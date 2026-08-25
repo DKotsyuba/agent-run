@@ -24,7 +24,7 @@ class StateOutboxTests(unittest.TestCase):
         request = StartRequest("codex", "model", "profile", "task", self.root)
         return self.store.create_agent(
             request, task_summary="summary", config_revision="cfg-1", at=1
-        )
+        ).agent_id
 
     def finish(self, agent_id) -> None:
         self.store.transition(agent_id, AgentStatus.STARTING, at=2)

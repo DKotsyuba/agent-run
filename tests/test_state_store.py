@@ -2,7 +2,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -48,22 +50,101 @@ class StateStoreTests(unittest.TestCase):
     def create(self, request: StartRequest | None = None):
         return self.store.create_agent(
             request or self.request(), task_summary="summary", config_revision="cfg-1", at=1
-        )
+        ).agent_id
 
     def test_session_request_id_is_idempotent_and_binding_is_immutable(self) -> None:
         ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
         request = self.request(request_id="request-1", orchestrator=ref)
-        first = self.create(request)
-        second = self.create(request)
-        self.assertEqual(first, second)
+        first = self.store.create_agent(
+            request, task_summary="summary", config_revision="cfg-1", at=1
+        )
+        second = self.store.create_agent(
+            request, task_summary="summary", config_revision="cfg-1", at=1
+        )
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(first.agent_id, second.agent_id)
         self.assertEqual(len(self.store.list_agents()), 1)
-        self.assertEqual(self.store.bind_orchestrator(first, ref, at=2), self.store.get_agent(first)["orchestrator_session_id"])
+        self.assertEqual(
+            self.store.bind_orchestrator(first.agent_id, ref, at=2),
+            self.store.get_agent(first.agent_id)["orchestrator_session_id"],
+        )
 
         with self.assertRaises(ValidationError):
             self.store.bind_orchestrator(
-                first, OrchestratorRef("codex_queue", "different-session"), at=3
+                first.agent_id,
+                OrchestratorRef("codex_queue", "different-session"),
+                at=3,
             )
         self.assertEqual(len(self.store.list_agents()), 1)
+
+    def test_unbound_request_id_is_globally_concurrent_and_exact(self) -> None:
+        request = self.request(request_id="shared-request")
+        barrier = Barrier(2)
+        database = self.root / "state.db"
+
+        def create_once():
+            store = StateStore.open(database)
+            try:
+                barrier.wait()
+                return store.create_agent(
+                    request, task_summary="summary", config_revision="cfg-1", at=2
+                )
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(create_once) for _ in range(2)]
+            results = [future.result() for future in futures]
+
+        self.assertEqual([result.created for result in results].count(True), 1)
+        self.assertEqual(results[0].agent_id, results[1].agent_id)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM agents WHERE request_id = 'shared-request'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM events
+                   WHERE agent_id = ? AND kind = 'created'""",
+                (results[0].agent_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertFalse(
+            self.store.create_agent(
+                request, task_summary="summary", config_revision="cfg-1", at=3
+            ).created
+        )
+        with self.assertRaises(ValidationError):
+            self.store.create_agent(
+                self.request(request_id="shared-request", task="different"),
+                task_summary="summary",
+                config_revision="cfg-1",
+            )
+        with self.assertRaises(ValidationError):
+            self.store.create_agent(
+                request, task_summary="different", config_revision="cfg-1"
+            )
+        with self.assertRaises(ValidationError):
+            self.store.create_agent(
+                request, task_summary="summary", config_revision="cfg-2"
+            )
+
+        first = self.store.create_agent(
+            self.request(task="non-idempotent-1"),
+            task_summary="summary",
+            config_revision="cfg-1",
+        )
+        second = self.store.create_agent(
+            self.request(task="non-idempotent-2"),
+            task_summary="summary",
+            config_revision="cfg-1",
+        )
+        self.assertTrue(first.created and second.created)
+        self.assertNotEqual(first.agent_id, second.agent_id)
 
     def test_session_lookup_and_agent_filter_are_read_only_and_composable(self) -> None:
         first = self.create(self.request(task="first"))
