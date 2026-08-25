@@ -440,7 +440,13 @@ class RuntimeSession(Protocol):
 class RuntimeAdapter(Protocol):
     def describe(self) -> RuntimeInfo: ...
     def validate(self, config: RuntimeConfig) -> None: ...
-    def materialize(self, config: RuntimeConfig, home: Path) -> str: ...
+    def materialize(
+        self,
+        config: RuntimeConfig,
+        home: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
+    ) -> str: ...
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth: ...
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]: ...
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]: ...
@@ -451,6 +457,8 @@ class RuntimeAdapter(Protocol):
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan: ...
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession: ...
 ```
@@ -462,6 +470,9 @@ Contract rules:
 - unsupported requested capabilities refuse before the public agent row is
   accepted;
 - `materialize` may write only inside the adapter's generated home;
+- `materialize` and `prepare` receive the resolved MCP servers as a required
+  keyword-only `mcp_servers` mapping; adapters never read ambient config to
+  resolve the names listed in `RuntimeConfig.mcp`;
 - `prepare` starts nothing and returns no live handles;
 - `launch` runs only inside the detached supervisor;
 - `RuntimeSession.cancel` performs engine-native interruption before the shared
