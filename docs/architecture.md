@@ -318,7 +318,38 @@ class StartRequest:
     output_schema: dict | None = None
     orchestrator: OrchestratorRef | None = None
     request_id: str | None = None
+
+class MessageRole(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    SYSTEM = "system"
+
+@dataclass(frozen=True, slots=True)
+class Message:
+    at: float
+    role: MessageRole
+    content: str
+    name: str | None = None
+    raw_ref: str | None = None
+
+@dataclass(frozen=True, slots=True)
+class Outcome:
+    status: AgentStatus
+    exit_code: int | None = None
+    failure_kind: str | None = None
+    failure_text: str | None = None
+    runtime_session_id: str | None = None
+    answer_path: Path | None = None
+    answer_bytes: int | None = None
+    answer_sha256: str | None = None
 ```
+
+Public agent ids use `ag-YYYYMMDD-HHMMSS-<10 lowercase hex>`. Domain constructors
+require actual enum instances rather than accepting equal raw strings. Message
+timestamps are finite and nonnegative, message content is nonblank, outcomes are
+terminal, and answer byte counts are nonnegative.
 
 Transitions:
 
@@ -998,4 +1029,3 @@ Core acceptance tests:
 - Preserve current security and failure semantics before adding workflows.
 - Prefer verified runtime-native isolation over pretending a separate home is
   effective when the engine still reads global state.
-
