@@ -90,6 +90,57 @@ class StateOutboxTests(unittest.TestCase):
         )
         self.assertIsNone(self.store.claim_delivery("other", at=1000))
 
+    def test_failed_delivery_requires_live_owned_lease(self) -> None:
+        agent_id = self.create()
+        self.finish(agent_id)
+        self.store.bind_orchestrator(
+            agent_id, OrchestratorRef("codex_queue", "session", "turn"), at=5
+        )
+        delivery = self.store.claim_delivery("worker-1", at=5, lease_seconds=10)
+
+        with self.assertRaisesRegex(ValidationError, "lease is not owned"):
+            self.store.fail_delivery(delivery["id"], "worker-2", "wrong owner", at=6)
+        with self.assertRaisesRegex(ValidationError, "lease is not owned"):
+            self.store.fail_delivery(delivery["id"], "worker-1", "expired", at=15)
+        unchanged = self.store.connection.execute(
+            "SELECT state, last_error, ambiguous_result, lease_owner FROM deliveries WHERE id = ?",
+            (delivery["id"],),
+        ).fetchone()
+        self.assertEqual(tuple(unchanged), ("sending", None, 0, "worker-1"))
+
+        reclaimed = self.store.claim_delivery("worker-2", at=15, lease_seconds=10)
+        self.store.fail_delivery(
+            reclaimed["id"], "worker-2", "permanent", at=16, ambiguous_result=True
+        )
+        failed = self.store.connection.execute(
+            """SELECT state, last_error, ambiguous_result, lease_owner, lease_until
+               FROM deliveries WHERE id = ?""",
+            (delivery["id"],),
+        ).fetchone()
+        self.assertEqual(tuple(failed), ("failed", "permanent", 1, None, None))
+
+    def test_context_receipt_upserts_only_changed_keys(self) -> None:
+        agent_id = self.create()
+        session_id = self.store.bind_orchestrator(
+            agent_id, OrchestratorRef("codex_queue", "session", "turn"), at=5
+        )
+
+        self.assertTrue(self.store.record_context_receipt(session_id, "first", at=6))
+        self.assertFalse(self.store.record_context_receipt(session_id, "first", at=7))
+        receipt = self.store.connection.execute(
+            "SELECT context_key, injected_at FROM context_receipts WHERE orchestrator_session_id = ?",
+            (session_id,),
+        ).fetchone()
+        self.assertEqual(tuple(receipt), ("first", 6))
+        self.assertTrue(self.store.record_context_receipt(session_id, "second", at=8))
+        receipt = self.store.connection.execute(
+            "SELECT context_key, injected_at FROM context_receipts WHERE orchestrator_session_id = ?",
+            (session_id,),
+        ).fetchone()
+        self.assertEqual(tuple(receipt), ("second", 8))
+        with self.assertRaisesRegex(Exception, "FOREIGN KEY constraint failed"):
+            self.store.record_context_receipt("unknown-session", "key", at=9)
+
     def test_reconciliation_requires_supplied_proof_before_persisting_lost(self) -> None:
         agent_id = self.create()
         with self.assertRaises(ValidationError):
