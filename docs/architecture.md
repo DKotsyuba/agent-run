@@ -689,9 +689,29 @@ deliveries, and capacity samples by lane/window/source/reset.
 
 Transaction rules:
 
+```python
+@dataclass(frozen=True, slots=True)
+class AgentCreation:
+    agent_id: AgentId
+    created: bool
+
+class StateStore:
+    def create_agent(
+        self,
+        request: StartRequest,
+        *,
+        task_summary: str,
+        config_revision: str,
+        agent_id: str | AgentId | None = None,
+        at: float | None = None,
+    ) -> AgentCreation: ...
+```
+
 - `BEGIN IMMEDIATE` for state transitions and outbox claims;
 - start inserts the agent and initial event before supervisor spawn;
-- a caller-supplied `request_id` makes a timed-out start idempotent;
+- a caller-supplied `request_id` is globally idempotent before binding; under
+  `BEGIN IMMEDIATE`, retries must match the serialized request, task summary,
+  and configuration revision exactly;
 - worker claims use conditional status/attempt updates;
 - the final artifact is flushed and hashed before terminal commit;
 - terminal commit updates the agent, appends the terminal event, and activates
@@ -874,10 +894,18 @@ class AgentService(Protocol):
     def list(self, query: AgentQuery) -> AgentPage: ...
     def transcript(self, agent_id: str, cursor: int = 0, limit: int = 200) -> TranscriptPage: ...
     def answer(self, agent_id: str) -> AnswerView: ...
-    def summary(self, orchestrator: OrchestratorRef | None = None) -> WorkSummary: ...
+    def summary(
+        self,
+        agent_id: str | None = None,
+        orchestrator: OrchestratorRef | None = None,
+    ) -> WorkSummary: ...
     def models(self) -> Mapping[str, tuple[ModelInfo, ...]]: ...
     def limits(self) -> CapacityReport: ...
 ```
+
+`summary` requires exactly one of `agent_id` or `orchestrator`. Trusted
+completion notices use `summary(agent_id)`; session-scoped views use the
+orchestrator reference.
 
 Minimum CLI:
 
