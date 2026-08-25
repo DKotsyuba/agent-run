@@ -42,9 +42,11 @@ def dispatcher_lock(path: Path) -> Iterator[bool]:
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except BlockingIOError:
             yield False
             return
+        except OSError as error:
+            raise DeliveryError("cannot acquire delivery dispatcher lock") from error
         try:
             yield True
         finally:
@@ -64,6 +66,7 @@ class DispatchResult:
     retried: int = 0
     failed: int = 0
     ambiguous: int = 0
+    claim_lost: int = 0
     locked_out: bool = False
 
 
@@ -111,6 +114,18 @@ class DeliveryDispatcher:
         self._config = DeliveryConfig() if config is None else config
         if not isinstance(self._config, DeliveryConfig):
             raise ValidationError("config must be a DeliveryConfig")
+        for name in ("retry_base_seconds", "retry_cap_seconds"):
+            value = getattr(self._config, name)
+            if type(value) not in (int, float) or not 0 < value < float("inf"):
+                raise ValidationError(f"delivery.{name} must be positive and finite")
+        if self._config.retry_cap_seconds < self._config.retry_base_seconds:
+            raise ValidationError("delivery.retry_cap_seconds must not be below retry base")
+        if type(self._config.max_attempts) is not int or self._config.max_attempts < 0:
+            raise ValidationError("delivery.max_attempts must be a nonnegative integer")
+        if type(lease_seconds) not in (int, float) or not 0 < lease_seconds < float("inf"):
+            raise ValidationError("lease_seconds must be positive and finite")
+        for transport in self._transports.values():
+            transport.validate(self._config)
         self._lease_seconds = lease_seconds
         self._owner = new_owner() if owner is None else owner
 
@@ -139,7 +154,7 @@ class DeliveryDispatcher:
 
         if max_batch < 1:
             raise ValidationError("max_batch must be at least 1")
-        claimed = delivered = retried = failed = ambiguous = 0
+        claimed = delivered = retried = failed = ambiguous = claim_lost = 0
         while claimed < max_batch:
             row = self._store.claim_delivery(
                 self._owner, at=at, lease_seconds=self._lease_seconds
@@ -154,6 +169,9 @@ class DeliveryDispatcher:
                 delivered += 1
             elif verdict.state == "retry_wait":
                 retried += 1
+            elif verdict.state == "claim_lost":
+                claim_lost += 1
+                break
             else:
                 failed += 1
         return DispatchResult(
@@ -162,15 +180,16 @@ class DeliveryDispatcher:
             retried=retried,
             failed=failed,
             ambiguous=ambiguous,
+            claim_lost=claim_lost,
         )
 
     def _dispatch(self, row: Mapping[str, object], at: float | None) -> _Verdict:
         delivery_id = str(row["id"])
         transport = self._transports.get(str(row["transport"]))
         if transport is None:
-            return self._give_up_or_retry(
-                row, f"no transport named {row['transport']!r}", False, at
-            )
+            if self._fail(delivery_id, "delivery transport is not configured", False, at):
+                return _Verdict("failed", False)
+            return _Verdict("claim_lost", True)
         try:
             receipt = transport.send(target_for(row), notice_for(row))
         except AmbiguousDeliveryError as error:
@@ -179,13 +198,20 @@ class DeliveryDispatcher:
             return self._give_up_or_retry(row, str(error), True, at)
         except DeliveryError as error:
             return self._give_up_or_retry(row, str(error), False, at)
-        self._store.complete_delivery(
-            delivery_id,
-            self._owner,
-            remote_message_id=receipt.remote_message_id,
-            ambiguous_result=receipt.ambiguous,
-            at=at,
-        )
+        except Exception as error:
+            return self._give_up_or_retry(
+                row, f"transport send raised {type(error).__name__}", True, at
+            )
+        try:
+            self._store.complete_delivery(
+                delivery_id,
+                self._owner,
+                remote_message_id=receipt.remote_message_id,
+                ambiguous_result=receipt.ambiguous,
+                at=at,
+            )
+        except ValidationError:
+            return _Verdict("claim_lost", True)
         return _Verdict("delivered", receipt.ambiguous)
 
     def _give_up_or_retry(
@@ -199,37 +225,37 @@ class DeliveryDispatcher:
         limit = self._config.max_attempts
         # `max_attempts = 0` means unlimited: retries are durable by default.
         if limit > 0 and int(row["attempts"]) >= limit:
-            self._fail(delivery_id, error, ambiguous, at)
-            return _Verdict("failed", ambiguous)
-        self._store.retry_delivery(
-            delivery_id,
-            self._owner,
-            error,
-            at=at,
-            ambiguous_result=ambiguous,
-            base_delay=self._config.retry_base_seconds,
-            max_delay=self._config.retry_cap_seconds,
-        )
+            if self._fail(delivery_id, error, ambiguous, at):
+                return _Verdict("failed", ambiguous)
+            return _Verdict("claim_lost", True)
+        try:
+            self._store.retry_delivery(
+                delivery_id,
+                self._owner,
+                error,
+                at=at,
+                ambiguous_result=ambiguous,
+                base_delay=self._config.retry_base_seconds,
+                max_delay=self._config.retry_cap_seconds,
+            )
+        except ValidationError:
+            return _Verdict("claim_lost", True)
         return _Verdict("retry_wait", ambiguous)
 
     def _fail(
         self, delivery_id: str, error: str, ambiguous: bool, at: float | None
-    ) -> None:
-        # StateStore exposes delivered/retry_wait/cancelled only; `failed` is
-        # reached through the same guarded claim helper it uses itself.
-        connection = self._store.connection
-        now = timestamp(at)
-        with immediate(connection):
-            if not finish_delivery_claim(
-                connection,
+    ) -> bool:
+        try:
+            self._store.fail_delivery(
                 delivery_id,
                 self._owner,
-                "failed",
-                now=now,
-                last_error=error,
+                error,
+                at=at,
                 ambiguous_result=ambiguous,
-            ):
-                raise ValidationError("delivery lease is not owned by caller")
+            )
+        except ValidationError:
+            return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)

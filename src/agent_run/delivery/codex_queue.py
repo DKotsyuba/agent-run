@@ -26,6 +26,10 @@ TRANSPORT_NAME = "codex_queue"
 QueueSender = Callable[[str, str], "str | None"]
 
 
+class SessionGoneError(LookupError):
+    """The queue target no longer exists; never create a replacement."""
+
+
 class CodexQueueTransport:
     """Deliver a completion notice by queueing one message on a live session.
 
@@ -73,12 +77,14 @@ class CodexQueueTransport:
             raise AmbiguousDeliveryError(
                 f"codex queue acceptance is unknown for {notice.notification_id}"
             ) from error
-        except LookupError as error:
+        except SessionGoneError as error:
             raise DeliveryError(
                 "codex queue session is gone; agent-run never opens a replacement"
             ) from error
         except OSError as error:
-            raise DeliveryError(f"codex queue is unreachable: {error}") from error
+            raise DeliveryError(
+                f"codex queue is unreachable ({type(error).__name__})"
+            ) from error
         if remote_message_id is not None and not isinstance(remote_message_id, str):
             raise DeliveryError("codex queue returned a non-string message id")
         return DeliveryReceipt(remote_message_id=remote_message_id, ambiguous=False)

@@ -16,6 +16,12 @@ from agent_run.delivery.base import (
 from agent_run.delivery.dispatch import DeliveryDispatcher, dispatcher_lock
 
 
+import time
+from unittest import mock
+
+from agent_run.errors import ValidationError
+
+
 class FakeTransport:
     name = "codex_queue"
     api_version = 1
@@ -23,15 +29,18 @@ class FakeTransport:
     def __init__(self, *behaviors) -> None:
         self.behaviors = list(behaviors)
         self.calls: list[tuple[OrchestratorRef, object]] = []
+        self.validated = []
 
     def validate(self, config) -> None:
-        return None
+        self.validated.append(config)
 
     def send(self, target, notice) -> DeliveryReceipt:
         self.calls.append((target, notice))
         behavior = self.behaviors[min(len(self.calls), len(self.behaviors)) - 1]
         if isinstance(behavior, Exception):
             raise behavior
+        if callable(behavior):
+            return behavior(target, notice)
         return behavior
 
 
@@ -51,7 +60,7 @@ class DeliveryDispatchTests(unittest.TestCase):
         request = StartRequest("codex", "model", "profile", "task", self.root)
         agent_id = self.store.create_agent(
             request, task_summary="summary", config_revision="cfg-1", at=1
-        )
+        ).agent_id
         self.store.transition(agent_id, AgentStatus.STARTING, at=2)
         self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
         self.store.transition(
@@ -69,12 +78,14 @@ class DeliveryDispatchTests(unittest.TestCase):
             ).fetchone()
         )
 
-    def dispatcher(self, transport, config=None, transports=None) -> DeliveryDispatcher:
+    def dispatcher(
+        self, transport, config=None, transports=None, lease_seconds=10
+    ) -> DeliveryDispatcher:
         return DeliveryDispatcher(
             self.store,
             {transport.name: transport} if transports is None else transports,
             config,
-            lease_seconds=10,
+            lease_seconds=lease_seconds,
         )
 
     def test_pending_notice_is_delivered_once_and_the_outbox_then_rests(self) -> None:
@@ -132,13 +143,83 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.assertIsNone(row["lease_owner"])
         self.assertEqual(dispatcher.run(lock_path=self.lock_path, at=10_000).claimed, 0)
 
-    def test_unknown_transport_is_retried_rather_than_dropped(self) -> None:
+    def test_unknown_transport_is_a_permanent_configuration_failure(self) -> None:
         transport = FakeTransport(DeliveryReceipt("remote-1"))
         dispatcher = self.dispatcher(transport, transports={"slack": transport})
         result = dispatcher.run(lock_path=self.lock_path, at=10)
-        self.assertEqual((result.retried, result.failed), (1, 0))
+        self.assertEqual((result.retried, result.failed), (0, 1))
         self.assertEqual(transport.calls, [])
-        self.assertIn("no transport", self.delivery_row()["last_error"])
+        self.assertEqual(self.delivery_row()["state"], "failed")
+        self.assertEqual(
+            self.delivery_row()["last_error"], "delivery transport is not configured"
+        )
+
+    def test_unexpected_transport_error_is_sanitized_and_releases_claim(self) -> None:
+        transport = FakeTransport(RuntimeError("secret sender detail"))
+        dispatcher = self.dispatcher(transport, DeliveryConfig(max_attempts=1))
+        result = dispatcher.run(lock_path=self.lock_path, at=10)
+        row = self.delivery_row()
+        self.assertEqual((result.failed, result.ambiguous), (1, 1))
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["last_error"], "transport send raised RuntimeError")
+        self.assertNotIn("secret", row["last_error"])
+        self.assertIsNone(row["lease_owner"])
+
+    def test_send_longer_than_lease_is_ambiguous_and_reclaimable(self) -> None:
+        def slow_send(_target, _notice):
+            time.sleep(0.03)
+            return DeliveryReceipt("maybe-delivered")
+
+        result = self.dispatcher(
+            FakeTransport(slow_send), lease_seconds=0.01
+        ).run(lock_path=self.lock_path)
+        self.assertEqual((result.claim_lost, result.ambiguous, result.failed), (1, 1, 0))
+        self.assertEqual(self.delivery_row()["state"], "sending")
+
+        reclaimed = self.dispatcher(FakeTransport(DeliveryReceipt("remote-2"))).run(
+            lock_path=self.lock_path
+        )
+        self.assertEqual(reclaimed.delivered, 1)
+        self.assertEqual(self.delivery_row()["state"], "delivered")
+
+    def test_cancel_during_send_is_terminal_and_does_not_retry(self) -> None:
+        def cancel(_target, _notice):
+            self.store.cancel_delivery(self.delivery_row()["id"])
+            return DeliveryReceipt("late-ack")
+
+        result = self.dispatcher(FakeTransport(cancel)).run(
+            lock_path=self.lock_path, at=10
+        )
+        self.assertEqual((result.claim_lost, result.retried, result.failed), (1, 0, 0))
+        self.assertEqual(self.delivery_row()["state"], "cancelled")
+        self.assertEqual(
+            self.dispatcher(FakeTransport(DeliveryReceipt("unused"))).run(
+                lock_path=self.lock_path, at=100
+            ).claimed,
+            0,
+        )
+
+    def test_constructor_validates_config_and_every_transport(self) -> None:
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+        config = DeliveryConfig()
+        self.dispatcher(transport, config)
+        self.assertEqual(transport.validated, [config])
+        for invalid in (
+            DeliveryConfig(retry_base_seconds=0),
+            DeliveryConfig(retry_base_seconds=2, retry_cap_seconds=1),
+            DeliveryConfig(max_attempts=-1),
+        ):
+            with self.assertRaises(ValidationError):
+                self.dispatcher(transport, invalid)
+
+    def test_unsupported_flock_is_loud_not_contention(self) -> None:
+        dispatcher = self.dispatcher(FakeTransport(DeliveryReceipt("remote-1")))
+        with mock.patch(
+            "agent_run.delivery.dispatch.fcntl.flock",
+            side_effect=OSError(95, "operation not supported"),
+        ):
+            with self.assertRaises(DeliveryError):
+                dispatcher.run(lock_path=self.lock_path, at=10)
 
     def test_only_one_dispatcher_runs_at_a_time(self) -> None:
         transport = FakeTransport(DeliveryReceipt("remote-1"))

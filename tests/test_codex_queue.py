@@ -18,6 +18,9 @@ from agent_run.delivery.codex_queue import CodexQueueTransport
 AGENT_ID = "ag-20260825-120000-0123456789"
 
 
+from agent_run.delivery.codex_queue import SessionGoneError
+
+
 class RecordingQueue:
     """A queue that records sends and can only reach existing sessions."""
 
@@ -31,7 +34,7 @@ class RecordingQueue:
         if self.outcome is not None:
             raise self.outcome
         if session_id not in self.sessions:
-            raise LookupError(f"no such session: {session_id}")
+            raise SessionGoneError(f"no such session: {session_id}")
         return f"remote-{len(self.sent)}"
 
 
@@ -78,6 +81,13 @@ class CodexQueueTransportTests(unittest.TestCase):
             CodexQueueTransport(RecordingQueue()).send(
                 OrchestratorRef("slack", "session-1"), self.notice
             )
+
+    def test_only_explicit_session_gone_is_classified_as_missing(self) -> None:
+        for error in (KeyError("sender bug"), IndexError("sender bug")):
+            with self.assertRaises(type(error)):
+                CodexQueueTransport(RecordingQueue(outcome=error)).send(
+                    self.target, self.notice
+                )
 
     def test_validate_and_arguments_are_checked(self) -> None:
         transport = CodexQueueTransport(RecordingQueue())
