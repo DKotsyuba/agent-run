@@ -151,10 +151,32 @@ class StateStoreTests(unittest.TestCase):
         second = self.create(self.request(task="second"))
         other = self.create(self.request(task="other"))
         ref = OrchestratorRef("codex_queue", "session-a", "turn-a")
-        other_ref = OrchestratorRef("codex_queue", "session-b", "turn-b")
+        updated_ref = OrchestratorRef("codex_queue", "session-a", "turn-b")
+        other_ref = OrchestratorRef("other_transport", "session-a", "turn-c")
         session_id = self.store.bind_orchestrator(first, ref, at=2)
-        self.assertEqual(self.store.bind_orchestrator(second, ref, at=2), session_id)
+        self.assertEqual(
+            self.store.bind_orchestrator(second, updated_ref, at=3), session_id
+        )
+        self.assertEqual(
+            self.store.bind_orchestrator(
+                first, OrchestratorRef("codex_queue", "session-a"), at=4
+            ),
+            session_id,
+        )
         self.store.bind_orchestrator(other, other_ref, at=2)
+        stored_session = self.store.connection.execute(
+            """SELECT external_turn_id, last_seen_at FROM orchestrator_sessions
+               WHERE id = ?""",
+            (session_id,),
+        ).fetchone()
+        self.assertEqual(tuple(stored_session), ("turn-b", 4))
+        self.assertEqual(
+            self.store.connection.execute(
+                """SELECT COUNT(*) FROM orchestrator_sessions
+                   WHERE transport = 'codex_queue' AND external_session_id = 'session-a'"""
+            ).fetchone()[0],
+            1,
+        )
 
         session_count = self.store.connection.execute(
             "SELECT COUNT(*) FROM orchestrator_sessions"
@@ -177,7 +199,7 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertEqual(len(self.store.list_agents()), 3)
 
-        self.store.transition(first, AgentStatus.STARTING, at=3)
+        self.store.transition(first, AgentStatus.STARTING, at=5)
         self.assertEqual(
             [
                 row["id"]
