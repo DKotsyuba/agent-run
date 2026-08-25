@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol
 
-from ..config import RuntimeConfig
+from ..config import McpConfig, RuntimeConfig
 from ..domain import Message, Outcome, StartRequest
 from ..profiles import AgentProfile
 
@@ -98,7 +98,13 @@ class RuntimeAdapter(Protocol):
 
     def validate(self, config: RuntimeConfig) -> None: ...
 
-    def materialize(self, config: RuntimeConfig, home: Path) -> str: ...
+    def materialize(
+        self,
+        config: RuntimeConfig,
+        home: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
+    ) -> str: ...
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth: ...
 
@@ -113,6 +119,8 @@ class RuntimeAdapter(Protocol):
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan: ...
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession: ...
