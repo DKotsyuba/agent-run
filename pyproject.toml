@@ -8,6 +8,5 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = []
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-packages = ["agent_run"]
+[tool.setuptools.packages.find]
+where = ["src"]
