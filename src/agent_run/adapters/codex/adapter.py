@@ -1,0 +1,313 @@
+"""Codex runtime adapter: isolated home, app-server launch, models/limits.
+
+No live ``codex`` calls happen anywhere in this module. Model rosters and
+capacity limits are read from an isolated on-disk cache/evidence file below
+the generated ``CODEX_HOME`` (populated by a live probe out of this task's
+scope); this adapter only intersects that cache with the configured
+allowlist and marks missing/stale evidence ``unknown``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
+
+from ...config import RuntimeConfig, load_config
+from ...domain import StartRequest
+from ...errors import ValidationError
+from ...paths import agent_run_home, config_path
+from ...profiles import AgentProfile
+from ..base import (
+    ADAPTER_API_VERSION,
+    Capability,
+    EventSink,
+    LaunchPlan,
+    LimitSample,
+    ModelInfo,
+    RuntimeAdapter,
+    RuntimeHealth,
+    RuntimeInfo,
+    RuntimeSession,
+)
+from ..home import content_hash, create_symlink_bridge, write_managed_file
+from . import app_server
+
+
+_CONFIG_REL = "config.toml"
+_MODEL_CACHE_REL = "cache/models.json"
+_ROLLOUT_EVIDENCE_REL = "cache/rollout_evidence.json"
+_LIMITS_STALE_SECONDS = 900
+_APPROVAL_POLICY = "never"
+
+
+def _toml_string(value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_array(values) -> str:
+    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
+
+
+def _read_json(path: Path) -> object | None:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+class CodexAdapter:
+    def describe(self) -> RuntimeInfo:
+        return RuntimeInfo(
+            "codex",
+            ADAPTER_API_VERSION,
+            frozenset(
+                {
+                    Capability.STEER,
+                    Capability.EFFORT,
+                    Capability.READ_ROOTS,
+                    Capability.WRITE,
+                    Capability.TRANSCRIPT,
+                    Capability.MODEL_ROSTER,
+                    Capability.LIVE_LIMITS,
+                    Capability.MCP,
+                    Capability.SKILLS,
+                    Capability.HOOKS,
+                }
+            ),
+        )
+
+    def validate(self, config: RuntimeConfig) -> None:
+        if not isinstance(config, RuntimeConfig):
+            raise ValidationError("codex adapter requires a RuntimeConfig")
+        if config.service_mode is not None:
+            raise ValidationError("codex runtime does not use service_mode")
+        if config.auth is None or config.auth.kind != "file_link":
+            raise ValidationError("codex runtime requires a file_link auth bridge")
+        if not config.models:
+            raise ValidationError("codex runtime requires at least one configured model")
+
+    def materialize(self, config: RuntimeConfig, home: Path) -> str:
+        self.validate(config)
+        agent_run_root = agent_run_home()
+        skills_root = agent_run_root / "skills" / "codex"
+        skill_hashes: dict[str, str] = {}
+        for name in config.skills:
+            source = skills_root / name / "SKILL.md"
+            try:
+                text = source.read_text(encoding="utf-8")
+            except OSError as error:
+                raise ValidationError(f"codex skill is not available: {name}: {error}") from error
+            skill_hashes[name] = write_managed_file(home, f"skills/{name}/SKILL.md", text)
+
+        mcp_defs: Mapping[str, object] = {}
+        if config.mcp:
+            mcp_defs = load_config(config_path(agent_run_root)).mcp
+
+        mcp_lines: list[str] = []
+        for name in sorted(config.mcp):
+            try:
+                mcp_def = mcp_defs[name]
+            except KeyError as error:
+                raise ValidationError(f"codex mcp reference is not configured: {name}") from error
+            mcp_lines.append(f"[mcp_servers.{name}]")
+            mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
+            mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
+            if mcp_def.env_from:
+                mcp_lines.append(f"env_from = {_toml_array(mcp_def.env_from)}")
+            mcp_lines.append("")
+
+        hook_lines: list[str] = []
+        for hook in config.hooks:
+            hook_lines.append("[[hooks]]")
+            hook_lines.append(f"event = {_toml_string(hook.event)}")
+            if hook.matcher is not None:
+                hook_lines.append(f"matcher = {_toml_string(hook.matcher)}")
+            hook_lines.append(f"command = {_toml_array(hook.command)}")
+            hook_lines.append("")
+
+        skill_lines = [f"skills = {_toml_array(sorted(config.skills))}"] if config.skills else []
+        body_lines = [
+            "# generated by agent-run; do not edit by hand",
+            *skill_lines,
+            "",
+            *mcp_lines,
+            *hook_lines,
+        ]
+        generated_config = "\n".join(body_lines).rstrip() + "\n"
+        write_managed_file(home, _CONFIG_REL, generated_config)
+
+        auth_digest = ""
+        if config.auth is not None and config.auth.kind == "file_link":
+            bridge = create_symlink_bridge(home, config.auth.target, config.auth.source)
+            auth_digest = str(bridge.resolve(strict=True))
+
+        fingerprint = "\n".join(
+            [
+                generated_config,
+                *(f"{name}:{digest}" for name, digest in sorted(skill_hashes.items())),
+                auth_digest,
+            ]
+        )
+        return content_hash(fingerprint)
+
+    def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
+        try:
+            self.validate(config)
+        except ValidationError as error:
+            return RuntimeHealth(False, None, None, str(error))
+        home_path = Path(home)
+        binary_ok = config.binary.exists() and os.access(config.binary, os.X_OK)
+        home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
+        auth_ok = None
+        if config.auth is not None and config.auth.kind == "file_link":
+            bridge = home_path / config.auth.target
+            auth_ok = bridge.is_symlink() and bridge.exists()
+        cache = _read_json(home_path / _MODEL_CACHE_REL)
+        version = cache.get("codex_version") if isinstance(cache, dict) else None
+        available = bool(binary_ok and home_ok and (auth_ok is not False))
+        reason = None if available else "codex binary, generated home, or auth bridge is missing"
+        return RuntimeHealth(available, version if isinstance(version, str) else None, auth_ok, reason)
+
+    def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
+        cache = _read_json(Path(home) / _MODEL_CACHE_REL)
+        entries = cache.get("models") if isinstance(cache, dict) else None
+        by_id: dict[str, dict] = {}
+        if isinstance(entries, list):
+            for item in entries:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    by_id[item["id"]] = item
+        result = []
+        for model_id in config.models:
+            item = by_id.get(model_id, {})
+            description = item.get("description")
+            efforts_raw = item.get("efforts")
+            efforts = (
+                tuple(effort for effort in efforts_raw if isinstance(effort, str))
+                if isinstance(efforts_raw, list)
+                else ()
+            )
+            result.append(ModelInfo(model_id, description if isinstance(description, str) else "", efforts))
+        return tuple(result)
+
+    def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
+        payload = _read_json(Path(home) / _ROLLOUT_EVIDENCE_REL)
+        samples_raw = payload.get("samples") if isinstance(payload, dict) else None
+        if not isinstance(samples_raw, list):
+            return ()
+        now = time.time()
+        result = []
+        for item in samples_raw:
+            if not isinstance(item, dict):
+                continue
+            lane, window = item.get("lane"), item.get("window")
+            if not isinstance(lane, str) or not isinstance(window, str):
+                continue
+            observed_raw = item.get("observed_at")
+            observed_at = None
+            stale = True
+            if isinstance(observed_raw, (int, float)) and not isinstance(observed_raw, bool):
+                observed_at = datetime.fromtimestamp(observed_raw, tz=timezone.utc)
+                stale = (now - observed_raw) > _LIMITS_STALE_SECONDS
+            remaining = item.get("remaining_percent")
+            if stale or not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+                remaining = None
+            reset_raw = item.get("reset_at")
+            reset_at = (
+                datetime.fromtimestamp(reset_raw, tz=timezone.utc)
+                if isinstance(reset_raw, (int, float)) and not isinstance(reset_raw, bool)
+                else None
+            )
+            valid_for = item.get("valid_for_seconds")
+            result.append(
+                LimitSample(
+                    lane=lane,
+                    window=window,
+                    remaining_percent=remaining,
+                    reset_at=reset_at,
+                    observed_at=observed_at,
+                    source="unknown" if stale else "rollout_evidence",
+                    target=item.get("target") if isinstance(item.get("target"), str) else None,
+                    valid_for_seconds=valid_for if isinstance(valid_for, int) and not isinstance(valid_for, bool) else None,
+                )
+            )
+        return tuple(result)
+
+    def prepare(
+        self,
+        request: StartRequest,
+        profile: AgentProfile,
+        config: RuntimeConfig,
+        home: Path,
+        agent_dir: Path,
+    ) -> LaunchPlan:
+        if not isinstance(request, StartRequest):
+            raise ValidationError("prepare requires a StartRequest")
+        if not isinstance(profile, AgentProfile):
+            raise ValidationError("prepare requires an AgentProfile")
+        self.validate(config)
+        if request.runtime != "codex":
+            raise ValidationError(f"codex adapter cannot prepare runtime {request.runtime!r}")
+        if request.model not in config.models:
+            raise ValidationError(f"model not allowed for codex: {request.model}")
+        if request.output_schema is not None:
+            raise ValidationError("codex runtime does not support output_schema")
+
+        available = {info.id: info for info in self.models(config, home)}
+        if request.effort is not None:
+            efforts = available.get(request.model, ModelInfo(request.model, "")).efforts
+            if efforts and request.effort not in efforts:
+                raise ValidationError(
+                    f"effort {request.effort!r} is not offered for model {request.model!r}"
+                )
+        if request.write and not profile.write:
+            raise ValidationError("profile does not grant write access for this request")
+        if not profile.write and not profile.read_roots:
+            raise ValidationError(
+                "codex refuses a no-filesystem profile: grant write or at least one read root"
+            )
+        home_path = Path(home)
+        if not (home_path / _CONFIG_REL).is_file():
+            raise ValidationError(f"codex home is not materialized: {home_path}")
+
+        cwd = str(request.workdir)
+        roots = (cwd, *(str(root) for root in profile.read_roots))
+        writable_roots = (cwd,) if profile.write else ()
+        sandbox_mode = "workspace-write" if profile.write else "read-only"
+
+        environment = {
+            "CODEX_HOME": str(home_path),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+        adapter_state = {
+            "model": request.model,
+            "effort": request.effort,
+            "sandbox_mode": sandbox_mode,
+            "approval_policy": _APPROVAL_POLICY,
+            "roots": roots,
+            "writable_roots": writable_roots,
+            "mcp": tuple(config.mcp),
+            "skills": tuple(config.skills),
+            "profile": profile.name,
+        }
+        return LaunchPlan(
+            argv=(str(config.binary), "app-server"),
+            cwd=request.workdir,
+            environment=MappingProxyType(environment),
+            initial_input=request.task,
+            runtime_stream_path=Path(agent_dir) / "runtime.jsonl",
+            adapter_state=MappingProxyType(adapter_state),
+        )
+
+    def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession:
+        transport = app_server.ProcessTransport(plan)
+        return app_server.start_session(transport, plan, sink)
+
+
+ADAPTER: RuntimeAdapter = CodexAdapter()
