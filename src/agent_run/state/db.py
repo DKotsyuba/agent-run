@@ -186,12 +186,12 @@ def checked_supervisor_proof(
 
 
 def idempotent_agent(
-    connection: sqlite3.Connection, session_id: str, request_id: str
+    connection: sqlite3.Connection, request_id: str
 ) -> sqlite3.Row | None:
     return connection.execute(
         """SELECT id, request_json, task_summary, config_revision FROM agents
-           WHERE orchestrator_session_id = ? AND request_id = ?""",
-        (session_id, request_id),
+           WHERE request_id = ?""",
+        (request_id,),
     ).fetchone()
 
 
