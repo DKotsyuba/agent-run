@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -23,12 +24,11 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 
+from . import delivery
 from .db import (
     agent_row,
     checked_supervisor_proof,
-    claim_delivery_row,
     count_agents,
-    finish_delivery_claim,
     idempotent_agent,
     immediate,
     integer,
@@ -40,8 +40,6 @@ from .db import (
     message_rows,
     nonblank,
     open_database,
-    owned_delivery_attempts,
-    positive_number,
     request_json,
     recent_capacity_rows,
     require_attempt,
@@ -50,6 +48,12 @@ from .db import (
     timestamp,
     validate_message_storage,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentCreation:
+    agent_id: AgentId
+    created: bool
 
 
 class StateStore:
@@ -76,7 +80,7 @@ class StateStore:
         config_revision: str,
         agent_id: str | AgentId | None = None,
         at: float | None = None,
-    ) -> AgentId:
+    ) -> AgentCreation:
         """Insert an agent and its initial event, or return its idempotent peer."""
 
         if not isinstance(request, StartRequest):
@@ -87,15 +91,8 @@ class StateStore:
         candidate = new_agent_id() if agent_id is None else validate_agent_id(agent_id)
         serialized = request_json(request)
         with immediate(self.connection):
-            session_id = (
-                None
-                if request.orchestrator is None
-                else session_for_ref(self.connection, request.orchestrator, created_at)
-            )
-            if session_id is not None and request.request_id is not None:
-                existing = idempotent_agent(
-                    self.connection, session_id, request.request_id
-                )
+            if request.request_id is not None:
+                existing = idempotent_agent(self.connection, request.request_id)
                 if existing is not None:
                     if (
                         existing["request_json"] != serialized
@@ -103,7 +100,12 @@ class StateStore:
                         or existing["config_revision"] != config_revision
                     ):
                         raise ValidationError("request_id was reused for a different request")
-                    return AgentId(str(existing["id"]))
+                    return AgentCreation(AgentId(str(existing["id"])), False)
+            session_id = (
+                None
+                if request.orchestrator is None
+                else session_for_ref(self.connection, request.orchestrator, created_at)
+            )
             insert_agent_row(
                 self.connection,
                 candidate,
@@ -121,7 +123,7 @@ class StateStore:
                 "created",
                 to_status=AgentStatus.CREATED.value,
             )
-        return candidate
+        return AgentCreation(candidate, True)
 
     def bind_orchestrator(
         self,
@@ -152,6 +154,39 @@ class StateStore:
                 )
         return session_id
 
+    def find_orchestrator_session(self, ref: OrchestratorRef) -> str | None:
+        if not isinstance(ref, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        row = self.connection.execute(
+            """SELECT id FROM orchestrator_sessions
+               WHERE transport = ? AND external_session_id = ?""",
+            (ref.transport, ref.external_session_id),
+        ).fetchone()
+        return None if row is None else str(row["id"])
+
+    def record_context_receipt(
+        self,
+        orchestrator_session_id: str,
+        context_key: str,
+        *,
+        at: float | None = None,
+    ) -> bool:
+        nonblank("orchestrator_session_id", orchestrator_session_id)
+        nonblank("context_key", context_key)
+        injected_at = timestamp(at)
+        with immediate(self.connection):
+            changed = self.connection.execute(
+                """INSERT INTO context_receipts (
+                       orchestrator_session_id, context_key, injected_at
+                   ) VALUES (?, ?, ?)
+                   ON CONFLICT(orchestrator_session_id) DO UPDATE SET
+                       context_key = excluded.context_key,
+                       injected_at = excluded.injected_at
+                   WHERE context_receipts.context_key <> excluded.context_key""",
+                (orchestrator_session_id, context_key, injected_at),
+            ).rowcount
+        return changed == 1
+
     def get_agent(self, agent_id: str | AgentId) -> dict[str, object]:
         return dict(agent_row(self.connection, validate_agent_id(agent_id)))
 
@@ -159,11 +194,14 @@ class StateStore:
         self,
         *,
         statuses: Iterable[AgentStatus] | None = None,
+        orchestrator_session_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, object]]:
         integer("limit", limit, minimum=1)
         integer("offset", offset, minimum=0)
+        if orchestrator_session_id is not None:
+            nonblank("orchestrator_session_id", orchestrator_session_id)
         params: list[object] = []
         where = ""
         if statuses is not None:
@@ -175,6 +213,10 @@ class StateStore:
                 return []
             where = f"WHERE status IN ({','.join('?' for _ in values)})"
             params.extend(values)
+        if orchestrator_session_id is not None:
+            where += " AND " if where else "WHERE "
+            where += "orchestrator_session_id = ?"
+            params.append(orchestrator_session_id)
         params.extend((limit, offset))
         rows = self.connection.execute(
             f"""SELECT * FROM agents {where}
@@ -611,87 +653,41 @@ class StateStore:
         return [dict(row) for row in rows]
 
     def claim_delivery(
-        self,
-        owner: str,
-        *,
-        at: float | None = None,
-        lease_seconds: float = 30,
+        self, owner: str, *, at: float | None = None, lease_seconds: float = 30
     ) -> dict[str, object] | None:
-        nonblank("lease owner", owner)
-        now = timestamp(at)
-        lease_seconds = positive_number("lease_seconds", lease_seconds)
-        with immediate(self.connection):
-            row = claim_delivery_row(
-                self.connection, owner, now, now + lease_seconds
-            )
-        return row_dict(row)
+        return delivery.claim_delivery(self.connection, owner, at=at, lease_seconds=lease_seconds)
 
     def complete_delivery(
-        self,
-        delivery_id: str,
-        owner: str,
-        *,
+        self, delivery_id: str, owner: str, *,
         remote_message_id: str | None = None,
         ambiguous_result: bool = False,
         at: float | None = None,
     ) -> None:
-        nonblank("delivery_id", delivery_id)
-        nonblank("lease owner", owner)
-        now = timestamp(at)
-        with immediate(self.connection):
-            if not finish_delivery_claim(
-                self.connection,
-                delivery_id,
-                owner,
-                "delivered",
-                now=now,
-                remote_message_id=remote_message_id,
-                ambiguous_result=ambiguous_result,
-            ):
-                raise ValidationError("delivery lease is not owned by caller")
+        delivery.complete_delivery(
+            self.connection, delivery_id, owner,
+            remote_message_id=remote_message_id,
+            ambiguous_result=ambiguous_result, at=at,
+        )
+
+    def fail_delivery(
+        self, delivery_id: str, owner: str, error: str, *,
+        at: float | None = None, ambiguous_result: bool = False,
+    ) -> None:
+        delivery.fail_delivery(
+            self.connection, delivery_id, owner, error,
+            at=at, ambiguous_result=ambiguous_result,
+        )
 
     def retry_delivery(
-        self,
-        delivery_id: str,
-        owner: str,
-        error: str,
-        *,
-        at: float | None = None,
-        ambiguous_result: bool = False,
-        base_delay: float = 1,
-        max_delay: float = 300,
+        self, delivery_id: str, owner: str, error: str, *,
+        at: float | None = None, ambiguous_result: bool = False,
+        base_delay: float = 1, max_delay: float = 300,
     ) -> float:
-        nonblank("delivery_id", delivery_id)
-        nonblank("lease owner", owner)
-        nonblank("delivery error", error)
-        base_delay = positive_number("base_delay", base_delay)
-        max_delay = positive_number("max_delay", max_delay)
-        now = timestamp(at)
-        with immediate(self.connection):
-            attempts = owned_delivery_attempts(self.connection, delivery_id, owner, now)
-            if attempts is None:
-                raise ValidationError("delivery lease is not owned by caller")
-            delay = min(max_delay, base_delay * (2 ** min(attempts - 1, 20)))
-            next_attempt_at = now + delay
-            finish_delivery_claim(
-                self.connection,
-                delivery_id,
-                owner,
-                "retry_wait",
-                now=now,
-                last_error=error,
-                ambiguous_result=ambiguous_result,
-                next_attempt_at=next_attempt_at,
-            )
-        return next_attempt_at
+        return delivery.retry_delivery(
+            self.connection, delivery_id, owner, error,
+            at=at, ambiguous_result=ambiguous_result,
+            base_delay=base_delay, max_delay=max_delay,
+        )
 
     def cancel_delivery(self, delivery_id: str) -> bool:
-        nonblank("delivery_id", delivery_id)
-        with immediate(self.connection):
-            updated = self.connection.execute(
-                """UPDATE deliveries SET state = 'cancelled', lease_owner = NULL,
-                   lease_until = NULL, next_attempt_at = NULL
-                   WHERE id = ? AND state NOT IN ('delivered', 'cancelled')""",
-                (delivery_id,),
-            ).rowcount
-        return updated == 1
+        return delivery.cancel_delivery(self.connection, delivery_id)

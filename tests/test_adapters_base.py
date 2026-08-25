@@ -1,3 +1,4 @@
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -9,11 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
     Capability,
+    RuntimeAdapter,
     RuntimeHealth,
     RuntimeInfo,
 )
 from agent_run.adapters.registry import AdapterRegistry, load_adapter
-from agent_run.config import RuntimeConfig
+from agent_run.config import McpConfig, RuntimeConfig
 from agent_run.errors import ValidationError
 
 
@@ -27,7 +29,7 @@ class FakeAdapter:
     def validate(self, config):
         return None
 
-    def materialize(self, config, home):
+    def materialize(self, config, home, *, mcp_servers):
         return "hash"
 
     def probe(self, config, home):
@@ -39,10 +41,20 @@ class FakeAdapter:
     def limits(self, config, home):
         return ()
 
-    def prepare(self, request, profile, config, home, agent_dir):
+    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
         raise AssertionError("not called while loading")
 
     def launch(self, plan, sink):
+        raise AssertionError("not called while loading")
+
+
+class LegacyAdapter(FakeAdapter):
+    """Pre-T-028 shape: resolves MCP servers from ambient config instead."""
+
+    def materialize(self, config, home):
+        return "hash"
+
+    def prepare(self, request, profile, config, home, agent_dir):
         raise AssertionError("not called while loading")
 
 
@@ -82,6 +94,30 @@ class AdapterTests(unittest.TestCase):
                 return_value=module,
             ), self.assertRaisesRegex(ValidationError, message):
                 load_adapter("fake_module:ADAPTER")
+
+    def test_materialize_and_prepare_require_resolved_mcp_servers(self) -> None:
+        config = self.runtime()
+        home = Path("/tmp/fake-home")
+        servers = {"docs": McpConfig("stdio", Path("/bin/echo"))}
+        arguments = {
+            "materialize": (config, home),
+            "prepare": (object(), object(), config, home, home / "agent"),
+        }
+        for method, args in arguments.items():
+            with self.subTest(method=method):
+                contract = inspect.signature(getattr(RuntimeAdapter, method))
+                parameter = contract.parameters["mcp_servers"]
+                self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+                self.assertIs(parameter.default, inspect.Parameter.empty)
+                self.assertEqual(parameter.annotation, "Mapping[str, McpConfig]")
+                with self.assertRaises(TypeError):
+                    contract.bind(FakeAdapter(), *args)
+                contract.bind(FakeAdapter(), *args, mcp_servers=servers)
+                current = inspect.signature(getattr(FakeAdapter(), method))
+                current.bind(*args, mcp_servers=servers)
+                legacy = inspect.signature(getattr(LegacyAdapter(), method))
+                with self.assertRaises(TypeError):
+                    legacy.bind(*args, mcp_servers=servers)
 
     def test_registry_refuses_unknown_and_disabled_runtimes(self) -> None:
         registry = AdapterRegistry({"fake": self.runtime(enabled=False)})
