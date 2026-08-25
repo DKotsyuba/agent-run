@@ -440,7 +440,13 @@ class RuntimeSession(Protocol):
 class RuntimeAdapter(Protocol):
     def describe(self) -> RuntimeInfo: ...
     def validate(self, config: RuntimeConfig) -> None: ...
-    def materialize(self, config: RuntimeConfig, home: Path) -> str: ...
+    def materialize(
+        self,
+        config: RuntimeConfig,
+        home: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
+    ) -> str: ...
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth: ...
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]: ...
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]: ...
@@ -451,6 +457,8 @@ class RuntimeAdapter(Protocol):
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan: ...
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession: ...
 ```
@@ -462,6 +470,9 @@ Contract rules:
 - unsupported requested capabilities refuse before the public agent row is
   accepted;
 - `materialize` may write only inside the adapter's generated home;
+- `materialize` and `prepare` receive the resolved MCP servers as a required
+  keyword-only `mcp_servers` mapping; adapters never read ambient config to
+  resolve the names listed in `RuntimeConfig.mcp`;
 - `prepare` starts nothing and returns no live handles;
 - `launch` runs only inside the detached supervisor;
 - `RuntimeSession.cancel` performs engine-native interruption before the shared
@@ -678,9 +689,29 @@ deliveries, and capacity samples by lane/window/source/reset.
 
 Transaction rules:
 
+```python
+@dataclass(frozen=True, slots=True)
+class AgentCreation:
+    agent_id: AgentId
+    created: bool
+
+class StateStore:
+    def create_agent(
+        self,
+        request: StartRequest,
+        *,
+        task_summary: str,
+        config_revision: str,
+        agent_id: str | AgentId | None = None,
+        at: float | None = None,
+    ) -> AgentCreation: ...
+```
+
 - `BEGIN IMMEDIATE` for state transitions and outbox claims;
 - start inserts the agent and initial event before supervisor spawn;
-- a caller-supplied `request_id` makes a timed-out start idempotent;
+- a caller-supplied `request_id` is globally idempotent before binding; under
+  `BEGIN IMMEDIATE`, retries must match the serialized request, task summary,
+  and configuration revision exactly;
 - worker claims use conditional status/attempt updates;
 - the final artifact is flushed and hashed before terminal commit;
 - terminal commit updates the agent, appends the terminal event, and activates
@@ -863,10 +894,18 @@ class AgentService(Protocol):
     def list(self, query: AgentQuery) -> AgentPage: ...
     def transcript(self, agent_id: str, cursor: int = 0, limit: int = 200) -> TranscriptPage: ...
     def answer(self, agent_id: str) -> AnswerView: ...
-    def summary(self, orchestrator: OrchestratorRef | None = None) -> WorkSummary: ...
+    def summary(
+        self,
+        agent_id: str | None = None,
+        orchestrator: OrchestratorRef | None = None,
+    ) -> WorkSummary: ...
     def models(self) -> Mapping[str, tuple[ModelInfo, ...]]: ...
     def limits(self) -> CapacityReport: ...
 ```
+
+`summary` requires exactly one of `agent_id` or `orchestrator`. Trusted
+completion notices use `summary(agent_id)`; session-scoped views use the
+orchestrator reference.
 
 Minimum CLI:
 
