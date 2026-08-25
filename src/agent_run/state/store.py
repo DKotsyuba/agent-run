@@ -152,6 +152,16 @@ class StateStore:
                 )
         return session_id
 
+    def find_orchestrator_session(self, ref: OrchestratorRef) -> str | None:
+        if not isinstance(ref, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        row = self.connection.execute(
+            """SELECT id FROM orchestrator_sessions
+               WHERE transport = ? AND external_session_id = ?""",
+            (ref.transport, ref.external_session_id),
+        ).fetchone()
+        return None if row is None else str(row["id"])
+
     def record_context_receipt(
         self,
         orchestrator_session_id: str,
@@ -182,11 +192,14 @@ class StateStore:
         self,
         *,
         statuses: Iterable[AgentStatus] | None = None,
+        orchestrator_session_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, object]]:
         integer("limit", limit, minimum=1)
         integer("offset", offset, minimum=0)
+        if orchestrator_session_id is not None:
+            nonblank("orchestrator_session_id", orchestrator_session_id)
         params: list[object] = []
         where = ""
         if statuses is not None:
@@ -198,6 +211,10 @@ class StateStore:
                 return []
             where = f"WHERE status IN ({','.join('?' for _ in values)})"
             params.extend(values)
+        if orchestrator_session_id is not None:
+            where += " AND " if where else "WHERE "
+            where += "orchestrator_session_id = ?"
+            params.append(orchestrator_session_id)
         params.extend((limit, offset))
         rows = self.connection.execute(
             f"""SELECT * FROM agents {where}
