@@ -10,7 +10,11 @@ protocol so it can be tested with a fake transport.
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
@@ -82,10 +86,11 @@ def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, 
         )
 
 
-_STATUS_MAP: Mapping[str, AgentStatus] = {
+#: Only these turn statuses end a turn; ``inProgress`` is not a completion.
+_TERMINAL_STATUS: Mapping[str, AgentStatus] = {
     "completed": AgentStatus.SUCCEEDED,
+    "interrupted": AgentStatus.CANCELLED,
     "failed": AgentStatus.FAILED,
-    "cancelled": AgentStatus.CANCELLED,
 }
 
 
@@ -97,32 +102,64 @@ def _optional_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _normalize_message(event: Mapping[str, object]) -> Message:
+def _mapping(value: object) -> Mapping[str, object]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _item_time(value: object) -> object:
+    """Absent timestamps default to now; a present one is validated, not repaired."""
+
+    return time.time() if value is None else value
+
+
+def _normalize_message(item: Mapping[str, object]) -> Message:
     return Message(
-        at=float(event.get("at", 0.0)),
-        role=MessageRole(event.get("role")),
-        content=str(event.get("content", "")),
-        name=_optional_str(event.get("name")),
-        raw_ref=_optional_str(event.get("raw_ref")),
+        at=_item_time(item.get("at")),
+        role=MessageRole.ASSISTANT,
+        content=str(item.get("text", "")),
+        name=_optional_str(item.get("name")),
+        raw_ref=_optional_str(item.get("id")),
     )
 
 
-def _normalize_outcome(event: Mapping[str, object], thread_id: str) -> Outcome:
-    status = _STATUS_MAP.get(event.get("status"))
+def _assistant_messages(
+    turn: Mapping[str, object],
+) -> tuple[tuple[Message, ...], tuple[Mapping[str, object], ...]]:
+    """Split ``turn.items`` into normalized assistant messages and malformed items."""
+
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return (), ()
+    messages: list[Message] = []
+    malformed: list[Mapping[str, object]] = []
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("type") != "agentMessage":
+            continue
+        try:
+            messages.append(_normalize_message(item))
+        except (ValidationError, ValueError) as error:
+            malformed.append({"error": str(error), "raw": dict(item)})
+    return tuple(messages), tuple(malformed)
+
+
+def _normalize_outcome(turn: Mapping[str, object], thread_id: str) -> Outcome:
+    status_raw = turn.get("status")
+    status = _TERMINAL_STATUS.get(status_raw) if isinstance(status_raw, str) else None
     if status is None:
         raise VerificationError(
-            f"codex turn/completed reported an unknown status: {event.get('status')!r}"
+            f"codex turn/completed reported a nonterminal or unknown status: {status_raw!r}"
         )
-    answer_path = _optional_str(event.get("answer_path"))
+    error = _mapping(turn.get("error"))
+    answer_path = _optional_str(turn.get("answer_path"))
     return Outcome(
         status=status,
-        exit_code=_optional_int(event.get("exit_code")),
-        failure_kind=_optional_str(event.get("failure_kind")),
-        failure_text=_optional_str(event.get("failure_text")),
+        exit_code=_optional_int(turn.get("exit_code")),
+        failure_kind=_optional_str(error.get("kind") or error.get("code")),
+        failure_text=_optional_str(error.get("message")),
         runtime_session_id=thread_id,
         answer_path=Path(answer_path) if answer_path else None,
-        answer_bytes=_optional_int(event.get("answer_bytes")),
-        answer_sha256=_optional_str(event.get("answer_sha256")),
+        answer_bytes=_optional_int(turn.get("answer_bytes")),
+        answer_sha256=_optional_str(turn.get("answer_sha256")),
     )
 
 
@@ -134,6 +171,7 @@ class CodexAppServerSession:
         self._sink = sink
         self._thread_id = thread_id
         self._buffered_outcome: Outcome | None = None
+        self._pending_raw: list[Mapping[str, object]] = []
         self._closed = False
 
     @property
@@ -143,7 +181,7 @@ class CodexAppServerSession:
     def wait(self, timeout_seconds: float | None) -> Outcome | None:
         if self._buffered_outcome is not None:
             return self._pop_outcome()
-        event = self._transport.poll_event(timeout_seconds)
+        event = self._next_raw(timeout_seconds)
         if event is None:
             return None
         self._handle_event(event)
@@ -173,10 +211,24 @@ class CodexAppServerSession:
 
     def _drain_pending(self) -> None:
         while True:
-            event = self._transport.poll_event(0)
+            event = self._next_raw(0)
             if event is None:
                 return
             self._handle_event(event)
+
+    def _next_raw(self, timeout: float | None) -> Mapping[str, object] | None:
+        """Return the next raw envelope, keeping it retained until it is normalized."""
+
+        if self._pending_raw:
+            return self._pending_raw[0]
+        event = self._transport.poll_event(timeout)
+        if event is not None:
+            self._pending_raw.append(event)
+        return event
+
+    def _consume_raw(self) -> None:
+        if self._pending_raw:
+            self._pending_raw.pop(0)
 
     def _pop_outcome(self) -> Outcome:
         outcome = self._buffered_outcome
@@ -184,21 +236,37 @@ class CodexAppServerSession:
         return outcome
 
     def _handle_event(self, event: Mapping[str, object]) -> None:
-        kind = event.get("type")
-        if kind == "message":
-            try:
-                self._sink.message(_normalize_message(event))
-            except (ValidationError, ValueError) as error:
-                self._sink.event("malformed_message", {"error": str(error), "raw": dict(event)})
-        elif kind == "turn/completed":
-            self._buffered_outcome = _normalize_outcome(event, self._thread_id)
-        elif kind == "session":
-            thread_id = event.get("threadId")
-            if isinstance(thread_id, str) and thread_id:
-                self._sink.session(thread_id)
-        else:
-            data = {key: value for key, value in event.items() if key != "type"}
-            self._sink.event(str(kind), data)
+        """Interpret one JSON-RPC notification: ``{method, params}``.
+
+        The raw envelope stays retained until it has been normalized, so a
+        refused completion is not lost; once an outcome exists it is buffered
+        before any sink call, so a raising sink cannot drop it either.
+        """
+
+        method = event.get("method")
+        params = _mapping(event.get("params"))
+        if not isinstance(method, str) or not method:
+            self._consume_raw()
+            self._sink.event("malformed_event", {"raw": dict(event)})
+            return
+        if method != "turn/completed":
+            self._consume_raw()
+            self._sink.event(method, dict(params))
+            return
+        thread_id = params.get("threadId")
+        if isinstance(thread_id, str) and thread_id and thread_id != self._thread_id:
+            self._consume_raw()
+            self._sink.event(method, dict(params))
+            return
+        turn = _mapping(params.get("turn"))
+        outcome = _normalize_outcome(turn, self._thread_id)
+        messages, malformed = _assistant_messages(turn)
+        self._consume_raw()
+        self._buffered_outcome = outcome
+        for message in messages:
+            self._sink.message(message)
+        for record in malformed:
+            self._sink.event("malformed_message", dict(record))
 
 
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:
@@ -239,6 +307,9 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     return CodexAppServerSession(transport, sink, thread_id)
 
 
+_STREAM_CLOSED = object()
+
+
 class ProcessTransport:
     """Real ``codex app-server`` subprocess speaking newline-delimited JSON-RPC."""
 
@@ -253,11 +324,52 @@ class ProcessTransport:
             start_new_session=True,
         )
         self._next_id = 1
-        self._buffer: list[Mapping[str, object]] = []
+        self._incoming: queue.Queue = queue.Queue()
+        self._notifications: deque = deque()
+        self._reader = threading.Thread(
+            target=self._read_stream, name="codex-app-server-reader", daemon=True
+        )
+        self._reader.start()
 
     @property
     def pid(self) -> int | None:
         return self._process.pid
+
+    def _read_stream(self) -> None:
+        """Drain stdout on a daemon thread so no caller ever blocks on readline."""
+
+        stream = self._process.stdout
+        try:
+            if stream is not None:
+                for line in iter(stream.readline, b""):
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        message = json.loads(text)
+                    except ValueError:
+                        continue
+                    if isinstance(message, dict):
+                        self._incoming.put(message)
+        finally:
+            self._incoming.put(_STREAM_CLOSED)
+
+    def _take(self, timeout: float | None) -> Mapping[str, object] | None:
+        """Pull one parsed message; ``None`` on timeout or end of stream."""
+
+        try:
+            if timeout is None:
+                message = self._incoming.get()
+            elif timeout <= 0:
+                message = self._incoming.get_nowait()
+            else:
+                message = self._incoming.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if message is _STREAM_CLOSED:
+            self._incoming.put(_STREAM_CLOSED)
+            return None
+        return message
 
     def request(self, method: str, params: Mapping[str, object]) -> Mapping[str, object]:
         request_id = self._next_id
@@ -265,28 +377,40 @@ class ProcessTransport:
         payload = json.dumps(
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)}
         ).encode("utf-8")
-        assert self._process.stdin is not None and self._process.stdout is not None
-        self._process.stdin.write(payload + b"\n")
-        self._process.stdin.flush()
+        if self._process.stdin is None:
+            raise ConnectionError(f"codex app-server has no stdin for {method}")
+        try:
+            self._process.stdin.write(payload + b"\n")
+            self._process.stdin.flush()
+        except (OSError, ValueError) as error:
+            raise ConnectionError(f"codex app-server stdin is closed for {method}") from error
         while True:
-            line = self._process.stdout.readline()
-            if not line:
-                raise ConnectionError(f"codex app-server closed the stream while waiting for {method}")
-            message = json.loads(line)
+            message = self._take(None)
+            if message is None:
+                raise ConnectionError(
+                    f"codex app-server closed the stream while waiting for {method}"
+                )
             if message.get("id") == request_id:
                 if "error" in message:
                     raise ValidationError(f"codex app-server rejected {method}: {message['error']}")
-                return message.get("result", {})
-            self._buffer.append(message)
+                result = message.get("result", {})
+                return result if isinstance(result, Mapping) else {}
+            if isinstance(message.get("method"), str):
+                self._notifications.append(message)
 
     def poll_event(self, timeout: float | None) -> Mapping[str, object] | None:
-        if self._buffer:
-            return self._buffer.pop(0)
-        assert self._process.stdout is not None
-        line = self._process.stdout.readline()
-        if not line:
-            return None
-        return json.loads(line)
+        if self._notifications:
+            return self._notifications.popleft()
+        deadline = None if timeout is None else time.monotonic() + max(float(timeout), 0.0)
+        while True:
+            remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            message = self._take(remaining)
+            if message is None:
+                return None
+            if isinstance(message.get("method"), str):
+                return message
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
 
     def terminate(self, grace_seconds: float) -> None:
         self._process.terminate()
@@ -295,7 +419,20 @@ class ProcessTransport:
         except subprocess.TimeoutExpired:
             self._process.kill()
             self._process.wait(timeout=max(grace_seconds, 1))
+        finally:
+            # The reader owns stdout, so the pipes can only be released once it
+            # has seen end of stream.
+            self._reader.join(timeout=1)
+            self._close_pipes()
 
     def close(self) -> None:
         if self._process.stdin:
             self._process.stdin.close()
+
+    def _close_pipes(self) -> None:
+        for pipe in (self._process.stdin, self._process.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass

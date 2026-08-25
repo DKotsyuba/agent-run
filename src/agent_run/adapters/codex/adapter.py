@@ -10,6 +10,7 @@ allowlist and marks missing/stale evidence ``unknown``.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -17,11 +18,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from ...config import RuntimeConfig, load_config
+from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
-from ...errors import ValidationError
-from ...paths import agent_run_home, config_path
-from ...profiles import AgentProfile
+from ...errors import PathEscapeError, ValidationError
+from ...paths import agent_run_home
+from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -55,11 +56,90 @@ def _toml_array(values) -> str:
 
 
 def _read_json(path: Path) -> object | None:
+    """Read one isolated cache file; unreadable, non-UTF-8 or invalid JSON is no evidence."""
+
     try:
         with path.open("r", encoding="utf-8") as stream:
             return json.load(stream)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError covers both json.JSONDecodeError and UnicodeDecodeError.
         return None
+
+
+def _timestamp(value: object) -> datetime | None:
+    """Convert a cached epoch second to UTC; anything unrepresentable is unknown."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _resolved_directory(value: object, label: str) -> Path:
+    try:
+        resolved = Path(value).expanduser().resolve(strict=True)
+    except (TypeError, OSError, RuntimeError) as error:
+        raise ValidationError(f"{label} must be an existing directory: {value}") from error
+    if not resolved.is_dir():
+        raise ValidationError(f"{label} must be an existing directory: {value}")
+    return resolved
+
+
+def _prune_skills(home: Path, selected: frozenset[str]) -> None:
+    """Drop adapter-owned skill directories that are no longer selected.
+
+    Only direct children below ``skills/`` that carry a managed ``SKILL.md``
+    are touched, so runtime-owned state below the generated home survives.
+    """
+
+    skills_root = home / "skills"
+    if skills_root.is_symlink():
+        raise PathEscapeError(f"codex skills root must not be a symlink: {skills_root}")
+    if not skills_root.is_dir():
+        return
+    for child in sorted(skills_root.iterdir()):
+        if child.name in selected or child.is_symlink() or not child.is_dir():
+            continue
+        managed = child / "SKILL.md"
+        if managed.is_symlink() or not managed.is_file():
+            continue
+        managed.unlink()
+        try:
+            child.rmdir()
+        except OSError:
+            # The runtime kept unrelated files below this skill; leave them.
+            pass
+
+
+def _bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
+    """The bridge is authenticated only if it canonically resolves to the configured source."""
+
+    if source is None or not bridge.is_symlink():
+        return False
+    try:
+        return bridge.resolve(strict=True) == Path(source).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _require_resolved_mcp(
+    config: RuntimeConfig, mcp_servers: Mapping[str, McpConfig], where: str
+) -> None:
+    """Every selected MCP must come from the caller-resolved mapping, not ambient config."""
+
+    if not isinstance(mcp_servers, Mapping):
+        raise ValidationError(f"codex {where} requires a resolved mcp_servers mapping")
+    for name in config.mcp:
+        try:
+            definition = mcp_servers[name]
+        except (KeyError, TypeError) as error:
+            raise ValidationError(f"codex mcp reference is not configured: {name}") from error
+        if not isinstance(definition, McpConfig):
+            raise ValidationError(f"codex mcp reference is not resolved: {name}")
 
 
 class CodexAdapter:
@@ -93,10 +173,16 @@ class CodexAdapter:
         if not config.models:
             raise ValidationError("codex runtime requires at least one configured model")
 
-    def materialize(self, config: RuntimeConfig, home: Path) -> str:
+    def materialize(
+        self,
+        config: RuntimeConfig,
+        home: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
+    ) -> str:
         self.validate(config)
-        agent_run_root = agent_run_home()
-        skills_root = agent_run_root / "skills" / "codex"
+        _require_resolved_mcp(config, mcp_servers, "materialize")
+        skills_root = agent_run_home() / "skills" / "codex"
         skill_hashes: dict[str, str] = {}
         for name in config.skills:
             source = skills_root / name / "SKILL.md"
@@ -105,17 +191,11 @@ class CodexAdapter:
             except OSError as error:
                 raise ValidationError(f"codex skill is not available: {name}: {error}") from error
             skill_hashes[name] = write_managed_file(home, f"skills/{name}/SKILL.md", text)
-
-        mcp_defs: Mapping[str, object] = {}
-        if config.mcp:
-            mcp_defs = load_config(config_path(agent_run_root)).mcp
+        _prune_skills(Path(home), frozenset(config.skills))
 
         mcp_lines: list[str] = []
         for name in sorted(config.mcp):
-            try:
-                mcp_def = mcp_defs[name]
-            except KeyError as error:
-                raise ValidationError(f"codex mcp reference is not configured: {name}") from error
+            mcp_def = mcp_servers[name]
             mcp_lines.append(f"[mcp_servers.{name}]")
             mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
             mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
@@ -167,8 +247,7 @@ class CodexAdapter:
         home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
         auth_ok = None
         if config.auth is not None and config.auth.kind == "file_link":
-            bridge = home_path / config.auth.target
-            auth_ok = bridge.is_symlink() and bridge.exists()
+            auth_ok = _bridge_points_at_source(home_path / config.auth.target, config.auth.source)
         cache = _read_json(home_path / _MODEL_CACHE_REL)
         version = cache.get("codex_version") if isinstance(cache, dict) else None
         available = bool(binary_ok and home_ok and (auth_ok is not False))
@@ -178,14 +257,17 @@ class CodexAdapter:
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
         cache = _read_json(Path(home) / _MODEL_CACHE_REL)
         entries = cache.get("models") if isinstance(cache, dict) else None
+        if not isinstance(entries, list):
+            return ()
         by_id: dict[str, dict] = {}
-        if isinstance(entries, list):
-            for item in entries:
-                if isinstance(item, dict) and isinstance(item.get("id"), str):
-                    by_id[item["id"]] = item
+        for item in entries:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                by_id[item["id"]] = item
         result = []
         for model_id in config.models:
-            item = by_id.get(model_id, {})
+            item = by_id.get(model_id)
+            if item is None:
+                continue
             description = item.get("description")
             efforts_raw = item.get("efforts")
             efforts = (
@@ -210,20 +292,17 @@ class CodexAdapter:
             if not isinstance(lane, str) or not isinstance(window, str):
                 continue
             observed_raw = item.get("observed_at")
-            observed_at = None
-            stale = True
-            if isinstance(observed_raw, (int, float)) and not isinstance(observed_raw, bool):
-                observed_at = datetime.fromtimestamp(observed_raw, tz=timezone.utc)
-                stale = (now - observed_raw) > _LIMITS_STALE_SECONDS
+            observed_at = _timestamp(observed_raw)
+            stale = observed_at is None or (now - float(observed_raw)) > _LIMITS_STALE_SECONDS
             remaining = item.get("remaining_percent")
-            if stale or not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+            if (
+                stale
+                or isinstance(remaining, bool)
+                or not isinstance(remaining, (int, float))
+                or not math.isfinite(remaining)
+            ):
                 remaining = None
-            reset_raw = item.get("reset_at")
-            reset_at = (
-                datetime.fromtimestamp(reset_raw, tz=timezone.utc)
-                if isinstance(reset_raw, (int, float)) and not isinstance(reset_raw, bool)
-                else None
-            )
+            reset_at = _timestamp(item.get("reset_at"))
             valid_for = item.get("valid_for_seconds")
             result.append(
                 LimitSample(
@@ -246,12 +325,15 @@ class CodexAdapter:
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
+        *,
+        mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan:
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
         if not isinstance(profile, AgentProfile):
             raise ValidationError("prepare requires an AgentProfile")
         self.validate(config)
+        _require_resolved_mcp(config, mcp_servers, "prepare")
         if request.runtime != "codex":
             raise ValidationError(f"codex adapter cannot prepare runtime {request.runtime!r}")
         if request.model not in config.models:
@@ -259,16 +341,20 @@ class CodexAdapter:
         if request.output_schema is not None:
             raise ValidationError("codex runtime does not support output_schema")
 
-        available = {info.id: info for info in self.models(config, home)}
-        if request.effort is not None:
-            efforts = available.get(request.model, ModelInfo(request.model, "")).efforts
-            if efforts and request.effort not in efforts:
-                raise ValidationError(
-                    f"effort {request.effort!r} is not offered for model {request.model!r}"
-                )
+        discovered = {info.id: info for info in self.models(config, home)}
+        model = discovered.get(request.model)
+        if model is None:
+            raise ValidationError(
+                f"model is not discovered in the codex roster cache: {request.model}"
+            )
+        if request.effort is not None and request.effort not in model.efforts:
+            raise ValidationError(
+                f"effort {request.effort!r} is not offered for model {request.model!r}"
+            )
         if request.write and not profile.write:
             raise ValidationError("profile does not grant write access for this request")
-        if not profile.write and not profile.read_roots:
+        effective_write = bool(request.write and profile.write)
+        if not profile.write and not profile.read_roots and not request.read_roots:
             raise ValidationError(
                 "codex refuses a no-filesystem profile: grant write or at least one read root"
             )
@@ -276,10 +362,17 @@ class CodexAdapter:
         if not (home_path / _CONFIG_REL).is_file():
             raise ValidationError(f"codex home is not materialized: {home_path}")
 
-        cwd = str(request.workdir)
-        roots = (cwd, *(str(root) for root in profile.read_roots))
-        writable_roots = (cwd,) if profile.write else ()
-        sandbox_mode = "workspace-write" if profile.write else "read-only"
+        workdir = _resolved_directory(request.workdir, "workdir")
+        roots = tuple(
+            str(root)
+            for root in normalize_read_roots(
+                (workdir, *profile.read_roots, *request.read_roots)
+            )
+        )
+        # The writable grant never widens beyond the workdir, even when a read
+        # root above it swallowed the workdir in the normalized antichain.
+        writable_roots = (str(workdir),) if effective_write else ()
+        sandbox_mode = "workspace-write" if effective_write else "read-only"
 
         environment = {
             "CODEX_HOME": str(home_path),
@@ -298,7 +391,7 @@ class CodexAdapter:
         }
         return LaunchPlan(
             argv=(str(config.binary), "app-server"),
-            cwd=request.workdir,
+            cwd=workdir,
             environment=MappingProxyType(environment),
             initial_input=request.task,
             runtime_stream_path=Path(agent_dir) / "runtime.jsonl",

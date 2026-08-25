@@ -1,4 +1,7 @@
+import os
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -7,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import LaunchPlan
 from agent_run.adapters.codex.app_server import (
     EffectiveTurnParams,
+    ProcessTransport,
     SteerRejected,
     VerificationError,
     start_session,
@@ -171,8 +175,31 @@ class StartSessionTests(unittest.TestCase):
         self.assertNotIn("turn/start", methods)
 
 
+def notification(method, params=None):
+    """A real JSON-RPC server notification envelope."""
+
+    return {"jsonrpc": "2.0", "method": method, "params": dict(params or {})}
+
+
+def completed(status="completed", items=None, thread_id="th_1", **turn):
+    turn = {"status": status, "items": list(items or []), **turn}
+    return notification("turn/completed", {"threadId": thread_id, "turn": turn})
+
+
+class RaisingSink(FakeSink):
+    def __init__(self, failures=1):
+        super().__init__()
+        self.failures = failures
+
+    def message(self, message):
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("sink is down")
+        super().message(message)
+
+
 class CodexAppServerSessionTests(unittest.TestCase):
-    def start(self, events=()):
+    def start(self, events=(), sink=None):
         cwd = Path("/work")
         plan = make_plan(
             cwd,
@@ -189,33 +216,92 @@ class CodexAppServerSessionTests(unittest.TestCase):
             responses={"initialize": [{}], "thread/start": [thread_response(cwd)], "turn/start": [{}]},
             events=list(events),
         )
-        sink = FakeSink()
+        sink = FakeSink() if sink is None else sink
         session = start_session(transport, plan, sink)
         return session, transport, sink
 
-    def test_wait_normalizes_messages_then_returns_the_terminal_outcome(self) -> None:
+    def test_wait_normalizes_assistant_items_then_returns_the_terminal_outcome(self) -> None:
         session, _transport, sink = self.start(
             events=[
-                {"type": "message", "role": "assistant", "content": "hi", "at": 1.0},
-                {"type": "turn/completed", "status": "completed", "exit_code": 0},
+                notification("turn/started", {"threadId": "th_1"}),
+                completed(
+                    items=[
+                        {"type": "reasoning", "text": "thinking"},
+                        {"type": "agentMessage", "text": "hi", "at": 1.0, "id": "item_1"},
+                    ],
+                    exit_code=0,
+                ),
             ]
         )
         self.assertIsNone(session.wait(0))
-        self.assertEqual(len(sink.messages), 1)
-        self.assertEqual(sink.messages[0].role, MessageRole.ASSISTANT)
-        self.assertEqual(sink.messages[0].content, "hi")
+        self.assertEqual(sink.events, [("turn/started", {"threadId": "th_1"})])
 
         outcome = session.wait(0)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
         self.assertEqual(outcome.runtime_session_id, "th_1")
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(len(sink.messages), 1)
+        self.assertEqual(sink.messages[0].role, MessageRole.ASSISTANT)
+        self.assertEqual(sink.messages[0].content, "hi")
+        self.assertEqual(sink.messages[0].raw_ref, "item_1")
 
         self.assertIsNone(session.wait(0))
 
-    def test_steer_buffers_an_already_pending_completion_until_ack(self) -> None:
-        session, transport, _sink = self.start(
-            events=[{"type": "turn/completed", "status": "completed", "exit_code": 0}]
+    def test_terminal_statuses_map_to_domain_outcomes(self) -> None:
+        for status, expected in (
+            ("completed", AgentStatus.SUCCEEDED),
+            ("interrupted", AgentStatus.CANCELLED),
+            ("failed", AgentStatus.FAILED),
+        ):
+            with self.subTest(status=status):
+                session, _transport, _sink = self.start(
+                    events=[completed(status=status, error={"kind": "oom", "message": "boom"})]
+                )
+                outcome = session.wait(0)
+                self.assertEqual(outcome.status, expected)
+                if status == "failed":
+                    self.assertEqual(outcome.failure_kind, "oom")
+                    self.assertEqual(outcome.failure_text, "boom")
+
+    def test_in_progress_completion_is_refused_and_the_raw_event_is_retained(self) -> None:
+        session, transport, _sink = self.start(events=[completed(status="inProgress")])
+        with self.assertRaisesRegex(VerificationError, "nonterminal or unknown status"):
+            session.wait(0)
+        self.assertEqual(transport._events, [])  # the transport already handed it over
+        with self.assertRaisesRegex(VerificationError, "nonterminal or unknown status"):
+            session.wait(0)  # still retained, not silently dropped
+
+    def test_unknown_status_is_refused(self) -> None:
+        session, _transport, _sink = self.start(events=[completed(status="exploded")])
+        with self.assertRaisesRegex(VerificationError, "nonterminal or unknown status"):
+            session.wait(0)
+
+    def test_outcome_survives_a_raising_sink(self) -> None:
+        session, _transport, sink = self.start(
+            events=[completed(items=[{"type": "agentMessage", "text": "hi"}])],
+            sink=RaisingSink(),
         )
+        with self.assertRaisesRegex(RuntimeError, "sink is down"):
+            session.wait(0)
+        outcome = session.wait(0)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(sink.messages, [])
+
+    def test_completion_for_another_thread_is_forwarded_not_consumed(self) -> None:
+        session, _transport, sink = self.start(events=[completed(thread_id="th_other")])
+        self.assertIsNone(session.wait(0))
+        self.assertEqual(sink.events[0][0], "turn/completed")
+        self.assertEqual(sink.events[0][1]["threadId"], "th_other")
+
+    def test_envelope_without_a_method_is_reported_not_dropped(self) -> None:
+        session, _transport, sink = self.start(events=[{"jsonrpc": "2.0", "result": {}}])
+        self.assertIsNone(session.wait(0))
+        self.assertEqual(sink.events[0][0], "malformed_event")
+
+    def test_steer_buffers_an_already_pending_completion_until_ack(self) -> None:
+        session, transport, _sink = self.start(events=[completed(exit_code=0)])
         transport._responses["turn/steer"] = [{"accepted": True}]
 
         session.steer("please wrap up")
@@ -227,9 +313,7 @@ class CodexAppServerSessionTests(unittest.TestCase):
         self.assertIn("turn/steer", methods)
 
     def test_steer_rejection_raises_and_keeps_buffered_completion(self) -> None:
-        session, transport, _sink = self.start(
-            events=[{"type": "turn/completed", "status": "completed", "exit_code": 0}]
-        )
+        session, transport, _sink = self.start(events=[completed(exit_code=0)])
         transport._responses["turn/steer"] = [{"accepted": False, "reason": "turn already finished"}]
 
         with self.assertRaisesRegex(SteerRejected, "turn already finished"):
@@ -251,18 +335,100 @@ class CodexAppServerSessionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             session.cancel(-1)
 
-    def test_malformed_message_is_routed_to_sink_event_instead_of_raising(self) -> None:
+    def test_malformed_assistant_item_is_reported_without_losing_the_outcome(self) -> None:
         session, _transport, sink = self.start(
-            events=[{"type": "message", "role": "not-a-role", "content": "hi", "at": 1.0}]
+            events=[
+                completed(
+                    items=[
+                        {"type": "agentMessage", "text": "fine"},
+                        {"type": "agentMessage", "text": "bad", "at": -1},
+                    ]
+                )
+            ]
         )
-        self.assertIsNone(session.wait(0))
-        self.assertEqual(sink.messages, [])
+        outcome = session.wait(0)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual([message.content for message in sink.messages], ["fine"])
         self.assertEqual(sink.events[0][0], "malformed_message")
 
-    def test_unknown_event_kind_is_forwarded_verbatim(self) -> None:
-        session, _transport, sink = self.start(events=[{"type": "log", "text": "hello"}])
+    def test_unknown_method_forwards_its_params(self) -> None:
+        session, _transport, sink = self.start(
+            events=[notification("item/completed", {"item": {"type": "commandExecution"}})]
+        )
         self.assertIsNone(session.wait(0))
-        self.assertEqual(sink.events, [("log", {"text": "hello"})])
+        self.assertEqual(
+            sink.events, [("item/completed", {"item": {"type": "commandExecution"}})]
+        )
+
+
+def transport_plan(script, tmpdir):
+    return LaunchPlan(
+        argv=(sys.executable, "-c", script),
+        cwd=Path(tmpdir),
+        environment={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        initial_input=None,
+        runtime_stream_path=Path(tmpdir) / "runtime.jsonl",
+        adapter_state={},
+    )
+
+
+_SERVER = """
+import json, sys
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\\n")
+    sys.stdout.flush()
+send({"jsonrpc": "2.0", "method": "turn/started", "params": {"n": 1}})
+line = sys.stdin.readline()
+request = json.loads(line)
+send({"jsonrpc": "2.0", "method": "turn/log", "params": {"n": 2}})
+send({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}})
+sys.stdin.readline()
+"""
+
+_SILENT_SERVER = """
+import sys
+sys.stdin.readline()
+"""
+
+
+class ProcessTransportTests(unittest.TestCase):
+    def transport(self, script):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        transport = ProcessTransport(transport_plan(script, directory.name))
+        self.addCleanup(transport.terminate, 5)
+        return transport
+
+    def test_request_returns_its_response_and_buffers_interleaved_notifications(self) -> None:
+        transport = self.transport(_SERVER)
+        result = transport.request("initialize", {"clientInfo": {"name": "agent-run"}})
+        self.assertEqual(result, {"ok": True})
+
+        first = transport.poll_event(2)
+        second = transport.poll_event(2)
+        self.assertEqual(first["method"], "turn/started")
+        self.assertEqual(second["method"], "turn/log")
+
+    def test_zero_timeout_never_blocks_and_finite_timeout_is_honored(self) -> None:
+        transport = self.transport(_SILENT_SERVER)
+        started = time.monotonic()
+        self.assertIsNone(transport.poll_event(0))
+        self.assertLess(time.monotonic() - started, 0.5)
+
+        started = time.monotonic()
+        self.assertIsNone(transport.poll_event(0.25))
+        waited = time.monotonic() - started
+        self.assertGreaterEqual(waited, 0.2)
+        self.assertLess(waited, 5)
+
+    def test_end_of_stream_yields_none_and_stays_closed(self) -> None:
+        transport = self.transport(_SILENT_SERVER)
+        transport.close()
+        transport._process.wait(timeout=5)
+        self.assertIsNone(transport.poll_event(2))
+        self.assertIsNone(transport.poll_event(2))
+        with self.assertRaises(ConnectionError):
+            transport.request("initialize", {})
 
 
 if __name__ == "__main__":
