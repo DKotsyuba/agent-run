@@ -92,6 +92,8 @@ class StateOutboxTests(unittest.TestCase):
 
     def test_reconciliation_requires_supplied_proof_before_persisting_lost(self) -> None:
         agent_id = self.create()
+        with self.assertRaises(ValidationError):
+            self.store.reconcile(agent_id, verdict="dead")
         self.store.record_supervisor(
             agent_id, pid=100, identity="pid100:start1", process_group_id=100, at=2
         )
@@ -99,14 +101,28 @@ class StateOutboxTests(unittest.TestCase):
             self.store.record_supervisor(
                 agent_id, pid=100, identity="pid100:start2", process_group_id=100, at=2
             )
-        self.assertFalse(self.store.reconcile(agent_id, verdict="unknown", at=3))
-        self.assertFalse(self.store.reconcile(agent_id, verdict="alive", at=3))
+        proof = {
+            "supervisor_pid": 100,
+            "process_group_id": 100,
+            "expected_identity": "pid100:start1",
+            "alive": True,
+            "checked_at": 3,
+        }
+        self.assertFalse(self.store.reconcile(agent_id, verdict="alive", **proof))
+        with self.assertRaises(ValidationError):
+            self.store.reconcile(agent_id, verdict="dead", **proof)
+        with self.assertRaises(ValidationError):
+            self.store.reconcile(agent_id, verdict="alive", **(proof | {"checked_at": 1}))
+        with self.assertRaises(ValidationError):
+            self.store.reconcile(
+                agent_id, verdict="alive", **(proof | {"supervisor_pid": 101})
+            )
         with self.assertRaises(ValidationError):
             self.store.reconcile(
                 agent_id,
                 verdict="identity_mismatch",
                 observed_identity="pid100:start1",
-                at=3,
+                **proof,
             )
         self.assertEqual(self.store.get_agent(agent_id)["status"], "created")
         self.assertTrue(
@@ -115,7 +131,7 @@ class StateOutboxTests(unittest.TestCase):
                 verdict="identity_mismatch",
                 observed_identity="pid100:start2",
                 reason="PID reused",
-                at=4,
+                **proof,
             )
         )
         self.assertEqual(self.store.get_agent(agent_id)["status"], "lost")
@@ -124,6 +140,22 @@ class StateOutboxTests(unittest.TestCase):
                 "SELECT state FROM deliveries WHERE agent_id = ?", (agent_id,)
             ).fetchone()[0],
             "waiting_binding",
+        )
+
+        dead_agent = self.create()
+        self.store.record_supervisor(
+            dead_agent, pid=200, identity="pid200:start1", process_group_id=200, at=4
+        )
+        self.assertTrue(
+            self.store.reconcile(
+                dead_agent,
+                verdict="dead",
+                supervisor_pid=200,
+                process_group_id=200,
+                expected_identity="pid200:start1",
+                alive=False,
+                checked_at=5,
+            )
         )
 
     def test_capacity_samples_return_only_recent_matching_rows(self) -> None:

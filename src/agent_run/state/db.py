@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
+import os
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
 from typing import Iterator
 
 from agent_run.domain import AgentId, OrchestratorRef, StartRequest
@@ -16,6 +19,7 @@ from agent_run.errors import ValidationError
 
 
 SCHEMA_VERSION = 1
+MAX_INLINE_MESSAGE_BYTES = 32 * 1024
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _TABLES = frozenset(
     {
@@ -65,6 +69,24 @@ def positive_number(name: str, value: float) -> float:
     return float(value)
 
 
+def validate_message_storage(content: str, raw_ref: str | None) -> None:
+    if len(content.encode("utf-8")) > MAX_INLINE_MESSAGE_BYTES:
+        raise ValidationError("message content exceeds the 32 KiB inline limit")
+    if raw_ref is None:
+        return
+    if not isinstance(raw_ref, str) or not raw_ref or "\\" in raw_ref:
+        raise ValidationError("raw_ref must be a normalized relative path")
+    path = PurePosixPath(raw_ref)
+    if (
+        path.is_absolute()
+        or raw_ref != path.as_posix()
+        or path.as_posix() == "."
+        or ".." in path.parts
+        or path.parts[0].startswith("~")
+    ):
+        raise ValidationError("raw_ref must be a normalized relative path")
+
+
 def json_text(value: object) -> str:
     try:
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -109,6 +131,58 @@ def agent_row(
     if row is None:
         raise ValidationError(f"unknown agent: {agent_id}")
     return row
+
+
+def checked_supervisor_proof(
+    agent: sqlite3.Row,
+    *,
+    verdict: str,
+    supervisor_pid: int | None,
+    process_group_id: int | None,
+    expected_identity: str | None,
+    alive: bool | None,
+    checked_at: float | None,
+    observed_identity: str | None,
+) -> tuple[float, str | None]:
+    stored = (
+        agent["supervisor_pid"],
+        agent["process_group_id"],
+        agent["supervisor_identity"],
+    )
+    if any(value is None for value in stored) or agent["heartbeat_at"] is None:
+        raise ValidationError("agent has no complete stored supervisor identity")
+    if supervisor_pid is None or process_group_id is None or expected_identity is None:
+        raise ValidationError("reconciliation proof is incomplete")
+    supplied = (
+        integer("supervisor_pid", supervisor_pid, minimum=1),
+        integer("process_group_id", process_group_id, minimum=1),
+        nonblank("expected_identity", expected_identity),
+    )
+    if supplied != stored:
+        raise ValidationError("reconciliation proof does not match stored supervisor")
+    if not isinstance(alive, bool):
+        raise ValidationError("reconciliation proof must include liveness")
+    if checked_at is None:
+        raise ValidationError("reconciliation proof must include checked_at")
+    checked = timestamp(checked_at)
+    if checked < agent["heartbeat_at"]:
+        raise ValidationError("reconciliation proof predates the last heartbeat")
+    if verdict == "alive":
+        if alive is not True:
+            raise ValidationError("alive verdict requires a live supervisor proof")
+        return checked, None
+    if verdict == "dead":
+        if alive is not False:
+            raise ValidationError("dead verdict requires a not-alive proof")
+        return checked, "supervisor_dead"
+    if (
+        alive is not True
+        or not isinstance(observed_identity, str)
+        or not observed_identity.strip()
+        or observed_identity == expected_identity
+    ):
+        raise ValidationError("identity mismatch requires differing live identities")
+    return checked, "supervisor_identity_mismatch"
 
 
 def idempotent_agent(
@@ -408,6 +482,40 @@ def _tables(connection: sqlite3.Connection) -> frozenset[str]:
     return frozenset(row[0] for row in rows)
 
 
+def _table_shape(
+    connection: sqlite3.Connection, table: str
+) -> tuple[tuple[str, str, int, int], ...]:
+    return tuple(
+        (str(row["name"]), str(row["type"]).upper(), int(row["notnull"]), int(row["pk"]))
+        for row in connection.execute(f'PRAGMA table_info("{table}")')
+    )
+
+
+@lru_cache(maxsize=1)
+def _expected_shapes() -> dict[str, tuple[tuple[str, str, int, int], ...]]:
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    try:
+        reference.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        return {table: _table_shape(reference, table) for table in _TABLES}
+    finally:
+        reference.close()
+
+
+@lru_cache(maxsize=1)
+def _schema_statements() -> tuple[str, ...]:
+    statements: list[str] = []
+    pending = ""
+    for line in _SCHEMA_PATH.read_text(encoding="utf-8").splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statements.append(pending)
+            pending = ""
+    if pending.strip():
+        raise ValidationError("schema.sql contains an incomplete statement")
+    return tuple(statements)
+
+
 def _validate_schema(connection: sqlite3.Connection) -> None:
     version = _version(connection)
     tables = _tables(connection)
@@ -416,6 +524,27 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
             f"unsupported or incomplete state schema: version {version}; "
             f"expected {SCHEMA_VERSION}"
         )
+    expected = _expected_shapes()
+    if any(_table_shape(connection, table) != expected[table] for table in _TABLES):
+        raise ValidationError("state schema columns or primary keys do not match schema v1")
+
+
+def _initialize_v1(connection: sqlite3.Connection) -> None:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        version = _version(connection)
+        tables = _tables(connection)
+        if version == 0 and not tables:
+            for statement in _schema_statements():
+                connection.execute(statement)
+        else:
+            _validate_schema(connection)
+        _validate_schema(connection)
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
 
 
 def _configure(connection: sqlite3.Connection) -> None:
@@ -433,28 +562,37 @@ def _private_path(path: Path, *, parent_created: bool) -> None:
     path.chmod(0o600)
 
 
+@contextmanager
+def _initialization_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f".{path.name}.init.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def initialize_database(database: str | Path) -> sqlite3.Connection:
     """Create schema v1 or open an already-valid v1 database."""
 
     path = Path(database).expanduser().resolve()
     parent_created = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if parent_created:
+        path.parent.chmod(0o700)
     existed = path.exists()
     connection = _raw_connect(path)
     try:
         version = _version(connection)
         tables = _tables(connection)
-        if version == 0 and not tables:
-            script = _SCHEMA_PATH.read_text(encoding="utf-8")
-            try:
-                connection.executescript(f"BEGIN IMMEDIATE;\n{script}\nCOMMIT;")
-            except BaseException:
-                connection.rollback()
-                raise
-        else:
+        if version != 0 or tables:
             _validate_schema(connection)
-        _validate_schema(connection)
-        _configure(connection)
+        with _initialization_lock(path):
+            _initialize_v1(connection)
+            _configure(connection)
         _private_path(path, parent_created=parent_created)
         return connection
     except BaseException:

@@ -3,7 +3,9 @@ import stat
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -66,6 +68,48 @@ class StateDatabaseTests(unittest.TestCase):
             connection.close()
             with self.assertRaises(ValidationError):
                 open_database(database)
+
+    def test_open_refuses_v1_tables_with_corrupt_column_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "corrupt.db"
+            connection = sqlite3.connect(database)
+            for table in (
+                "orchestrator_sessions",
+                "agents",
+                "attempts",
+                "events",
+                "messages",
+                "commands",
+                "deliveries",
+                "capacity_samples",
+                "context_receipts",
+            ):
+                connection.execute(f'CREATE TABLE "{table}" (wrong BLOB PRIMARY KEY)')
+            connection.execute("PRAGMA user_version=1")
+            connection.close()
+
+            with self.assertRaisesRegex(ValidationError, "columns or primary keys"):
+                open_database(database)
+
+    def test_concurrent_first_initializers_share_one_atomic_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "private" / "state.db"
+            callers = 8
+            barrier = Barrier(callers)
+
+            def initialize_once(_: int) -> int:
+                barrier.wait()
+                connection = initialize_database(database)
+                try:
+                    return connection.execute("PRAGMA user_version").fetchone()[0]
+                finally:
+                    connection.close()
+
+            with ThreadPoolExecutor(max_workers=callers) as pool:
+                versions = list(pool.map(initialize_once, range(callers)))
+
+            self.assertEqual(versions, [SCHEMA_VERSION] * callers)
+            open_database(database).close()
 
 
 if __name__ == "__main__":

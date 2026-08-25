@@ -25,6 +25,7 @@ from agent_run.errors import StateTransitionError, ValidationError
 
 from .db import (
     agent_row,
+    checked_supervisor_proof,
     claim_delivery_row,
     count_agents,
     finish_delivery_claim,
@@ -47,12 +48,11 @@ from .db import (
     row_dict,
     session_for_ref,
     timestamp,
+    validate_message_storage,
 )
 
 
 class StateStore:
-    """Small synchronous SQLite state store; each process opens its own instance."""
-
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
@@ -270,6 +270,7 @@ class StateStore:
         agent_id = validate_agent_id(agent_id)
         if not isinstance(message, Message):
             raise ValidationError("message must be a Message")
+        validate_message_storage(message.content, message.raw_ref)
         with immediate(self.connection):
             agent_row(self.connection, agent_id)
             require_attempt(self.connection, agent_id, attempt_id)
@@ -445,34 +446,33 @@ class StateStore:
         agent_id: str | AgentId,
         *,
         verdict: str,
+        supervisor_pid: int | None = None,
+        process_group_id: int | None = None,
+        expected_identity: str | None = None,
+        alive: bool | None = None,
+        checked_at: float | None = None,
         observed_identity: str | None = None,
         reason: str | None = None,
-        at: float | None = None,
     ) -> bool:
-        """Persist lost only from a supplied proven-dead or identity-mismatch verdict."""
-
         agent_id = validate_agent_id(agent_id)
-        if verdict not in {"alive", "dead", "identity_mismatch", "unknown"}:
+        if verdict not in {"alive", "dead", "identity_mismatch"}:
             raise ValidationError("invalid reconciliation verdict")
-        if verdict in {"alive", "unknown"}:
-            agent_row(self.connection, agent_id)
-            return False
-        changed_at = timestamp(at)
         with immediate(self.connection):
             agent = agent_row(self.connection, agent_id)
+            changed_at, failure_kind = checked_supervisor_proof(
+                agent,
+                verdict=verdict,
+                supervisor_pid=supervisor_pid,
+                process_group_id=process_group_id,
+                expected_identity=expected_identity,
+                alive=alive,
+                checked_at=checked_at,
+                observed_identity=observed_identity,
+            )
             if AgentStatus(agent["status"]) in TERMINAL:
                 return False
-            if verdict == "identity_mismatch":
-                if (
-                    agent["supervisor_identity"] is None
-                    or not isinstance(observed_identity, str)
-                    or not observed_identity.strip()
-                    or observed_identity == agent["supervisor_identity"]
-                ):
-                    raise ValidationError("identity mismatch requires differing identities")
-            failure_kind = (
-                "supervisor_dead" if verdict == "dead" else "supervisor_identity_mismatch"
-            )
+            if failure_kind is None:
+                return False
             self._transition(
                 agent_id,
                 AgentStatus.LOST,

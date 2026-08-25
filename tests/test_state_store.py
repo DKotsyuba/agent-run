@@ -148,6 +148,31 @@ class StateStoreTests(unittest.TestCase):
         self.store.complete_command(first_command, first, {"ok": True}, at=7)
         self.assertEqual(self.store.claim_command(first, at=8)["id"], second_command)
 
+    def test_message_storage_refuses_oversized_inline_content_and_escaping_refs(self) -> None:
+        class HundredMegabyteText(str):
+            def encode(self, *_: object, **__: object):
+                class ReportedBytes(bytes):
+                    def __len__(self) -> int:
+                        return 100 * 1024 * 1024
+
+                return ReportedBytes()
+
+        agent_id = self.create()
+        self.store.append_message(
+            agent_id, Message(1, MessageRole.USER, "x" * (32 * 1024))
+        )
+        for content in ("x" * (32 * 1024 + 1), HundredMegabyteText("externalize")):
+            with self.subTest(size=len(content)), self.assertRaisesRegex(
+                ValidationError, "32 KiB"
+            ):
+                self.store.append_message(agent_id, Message(2, MessageRole.USER, content))
+        with self.assertRaisesRegex(ValidationError, "normalized relative path"):
+            self.store.append_message(
+                agent_id,
+                Message(3, MessageRole.TOOL_RESULT, "external", raw_ref="../../outside"),
+            )
+        self.assertEqual(len(self.store.transcript(agent_id)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
