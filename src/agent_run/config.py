@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from typing import Mapping
 from .errors import ValidationError
 
 
-_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
 _ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _IMPORT_REF = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*\Z"
@@ -147,7 +148,7 @@ def _int(value: object, path: str, *, minimum: int) -> int:
 
 
 def _number(value: object, path: str, *, minimum: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < minimum:
         raise ValidationError(f"{path} must be a number >= {minimum}")
     return float(value)
 
@@ -378,7 +379,7 @@ def load_config(path: str | Path) -> Config:
         raw, {"schema_version", "core", "capacity", "delivery", "profiles", "mcp", "runtimes"}, ""
     )
     version = raw.get("schema_version")
-    if version != 1 or isinstance(version, bool):
+    if type(version) is not int or version != 1:
         raise ValidationError(f"unsupported schema_version: {version!r}")
     mcp = _parse_mcp(raw.get("mcp", {}))
     runtimes = _parse_runtimes(raw.get("runtimes", {}))

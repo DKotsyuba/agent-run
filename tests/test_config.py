@@ -93,6 +93,8 @@ extra = true
     def test_unsupported_versions_and_secret_literals_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValidationError, "schema_version"):
             self.load("schema_version = 2\n")
+        with self.assertRaisesRegex(ValidationError, "schema_version"):
+            self.load("schema_version = 1.0\n")
         with self.assertRaisesRegex(ValidationError, "not a secret value"):
             self.load(
                 """schema_version = 1
@@ -128,6 +130,38 @@ kind = "environment"
 names = ["literal-token"]
 """
             )
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        for field, text in (
+            ("env_from", f'''schema_version = 1
+[mcp.bad]
+transport = "stdio"
+command = "/bin/echo"
+env_from = ["{secret}"]
+'''),
+            ("auth names", f'''schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/home"
+models = ["test"]
+[runtimes.fake.auth]
+kind = "environment"
+names = ["{secret}"]
+'''),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValidationError, "not a secret value"):
+                self.load(text)
+
+    def test_nonfinite_numeric_values_are_rejected(self) -> None:
+        for field, text in (
+            ("core.default_timeout_seconds", "schema_version = 1\n[core]\ndefault_timeout_seconds = nan\n"),
+            ("core.warning_fraction", "schema_version = 1\n[core]\nwarning_fraction = nan\n"),
+            ("capacity.collect_interval_seconds", "schema_version = 1\n[capacity]\ncollect_interval_seconds = nan\n"),
+            ("delivery.retry_base_seconds", "schema_version = 1\n[delivery]\nretry_base_seconds = nan\n"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValidationError, field):
+                self.load(text)
 
 
 if __name__ == "__main__":

@@ -18,8 +18,11 @@ from agent_run.errors import ValidationError
 
 
 class FakeAdapter:
+    def __init__(self, api_version=ADAPTER_API_VERSION):
+        self.api_version = api_version
+
     def describe(self):
-        return RuntimeInfo("fake", ADAPTER_API_VERSION, frozenset({Capability.STEER}))
+        return RuntimeInfo("fake", self.api_version, frozenset({Capability.STEER}))
 
     def validate(self, config):
         return None
@@ -70,6 +73,8 @@ class AdapterTests(unittest.TestCase):
 
         for module, message in (
             (self.module(ADAPTER_API_VERSION=2), "API version"),
+            (self.module(ADAPTER_API_VERSION=1.0), "API version"),
+            (self.module(ADAPTER=FakeAdapter(1.0)), "reports API version"),
             (self.module(ADAPTER=object()), "missing callable"),
         ):
             with self.subTest(message=message), patch(

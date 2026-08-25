@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -37,6 +38,17 @@ class AdapterHomeTests(unittest.TestCase):
                 write_managed_file(home, "../outside", "no")
             with self.assertRaises(PathEscapeError):
                 write_managed_file(home, "linked/outside", "no")
+
+    def test_failed_atomic_replace_preserves_existing_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            target = home / "settings/config.toml"
+            write_managed_file(home, "settings/config.toml", "original")
+            with patch("agent_run.adapters.home.os.replace", side_effect=OSError("failed")):
+                with self.assertRaises(OSError):
+                    write_managed_file(home, "settings/config.toml", "replacement")
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertEqual(list(target.parent.glob(".*.tmp")), [])
 
     def test_symlink_bridges_are_explicit_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as source_dir:

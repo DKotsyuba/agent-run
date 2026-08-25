@@ -45,7 +45,7 @@ def load_adapter(
     except (ImportError, ValueError) as error:
         raise ValidationError(f"cannot import adapter module {module_name}: {error}") from error
     version = getattr(module, "ADAPTER_API_VERSION", None)
-    if version != ADAPTER_API_VERSION or isinstance(version, bool):
+    if type(version) is not int or version != ADAPTER_API_VERSION:
         raise ValidationError(
             f"adapter {reference} API version {version!r} does not match {ADAPTER_API_VERSION}"
         )
@@ -62,7 +62,7 @@ def load_adapter(
         raise ValidationError(f"adapter {reference} describe failed: {error}") from error
     if not isinstance(info, RuntimeInfo):
         raise ValidationError(f"adapter {reference} describe must return RuntimeInfo")
-    if info.adapter_api_version != ADAPTER_API_VERSION:
+    if type(info.adapter_api_version) is not int or info.adapter_api_version != ADAPTER_API_VERSION:
         raise ValidationError(
             f"adapter {reference} reports API version {info.adapter_api_version!r}, expected {ADAPTER_API_VERSION}"
         )
