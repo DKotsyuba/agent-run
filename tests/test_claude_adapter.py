@@ -68,6 +68,12 @@ class ClaudeAdapterTests(unittest.TestCase):
         values.update(overrides)
         return StartRequest(**values)
 
+    def prepare(self, *args, mcp_servers: dict = {}, **kwargs):
+        return self.adapter.prepare(*args, mcp_servers=mcp_servers, **kwargs)
+
+    def materialize(self, *args, mcp_servers: dict = {}, **kwargs):
+        return self.adapter.materialize(*args, mcp_servers=mcp_servers, **kwargs)
+
     # -- describe -----------------------------------------------------
 
     def test_describe_reports_api_version_and_excludes_live_limits(self) -> None:
@@ -126,25 +132,43 @@ class ClaudeAdapterTests(unittest.TestCase):
             health = self.adapter.probe(available, self.home)
             self.assertTrue(health.authenticated)
 
+    # -- mcp_servers is required --------------------------------------------
+
+    def test_materialize_and_prepare_require_the_mcp_servers_keyword(self) -> None:
+        config = self.runtime_config()
+        with self.assertRaises(TypeError):
+            self.adapter.materialize(config, self.home)
+        with self.assertRaises(TypeError):
+            self.adapter.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
+
     # -- materialize ---------------------------------------------------------
 
     def test_materialize_writes_only_declared_hooks_into_settings(self) -> None:
         config = self.runtime_config(hooks=(RuntimeHookConfig("UserPromptSubmit", ("agent-run", "hook")),))
-        digest = self.adapter.materialize(config, self.home)
+        digest = self.materialize(config, self.home)
         self.assertTrue(digest)
         settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
         self.assertIn("UserPromptSubmit", settings["hooks"])
         self.assertEqual(len(settings["hooks"]), 1)
 
+    def test_materialize_renders_hook_commands_shell_quoted(self) -> None:
+        config = self.runtime_config(
+            hooks=(RuntimeHookConfig("UserPromptSubmit", ("agent-run", "hook", "context abc")),)
+        )
+        self.materialize(config, self.home)
+        settings = json.loads((self.home / "settings.json").read_text(encoding="utf-8"))
+        rendered = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        self.assertEqual(rendered, "agent-run hook 'context abc'")
+
     def test_materialize_fails_closed_when_mcp_name_has_no_resolution(self) -> None:
         config = self.runtime_config(mcp=("agent_lsp",))
         with self.assertRaisesRegex(ValidationError, "no resolved MCP definition"):
-            self.adapter.materialize(config, self.home)
+            self.materialize(config, self.home)
 
     def test_materialize_renders_strict_mcp_config_when_resolved(self) -> None:
         config = self.runtime_config(mcp=("agent_lsp",))
         servers = {"agent_lsp": McpConfig("stdio", Path("/bin/agent-lsp"), ("--flag",), ("LSP_TOKEN",))}
-        self.adapter.materialize(config, self.home, mcp_servers=servers)
+        self.materialize(config, self.home, mcp_servers=servers)
         rendered = json.loads((self.home / "mcp" / "mcp-config.json").read_text(encoding="utf-8"))
         self.assertEqual(rendered["mcpServers"]["agent_lsp"]["command"], "/bin/agent-lsp")
         self.assertNotIn("LSP_TOKEN", json.dumps(rendered))
@@ -153,41 +177,56 @@ class ClaudeAdapterTests(unittest.TestCase):
         skill_dir = self.root / "skills" / "claude" / "delegate"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("Delegate work.", encoding="utf-8")
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "run.sh").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
         config = self.runtime_config(skills=("delegate",))
-        self.adapter.materialize(config, self.home)
+        self.materialize(config, self.home)
         plugin_manifest = self.home / "plugins" / "delegate" / ".claude-plugin" / "plugin.json"
         skill_link = self.home / "plugins" / "delegate" / "skills" / "delegate" / "SKILL.md"
+        scripts_link = self.home / "plugins" / "delegate" / "skills" / "delegate" / "scripts"
         self.assertTrue(plugin_manifest.is_file())
         self.assertTrue(skill_link.is_symlink())
         self.assertEqual(skill_link.read_text(encoding="utf-8"), "Delegate work.")
+        self.assertTrue(scripts_link.is_symlink())
+        self.assertEqual((scripts_link / "run.sh").read_text(encoding="utf-8"), "#!/bin/sh\necho hi\n")
 
     def test_materialize_fails_closed_on_missing_skill(self) -> None:
         config = self.runtime_config(skills=("missing-skill",))
         with self.assertRaisesRegex(ValidationError, "skill not found"):
-            self.adapter.materialize(config, self.home)
+            self.materialize(config, self.home)
 
     # -- prepare -------------------------------------------------------------
 
     def test_prepare_fails_closed_on_a_model_outside_the_roster(self) -> None:
         with self.assertRaisesRegex(ValidationError, "not in the configured roster"):
-            self.adapter.prepare(
+            self.prepare(
                 self.request(model="not-a-model"), self.profile(), self.runtime_config(), self.home, self.agent_dir
             )
 
+    def test_prepare_fails_closed_when_no_declared_auth_env_is_set(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "auth requires one of"):
+            self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
+
     def test_prepare_builds_an_isolated_launch_plan_for_a_read_only_profile(self) -> None:
-        plan = self.adapter.prepare(
-            self.request(), self.profile(write=False), self.runtime_config(), self.home, self.agent_dir
-        )
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(), self.profile(write=False), self.runtime_config(), self.home, self.agent_dir
+            )
         argv = plan.argv
         self.assertIn("--setting-sources", argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
         self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--no-session-persistence", argv)
         self.assertIn("--permission-mode", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+        tools = argv[argv.index("--tools") + 1].split(",")
+        self.assertEqual(set(tools), {"Read", "Grep", "Glob"})
         allowed = argv[argv.index("--allowedTools") + 1]
-        self.assertIn("Read", allowed)
+        self.assertIn("Read", allowed.split(","))
         self.assertNotIn("Write", allowed.split(","))
         self.assertNotIn("Bash", allowed.split(","))
+        self.assertNotIn("Bash", tools)
         disallowed = argv[argv.index("--disallowedTools") + 1]
         self.assertIn("WebFetch", disallowed)
         self.assertNotIn("--mcp-config", argv)
@@ -197,21 +236,46 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(payload["message"]["content"][0]["text"], "do the thing")
 
     def test_prepare_grants_write_tools_only_when_profile_allows_write(self) -> None:
-        plan = self.adapter.prepare(
-            self.request(), self.profile(write=True), self.runtime_config(), self.home, self.agent_dir
-        )
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(), self.profile(write=True), self.runtime_config(), self.home, self.agent_dir
+            )
         allowed = plan.argv[plan.argv.index("--allowedTools") + 1].split(",")
-        self.assertIn("Write", allowed)
-        self.assertIn("Bash", allowed)
+        self.assertIn(f"Write({self.workdir}/**)", allowed)
+        self.assertIn(f"Edit({self.workdir}/**)", allowed)
+        self.assertNotIn("Bash", allowed)
+        self.assertFalse(any(item == "Bash" or item.startswith("Bash(") for item in allowed))
+        tools = plan.argv[plan.argv.index("--tools") + 1].split(",")
+        self.assertIn("Write", tools)
+        self.assertNotIn("Bash", tools)
         self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "acceptEdits")
+
+    def test_prepare_fails_closed_when_write_mode_cannot_keep_a_read_root_read_only(self) -> None:
+        nested = self.workdir / "nested-read-root"
+        nested.mkdir()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            with self.assertRaisesRegex(ValidationError, "cannot keep a read root read-only"):
+                self.prepare(
+                    self.request(),
+                    self.profile(write=True, read_roots=(nested,)),
+                    self.runtime_config(),
+                    self.home,
+                    self.agent_dir,
+                )
 
     def test_prepare_adds_dirs_and_mcp_flags_and_never_leaks_secrets_into_argv(self) -> None:
         child = self.root / "child"
         child.mkdir()
         config = self.runtime_config(mcp=("agent_lsp",))
+        servers = {"agent_lsp": McpConfig("stdio", Path("/bin/agent-lsp"), (), ())}
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-super-secret"}):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(read_roots=(child,)), config, self.home, self.agent_dir
+            plan = self.prepare(
+                self.request(),
+                self.profile(read_roots=(child,)),
+                config,
+                self.home,
+                self.agent_dir,
+                mcp_servers=servers,
             )
         self.assertIn(str(child), plan.argv)
         self.assertIn("--mcp-config", plan.argv)
@@ -219,17 +283,41 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertNotIn("sk-super-secret", " ".join(plan.argv))
         self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-super-secret")
 
-    def test_prepare_embeds_effort_and_output_schema_in_the_system_prompt(self) -> None:
-        plan = self.adapter.prepare(
-            self.request(effort="high", output_schema={"type": "object"}),
-            self.profile(),
-            self.runtime_config(),
-            self.home,
-            self.agent_dir,
-        )
-        prompt = plan.argv[plan.argv.index("--append-system-prompt") + 1]
-        self.assertIn("reasoning effort: high", prompt)
-        self.assertIn('"type": "object"', prompt)
+    def test_prepare_fails_closed_when_an_mcp_definition_is_unresolved(self) -> None:
+        config = self.runtime_config(mcp=("agent_lsp",))
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            with self.assertRaisesRegex(ValidationError, "no resolved MCP definition"):
+                self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
+
+    def test_prepare_fails_closed_when_an_mcp_env_var_is_not_set(self) -> None:
+        config = self.runtime_config(mcp=("agent_lsp",))
+        servers = {"agent_lsp": McpConfig("stdio", Path("/bin/agent-lsp"), (), ("LSP_TOKEN",))}
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            os.environ.pop("LSP_TOKEN", None)
+            with self.assertRaisesRegex(ValidationError, "LSP_TOKEN"):
+                self.prepare(
+                    self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
+                )
+
+    def test_prepare_validates_effort_and_passes_the_native_flag(self) -> None:
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(effort="high", output_schema={"type": "object"}),
+                self.profile(),
+                self.runtime_config(),
+                self.home,
+                self.agent_dir,
+            )
+            self.assertIn("--effort", plan.argv)
+            self.assertEqual(plan.argv[plan.argv.index("--effort") + 1], "high")
+            prompt = plan.argv[plan.argv.index("--append-system-prompt") + 1]
+            self.assertNotIn("reasoning effort", prompt)
+            self.assertIn('"type": "object"', prompt)
+
+            with self.assertRaisesRegex(ValidationError, "effort must be one of"):
+                self.prepare(
+                    self.request(effort="bogus"), self.profile(), self.runtime_config(), self.home, self.agent_dir
+                )
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import json
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from ...domain import Message, MessageRole
 
@@ -41,6 +41,33 @@ def _redact(value: object) -> object:
 
 def _safe_event_data(payload: Mapping[str, object]) -> Mapping[str, object]:
     return MappingProxyType(dict(_redact(payload)))  # type: ignore[arg-type]
+
+
+def sanitize_line(raw_line: str, literal_secrets: Iterable[str]) -> str:
+    """Strip known live secret values and secret-shaped keys from one raw line.
+
+    Runs before the line ever reaches the decoder or the on-disk runtime log.
+    Literal substitution covers text the child might echo verbatim (including
+    a malformed, non-JSON line); the structural key-based pass then covers a
+    well-formed JSON object whose fields are named like a credential. Values
+    under keys that do not look like a credential, such as message text
+    blocks, are left untouched.
+    """
+
+    text = raw_line
+    for secret in literal_secrets:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    stripped = text.strip()
+    if not stripped:
+        return text
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(payload, dict):
+        return text
+    return json.dumps(_redact(payload), sort_keys=True)
 
 
 def _clean_session_id(value: object) -> str | None:
@@ -153,6 +180,25 @@ def _terminal_metadata(payload: Mapping[str, object], session_id: str | None) ->
             else None
         ),
         usage=_safe_event_data(usage) if isinstance(usage, Mapping) else MappingProxyType({}),
+    )
+
+
+def terminal_event_data(metadata: StreamMetadata) -> Mapping[str, object]:
+    """Bounded terminal metadata for a ``runtime_result`` event.
+
+    Excludes ``result_text`` and ``runtime_session_id`` so the event never
+    duplicates the answer content or the session-scoped sink call.
+    """
+
+    return MappingProxyType(
+        {
+            "subtype": metadata.subtype,
+            "is_error": metadata.is_error,
+            "duration_ms": metadata.duration_ms,
+            "num_turns": metadata.num_turns,
+            "total_cost_usd": metadata.total_cost_usd,
+            "usage": metadata.usage,
+        }
     )
 
 

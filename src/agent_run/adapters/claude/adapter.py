@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -35,7 +36,7 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash, create_symlink_bridge, write_managed_file
-from .stream import StreamDecoder
+from .stream import StreamDecoder, sanitize_line, terminal_event_data
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
 
@@ -56,9 +57,9 @@ _CAPABILITIES = frozenset(
 
 _READ_TOOLS = ("Read", "Grep", "Glob")
 _WRITE_TOOLS = ("Edit", "Write", "NotebookEdit")
-_BASH_TOOL = ("Bash",)
 _ALWAYS_DISALLOWED = ("WebFetch", "WebSearch")
 _AUTH_NAMES = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
+_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _KNOWN_HOOK_EVENTS = frozenset(
     {
         "PreToolUse",
@@ -83,7 +84,7 @@ def _render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
 
     grouped: dict[str, list[dict[str, object]]] = {}
     for hook in hooks:
-        entry: dict[str, object] = {"hooks": [{"type": "command", "command": " ".join(hook.command)}]}
+        entry: dict[str, object] = {"hooks": [{"type": "command", "command": shlex.join(hook.command)}]}
         if hook.matcher is not None:
             entry["matcher"] = hook.matcher
         grouped.setdefault(hook.event, []).append(entry)
@@ -116,18 +117,28 @@ def _render_mcp_config(
 
 
 def _render_plugin_dirs(home: Path, skills_root: Path, names: tuple[str, ...]) -> str:
-    """Generate one plugin directory per selected skill, symlinking its owner-authored SKILL.md."""
+    """Generate one plugin directory per selected skill.
+
+    Every top-level child of the owner-authored skill directory (SKILL.md,
+    plus any scripts/, references/, assets/, or other sibling) is bridged
+    into the generated plugin's skill directory through the same validated
+    symlink bridge, not just the manifest file.
+    """
 
     digests = []
     for name in sorted(names):
-        source = skills_root / name / "SKILL.md"
-        if not source.exists():
+        skill_dir = skills_root / name
+        manifest_source = skill_dir / "SKILL.md"
+        if not manifest_source.exists():
             raise ValidationError(f"claude skill not found: {name}")
         manifest_digest = write_managed_file(
             home, f"plugins/{name}/.claude-plugin/plugin.json", json.dumps({"name": name}, sort_keys=True)
         )
-        create_symlink_bridge(home, f"plugins/{name}/skills/{name}/SKILL.md", source)
-        digests.append(f"{name}:{manifest_digest}")
+        children = []
+        for child in sorted(skill_dir.iterdir()):
+            create_symlink_bridge(home, f"plugins/{name}/skills/{name}/{child.name}", child)
+            children.append(child.name)
+        digests.append(f"{name}:{manifest_digest}:{','.join(children)}")
     return content_hash(",".join(digests)) if digests else content_hash("no_skills")
 
 
@@ -161,15 +172,14 @@ class ClaudeAdapter:
         config: RuntimeConfig,
         home: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig] = MappingProxyType({}),
+        mcp_servers: Mapping[str, McpConfig],
     ) -> str:
         """Render settings, strict MCP config, and plugin dirs into ``home``.
 
-        ``mcp_servers`` is an optional resolution of the selected MCP names to
-        their full definitions; it is not part of the frozen adapter
-        interface, so callers that only pass ``(config, home)`` still work as
-        long as ``config.mcp`` is empty. A configured but unresolved MCP name
-        fails closed rather than emitting a non-functional entry.
+        ``mcp_servers`` is the caller's resolution of the selected MCP names
+        to their full definitions, required per the frozen adapter contract.
+        A configured but unresolved MCP name fails closed rather than
+        emitting a non-functional entry.
         """
 
         settings_digest = _render_settings(home, config.hooks)
@@ -199,19 +209,30 @@ class ClaudeAdapter:
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig] = MappingProxyType({}),
+        mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan:
         if request.model not in config.models:
             raise ValidationError(f"model is not in the configured roster: {request.model}")
+        if request.effort is not None and request.effort not in _SUPPORTED_EFFORTS:
+            raise ValidationError(
+                f"claude runtime effort must be one of {sorted(_SUPPORTED_EFFORTS)}: {request.effort!r}"
+            )
 
         allow_write = profile.write
-        allowed_tools = _READ_TOOLS + (_WRITE_TOOLS + _BASH_TOOL if allow_write else ())
-        allowed_tools += tuple(f"mcp__{name}" for name in config.mcp)
+        if allow_write:
+            for root in profile.read_roots:
+                if root != request.workdir and root.is_relative_to(request.workdir):
+                    raise ValidationError(
+                        "claude runtime cannot keep a read root read-only while it is nested "
+                        f"inside a writable workdir: {root}"
+                    )
+
+        base_tools = _READ_TOOLS + (_WRITE_TOOLS if allow_write else ())
+        write_scope = tuple(f"{tool}({request.workdir}/**)" for tool in _WRITE_TOOLS) if allow_write else ()
+        allowed_tools = _READ_TOOLS + write_scope + tuple(f"mcp__{name}" for name in config.mcp)
         permission_mode = "acceptEdits" if allow_write else "default"
 
         system_prompt_parts = [profile.body]
-        if request.effort is not None:
-            system_prompt_parts.append(f"Apply reasoning effort: {request.effort}.")
         if request.output_schema is not None:
             schema_text = json.dumps(request.output_schema, sort_keys=True)
             system_prompt_parts.append(
@@ -230,6 +251,7 @@ class ClaudeAdapter:
             "--input-format",
             "stream-json",
             "--verbose",
+            "--no-session-persistence",
             "--model",
             request.model,
             "--permission-mode",
@@ -246,8 +268,11 @@ class ClaudeAdapter:
             argv += ["--plugin-dir", str(home / "plugins" / name)]
         for root in roots:
             argv += ["--add-dir", str(root)]
+        argv += ["--tools", ",".join(base_tools)]
         argv += ["--allowedTools", ",".join(allowed_tools)]
         argv += ["--disallowedTools", ",".join(_ALWAYS_DISALLOWED)]
+        if request.effort is not None:
+            argv += ["--effort", request.effort]
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
@@ -255,16 +280,33 @@ class ClaudeAdapter:
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
+
+        auth_names: tuple[str, ...] = ()
         if config.auth is not None:
-            for name in config.auth.names:
+            auth_names = config.auth.names
+            if not any(os.environ.get(name) for name in auth_names):
+                raise ValidationError(
+                    "claude runtime auth requires one of the declared environment "
+                    f"variables to be set: {', '.join(auth_names)}"
+                )
+            for name in auth_names:
                 value = os.environ.get(name)
                 if value:
                     environment[name] = value
+
+        mcp_env_names: list[str] = []
         for name in config.mcp:
-            for env_name in _mcp_env_names(mcp_servers, name):
+            server = mcp_servers.get(name)
+            if server is None:
+                raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
+            for env_name in server.env_from:
                 value = os.environ.get(env_name)
-                if value:
-                    environment[env_name] = value
+                if not value:
+                    raise ValidationError(
+                        f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
+                    )
+                environment[env_name] = value
+                mcp_env_names.append(env_name)
 
         initial_input = (
             json.dumps(
@@ -289,6 +331,7 @@ class ClaudeAdapter:
                     "permission_mode": permission_mode,
                     "allowed_tools": allowed_tools,
                     "model": request.model,
+                    "secret_env_names": tuple(dict.fromkeys((*auth_names, *mcp_env_names))),
                 }
             ),
         )
@@ -305,16 +348,64 @@ class ClaudeAdapter:
             bufsize=1,
             start_new_session=True,
         )
-        return ClaudeSession(process, plan, sink)
+        try:
+            return ClaudeSession(process, plan, sink)
+        except BaseException:
+            _abort_launch(process)
+            raise
 
 
-def _mcp_env_names(mcp_servers: Mapping[str, McpConfig], name: str) -> tuple[str, ...]:
-    server = mcp_servers.get(name)
-    return server.env_from if server is not None else ()
+def _abort_launch(process: subprocess.Popen) -> None:
+    """Native-cancel, reap, and close pipes for a child that never got a session.
+
+    Runs when opening the runtime log, wiring the reader thread, or writing
+    the initial prompt fails during ``ClaudeSession`` construction, so the
+    child never outlives a failed ``launch``.
+    """
+
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    for pipe in (process.stdin, process.stdout):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _open_runtime_log(path: Path):
+    """Open the runtime stream log privately: O_CREAT|O_APPEND|O_WRONLY, mode 0600."""
+
+    descriptor = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    os.fchmod(descriptor, 0o600)
+    return os.fdopen(descriptor, "a", encoding="utf-8")
+
+
+def _known_secrets(plan: LaunchPlan) -> frozenset[str]:
+    """Literal secret values that must never reach the decoder or the disk log."""
+
+    names = plan.adapter_state.get("secret_env_names", ())
+    return frozenset(value for name in names if (value := plan.environment.get(name)))
 
 
 class ClaudeSession:
-    """A launched Claude Code child process and its stream reader thread."""
+    """A launched Claude Code child process and its stream reader thread.
+
+    Owns the child from construction until ``wait`` returns; any failure
+    while wiring up the log, the reader thread, or the initial prompt
+    propagates out of ``__init__`` so ``launch`` can native-cancel the
+    process group instead of leaking a running child.
+    """
 
     def __init__(self, process: subprocess.Popen, plan: LaunchPlan, sink: EventSink) -> None:
         self._process = process
@@ -322,16 +413,22 @@ class ClaudeSession:
         self._sink = sink
         self._decoder = StreamDecoder()
         self._lock = threading.Lock()
-        self._raw_stream = plan.runtime_stream_path.open("a", encoding="utf-8")
         self._cancelled = False
-        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
-        if plan.initial_input and process.stdin is not None:
-            try:
-                process.stdin.write(plan.initial_input)
-                process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
-        self._reader.start()
+        self._reader_error: BaseException | None = None
+        self._secrets = _known_secrets(plan)
+        self._raw_stream = _open_runtime_log(plan.runtime_stream_path)
+        try:
+            if plan.initial_input and process.stdin is not None:
+                try:
+                    process.stdin.write(plan.initial_input)
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+            self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+            self._reader.start()
+        except BaseException:
+            self._raw_stream.close()
+            raise
 
     @property
     def pid(self) -> int | None:
@@ -342,18 +439,25 @@ class ClaudeSession:
         if stdout is None:
             return
         for raw_line in stdout:
-            with self._lock:
-                self._raw_stream.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
-                self._raw_stream.flush()
-                result = self._decoder.feed(raw_line, at=time.time())
-            if result.session_id:
-                self._sink.session(result.session_id)
-            for message in result.messages:
-                self._sink.message(message)
-            if result.event:
-                self._sink.event(*result.event)
-            if result.warning:
-                self._sink.event("stream_diagnostic", {"reason": result.warning})
+            try:
+                sanitized = sanitize_line(raw_line, self._secrets)
+                with self._lock:
+                    self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
+                    self._raw_stream.flush()
+                result = self._decoder.feed(sanitized, at=time.time())
+                if result.session_id:
+                    self._sink.session(result.session_id)
+                for message in result.messages:
+                    self._sink.message(message)
+                if result.event:
+                    self._sink.event(*result.event)
+                if result.warning:
+                    self._sink.event("stream_diagnostic", {"reason": result.warning})
+                if result.terminal:
+                    self._sink.event("runtime_result", terminal_event_data(result.terminal))
+            except BaseException as error:  # persisted for wait(); keep draining the pipe
+                if self._reader_error is None:
+                    self._reader_error = error
 
     def steer(self, text: str) -> None:
         stdin = self._process.stdin
@@ -390,17 +494,42 @@ class ClaudeSession:
         except subprocess.TimeoutExpired:
             return None
         self._reader.join(timeout=5)
-        with self._lock:
-            self._raw_stream.close()
+        if not self._reader.is_alive():
+            with self._lock:
+                self._raw_stream.close()
+            for pipe in (self._process.stdin, self._process.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+        if self._reader_error is not None:
+            raise self._reader_error
         metadata = self._decoder.finalize()
+        succeeded = (
+            exit_code == 0
+            and not metadata.is_error
+            and metadata.subtype != "no_answer"
+            and bool(metadata.result_text)
+        )
         if self._cancelled:
             status = AgentStatus.CANCELLED
-        elif exit_code == 0 and not metadata.is_error and metadata.subtype != "no_answer":
+        elif succeeded:
             status = AgentStatus.SUCCEEDED
         else:
             status = AgentStatus.FAILED
-        failure_kind = None if status == AgentStatus.SUCCEEDED else (metadata.subtype or "error")
-        failure_text = None if status == AgentStatus.SUCCEEDED else metadata.result_text
+        if status == AgentStatus.SUCCEEDED:
+            failure_kind = None
+            failure_text = None
+        else:
+            empty_result = (
+                exit_code == 0
+                and not metadata.is_error
+                and metadata.subtype != "no_answer"
+                and not metadata.result_text
+            )
+            failure_kind = "empty_result" if empty_result else (metadata.subtype or "error")
+            failure_text = metadata.result_text
         return Outcome(
             status=status,
             exit_code=exit_code,
