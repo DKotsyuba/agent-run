@@ -152,6 +152,29 @@ class StateStore:
                 )
         return session_id
 
+    def record_context_receipt(
+        self,
+        orchestrator_session_id: str,
+        context_key: str,
+        *,
+        at: float | None = None,
+    ) -> bool:
+        nonblank("orchestrator_session_id", orchestrator_session_id)
+        nonblank("context_key", context_key)
+        injected_at = timestamp(at)
+        with immediate(self.connection):
+            changed = self.connection.execute(
+                """INSERT INTO context_receipts (
+                       orchestrator_session_id, context_key, injected_at
+                   ) VALUES (?, ?, ?)
+                   ON CONFLICT(orchestrator_session_id) DO UPDATE SET
+                       context_key = excluded.context_key,
+                       injected_at = excluded.injected_at
+                   WHERE context_receipts.context_key <> excluded.context_key""",
+                (orchestrator_session_id, context_key, injected_at),
+            ).rowcount
+        return changed == 1
+
     def get_agent(self, agent_id: str | AgentId) -> dict[str, object]:
         return dict(agent_row(self.connection, validate_agent_id(agent_id)))
 
@@ -646,6 +669,31 @@ class StateStore:
                 "delivered",
                 now=now,
                 remote_message_id=remote_message_id,
+                ambiguous_result=ambiguous_result,
+            ):
+                raise ValidationError("delivery lease is not owned by caller")
+
+    def fail_delivery(
+        self,
+        delivery_id: str,
+        owner: str,
+        error: str,
+        *,
+        at: float | None = None,
+        ambiguous_result: bool = False,
+    ) -> None:
+        nonblank("delivery_id", delivery_id)
+        nonblank("lease owner", owner)
+        nonblank("delivery error", error)
+        now = timestamp(at)
+        with immediate(self.connection):
+            if not finish_delivery_claim(
+                self.connection,
+                delivery_id,
+                owner,
+                "failed",
+                now=now,
+                last_error=error,
                 ambiguous_result=ambiguous_result,
             ):
                 raise ValidationError("delivery lease is not owned by caller")
