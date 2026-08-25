@@ -123,6 +123,28 @@ class VerifyCompletionTests(unittest.TestCase):
         self.assertEqual(outcome.failure_kind, ANSWER_INCOMPLETE)
         self.assertEqual(outcome.failure_text, "silence=3.0s/active")
 
+    def test_cancel_and_timeout_preserve_a_complete_answer(self) -> None:
+        body = f"usable partial result\n{DEFAULT_SENTINEL}"
+        proof = self.proof(body)
+        for reason, status in (
+            ("cancel", AgentStatus.CANCELLED),
+            ("timeout", AgentStatus.TIMED_OUT),
+        ):
+            with self.subTest(reason=reason):
+                outcome = verify_completion(
+                    session_outcome=Outcome(
+                        AgentStatus.SUCCEEDED, runtime_session_id="sess-stop"
+                    ),
+                    stop_reason=reason,
+                    answer=proof,
+                    group_gone=True,
+                )
+                self.assertIs(outcome.status, status)
+                self.assertEqual(outcome.answer_path, proof.path)
+                self.assertEqual(outcome.answer_bytes, len(body.encode()))
+                self.assertEqual(outcome.answer_sha256, proof.sha256)
+                self.assertEqual(outcome.runtime_session_id, "sess-stop")
+
     def test_timeout_without_any_answer_reports_silence(self) -> None:
         outcome = verify_completion(
             session_outcome=None,

@@ -93,6 +93,8 @@ class ProcessOps(Protocol):
 
     def sleep(self, seconds: float) -> None: ...
 
+    def process_group(self, pid: int) -> int | None: ...
+
     def signal_group(self, pgid: int, signal_number: int) -> bool: ...
 
     def group_alive(self, pgid: int) -> bool: ...
@@ -108,6 +110,14 @@ class SystemProcessOps:
 
     def sleep(self, seconds: float) -> None:
         time.sleep(max(0.0, seconds))
+
+    def process_group(self, pid: int) -> int | None:
+        try:
+            return os.getpgid(checked_pgid(pid))
+        except ProcessLookupError:
+            return None
+        except PermissionError as error:
+            raise ValidationError(f"cannot inspect process group for {pid}") from error
 
     def signal_group(self, pgid: int, signal_number: int) -> bool:
         try:
@@ -138,12 +148,38 @@ class Termination:
     waited_seconds: float
 
 
+@dataclass(frozen=True)
+class VerifiedProcessGroup:
+    """A leader-to-group identity proved before any group signal is allowed."""
+
+    leader_pid: int
+    pgid: int
+
+
+def verify_process_group(
+    ops: ProcessOps, leader_pid: int
+) -> VerifiedProcessGroup | None:
+    leader_pid = checked_pgid(leader_pid)
+    observed = ops.process_group(leader_pid)
+    if observed is None:
+        return None
+    if observed != leader_pid:
+        raise ValidationError(
+            f"engine pid {leader_pid} is not its process group leader"
+        )
+    return VerifiedProcessGroup(leader_pid, observed)
+
+
 def _await_group_exit(
-    ops: ProcessOps, pgid: int, budget: float, poll_seconds: float
+    ops: ProcessOps,
+    group: VerifiedProcessGroup,
+    budget: float,
+    poll_seconds: float,
 ) -> tuple[bool, float]:
     started = ops.monotonic()
     while True:
-        if not ops.group_alive(pgid):
+        ops.reap(group.leader_pid)
+        if not ops.group_alive(group.pgid):
             return True, ops.monotonic() - started
         waited = ops.monotonic() - started
         if waited >= budget:
@@ -153,8 +189,9 @@ def _await_group_exit(
 
 def terminate_process_group(
     ops: ProcessOps,
-    pgid: int,
+    group: VerifiedProcessGroup | None,
     *,
+    natural_grace_seconds: float = 0.0,
     grace_seconds: float = 10.0,
     kill_grace_seconds: float = 5.0,
     poll_seconds: float = 0.05,
@@ -165,22 +202,32 @@ def terminate_process_group(
     grandchildren; the returned evidence says whether the group is really gone.
     """
 
-    pgid = checked_pgid(pgid)
+    natural_grace_seconds = _nonnegative(
+        "natural_grace_seconds", natural_grace_seconds
+    )
     grace_seconds = _positive("grace_seconds", grace_seconds)
     kill_grace_seconds = _positive("kill_grace_seconds", kill_grace_seconds)
     poll_seconds = _positive("poll_seconds", poll_seconds)
     started = ops.monotonic()
-    if not ops.group_alive(pgid):
+    if group is None:
+        return Termination((), True, ops.monotonic() - started)
+
+    gone, _ = _await_group_exit(
+        ops, group, natural_grace_seconds, poll_seconds
+    )
+    if gone:
         return Termination((), True, ops.monotonic() - started)
 
     sent: list[str] = []
-    if ops.signal_group(pgid, signal.SIGTERM):
+    if ops.signal_group(group.pgid, signal.SIGTERM):
         sent.append("SIGTERM")
-    gone, _ = _await_group_exit(ops, pgid, grace_seconds, poll_seconds)
+    gone, _ = _await_group_exit(ops, group, grace_seconds, poll_seconds)
     if not gone:
-        if ops.signal_group(pgid, signal.SIGKILL):
+        if ops.signal_group(group.pgid, signal.SIGKILL):
             sent.append("SIGKILL")
-        gone, _ = _await_group_exit(ops, pgid, kill_grace_seconds, poll_seconds)
+        gone, _ = _await_group_exit(
+            ops, group, kill_grace_seconds, poll_seconds
+        )
     return Termination(tuple(sent), gone, ops.monotonic() - started)
 
 

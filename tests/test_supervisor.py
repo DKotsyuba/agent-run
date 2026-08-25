@@ -21,6 +21,12 @@ from agent_run.state.store import StateStore
 from agent_run.supervisor import DEFAULT_WARNING_TEXT, Supervisor, SupervisorSettings
 from agent_run.verify import ANSWER_INCOMPLETE, DEFAULT_SENTINEL, NO_ANSWER
 
+from agent_run.domain import TERMINAL
+from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.lifecycle import verify_process_group
+from agent_run.verify import GROUP_SURVIVED
+
+
 ENGINE_PID = 4242
 GRANDCHILD_PID = 4243
 
@@ -28,9 +34,18 @@ GRANDCHILD_PID = 4243
 class FakeOps:
     """A fake process table plus a clock that only fake waits advance."""
 
-    def __init__(self, *, members=(ENGINE_PID, GRANDCHILD_PID), ignores_term=frozenset()):
+    def __init__(
+        self,
+        *,
+        members=(ENGINE_PID, GRANDCHILD_PID),
+        ignores_term=frozenset(),
+        natural_exit_at: float | None = None,
+        on_sleep=None,
+    ):
         self.groups = {ENGINE_PID: set(members)}
         self.ignores_term = ignores_term
+        self.natural_exit_at = natural_exit_at
+        self.on_sleep = on_sleep
         self.clock = 0.0
         self.sent: list[int] = []
         self.reaped: list[int] = []
@@ -40,6 +55,13 @@ class FakeOps:
 
     def sleep(self, seconds: float) -> None:
         self.clock += max(0.0, seconds)
+        if self.on_sleep is not None:
+            self.on_sleep()
+        if self.natural_exit_at is not None and self.clock >= self.natural_exit_at:
+            self.groups[ENGINE_PID].clear()
+
+    def process_group(self, pid: int) -> int | None:
+        return next((pgid for pgid, members in self.groups.items() if pid in members), None)
 
     def signal_group(self, pgid: int, signal_number: int) -> bool:
         members = self.groups.get(pgid)
@@ -67,6 +89,15 @@ class FakeOps:
         return set(self.groups[ENGINE_PID])
 
 
+class UnkillableOps(FakeOps):
+    def signal_group(self, pgid: int, signal_number: int) -> bool:
+        if not self.groups.get(pgid):
+            return False
+        if signal_number != 0:
+            self.sent.append(signal_number)
+        return True
+
+
 class FakeSession:
     """A fake engine whose wrapper and grandchild share one process group."""
 
@@ -79,6 +110,7 @@ class FakeSession:
         native_cancel: bool = True,
         steer_error: str | None = None,
         on_wait=None,
+        on_cancel=None,
     ):
         self.pid = ENGINE_PID
         self._ops = ops
@@ -87,6 +119,7 @@ class FakeSession:
         self._native_cancel = native_cancel
         self._steer_error = steer_error
         self._on_wait = on_wait
+        self._on_cancel = on_cancel
         self._exited = False
         self.polls = 0
         self.cancels = 0
@@ -112,6 +145,8 @@ class FakeSession:
 
     def cancel(self, grace_seconds: float) -> None:
         self.cancels += 1
+        if self._on_cancel is not None:
+            self._on_cancel()
         if self._native_cancel:
             self._ops.groups[ENGINE_PID].discard(self.pid)
 
@@ -142,6 +177,20 @@ class CountingStore(StateStore):
     def __init__(self, connection: sqlite3.Connection):
         super().__init__(connection)
         self.heartbeats = 0
+        self.fail_starting_once = False
+        self.fail_running_once = False
+        self.reject_terminal = False
+
+    def transition(self, agent_id, target, **kwargs):
+        if target is AgentStatus.STARTING and self.fail_starting_once:
+            self.fail_starting_once = False
+            raise RuntimeError("starting write failed")
+        if target is AgentStatus.RUNNING and self.fail_running_once:
+            self.fail_running_once = False
+            raise RuntimeError("running write failed")
+        if target in TERMINAL and self.reject_terminal:
+            raise StateTransitionError("terminal write rejected")
+        return super().transition(agent_id, target, **kwargs)
 
     def record_supervisor(self, agent_id, **kwargs) -> None:
         self.heartbeats += 1
@@ -172,7 +221,7 @@ class SupervisorTests(unittest.TestCase):
             StartRequest("fake", "model", "profile", "task", self.root),
             task_summary="task",
             config_revision="rev-1",
-        )
+        ).agent_id
 
     def write_answer(self, text: str) -> None:
         self.answer.write_text(text, encoding="utf-8")
@@ -269,7 +318,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
         self.assertEqual(ops.sent, [signal.SIGTERM], "the surviving grandchild is signalled")
         self.assertEqual(ops.alive_members(), set())
-        self.assertEqual(ops.reaped, [ENGINE_PID])
+        self.assertIn(ENGINE_PID, ops.reaped)
         agent = self.agent()
         self.assertEqual(agent["status"], "succeeded")
         self.assertEqual(agent["answer_bytes"], len(body.encode("utf-8")))
@@ -385,6 +434,134 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.agent()["status"], "failed")
         self.assertEqual(self.agent()["failure_text"], "engine missing")
 
+    def test_natural_quiesce_allows_answer_flush_without_term(self) -> None:
+        body = f"flushed answer\n{DEFAULT_SENTINEL}\n"
+        ops = FakeOps(
+            natural_exit_at=0.5,
+            on_sleep=lambda: self.write_answer(body),
+        )
+        session = FakeSession(
+            ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(ops.sent, [])
+        self.assertEqual(outcome.answer_bytes, len(body.encode()))
+
+    def test_timeout_zero_after_launch_is_cleaned_and_failed(self) -> None:
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+
+        outcome = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=0
+        ).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "supervision_failed")
+        self.assertEqual(session.cancels, 1)
+        self.assertEqual(ops.alive_members(), set())
+
+    def test_non_group_leader_is_native_cancelled_but_never_group_signalled(self) -> None:
+        ops = FakeOps()
+        session = FakeSession(ops)
+        session.pid = GRANDCHILD_PID
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(session.cancels, 1)
+        self.assertEqual(ops.sent, [])
+        self.assertIn(GRANDCHILD_PID, ops.reaped)
+
+    def test_session_wait_exception_reaches_cleanup_and_durable_failure(self) -> None:
+        ops = FakeOps()
+
+        def fail_wait(_poll):
+            raise RuntimeError("wait failed")
+
+        session = FakeSession(ops, native_cancel=False, on_wait=fail_wait)
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(self.agent()["status"], "failed")
+        self.assertEqual(session.cancels, 1)
+        self.assertEqual(ops.alive_members(), set())
+
+    def test_running_transition_exception_reaches_cleanup_and_failure(self) -> None:
+        self.store.fail_running_once = True
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(self.agent()["status"], "failed")
+        self.assertEqual(session.cancels, 1)
+        self.assertEqual(ops.alive_members(), set())
+
+    def test_unkillable_cancel_is_failed_not_coerced_to_cancelled(self) -> None:
+        self.store.enqueue_command(self.agent_id, "cancel", {})
+        ops = UnkillableOps()
+        session = FakeSession(ops, native_cancel=False)
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, GROUP_SURVIVED)
+        self.assertEqual(self.agent()["status"], "failed")
+
+    def test_final_drain_completes_late_cancel_steer_and_unknown(self) -> None:
+        self.store.enqueue_command(self.agent_id, "cancel", {})
+
+        def enqueue_late_commands():
+            self.store.enqueue_command(self.agent_id, "cancel", {})
+            self.store.enqueue_command(self.agent_id, "steer", {"text": "too late"})
+            self.store.enqueue_command(self.agent_id, "other", {})
+
+        ops = FakeOps()
+        session = FakeSession(
+            ops, native_cancel=False, on_cancel=enqueue_late_commands
+        )
+        self.supervisor(FakeAdapter(session), ops).run()
+
+        rows = list(
+            self.store.connection.execute(
+                "SELECT kind, state, result_json FROM commands WHERE agent_id = ? ORDER BY id",
+                (self.agent_id,),
+            )
+        )
+        self.assertTrue(all(row["state"] == "completed" for row in rows))
+        self.assertIn("already_stopping", rows[1]["result_json"])
+        self.assertIn("agent_terminal", rows[2]["result_json"])
+        self.assertIn("agent_terminal", rows[3]["result_json"])
+
+    def test_startup_failure_reports_ready_failure_without_launch(self) -> None:
+        self.store.fail_starting_once = True
+        channel = ReadyChannel.open()
+        self.addCleanup(channel.close_read)
+        adapter = FakeAdapter(FakeSession(FakeOps()))
+
+        with self.assertRaisesRegex(RuntimeError, "starting write failed"):
+            self.supervisor(adapter, FakeOps(), ready=channel).run()
+        with self.assertRaisesRegex(ValidationError, "supervisor failed to start"):
+            channel.wait(1.0)
+        self.assertEqual(adapter.launches, 0)
+
+    def test_commit_rejection_is_not_swallowed_while_agent_is_active(self) -> None:
+        self.store.reject_terminal = True
+        ops = FakeOps()
+        session = FakeSession(
+            ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
+        )
+        self.write_answer(f"done {DEFAULT_SENTINEL}")
+
+        with self.assertRaisesRegex(StateTransitionError, "terminal write rejected"):
+            self.supervisor(FakeAdapter(session), ops).run()
+        self.assertEqual(ops.alive_members(), set())
+        self.assertNotIn(self.agent()["status"], {"succeeded", "cancelled"})
+
     def test_a_surviving_group_is_stopped_before_lost_is_committed(self) -> None:
         ops = FakeOps(ignores_term=frozenset({GRANDCHILD_PID}))
         self.store.transition(self.agent_id, AgentStatus.STARTING)
@@ -394,7 +571,11 @@ class SupervisorTests(unittest.TestCase):
         self.store.transition(self.agent_id, AgentStatus.RUNNING)
 
         termination = terminate_process_group(
-            ops, ENGINE_PID, grace_seconds=1.0, kill_grace_seconds=1.0, poll_seconds=0.5
+            ops,
+            verify_process_group(ops, ENGINE_PID),
+            grace_seconds=1.0,
+            kill_grace_seconds=1.0,
+            poll_seconds=0.5,
         )
         self.assertTrue(termination.group_gone)
         self.assertEqual(ops.alive_members(), set(), "engine group is gone before lost")

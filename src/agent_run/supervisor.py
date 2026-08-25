@@ -10,18 +10,19 @@ from pathlib import Path
 from typing import Mapping
 
 from .adapters.base import Capability, LaunchPlan, RuntimeAdapter, RuntimeSession
-from .domain import AgentId, AgentStatus, Message, Outcome, validate_agent_id
-from .errors import AgentRunError
+from .domain import TERMINAL, AgentId, AgentStatus, Message, Outcome, validate_agent_id
+from .errors import AgentRunError, ValidationError
 from .lifecycle import (
     Deadline,
     Phase,
     ProcessOps,
     ReadyChannel,
     SystemProcessOps,
-    checked_pgid,
+    VerifiedProcessGroup,
     install_signal_handlers,
     restore_signal_handlers,
     terminate_process_group,
+    verify_process_group,
 )
 from .state.store import StateStore
 from .verify import (
@@ -53,6 +54,7 @@ class SupervisorSettings:
     poll_seconds: float = 0.25
     grace_seconds: float = 10.0
     kill_grace_seconds: float = 5.0
+    natural_grace_seconds: float = 1.0
     warning_fraction: float = 0.90
     warning_text: str = DEFAULT_WARNING_TEXT
     silence_threshold_seconds: float = 60.0
@@ -118,7 +120,7 @@ class Supervisor:
         self._identity = identity or supervisor_identity()
         self._pid = os.getpid() if supervisor_pid is None else supervisor_pid
         self._sink = StoreEventSink(store, self._agent_id, self._ops)
-        self._pgid: int | None = None
+        self._group: VerifiedProcessGroup | None = None
         self._stop_reason: str | None = None
         self._signalled = False
         self._warned = False
@@ -129,21 +131,29 @@ class Supervisor:
 
         previous = install_signal_handlers(self._on_signal)
         try:
+            self._report_ready()
+            return self._launch_and_supervise()
+        finally:
+            restore_signal_handlers(previous)
+
+    def _report_ready(self) -> None:
+        try:
             self._store.transition(
                 self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
             )
             if self._ready is not None:
                 self._ready.ready()
-            return self._launch_and_supervise()
-        finally:
-            restore_signal_handlers(previous)
+        except Exception as error:
+            if self._ready is not None:
+                self._ready.failed(str(error))
+            raise
 
     def _on_signal(self, received: int) -> None:
         self._signalled = True
 
     def _launch_and_supervise(self) -> Outcome:
-        steerable = Capability.STEER in self._adapter.describe().capabilities
         try:
+            steerable = Capability.STEER in self._adapter.describe().capabilities
             session = self._adapter.launch(self._plan, self._sink)
         except Exception as error:  # adapter faults must stay durable, not crash
             return self._commit(
@@ -153,18 +163,23 @@ class Supervisor:
                     failure_text=str(error),
                 )
             )
+        try:
+            return self._run_launched(session, steerable)
+        except Exception as error:
+            return self._fail_launched(session, error)
+
+    def _run_launched(self, session: RuntimeSession, steerable: bool) -> Outcome:
         if session.pid is None:
-            self._safe_cancel(session)
-            return self._commit(
-                Outcome(AgentStatus.FAILED, failure_kind="no_process_group")
-            )
-        self._pgid = checked_pgid(session.pid)
+            raise ValidationError("runtime session has no engine pid")
+        self._group = verify_process_group(self._ops, session.pid)
+        if self._group is None:
+            raise ValidationError("engine exited before process-group verification")
         started_at = self._ops.monotonic()
         self._store.record_supervisor(
             self._agent_id,
             pid=self._pid,
             identity=self._identity,
-            process_group_id=self._pgid,
+            process_group_id=self._group.pgid,
         )
         self._last_heartbeat = started_at
         self._store.transition(self._agent_id, AgentStatus.RUNNING, kind="running")
@@ -173,6 +188,38 @@ class Supervisor:
         )
         session_outcome = self._supervise(session, deadline, steerable)
         return self._finish(session, session_outcome)
+
+    def _fail_launched(self, session: RuntimeSession, error: Exception) -> Outcome:
+        """Native-cancel, prove cleanup, then persist every post-launch fault."""
+
+        self._safe_cancel(session)
+        termination = terminate_process_group(
+            self._ops,
+            self._group,
+            grace_seconds=self._settings.grace_seconds,
+            kill_grace_seconds=self._settings.kill_grace_seconds,
+            poll_seconds=min(self._settings.poll_seconds, 1.0),
+        )
+        self._record_termination(termination, best_effort=True)
+        self._reap_session(session)
+        proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
+        outcome = verify_completion(
+            session_outcome=Outcome(
+                AgentStatus.FAILED,
+                failure_kind="supervision_failed",
+                failure_text=str(error),
+                runtime_session_id=self._sink.runtime_session_id,
+            ),
+            stop_reason=None,
+            answer=proof,
+            group_gone=termination.group_gone,
+            last_progress_at=self._sink.last_progress_at,
+            now=self._ops.monotonic(),
+            silence_threshold_seconds=self._settings.silence_threshold_seconds,
+        )
+        committed = self._commit(outcome)
+        self._drain_terminal_commands()
+        return committed
 
     def _supervise(
         self, session: RuntimeSession, deadline: Deadline, steerable: bool
@@ -211,12 +258,13 @@ class Supervisor:
         ):
             return
         self._last_heartbeat = now
-        assert self._pgid is not None
+        if self._group is None:
+            raise ValidationError("engine process group was not verified")
         self._store.record_supervisor(
             self._agent_id,
             pid=self._pid,
             identity=self._identity,
-            process_group_id=self._pgid,
+            process_group_id=self._group.pgid,
         )
 
     def _warn(
@@ -291,12 +339,6 @@ class Supervisor:
         """Adapter-native control first; group signals are the enforcement."""
 
         reason = self._stop_reason
-        if reason == STOP_CANCEL:
-            status = AgentStatus(self._store.get_agent(self._agent_id)["status"])
-            if status is AgentStatus.RUNNING:
-                self._store.transition(
-                    self._agent_id, AgentStatus.CANCELLING, kind="cancelling"
-                )
         self._store.append_event(self._agent_id, "stopping", data={"reason": reason})
         self._safe_cancel(session)
         return self._await_exit(session)
@@ -305,9 +347,12 @@ class Supervisor:
         try:
             session.cancel(self._settings.grace_seconds)
         except Exception as error:  # native cancel is best effort before signals
-            self._store.append_event(
-                self._agent_id, "native_cancel_failed", data={"error": str(error)}
-            )
+            try:
+                self._store.append_event(
+                    self._agent_id, "native_cancel_failed", data={"error": str(error)}
+                )
+            except Exception:
+                pass
 
     def _await_exit(self, session: RuntimeSession) -> Outcome | None:
         started = self._ops.monotonic()
@@ -322,26 +367,23 @@ class Supervisor:
     ) -> Outcome:
         """Verify the group is gone and the answer is real before going terminal."""
 
-        assert self._pgid is not None
+        if self._group is None:
+            raise ValidationError("engine process group was not verified")
+        natural_grace = (
+            self._settings.natural_grace_seconds
+            if self._stop_reason is None and session_outcome is not None
+            else 0.0
+        )
         termination = terminate_process_group(
             self._ops,
-            self._pgid,
+            self._group,
+            natural_grace_seconds=natural_grace,
             grace_seconds=self._settings.grace_seconds,
             kill_grace_seconds=self._settings.kill_grace_seconds,
             poll_seconds=min(self._settings.poll_seconds, 1.0),
         )
-        if termination.signals or not termination.group_gone:
-            self._store.append_event(
-                self._agent_id,
-                "process_group_terminated",
-                data={
-                    "signals": list(termination.signals),
-                    "group_gone": termination.group_gone,
-                    "process_group_id": self._pgid,
-                },
-            )
-        if session.pid is not None:
-            self._ops.reap(session.pid)
+        self._record_termination(termination)
+        self._reap_session(session)
         proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
         outcome = verify_completion(
             session_outcome=session_outcome,
@@ -352,13 +394,62 @@ class Supervisor:
             now=self._ops.monotonic(),
             silence_threshold_seconds=self._settings.silence_threshold_seconds,
         )
-        return self._commit(outcome)
+        committed = self._commit(outcome)
+        self._drain_terminal_commands()
+        return committed
+
+    def _record_termination(self, termination, *, best_effort: bool = False) -> None:
+        if self._group is None or not (termination.signals or not termination.group_gone):
+            return
+        try:
+            self._store.append_event(
+                self._agent_id,
+                "process_group_terminated",
+                data={
+                    "signals": list(termination.signals),
+                    "group_gone": termination.group_gone,
+                    "process_group_id": self._group.pgid,
+                },
+            )
+        except Exception:
+            if not best_effort:
+                raise
+
+    def _reap_session(self, session: RuntimeSession) -> None:
+        pid = session.pid
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1:
+            self._ops.reap(pid)
+
+    def _drain_terminal_commands(self) -> None:
+        while True:
+            command = self._store.claim_command(self._agent_id)
+            if command is None:
+                return
+            kind = str(command["kind"])
+            result = (
+                {"accepted": True, "reason": "already_stopping"}
+                if kind == CANCEL_COMMAND
+                else {"accepted": False, "reason": "agent_terminal"}
+            )
+            self._store.complete_command(int(command["id"]), self._agent_id, result)
 
     def _commit(self, outcome: Outcome) -> Outcome:
         """Commit terminal state, honouring an already-durable cancel intent."""
 
         current = AgentStatus(self._store.get_agent(self._agent_id)["status"])
-        if current is AgentStatus.CANCELLING and outcome.status is not AgentStatus.CANCELLED:
+        if (
+            self._stop_reason == STOP_CANCEL
+            and outcome.status is AgentStatus.CANCELLED
+            and current is AgentStatus.RUNNING
+        ):
+            self._store.transition(
+                self._agent_id, AgentStatus.CANCELLING, kind="cancelling"
+            )
+            current = AgentStatus.CANCELLING
+        if current is AgentStatus.CANCELLING and outcome.status in {
+            AgentStatus.SUCCEEDED,
+            AgentStatus.TIMED_OUT,
+        }:
             outcome = Outcome(
                 AgentStatus.CANCELLED,
                 exit_code=outcome.exit_code,
@@ -374,6 +465,32 @@ class Supervisor:
                 self._agent_id, outcome.status, outcome=outcome, kind="terminal"
             )
         except AgentRunError:
-            # Another writer already sealed this agent; its record wins.
-            pass
+            durable = self._store.get_agent(self._agent_id)
+            status = AgentStatus(str(durable["status"]))
+            if status not in TERMINAL:
+                raise
+            return Outcome(
+                status,
+                exit_code=None
+                if durable["exit_code"] is None
+                else int(durable["exit_code"]),
+                failure_kind=None
+                if durable["failure_kind"] is None
+                else str(durable["failure_kind"]),
+                failure_text=None
+                if durable["failure_text"] is None
+                else str(durable["failure_text"]),
+                runtime_session_id=None
+                if durable["runtime_session_id"] is None
+                else str(durable["runtime_session_id"]),
+                answer_path=None
+                if durable["answer_path"] is None
+                else Path(str(durable["answer_path"])),
+                answer_bytes=None
+                if durable["answer_bytes"] is None
+                else int(durable["answer_bytes"]),
+                answer_sha256=None
+                if durable["answer_sha256"] is None
+                else str(durable["answer_sha256"]),
+            )
         return outcome

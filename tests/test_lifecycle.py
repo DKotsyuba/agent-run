@@ -15,15 +15,23 @@ from agent_run.lifecycle import (
     install_signal_handlers,
     restore_signal_handlers,
     terminate_process_group,
+    verify_process_group,
 )
 
 
 class FakeOps:
     """A process table where a group may hold a wrapper and its grandchild."""
 
-    def __init__(self, groups: dict[int, set[int]], *, ignores_term: frozenset[int] = frozenset()):
+    def __init__(
+        self,
+        groups: dict[int, set[int]],
+        *,
+        ignores_term: frozenset[int] = frozenset(),
+        natural_exit_at: float | None = None,
+    ):
         self.groups = {pgid: set(pids) for pgid, pids in groups.items()}
         self.ignores_term = ignores_term
+        self.natural_exit_at = natural_exit_at
         self.clock = 0.0
         self.sent: list[tuple[int, int]] = []
         self.reaped: list[int] = []
@@ -33,6 +41,12 @@ class FakeOps:
 
     def sleep(self, seconds: float) -> None:
         self.clock += max(0.0, seconds)
+        if self.natural_exit_at is not None and self.clock >= self.natural_exit_at:
+            for members in self.groups.values():
+                members.clear()
+
+    def process_group(self, pid: int) -> int | None:
+        return next((pgid for pgid, members in self.groups.items() if pid in members), None)
 
     def signal_group(self, pgid: int, signal_number: int) -> bool:
         members = self.groups.get(checked_pgid(pgid))
@@ -97,7 +111,9 @@ class DeadlineTests(unittest.TestCase):
 class TerminateProcessGroupTests(unittest.TestCase):
     def test_term_removes_wrapper_and_grandchild_together(self) -> None:
         ops = FakeOps({4242: {4242, 4243}})
-        result = terminate_process_group(ops, 4242, grace_seconds=2.0, poll_seconds=0.5)
+        result = terminate_process_group(
+            ops, verify_process_group(ops, 4242), grace_seconds=2.0, poll_seconds=0.5
+        )
         self.assertEqual(result.signals, ("SIGTERM",))
         self.assertTrue(result.group_gone)
         self.assertEqual(ops.groups[4242], set())
@@ -105,7 +121,11 @@ class TerminateProcessGroupTests(unittest.TestCase):
     def test_a_grandchild_that_ignores_term_is_killed(self) -> None:
         ops = FakeOps({4242: {4242, 4243}}, ignores_term=frozenset({4243}))
         result = terminate_process_group(
-            ops, 4242, grace_seconds=2.0, kill_grace_seconds=1.0, poll_seconds=0.5
+            ops,
+            verify_process_group(ops, 4242),
+            grace_seconds=2.0,
+            kill_grace_seconds=1.0,
+            poll_seconds=0.5,
         )
         self.assertEqual(result.signals, ("SIGTERM", "SIGKILL"))
         self.assertTrue(result.group_gone)
@@ -116,7 +136,9 @@ class TerminateProcessGroupTests(unittest.TestCase):
 
     def test_an_already_dead_group_is_not_signalled(self) -> None:
         ops = FakeOps({4242: set()})
-        result = terminate_process_group(ops, 4242, grace_seconds=1.0, poll_seconds=0.5)
+        result = terminate_process_group(
+            ops, verify_process_group(ops, 4242), grace_seconds=1.0, poll_seconds=0.5
+        )
         self.assertEqual(result.signals, ())
         self.assertTrue(result.group_gone)
         self.assertEqual(ops.sent, [])
@@ -124,7 +146,11 @@ class TerminateProcessGroupTests(unittest.TestCase):
     def test_a_surviving_group_is_reported_not_gone(self) -> None:
         ops = UnkillableOps({4242: {4242}})
         result = terminate_process_group(
-            ops, 4242, grace_seconds=1.0, kill_grace_seconds=1.0, poll_seconds=0.5
+            ops,
+            verify_process_group(ops, 4242),
+            grace_seconds=1.0,
+            kill_grace_seconds=1.0,
+            poll_seconds=0.5,
         )
         self.assertEqual(result.signals, ("SIGTERM", "SIGKILL"))
         self.assertFalse(result.group_gone)
@@ -133,9 +159,29 @@ class TerminateProcessGroupTests(unittest.TestCase):
         ops = FakeOps({4242: {4242}})
         for pgid in (0, 1, -1, True, "4242"):
             with self.assertRaises(ValidationError):
-                terminate_process_group(ops, pgid)
+                verify_process_group(ops, pgid)
         with self.assertRaises(ValidationError):
-            terminate_process_group(ops, 4242, grace_seconds=0)
+            terminate_process_group(
+                ops, verify_process_group(ops, 4242), grace_seconds=0
+            )
+
+    def test_foreign_nonleader_pid_is_never_signalled(self) -> None:
+        ops = FakeOps({4242: {4242, 4243}})
+        with self.assertRaisesRegex(ValidationError, "not its process group leader"):
+            verify_process_group(ops, 4243)
+        self.assertEqual(ops.sent, [])
+
+    def test_natural_quiesce_reaps_before_signalling(self) -> None:
+        ops = FakeOps({4242: {4242, 4243}}, natural_exit_at=0.5)
+        result = terminate_process_group(
+            ops,
+            verify_process_group(ops, 4242),
+            natural_grace_seconds=1.0,
+            poll_seconds=0.25,
+        )
+        self.assertEqual(result.signals, ())
+        self.assertTrue(result.group_gone)
+        self.assertGreaterEqual(ops.reaped.count(4242), 2)
 
 
 class SignalHandlerTests(unittest.TestCase):

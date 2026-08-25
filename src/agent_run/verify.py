@@ -101,17 +101,15 @@ def _silence_note(last_progress_at: float | None, now: float, threshold: float) 
     return f"silence={quiet:.1f}s/{label}"
 
 
-def _answered(proof: AnswerProof | None, outcome: Outcome | None) -> Outcome:
+def _with_answer(outcome: Outcome, proof: AnswerProof | None) -> Outcome:
     if proof is None or not proof.complete:
-        return Outcome(
-            AgentStatus.SUCCEEDED,
-            exit_code=None if outcome is None else outcome.exit_code,
-            runtime_session_id=None if outcome is None else outcome.runtime_session_id,
-        )
+        return outcome
     return Outcome(
-        AgentStatus.SUCCEEDED,
-        exit_code=None if outcome is None else outcome.exit_code,
-        runtime_session_id=None if outcome is None else outcome.runtime_session_id,
+        outcome.status,
+        exit_code=outcome.exit_code,
+        failure_kind=outcome.failure_kind,
+        failure_text=outcome.failure_text,
+        runtime_session_id=outcome.runtime_session_id,
         answer_path=proof.path,
         answer_bytes=proof.size_bytes,
         answer_sha256=proof.sha256,
@@ -146,34 +144,46 @@ def verify_completion(
     session_id = None if session_outcome is None else session_outcome.runtime_session_id
 
     if not group_gone:
-        return Outcome(
-            AgentStatus.FAILED,
-            failure_kind=GROUP_SURVIVED,
-            failure_text=f"{evidence}; {note}",
-            runtime_session_id=session_id,
+        return _with_answer(
+            Outcome(
+                AgentStatus.FAILED,
+                failure_kind=GROUP_SURVIVED,
+                failure_text=f"{evidence}; {note}",
+                runtime_session_id=session_id,
+            ),
+            answer,
         )
     if stop_reason == STOP_CANCEL:
-        return Outcome(
-            AgentStatus.CANCELLED,
-            failure_kind=evidence,
-            failure_text=note,
-            runtime_session_id=session_id,
+        return _with_answer(
+            Outcome(
+                AgentStatus.CANCELLED,
+                failure_kind=evidence,
+                failure_text=note,
+                runtime_session_id=session_id,
+            ),
+            answer,
         )
     if stop_reason == STOP_TIMEOUT:
-        return Outcome(
-            AgentStatus.TIMED_OUT,
-            failure_kind=evidence,
-            failure_text=note,
-            runtime_session_id=session_id,
+        return _with_answer(
+            Outcome(
+                AgentStatus.TIMED_OUT,
+                failure_kind=evidence,
+                failure_text=note,
+                runtime_session_id=session_id,
+            ),
+            answer,
         )
     if session_outcome is None:
-        return Outcome(
-            AgentStatus.FAILED,
-            failure_kind=ENGINE_VANISHED,
-            failure_text=f"{evidence}; {note}",
+        return _with_answer(
+            Outcome(
+                AgentStatus.FAILED,
+                failure_kind=ENGINE_VANISHED,
+                failure_text=f"{evidence}; {note}",
+            ),
+            answer,
         )
     if session_outcome.status is not AgentStatus.SUCCEEDED:
-        return session_outcome
+        return _with_answer(session_outcome, answer)
     if answer is None or not answer.complete:
         return Outcome(
             AgentStatus.FAILED,
@@ -182,4 +192,4 @@ def verify_completion(
             failure_text=note,
             runtime_session_id=session_id,
         )
-    return _answered(answer, session_outcome)
+    return _with_answer(session_outcome, answer)
