@@ -65,6 +65,51 @@ class StateStoreTests(unittest.TestCase):
             )
         self.assertEqual(len(self.store.list_agents()), 1)
 
+    def test_session_lookup_and_agent_filter_are_read_only_and_composable(self) -> None:
+        first = self.create(self.request(task="first"))
+        second = self.create(self.request(task="second"))
+        other = self.create(self.request(task="other"))
+        ref = OrchestratorRef("codex_queue", "session-a", "turn-a")
+        other_ref = OrchestratorRef("codex_queue", "session-b", "turn-b")
+        session_id = self.store.bind_orchestrator(first, ref, at=2)
+        self.assertEqual(self.store.bind_orchestrator(second, ref, at=2), session_id)
+        self.store.bind_orchestrator(other, other_ref, at=2)
+
+        session_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM orchestrator_sessions"
+        ).fetchone()[0]
+        self.assertIsNone(
+            self.store.find_orchestrator_session(
+                OrchestratorRef("codex_queue", "unknown-session")
+            )
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM orchestrator_sessions"
+            ).fetchone()[0],
+            session_count,
+        )
+        self.assertEqual(self.store.find_orchestrator_session(ref), session_id)
+        self.assertEqual(
+            {row["id"] for row in self.store.list_agents(orchestrator_session_id=session_id)},
+            {first, second},
+        )
+        self.assertEqual(len(self.store.list_agents()), 3)
+
+        self.store.transition(first, AgentStatus.STARTING, at=3)
+        self.assertEqual(
+            [
+                row["id"]
+                for row in self.store.list_agents(
+                    statuses=[AgentStatus.CREATED],
+                    orchestrator_session_id=session_id,
+                )
+            ],
+            [second],
+        )
+        with self.assertRaises(ValidationError):
+            self.store.list_agents(orchestrator_session_id=" ")
+
     def test_guarded_transitions_attempts_and_atomic_terminal_outbox(self) -> None:
         agent_id = self.create()
         attempt_id = self.store.create_attempt(
