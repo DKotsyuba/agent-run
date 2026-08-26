@@ -141,6 +141,60 @@ class StateOutboxTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "FOREIGN KEY constraint failed"):
             self.store.record_context_receipt("unknown-session", "key", at=9)
 
+    def test_context_receipt_for_ref_creates_and_reuses_session(self) -> None:
+        ref = OrchestratorRef("codex_queue", "bookkeeping", "turn-1")
+        session_id, changed = self.store.record_context_receipt_for_ref(
+            ref, "first", at=5
+        )
+        self.assertTrue(changed)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM orchestrator_sessions"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            tuple(
+                self.store.connection.execute(
+                    """SELECT context_key, injected_at FROM context_receipts
+                       WHERE orchestrator_session_id = ?""",
+                    (session_id,),
+                ).fetchone()
+            ),
+            ("first", 5),
+        )
+
+        repeated_id, changed = self.store.record_context_receipt_for_ref(
+            OrchestratorRef("codex_queue", "bookkeeping"), "first", at=6
+        )
+        self.assertEqual(repeated_id, session_id)
+        self.assertFalse(changed)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT injected_at FROM context_receipts WHERE orchestrator_session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            5,
+        )
+        self.assertEqual(
+            self.store.record_context_receipt_for_ref(ref, "second", at=7),
+            (session_id, True),
+        )
+
+        agent_id = self.create()
+        self.assertEqual(
+            self.store.bind_orchestrator(
+                agent_id, OrchestratorRef("codex_queue", "bookkeeping", "turn-2"), at=8
+            ),
+            session_id,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM orchestrator_sessions"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_reconciliation_requires_supplied_proof_before_persisting_lost(self) -> None:
         agent_id = self.create()
         with self.assertRaises(ValidationError):

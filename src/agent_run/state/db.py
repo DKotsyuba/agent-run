@@ -218,11 +218,12 @@ def session_for_ref(
         (ref.transport, ref.external_session_id),
     ).fetchone()
     if row is not None:
-        if row["external_turn_id"] != ref.external_turn_id:
-            raise ValidationError("orchestrator session target is immutable")
         connection.execute(
-            "UPDATE orchestrator_sessions SET last_seen_at = MAX(last_seen_at, ?) WHERE id = ?",
-            (at, row["id"]),
+            """UPDATE orchestrator_sessions
+               SET external_turn_id = COALESCE(?, external_turn_id),
+                   last_seen_at = MAX(last_seen_at, ?)
+               WHERE id = ?""",
+            (ref.external_turn_id, at, row["id"]),
         )
         return str(row["id"])
     session_id = f"ors_{uuid.uuid4().hex}"
@@ -240,6 +241,24 @@ def session_for_ref(
         ),
     )
     return session_id
+
+
+def _upsert_context_receipt(
+    connection: sqlite3.Connection,
+    orchestrator_session_id: str,
+    context_key: str,
+    injected_at: float,
+) -> bool:
+    return connection.execute(
+        """INSERT INTO context_receipts (
+               orchestrator_session_id, context_key, injected_at
+           ) VALUES (?, ?, ?)
+           ON CONFLICT(orchestrator_session_id) DO UPDATE SET
+               context_key = excluded.context_key,
+               injected_at = excluded.injected_at
+           WHERE context_receipts.context_key <> excluded.context_key""",
+        (orchestrator_session_id, context_key, injected_at),
+    ).rowcount == 1
 
 
 def insert_event(
