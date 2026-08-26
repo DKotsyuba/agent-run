@@ -1,4 +1,7 @@
+import contextlib
 import json
+import os
+import signal
 import stat
 import sys
 import tempfile
@@ -281,6 +284,93 @@ class ClaudeSessionTests(unittest.TestCase):
         outcome = session.wait(timeout_seconds=5)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+
+    # -- settling on stream content instead of process exit ----------------
+    #
+    # Regression for the live canary: a real claude 2.1.245 child answered
+    # with a clean ``result``/``success`` line but never exited on its own
+    # -- it held stdin open for another turn, per the stream-json protocol,
+    # and (unprompted) later replayed a second full init-to-result cycle on
+    # the same session id. The old ``wait()`` blocked on OS process exit, so
+    # it never settled: no claude agent ever reached ``succeeded``. These
+    # scripts model that exact shape -- they never exit on their own after
+    # answering, only in reaction to being killed or to stdin closing -- so
+    # they fail (``wait`` times out and returns ``None``) on unfixed code.
+
+    def _force_kill(self, session) -> None:
+        process = session._process
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                process.wait(timeout=2)
+
+    def test_wait_settles_on_first_result_without_waiting_for_process_exit(self) -> None:
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-live'}))\n"
+            "print(json.dumps({'type': 'assistant', 'session_id': 'sess-live', 'message': {'role': 'assistant', "
+            "'content': [{'type': 'text', 'text': 'CANARY_OK'}]}}))\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-live', 'subtype': 'success', "
+            "'is_error': False, 'result': 'CANARY_OK', 'duration_ms': 1, 'num_turns': 1, "
+            "'total_cost_usd': 0.01, 'usage': {}}))\n"
+            "sys.stdout.flush()\n"
+            # The real engine holds stdin open for another turn instead of
+            # exiting. If agent-run left stdin open, feed a duplicate second
+            # cycle here to prove settling is also idempotent against it.
+            "line = sys.stdin.readline()\n"
+            "if line:\n"
+            "    print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-live'}))\n"
+            "    print(json.dumps({'type': 'result', 'session_id': 'sess-live', 'subtype': 'success', "
+            "'is_error': False, 'result': 'CANARY_OK', 'duration_ms': 1, 'num_turns': 1, "
+            "'total_cost_usd': 0.02, 'usage': {}}))\n"
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        self.addCleanup(self._force_kill, session)
+
+        started = time.monotonic()
+        outcome = session.wait(timeout_seconds=15)
+        elapsed = time.monotonic() - started
+
+        self.assertIsNotNone(outcome, "wait() never settled even though a result/success line was streamed")
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertLess(elapsed, 10, "wait() waited near the full timeout instead of settling on the stream")
+        answer = self.agent_dir / "answer.md"
+        self.assertIn("CANARY_OK", answer.read_text(encoding="utf-8"))
+
+        # The still-running engine was actually ended, not just ignored.
+        self.assertIsNotNone(session._process.poll())
+
+        # No duplicate cycle was ever allowed to happen: closing stdin (and
+        # signalling) as soon as the first result arrived pre-empts it.
+        log_lines = [
+            json.loads(line) for line in self.log_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        result_lines = [entry for entry in log_lines if entry.get("type") == "result"]
+        self.assertEqual(len(result_lines), 1)
+
+    def test_wait_settles_failed_on_first_error_result_without_waiting_for_process_exit(self) -> None:
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-live', 'subtype': 'error_during_execution', "
+            "'is_error': True, 'result': 'boom'}))\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.readline()\n"  # holds stdin open, exactly like the success case above
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        self.addCleanup(self._force_kill, session)
+
+        started = time.monotonic()
+        outcome = session.wait(timeout_seconds=15)
+        elapsed = time.monotonic() - started
+
+        self.assertIsNotNone(outcome, "wait() never settled even though a terminal error result was streamed")
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "error_during_execution")
+        self.assertLess(elapsed, 10, "wait() waited near the full timeout instead of settling on the stream")
+        self.assertIsNotNone(session._process.poll())
 
 
 if __name__ == "__main__":

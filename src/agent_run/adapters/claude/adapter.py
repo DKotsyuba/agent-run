@@ -424,6 +424,18 @@ class ClaudeSession:
         self._lock = threading.Lock()
         self._cancelled = False
         self._reader_error: BaseException | None = None
+        # Set the instant a terminal ``result`` line is decoded, or when the
+        # reader loop ends for any other reason (crash, EOF). ``wait`` blocks
+        # on this instead of on OS process exit: the real engine holds stdin
+        # open for another turn after answering, which in agent-run's
+        # one-shot task model never comes, so process exit is not a signal
+        # we can wait on.
+        self._settled = threading.Event()
+        # Set when ``wait`` had to end a still-alive child itself (rather
+        # than the child exiting on its own): the resulting exit code (a
+        # signal-terminated process rarely reports 0) must not then flip an
+        # otherwise-successful engine result to failed.
+        self._force_stopped = False
         self._secrets = _known_secrets(plan)
         self._raw_stream = _open_runtime_log(plan.runtime_stream_path)
         try:
@@ -448,32 +460,41 @@ class ClaudeSession:
         return True
 
     def _read_stdout(self) -> None:
-        stdout = self._process.stdout
-        if stdout is None:
-            return
-        for raw_line in stdout:
-            try:
-                sanitized = sanitize_line(raw_line, self._secrets)
-                with self._lock:
-                    self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
-                    self._raw_stream.flush()
-                result = self._decoder.feed(sanitized, at=time.time())
-                if result.session_id:
-                    self._sink.session(result.session_id)
-                for message in result.messages:
-                    self._sink.message(message)
-                if result.event:
-                    self._sink.event(*result.event)
-                if result.warning:
-                    # Best-effort: a bookkeeping write here must never mask
-                    # the real outcome already captured in ``result``/self._decoder.
-                    with contextlib.suppress(Exception):
-                        self._sink.event("stream_diagnostic", {"reason": result.warning})
-                if result.terminal:
-                    self._sink.event("runtime_result", terminal_event_data(result.terminal))
-            except BaseException as error:  # persisted for wait(); keep draining the pipe
-                if self._reader_error is None:
-                    self._reader_error = error
+        try:
+            stdout = self._process.stdout
+            if stdout is None:
+                return
+            for raw_line in stdout:
+                try:
+                    sanitized = sanitize_line(raw_line, self._secrets)
+                    with self._lock:
+                        self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
+                        self._raw_stream.flush()
+                    result = self._decoder.feed(sanitized, at=time.time())
+                    if result.session_id:
+                        self._sink.session(result.session_id)
+                    for message in result.messages:
+                        self._sink.message(message)
+                    if result.event:
+                        self._sink.event(*result.event)
+                    if result.warning:
+                        # Best-effort: a bookkeeping write here must never mask
+                        # the real outcome already captured in ``result``/self._decoder.
+                        with contextlib.suppress(Exception):
+                            self._sink.event("stream_diagnostic", {"reason": result.warning})
+                    if result.terminal:
+                        self._sink.event("runtime_result", terminal_event_data(result.terminal))
+                        # First result/success (or error) wins: settle now
+                        # instead of waiting for the child to exit on its own.
+                        self._settled.set()
+                except BaseException as error:  # persisted for wait(); keep draining the pipe
+                    if self._reader_error is None:
+                        self._reader_error = error
+        finally:
+            # Covers the crash/EOF case too: the child exited (or the pipe
+            # closed) without ever producing a terminal line, so ``wait``
+            # must still unblock and fall back to ``finalize()``.
+            self._settled.set()
 
     def steer(self, text: str) -> None:
         stdin = self._process.stdin
@@ -504,11 +525,50 @@ class ClaudeSession:
         while time.time() < deadline and self._process.poll() is None:
             time.sleep(0.05)
 
-    def wait(self, timeout_seconds: float | None) -> Outcome | None:
+    def _stop_process(self) -> None:
+        """End a child that is still alive after its answer already arrived.
+
+        The real engine holds stdin open for another turn in this
+        stream-json session; agent-run's one-shot task model has nothing
+        more to send, so leaving it running only strands the process group
+        and leaves room for a spurious duplicate cycle (observed live: a
+        second system/init-to-result cycle on the same session, long after
+        the first result/success). Idempotent settling in the decoder means
+        such a duplicate is discarded even if this loses the race, but
+        closing stdin and signaling promptly avoids relying on that.
+        """
+
+        self._force_stopped = True
+        stdin = self._process.stdin
+        if stdin is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stdin.close()
+        with contextlib.suppress(OSError):
+            self._process.send_signal(signal.SIGINT)
         try:
-            exit_code = self._process.wait(timeout=timeout_seconds)
+            self._process.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(self._process.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self._process.wait(timeout=5)
+
+    def wait(self, timeout_seconds: float | None) -> Outcome | None:
+        # Settle on stream content, not process exit: the child may keep
+        # running (or spontaneously start a second turn) after its first
+        # result/success line arrives, per the live evidence above.
+        if not self._settled.wait(timeout=timeout_seconds):
             return None
+        try:
+            # Brief natural-exit grace: a process that answered and is
+            # already finishing on its own should not be signalled.
+            exit_code = self._process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            self._stop_process()
+            try:
+                exit_code = self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return None
         self._reader.join(timeout=5 if timeout_seconds is None else timeout_seconds)
         if self._reader.is_alive():
             return None
@@ -523,8 +583,12 @@ class ClaudeSession:
         if self._reader_error is not None:
             raise self._reader_error
         metadata = self._decoder.finalize()
+        # A signal-terminated exit code from ``_stop_process`` reflects how
+        # agent-run ended an already-answered child, not whether the engine
+        # itself succeeded; only a naturally-exited child must report 0.
+        exit_ok = exit_code == 0 or self._force_stopped
         succeeded = (
-            exit_code == 0
+            exit_ok
             and not metadata.is_error
             and metadata.subtype != "no_answer"
             and bool(metadata.result_text)
@@ -540,7 +604,7 @@ class ClaudeSession:
             failure_text = None
         else:
             empty_result = (
-                exit_code == 0
+                exit_ok
                 and not metadata.is_error
                 and metadata.subtype != "no_answer"
                 and not metadata.result_text
