@@ -66,6 +66,17 @@ command = ["echo", "done"]
         self.assertEqual(config.runtimes["fake"].models, ("test",))
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))
 
+    def test_delivery_queue_binary_is_optional_and_absolute(self) -> None:
+        self.assertIsNone(self.load("schema_version = 1\n").delivery.codex_queue_bin)
+        configured = self.load(
+            'schema_version = 1\n[delivery]\ncodex_queue_bin = "/bin/echo"\n'
+        )
+        self.assertEqual(configured.delivery.codex_queue_bin, Path("/bin/echo"))
+        with self.assertRaisesRegex(ValidationError, "delivery.codex_queue_bin"):
+            self.load(
+                'schema_version = 1\n[delivery]\ncodex_queue_bin = "relative"\n'
+            )
+
     def test_core_and_capacity_bounds_fail_during_load(self) -> None:
         invalid = (
             ("core", "warning_fraction", "true"),

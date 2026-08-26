@@ -92,7 +92,9 @@ def _parser() -> argparse.ArgumentParser:
     transcript.add_argument("agent_id")
     transcript.add_argument("--cursor", type=int, default=0)
     transcript.add_argument("--limit", type=int, default=200)
-    transcript.add_argument("--full", action="store_true")
+    transcript_mode = transcript.add_mutually_exclusive_group()
+    transcript_mode.add_argument("--follow", action="store_true")
+    transcript_mode.add_argument("--full", action="store_true")
 
     commands.add_parser("models")
     commands.add_parser("limits")
@@ -119,6 +121,13 @@ def _parser() -> argparse.ArgumentParser:
     delivery_cancel = delivery.add_parser("cancel")
     delivery_cancel.add_argument("delivery_id")
     delivery.add_parser("dispatch")
+    delivery_launchd = delivery.add_parser("launchd")
+    delivery_launchd.add_argument("--binary", required=True)
+    delivery_launchd.add_argument(
+        "--label", default="com.pluto.agent-run.delivery"
+    )
+    delivery_launchd.add_argument("--stdout-log", default="/dev/null")
+    delivery_launchd.add_argument("--stderr-log")
 
     hook = commands.add_parser("hook").add_subparsers(
         dest="hook_command", required=True
@@ -163,18 +172,6 @@ def _payload(stream: TextIO) -> dict:
 def _hook_payload(payload: dict, *, bind: bool) -> dict:
     if "session_id" not in payload:
         return payload
-    unknown = set(payload) - {
-        "session_id",
-        "turn_id",
-        "cwd",
-        "hook_event_name",
-        "prompt",
-        "tool_name",
-        "tool_input",
-        "tool_response",
-    }
-    if unknown:
-        raise ValidationError(f"unknown raw hook payload keys: {sorted(unknown)}")
     expected_event = "PostToolUse" if bind else "UserPromptSubmit"
     event = payload.get("hook_event_name")
     if event is not None and event != expected_event:
@@ -267,6 +264,39 @@ def _full_transcript(service, args: argparse.Namespace):
         cursor = page.next_cursor
 
 
+def _follow_transcript(service, args: argparse.Namespace):
+    import time
+
+    from .domain import TERMINAL
+
+    cursor = args.cursor
+    messages = []
+    pages = 0
+    while True:
+        page = service.transcript(args.agent_id, cursor=cursor, limit=args.limit)
+        pages += 1
+        if page.messages:
+            next_cursor = page.messages[-1].seq
+            if next_cursor <= cursor:
+                raise AgentRunError("transcript pagination did not advance")
+            cursor = next_cursor
+            messages.extend(page.messages)
+        elif not page.complete:
+            raise AgentRunError("transcript pagination did not advance")
+        if not page.complete:
+            continue
+        if service.get(args.agent_id).status in TERMINAL:
+            return {
+                "agent_id": page.agent_id,
+                "messages": messages,
+                "cursor": args.cursor,
+                "next_cursor": None,
+                "complete": True,
+                "pages": pages,
+            }
+        time.sleep(0.25)
+
+
 def _execute(args: argparse.Namespace, service, stream: TextIO):
     command = args.command
     if command == "start":
@@ -288,7 +318,9 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
         return service.summary(agent_id=args.agent_id, orchestrator=_ref(args))
     if command == "transcript":
         return (
-            _full_transcript(service, args)
+            _follow_transcript(service, args)
+            if args.follow
+            else _full_transcript(service, args)
             if args.full
             else service.transcript(args.agent_id, args.cursor, args.limit)
         )
@@ -366,20 +398,50 @@ def _capacity_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]
     }
 
 
-def _dispatch_once(home: Path):
-    executable = os.environ.get("CODEX_QUEUE_BIN")
-    if not executable or not Path(executable).is_absolute():
-        raise ValidationError("CODEX_QUEUE_BIN must name an absolute executable")
+def _delivery_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    from .delivery.launchd import argv, build_configured_job, render_plist
+
     config = load_config(config_path(home))
+    job = build_configured_job(
+        config.delivery,
+        args.label,
+        Path(args.binary),
+        home,
+        stdout_log=Path(args.stdout_log),
+        stderr_log=(
+            home / "delivery-worker.err.log"
+            if args.stderr_log is None
+            else Path(args.stderr_log)
+        ),
+    )
+    return {
+        "label": job.label,
+        "interval_seconds": job.interval_seconds,
+        "argv": argv(job),
+        "plist": render_plist(job),
+    }
+
+
+def _dispatch_once(home: Path):
+    config = load_config(config_path(home))
+    executable = (
+        os.environ["CODEX_QUEUE_BIN"]
+        if "CODEX_QUEUE_BIN" in os.environ
+        else config.delivery.codex_queue_bin
+    )
+    if executable is None or not str(executable) or not Path(executable).is_absolute():
+        raise ValidationError(
+            "delivery.codex_queue_bin or CODEX_QUEUE_BIN must name an absolute executable"
+        )
     store = StateStore.open(state_db_path(home))
     try:
-        sender = CodexQueueSender(executable, timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
+        sender = CodexQueueSender(str(executable), timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
         dispatcher = DeliveryDispatcher(
             store,
             {TRANSPORT_NAME: CodexQueueTransport(sender)},
             config.delivery,
         )
-        return dispatcher.run(home=home, max_batch=1)
+        return dispatcher.run(home=home)
     finally:
         store.close()
 
@@ -495,10 +557,33 @@ class _Runtime:
 
 
 def _initialize(home: Path):
-    load_config(config_path(home))
+    created = not home.exists()
+    if not created and not home.is_dir():
+        raise ValidationError("agent-run home must be a directory")
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if created:
+        home.chmod(0o700)
+    path = config_path(home)
+    if path.is_symlink():
+        raise ValidationError("config.toml must not be a symlink")
+    if not path.exists():
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write("schema_version = 1\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+    load_config(path)
     store = StateStore.initialize(state_db_path(home))
     store.close()
-    return {"home": home, "config": config_path(home), "state": state_db_path(home)}
+    return {"home": home, "config": path, "state": state_db_path(home)}
 
 
 def _doctor(home: Path):
@@ -536,6 +621,8 @@ def main(
             result = _doctor(home)
         elif args.command == "capacity" and args.capacity_command == "launchd":
             result = _capacity_launchd(home, args)
+        elif args.command == "delivery" and args.delivery_command == "launchd":
+            result = _delivery_launchd(home, args)
         else:
             if service is None:
                 owned = _Runtime(home)

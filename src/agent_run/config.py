@@ -39,6 +39,7 @@ class DeliveryConfig:
     retry_base_seconds: float = 2
     retry_cap_seconds: float = 60
     max_attempts: int = 0
+    codex_queue_bin: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -242,7 +243,9 @@ def _parse_capacity(value: object) -> CapacityConfig:
 def _parse_delivery(value: object) -> DeliveryConfig:
     table = _table(value, "delivery")
     _reject_unknown(
-        table, {"retry_base_seconds", "retry_cap_seconds", "max_attempts"}, "delivery"
+        table,
+        {"retry_base_seconds", "retry_cap_seconds", "max_attempts", "codex_queue_bin"},
+        "delivery",
     )
     base = _number(
         table.get("retry_base_seconds", 2),
@@ -258,6 +261,9 @@ def _parse_delivery(value: object) -> DeliveryConfig:
         base,
         cap,
         _int(table.get("max_attempts", 0), "delivery.max_attempts", minimum=0),
+        None
+        if table.get("codex_queue_bin") is None
+        else _path(table["codex_queue_bin"], "delivery.codex_queue_bin"),
     )
 
 

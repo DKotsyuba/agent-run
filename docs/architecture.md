@@ -204,6 +204,7 @@ context_max_chars = 2500
 retry_base_seconds = 2
 retry_cap_seconds = 60
 max_attempts = 0 # durable retries; zero means unlimited
+codex_queue_bin = "/absolute/path/to/codex"
 
 [profiles]
 directory = "~/.agent-run/profiles"
@@ -275,6 +276,9 @@ Rules:
 - `capacity.sample_retention` bounds collector-managed history to the global
   newest rows ordered by `observed_at DESC, id DESC`, including expired rows
   used for trends;
+- `delivery.codex_queue_bin` is an absolute owner-authored executable; an
+  explicit absolute `CODEX_QUEUE_BIN` environment value overrides it for
+  compatibility;
 - a runtime disabled in config cannot be launched or queried for live capacity;
 - generated runtime configuration is content-addressed by a configuration hash;
 - runtime-owned session/cache/trust state is not erased during regeneration;
@@ -840,7 +844,9 @@ Binding rules:
 - if binding happens after terminal completion, the waiting delivery is activated
   transactionally;
 - terminal completion must always create or activate exactly one local outbox
-  item for chat delivery.
+  item for chat delivery;
+- raw third-party hook envelopes may contain unrelated fields, but the normalized
+  binding payload remains strict and missing or conflicting agent ids refuse.
 
 Trusted payload:
 
@@ -869,7 +875,9 @@ Claims use leases and capped exponential backoff. Retries are unlimited by
 default. Where a transport offers an idempotency key, use `notification_id`.
 Codex queue currently does not, so ambiguous acceptance remains at-least-once.
 Duplicate messages reference the same `agent_id` and must never launch a
-replacement.
+replacement. A one-shot periodic launchd sweeper reclaims due `retry_wait` rows
+after the terminal child exits. Each trigger drains a bounded multi-row batch;
+the next trigger recovers overflow without a resident daemon or busy loop.
 
 ## 12. Capacity and active-agent context
 
@@ -962,10 +970,16 @@ agent-run models
 agent-run limits
 agent-run context
 agent-run capacity collect --once
-agent-run delivery status|cancel|dispatch
+agent-run delivery status|cancel|dispatch|launchd
 agent-run doctor
 agent-run init
 ```
+
+`transcript --follow` advances its cursor without duplicates, polls at a bounded
+interval while the agent is active, and exits after terminal state plus a drained
+transcript. `--full` keeps its finite current-pagination semantics. On a fresh
+home, `init` creates a private minimal config and state database without inventing
+runtime, delivery, or credential values; an existing config is never replaced.
 
 Minimum MCP tools:
 
@@ -1103,6 +1117,15 @@ Core acceptance tests:
 21. Service and context capacity history use the configured retention, include
     expired trend rows within that bound, and do not fall back to a separate
     hardcoded limit.
+22. Due delivery retries wake after terminal child exit, respect
+    `next_attempt_at`, drain a bounded backlog larger than one, and leave overflow
+    recoverable by the next one-shot sweep.
+23. Delivery uses the absolute owner-configured Codex queue executable unless an
+    explicit absolute compatibility environment override is present.
+24. Fresh `init` creates private minimal config/state artifacts idempotently and
+    writes no credentials or inferred runtime configuration.
+25. Transcript follow is duplicate-free and terminal-bounded; raw hook envelopes
+    ignore unrelated fields while normalized payloads remain strict.
 
 ## 17. Decisions
 
