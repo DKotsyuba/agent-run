@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agent_run.adapters.opencode.permissions import PermissionBroker
 from agent_run.adapters.opencode.service import PASSWORD_ENV
 from agent_run.adapters.opencode.http import (
     HEALTH_PATH,
@@ -412,6 +413,29 @@ class EmptyAcknowledgementTests(ClientCase):
                 client = self.client(FakeReply(b"", status=status))
                 self.assertEqual(
                     dict(client.answer_permission("ses_1", "perm_1", {"reply": "once"})), {}
+                )
+
+
+class PermissionBrokerReplyEncodingTests(ClientCase):
+    """Reproduces the live supervision_failed fault: a permission arriving
+    during launch drove PermissionBroker.reply()'s real (unfixed) return
+    value -- a MappingProxyType -- straight into _once(), which does
+    ``json.dumps(payload)`` with no dict()-unwrapping step first. json.dumps
+    raises "Object of type mappingproxy is not JSON serializable" for a
+    mappingproxy at any nesting depth, including the top level, so the POST
+    body never got built at all."""
+
+    def test_broker_reply_survives_the_real_json_encoding_step(self):
+        broker = PermissionBroker()
+        for kind in ("external_directory", "bash"):
+            with self.subTest(kind=kind):
+                decision = broker.decide({"id": f"p-{kind}", "type": kind, "path": "/"})
+                client = self.client(FakeReply(b"", status=NO_CONTENT))
+                client.answer_permission("ses_1", decision.permission_id, broker.reply(decision))
+                _, _, body = self.opener.calls[0]
+                self.assertEqual(
+                    json.loads(body.decode("utf-8")),
+                    {"reply": "once" if decision.granted else "reject"},
                 )
 
 
