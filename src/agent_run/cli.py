@@ -19,6 +19,7 @@ from .capacity.launchd import build_configured_job, render_plist
 from .config import load_config
 from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueSender, CodexQueueTransport
 from .delivery.dispatch import DeliveryDispatcher
+from .doctor import run_doctor
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import AgentRunError, ValidationError
 from .hooks.bind import ref_from_payload, run_hook
@@ -26,7 +27,7 @@ from .hooks.context import build_context
 from .launch import launch_detached
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
-from .state import StateStore
+from .state import StateStore, reconcile_reaped_supervisor
 from .supervisor import Supervisor, SupervisorSettings
 
 _MAX_STDIN_CHARS = 1_048_576
@@ -447,6 +448,13 @@ def _dispatch_once(home: Path):
 
 
 def _launch_callback(home: Path):
+    def post_reap(pid: int, _wait_status: int) -> None:
+        store = StateStore.open(state_db_path(home))
+        try:
+            reconcile_reaped_supervisor(store, pid)
+        finally:
+            store.close()
+
     def launch(
         agent_id: AgentId,
         request: StartRequest,
@@ -477,6 +485,7 @@ def _launch_callback(home: Path):
             child,
             post_terminal=lambda: _dispatch_once(home),
             post_terminal_timeout_seconds=_POST_TERMINAL_TIMEOUT_SECONDS,
+            post_reap=post_reap,
         )
 
     return launch
@@ -587,10 +596,7 @@ def _initialize(home: Path):
 
 
 def _doctor(home: Path):
-    load_config(config_path(home))
-    store = StateStore.open(state_db_path(home))
-    store.close()
-    return {"home": home, "config": "ok", "state": "ok"}
+    return run_doctor(home)
 
 
 def main(

@@ -508,6 +508,25 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(config.stat().st_ino, before)
 
+    def test_doctor_delegates_to_the_structured_read_only_seam(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            stdout = io.StringIO()
+            report = {"home": home, "findings": []}
+            with patch.object(cli, "run_doctor", return_value=report) as doctor:
+                code = cli.main(
+                    ["--home", str(home), "doctor"],
+                    stdin=io.StringIO(),
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                json.loads(stdout.getvalue()),
+                {"home": str(home), "findings": []},
+            )
+            doctor.assert_called_once_with(home)
+
     def test_hook_context_wraps_first_injection_and_suppresses_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
@@ -876,7 +895,14 @@ class CliTests(unittest.TestCase):
                 events.append("dispatch")
                 raise RuntimeError("delivery failed")
 
-            def detached(child, *, post_terminal, post_terminal_timeout_seconds):
+            def reconciled(reconcile_store, pid):
+                self.assertIs(reconcile_store, store)
+                self.assertEqual(pid, 123)
+                events.append("reconcile")
+
+            def detached(
+                child, *, post_terminal, post_terminal_timeout_seconds, post_reap
+            ):
                 events.append("child")
                 child(ready)
                 self.assertEqual(post_terminal_timeout_seconds, 31.0)
@@ -884,6 +910,7 @@ class CliTests(unittest.TestCase):
                     post_terminal()
                 except RuntimeError:
                     events.append("dispatch_failed")
+                post_reap(123, 0)
                 return 123
 
             with patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
@@ -892,15 +919,28 @@ class CliTests(unittest.TestCase):
                 cli, "launch_detached", side_effect=detached
             ), patch.object(
                 cli, "_dispatch_once", side_effect=failed_dispatch
+            ), patch.object(
+                cli, "reconcile_reaped_supervisor", side_effect=reconciled
             ):
                 cli._launch_callback(home)(
                     AgentId(AGENT_ID), request, object(), object(), home / "agents" / AGENT_ID
                 )
 
-        opened.assert_called_once_with(home.resolve() / "state.db")
-        store.close.assert_called_once_with()
+        self.assertEqual(opened.call_count, 2)
+        opened.assert_called_with(home.resolve() / "state.db")
+        self.assertEqual(store.close.call_count, 2)
         supervisor.run.assert_called_once_with()
-        self.assertEqual(events, ["child", "store_closed", "dispatch", "dispatch_failed"])
+        self.assertEqual(
+            events,
+            [
+                "child",
+                "store_closed",
+                "dispatch",
+                "dispatch_failed",
+                "reconcile",
+                "store_closed",
+            ],
+        )
         self.assertEqual(constructor.call_args.kwargs["answer_path"], home / "agents" / AGENT_ID / "answer.md")
         self.assertEqual(constructor.call_args.kwargs["timeout_seconds"], 480)
         self.assertIs(constructor.call_args.kwargs["ready"], ready)
