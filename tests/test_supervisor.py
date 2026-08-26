@@ -3,6 +3,7 @@ import signal
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -15,11 +16,12 @@ from agent_run.adapters.base import (
     LaunchPlan,
     RuntimeInfo,
 )
-from agent_run.domain import AgentStatus, Outcome, StartRequest
+from agent_run.domain import AgentStatus, Message, MessageRole, Outcome, StartRequest
 from agent_run.lifecycle import ReadyChannel, terminate_process_group
 from agent_run.state.store import StateStore
 from agent_run.supervisor import (
     DEFAULT_WARNING_TEXT,
+    StoreEventSink,
     Supervisor,
     SupervisorSettings,
     supervisor_identity,
@@ -783,6 +785,104 @@ class SupervisorTests(unittest.TestCase):
         agent = self.agent()
         self.assertEqual(agent["status"], "lost")
         self.assertEqual(agent["failure_kind"], "supervisor_dead")
+
+
+class StoreEventSinkThreadingTests(unittest.TestCase):
+    """A detached supervisor's engine adapter may call the sink from a
+    background stream-reader thread (Claude's adapter does). The sink's
+    connection was created on the supervisor's own thread, and sqlite3
+    connections are thread-affine, so a naive shared connection raises
+    ``sqlite3.ProgrammingError`` the first time a non-owner thread writes."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = StateStore.initialize(self.root / "state.db")
+        self.addCleanup(self.store.close)
+        self.agent_id = self.store.create_agent(
+            StartRequest(
+                "fake", "model", "profile", "task", self.root, timeout_seconds=480
+            ),
+            task_summary="task",
+            config_revision="rev-1",
+        ).agent_id
+
+    def events(self, kind: str) -> list[sqlite3.Row]:
+        return list(
+            self.store.connection.execute(
+                "SELECT * FROM events WHERE agent_id = ? AND kind = ? ORDER BY seq",
+                (self.agent_id, kind),
+            )
+        )
+
+    def run_in_thread(self, target) -> threading.Thread:
+        worker = threading.Thread(target=target)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "worker thread did not finish in time")
+        return worker
+
+    def test_sink_write_from_a_non_owner_thread_lands_durably(self) -> None:
+        sink = StoreEventSink(self.store, self.agent_id, FakeOps())
+        errors: list[BaseException] = []
+
+        def call_from_worker() -> None:
+            try:
+                sink.event("worker_event", {"from": "worker"})
+            except BaseException as error:  # captured, not swallowed by the thread
+                errors.append(error)
+
+        self.run_in_thread(call_from_worker)
+
+        self.assertEqual(errors, [])
+        rows = self.events("worker_event")
+        self.assertEqual(len(rows), 1)
+
+    def test_sink_message_and_session_from_a_non_owner_thread_land_durably(self) -> None:
+        sink = StoreEventSink(self.store, self.agent_id, FakeOps())
+        message = Message(at=1.0, role=MessageRole.ASSISTANT, content="hello")
+        errors: list[BaseException] = []
+
+        def call_from_worker() -> None:
+            try:
+                sink.session("runtime-session-1")
+                sink.message(message)
+            except BaseException as error:
+                errors.append(error)
+
+        self.run_in_thread(call_from_worker)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sink.runtime_session_id, "runtime-session-1")
+        self.assertEqual(len(self.events("runtime_session")), 1)
+        transcript = self.store.transcript(self.agent_id)
+        self.assertEqual([row["content"] for row in transcript], ["hello"])
+
+    def test_concurrent_sink_writes_from_two_threads_all_land_without_error(self) -> None:
+        sink = StoreEventSink(self.store, self.agent_id, FakeOps())
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def call_from_worker(index: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                sink.event(f"concurrent_event_{index}", {"index": index})
+            except BaseException as error:
+                errors.append(error)
+
+        workers = [
+            threading.Thread(target=call_from_worker, args=(index,)) for index in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.events("concurrent_event_0")), 1)
+        self.assertEqual(len(self.events("concurrent_event_1")), 1)
 
 
 if __name__ == "__main__":

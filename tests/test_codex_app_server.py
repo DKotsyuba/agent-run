@@ -40,7 +40,10 @@ class FakeTransport:
         queue = self._responses.get(method)
         if not queue:
             return {}
-        return queue.pop(0)
+        response = queue.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     def poll_event(self, timeout):
         if self._events:
@@ -152,6 +155,33 @@ _LIVE_WORKSPACE_WRITE_ECHO = {
     "reasoningEffort": None,
     "multiAgentMode": "explicitRequestOnly",
 }
+
+#: Captured live 2026-08-26 from a real probe against codex CLI 0.149.1's
+#: app-server, for a turn/start whose request had
+#: input=[{"type": "text", "text": "Return exactly CANARY_OK"}]. Confirms
+#: the beta contract needs a sequence: a bare string input is rejected with
+#: -32600 "invalid type: string ..., expected a sequence" -- the exact
+#: proven-live failure this module fixes.
+_LIVE_TURN_START_ACK = {
+    "turn": {
+        "id": "01a03ec9-529b-74a3-9d84-5d90190a9ca4",
+        "items": [],
+        "itemsView": "notLoaded",
+        "status": "inProgress",
+        "error": None,
+        "startedAt": None,
+        "completedAt": None,
+        "durationMs": None,
+    }
+}
+
+#: Same live probe: turn/steer under the beta contract needs the ``input``
+#: key (not ``text``), the same sequence shape, and a new required
+#: ``expectedTurnId`` naming the turn started above. Success echoes only
+#: ``turnId`` -- there is no ``accepted``/``reason`` pair in this contract,
+#: so a rejection is signalled the same way every other method signals one:
+#: a JSON-RPC error, which ``ProcessTransport.request`` already raises.
+_LIVE_TURN_STEER_ACK = {"turnId": "01a03ecc-dc6f-7670-a9f0-f56b351fc701"}
 
 
 class VerifyEffectiveParamsTests(unittest.TestCase):
@@ -281,7 +311,7 @@ class StartSessionTests(unittest.TestCase):
             responses={
                 "initialize": [{}],
                 "thread/start": [thread_response(cwd)],
-                "turn/start": [{}],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
             }
         )
         sink = FakeSink()
@@ -292,7 +322,10 @@ class StartSessionTests(unittest.TestCase):
         self.assertEqual(methods, ["initialize", "thread/start", "turn/start"])
         self.assertEqual(len(transport.timeouts), 3)
         self.assertTrue(all(0 < value <= 30 for value in transport.timeouts))
-        self.assertEqual(transport.requests[-1][1]["input"], "do the thing")
+        self.assertEqual(
+            transport.requests[-1][1]["input"],
+            [{"type": "text", "text": "do the thing"}],
+        )
 
     def test_refuses_when_effective_params_drift(self) -> None:
         cwd = Path("/work")
@@ -337,13 +370,66 @@ class StartSessionTests(unittest.TestCase):
             responses={
                 "initialize": [{}],
                 "thread/start": [_LIVE_READ_ONLY_ECHO],
-                "turn/start": [{}],
+                "turn/start": [_LIVE_TURN_START_ACK],
             }
         )
         sink = FakeSink()
         session = start_session(transport, plan, sink)
         self.assertEqual(sink.sessions, ["01a03e9c-4cf3-7081-a577-879ea9dda343"])
         self.assertEqual(session.pid, 4242)
+
+    def test_turn_start_and_steer_use_the_live_beta_shapes(self) -> None:
+        """Regression for the proven-live failure on codex CLI 0.149.1:
+        turn/start rejected a bare string ``input`` with -32600 "invalid
+        type: string ..., expected a sequence". Pins both the accepted
+        request shapes and the exact live ack payloads (captured
+        2026-08-26 against the sealed release) for the initial task and a
+        follow-up steer message."""
+        cwd = Path("/Users/pluto/projects/agent-run")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-luna",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "roots": (str(cwd),),
+                "writable_roots": (),
+            },
+            initial_input="Return exactly CANARY_OK",
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [_LIVE_READ_ONLY_ECHO],
+                "turn/start": [_LIVE_TURN_START_ACK],
+                "turn/steer": [_LIVE_TURN_STEER_ACK],
+            }
+        )
+        session = start_session(transport, plan, FakeSink())
+        self.assertEqual(
+            transport.requests[-1],
+            (
+                "turn/start",
+                {
+                    "threadId": "01a03e9c-4cf3-7081-a577-879ea9dda343",
+                    "input": [{"type": "text", "text": "Return exactly CANARY_OK"}],
+                },
+            ),
+        )
+
+        session.steer("stop, say DONE instead")
+        self.assertEqual(
+            transport.requests[-1],
+            (
+                "turn/steer",
+                {
+                    "threadId": "01a03e9c-4cf3-7081-a577-879ea9dda343",
+                    "input": [{"type": "text", "text": "stop, say DONE instead"}],
+                    "expectedTurnId": "01a03ec9-529b-74a3-9d84-5d90190a9ca4",
+                },
+            ),
+        )
 
 
 def notification(method, params=None):
@@ -384,7 +470,11 @@ class CodexAppServerSessionTests(unittest.TestCase):
             },
         )
         transport = FakeTransport(
-            responses={"initialize": [{}], "thread/start": [thread_response(cwd)], "turn/start": [{}]},
+            responses={
+                "initialize": [{}],
+                "thread/start": [thread_response(cwd)],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            },
             events=list(events),
         )
         sink = FakeSink() if sink is None else sink
@@ -506,20 +596,43 @@ class CodexAppServerSessionTests(unittest.TestCase):
         self.assertEqual(sink.events[0][0], "malformed_event")
 
     def test_steer_buffers_an_already_pending_completion_until_ack(self) -> None:
+        """Regression: the live beta ack is ``{"turnId": ...}`` with no
+        ``accepted`` key at all, so steer() must not mistake it for a
+        rejection -- and must send ``input``/``expectedTurnId``, not the
+        legacy ``text``."""
         session, transport, _sink = self.start(events=[completed(exit_code=0)])
-        transport._responses["turn/steer"] = [{"accepted": True}]
+        transport._responses["turn/steer"] = [{"turnId": "turn_1"}]
 
         session.steer("please wrap up")
 
         outcome = session.wait(0)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
-        methods = [method for method, _ in transport.requests]
-        self.assertIn("turn/steer", methods)
+        self.assertEqual(
+            transport.requests[-1],
+            (
+                "turn/steer",
+                {
+                    "threadId": "th_1",
+                    "input": [{"type": "text", "text": "please wrap up"}],
+                    "expectedTurnId": "turn_1",
+                },
+            ),
+        )
 
     def test_steer_rejection_raises_and_keeps_buffered_completion(self) -> None:
+        """Regression: the beta contract signals a steer rejection the same
+        way every other method does -- a JSON-RPC error that
+        ``ProcessTransport.request`` already raises as ``ValidationError``
+        -- not an ``{"accepted": false}`` payload. steer() must translate
+        that into ``SteerRejected``."""
         session, transport, _sink = self.start(events=[completed(exit_code=0)])
-        transport._responses["turn/steer"] = [{"accepted": False, "reason": "turn already finished"}]
+        transport._responses["turn/steer"] = [
+            ValidationError(
+                "codex app-server rejected turn/steer: "
+                "{'code': -32600, 'message': 'turn already finished'}"
+            )
+        ]
 
         with self.assertRaisesRegex(SteerRejected, "turn already finished"):
             session.steer("please wrap up")

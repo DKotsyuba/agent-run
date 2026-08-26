@@ -269,11 +269,13 @@ class CodexAppServerSession:
         sink,
         thread_id: str,
         *,
+        turn_id: str | None = None,
         answer_path: Path | None = None,
     ) -> None:
         self._transport = transport
         self._sink = sink
         self._thread_id = thread_id
+        self._turn_id = turn_id
         self._answer_path = answer_path
         self._buffered_outcome: Outcome | None = None
         self._pending_raw: list[Mapping[str, object]] = []
@@ -302,14 +304,18 @@ class CodexAppServerSession:
         if not isinstance(text, str) or not text.strip():
             raise ValidationError("steer text must be nonblank")
         self._drain_pending()
-        response = self._transport.request(
-            "turn/steer",
-            {"threadId": self._thread_id, "text": text},
-            timeout_seconds=30.0,
-        )
-        if not response.get("accepted"):
-            reason = response.get("reason")
-            raise SteerRejected(str(reason) if reason else "codex rejected the steer request")
+        try:
+            self._transport.request(
+                "turn/steer",
+                {
+                    "threadId": self._thread_id,
+                    "input": [{"type": "text", "text": text}],
+                    "expectedTurnId": self._turn_id,
+                },
+                timeout_seconds=30.0,
+            )
+        except ValidationError as error:
+            raise SteerRejected(str(error)) from error
 
     def cancel(self, grace_seconds: float) -> None:
         if isinstance(grace_seconds, bool) or not isinstance(grace_seconds, (int, float)) or grace_seconds < 0:
@@ -455,13 +461,17 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     if not isinstance(thread_id, str) or not thread_id:
         raise VerificationError("codex thread/start did not return a threadId")
     sink.session(thread_id)
-    transport.request(
+    turn_ack = transport.request(
         "turn/start",
-        {"threadId": thread_id, "input": plan.initial_input},
+        {"threadId": thread_id, "input": [{"type": "text", "text": plan.initial_input}]},
         timeout_seconds=remaining(),
     )
+    turn = turn_ack.get("turn")
+    turn_id = turn.get("id") if isinstance(turn, Mapping) else None
+    if not isinstance(turn_id, str) or not turn_id:
+        raise VerificationError("codex turn/start did not return a turn id")
     return CodexAppServerSession(
-        transport, sink, thread_id, answer_path=plan.answer_path
+        transport, sink, thread_id, turn_id=turn_id, answer_path=plan.answer_path
     )
 
 

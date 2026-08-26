@@ -7,6 +7,7 @@ import json
 import math
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -124,31 +125,56 @@ class SupervisorSettings:
 
 
 class StoreEventSink:
-    """Adapter-facing sink that persists messages and tracks last progress."""
+    """Adapter-facing sink that persists messages and tracks last progress.
+
+    Adapters call this from whatever thread reads their engine's output: a
+    background stream-reader thread for some, the supervisor's own thread for
+    others. A ``sqlite3.Connection`` may only be used from the thread that
+    created it, so this sink never shares the supervisor's own connection
+    across threads. Instead every calling thread other than the owner lazily
+    opens (and keeps) its own connection to the same database file the first
+    time it calls in; SQLite's own locking (WAL journalling plus
+    ``busy_timeout``, see state/db.py) serializes the resulting concurrent
+    writes, exactly as it already does for the multiple independent
+    ``StateStore`` connections opened elsewhere in this codebase (e.g. the
+    concurrent-creation paths covered in tests/test_state_store.py).
+    """
 
     def __init__(self, store: StateStore, agent_id: AgentId, ops: ProcessOps):
-        self._store = store
+        self._owner_thread_id = threading.get_ident()
+        self._owner_store = store
+        self._database_path = store.path()
         self._agent_id = agent_id
         self._ops = ops
         self.last_progress_at: float | None = None
         self.runtime_session_id: str | None = None
+        self._thread_local = threading.local()
+
+    def _store_for_caller(self) -> StateStore:
+        if threading.get_ident() == self._owner_thread_id:
+            return self._owner_store
+        store = getattr(self._thread_local, "store", None)
+        if store is None:
+            store = StateStore.open(self._database_path)
+            self._thread_local.store = store
+        return store
 
     def _touch(self) -> None:
         self.last_progress_at = self._ops.monotonic()
 
     def message(self, message: Message) -> None:
-        self._store.append_message(self._agent_id, message)
+        self._store_for_caller().append_message(self._agent_id, message)
         self._touch()
 
     def session(self, runtime_session_id: str) -> None:
         self.runtime_session_id = runtime_session_id
-        self._store.append_event(
+        self._store_for_caller().append_event(
             self._agent_id, "runtime_session", data={"id": runtime_session_id}
         )
         self._touch()
 
     def event(self, kind: str, data: Mapping[str, object]) -> None:
-        self._store.append_event(self._agent_id, kind, data=dict(data))
+        self._store_for_caller().append_event(self._agent_id, kind, data=dict(data))
         self._touch()
 
 

@@ -45,6 +45,7 @@ from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import AgentStatus, MessageRole, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
+from agent_run.state import StateStore
 
 from test_opencode_service import runtime_config
 
@@ -690,7 +691,37 @@ class SessionTests(AdapterCase):
         # The first absence was probed for output, found none, and kept waiting.
         self.assertEqual([call for call in service.calls if call[0] == "messages"].__len__(), 2)
         self.assertEqual(len(self.remaining()), 1)
-        self.assertEqual(self.sink.messages[0].raw_ref, str(self.captures / self.remaining()[0]))
+        # A bare filename, not the absolute capture path: the persistence
+        # guard (agent_run.state.db.validate_message_storage) refuses an
+        # absolute raw_ref, so this is what the supervisor must be able to
+        # store (see test_message_raw_ref_is_a_normalized_relative_path_the_store_accepts).
+        self.assertEqual(self.sink.messages[0].raw_ref, self.remaining()[0])
+
+    def test_message_raw_ref_is_a_normalized_relative_path_the_store_accepts(self):
+        """Drive the exact call the supervisor makes: StoreEventSink.message
+        persists every emitted Message via StateStore.append_message, which
+        enforces agent_run.state.db.validate_message_storage. A raw_ref taken
+        straight from the HTTP capture's absolute body_path fails that guard
+        with "raw_ref must be a normalized relative path"; the bare capture
+        filename is what must reach the store instead.
+        """
+
+        service = FakeService(
+            self.captures, [{"type": "running"}, None], [[message("assistant", "done", at=1.0)]]
+        )
+        self.session(service).wait(30.0)
+        recorded = self.sink.messages[0]
+        self.assertEqual(recorded.raw_ref, self.remaining()[0])
+
+        store = StateStore.initialize(self.root / "state.db")
+        self.addCleanup(store.close)
+        agent_id = store.create_agent(
+            _replace(self.request, timeout_seconds=60),
+            task_summary="t",
+            config_revision="r",
+        ).agent_id
+        store.append_message(agent_id, recorded)
+        self.assertEqual(len(store.transcript(agent_id)), 1)
 
     def test_answer_is_recorded_as_exact_utf8_bytes_and_hash(self):
         from agent_run.verify import DEFAULT_SENTINEL
