@@ -510,7 +510,11 @@ class OpenCodeRuntimeSession:
         """Emit the transcript, record answer.md, and keep only this capture."""
 
         outcome = normalize_outcome(info, payload, runtime_session_id=self._session_id)
-        for message in normalize_transcript(payload, raw_ref=capture.raw_ref):
+        # The capture lives directly under the agent's own directory (no
+        # subdirectories), so its bare filename is already the normalized,
+        # relative raw_ref the persistence guard requires -- the absolute
+        # capture.raw_ref would fail it (and would leak this host's tmp layout).
+        for message in normalize_transcript(payload, raw_ref=capture.body_path.name):
             self._sink.message(message)
         answer = extract_answer(payload, agent=self._agent)
         if answer and self._response_dir is not None:
