@@ -1,0 +1,616 @@
+"""Typed application service shared by CLI and MCP transports."""
+
+from __future__ import annotations
+
+import hashlib
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import Callable, Mapping, TypeAlias
+
+from .adapters.base import Capability, LaunchPlan, ModelInfo, RuntimeAdapter
+from .adapters.registry import AdapterRegistry
+from .capacity.advice import CapacityAdvice, build_advice
+from .capacity.forecast import build_forecasts
+from .capacity.history import load_series
+from .config import Config, McpConfig, RuntimeConfig, load_config
+from .domain import (
+    ACTIVE,
+    TERMINAL,
+    AgentId,
+    AgentStatus,
+    OrchestratorRef,
+    StartRequest,
+    new_agent_id,
+    validate_agent_id,
+)
+from .errors import ValidationError
+from .paths import agent_dir, config_path, state_db_path
+from .profiles import load_profile
+from .state.store import StateStore
+
+
+_SUMMARY_LIMIT = 50
+_TASK_SUMMARY_CHARS = 160
+_DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
+_CHUNK = 65536
+
+LaunchAgent: TypeAlias = Callable[
+    [AgentId, StartRequest, RuntimeAdapter, LaunchPlan, Path], None
+]
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryView:
+    agent_id: AgentId
+    bound: bool
+    orchestrator_session_id: str | None
+    notification_id: str | None
+    state: str
+    attempts: int
+    ambiguous: bool
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentView:
+    agent_id: AgentId
+    runtime: str
+    model: str
+    profile: str
+    task_summary: str
+    status: AgentStatus
+    created_at: float
+    started_at: float | None
+    finished_at: float | None
+    elapsed_seconds: float
+    last_progress_at: float | None
+    silence_seconds: float | None
+    warned: bool
+    failure_kind: str | None
+    failure_text: str | None
+    answer_available: bool
+    answer_bytes: int | None
+    answer_sha256: str | None
+    delivery: DeliveryView
+
+
+@dataclass(frozen=True, slots=True)
+class StartResult:
+    agent_id: AgentId
+    created: bool
+    agent: AgentView
+
+
+@dataclass(frozen=True, slots=True)
+class AgentQuery:
+    active: bool = False
+    orchestrator: OrchestratorRef | None = None
+    offset: int = 0
+    limit: int = 100
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.active, bool):
+            raise ValidationError("active must be a boolean")
+        if self.orchestrator is not None and not isinstance(
+            self.orchestrator, OrchestratorRef
+        ):
+            raise ValidationError("orchestrator must be an OrchestratorRef or None")
+        for name, value, minimum in (
+            ("offset", self.offset, 0),
+            ("limit", self.limit, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValidationError(f"{name} must be an integer >= {minimum}")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentPage:
+    items: tuple[AgentView, ...]
+    total: int
+    offset: int
+    limit: int
+    next_offset: int | None
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CommandView:
+    command_id: int
+    agent_id: AgentId
+    kind: str
+    state: str = "pending"
+
+
+@dataclass(frozen=True, slots=True)
+class MessageView:
+    seq: int
+    at: float
+    role: str
+    name: str | None
+    content: str
+    raw_ref: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptPage:
+    agent_id: AgentId
+    messages: tuple[MessageView, ...]
+    cursor: int
+    limit: int
+    next_cursor: int | None
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerView:
+    agent_id: AgentId
+    status: AgentStatus
+    available: bool
+    path: Path | None
+    size_bytes: int | None
+    sha256: str | None
+    content: str | None
+    inline_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkSummary:
+    scope: str
+    agent_id: AgentId | None
+    orchestrator: OrchestratorRef | None
+    agents: tuple[AgentView, ...]
+    total: int
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityReport:
+    observed_at: float
+    items: tuple[CapacityAdvice, ...]
+
+
+class AgentService:
+    """Validate once, persist once, and expose stable transport-neutral views."""
+
+    def __init__(
+        self,
+        config: Config,
+        store: StateStore,
+        home: str | Path,
+        *,
+        launch: LaunchAgent,
+        now: Callable[[], float] = time.time,
+        max_inline_answer_bytes: int = _DEFAULT_INLINE_ANSWER_BYTES,
+    ) -> None:
+        if not isinstance(config, Config):
+            raise ValidationError("config must be a Config")
+        if not isinstance(store, StateStore):
+            raise ValidationError("store must be a StateStore")
+        if not callable(launch) or not callable(now):
+            raise ValidationError("launch and now must be callable")
+        if (
+            isinstance(max_inline_answer_bytes, bool)
+            or not isinstance(max_inline_answer_bytes, int)
+            or max_inline_answer_bytes < 1
+        ):
+            raise ValidationError("max_inline_answer_bytes must be a positive integer")
+        self._config = config
+        self._store = store
+        self._home = Path(home).expanduser().resolve()
+        self._registry = AdapterRegistry(config)
+        self._launch = launch
+        self._now = now
+        self._max_inline_answer_bytes = max_inline_answer_bytes
+
+    @classmethod
+    def from_home(
+        cls,
+        home: str | Path,
+        *,
+        launch: LaunchAgent,
+        now: Callable[[], float] = time.time,
+        max_inline_answer_bytes: int = _DEFAULT_INLINE_ANSWER_BYTES,
+    ) -> AgentService:
+        """Compose the shared service around an initialized agent-run home."""
+
+        root = Path(home).expanduser().resolve()
+        return cls(
+            load_config(config_path(root)),
+            StateStore.open(state_db_path(root)),
+            root,
+            launch=launch,
+            now=now,
+            max_inline_answer_bytes=max_inline_answer_bytes,
+        )
+
+    def close(self) -> None:
+        self._store.close()
+
+    def start(self, request: StartRequest) -> StartResult:
+        if not isinstance(request, StartRequest):
+            raise ValidationError("request must be a StartRequest")
+        runtime = self._runtime_config(request.runtime)
+        adapter = self._registry.load(
+            request.runtime, self._required_capabilities(request, runtime)
+        )
+        adapter.validate(runtime)
+        if request.model not in runtime.models:
+            raise ValidationError(
+                f"model is not configured for runtime {request.runtime}: {request.model}"
+            )
+        roster = adapter.models(runtime, runtime.home)
+        if request.model not in {model.id for model in roster}:
+            raise ValidationError(
+                f"model is not available for runtime {request.runtime}: {request.model}"
+            )
+        profile = load_profile(
+            self._config.profiles,
+            request.profile,
+            requested_write=request.write,
+            read_roots=request.read_roots,
+        )
+        mcp_servers = self._mcp_servers(runtime)
+        revision = adapter.materialize(
+            runtime, runtime.home, mcp_servers=mcp_servers
+        )
+        candidate = new_agent_id()
+        candidate_dir = agent_dir(candidate, self._home)
+        plan = adapter.prepare(
+            request,
+            profile,
+            runtime,
+            runtime.home,
+            candidate_dir,
+            mcp_servers=mcp_servers,
+        )
+        creation = self._store.create_agent(
+            request,
+            task_summary=self._task_summary(request.task),
+            config_revision=revision,
+            agent_id=candidate,
+            at=self._now(),
+        )
+        if creation.created:
+            self._launch(
+                creation.agent_id, request, adapter, plan, candidate_dir
+            )
+        return StartResult(
+            creation.agent_id, creation.created, self.get(creation.agent_id)
+        )
+
+    def bind(
+        self, agent_id: str | AgentId, orchestrator: OrchestratorRef
+    ) -> DeliveryView:
+        if not isinstance(orchestrator, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        session_id = self._store.bind_orchestrator(
+            agent_id, orchestrator, at=self._now()
+        )
+        return self._delivery_view(validate_agent_id(agent_id), session_id)
+
+    def cancel(self, agent_id: str | AgentId) -> AgentView:
+        self._store.enqueue_command(agent_id, "cancel", {}, at=self._now())
+        return self.get(agent_id)
+
+    def steer(self, agent_id: str | AgentId, text: str) -> CommandView:
+        if not isinstance(text, str) or not text.strip():
+            raise ValidationError("steer text must be a nonblank string")
+        checked = validate_agent_id(agent_id)
+        agent = self._store.get_agent(checked)
+        self._registry.load(str(agent["runtime"]), (Capability.STEER,))
+        command_id = self._store.enqueue_command(
+            checked, "steer", {"text": text}, at=self._now()
+        )
+        return CommandView(command_id, checked, "steer")
+
+    def get(self, agent_id: str | AgentId) -> AgentView:
+        return self._agent_view(self._store.get_agent(agent_id), self._now())
+
+    def list(self, query: AgentQuery = AgentQuery()) -> AgentPage:
+        if not isinstance(query, AgentQuery):
+            raise ValidationError("query must be an AgentQuery")
+        statuses = ACTIVE if query.active else None
+        session_id = (
+            None
+            if query.orchestrator is None
+            else self._store.find_orchestrator_session(query.orchestrator)
+        )
+        if query.orchestrator is not None and session_id is None:
+            return AgentPage((), 0, query.offset, query.limit, None, True)
+        rows = self._store.list_agents(
+            statuses=statuses,
+            orchestrator_session_id=session_id,
+            limit=query.limit,
+            offset=query.offset,
+        )
+        total = self._count_agents(statuses, session_id)
+        items = tuple(self._agent_view(row, self._now()) for row in rows)
+        consumed = query.offset + len(items)
+        complete = consumed >= total
+        return AgentPage(
+            items,
+            total,
+            query.offset,
+            query.limit,
+            None if complete else consumed,
+            complete,
+        )
+
+    def transcript(
+        self, agent_id: str | AgentId, cursor: int = 0, limit: int = 200
+    ) -> TranscriptPage:
+        checked = validate_agent_id(agent_id)
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ValidationError("cursor must be a nonnegative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValidationError("limit must be a positive integer")
+        rows = self._store.transcript(
+            checked, after_seq=cursor, limit=limit + 1
+        )
+        complete = len(rows) <= limit
+        selected = rows[:limit]
+        messages = tuple(
+            MessageView(
+                int(row["seq"]),
+                float(row["at"]),
+                str(row["role"]),
+                None if row["name"] is None else str(row["name"]),
+                str(row["content"]),
+                None if row["raw_ref"] is None else str(row["raw_ref"]),
+            )
+            for row in selected
+        )
+        next_cursor = None if complete or not messages else messages[-1].seq
+        return TranscriptPage(
+            checked, messages, cursor, limit, next_cursor, complete
+        )
+
+    def answer(self, agent_id: str | AgentId) -> AnswerView:
+        checked = validate_agent_id(agent_id)
+        row = self._store.get_agent(checked)
+        status = AgentStatus(str(row["status"]))
+        if row["answer_path"] is None:
+            return AnswerView(checked, status, False, None, None, None, None, True)
+        if row["answer_bytes"] is None or row["answer_sha256"] is None:
+            raise ValidationError("stored answer proof is incomplete")
+        size = int(row["answer_bytes"])
+        expected_sha = str(row["answer_sha256"])
+        path = Path(str(row["answer_path"]))
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise ValidationError(f"cannot resolve stored answer: {error}") from error
+        root = agent_dir(checked, self._home).resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            raise ValidationError("stored answer path is outside the agent directory")
+        if resolved.stat().st_size != size:
+            raise ValidationError("stored answer size does not match the sealed file")
+        digest = hashlib.sha256()
+        content = bytearray() if size <= self._max_inline_answer_bytes else None
+        counted = 0
+        try:
+            with resolved.open("rb") as stream:
+                while chunk := stream.read(_CHUNK):
+                    counted += len(chunk)
+                    digest.update(chunk)
+                    if content is not None:
+                        content.extend(chunk)
+        except OSError as error:
+            raise ValidationError(f"cannot read stored answer: {error}") from error
+        if counted != size or digest.hexdigest() != expected_sha:
+            raise ValidationError("stored answer hash does not match the sealed file")
+        try:
+            text = None if content is None else bytes(content).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValidationError("stored answer is not valid UTF-8") from error
+        return AnswerView(
+            checked,
+            status,
+            True,
+            resolved,
+            size,
+            expected_sha,
+            text,
+            content is not None,
+        )
+
+    def summary(
+        self,
+        *,
+        agent_id: str | AgentId | None = None,
+        orchestrator: OrchestratorRef | None = None,
+    ) -> WorkSummary:
+        if (agent_id is None) == (orchestrator is None):
+            raise ValidationError("summary requires exactly one of agent_id or orchestrator")
+        if agent_id is not None:
+            agent = self.get(agent_id)
+            return WorkSummary("agent", agent.agent_id, None, (agent,), 1, True)
+        if not isinstance(orchestrator, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        page = self.list(
+            AgentQuery(active=True, orchestrator=orchestrator, limit=_SUMMARY_LIMIT)
+        )
+        return WorkSummary(
+            "orchestrator", None, orchestrator, page.items, page.total, page.complete
+        )
+
+    def models(self) -> Mapping[str, tuple[ModelInfo, ...]]:
+        result: dict[str, tuple[ModelInfo, ...]] = {}
+        for name in sorted(self._config.runtimes):
+            runtime = self._config.runtimes[name]
+            if not runtime.enabled:
+                continue
+            adapter = self._registry.load(name, (Capability.MODEL_ROSTER,))
+            adapter.validate(runtime)
+            allowed = set(runtime.models)
+            result[name] = tuple(
+                model
+                for model in adapter.models(runtime, runtime.home)
+                if model.id in allowed
+            )
+        return MappingProxyType(result)
+
+    def limits(self) -> CapacityReport:
+        observed_at = self._now()
+        enabled = {
+            name for name, runtime in self._config.runtimes.items() if runtime.enabled
+        }
+        series = tuple(
+            item for item in load_series(self._store) if item.key.runtime in enabled
+        )
+        items = build_advice(build_forecasts(series, now=observed_at))
+        ordered = tuple(
+            sorted(
+                items,
+                key=lambda item: (
+                    item.key.runtime,
+                    item.key.lane,
+                    item.key.window,
+                    item.key.target or "",
+                    item.key.source,
+                ),
+            )
+        )
+        return CapacityReport(observed_at, ordered)
+
+    def _runtime_config(self, name: str) -> RuntimeConfig:
+        try:
+            return self._config.runtimes[name]
+        except KeyError as error:
+            raise ValidationError(f"runtime is not configured: {name}") from error
+
+    def _mcp_servers(self, runtime: RuntimeConfig) -> Mapping[str, McpConfig]:
+        try:
+            return MappingProxyType(
+                {name: self._config.mcp[name] for name in runtime.mcp}
+            )
+        except KeyError as error:
+            raise ValidationError(
+                f"runtime references unknown MCP server: {error.args[0]}"
+            ) from error
+
+    @staticmethod
+    def _required_capabilities(
+        request: StartRequest, runtime: RuntimeConfig
+    ) -> frozenset[Capability]:
+        required = {Capability.MODEL_ROSTER, Capability.TRANSCRIPT}
+        if request.write:
+            required.add(Capability.WRITE)
+        if request.read_roots:
+            required.add(Capability.READ_ROOTS)
+        if request.effort is not None:
+            required.add(Capability.EFFORT)
+        if request.output_schema is not None:
+            required.add(Capability.OUTPUT_SCHEMA)
+        if runtime.mcp:
+            required.add(Capability.MCP)
+        if runtime.skills:
+            required.add(Capability.SKILLS)
+        if runtime.hooks:
+            required.add(Capability.HOOKS)
+        return frozenset(required)
+
+    @staticmethod
+    def _task_summary(task: str) -> str:
+        return " ".join(task.split())[:_TASK_SUMMARY_CHARS]
+
+    def _count_agents(
+        self,
+        statuses: frozenset[AgentStatus] | None,
+        orchestrator_session_id: str | None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[object] = []
+        if statuses is not None:
+            values = tuple(status.value for status in statuses)
+            clauses.append(f"status IN ({','.join('?' for _ in values)})")
+            params.extend(values)
+        if orchestrator_session_id is not None:
+            clauses.append("orchestrator_session_id = ?")
+            params.append(orchestrator_session_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        row = self._store.connection.execute(
+            f"SELECT COUNT(*) AS total FROM agents{where}", params
+        ).fetchone()
+        return int(row["total"])
+
+    def _agent_view(self, row: Mapping[str, object], now: float) -> AgentView:
+        agent_id = validate_agent_id(str(row["id"]))
+        status = AgentStatus(str(row["status"]))
+        created_at = float(row["created_at"])
+        started_at = None if row["started_at"] is None else float(row["started_at"])
+        finished_at = None if row["finished_at"] is None else float(row["finished_at"])
+        progress_row = self._store.connection.execute(
+            "SELECT MAX(at) AS at FROM messages WHERE agent_id = ?", (agent_id,)
+        ).fetchone()
+        progress = None if progress_row["at"] is None else float(progress_row["at"])
+        warned = bool(row["warned"]) or self._store.connection.execute(
+            "SELECT 1 FROM events WHERE agent_id = ? AND kind = 'deadline_warning' LIMIT 1",
+            (agent_id,),
+        ).fetchone() is not None
+        silence = (
+            None
+            if row["silent_seconds"] is None
+            else float(row["silent_seconds"])
+        )
+        if silence is None and status in ACTIVE:
+            silence = max(0.0, now - (progress or started_at or created_at))
+        end = finished_at if finished_at is not None else now
+        answer_bytes = (
+            None if row["answer_bytes"] is None else int(row["answer_bytes"])
+        )
+        answer_sha = (
+            None if row["answer_sha256"] is None else str(row["answer_sha256"])
+        )
+        return AgentView(
+            agent_id,
+            str(row["runtime"]),
+            str(row["model"]),
+            str(row["profile"]),
+            str(row["task_summary"]),
+            status,
+            created_at,
+            started_at,
+            finished_at,
+            max(0.0, end - (started_at or created_at)),
+            progress,
+            silence,
+            warned,
+            None if row["failure_kind"] is None else str(row["failure_kind"]),
+            None if row["failure_text"] is None else str(row["failure_text"]),
+            row["answer_path"] is not None,
+            answer_bytes,
+            answer_sha,
+            self._delivery_view(
+                agent_id,
+                None
+                if row["orchestrator_session_id"] is None
+                else str(row["orchestrator_session_id"]),
+            ),
+        )
+
+    def _delivery_view(
+        self, agent_id: AgentId, session_id: str | None
+    ) -> DeliveryView:
+        row = self._store.connection.execute(
+            """SELECT id, state, attempts, ambiguous_result, last_error
+               FROM deliveries WHERE agent_id = ?
+               ORDER BY terminal_event_seq DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            return DeliveryView(
+                agent_id, session_id is not None, session_id, None, "not_created", 0, False, None
+            )
+        return DeliveryView(
+            agent_id,
+            session_id is not None,
+            session_id,
+            str(row["id"]),
+            str(row["state"]),
+            int(row["attempts"]),
+            bool(row["ambiguous_result"]),
+            None if row["last_error"] is None else str(row["last_error"]),
+        )
