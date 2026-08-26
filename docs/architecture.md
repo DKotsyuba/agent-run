@@ -562,6 +562,9 @@ MCP, skill paths, and lifecycle hooks:
 ### OpenCode
 
 - Use only the v2 HTTP service; no per-run CLI fallback.
+- Authenticate every service request with HTTP Basic username `opencode` and a
+  password read only from `OPENCODE_SERVER_PASSWORD`; never persist it in config,
+  argv, logs, or the service descriptor.
 - Start an agent-run-owned service with generated config and isolated
   `XDG_CONFIG_HOME`/`XDG_DATA_HOME` under the runtime home.
 - Set `OPENCODE_DISABLE_CLAUDE_CODE=1`.
