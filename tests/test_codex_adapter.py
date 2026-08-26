@@ -121,6 +121,11 @@ env_from = ["PATH"]
 
         self.assertEqual((self.home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "demo skill")
         generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertNotIn("skills =", generated)
+        self.assertEqual(
+            [path.name for path in (self.home / "skills").iterdir()],
+            ["demo"],
+        )
         self.assertIn("[mcp_servers.agent_lsp]", generated)
         self.assertIn("[[hooks]]", generated)
         self.assertIn("UserPromptSubmit", generated)
