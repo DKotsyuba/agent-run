@@ -192,6 +192,12 @@ class CountingStore(StateStore):
         self.fail_running_once = False
         self.reject_terminal = False
         self.starting_error: Exception | None = None
+        self.fail_event_kind: str | None = None
+
+    def append_event(self, agent_id, kind, **kwargs):
+        if kind == self.fail_event_kind:
+            raise RuntimeError(f"{kind} write failed")
+        return super().append_event(agent_id, kind, **kwargs)
 
     def transition(self, agent_id, target, **kwargs):
         if target is AgentStatus.STARTING and self.starting_error is not None:
@@ -433,6 +439,50 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(outcome.failure_text, "silence=no_progress")
         self.assertEqual(self.agent()["status"], "timed_out")
         self.assertEqual(ops.alive_members(), set())
+
+    def test_a_failing_stopping_bookkeeping_write_does_not_mask_the_timeout(self) -> None:
+        """A durable-write hiccup on the "stopping" event must stay best-effort.
+
+        stop_reason is already durable in memory once _stop() begins; losing
+        the informational "stopping" record must not turn a real timed_out
+        outcome into supervision_failed.
+        """
+
+        self.store.fail_event_kind = "stopping"
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+        settings = SupervisorSettings(
+            poll_seconds=0.4, grace_seconds=1.0, heartbeat_seconds=1000.0
+        )
+        outcome = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
+        ).run()
+
+        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
+        self.assertEqual(self.agent()["status"], "timed_out")
+        self.assertEqual(self.events("stopping"), [])
+
+    def test_a_failing_termination_bookkeeping_write_does_not_mask_the_timeout(self) -> None:
+        """Same guarantee for the "process_group_terminated" write in _finish().
+
+        _record_termination already supports ``best_effort`` (used by
+        _fail_launched); _finish() must use it too so the group-kill record
+        cannot turn a known outcome into supervision_failed.
+        """
+
+        self.store.fail_event_kind = "process_group_terminated"
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+        settings = SupervisorSettings(
+            poll_seconds=0.4, grace_seconds=1.0, heartbeat_seconds=1000.0
+        )
+        outcome = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
+        ).run()
+
+        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
+        self.assertEqual(self.agent()["status"], "timed_out")
+        self.assertEqual(self.events("process_group_terminated"), [])
 
     def test_timeout_distinguishes_a_cut_off_answer_from_no_answer(self) -> None:
         ops = FakeOps()

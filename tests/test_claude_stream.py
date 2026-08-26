@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.claude.stream import StreamDecoder, sanitize_line, terminal_event_data
 from agent_run.domain import MessageRole
+from agent_run.state.db import json_text
 
 
 class StreamDecoderTests(unittest.TestCase):
@@ -180,6 +181,30 @@ class TerminalEventDataTests(unittest.TestCase):
         self.assertNotIn("the full answer text", " ".join(f"{key}={value}" for key, value in event.items()))
         self.assertEqual(event["subtype"], "success")
         self.assertEqual(event["duration_ms"], 5)
+
+    def test_event_with_usage_is_actually_json_serializable(self) -> None:
+        """Regression: ``usage`` must not be a nested MappingProxyType.
+
+        ``StoreEventSink.event`` only converts the *outer* mapping with
+        ``dict(data)`` before persisting; a MappingProxyType nested one level
+        deeper (previously produced by ``_safe_event_data``) survives that
+        shallow conversion and blows up ``json_text`` -- masking a real
+        outcome as ``supervision_failed`` on the terminal commit.
+        """
+
+        decoder = StreamDecoder()
+        line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "done",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            }
+        )
+        result = decoder.feed(line, at=0.0)
+        event = dict(terminal_event_data(result.terminal))  # mirrors StoreEventSink.event
+        json_text(event)  # must not raise ValidationError("value must be JSON serializable")
 
 
 if __name__ == "__main__":
