@@ -6,7 +6,7 @@ import contextlib
 import json
 import math
 import os
-import sys
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -45,9 +45,26 @@ DEFAULT_WARNING_TEXT = (
 
 
 def supervisor_identity() -> str:
-    """The full command identity reconciliation compares against."""
+    """The full command identity reconciliation compares against.
 
-    return " ".join(sys.argv) or "agent-run-supervisor"
+    Derived from `ps -o command=` on this process's own pid -- the same
+    probe reconciliation and doctor run later -- because argv[0] as passed
+    to exec can diverge from what ps reports (a venv python symlink
+    resolves to the real framework binary on macOS).
+    """
+
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(os.getpid()), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        identity = result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        identity = ""
+    return identity or "agent-run-supervisor"
 
 
 def _error_text(error: BaseException) -> str:

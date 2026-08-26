@@ -84,12 +84,14 @@ def launch_detached(
         str(identity_write),
     ]
     try:
-        # Reconciliation compares the stored identity against `ps -o command=`,
-        # so the parent records the exact argv it is about to exec.
+        # The child derives its own identity from `ps -o command=` on its own
+        # pid (see supervisor_identity()): a parent-recorded argv can diverge
+        # from what ps reports once exec'd (e.g. a venv python symlink
+        # resolves to the real framework binary on macOS), so the parent
+        # does not record one here.
         blob = json.dumps(
             {
                 **dict(payload),
-                "identity": " ".join(argv),
                 "post_terminal_timeout_seconds": dispatch_timeout,
             }
         ).encode("utf-8")
