@@ -247,6 +247,11 @@ def _call_tool(service: AgentService, name: str, raw: dict) -> object:
         schema = args.get("output_schema")
         if schema is not None and not isinstance(schema, dict):
             raise ValidationError("output_schema must be an object or null")
+        timeout = (
+            {}
+            if "timeout_seconds" not in args
+            else {"timeout_seconds": args["timeout_seconds"]}
+        )
         return service.start(
             StartRequest(
                 _string(args, "runtime"),
@@ -256,7 +261,7 @@ def _call_tool(service: AgentService, name: str, raw: dict) -> object:
                 Path(_string(args, "workdir")),
                 write=write,
                 effort=_optional_string(args, "effort"),
-                timeout_seconds=args.get("timeout_seconds", 480),
+                **timeout,
                 read_roots=tuple(Path(item) for item in roots),
                 output_schema=schema,
                 orchestrator=_optional_orchestrator(args.get("orchestrator")),

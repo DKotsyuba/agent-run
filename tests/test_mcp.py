@@ -154,6 +154,25 @@ class McpTests(unittest.TestCase):
         self.assertIsNone(answer["content"])
         self.assertFalse(answer["inline_complete"])
 
+    def test_start_preserves_omitted_and_explicit_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            arguments = {
+                "runtime": "fake",
+                "model": "model",
+                "profile": "p",
+                "task": "t",
+                "workdir": directory,
+            }
+            service, _ = self.run_server(
+                [
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "start", "arguments": arguments}},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "start", "arguments": {**arguments, "timeout_seconds": 480}}},
+                ]
+            )
+        starts = [value for name, value in service.calls if name == "start"]
+        self.assertIsNone(starts[0].timeout_seconds)
+        self.assertEqual(starts[1].timeout_seconds, 480)
+
     def test_protocol_and_tool_errors_are_bounded_and_loop_continues(self) -> None:
         service, responses = self.run_server(
             [

@@ -57,7 +57,9 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def finished_agent(self) -> str:
-        request = StartRequest("codex", "model", "profile", "task", self.root)
+        request = StartRequest(
+            "codex", "model", "profile", "task", self.root, timeout_seconds=480
+        )
         agent_id = self.store.create_agent(
             request, task_summary="summary", config_revision="cfg-1", at=1
         ).agent_id

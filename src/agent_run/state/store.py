@@ -22,7 +22,7 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 
-from . import delivery
+from . import capacity, delivery
 from .db import (
     _upsert_context_receipt,
     agent_row,
@@ -72,6 +72,8 @@ class StateStore:
         agent_id: str | AgentId | None = None,
         at: float | None = None,
     ) -> AgentCreation:
+        if isinstance(request, StartRequest) and request.timeout_seconds is None:
+            raise ValidationError("timeout_seconds must be resolved before persistence")
         return create_agent_record(
             self.connection,
             request,
@@ -92,6 +94,8 @@ class StateStore:
         agent_id: str | AgentId | None = None,
         at: float | None = None,
     ) -> AgentCreation:
+        if isinstance(request, StartRequest) and request.timeout_seconds is None:
+            raise ValidationError("timeout_seconds must be resolved before persistence")
         return create_agent_record(
             self.connection,
             request,
@@ -633,6 +637,19 @@ class StateStore:
             nonblank("runtime", runtime)
         rows = recent_capacity_rows(self.connection, now, runtime, limit)
         return [dict(row) for row in rows]
+
+    def prune_capacity_samples(self, retention: int) -> int:
+        return capacity.prune_capacity_samples(self.connection, retention)
+
+    def capacity_sample_history(
+        self, *, retention: int, runtime: str | None = None
+    ) -> list[dict[str, object]]:
+        return [
+            dict(row)
+            for row in capacity.capacity_sample_history(
+                self.connection, retention=retention, runtime=runtime
+            )
+        ]
 
     def claim_delivery(
         self, owner: str, *, at: float | None = None, lease_seconds: float = 30

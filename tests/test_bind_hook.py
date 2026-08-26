@@ -28,7 +28,9 @@ class BindHookTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def create(self) -> str:
-        request = StartRequest("codex", "model", "profile", "task", self.root)
+        request = StartRequest(
+            "codex", "model", "profile", "task", self.root, timeout_seconds=480
+        )
         return self.store.create_agent(
             request, task_summary="summary", config_revision="cfg-1", at=1
         ).agent_id

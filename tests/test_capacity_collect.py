@@ -18,7 +18,7 @@ from agent_run.capacity.collect import (
     STATUS_UNSUPPORTED,
     collect_once,
 )
-from agent_run.config import Config, RuntimeConfig
+from agent_run.config import CapacityConfig, Config, RuntimeConfig
 from agent_run.state import StateStore
 
 
@@ -200,6 +200,31 @@ class CapacityCollectTests(unittest.TestCase):
         payload = stored[0]["payload_json"]
         self.assertNotIn("auth", payload)
         self.assertNotIn("token", payload.lower())
+
+    def test_partial_failure_still_prunes_to_global_retention(self) -> None:
+        for observed_at in (1, 2):
+            self.store.insert_capacity_sample(
+                runtime="codex", lane="requests", window="5h", source="provider",
+                payload={}, observed_at=observed_at,
+            )
+        config = Config(
+            schema_version=1,
+            capacity=CapacityConfig(sample_retention=1),
+            runtimes={"broken": _runtime_config()},
+        )
+        adapter = FakeAdapter(
+            capabilities=frozenset({Capability.LIVE_LIMITS}),
+            limits_error=RuntimeError("unavailable"),
+        )
+
+        report = collect_once(
+            self.store, config, at=3, loader=lambda name, runtime: adapter
+        )
+
+        self.assertEqual(report.results[0].status, STATUS_FAILED)
+        rows = self.store.capacity_sample_history(retention=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["observed_at"], 2)
 
 
 if __name__ == "__main__":

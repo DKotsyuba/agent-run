@@ -158,7 +158,7 @@ class StartRequest:
     workdir: Path
     write: bool = False
     effort: str | None = None
-    timeout_seconds: float = 480
+    timeout_seconds: float | None = None
     read_roots: tuple[Path, ...] = ()
     output_schema: dict | None = None
     orchestrator: OrchestratorRef | None = None
@@ -167,12 +167,13 @@ class StartRequest:
     def __post_init__(self) -> None:
         for name in ("runtime", "model", "profile", "task"):
             _nonblank(name, getattr(self, name))
-        if isinstance(self.timeout_seconds, bool) or not isinstance(
-            self.timeout_seconds, (int, float)
-        ):
-            raise ValidationError("timeout_seconds must be positive and finite")
-        if self.timeout_seconds <= 0 or not math.isfinite(self.timeout_seconds):
-            raise ValidationError("timeout_seconds must be positive and finite")
+        if self.timeout_seconds is not None:
+            if isinstance(self.timeout_seconds, bool) or not isinstance(
+                self.timeout_seconds, (int, float)
+            ):
+                raise ValidationError("timeout_seconds must be positive and finite")
+            if self.timeout_seconds <= 0 or not math.isfinite(self.timeout_seconds):
+                raise ValidationError("timeout_seconds must be positive and finite")
         if not isinstance(self.read_roots, tuple):
             raise ValidationError("read_roots must be a tuple")
         workdir = _existing_directory("workdir", self.workdir)
@@ -194,6 +195,7 @@ class StartRequest:
             _bounded_id("request_id", self.request_id)
         object.__setattr__(self, "workdir", workdir)
         object.__setattr__(self, "read_roots", read_roots)
+
 
 
 class MessageRole(str, Enum):

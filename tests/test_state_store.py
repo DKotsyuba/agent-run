@@ -43,6 +43,7 @@ class StateStoreTests(unittest.TestCase):
             "profile",
             task,
             self.root,
+            timeout_seconds=480,
             request_id=request_id,
             orchestrator=orchestrator,
         )
@@ -77,6 +78,22 @@ class StateStoreTests(unittest.TestCase):
                 at=3,
             )
         self.assertEqual(len(self.store.list_agents()), 1)
+
+    def test_unresolved_timeout_is_never_persisted(self) -> None:
+        request = StartRequest("codex", "model", "profile", "task", self.root)
+        with self.assertRaisesRegex(ValidationError, "resolved before persistence"):
+            self.store.create_agent(
+                request, task_summary="summary", config_revision="cfg-1"
+            )
+        with self.assertRaisesRegex(ValidationError, "resolved before persistence"):
+            self.store.create_agent_limited(
+                request,
+                task_summary="summary",
+                config_revision="cfg-1",
+                global_limit=1,
+                runtime_limit=1,
+            )
+        self.assertEqual(self.store.list_agents(), [])
 
     def test_unbound_request_id_is_globally_concurrent_and_exact(self) -> None:
         request = self.request(request_id="shared-request")
@@ -263,7 +280,9 @@ class StateStoreTests(unittest.TestCase):
 
     def test_global_runtime_caps_and_terminal_rows_release_capacity(self) -> None:
         def request_for(runtime: str, task: str) -> StartRequest:
-            return StartRequest(runtime, "model", "profile", task, self.root)
+            return StartRequest(
+                runtime, "model", "profile", task, self.root, timeout_seconds=480
+            )
 
         first = self.store.create_agent_limited(
             request_for("codex", "first"),

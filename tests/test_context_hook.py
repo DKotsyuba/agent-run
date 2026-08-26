@@ -29,7 +29,8 @@ class ContextHookTests(unittest.TestCase):
 
     def request(self) -> StartRequest:
         return StartRequest(
-            "codex", "model", "profile", "do work", self.root, orchestrator=self.ref
+            "codex", "model", "profile", "do work", self.root,
+            timeout_seconds=480, orchestrator=self.ref,
         )
 
     def test_first_prompt_creates_receipt_dedups_and_reuses_later_binding(self) -> None:
@@ -100,6 +101,7 @@ class ContextHookTests(unittest.TestCase):
                 "profile",
                 f"task {index}",
                 self.root,
+                timeout_seconds=480,
                 orchestrator=self.ref,
                 request_id=f"req-{index}",
             )

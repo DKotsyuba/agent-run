@@ -223,7 +223,9 @@ class SupervisorTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.answer = self.root / "answer.md"
         self.agent_id = self.store.create_agent(
-            StartRequest("fake", "model", "profile", "task", self.root),
+            StartRequest(
+                "fake", "model", "profile", "task", self.root, timeout_seconds=480
+            ),
             task_summary="task",
             config_revision="rev-1",
         ).agent_id
