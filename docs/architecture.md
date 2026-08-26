@@ -746,6 +746,14 @@ class StateStore:
         retention: int,
         runtime: str | None = None,
     ) -> list[dict[str, object]]: ...
+
+    def reconcile_reaped(
+        self,
+        agent_id: str | AgentId,
+        supervisor_pid: int,
+        *,
+        checked_at: float | None = None,
+    ) -> bool: ...
 ```
 
 - `BEGIN IMMEDIATE` for state transitions and outbox claims;
@@ -768,6 +776,9 @@ class StateStore:
 - capacity pruning runs under `BEGIN IMMEDIATE` and atomically keeps the global
   newest `retention` rows by `observed_at DESC, id DESC`; history uses the same
   global bound and ordering without filtering expired rows;
+- an exact `waitpid` proof is reconciled against the captured public agent id;
+  it closes the post-ready/pre-identity `starting` window, refuses a different
+  recorded supervisor pid, and is idempotent after terminal state;
 - terminal states never transition back;
 - state migrations are numbered SQL files, backed up before application, and
   applied in one transaction. No migration framework is needed.
@@ -840,7 +851,9 @@ Reconciliation checks PID, full command identity, heartbeat, and process group.
 A stale supervisor with a verified surviving engine group is terminated before
 `lost` is committed. Reaping a leader or observing a nonleader does not count as
 group exit while the verified group or owned process is still live. An ambiguous
-execution is never automatically replayed.
+execution is never automatically replayed. The detached reaper carries both the
+exact child pid and the captured agent id, so an exit immediately after READY is
+durably marked `lost` even when the supervisor identity row was not yet written.
 
 ## 11. Orchestrator binding and completion messages
 
