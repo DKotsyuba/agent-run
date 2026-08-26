@@ -28,8 +28,11 @@ class StateDatabaseTests(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(database.stat().st_mode), 0o600)
+            database.chmod(0o644)
             reopened = open_database(database)
             self.assertEqual(reopened.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            for candidate in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
+                self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
             reopened.close()
 
     def test_invalid_and_newer_versions_refuse_without_schema_mutation(self) -> None:

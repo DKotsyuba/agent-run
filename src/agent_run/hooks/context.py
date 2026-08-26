@@ -19,7 +19,7 @@ from ..capacity import history as history_module
 from ..config import Config
 from ..domain import ACTIVE, OrchestratorRef
 from ..errors import ValidationError
-from ..state import StateStore
+from ..state import StateStore, context_agents
 
 
 CONTEXT_HARD_LIMIT_CHARS = 2500
@@ -58,7 +58,7 @@ def build_context(
     capacity_text, capacity_key = _capacity_block(
         store, at, config.capacity.sample_retention
     )
-    agents = () if session_id is None else _active_agents(store, session_id)
+    agents = () if session_id is None else _active_agents(store, session_id, at)
     active_text, active_key = _active_block(agents, at)
     context_key = _combine_key(capacity_key, active_key)
     budget = min(max(config.capacity.context_max_chars, 0), CONTEXT_HARD_LIMIT_CHARS)
@@ -98,12 +98,10 @@ def _capacity_block(
     return text, key
 
 
-def _active_agents(store: StateStore, session_id: str) -> tuple[dict, ...]:
-    return tuple(
-        store.list_agents(
-            statuses=ACTIVE, orchestrator_session_id=session_id, limit=1_000_000
-        )
-    )
+def _active_agents(
+    store: StateStore, session_id: str, at: float
+) -> tuple[dict, ...]:
+    return context_agents(store, session_id, at=at)
 
 
 def _material_silence(agent: dict) -> bool:

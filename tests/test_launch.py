@@ -177,6 +177,23 @@ class DetachedLaunchTests(unittest.TestCase):
         self.assertEqual(ran.read_text(), "once\n")
         self.assertEqual(dispatched.read_text(), "once\n")
 
+    def test_post_reap_receives_exact_pid_and_wait_status(self) -> None:
+        report = self.root / "reaped"
+
+        def child(ready):
+            ready.ready()
+
+        def reaped(pid, status):
+            report.write_text(f"{pid}:{status}", encoding="utf-8")
+
+        pid = launch_detached(
+            child, post_reap=reaped, post_reap_timeout_seconds=1
+        )
+        self.wait_for(lambda: report.exists() and report.read_text().count(":") == 1 and not report.read_text().endswith(":"))
+        reported_pid, status = map(int, report.read_text().split(":"))
+        self.assertEqual(reported_pid, pid)
+        self.assertTrue(os.WIFEXITED(status))
+
     @staticmethod
     def alive(pid: int) -> bool:
         try:
