@@ -41,7 +41,10 @@ STARTUP_POLL_SECONDS = 0.2
 DESCRIPTOR_NAME = "service.json"
 SERVICE_LOG_NAME = "service.log"
 CONFIG_RELATIVE_PATH = "xdg/config/opencode/opencode.json"
-CONFIG_API_PATH = "/api/config"
+CONFIG_API_PATH = "/config"
+GLOBAL_HEALTH_PATH = "/global/health"
+#: Refuses an upgraded or misdirected candidate instead of a drifted contract.
+PINNED_VERSION = "1.18.18"
 PROBE_TIMEOUT_SECONDS = 0.5
 TERMINATE_GRACE_SECONDS = 5.0
 KILL_GRACE_SECONDS = 2.0
@@ -221,6 +224,7 @@ def _environment(
         "XDG_STATE_HOME": str(root / "xdg" / "state"),
         "XDG_CACHE_HOME": str(root / "xdg" / "cache"),
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+        "OPENCODE_DISABLE_AUTOUPDATE": "true",
         # Never inherited: an ambient PATH makes the launched argv nondeterministic.
         "PATH": SERVICE_PATH,
     }
@@ -303,18 +307,25 @@ def _contained(candidate: Path, expected: Path, key: str) -> None:
 def verify_isolation(
     plan: ServicePlan, health: Mapping[str, object], *, pid: int, config_hash: str
 ) -> ServiceDescriptor:
-    """Prove the exact spawned service answered its authenticated health endpoint."""
+    """Prove the exact spawned service answered its authenticated health endpoint.
+
+    v1's ``/api/health`` never reports "pid" (only ``{"healthy": true}``), so
+    its absence proves nothing either way; the exclusive port, the private
+    password, and the config-sentinel/version-pin checks carry isolation
+    instead when it is missing.
+    """
 
     if not isinstance(plan, ServicePlan):
         raise ValidationError("isolation proof requires a ServicePlan")
     if not isinstance(health, Mapping) or health.get("healthy") is not True:
         raise ServiceIsolationError("service reported unhealthy or invalid health payload")
     candidate_pid = _pid(pid)
-    reported_pid = _pid(health.get("pid"))
-    if reported_pid != candidate_pid:
-        raise ServiceIsolationError(
-            f"service health pid {reported_pid} does not match spawned pid {candidate_pid}"
-        )
+    if "pid" in health:
+        reported_pid = _pid(health.get("pid"))
+        if reported_pid != candidate_pid:
+            raise ServiceIsolationError(
+                f"service health pid {reported_pid} does not match spawned pid {candidate_pid}"
+            )
     version = health.get("version")
     if version is not None and not isinstance(version, str):
         raise ServiceIsolationError("service reported an invalid version")
@@ -495,7 +506,8 @@ def start_service(
             pid=process.pid,
             config_hash=config_hash,
         )
-        verify_config_isolation(_reported_config(client), root, config_file)
+        verify_config_isolation(_fetch_json(client, CONFIG_API_PATH), config_file)
+        verify_pinned_version(_fetch_json(client, GLOBAL_HEALTH_PATH))
         # Recorded last, and inside the guard: a service nothing can attach to
         # is a leak, so a failed write takes the candidate down with it.
         write_service_descriptor(root, descriptor)
@@ -614,65 +626,59 @@ def _await_health(
         sleep(plan.poll_interval_seconds)
 
 
-def _reported_config(client: object) -> object:
-    capture = client.get(CONFIG_API_PATH)
+def _fetch_json(client: object, path: str) -> object:
+    capture = client.get(path)
     try:
         return capture.json()
     finally:
         capture.release()
 
 
-def verify_config_isolation(
-    payload: object, home: str | Path, config_path: str | Path
-) -> None:
-    """Prove the service is configured from the generated file and nothing global.
+#: default_agent + model: no stray global config coincidentally matches both.
+_SENTINEL_KEYS: tuple[str, ...] = ("default_agent", "model")
 
-    Only a "document" entry names a loaded configuration source. The engine
-    also reports well-known integration paths (~/.claude, ~/.agents,
-    ~/.opencode, and the generated-home directory) for every managed service,
-    isolated or not, so entries of any other type are never evidence either
-    way and are ignored here.
 
-    A document entry's `info` field carries the resolved provider settings,
-    secrets included, and must never be read, logged, or placed in an error.
-    """
+def verify_config_isolation(payload: object, config_path: str | Path) -> None:
+    """Prove /config came from the generated file via a sentinel round-trip;
+    v1 has no per-source document list to walk instead."""
 
-    if not isinstance(payload, list) or not all(
-        isinstance(entry, Mapping) for entry in payload
-    ):
+    if not isinstance(payload, Mapping):
         raise ServiceIsolationError(
-            "opencode /api/config did not report a list of config entries; "
-            "refusing a service whose configuration cannot be proven"
+            "opencode /config did not report a JSON object; refusing a service whose configuration cannot be proven"
         )
+    path = Path(config_path)
+    try:
+        generated = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ServiceIsolationError(f"generated opencode config is unreadable: {path}") from error
+    except ValueError as error:
+        raise ServiceIsolationError(f"generated opencode config is not valid JSON: {path}") from error
+    if not isinstance(generated, Mapping):
+        raise ServiceIsolationError(f"generated opencode config must be a JSON object: {path}")
+    for key in _SENTINEL_KEYS:
+        expected = generated.get(key)
+        if not isinstance(expected, str) or not expected:
+            raise ServiceIsolationError(f"generated opencode config has no {key!r} sentinel")
+        observed = payload.get(key)
+        if observed != expected:
+            raise ServiceIsolationError(
+                f"opencode /config reports {key} {observed!r}, expected the generated "
+                f"{expected!r}; refusing a service configured from somewhere else"
+            )
 
-    root = _service_root(home)
-    roots = {root, root.resolve()}
-    candidate = Path(config_path)
-    expected = {str(candidate), str(candidate.resolve())}
 
-    found_expected = False
-    for entry in payload:
-        if entry.get("type") != "document":
-            continue
-        value = entry.get("path")
-        if not isinstance(value, str):
-            continue
-        if value in expected:
-            found_expected = True
-            continue
-        path = Path(value)
-        if any(path == item or path.is_relative_to(item) for item in roots):
-            continue
+def verify_pinned_version(payload: object, *, pinned: str = PINNED_VERSION) -> None:
+    """Refuse a candidate whose reported version is not the pin: the real
+    anti-drift guard against an unattended upgrade or a misdirected binary."""
+
+    if not isinstance(payload, Mapping):
         raise ServiceIsolationError(
-            f"opencode /api/config reports the document {value} outside the "
-            f"generated home {root}; refusing a service configured from "
-            "somewhere else"
+            "opencode /global/health did not report a JSON object; refusing a service whose version cannot be proven"
         )
-
-    if not found_expected:
+    version = payload.get("version")
+    if version != pinned:
         raise ServiceIsolationError(
-            f"opencode /api/config does not report the generated config {candidate}; "
-            "refusing a service configured from somewhere else"
+            f"opencode service reports version {version!r}; refusing anything but the pinned {pinned!r}"
         )
 
 

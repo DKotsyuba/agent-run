@@ -19,6 +19,8 @@ from agent_run.adapters.opencode.http import HEALTH_PATH, OpenCodeHttpClient, Re
 from agent_run.adapters.opencode.service import (
     CONFIG_API_PATH,
     CONFIG_RELATIVE_PATH,
+    GLOBAL_HEALTH_PATH,
+    PINNED_VERSION,
     SERVICE_HOST,
     SERVICE_LOG_NAME,
     SERVICE_PATH,
@@ -67,7 +69,7 @@ class ServiceTempCase(unittest.TestCase):
         self.root = Path(self._temp.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
-        self.binary = self.root / "opencode2"
+        self.binary = self.root / "opencode"
         self.binary.write_text("#!/bin/sh\n", encoding="utf-8")
         self.config = runtime_config(self.binary, self.home)
 
@@ -112,6 +114,7 @@ class BuildServicePlanTests(ServiceTempCase):
             sorted(plan.environment),
             [
                 "HOME",
+                "OPENCODE_DISABLE_AUTOUPDATE",
                 "OPENCODE_DISABLE_CLAUDE_CODE",
                 PASSWORD_ENV,
                 "PATH",
@@ -242,64 +245,69 @@ class IsolationProofTests(ServiceTempCase):
         with self.assertRaises(ServiceIsolationError):
             verify_isolation(self.plan(), payload, pid=4242, config_hash=CONFIG_HASH)
 
+    def test_a_health_payload_with_no_pid_field_is_accepted(self):
+        """v1 stable's real /api/health is exactly {"healthy": true}: no pid,
+        no version. Its absence must not be confused with a pid of 0/None."""
+
+        payload = self.reported()
+        del payload["pid"]
+        del payload["version"]
+        descriptor = verify_isolation(self.plan(), payload, pid=4242, config_hash=CONFIG_HASH)
+        self.assertEqual(descriptor.pid, 4242)
+        self.assertIsNone(descriptor.version)
+
 
 class ConfigIsolationTests(ServiceTempCase):
-    """verify_config_isolation: only 'document' entries are ever evidence."""
+    """verify_config_isolation: a sentinel-key assert on the merged /config document.
+
+    v1 has no per-source document list, only ``GET /config``'s one merged
+    document, so isolation is proven by round-tripping the generated file's
+    own default_agent/model pair instead of walking a list of sources.
+    """
 
     def setUp(self):
         super().setUp()
         self.config_file = self.home / CONFIG_RELATIVE_PATH
-
-    def live_shape(self, *extra_entries):
-        """The real /api/config shape: a list of typed entries.
-
-        The claude/agents/directory entries name well-known integration
-        paths the engine reports for every service, isolated or not — they
-        must never be mistaken for evidence either way.
-        """
-        return [
-            {"type": "claude", "path": "/Users/pluto/.claude"},
-            {"type": "agents", "path": "/Users/pluto/.agents"},
-            {
-                "type": "document",
-                "path": str(self.config_file),
-                "info": {"provider": {"apiKey": "sk-fixture-secret"}},
-            },
-            {"type": "directory", "path": str(self.home / "xdg/config/opencode")},
-            {"type": "directory", "path": "/Users/pluto/.opencode"},
-            *extra_entries,
-        ]
-
-    def test_the_exact_live_shape_passes(self):
-        verify_config_isolation(self.live_shape(), self.home, self.config_file)
-
-    def test_a_document_at_a_global_path_is_refused_without_leaking_its_info(self):
-        secret = "sk-global-super-secret"
-        payload = self.live_shape(
-            {
-                "type": "document",
-                "path": "/Users/pluto/.config/opencode/opencode.json",
-                "info": {"provider": {"apiKey": secret}},
-            }
+        write_managed_file(
+            self.home,
+            CONFIG_RELATIVE_PATH,
+            json.dumps({"default_agent": "agent-run", "model": MODEL}) + "\n",
         )
+
+    def merged(self, **overrides):
+        """The real /config shape: the one merged document, sentinel matching."""
+        payload = {"default_agent": "agent-run", "model": MODEL, "share": "disabled"}
+        payload.update(overrides)
+        return payload
+
+    def test_the_matching_merged_document_passes(self):
+        verify_config_isolation(self.merged(), self.config_file)
+
+    def test_a_mismatched_default_agent_is_refused_without_leaking_the_document(self):
+        payload = self.merged(default_agent="global-primary")
         with self.assertRaises(ServiceIsolationError) as caught:
-            verify_config_isolation(payload, self.home, self.config_file)
+            verify_config_isolation(payload, self.config_file)
         message = str(caught.exception)
-        self.assertIn("outside the generated home", message)
-        self.assertNotIn(secret, message)
+        self.assertIn("default_agent", message)
+        self.assertIn("global-primary", message)
+        self.assertNotIn("share", message)
 
-    def test_no_document_for_the_generated_path_is_refused(self):
-        payload = [
-            {"type": "claude", "path": "/Users/pluto/.claude"},
-            {"type": "directory", "path": "/Users/pluto/.opencode"},
-        ]
+    def test_a_mismatched_model_is_refused(self):
+        payload = self.merged(model="omniroute/some-other-model")
         with self.assertRaises(ServiceIsolationError) as caught:
-            verify_config_isolation(payload, self.home, self.config_file)
-        self.assertIn("does not report the generated config", str(caught.exception))
+            verify_config_isolation(payload, self.config_file)
+        self.assertIn("model", str(caught.exception))
 
-    def test_a_non_list_payload_is_refused(self):
-        with self.assertRaises(ServiceIsolationError):
-            verify_config_isolation({"data": "not-a-list"}, self.home, self.config_file)
+    def test_a_non_mapping_payload_is_refused(self):
+        with self.assertRaises(ServiceIsolationError) as caught:
+            verify_config_isolation([{"type": "document"}], self.config_file)
+        self.assertIn("did not report a JSON object", str(caught.exception))
+
+    def test_a_generated_config_missing_a_sentinel_is_refused(self):
+        write_managed_file(self.home, CONFIG_RELATIVE_PATH, '{"share": "disabled"}\n')
+        with self.assertRaises(ServiceIsolationError) as caught:
+            verify_config_isolation(self.merged(), self.config_file)
+        self.assertIn("sentinel", str(caught.exception))
 
 
 class DescriptorFileTests(ServiceTempCase):
@@ -453,7 +461,9 @@ class StartServiceTests(ServiceTempCase):
     def setUp(self):
         super().setUp()
         self.config_digest = write_managed_file(
-            self.home, CONFIG_RELATIVE_PATH, '{"generated": true}\n'
+            self.home,
+            CONFIG_RELATIVE_PATH,
+            json.dumps({"default_agent": "agent-run", "model": MODEL}) + "\n",
         )
         self.config_file = self.home / CONFIG_RELATIVE_PATH
         self.pid = os.getpid()
@@ -499,28 +509,17 @@ class StartServiceTests(ServiceTempCase):
         payload.update(overrides)
         return FakeReply(payload)
 
-    def reported_config(self, *extra_documents):
-        """The live /api/config shape: a list of typed entries.
+    def reported_config(self, **overrides):
+        """The live /config shape: the one merged document, sentinel matching."""
+        payload = {"default_agent": "agent-run", "model": MODEL, "share": "disabled"}
+        payload.update(overrides)
+        return FakeReply(payload)
 
-        Non-document entries (claude, agents, directory) name well-known
-        integration paths the engine reports for every service, isolated or
-        not, and are included here to prove they are never mistaken for
-        evidence of a loaded configuration.
-        """
-        return FakeReply(
-            [
-                {"type": "claude", "path": "/Users/pluto/.claude"},
-                {"type": "agents", "path": "/Users/pluto/.agents"},
-                {
-                    "type": "document",
-                    "path": str(self.config_file),
-                    "info": {"provider": {"apiKey": "sk-fixture-secret"}},
-                },
-                {"type": "directory", "path": str(self.home / "xdg/config/opencode")},
-                {"type": "directory", "path": "/Users/pluto/.opencode"},
-                *extra_documents,
-            ]
-        )
+    def global_health(self, **overrides):
+        """The live /global/health shape: healthy plus the pinned version."""
+        payload = {"healthy": True, "version": PINNED_VERSION}
+        payload.update(overrides)
+        return FakeReply(payload)
 
     def assert_candidate_cleaned_up(self):
         self.assertEqual(
@@ -547,7 +546,7 @@ class StartServiceTests(ServiceTempCase):
         self.assertEqual(self.spawns, [])
 
     def test_one_start_spawns_one_default_serve_and_records_the_proof(self):
-        started = self.start(self.healthy(), self.reported_config())
+        started = self.start(self.healthy(), self.reported_config(), self.global_health())
 
         self.assertFalse(started.reused)
         self.assertEqual(len(self.spawns), 1)
@@ -575,6 +574,7 @@ class StartServiceTests(ServiceTempCase):
             [
                 f"{started.descriptor.base_url}{HEALTH_PATH}",
                 f"{started.descriptor.base_url}{CONFIG_API_PATH}",
+                f"{started.descriptor.base_url}{GLOBAL_HEALTH_PATH}",
             ],
         )
         self.assertEqual(started.descriptor.pid, self.pid)
@@ -593,11 +593,22 @@ class StartServiceTests(ServiceTempCase):
 
     def test_readiness_survives_a_refusal_before_the_service_is_up(self):
         started = self.start(
-            http_error(503), self.healthy(), self.reported_config()
+            http_error(503), self.healthy(), self.reported_config(), self.global_health()
         )
         self.assertEqual(len(self.spawns), 1)
-        self.assertEqual(len(self.opener.calls), 3)
+        self.assertEqual(len(self.opener.calls), 4)
         self.assertEqual(started.descriptor.pid, self.pid)
+
+    def test_a_v1_shaped_health_reply_without_pid_or_version_still_completes(self):
+        """v1 stable's real /api/health is exactly {"healthy": true}: no pid,
+        no version -- unlike the beta shape every other fixture here uses."""
+
+        started = self.start(
+            FakeReply({"healthy": True}), self.reported_config(), self.global_health()
+        )
+        self.assertFalse(started.reused)
+        self.assertEqual(started.descriptor.pid, self.pid)
+        self.assertIsNone(started.descriptor.version)
 
     def test_a_health_pid_mismatch_terminates_only_the_candidate(self):
         with self.assertRaises(ServiceIsolationError) as caught:
@@ -635,28 +646,26 @@ class StartServiceTests(ServiceTempCase):
         self.assert_candidate_cleaned_up()
 
     def test_a_second_start_reuses_the_proven_service(self):
-        first = self.start(self.healthy(), self.reported_config())
+        first = self.start(self.healthy(), self.reported_config(), self.global_health())
         second = self.start()
         self.assertTrue(second.reused)
         self.assertEqual(second.descriptor.as_dict(), first.descriptor.as_dict())
         self.assertEqual(len(self.spawns), 1)
         self.assertEqual(self.opener.calls, [])
 
-    def test_the_config_report_must_name_the_generated_source_only(self):
+    def test_the_config_report_must_match_the_generated_sentinel(self):
         cases = (
             (
                 FakeReply([{"type": "claude", "path": "/Users/pluto/.claude"}]),
-                "does not report the generated config",
+                "did not report a JSON object",
             ),
             (
-                self.reported_config(
-                    {
-                        "type": "document",
-                        "path": str(Path.home() / ".config/opencode/opencode.json"),
-                        "info": {"provider": {"apiKey": "sk-global-secret"}},
-                    }
-                ),
-                "outside the generated home",
+                self.reported_config(default_agent="global-primary"),
+                "default_agent",
+            ),
+            (
+                self.reported_config(model="omniroute/some-other-model"),
+                "model",
             ),
         )
         for reply, expected in cases:
@@ -665,11 +674,22 @@ class StartServiceTests(ServiceTempCase):
                 self.ops.signals.clear()
                 with self.assertRaises(ServiceIsolationError) as caught:
                     self.start(self.healthy(), reply)
-                message = str(caught.exception)
-                self.assertIn(expected, message)
-                self.assertNotIn("sk-global-secret", message)
+                self.assertIn(expected, str(caught.exception))
                 self.assertEqual(len(self.spawns), 1)
                 self.assert_candidate_cleaned_up()
+
+    def test_a_mismatched_pinned_version_is_refused_and_cleans_up(self):
+        with self.assertRaises(ServiceIsolationError) as caught:
+            self.start(
+                self.healthy(),
+                self.reported_config(),
+                self.global_health(version="1.18.99"),
+            )
+        message = str(caught.exception)
+        self.assertIn("1.18.99", message)
+        self.assertIn(PINNED_VERSION, message)
+        self.assertEqual(len(self.spawns), 1)
+        self.assert_candidate_cleaned_up()
 
 
 if __name__ == "__main__":

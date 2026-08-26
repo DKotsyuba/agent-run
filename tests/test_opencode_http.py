@@ -29,12 +29,13 @@ from agent_run.errors import ValidationError
 
 
 class FakeReply:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, content_type=None):
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
         self._buffer = io.BytesIO(body)
         self.status = status
         self.closed = False
         self.reads = 0
+        self.headers = {"Content-Type": content_type} if content_type else {}
 
     def read(self, size=-1):
         self.reads += 1
@@ -207,6 +208,32 @@ class CaptureTests(ClientCase):
         client = self.client(FakeReply(b"{not json"))
         with self.assertRaises(ValidationError):
             client.get("/session/s1").json()
+
+    def test_a_2xx_html_reply_is_refused_by_content_type_not_as_bad_json(self):
+        """The v1 web UI's catch-all answers any unknown path with 200 text/html;
+        that must read as a clear wrong-path refusal, never a JSON parse error."""
+
+        client = self.client(
+            FakeReply(b"<!doctype html><html></html>", content_type="text/html; charset=utf-8")
+        )
+        with self.assertRaises(ValidationError) as caught:
+            client.get("/unknown-path").json()
+        message = str(caught.exception)
+        self.assertIn("/unknown-path", message)
+        self.assertIn("text/html", message)
+        self.assertNotIn("not valid JSON", message)
+
+    def test_a_json_content_type_with_a_charset_parameter_still_decodes(self):
+        client = self.client(
+            FakeReply({"ok": True}, content_type="application/json; charset=utf-8")
+        )
+        self.assertEqual(client.get("/session/s1").json(), {"ok": True})
+
+    def test_a_missing_content_type_still_decodes_as_json(self):
+        """Fixtures and any transport that omits the header keep working."""
+
+        client = self.client(FakeReply({"ok": True}))
+        self.assertEqual(client.get("/session/s1").json(), {"ok": True})
 
 
 class CaptureLifetimeTests(ClientCase):
