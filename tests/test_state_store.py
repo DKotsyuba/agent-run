@@ -517,6 +517,28 @@ class StateStoreTests(unittest.TestCase):
             )
         self.assertEqual(len(self.store.transcript(agent_id)), 1)
 
+    def test_path_reopens_a_second_writable_connection_to_the_same_file(self) -> None:
+        """The supervisor's StoreEventSink relies on this: a caller holding only
+        a connection (not the path it was opened from) can recover that path
+        and open its own independent, fully-functional connection to the same
+        database -- the mechanism that lets a background thread write durably
+        without sharing the thread-affine sqlite3.Connection object."""
+
+        agent_id = self.create()
+        self.assertEqual(self.store.path(), (self.root / "state.db").resolve())
+
+        second = StateStore.open(self.store.path())
+        try:
+            second.append_event(agent_id, "from_second_connection")
+        finally:
+            second.close()
+
+        rows = self.store.connection.execute(
+            "SELECT kind FROM events WHERE agent_id = ? AND kind = 'from_second_connection'",
+            (agent_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
