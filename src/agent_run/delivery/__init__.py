@@ -10,6 +10,7 @@ from .base import (
     DeliveryError,
     DeliveryReceipt,
 )
+from .claude_uds import ClaudeSessionSender, ClaudeUdsTransport
 from .codex_queue import TRANSPORT_NAME, CodexQueueTransport
 from .dispatch import (
     DeliveryDispatcher,
@@ -25,6 +26,8 @@ __all__ = [
     "AmbiguousDeliveryError",
     "ChatTransport",
     "ChatTransportConfig",
+    "ClaudeSessionSender",
+    "ClaudeUdsTransport",
     "CodexQueueTransport",
     "CompletionNotice",
     "DeliveryDispatcher",

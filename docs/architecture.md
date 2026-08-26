@@ -127,6 +127,7 @@ src/agent_run/
     base.py
     dispatch.py
     codex_queue.py
+    claude_uds.py
   hooks/
     context.py
     bind.py
@@ -892,8 +893,30 @@ class ChatTransport(Protocol):
     def send(self, target: OrchestratorRef, notice: CompletionNotice) -> DeliveryReceipt: ...
 ```
 
-The first transport is Codex queue delivery. More transports may be added
-without changing runtime adapters or state.
+Two transports ship today:
+
+- `codex_queue` runs `codex queue` against a live Codex thread;
+- `claude_uds` writes an auth line and one user line into the Unix-domain
+  inbox a live Claude Code session publishes at
+  `~/.claude/sessions/<pid>.json` -> `/tmp/cc-socks/<pid>.sock`. A registry
+  miss or a probe-connect refusal means the session is gone; a stalled write
+  is ambiguous, never a failure. Verified on claude 2.1.245: headless
+  (`--print`) sessions register the same as interactive ones, and the inbox
+  is *not* gated by `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`.
+
+More transports may be added without changing runtime adapters or state.
+
+Each runtime's hook config names the transport its own sessions speak:
+`hook bind` and `hook context` take `--transport <name>`, defaulting to
+`codex_queue`. The name it records is the name the dispatcher routes back to,
+so a Claude runtime's hooks must pass `--transport claude_uds`:
+
+```toml
+[[runtimes.claude.hooks]]
+event = "PostToolUse"
+matcher = "^mcp__agent_run__start$"
+command = ["agent-run", "hook", "bind", "--transport", "claude_uds"]
+```
 
 Binding rules:
 
