@@ -259,6 +259,51 @@ class CliTests(unittest.TestCase):
         self.assertEqual([message["content"] for message in payload["messages"]], ["one", "two"])
         self.assertEqual(full.calls, [("transcript", 0, 1), ("transcript", 1, 1)])
 
+    def test_transcript_follow_polls_without_duplicates_until_terminal_and_drained(self):
+        class FollowService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.statuses = [AgentStatus.RUNNING, AgentStatus.SUCCEEDED]
+
+            def get(self, agent_id):
+                self.calls.append("get")
+                return FakeView(
+                    self.statuses.pop(0), Path("/tmp/answer.md"), MappingProxyType({})
+                )
+
+            def transcript(self, agent_id, cursor=0, limit=200):
+                self.calls.append(("transcript", cursor, limit))
+                seq = cursor + 1
+                return TranscriptPage(
+                    AgentId(AGENT_ID),
+                    (MessageView(seq, float(seq), "assistant", None, str(seq), None),),
+                    cursor,
+                    limit,
+                    None,
+                    True,
+                )
+
+        service = FollowService()
+        with patch("time.sleep") as sleep:
+            code, output, error = self.run_cli(
+                ["transcript", AGENT_ID, "--limit", "1", "--follow"],
+                service=service,
+            )
+        payload = json.loads(output)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual([item["seq"] for item in payload["messages"]], [1, 2])
+        self.assertEqual(
+            service.calls,
+            [("transcript", 0, 1), "get", ("transcript", 1, 1), "get"],
+        )
+        sleep.assert_called_once()
+
+        code, output, error = self.run_cli(
+            ["transcript", AGENT_ID, "--follow", "--full"], service=FakeService()
+        )
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("not allowed with argument", error)
+
     def test_expected_errors_are_stable_json_but_unexpected_faults_propagate(self):
         expected = FakeService()
         expected.error = ValidationError("bad request")
@@ -400,6 +445,69 @@ class CliTests(unittest.TestCase):
             self.assertEqual((code, output), (2, ""))
             self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
 
+    def test_delivery_launchd_renders_a_durable_bounded_sweeper(self):
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            queue = home / "queue"
+            (home / "config.toml").write_text(
+                f"schema_version = 1\n[delivery]\nretry_base_seconds = 2.1\n"
+                f'codex_queue_bin = "{queue}"\n',
+                encoding="utf-8",
+            )
+            binary = home / "agent-run"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            code = cli.main(
+                [
+                    "--home", str(home), "delivery", "launchd", "--binary", str(binary)
+                ],
+                stdin=io.StringIO(),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual((code, stderr.getvalue()), (0, ""))
+            self.assertFalse((home / "state.db").exists())
+            rendered = json.loads(stdout.getvalue())
+            self.assertEqual(rendered["interval_seconds"], 3)
+            self.assertEqual(
+                rendered["argv"],
+                [str(binary), "--home", str(home), "delivery", "dispatch"],
+            )
+            parsed = plistlib.loads(rendered["plist"].encode("utf-8"))
+            self.assertEqual(parsed["ProgramArguments"], rendered["argv"])
+            self.assertEqual(parsed["StartInterval"], 3)
+            self.assertIs(parsed["RunAtLoad"], False)
+            self.assertNotIn("KeepAlive", parsed)
+
+    def test_init_bootstraps_private_minimal_home_without_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / "fresh"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = ["--home", str(home), "init"]
+            code = cli.main(
+                args, stdin=io.StringIO(), stdout=stdout, stderr=stderr
+            )
+            self.assertEqual((code, stderr.getvalue()), (0, ""))
+            config = home / "config.toml"
+            state = home / "state.db"
+            self.assertEqual(config.read_text(encoding="utf-8"), "schema_version = 1\n")
+            self.assertTrue(state.is_file())
+            self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("token", config.read_text(encoding="utf-8").lower())
+
+            before = config.stat().st_ino
+            self.assertEqual(
+                cli.main(args, stdin=io.StringIO(), stdout=io.StringIO(), stderr=io.StringIO()),
+                0,
+            )
+            self.assertEqual(config.stat().st_ino, before)
+
     def test_hook_context_wraps_first_injection_and_suppresses_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
@@ -479,6 +587,8 @@ class CliTests(unittest.TestCase):
                 "turn_id": "turn-1",
                 "cwd": str(home),
                 "prompt": "must-not-be-logged",
+                "transcript_path": "/ignored/raw-transcript",
+                "permission_mode": "default",
             }
 
             with patch.object(
@@ -508,6 +618,8 @@ class CliTests(unittest.TestCase):
                 "session_id": "raw-session",
                 "turn_id": "turn-2",
                 "tool_name": "mcp__agent_run__start",
+                "tool_use_id": "call-1",
+                "unrelated_metadata": {"ignored": True},
                 "tool_response": {
                     "content": [{"type": "text", "text": "ignored"}],
                     "structuredContent": {"agent_id": agent_id},
@@ -620,6 +732,19 @@ class CliTests(unittest.TestCase):
             self.assertEqual((code, output), (2, ""))
             self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
 
+            normalized = {
+                "transport": cli.TRANSPORT_NAME,
+                "external_session_id": "strict-normalized",
+                "unrelated": True,
+            }
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "context"],
+                service=runtime,
+                stdin=json.dumps(normalized),
+            )
+            self.assertEqual((code, output), (2, ""))
+            self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
+
     def test_mcp_command_is_reserved_without_importing_parallel_module(self):
         sys.modules.pop("agent_run.mcp", None)
         args = cli._parser().parse_args(["mcp"])
@@ -664,8 +789,10 @@ class CliTests(unittest.TestCase):
             dispatcher = Mock()
             result = object()
             dispatcher.run.return_value = result
-            config = SimpleNamespace(delivery=object())
-            with patch.dict(os.environ, {"CODEX_QUEUE_BIN": str(executable)}), patch.object(
+            config = SimpleNamespace(
+                delivery=SimpleNamespace(codex_queue_bin=executable)
+            )
+            with patch.dict(os.environ, {}, clear=True), patch.object(
                 cli, "load_config", return_value=config
             ), patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
                 cli, "CodexQueueSender", return_value=sender
@@ -682,7 +809,7 @@ class CliTests(unittest.TestCase):
             dispatcher_type.assert_called_once_with(
                 store, {cli.TRANSPORT_NAME: transport}, config.delivery
             )
-            dispatcher.run.assert_called_once_with(home=home, max_batch=1)
+            dispatcher.run.assert_called_once_with(home=home)
             store.close.assert_called_once_with()
 
             runtime = object.__new__(cli._Runtime)
@@ -691,11 +818,40 @@ class CliTests(unittest.TestCase):
                 self.assertIs(runtime.delivery_dispatch(), result)
             dispatch.assert_called_once_with(home)
 
+    def test_dispatch_environment_binary_explicitly_overrides_owner_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            configured = home / "configured"
+            override = home / "override"
+            override.write_text("#!/bin/sh\n", encoding="utf-8")
+            override.chmod(0o700)
+            config = SimpleNamespace(
+                delivery=SimpleNamespace(codex_queue_bin=configured)
+            )
+            dispatcher = Mock()
+            dispatcher.run.return_value = object()
+            with patch.dict(
+                os.environ, {"CODEX_QUEUE_BIN": str(override)}, clear=True
+            ), patch.object(cli, "load_config", return_value=config), patch.object(
+                cli.StateStore, "open", return_value=Mock()
+            ), patch.object(cli, "CodexQueueSender", return_value=Mock()) as sender, patch.object(
+                cli, "CodexQueueTransport", return_value=Mock()
+            ), patch.object(cli, "DeliveryDispatcher", return_value=dispatcher):
+                cli._dispatch_once(home)
+            sender.assert_called_once_with(str(override), timeout_seconds=30.0)
+
     def test_dispatch_requires_an_absolute_codex_queue_binary(self):
-        with patch.dict(os.environ, {}, clear=True):
+        config = SimpleNamespace(
+            delivery=SimpleNamespace(codex_queue_bin=None)
+        )
+        with patch.object(cli, "load_config", return_value=config), patch.dict(
+            os.environ, {}, clear=True
+        ):
             with self.assertRaisesRegex(ValidationError, "CODEX_QUEUE_BIN"):
                 cli._dispatch_once(Path("/tmp/home"))
-        with patch.dict(os.environ, {"CODEX_QUEUE_BIN": "codex"}, clear=True):
+        with patch.object(cli, "load_config", return_value=config), patch.dict(
+            os.environ, {"CODEX_QUEUE_BIN": "codex"}, clear=True
+        ):
             with self.assertRaisesRegex(ValidationError, "absolute executable"):
                 cli._dispatch_once(Path("/tmp/home"))
 

@@ -109,6 +109,23 @@ class DeliveryDispatchTests(unittest.TestCase):
         again = dispatcher.run(lock_path=self.lock_path, at=11)
         self.assertEqual((again.claimed, len(transport.calls)), (0, 1))
 
+    def test_trigger_drains_bounded_backlog_and_overflow_is_recoverable(self) -> None:
+        self.finished_agent()
+        self.finished_agent()
+        transport = FakeTransport(DeliveryReceipt("remote"))
+        dispatcher = self.dispatcher(transport)
+
+        drained = dispatcher.run(lock_path=self.lock_path, at=10)
+
+        self.assertEqual((drained.claimed, drained.delivered), (3, 3))
+        self.assertEqual(len(transport.calls), 3)
+
+        self.finished_agent()
+        self.finished_agent()
+        bounded = dispatcher.run(lock_path=self.lock_path, at=11, max_batch=1)
+        recovered = dispatcher.run(lock_path=self.lock_path, at=11)
+        self.assertEqual((bounded.claimed, recovered.claimed), (1, 1))
+
     def test_ambiguous_timeout_retries_with_capped_backoff_and_stays_durable(self) -> None:
         transport = FakeTransport(AmbiguousDeliveryError("unknown acceptance"))
         config = DeliveryConfig(retry_base_seconds=2, retry_cap_seconds=3, max_attempts=0)
