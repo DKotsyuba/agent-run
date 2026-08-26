@@ -26,6 +26,7 @@ TRANSPORT_NAME = "codex_queue"
 QueueSender = Callable[[str, str], "str | None"]
 
 
+# QueueSender implementations must raise only this error for an absent session.
 class SessionGoneError(LookupError):
     """The queue target no longer exists; never create a replacement."""
 

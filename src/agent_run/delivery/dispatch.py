@@ -14,7 +14,6 @@ from ..config import DeliveryConfig
 from ..domain import AgentStatus, OrchestratorRef
 from ..errors import ValidationError
 from ..paths import agent_run_home
-from ..state.db import finish_delivery_claim, immediate, timestamp
 from ..state.store import StateStore
 from .base import (
     AmbiguousDeliveryError,
