@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.opencode.service import PASSWORD_ENV
 from agent_run.adapters.home import content_hash, write_managed_file
 from agent_run.adapters.opencode import service as service_module
-from agent_run.adapters.opencode.http import HEALTH_PATH, OpenCodeHttpClient, RetryPolicy
+from agent_run.adapters.opencode.http import HEALTH_PATH, MODEL_PATH, OpenCodeHttpClient, RetryPolicy
 from agent_run.adapters.opencode.service import (
     CONFIG_API_PATH,
     CONFIG_RELATIVE_PATH,
@@ -521,6 +521,24 @@ class StartServiceTests(ServiceTempCase):
         payload.update(overrides)
         return FakeReply(payload)
 
+    def model_roster(self, data=None):
+        """The live /api/model shape: default is one active, enabled entry.
+
+        Pass ``data=[]`` for the live-proven post-boot race window, where
+        providers have not registered yet.
+        """
+        if data is None:
+            data = [
+                {
+                    "providerID": "omniroute",
+                    "id": MODEL.split("/", 1)[1],
+                    "name": MODEL,
+                    "enabled": True,
+                    "status": "active",
+                }
+            ]
+        return FakeReply({"data": data})
+
     def assert_candidate_cleaned_up(self):
         self.assertEqual(
             self.ops.signals,
@@ -546,7 +564,9 @@ class StartServiceTests(ServiceTempCase):
         self.assertEqual(self.spawns, [])
 
     def test_one_start_spawns_one_default_serve_and_records_the_proof(self):
-        started = self.start(self.healthy(), self.reported_config(), self.global_health())
+        started = self.start(
+            self.healthy(), self.reported_config(), self.global_health(), self.model_roster()
+        )
 
         self.assertFalse(started.reused)
         self.assertEqual(len(self.spawns), 1)
@@ -575,6 +595,7 @@ class StartServiceTests(ServiceTempCase):
                 f"{started.descriptor.base_url}{HEALTH_PATH}",
                 f"{started.descriptor.base_url}{CONFIG_API_PATH}",
                 f"{started.descriptor.base_url}{GLOBAL_HEALTH_PATH}",
+                f"{started.descriptor.base_url}{MODEL_PATH}",
             ],
         )
         self.assertEqual(started.descriptor.pid, self.pid)
@@ -593,10 +614,14 @@ class StartServiceTests(ServiceTempCase):
 
     def test_readiness_survives_a_refusal_before_the_service_is_up(self):
         started = self.start(
-            http_error(503), self.healthy(), self.reported_config(), self.global_health()
+            http_error(503),
+            self.healthy(),
+            self.reported_config(),
+            self.global_health(),
+            self.model_roster(),
         )
         self.assertEqual(len(self.spawns), 1)
-        self.assertEqual(len(self.opener.calls), 4)
+        self.assertEqual(len(self.opener.calls), 5)
         self.assertEqual(started.descriptor.pid, self.pid)
 
     def test_a_v1_shaped_health_reply_without_pid_or_version_still_completes(self):
@@ -604,7 +629,10 @@ class StartServiceTests(ServiceTempCase):
         no version -- unlike the beta shape every other fixture here uses."""
 
         started = self.start(
-            FakeReply({"healthy": True}), self.reported_config(), self.global_health()
+            FakeReply({"healthy": True}),
+            self.reported_config(),
+            self.global_health(),
+            self.model_roster(),
         )
         self.assertFalse(started.reused)
         self.assertEqual(started.descriptor.pid, self.pid)
@@ -646,12 +674,46 @@ class StartServiceTests(ServiceTempCase):
         self.assert_candidate_cleaned_up()
 
     def test_a_second_start_reuses_the_proven_service(self):
-        first = self.start(self.healthy(), self.reported_config(), self.global_health())
+        first = self.start(
+            self.healthy(), self.reported_config(), self.global_health(), self.model_roster()
+        )
         second = self.start()
         self.assertTrue(second.reused)
         self.assertEqual(second.descriptor.as_dict(), first.descriptor.as_dict())
         self.assertEqual(len(self.spawns), 1)
         self.assertEqual(self.opener.calls, [])
+
+    def test_start_waits_for_the_model_roster_before_succeeding(self):
+        """The live-proven race: /api/model can be empty right after health
+        goes healthy, while providers register async. start_service must not
+        succeed until the configured model actually appears."""
+
+        started = self.start(
+            self.healthy(),
+            self.reported_config(),
+            self.global_health(),
+            self.model_roster(data=[]),
+            self.model_roster(),
+        )
+        self.assertFalse(started.reused)
+        model_calls = [
+            url for _method, url in self.opener.calls if url.endswith(MODEL_PATH)
+        ]
+        self.assertEqual(len(model_calls), 2)
+
+    def test_a_roster_that_never_populates_fails_closed_and_cleans_up(self):
+        clock = [0.0, 0.0, 100.0]
+        with self.assertRaises(ServiceIsolationError) as caught:
+            self.start(
+                self.healthy(),
+                self.reported_config(),
+                self.global_health(),
+                self.model_roster(data=[]),
+                monotonic=lambda: clock.pop(0),
+            )
+        self.assertIn(MODEL, str(caught.exception))
+        self.assertEqual(len(self.spawns), 1)
+        self.assert_candidate_cleaned_up()
 
     def test_the_config_report_must_match_the_generated_sentinel(self):
         cases = (

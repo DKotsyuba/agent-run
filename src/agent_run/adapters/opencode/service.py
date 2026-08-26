@@ -499,15 +499,24 @@ def start_service(
     config_hash = config_file_hash(config_file)
     process = _spawn(plan)
     try:
+        from .readiness import await_health, await_model_roster
+
         client = _client(plan, root) if client_factory is None else client_factory(plan.base_url)
+        health_started = monotonic()
         descriptor = verify_isolation(
             plan,
-            _await_health(plan, process, client, sleep=sleep, monotonic=monotonic),
+            await_health(plan, process, client, sleep=sleep, monotonic=monotonic),
             pid=process.pid,
             config_hash=config_hash,
         )
         verify_config_isolation(_fetch_json(client, CONFIG_API_PATH), config_file)
         verify_pinned_version(_fetch_json(client, GLOBAL_HEALTH_PATH))
+        # Live-proven v1 race: providers register async right after health
+        # goes healthy, so close it here, once, at readiness.
+        await_model_roster(
+            client, config.models, plan=plan, started_at=health_started,
+            sleep=sleep, monotonic=monotonic,
+        )
         # Recorded last, and inside the guard: a service nothing can attach to
         # is a leak, so a failed write takes the candidate down with it.
         write_service_descriptor(root, descriptor)
@@ -586,44 +595,6 @@ def _spawn(plan: ServicePlan) -> subprocess.Popen:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-
-
-def _await_health(
-    plan: ServicePlan,
-    process: subprocess.Popen,
-    client: object,
-    *,
-    sleep: Callable[[float], None],
-    monotonic: Callable[[], float],
-) -> Mapping[str, object]:
-    """Poll health until the candidate answers, dies, refuses, or runs out."""
-
-    from .http import HttpError, TransientHttpError
-
-    deadline = monotonic() + plan.startup_timeout_seconds
-    while True:
-        code = process.poll()
-        if code is not None:
-            raise ServiceIsolationError(
-                f"opencode service exited with status {code} before it reported healthy"
-            )
-        try:
-            return client.health()
-        except TransientHttpError:
-            pass
-        except HttpError as error:
-            if error.status in _AUTH_REFUSED:
-                raise ServiceIsolationError(
-                    f"opencode service refused the managed credentials with {error.status}; "
-                    f"{PASSWORD_ENV} does not match the running service"
-                ) from error
-            raise
-        if monotonic() >= deadline:
-            raise ServiceIsolationError(
-                "opencode service did not report healthy within "
-                f"{plan.startup_timeout_seconds} seconds"
-            )
-        sleep(plan.poll_interval_seconds)
 
 
 def _fetch_json(client: object, path: str) -> object:
