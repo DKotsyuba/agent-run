@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import select
-import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 
 from .errors import ValidationError
@@ -25,31 +25,38 @@ DEFAULT_DISPATCH_TIMEOUT_SECONDS = 5.0
 DEFAULT_REAP_TIMEOUT_SECONDS = 5.0
 DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
 DEFAULT_CLEANUP_KILL_SECONDS = 1.0
+SUPERVISOR_MODULE = "agent_run.supervisor_main"
 _POLL_SECONDS = 0.01
 
 
 def launch_detached(
-    child: Callable[[ReadyChannel], object],
+    payload: Mapping[str, object],
     *,
+    executable: str,
+    module: str = SUPERVISOR_MODULE,
     readiness_timeout_seconds: float = DEFAULT_READY_TIMEOUT_SECONDS,
-    post_terminal: Callable[[], object] | None = None,
     post_terminal_timeout_seconds: float = DEFAULT_DISPATCH_TIMEOUT_SECONDS,
     post_reap: Callable[[int, int], object] | None = None,
     post_reap_timeout_seconds: float = DEFAULT_REAP_TIMEOUT_SECONDS,
     cleanup_grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
     cleanup_kill_seconds: float = DEFAULT_CLEANUP_KILL_SECONDS,
 ) -> int:
-    """Fork one session leader and return its pid after ``READY_TOKEN`` only.
+    """Fork one session leader, exec `module`, and return its pid after READY.
 
-    ``child`` owns construction and execution of the accepted Supervisor. The
-    durable agent row must already exist. ``post_terminal`` is attempted once
-    after the child returns or raises and is bounded independently.
+    The child execs a fresh interpreter before touching anything: on macOS a
+    forked child of a process that has used SQLite segfaults inside
+    ``sqlite3.connect`` roughly half the time, and the CLI always has
+    ``state.db`` open here. ``payload`` carries live secrets, so it crosses only
+    the private pipe -- never argv, never a file. The durable agent row must
+    already exist; the child performs its own post-terminal dispatch.
     """
 
-    if not callable(child):
-        raise ValidationError("detached child callback must be callable")
-    if post_terminal is not None and not callable(post_terminal):
-        raise ValidationError("post-terminal callback must be callable")
+    if not isinstance(payload, Mapping):
+        raise ValidationError("detached supervisor payload must be a mapping")
+    if not isinstance(executable, str) or not executable.strip():
+        raise ValidationError("detached supervisor executable must be a nonblank string")
+    if not isinstance(module, str) or not module.strip():
+        raise ValidationError("detached supervisor module must be a nonblank string")
     if post_reap is not None and not callable(post_reap):
         raise ValidationError("post-reap callback must be callable")
     ready_timeout = _positive("readiness_timeout_seconds", readiness_timeout_seconds)
@@ -61,31 +68,63 @@ def launch_detached(
     kill_grace = _positive("cleanup_kill_seconds", cleanup_kill_seconds)
 
     ready = ReadyChannel.open()
+    payload_read, payload_write = os.pipe()
     identity_read, identity_write = os.pipe()
+    os.set_inheritable(payload_read, True)
+    os.set_inheritable(identity_write, True)
+    argv = [
+        executable,
+        "-m",
+        module,
+        "--payload-fd",
+        str(payload_read),
+        "--ready-fd",
+        str(ready.write_fd),
+        "--identity-fd",
+        str(identity_write),
+    ]
+    try:
+        # Reconciliation compares the stored identity against `ps -o command=`,
+        # so the parent records the exact argv it is about to exec.
+        blob = json.dumps(
+            {
+                **dict(payload),
+                "identity": " ".join(argv),
+                "post_terminal_timeout_seconds": dispatch_timeout,
+            }
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        for descriptor in (payload_read, payload_write, identity_read, identity_write):
+            _close(descriptor)
+        ready.close_read()
+        ready.close_write()
+        raise ValidationError(f"detached supervisor payload is not JSON: {error}") from error
+
     try:
         pid = os.fork()
     except OSError as error:
+        for descriptor in (payload_read, payload_write, identity_read, identity_write):
+            _close(descriptor)
         ready.close_read()
         ready.close_write()
-        _close(identity_read)
-        _close(identity_write)
         raise ValidationError("cannot fork detached supervisor") from error
 
     if pid == 0:
-        _child_main(
-            ready,
-            identity_read,
-            identity_write,
-            child,
-            post_terminal,
-            dispatch_timeout,
-        )
+        # Nothing but setsid and execv may run here: any inherited library state
+        # touched before the exec is exactly what crashes the child.
+        try:
+            os.setsid()
+            os.execv(executable, argv)
+        except BaseException:
+            os._exit(1)
 
     ready.close_write()
     _close(identity_write)
+    _close(payload_read)
     deadline = time.monotonic() + ready_timeout
     group: VerifiedProcessGroup | None = None
     try:
+        _write_payload(payload_write, blob)
         reported_pid = _read_identity(identity_read, deadline)
         if reported_pid != pid:
             raise ValidationError("detached supervisor reported the wrong process identity")
@@ -109,43 +148,17 @@ def launch_detached(
     return pid
 
 
-def _child_main(
-    ready: ReadyChannel,
-    identity_read: int,
-    identity_write: int,
-    child: Callable[[ReadyChannel], object],
-    post_terminal: Callable[[], object] | None,
-    dispatch_timeout: float,
-) -> None:
-    ready.close_read()
-    _close(identity_read)
-    try:
-        os.setsid()
-        pid = os.getpid()
-        if os.getpgrp() != pid:
-            raise ValidationError("detached child is not its process-group leader")
-        os.write(identity_write, f"{pid}\n".encode("ascii"))
-    except BaseException as error:
-        _close(identity_write)
-        ready.failed(_failure_reason(error))
-        os._exit(1)
-    _close(identity_write)
+def _write_payload(fd: int, blob: bytes) -> None:
+    """Hand the child its payload; a child that died before exec closes the pipe."""
 
-    exit_code = 0
     try:
-        _redirect_standard_streams()
-        child(ready)
-    except BaseException as error:
-        ready.failed(_failure_reason(error))
-        exit_code = 1
+        offset = 0
+        while offset < len(blob):
+            offset += os.write(fd, blob[offset:])
+    except OSError as error:
+        raise ValidationError("detached supervisor closed the payload channel") from error
     finally:
-        ready.close_write()
-        if post_terminal is not None:
-            try:
-                _bounded(post_terminal, dispatch_timeout)
-            except BaseException:
-                exit_code = 1
-        os._exit(exit_code)
+        _close(fd)
 
 
 def _read_identity(fd: int, deadline: float) -> int:
@@ -190,20 +203,6 @@ def _cleanup(
         raise ValidationError("detached supervisor process group survived cleanup")
 
 
-def _bounded(callback: Callable[[], object], timeout_seconds: float) -> None:
-    def expired(_number: int, _frame: object) -> None:
-        raise TimeoutError("post-terminal callback exceeded its deadline")
-
-    previous = signal.getsignal(signal.SIGALRM)
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        callback()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
-
-
 def _wait_child(pid: int, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while True:
@@ -239,21 +238,6 @@ def _reap_child(
     worker = threading.Thread(target=invoke, daemon=True)
     worker.start()
     worker.join(timeout_seconds)
-
-
-def _redirect_standard_streams() -> None:
-    descriptor = os.open(os.devnull, os.O_RDWR)
-    try:
-        for target in (0, 1, 2):
-            os.dup2(descriptor, target)
-    finally:
-        if descriptor > 2:
-            os.close(descriptor)
-
-
-def _failure_reason(error: BaseException) -> str:
-    detail = str(error).strip()
-    return (f"{type(error).__name__}: {detail}" if detail else type(error).__name__)[:300]
 
 
 def _positive(name: str, value: object) -> float:

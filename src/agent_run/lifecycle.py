@@ -279,6 +279,14 @@ class ReadyChannel:
         os.set_inheritable(write_fd, True)
         return cls(read_fd, write_fd)
 
+    @classmethod
+    def from_write_fd(cls, write_fd: int) -> ReadyChannel:
+        """The exec'd supervisor inherits only the write end; the wire is the same."""
+
+        if isinstance(write_fd, bool) or not isinstance(write_fd, int) or write_fd < 0:
+            raise ValidationError("ready write fd must be a nonnegative integer")
+        return cls(-1, write_fd)
+
     def ready(self) -> None:
         self._report(READY_TOKEN)
 

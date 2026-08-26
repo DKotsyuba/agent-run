@@ -947,7 +947,7 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "absolute executable"):
                 cli._dispatch_once(Path("/tmp/home"))
 
-    def test_terminal_dispatch_uses_fresh_store_and_never_reruns_agent(self):
+    def test_launch_hands_over_one_exec_payload_and_reconciles_on_reap(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             workdir = home / "work"
@@ -957,16 +957,11 @@ class CliTests(unittest.TestCase):
                 timeout_seconds=480,
             )
             store = Mock()
-            supervisor = Mock()
-            ready = object()
+            plan = Mock()
+            plan.to_payload.return_value = {"argv": ["engine"], "environment": {"T": "s"}}
             events = []
+            captured = {}
             store.close.side_effect = lambda: events.append("store_closed")
-
-            def failed_dispatch(dispatch_home):
-                self.assertEqual(dispatch_home, home)
-                self.assertTrue(store.close.called)
-                events.append("dispatch")
-                raise RuntimeError("delivery failed")
 
             def reconciled(reconcile_store, reconciled_agent_id, pid):
                 self.assertIs(reconcile_store, store)
@@ -974,50 +969,41 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(pid, 123)
                 events.append("reconcile")
 
-            def detached(
-                child, *, post_terminal, post_terminal_timeout_seconds, post_reap
-            ):
-                events.append("child")
-                child(ready)
-                self.assertEqual(post_terminal_timeout_seconds, 31.0)
-                try:
-                    post_terminal()
-                except RuntimeError:
-                    events.append("dispatch_failed")
-                post_reap(123, 0)
+            def detached(payload, **kwargs):
+                captured.update(payload=payload, kwargs=kwargs)
+                kwargs["post_reap"](123, 0)
                 return 123
 
             with patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
                 cli, "load_config", return_value=SimpleNamespace(core=SimpleNamespace(warning_fraction=0.9))
-            ), patch.object(cli, "Supervisor", return_value=supervisor) as constructor, patch.object(
-                cli, "launch_detached", side_effect=detached
             ), patch.object(
-                cli, "_dispatch_once", side_effect=failed_dispatch
+                cli, "launch_detached", side_effect=detached
             ), patch.object(
                 cli, "reconcile_reaped_agent", side_effect=reconciled
             ):
                 cli._launch_callback(home)(
-                    AgentId(AGENT_ID), request, object(), object(), home / "agents" / AGENT_ID
+                    AgentId(AGENT_ID), request, object(), plan, home / "agents" / AGENT_ID
                 )
 
-        self.assertEqual(opened.call_count, 2)
-        opened.assert_called_with(home.resolve() / "state.db")
-        self.assertEqual(store.close.call_count, 2)
-        supervisor.run.assert_called_once_with()
+        # The supervisor now runs in an exec'd interpreter, so the parent must
+        # hand over data only: no callable, no adapter, no open store.
+        opened.assert_called_once_with(home.resolve() / "state.db")
+        self.assertEqual(events, ["reconcile", "store_closed"])
+        self.assertEqual(captured["kwargs"]["executable"], sys.executable)
+        self.assertEqual(captured["kwargs"]["post_terminal_timeout_seconds"], 31.0)
         self.assertEqual(
-            events,
-            [
-                "child",
-                "store_closed",
-                "dispatch",
-                "dispatch_failed",
-                "reconcile",
-                "store_closed",
-            ],
+            json.loads(json.dumps(captured["payload"])),
+            {
+                "agent_id": AGENT_ID,
+                "home": str(home),
+                "runtime": "codex",
+                "timeout_seconds": 480,
+                "answer_path": str(home / "agents" / AGENT_ID / "answer.md"),
+                "agent_dir": str(home / "agents" / AGENT_ID),
+                "warning_fraction": 0.9,
+                "plan": {"argv": ["engine"], "environment": {"T": "s"}},
+            },
         )
-        self.assertEqual(constructor.call_args.kwargs["answer_path"], home / "agents" / AGENT_ID / "answer.md")
-        self.assertEqual(constructor.call_args.kwargs["timeout_seconds"], 480)
-        self.assertIs(constructor.call_args.kwargs["ready"], ready)
 
 
 class PackagingTests(unittest.TestCase):

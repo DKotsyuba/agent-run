@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -10,6 +12,7 @@ from typing import Mapping, Protocol
 
 from ..config import McpConfig, RuntimeConfig
 from ..domain import Message, Outcome, StartRequest
+from ..errors import ValidationError
 from ..profiles import AgentProfile
 
 
@@ -73,6 +76,59 @@ class LaunchPlan:
     runtime_stream_path: Path
     adapter_state: Mapping[str, object]
     answer_path: Path | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        """JSON form handed to the exec'd supervisor over a private pipe.
+
+        ``environment`` carries live secrets, so this never reaches argv or disk.
+        """
+
+        return {
+            "argv": [str(item) for item in self.argv],
+            "cwd": str(self.cwd),
+            "environment": {str(k): str(v) for k, v in self.environment.items()},
+            "initial_input_b64": _encode_input(self.initial_input),
+            "initial_input_is_bytes": isinstance(self.initial_input, bytes),
+            "runtime_stream_path": str(self.runtime_stream_path),
+            "adapter_state": dict(self.adapter_state),
+            "answer_path": None if self.answer_path is None else str(self.answer_path),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> LaunchPlan:
+        """Rebuild a plan, failing closed on anything the parent did not write."""
+
+        if not isinstance(payload, Mapping):
+            raise ValidationError("launch plan payload must be a mapping")
+        try:
+            answer_path = payload["answer_path"]
+            return cls(
+                tuple(str(item) for item in payload["argv"]),
+                Path(str(payload["cwd"])),
+                {str(k): str(v) for k, v in payload["environment"].items()},
+                _decode_input(
+                    payload["initial_input_b64"], payload["initial_input_is_bytes"]
+                ),
+                Path(str(payload["runtime_stream_path"])),
+                dict(payload["adapter_state"]),
+                None if answer_path is None else Path(str(answer_path)),
+            )
+        except (AttributeError, KeyError, TypeError, ValueError, binascii.Error) as error:
+            raise ValidationError(f"malformed launch plan payload: {error}") from error
+
+
+def _encode_input(value: object) -> str | None:
+    if value is None:
+        return None
+    raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _decode_input(value: object, is_bytes: object) -> str | bytes | None:
+    if value is None:
+        return None
+    raw = base64.b64decode(str(value).encode("ascii"), validate=True)
+    return raw if is_bytes else raw.decode("utf-8")
 
 
 class EventSink(Protocol):
