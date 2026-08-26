@@ -467,6 +467,45 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(limits.items[0].key.runtime, "fake")
         self.assertEqual(ADAPTER.limits_calls, 0)
 
+    def test_codex_models_bootstrap_from_config_without_isolated_cache(self) -> None:
+        from agent_run.config import RuntimeAuthConfig
+
+        codex_home = self.root / "codex-runtime"
+        codex_home.mkdir()
+        auth = self.root / "codex-auth.json"
+        auth.write_text("{}", encoding="utf-8")
+        config = replace(
+            self.config,
+            runtimes={
+                "codex": RuntimeConfig(
+                    True,
+                    "agent_run.adapters.codex.adapter:ADAPTER",
+                    Path("/bin/true"),
+                    codex_home,
+                    ("gpt-5.6-sol", "gpt-5.6-terra"),
+                    auth=RuntimeAuthConfig("file_link", auth, "auth.json"),
+                )
+            },
+        )
+        service = AgentService(
+            config,
+            self.store,
+            self.root,
+            launch=lambda *_: None,
+            now=lambda: 100.0,
+        )
+
+        roster = service.models()["codex"]
+
+        self.assertEqual(
+            [(model.id, model.description, model.efforts) for model in roster],
+            [
+                ("gpt-5.6-sol", "", ()),
+                ("gpt-5.6-terra", "", ()),
+            ],
+        )
+        self.assertFalse((codex_home / "cache" / "models.json").exists())
+
     def test_from_home_is_the_single_composition_root(self) -> None:
         (self.root / "config.toml").write_text(
             f"""schema_version = 1

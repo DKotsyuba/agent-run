@@ -291,17 +291,51 @@ env_from = ["PATH"]
         self.assertEqual(sol.description, "fast")
         self.assertEqual(sol.efforts, ("low", "high"))
 
-    def test_models_without_cache_is_empty(self) -> None:
-        (self.cache_dir / "models.json").unlink()
-        self.assertEqual(ADAPTER.models(self.runtime_config(), self.home), ())
+    def test_models_normalizes_real_cache_and_keeps_present_cache_strict(self) -> None:
+        config = self.runtime_config()
+        self.write_model_cache(
+            """{"models": [
+                {"slug": "gpt-5.6-sol", "description": "real cache", "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "high"}, {"effort": "high"}
+                ]},
+                {"slug": "not-allowlisted", "supported_reasoning_levels": [{"effort": "low"}]}
+            ]}"""
+        )
+        models = ADAPTER.models(config, self.home)
+        self.assertEqual([model.id for model in models], ["gpt-5.6-sol"])
+        self.assertEqual(models[0].description, "real cache")
+        self.assertEqual(models[0].efforts, ("low", "high"))
 
-    def test_models_with_unreadable_cache_is_empty(self) -> None:
-        (self.cache_dir / "models.json").write_bytes(b'{"models": [{"id": "\xff\xfe"}]}')
-        self.assertEqual(ADAPTER.models(self.runtime_config(), self.home), ())
-        (self.cache_dir / "models.json").write_text("not json at all", encoding="utf-8")
-        self.assertEqual(ADAPTER.models(self.runtime_config(), self.home), ())
-        (self.cache_dir / "models.json").write_text('{"models": {}}', encoding="utf-8")
-        self.assertEqual(ADAPTER.models(self.runtime_config(), self.home), ())
+    def test_models_without_cache_falls_back_to_config_only(self) -> None:
+        (self.cache_dir / "models.json").unlink()
+        ambient = self.agent_run_root / "cache" / "models.json"
+        ambient.parent.mkdir(exist_ok=True)
+        ambient.write_text(
+            '{"models": [{"slug": "ambient-only"}]}', encoding="utf-8"
+        )
+        models = ADAPTER.models(self.runtime_config(), self.home)
+        self.assertEqual(
+            [(model.id, model.description, model.efforts) for model in models],
+            [
+                ("gpt-5.6-sol", "", ()),
+                ("gpt-5.6-terra", "", ()),
+            ],
+        )
+
+    def test_models_with_unreadable_cache_falls_back_to_config_only(self) -> None:
+        path = self.cache_dir / "models.json"
+        invalid = (b'{"models": [{"id": "\xff\xfe"}]}', b"not json at all", b'{"models": {}}')
+        for content in invalid:
+            with self.subTest(content=content):
+                path.write_bytes(content)
+                models = ADAPTER.models(self.runtime_config(), self.home)
+                self.assertEqual(
+                    [model.id for model in models],
+                    ["gpt-5.6-sol", "gpt-5.6-terra"],
+                )
+                self.assertTrue(
+                    all(not model.description and not model.efforts for model in models)
+                )
 
     # -- limits -------------------------------------------------------------
 
@@ -601,8 +635,8 @@ env_from = ["PATH"]
             self.prepare(self.start_request(), profile, config)
 
         (self.cache_dir / "models.json").unlink()
-        with self.assertRaisesRegex(ValidationError, "not discovered"):
-            self.prepare(self.start_request(), profile, config)
+        plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(plan.adapter_state["model"], "gpt-5.6-sol")
 
     def test_prepare_refuses_output_schema(self) -> None:
         config = self.materialized()
@@ -626,6 +660,16 @@ env_from = ["PATH"]
             )
         plan = self.prepare(self.start_request(effort="high"), profile, config)
         self.assertEqual(plan.adapter_state["effort"], "high")
+
+    def test_prepare_bootstraps_without_cache_but_explicit_effort_stays_closed(self) -> None:
+        config = self.materialized()
+        (self.cache_dir / "models.json").unlink()
+        profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
+
+        plan = self.prepare(self.start_request(effort=None), profile, config)
+        self.assertEqual(plan.adapter_state["model"], "gpt-5.6-sol")
+        with self.assertRaisesRegex(ValidationError, "effort"):
+            self.prepare(self.start_request(effort="low"), profile, config)
 
     def test_prepare_refuses_write_beyond_profile_grant(self) -> None:
         config = self.materialized()
