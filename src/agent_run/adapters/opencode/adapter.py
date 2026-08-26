@@ -388,10 +388,10 @@ class OpenCodeAdapter:
         if client is None:
             client = OpenCodeHttpClient(str(service["base_url"]), response_dir)
         model = state["model"]
-        if not isinstance(model, Mapping) or "modelID" not in model:
+        if not isinstance(model, Mapping) or "id" not in model:
             raise ValidationError("launch plan carries no canonical opencode model")
         opened = client.create_session(
-            {"agent": PRIMARY_AGENT, "model": dict(model), "title": str(model["modelID"])}
+            {"agent": PRIMARY_AGENT, "model": dict(model), "title": str(model["id"])}
         )
         session_id = opened.get("id")
         if not isinstance(session_id, str) or not session_id.strip():
@@ -462,10 +462,11 @@ class OpenCodeRuntimeSession:
     def wait(self, timeout_seconds: float | None) -> Outcome | None:
         """Settle this session, answering its permissions while it works.
 
-        The service reports ``idle`` for a session it has not begun working on,
-        so an initial idle is not an outcome: the turn is only settled once the
-        session has been seen busy or retrying, or the primary agent has
-        actually produced output.
+        ``/api/session/active`` reports only a currently-running session; it
+        cannot tell "not started yet" from "just finished". So an initial
+        absence is not an outcome: the turn is only settled once the session
+        has been seen working, or the primary agent has actually produced
+        output.
         """
 
         deadline = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
@@ -487,7 +488,8 @@ class OpenCodeRuntimeSession:
                     capture.release()
                     raise
                 if final:
-                    return self._finish(status, payload, capture)
+                    info = self._client.session_info(self._session_id)
+                    return self._finish(info, payload, capture)
                 capture.release()
             if self._monotonic() - started >= deadline:
                 return None
@@ -500,16 +502,14 @@ class OpenCodeRuntimeSession:
         entry = statuses.get(self._session_id)
         if entry is None:
             return {}
-        if isinstance(entry, str):
-            return {"state": entry}
         if not isinstance(entry, Mapping):
-            raise ValidationError("opencode session status entry must be a mapping or a string")
+            raise ValidationError("opencode session status entry must be a mapping")
         return entry
 
-    def _finish(self, status, payload, capture) -> Outcome:
+    def _finish(self, info, payload, capture) -> Outcome:
         """Emit the transcript, record answer.md, and keep only this capture."""
 
-        outcome = normalize_outcome(status, runtime_session_id=self._session_id)
+        outcome = normalize_outcome(info, payload, runtime_session_id=self._session_id)
         for message in normalize_transcript(payload, raw_ref=capture.raw_ref):
             self._sink.message(message)
         answer = extract_answer(payload, agent=self._agent)

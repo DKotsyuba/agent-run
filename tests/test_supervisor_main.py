@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import subprocess
 import sys
@@ -26,6 +27,25 @@ from tests.test_launch import child_pythonpath
 ENGINE = r'printf "%s\n%s\n" "$STUB_SECRET" "$STUB_SENTINEL" > "$1"'
 SECRET = "opencode-server-password-2f7c"
 LAUNCH_ROUNDS = 10
+
+
+def _framework_python() -> str | None:
+    """A macOS Framework-build interpreter, if one is installed.
+
+    Only a Framework build re-execs into its ``Resources/Python.app`` binary
+    on launch, which is what makes ``ps -o command=`` report a different
+    path than the argv0 it was exec'd with -- the exact hazard this
+    reproduces. A non-Framework interpreter (pyenv, Homebrew) leaves argv0
+    alone, so it cannot trigger it.
+    """
+    for candidate in sorted(
+        glob.glob("/Library/Frameworks/Python.framework/Versions/*/bin/python3.*")
+    ):
+        name = os.path.basename(candidate)
+        suffix = name[len("python3.") :] if name.startswith("python3.") else ""
+        if suffix.isdigit() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX only")
@@ -91,13 +111,13 @@ class SupervisorMainTests(unittest.TestCase):
             "plan": plan.to_payload(),
         }
 
-    def launch(self, payload: dict, **kwargs) -> int:
+    def launch(self, payload: dict, *, executable: str | None = None, **kwargs) -> int:
         previous = os.environ.get("PYTHONPATH")
         os.environ["PYTHONPATH"] = self.environment["PYTHONPATH"]
         try:
             return launch_detached(
                 payload,
-                executable=sys.executable,
+                executable=executable or sys.executable,
                 post_terminal_timeout_seconds=10.0,
                 readiness_timeout_seconds=10.0,
                 **kwargs,
@@ -156,8 +176,18 @@ class SupervisorMainTests(unittest.TestCase):
             self.assertEqual(len(self.events(agent_id, "terminal")), 1)
 
     def test_recorded_identity_matches_the_exec_command_line(self) -> None:
+        framework_python = _framework_python()
+        if framework_python is None:
+            self.skipTest("no macOS Framework Python build installed")
+
+        # Exec through a symlink to a Framework build: it re-execs into its
+        # own Resources/Python.app binary, so `ps -o command=` reports a
+        # path that never appears in the argv passed to exec -- exactly the
+        # hazard that broke reconciliation on the release venv.
         agent_id, directory, plan = self.create_agent(sleep_seconds=1.5)
-        pid = self.launch(self.payload(agent_id, directory, plan))
+        symlink = Path(self.temporary.name) / "python-symlink"
+        symlink.symlink_to(framework_python)
+        pid = self.launch(self.payload(agent_id, directory, plan), executable=str(symlink))
         self.wait_for(lambda: self.status(agent_id) is AgentStatus.RUNNING)
 
         recorded = str(self.store.get_agent(agent_id)["supervisor_identity"])

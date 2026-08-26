@@ -98,7 +98,6 @@ def _supervise(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -
                 warning_fraction=_number(payload, "warning_fraction")
             ),
             ready=ready,
-            identity=_text(payload, "identity"),
         ).run()
     finally:
         store.close()
