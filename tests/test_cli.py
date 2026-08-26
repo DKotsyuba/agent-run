@@ -293,7 +293,80 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "mcp")
         self.assertNotIn("agent_run.mcp", sys.modules)
 
-    def test_detached_child_opens_and_closes_its_own_store(self):
+    def test_mcp_uses_injected_stdio_for_initialize_and_tools_list(self):
+        requests = (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        )
+        stdin = io.StringIO("".join(json.dumps(request) + "\n" for request in requests))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = cli.main(
+            ["mcp"],
+            service=FakeService(),
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual((code, stderr.getvalue()), (0, ""))
+        self.assertEqual([response["id"] for response in responses], [1, 2])
+        self.assertEqual(
+            [tool["name"] for tool in responses[1]["result"]["tools"]],
+            [
+                "start", "cancel", "steer", "status", "list_agents",
+                "summary", "transcript", "answer", "models", "limits",
+            ],
+        )
+
+    def test_dispatch_composes_sender_transport_and_fresh_store_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            executable = home / "codex"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            store = Mock()
+            sender = Mock()
+            transport = Mock()
+            dispatcher = Mock()
+            result = object()
+            dispatcher.run.return_value = result
+            config = SimpleNamespace(delivery=object())
+            with patch.dict(os.environ, {"CODEX_QUEUE_BIN": str(executable)}), patch.object(
+                cli, "load_config", return_value=config
+            ), patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
+                cli, "CodexQueueSender", return_value=sender
+            ) as sender_type, patch.object(
+                cli, "CodexQueueTransport", return_value=transport
+            ) as transport_type, patch.object(
+                cli, "DeliveryDispatcher", return_value=dispatcher
+            ) as dispatcher_type:
+                self.assertIs(cli._dispatch_once(home), result)
+
+            opened.assert_called_once_with(home / "state.db")
+            sender_type.assert_called_once_with(str(executable), timeout_seconds=30.0)
+            transport_type.assert_called_once_with(sender)
+            dispatcher_type.assert_called_once_with(
+                store, {cli.TRANSPORT_NAME: transport}, config.delivery
+            )
+            dispatcher.run.assert_called_once_with(home=home, max_batch=1)
+            store.close.assert_called_once_with()
+
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            with patch.object(cli, "_dispatch_once", return_value=result) as dispatch:
+                self.assertIs(runtime.delivery_dispatch(), result)
+            dispatch.assert_called_once_with(home)
+
+    def test_dispatch_requires_an_absolute_codex_queue_binary(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValidationError, "CODEX_QUEUE_BIN"):
+                cli._dispatch_once(Path("/tmp/home"))
+        with patch.dict(os.environ, {"CODEX_QUEUE_BIN": "codex"}, clear=True):
+            with self.assertRaisesRegex(ValidationError, "absolute executable"):
+                cli._dispatch_once(Path("/tmp/home"))
+
+    def test_terminal_dispatch_uses_fresh_store_and_never_reruns_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             workdir = home / "work"
@@ -302,15 +375,31 @@ class CliTests(unittest.TestCase):
             store = Mock()
             supervisor = Mock()
             ready = object()
+            events = []
+            store.close.side_effect = lambda: events.append("store_closed")
 
-            def detached(child):
+            def failed_dispatch(dispatch_home):
+                self.assertEqual(dispatch_home, home)
+                self.assertTrue(store.close.called)
+                events.append("dispatch")
+                raise RuntimeError("delivery failed")
+
+            def detached(child, *, post_terminal, post_terminal_timeout_seconds):
+                events.append("child")
                 child(ready)
+                self.assertEqual(post_terminal_timeout_seconds, 31.0)
+                try:
+                    post_terminal()
+                except RuntimeError:
+                    events.append("dispatch_failed")
                 return 123
 
             with patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
                 cli, "load_config", return_value=SimpleNamespace(core=SimpleNamespace(warning_fraction=0.9))
             ), patch.object(cli, "Supervisor", return_value=supervisor) as constructor, patch.object(
                 cli, "launch_detached", side_effect=detached
+            ), patch.object(
+                cli, "_dispatch_once", side_effect=failed_dispatch
             ):
                 cli._launch_callback(home)(
                     AgentId(AGENT_ID), request, object(), object(), home / "agents" / AGENT_ID
@@ -319,6 +408,7 @@ class CliTests(unittest.TestCase):
         opened.assert_called_once_with(home.resolve() / "state.db")
         store.close.assert_called_once_with()
         supervisor.run.assert_called_once_with()
+        self.assertEqual(events, ["child", "store_closed", "dispatch", "dispatch_failed"])
         self.assertEqual(constructor.call_args.kwargs["answer_path"], home / "agents" / AGENT_ID / "answer.md")
         self.assertEqual(constructor.call_args.kwargs["timeout_seconds"], 480)
         self.assertIs(constructor.call_args.kwargs["ready"], ready)

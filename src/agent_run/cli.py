@@ -15,6 +15,8 @@ from typing import TextIO
 
 from .capacity.collect import collect_once
 from .config import load_config
+from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueSender, CodexQueueTransport
+from .delivery.dispatch import DeliveryDispatcher
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import AgentRunError, ValidationError
 from .hooks.bind import ref_from_payload, run_hook
@@ -27,9 +29,8 @@ from .supervisor import Supervisor, SupervisorSettings
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
-_DELIVERY_SEAM = (
-    "delivery dispatch is unavailable: no accepted public QueueSender composition exists"
-)
+_QUEUE_TIMEOUT_SECONDS = 30.0
+_POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 
 
 class _Parser(argparse.ArgumentParser):
@@ -282,6 +283,24 @@ def _emit(value, stream: TextIO) -> None:
     stream.write("\n")
 
 
+def _dispatch_once(home: Path):
+    executable = os.environ.get("CODEX_QUEUE_BIN")
+    if not executable or not Path(executable).is_absolute():
+        raise ValidationError("CODEX_QUEUE_BIN must name an absolute executable")
+    config = load_config(config_path(home))
+    store = StateStore.open(state_db_path(home))
+    try:
+        sender = CodexQueueSender(executable, timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
+        dispatcher = DeliveryDispatcher(
+            store,
+            {TRANSPORT_NAME: CodexQueueTransport(sender)},
+            config.delivery,
+        )
+        return dispatcher.run(home=home, max_batch=1)
+    finally:
+        store.close()
+
+
 def _launch_callback(home: Path):
     def launch(
         agent_id: AgentId,
@@ -309,7 +328,11 @@ def _launch_callback(home: Path):
             finally:
                 store.close()
 
-        launch_detached(child)
+        launch_detached(
+            child,
+            post_terminal=lambda: _dispatch_once(home),
+            post_terminal_timeout_seconds=_POST_TERMINAL_TIMEOUT_SECONDS,
+        )
 
     return launch
 
@@ -355,7 +378,7 @@ class _Runtime:
             store.close()
 
     def delivery_dispatch(self):
-        raise AgentRunError(_DELIVERY_SEAM)
+        return _dispatch_once(self.home)
 
     def hook_context(self, payload: dict):
         config, store = self._inputs()
@@ -421,7 +444,11 @@ def main(
             if args.command == "mcp":
                 from .mcp import serve
 
-                returned = serve(owned.core if owned is not None else target)
+                returned = serve(
+                    owned.core if owned is not None else target,
+                    stdin=stdin,
+                    stdout=stdout,
+                )
                 return returned if isinstance(returned, int) else 0
             result = _execute(args, target, stdin)
         _emit(result, stdout)
