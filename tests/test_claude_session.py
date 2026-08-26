@@ -179,6 +179,28 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertIn("second", log_text)
         self.assertIn("\"type\": \"result\"", log_text)
 
+    def test_wait_refuses_to_finalize_while_reader_is_still_alive(self) -> None:
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-1', "
+            "'subtype': 'success', 'is_error': False, 'result': 'done'}))\n"
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        session._process.wait(timeout=5)
+        session._reader.join(timeout=5)
+
+        with patch.object(session._reader, "join") as bounded_join, patch.object(
+            session._reader, "is_alive", return_value=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "reader_timeout"):
+                session.wait(timeout_seconds=5)
+            bounded_join.assert_called_once_with(timeout=5)
+        self.assertFalse(session._raw_stream.closed)
+
+        outcome = session.wait(timeout_seconds=5)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+
     # -- constructor failure aborts the child ------------------------------
 
     def test_constructor_failure_native_cancels_and_reaps_the_process_group(self) -> None:

@@ -24,7 +24,7 @@ from ...config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from ...domain import AgentStatus, Outcome, StartRequest
 from ...errors import ValidationError
 from ...paths import agent_run_home
-from ...profiles import AgentProfile
+from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -218,9 +218,16 @@ class ClaudeAdapter:
                 f"claude runtime effort must be one of {sorted(_SUPPORTED_EFFORTS)}: {request.effort!r}"
             )
 
-        allow_write = profile.write
+        if request.write and not profile.write:
+            raise ValidationError("claude profile does not allow requested write access")
+        allow_write = request.write and profile.write
+        declared_roots = tuple(
+            normalize_read_roots((root,))[0]
+            for root in (*profile.read_roots, *request.read_roots)
+        )
+        roots = normalize_read_roots((request.workdir, *declared_roots))
         if allow_write:
-            for root in profile.read_roots:
+            for root in declared_roots:
                 if root != request.workdir and root.is_relative_to(request.workdir):
                     raise ValidationError(
                         "claude runtime cannot keep a read root read-only while it is nested "
@@ -241,7 +248,6 @@ class ClaudeAdapter:
             )
 
         session_id = str(uuid.uuid4())
-        roots = tuple(dict.fromkeys((request.workdir, *profile.read_roots)))
 
         argv: list[str] = [
             str(config.binary),
@@ -276,7 +282,7 @@ class ClaudeAdapter:
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
-        environment: dict[str, str] = {}
+        environment: dict[str, str] = {"HOME": str(home)}
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
@@ -494,15 +500,16 @@ class ClaudeSession:
         except subprocess.TimeoutExpired:
             return None
         self._reader.join(timeout=5)
-        if not self._reader.is_alive():
-            with self._lock:
-                self._raw_stream.close()
-            for pipe in (self._process.stdin, self._process.stdout):
-                if pipe is not None:
-                    try:
-                        pipe.close()
-                    except OSError:
-                        pass
+        if self._reader.is_alive():
+            raise RuntimeError("reader_timeout")
+        with self._lock:
+            self._raw_stream.close()
+        for pipe in (self._process.stdin, self._process.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
         if self._reader_error is not None:
             raise self._reader_error
         metadata = self._decoder.finalize()

@@ -231,6 +231,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertIn("WebFetch", disallowed)
         self.assertNotIn("--mcp-config", argv)
         self.assertEqual(plan.cwd, self.workdir)
+        self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.runtime_stream_path, self.agent_dir / "runtime.jsonl")
         payload = json.loads(plan.initial_input)
         self.assertEqual(payload["message"]["content"][0]["text"], "do the thing")
@@ -238,7 +239,11 @@ class ClaudeAdapterTests(unittest.TestCase):
     def test_prepare_grants_write_tools_only_when_profile_allows_write(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
             plan = self.prepare(
-                self.request(), self.profile(write=True), self.runtime_config(), self.home, self.agent_dir
+                self.request(write=True),
+                self.profile(write=True),
+                self.runtime_config(),
+                self.home,
+                self.agent_dir,
             )
         allowed = plan.argv[plan.argv.index("--allowedTools") + 1].split(",")
         self.assertIn(f"Write({self.workdir}/**)", allowed)
@@ -250,18 +255,98 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertNotIn("Bash", tools)
         self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "acceptEdits")
 
-    def test_prepare_fails_closed_when_write_mode_cannot_keep_a_read_root_read_only(self) -> None:
-        nested = self.workdir / "nested-read-root"
-        nested.mkdir()
+    def test_request_can_narrow_but_not_widen_profile_write(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
-            with self.assertRaisesRegex(ValidationError, "cannot keep a read root read-only"):
+            narrowed = self.prepare(
+                self.request(write=False),
+                self.profile(write=True),
+                self.runtime_config(),
+                self.home,
+                self.agent_dir,
+            )
+            with self.assertRaisesRegex(ValidationError, "does not allow requested write"):
                 self.prepare(
-                    self.request(),
-                    self.profile(write=True, read_roots=(nested,)),
+                    self.request(write=True),
+                    self.profile(write=False),
                     self.runtime_config(),
                     self.home,
                     self.agent_dir,
                 )
+        tools = narrowed.argv[narrowed.argv.index("--tools") + 1].split(",")
+        allowed = narrowed.argv[narrowed.argv.index("--allowedTools") + 1].split(",")
+        self.assertNotIn("Write", tools)
+        self.assertNotIn("Edit", tools)
+        self.assertFalse(any(item.startswith(("Write(", "Edit(")) for item in allowed))
+        self.assertEqual(
+            narrowed.argv[narrowed.argv.index("--permission-mode") + 1], "default"
+        )
+
+    def test_prepare_fails_closed_when_write_mode_cannot_keep_a_read_root_read_only(self) -> None:
+        nested = self.workdir / "nested-read-root"
+        nested.mkdir()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            cases = (
+                (self.request(write=True, read_roots=(nested,)), self.profile(write=True)),
+                (self.request(write=True), self.profile(write=True, read_roots=(nested,))),
+            )
+            for request, profile in cases:
+                with self.subTest(request_roots=request.read_roots):
+                    with self.assertRaisesRegex(
+                        ValidationError, "cannot keep a read root read-only"
+                    ):
+                        self.prepare(
+                            request,
+                            profile,
+                            self.runtime_config(),
+                            self.home,
+                            self.agent_dir,
+                        )
+
+    def test_prepare_normalizes_profile_and_request_roots_as_one_antichain(self) -> None:
+        parent = self.root / "shared"
+        nested = parent / "nested"
+        request_only = self.root / "request-only"
+        nested.mkdir(parents=True)
+        request_only.mkdir()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(read_roots=(request_only, nested)),
+                self.profile(read_roots=(parent,)),
+                self.runtime_config(),
+                self.home,
+                self.agent_dir,
+            )
+        roots = tuple(
+            plan.argv[index + 1]
+            for index, value in enumerate(plan.argv)
+            if value == "--add-dir"
+        )
+        self.assertEqual(set(roots), {str(self.workdir), str(parent), str(request_only)})
+        self.assertNotIn(str(nested), roots)
+        self.assertEqual(
+            roots, tuple(sorted(roots, key=lambda value: (len(Path(value).parts), value)))
+        )
+
+    def test_prepare_sets_isolated_home_and_copies_only_declared_environment(self) -> None:
+        ambient = {
+            "HOME": "/ambient/home",
+            "CLAUDE_CONFIG_DIR": "/ambient/claude",
+            "UNRELATED_SECRET": "must-not-copy",
+            "ANTHROPIC_API_KEY": "sk-test",
+        }
+        with patch.dict("os.environ", ambient, clear=False):
+            plan = self.prepare(
+                self.request(),
+                self.profile(),
+                self.runtime_config(),
+                self.home,
+                self.agent_dir,
+            )
+        self.assertEqual(
+            dict(plan.environment),
+            {"HOME": str(self.home), "PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-test"},
+        )
+        self.assertNotIn("/ambient", " ".join(plan.argv))
 
     def test_prepare_adds_dirs_and_mcp_flags_and_never_leaks_secrets_into_argv(self) -> None:
         child = self.root / "child"
