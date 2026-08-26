@@ -229,6 +229,24 @@ def extract_answer(
     )
 
 
+def has_reported_error(
+    payload: Mapping[str, object] | Sequence[object], *, agent: str = PRIMARY_AGENT
+) -> bool:
+    """Whether this agent's most recent message already carries a structured
+    error -- a terminal shape with no text to extract (a provider failure, an
+    aborted turn). A bare tool-call part with neither text nor a top-level
+    error (proven live, T17B: v1 1.18.18 mid-tool-round) is not covered here
+    and must not be mistaken for one. Scoped to ``agent`` for the same reason
+    ``extract_answer`` is: a sub-agent's error must never settle the primary
+    session's ``wait()``.
+    """
+
+    for item in _messages(payload):
+        if _role(item) is MessageRole.ASSISTANT and _agent(item) == agent:
+            return isinstance(item.get("error"), Mapping)
+    return False
+
+
 def normalize_outcome(
     info: Mapping[str, object],
     payload: Mapping[str, object] | Sequence[object] = (),
