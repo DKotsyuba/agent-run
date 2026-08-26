@@ -8,5 +8,11 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+agent-run = "agent_run.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"agent_run.state" = ["schema.sql"]
