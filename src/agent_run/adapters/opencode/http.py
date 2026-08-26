@@ -387,6 +387,11 @@ class OpenCodeHttpClient:
     def create_session(self, payload: Mapping[str, object]) -> Mapping[str, object]:
         return _data_mapping(self._decoded(self.post(SESSION_PATH, payload)))
 
+    def session_info(self, session_id: str) -> Mapping[str, object]:
+        """One session's current record, including its terminal ``outcome``."""
+
+        return _data_mapping(self._decoded(self.get(f"{SESSION_PATH}/{_session(session_id)}")))
+
     def prompt_async(self, session_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
         # A prompt is never retried: a failed model turn is ambiguous.
         return _data_mapping(self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/prompt", payload)))

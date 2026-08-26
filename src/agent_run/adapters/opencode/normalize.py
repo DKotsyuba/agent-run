@@ -1,4 +1,15 @@
-"""Pure OpenCode model, transcript, and status normalization."""
+"""Pure OpenCode model, transcript, and status normalization.
+
+Every shape here is the flat beta-18286 v2 contract proven live against the
+service's own ``/openapi.json``: a session's ``model`` is ``Model.Ref``
+(``providerID`` + ``id``, not ``modelID``); ``/api/session/active`` reports only
+``{sessionID: {"type": "running"}}`` for a session currently executing a turn,
+and omits any session that is not; the terminal ``outcome`` (succeeded, failed,
+interrupted) lives on the session record itself, not on that active map; and a
+``Session.Message.Info`` is a flat, ``type``-discriminated object -- no
+``info``/``parts`` wrapper -- with a direct ``text`` field for user/system
+messages and a ``content`` parts array for assistant messages.
+"""
 
 from __future__ import annotations
 
@@ -11,26 +22,35 @@ from ..base import ModelInfo
 
 
 PRIMARY_AGENT = "agent-run"
-_TERMINAL_STATES: Mapping[str, AgentStatus] = MappingProxyType(
+
+#: ``Session.Info.outcome`` is exactly these three values once a session is
+#: no longer running.
+_OUTCOME_STATUS: Mapping[str, AgentStatus] = MappingProxyType(
     {
-        "completed": AgentStatus.SUCCEEDED,
-        "idle": AgentStatus.SUCCEEDED,
-        "aborted": AgentStatus.CANCELLED,
-        "cancelled": AgentStatus.CANCELLED,
-        "error": AgentStatus.FAILED,
+        "succeeded": AgentStatus.SUCCEEDED,
         "failed": AgentStatus.FAILED,
-        "timeout": AgentStatus.TIMED_OUT,
-        "timed_out": AgentStatus.TIMED_OUT,
+        "interrupted": AgentStatus.CANCELLED,
     }
 )
-_ACTIVE_STATES = frozenset(
-    {"running", "busy", "pending", "queued", "streaming", "retry", "retrying"}
-)
+#: ``Session.Message.Info`` types that carry a conversational role.
 _ROLES: Mapping[str, MessageRole] = MappingProxyType(
     {
         "user": MessageRole.USER,
         "assistant": MessageRole.ASSISTANT,
         "system": MessageRole.SYSTEM,
+    }
+)
+#: The union's other known types: session events with no message role. Kept
+#: distinct from a genuinely unrecognized type, which still fails closed.
+_EVENT_TYPES = frozenset(
+    {
+        "agent_selected",
+        "model_selected",
+        "location_switched",
+        "synthetic",
+        "skill",
+        "shell",
+        "compaction",
     }
 )
 
@@ -51,10 +71,10 @@ def split_model(value: object) -> tuple[str, str]:
 
 
 def model_reference(value: str) -> Mapping[str, str]:
-    """The v2 prompt body's model shape."""
+    """The v2 ``Model.Ref`` shape: ``{"providerID": ..., "id": ...}``."""
 
     provider, model = split_model(value)
-    return {"providerID": provider, "modelID": model}
+    return {"providerID": provider, "id": model}
 
 
 def normalize_models(
@@ -102,22 +122,17 @@ def _sequence(value: object) -> tuple[object, ...]:
     raise ValidationError("opencode payload expected an array")
 
 
-def _info(item: Mapping[str, object]) -> Mapping[str, object]:
-    """A v2 message is ``{info, parts}``; the metadata lives in ``info``."""
+def _text(item: Mapping[str, object]) -> str:
+    """User/system messages carry ``text`` directly; assistant text is the
+    ``text`` parts of its ``content`` array."""
 
-    info = item.get("info")
-    if isinstance(info, Mapping):
-        return info
-    if info is not None:
-        raise ValidationError("opencode message info must be a mapping")
-    return item
-
-
-def _text_parts(item: Mapping[str, object]) -> str:
+    direct = item.get("text")
+    if isinstance(direct, str):
+        return direct.strip()
     chunks: list[str] = []
-    for part in _sequence(item.get("parts")):
+    for part in _sequence(item.get("content")):
         if not isinstance(part, Mapping):
-            raise ValidationError("opencode message part must be a mapping")
+            raise ValidationError("opencode message content item must be a mapping")
         if part.get("type") != "text":
             continue
         text = part.get("text")
@@ -127,39 +142,49 @@ def _text_parts(item: Mapping[str, object]) -> str:
 
 
 def _at(item: Mapping[str, object]) -> float:
-    info = _info(item)
-    time_value = info.get("time")
-    raw = time_value.get("created") if isinstance(time_value, Mapping) else info.get("created")
+    time_value = item.get("time")
+    raw = time_value.get("created") if isinstance(time_value, Mapping) else None
     if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
         return 0.0
     return float(raw)
 
 
-def _role(item: Mapping[str, object]) -> MessageRole:
-    raw = _info(item).get("role")
-    try:
+def _role(item: Mapping[str, object]) -> MessageRole | None:
+    """The v2 conversational role, or None for a role-less session event."""
+
+    raw = item.get("type")
+    if raw in _ROLES:
         return _ROLES[raw]  # type: ignore[index]
-    except (KeyError, TypeError) as error:
-        raise ValidationError(f"unknown opencode message role: {raw!r}") from error
+    if raw in _EVENT_TYPES:
+        return None
+    raise ValidationError(f"unknown opencode message type: {raw!r}")
 
 
 def _agent(item: Mapping[str, object]) -> str:
-    value = _info(item).get("agent")
+    value = item.get("agent")
     return value if isinstance(value, str) and value.strip() else PRIMARY_AGENT
 
 
 def normalize_transcript(
     payload: Mapping[str, object] | Sequence[object], *, raw_ref: str | None = None
 ) -> tuple[Message, ...]:
-    """Turn a captured message page into domain messages, dropping empty text."""
+    """Turn a captured message page into domain messages.
+
+    A role-less session event (model/agent switch, a synthetic retry marker,
+    a tool-only turn, ...) is dropped, not refused; only a genuinely
+    unrecognized message type fails closed.
+    """
 
     messages: list[Message] = []
     for item in _messages(payload):
-        content = _text_parts(item)
+        role = _role(item)
+        if role is None:
+            continue
+        content = _text(item)
         if not content:
             continue
         messages.append(
-            Message(_at(item), _role(item), content, name=_agent(item), raw_ref=raw_ref)
+            Message(_at(item), role, content, name=_agent(item), raw_ref=raw_ref)
         )
     return tuple(messages)
 
@@ -167,7 +192,9 @@ def normalize_transcript(
 def _messages(
     payload: Mapping[str, object] | Sequence[object],
 ) -> tuple[Mapping[str, object], ...]:
-    items = payload.get("messages") if isinstance(payload, Mapping) else payload
+    """``GET .../message`` replies ``{"data": [...], "cursor": {...}}``."""
+
+    items = payload.get("data") if isinstance(payload, Mapping) else payload
     result = []
     for item in _sequence(items):
         if not isinstance(item, Mapping):
@@ -191,52 +218,73 @@ def extract_answer(
         text
         for item in _messages(payload)
         if _role(item) is MessageRole.ASSISTANT and _agent(item) == agent
-        for text in (_text_parts(item),)
+        for text in (_text(item),)
         if text
     )
 
 
 def normalize_outcome(
-    state: Mapping[str, object], *, runtime_session_id: str | None = None
+    info: Mapping[str, object],
+    payload: Mapping[str, object] | Sequence[object] = (),
+    *,
+    runtime_session_id: str | None = None,
 ) -> Outcome:
-    """Map a reported session state to exactly one terminal outcome."""
+    """Map a session record's ``outcome`` to exactly one terminal Outcome.
 
-    if not isinstance(state, Mapping):
-        raise ValidationError("opencode session state must be a mapping")
-    raw = state.get("state", state.get("status"))
-    if not isinstance(raw, str) or raw not in _TERMINAL_STATES:
-        raise ValidationError(f"opencode session state is not terminal: {raw!r}")
-    status = _TERMINAL_STATES[raw]
-    error = state.get("error")
-    kind = None
-    text = None
-    if isinstance(error, Mapping):
-        name = error.get("name")
-        message = error.get("message")
-        kind = name if isinstance(name, str) else "opencode_error"
-        text = message if isinstance(message, str) else None
-    elif isinstance(error, str) and error.strip():
-        kind = "opencode_error"
-        text = error
-    if kind is not None and status is AgentStatus.SUCCEEDED:
-        status = AgentStatus.FAILED
+    The session record carries no error detail; a non-``succeeded`` outcome's
+    detail, when the provider reported one, is read off the last assistant
+    message's structured error in the already-fetched transcript ``payload``.
+    """
+
+    if not isinstance(info, Mapping):
+        raise ValidationError("opencode session info must be a mapping")
+    raw = info.get("outcome")
+    if not isinstance(raw, str) or raw not in _OUTCOME_STATUS:
+        raise ValidationError(f"opencode session outcome is not terminal: {raw!r}")
+    status = _OUTCOME_STATUS[raw]
+    kind, text = (None, None) if status is AgentStatus.SUCCEEDED else _last_error(payload)
     return Outcome(
         status=status,
-        failure_kind=kind if status is not AgentStatus.SUCCEEDED else None,
-        failure_text=text if status is not AgentStatus.SUCCEEDED else None,
+        failure_kind=kind,
+        failure_text=text,
         runtime_session_id=runtime_session_id,
     )
 
 
+def _last_error(
+    payload: Mapping[str, object] | Sequence[object],
+) -> tuple[str | None, str | None]:
+    """The last assistant message's ``Session.StructuredError``, if any."""
+
+    kind = text = None
+    for item in _messages(payload):
+        error = item.get("error") if item.get("type") == "assistant" else None
+        if isinstance(error, Mapping):
+            name = error.get("type")
+            message = error.get("message")
+            kind = name if isinstance(name, str) else "opencode_error"
+            text = message if isinstance(message, str) else None
+    return kind, text
+
+
 def session_state(status: Mapping[str, object]) -> str | None:
-    raw = status.get("state", status.get("status")) if isinstance(status, Mapping) else None
+    """The ``/api/session/active`` entry's discriminant, or None when absent."""
+
+    raw = status.get("type") if isinstance(status, Mapping) else None
     return raw if isinstance(raw, str) else None
 
 
-def is_settled(state: Mapping[str, object]) -> bool:
-    raw = session_state(state)
-    return raw is not None and raw not in _ACTIVE_STATES and raw in _TERMINAL_STATES
-
-
 def is_working(state: Mapping[str, object]) -> bool:
-    return session_state(state) in _ACTIVE_STATES
+    return session_state(state) == "running"
+
+
+def is_settled(state: Mapping[str, object]) -> bool:
+    """A session absent from ``/active`` is not currently running.
+
+    That is the only settle signal the endpoint offers: it cannot distinguish
+    "not started yet" from "just finished", so ``wait()`` only trusts this
+    once the session has been seen working, or the transcript already carries
+    an answer.
+    """
+
+    return not is_working(state)

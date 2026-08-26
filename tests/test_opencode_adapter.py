@@ -54,12 +54,33 @@ MODEL = "omniroute/deepseek-v4-pro"
 ALT_MODEL = "omniroute/minimax-m3"
 
 
-def message(role, text, *, agent=PRIMARY_AGENT, at=1.0):
-    """One v2 transcript entry: metadata in ``info``, content in ``parts``."""
+def message(role, text, *, agent=PRIMARY_AGENT, at=1.0, error=None):
+    """One flat v2 ``Session.Message.Info`` entry, proven live against beta-18286.
 
+    A user/system message carries ``text`` directly; an assistant message
+    carries a ``content`` parts array and, on a failed turn, a structured
+    ``error``.
+    """
+
+    if role == "assistant":
+        entry = {
+            "id": "msg_1",
+            "type": "assistant",
+            "sessionID": "ses_1",
+            "agent": agent,
+            "model": {"providerID": "omniroute", "id": "deepseek-v4-pro"},
+            "time": {"created": at},
+            "content": [{"type": "text", "text": text}],
+        }
+        if error is not None:
+            entry["error"] = error
+        return entry
     return {
-        "info": {"role": role, "agent": agent, "time": {"created": at}, "sessionID": "ses_1"},
-        "parts": [{"type": "text", "text": text}],
+        "id": "msg_1",
+        "type": role,
+        "sessionID": "ses_1",
+        "time": {"created": at},
+        "text": text,
     }
 
 
@@ -129,7 +150,7 @@ class TranscriptTests(unittest.TestCase):
 
     def test_sub_agent_output_is_excluded_from_the_answer(self):
         payload = {
-            "messages": [
+            "data": [
                 message("user", "task"),
                 message("assistant", "verifier notes", agent=VERIFY_AGENT, at=2.0),
                 message("assistant", "primary answer", at=3.0),
@@ -141,7 +162,7 @@ class TranscriptTests(unittest.TestCase):
     def test_transcript_keeps_every_agent_and_drops_empty_text(self):
         payload = [
             message("user", "task"),
-            {"info": {"role": "assistant"}, "parts": [{"type": "tool", "tool": "bash"}]},
+            {"id": "msg_2", "type": "assistant", "agent": PRIMARY_AGENT, "content": []},
             message("assistant", "answer", agent=VERIFY_AGENT, at=2.0),
         ]
         messages = normalize_transcript(payload, raw_ref="/tmp/reply.json")
@@ -150,36 +171,47 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(messages[1].raw_ref, "/tmp/reply.json")
         self.assertEqual(messages[1].at, 2.0)
 
-    def test_unknown_role_and_malformed_info_are_refused(self):
+    def test_role_less_session_events_are_dropped_not_refused(self):
+        payload = [
+            message("user", "task"),
+            {"id": "msg_2", "type": "synthetic", "text": "retrying", "time": {"created": 1.5}},
+            message("assistant", "answer", at=2.0),
+        ]
+        messages = normalize_transcript(payload)
+        self.assertEqual([item.content for item in messages], ["task", "answer"])
+
+    def test_unknown_or_malformed_message_shape_is_refused(self):
         with self.assertRaises(ValidationError):
             normalize_transcript([message("tool", "x")])
         with self.assertRaises(ValidationError):
-            normalize_transcript([{"info": "assistant", "parts": [{"type": "text", "text": "x"}]}])
+            normalize_transcript([{"type": "assistant", "content": "not-a-list"}])
 
 
 class OutcomeTests(unittest.TestCase):
-    def test_states_normalize_to_terminal_outcomes(self):
-        self.assertEqual(normalize_outcome({"state": "completed"}).status, AgentStatus.SUCCEEDED)
-        self.assertEqual(normalize_outcome({"state": "idle"}).status, AgentStatus.SUCCEEDED)
-        self.assertEqual(normalize_outcome({"state": "aborted"}).status, AgentStatus.CANCELLED)
-        self.assertEqual(normalize_outcome({"state": "timeout"}).status, AgentStatus.TIMED_OUT)
+    def test_session_outcomes_normalize_to_terminal_statuses(self):
+        self.assertEqual(normalize_outcome({"outcome": "succeeded"}).status, AgentStatus.SUCCEEDED)
+        self.assertEqual(normalize_outcome({"outcome": "failed"}).status, AgentStatus.FAILED)
+        self.assertEqual(normalize_outcome({"outcome": "interrupted"}).status, AgentStatus.CANCELLED)
 
-    def test_reported_error_wins_over_a_completed_state(self):
+    def test_failure_detail_comes_from_the_last_assistant_error(self):
+        payload = [message("assistant", "partial", error={"type": "ProviderError", "message": "429"})]
         outcome = normalize_outcome(
-            {"state": "idle", "error": {"name": "ProviderError", "message": "429"}},
-            runtime_session_id="ses_1",
+            {"outcome": "failed"}, payload, runtime_session_id="ses_1"
         )
         self.assertEqual(outcome.status, AgentStatus.FAILED)
         self.assertEqual(outcome.failure_kind, "ProviderError")
         self.assertEqual(outcome.runtime_session_id, "ses_1")
 
-    def test_busy_and_retrying_are_work_not_outcomes(self):
-        for state in ("busy", "retrying"):
-            self.assertTrue(is_working({"state": state}))
-            self.assertFalse(is_settled({"state": state}))
-            with self.assertRaises(ValidationError):
-                normalize_outcome({"state": state})
-        self.assertTrue(is_settled({"state": "idle"}))
+    def test_non_terminal_or_malformed_outcome_is_refused(self):
+        for info in ({"outcome": "running"}, {}, {"outcome": None}, "not-a-mapping"):
+            with self.subTest(info=info):
+                with self.assertRaises(ValidationError):
+                    normalize_outcome(info)
+
+    def test_active_map_entry_reports_work_not_an_outcome(self):
+        self.assertTrue(is_working({"type": "running"}))
+        self.assertFalse(is_settled({"type": "running"}))
+        self.assertTrue(is_settled({}))
         self.assertFalse(is_working({}))
 
 
@@ -187,7 +219,7 @@ class ModelTests(unittest.TestCase):
     def test_canonical_identifiers_split_into_provider_and_model(self):
         self.assertEqual(split_model(MODEL), ("omniroute", "deepseek-v4-pro"))
         self.assertEqual(
-            dict(model_reference(MODEL)), {"providerID": "omniroute", "modelID": "deepseek-v4-pro"}
+            dict(model_reference(MODEL)), {"providerID": "omniroute", "id": "deepseek-v4-pro"}
         )
 
     def test_non_canonical_identifiers_are_refused(self):
@@ -489,7 +521,7 @@ class ProbeAndPrepareTests(AdapterCase):
         self.assertEqual(plan.adapter_state["service"]["pid"], descriptor.pid)
         self.assertEqual(plan.adapter_state["service"]["config_hash"], descriptor.config_hash)
         self.assertEqual(
-            plan.adapter_state["model"], {"providerID": "omniroute", "modelID": "deepseek-v4-pro"}
+            plan.adapter_state["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"}
         )
         self.assertEqual(plan.adapter_state["agent"], PRIMARY_AGENT)
         self.assertNotIn("write_roots", plan.adapter_state)
@@ -547,13 +579,21 @@ class ProbeAndPrepareTests(AdapterCase):
 
 
 class FakeService:
-    """Enough of the proven v2 service to drive one session end to end."""
+    """Enough of the proven v2 service to drive one session end to end.
 
-    def __init__(self, directory, statuses, message_pages, permission_pages=()):
+    ``statuses`` entries are ``/api/session/active`` shapes: ``{"type":
+    "running"}`` while a turn is in flight, or ``None`` when the session is
+    absent from that map (idle or settled). ``outcome`` is what
+    ``GET /api/session/{id}`` reports once ``wait()`` decides the turn is
+    final -- the only source of the terminal status on the real service.
+    """
+
+    def __init__(self, directory, statuses, message_pages, permission_pages=(), outcome="succeeded"):
         self.directory = Path(directory)
         self.statuses = list(statuses)
         self.message_pages = list(message_pages)
         self.permission_pages = list(permission_pages)
+        self.outcome = outcome
         self.calls = []
 
     def _capture(self, payload):
@@ -572,6 +612,10 @@ class FakeService:
         self.calls.append(("session_status",))
         entry = self._next(self.statuses, None)
         return {} if entry is None else {"ses_1": entry}
+
+    def session_info(self, session_id):
+        self.calls.append(("session_info", session_id))
+        return {"outcome": self.outcome}
 
     def messages(self, session_id):
         self.calls.append(("messages", session_id))
@@ -619,7 +663,7 @@ class SessionTests(AdapterCase):
             broker=broker if broker is not None else PermissionBroker((self.read_root,)),
             pid=4242,
             response_dir=self.agent_dir,
-            model={"providerID": "omniroute", "modelID": "deepseek-v4-pro"},
+            model={"providerID": "omniroute", "id": "deepseek-v4-pro"},
             sleep=self.advance,
             monotonic=lambda: self.clock,
             **kwargs,
@@ -632,8 +676,8 @@ class SessionTests(AdapterCase):
         answer = "готово ✅"
         service = FakeService(
             self.captures,
-            ["idle", "busy", "retrying", "idle"],
-            # One page per fetch: the first idle finds nothing, the last one the answer.
+            [None, {"type": "running"}, {"type": "running"}, None],
+            # One page per fetch: the first absence finds nothing, the last one the answer.
             [[], [message("user", "task"), message("assistant", answer, at=2.0)]],
         )
         session = self.session(service)
@@ -643,7 +687,7 @@ class SessionTests(AdapterCase):
         self.assertEqual(session.pid, 4242)
         self.assertEqual(self.sink.sessions, ["ses_1"])
         self.assertEqual([item.content for item in self.sink.messages], ["task", answer])
-        # The first idle was probed for output, found none, and kept waiting.
+        # The first absence was probed for output, found none, and kept waiting.
         self.assertEqual([call for call in service.calls if call[0] == "messages"].__len__(), 2)
         self.assertEqual(len(self.remaining()), 1)
         self.assertEqual(self.sink.messages[0].raw_ref, str(self.captures / self.remaining()[0]))
@@ -653,7 +697,7 @@ class SessionTests(AdapterCase):
 
         answer = "готово ✅"
         service = FakeService(
-            self.captures, ["busy", "idle"], [[message("assistant", answer, at=2.0)]]
+            self.captures, [{"type": "running"}, None], [[message("assistant", answer, at=2.0)]]
         )
         outcome = self.session(service).wait(30.0)
         path = self.agent_dir / ANSWER_NAME
@@ -665,7 +709,7 @@ class SessionTests(AdapterCase):
         self.assertNotEqual(outcome.answer_bytes, len(answer))
 
     def test_idle_with_primary_output_settles_immediately(self):
-        service = FakeService(self.captures, ["idle"], [[message("assistant", "done", at=1.0)]])
+        service = FakeService(self.captures, [None], [[message("assistant", "done", at=1.0)]])
         outcome = self.session(service).wait(30.0)
         self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
         self.assertEqual(self.slept, [])
@@ -673,7 +717,7 @@ class SessionTests(AdapterCase):
     def test_sub_agent_output_alone_does_not_settle_an_idle_session(self):
         service = FakeService(
             self.captures,
-            ["idle"],
+            [None],
             [[message("assistant", "verifier notes", agent=VERIFY_AGENT, at=1.0)]],
         )
         session = self.session(service)
@@ -681,7 +725,7 @@ class SessionTests(AdapterCase):
         self.assertEqual(self.remaining(), [])
 
     def test_wait_times_out_without_leaking_captures(self):
-        service = FakeService(self.captures, ["idle"], [[]])
+        service = FakeService(self.captures, [None], [[]])
         session = self.session(service)
         self.assertIsNone(session.wait(1.0))
         self.assertEqual(self.remaining(), [])
@@ -690,8 +734,12 @@ class SessionTests(AdapterCase):
     def test_error_state_reports_a_failure_and_still_emits_the_transcript(self):
         service = FakeService(
             self.captures,
-            ["busy", {"state": "error", "error": {"name": "ProviderError", "message": "429"}}],
-            [[message("assistant", "partial", at=2.0)]],
+            [{"type": "running"}, None],
+            [[message(
+                "assistant", "partial", at=2.0,
+                error={"type": "ProviderError", "message": "429"},
+            )]],
+            outcome="failed",
         )
         outcome = self.session(service).wait(30.0)
         self.assertEqual(outcome.status, AgentStatus.FAILED)
@@ -705,7 +753,10 @@ class SessionTests(AdapterCase):
             {"id": "p3", "type": "external_directory", "path": "/etc", "sessionID": "other"},
         ]
         service = FakeService(
-            self.captures, ["busy", "idle"], [[message("assistant", "done", at=1.0)]], [pending, pending]
+            self.captures,
+            [{"type": "running"}, None],
+            [[message("assistant", "done", at=1.0)]],
+            [pending, pending],
         )
         outcome = self.session(service).wait(30.0)
         answered = [call for call in service.calls if call[0] == "answer_permission"]
@@ -717,13 +768,15 @@ class SessionTests(AdapterCase):
         self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
 
     def test_steer_and_cancel_use_engine_native_calls(self):
-        service = FakeService(self.captures, ["busy", "aborted"], [[]])
+        service = FakeService(
+            self.captures, [{"type": "running"}, None], [[]], outcome="interrupted"
+        )
         session = self.session(service)
         session.steer("focus on tests")
         session.cancel(2.0)
         steered = [call for call in service.calls if call[0] == "prompt_async"][0]
         self.assertEqual(steered[2]["parts"], [{"type": "text", "text": "focus on tests"}])
-        self.assertEqual(steered[2]["model"], {"providerID": "omniroute", "modelID": "deepseek-v4-pro"})
+        self.assertEqual(steered[2]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"})
         self.assertIn(("abort", "ses_1"), service.calls)
         self.assertEqual(session.wait(30.0).status, AgentStatus.CANCELLED)
         with self.assertRaises(ValidationError):
@@ -737,17 +790,32 @@ class SessionTests(AdapterCase):
     def test_launch_opens_a_session_and_prompts_it_asynchronously(self):
         self.prove_service()
         plan = self.prepare()
-        service = FakeService(self.captures, ["busy"], [[]])
+        service = FakeService(self.captures, [{"type": "running"}], [[]])
         sink = FakeSink()
         session = self.adapter.launch(plan, sink, client=service)
         self.assertEqual(sink.sessions, ["ses_1"])
         self.assertEqual(service.calls[0][0], "create_session")
         self.assertEqual(service.calls[1][0], "prompt_async")
         self.assertEqual(
-            service.calls[1][2]["model"], {"providerID": "omniroute", "modelID": "deepseek-v4-pro"}
+            service.calls[1][2]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"}
         )
         self.assertEqual(service.calls[1][2]["agent"], PRIMARY_AGENT)
         self.assertEqual(session.pid, plan.adapter_state["service"]["pid"])
+
+    def test_launch_session_create_uses_the_v2_model_ref_shape(self):
+        """Regression: beta-18286 400s ``/api/session`` with body detail
+        ``{"_tag": "InvalidRequestError", "message": "Missing key\\n  at
+        [\\"model\\"][\\"id\\"]"}`` when the create body sends ``modelID``
+        instead of the ``Model.Ref`` schema's ``id``; proven live against the
+        canary service before this fix landed.
+        """
+        self.prove_service()
+        plan = self.prepare()
+        service = FakeService(self.captures, [{"type": "running"}], [[]])
+        self.adapter.launch(plan, FakeSink(), client=service)
+        created = [call for call in service.calls if call[0] == "create_session"][0]
+        self.assertEqual(created[1]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"})
+        self.assertNotIn("modelID", created[1]["model"])
 
 
 class ProductionSizeTests(unittest.TestCase):

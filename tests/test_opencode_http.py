@@ -93,6 +93,7 @@ class AuthenticationTests(ClientCase):
             FakeReply({"data": {}}),
             FakeReply({"data": {"id": "ses_1"}}),
             FakeReply({"data": {}}),
+            FakeReply({"data": {"id": "ses_1", "outcome": "succeeded"}}),
             FakeReply({}),
             FakeReply([]),
             FakeReply([]),
@@ -104,13 +105,14 @@ class AuthenticationTests(ClientCase):
         client.session_status()
         client.create_session({"agent": "agent-run"})
         client.prompt_async("ses_1", {"parts": []})
+        client.session_info("ses_1")
         client.abort("ses_1")
         client.messages("ses_1").release()
         client.permissions("ses_1").release()
         client.answer_permission("ses_1", "perm_1", {"response": "reject"})
 
         encoded = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
-        self.assertEqual(self.opener.authorizations, [f"Basic {encoded}"] * 9)
+        self.assertEqual(self.opener.authorizations, [f"Basic {encoded}"] * 10)
 
     def test_live_client_refuses_missing_or_blank_password(self):
         for environment in ({}, {PASSWORD_ENV: "   "}):
@@ -210,13 +212,15 @@ class CaptureLifetimeTests(ClientCase):
     def test_decoded_endpoints_keep_no_capture(self):
         client = self.client(
             FakeReply({"ok": True}),
-            FakeReply({"data": {"ses_1": {"state": "idle"}}}),
+            FakeReply({"data": {"ses_1": {"type": "running"}}}),
             FakeReply({"data": {"id": "ses_1"}}),
+            FakeReply({"data": {"id": "ses_1", "outcome": "succeeded"}}),
             FakeReply(b"", status=NO_CONTENT),
         )
         client.health()
         client.session_status()
         client.create_session({"agent": "agent-run"})
+        client.session_info("ses_1")
         client.abort("ses_1")
         self.assertEqual(self.captures(), [])
 
@@ -336,9 +340,10 @@ class EndpointTests(ClientCase):
     def test_proven_v2_paths_are_used(self):
         client = self.client(
             FakeReply({"ok": True}),
-            FakeReply({"data": {"ses_1": {"state": "busy"}}}),
+            FakeReply({"data": {"ses_1": {"type": "running"}}}),
             FakeReply({"data": {"id": "ses_1"}}),
             FakeReply({"data": {}}),
+            FakeReply({"data": {"id": "ses_1", "outcome": "succeeded"}}),
             FakeReply(b"", status=NO_CONTENT),
             FakeReply([]),
             FakeReply(b"", status=NO_CONTENT),
@@ -347,6 +352,7 @@ class EndpointTests(ClientCase):
         client.session_status()
         client.create_session({"agent": "agent-run"})
         client.prompt_async("ses_1", {"parts": []})
+        client.session_info("ses_1")
         client.abort("ses_1")
         client.permissions("ses_1").release()
         client.answer_permission("ses_1", "perm_1", {"response": "reject"})
@@ -357,6 +363,7 @@ class EndpointTests(ClientCase):
                 ("GET", f"http://127.0.0.1:41777{SESSION_STATUS_PATH}"),
                 ("POST", "http://127.0.0.1:41777/api/session"),
                 ("POST", "http://127.0.0.1:41777/api/session/ses_1/prompt"),
+                ("GET", "http://127.0.0.1:41777/api/session/ses_1"),
                 ("POST", "http://127.0.0.1:41777/api/session/ses_1/interrupt"),
                 ("GET", "http://127.0.0.1:41777/api/session/ses_1/permission"),
                 ("POST", "http://127.0.0.1:41777/api/session/ses_1/permission/perm_1/reply"),
