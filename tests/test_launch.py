@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agent_run.errors import ValidationError
 from agent_run.launch import launch_detached
@@ -91,12 +92,21 @@ class DetachedLaunchTests(unittest.TestCase):
             with dispatched.open("a") as stream:
                 stream.write("once\n")
 
-        with self.assertRaisesRegex(ValidationError, "RuntimeError: startup broke"):
-            launch_detached(child, post_terminal=dispatch, readiness_timeout_seconds=1)
+        with mock.patch("agent_run.launch.verify_process_group", return_value=None):
+            with self.assertRaisesRegex(ValidationError, "RuntimeError: startup broke"):
+                launch_detached(child, post_terminal=dispatch, readiness_timeout_seconds=1)
         pid = int(pid_path.read_text())
         with self.assertRaises(ChildProcessError):
             os.waitpid(pid, os.WNOHANG)
         self.assertEqual(dispatched.read_text(), "once\n")
+
+    def test_fast_ready_terminal_exit_does_not_require_a_live_group_sample(self) -> None:
+        def child(ready) -> None:
+            ready.ready()
+
+        with mock.patch("agent_run.launch.verify_process_group", return_value=None):
+            pid = launch_detached(child)
+        self.wait_for(lambda: not self.alive(pid))
 
     def test_readiness_timeout_kills_verified_wrapper_and_grandchild_group(self) -> None:
         evidence = self.root / "pids"

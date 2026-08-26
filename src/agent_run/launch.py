@@ -84,8 +84,6 @@ def launch_detached(
         if reported_pid != pid:
             raise ValidationError("detached supervisor reported the wrong process identity")
         group = verify_process_group(SystemProcessOps(), pid)
-        if group is None:
-            raise ValidationError("detached supervisor exited before process-group proof")
         token = ready.wait(_remaining(deadline))
     except ValidationError as error:
         ready.close_read()
