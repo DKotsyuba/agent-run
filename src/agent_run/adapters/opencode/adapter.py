@@ -37,6 +37,7 @@ from .normalize import (
     PRIMARY_AGENT,
     _sequence,
     extract_answer,
+    has_reported_error,
     is_settled,
     is_working,
     model_reference,
@@ -476,33 +477,36 @@ class OpenCodeRuntimeSession:
         """Settle this session, answering its permissions while it works.
 
         ``/api/session/active`` reports only a currently-running session; it
-        cannot tell "not started yet" from "just finished". So an initial
-        absence is not an outcome: the turn is only settled once the session
-        has been seen working, the primary agent has actually produced
-        output, or this session's own ``cancel()`` already fired -- a v1
-        ``/interrupt`` sent right after ``prompt`` can settle with neither
-        (proven live, T041), and without this it would spin until timeout
-        instead of ever reaching ``_finish()``.
+        cannot tell "not started yet" from "just finished". So an absence is
+        never itself an outcome: a settled poll only ends the turn once the
+        fetched transcript actually shows one -- the primary agent produced
+        real text, its most recent message carries a structured error, or
+        this session's own ``cancel()`` already fired (a v1 ``/interrupt``
+        sent right after ``prompt`` can settle with neither, proven live,
+        T041). Checking the transcript itself, rather than trusting an
+        absence on its own, also covers the gap ``/active`` leaves *between*
+        a multi-round session's tool calls: the newest message there is an
+        assistant turn with only a tool-call part -- no text, no error -- and
+        that must keep waiting rather than be read as done (proven live,
+        T17B: v1 1.18.18 settled mid-tool-round on a bare tool-call message
+        and raised "opencode session outcome is not terminal: None").
         """
 
         deadline = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
         if deadline <= 0:
             raise ValidationError("opencode wait deadline must be positive")
         started = self._monotonic()
-        working = False
         while True:
             self.resolve_permissions()
             status = self._status()
-            if is_working(status):
-                working = True
-            elif is_settled(status):
+            if is_settled(status):
                 capture = self._client.messages(self._session_id)
                 try:
                     payload = capture.json()
                     final = (
-                        working
-                        or self._cancel_requested
+                        self._cancel_requested
                         or bool(extract_answer(payload, agent=self._agent))
+                        or has_reported_error(payload, agent=self._agent)
                     )
                 except BaseException:
                     capture.release()

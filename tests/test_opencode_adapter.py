@@ -21,6 +21,7 @@ from agent_run.adapters.opencode.adapter import (
     OpenCodeRuntimeSession,
     PermissionBroker,
     extract_answer,
+    has_reported_error,
     is_settled,
     is_working,
     model_reference,
@@ -421,6 +422,113 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(outcome.status, AgentStatus.FAILED)
         self.assertEqual(outcome.failure_kind, "unknown")
         self.assertIn("HTTP 401", outcome.failure_text)
+
+    # -- the exact live capture that broke wait() mid-tool-round (T17B): a
+    # review-profile canary, model omniroute/deepseek-v4-pro, called `read`
+    # and was interrupted -- captured verbatim from
+    # ~/.agent-run/canaries/M011-final/home/agents/ag-20260826-221722-83e24773f8/
+    # reply.w2x7f4tq.json. ``/api/session/active`` had already dropped the
+    # session (the gap between tool rounds, not a finished turn) when this
+    # was fetched, and the newest message is a bare tool-call part with
+    # neither text nor a top-level error.
+    LIVE_V1_TOOL_ROUND_MESSAGES = {
+        "data": [
+            {
+                "id": "msg_04026722e001LDHgLOu7cacRhf",
+                "time": {"created": 1787782656558},
+                "type": "assistant",
+                "agent": "agent-run",
+                "model": {
+                    "id": "opencode/deepseek-v4-pro",
+                    "providerID": "omniroute",
+                    "variant": "default",
+                },
+                "content": [
+                    {
+                        "type": "tool",
+                        "id": "call_ccae0374dbe54877bdf6cfe3",
+                        "name": "read",
+                        "provider": {"executed": False},
+                        "state": {
+                            "status": "error",
+                            "input": {"path": "."},
+                            "content": [],
+                            "structured": {},
+                            "error": {
+                                "type": "unknown",
+                                "message": "Tool execution interrupted",
+                            },
+                        },
+                        "time": {
+                            "created": 1787782656561,
+                            "ran": 1787782656812,
+                            "completed": 1787782656848,
+                        },
+                    }
+                ],
+            },
+            {
+                "id": "msg_040263a2c001EEURmfHUCSzSkw",
+                "time": {"created": 1787782642221},
+                "text": (
+                    "Review the assigned scope independently. Do not edit "
+                    "files. Report only actionable findings with concise "
+                    "file:line evidence, verification performed, and a "
+                    "clear verdict.\n\nReturn exactly CANARY_OK"
+                ),
+                "type": "user",
+            },
+        ],
+        "cursor": {
+            "previous": (
+                "eyJpZCI6Im1zZ18wNDAyNjcyMmUwMDFMREhnTE91N2NhY1JoZiIsIm9yZGVyIjoi"
+                "ZGVzYyIsImRpcmVjdGlvbiI6InByZXZpb3VzIn0"
+            ),
+            "next": (
+                "eyJpZCI6Im1zZ18wNDAyNjNhMmMwMDFFRVVSbWZIVUNTelNrdyIsIm9yZGVyIjoi"
+                "ZGVzYyIsImRpcmVjdGlvbiI6Im5leHQifQ"
+            ),
+        },
+    }
+
+    def test_live_tool_round_gap_has_no_extractable_answer_or_error(self):
+        """The exact live capture (T17B): a bare tool-call part is neither
+        real text nor a structured error, so both signals wait() checks for
+        finality must independently report nothing here."""
+
+        self.assertEqual(extract_answer(self.LIVE_V1_TOOL_ROUND_MESSAGES), "")
+        self.assertFalse(has_reported_error(self.LIVE_V1_TOOL_ROUND_MESSAGES))
+
+    def test_live_tool_round_gap_still_fails_closed_if_ever_treated_as_settled(self):
+        """Reached directly -- as the old ``wait()`` did via its sticky
+        ``working`` flag, crashing supervision with "opencode session outcome
+        is not terminal: None" -- this exact payload is correctly refused as
+        non-terminal. The bug was ``wait()`` calling ``_finish()`` at all on
+        a mid-round gap, not this function's verdict on it."""
+
+        with self.assertRaises(ValidationError):
+            normalize_outcome({}, self.LIVE_V1_TOOL_ROUND_MESSAGES)
+
+    def test_message_order_is_newest_first_not_oldest_first(self):
+        """Guards the newest-first contract itself (proven live for both
+        beta-18286 and v1 1.18.18, see the module docstring): read tail-first
+        instead, an old failed turn would incorrectly outrank a later real
+        success, and a stale error would incorrectly outrank fresh output."""
+
+        payload = {
+            "data": [
+                message("assistant", "final answer", at=3.0),
+                message("user", "retry", at=2.0),
+                message(
+                    "assistant", "", at=1.0,
+                    error={"type": "ProviderError", "message": "429"},
+                ),
+            ]
+        }
+        outcome = normalize_outcome({}, payload)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(extract_answer(payload), "final answer")
+        self.assertFalse(has_reported_error(payload))
 
 
 class ModelTests(unittest.TestCase):
@@ -1020,6 +1128,64 @@ class SessionTests(AdapterCase):
         outcome = self.session(service).wait(30.0)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
         self.assertEqual(outcome.failure_kind, "MessageAbortedError")
+
+    def test_tool_round_gap_does_not_settle_the_wait_prematurely(self):
+        """Live, T17B: ``/api/session/active`` drops the session between the
+        tool-round's two HTTP calls, and the only message on record at that
+        instant is a bare tool-call part -- the exact capture in
+        ``OutcomeTests.LIVE_V1_TOOL_ROUND_MESSAGES``. The old ``wait()``
+        treated any settled poll as final once it had ever seen "running",
+        so it called ``_finish()`` here and crashed with "opencode session
+        outcome is not terminal: None". It must instead keep waiting -- and,
+        since this fixture never produces a real answer, time out cleanly
+        rather than raise or leak the capture."""
+
+        service = FakeService(
+            self.captures,
+            [{"type": "running"}, None],
+            [OutcomeTests.LIVE_V1_TOOL_ROUND_MESSAGES],
+        )
+        session = self.session(service)
+        self.assertIsNone(session.wait(1.0))
+        self.assertEqual(self.remaining(), [])
+
+    def test_multi_round_tool_session_settles_once_the_final_answer_lands(self):
+        """Schema-faithful multi-round tool session (T17B): the first settled
+        poll lands mid-round on a bare tool-call message (must keep waiting),
+        the engine resumes ("running" again), and the second settled poll's
+        newest message is the real answer that followed the completed tool
+        call -- newest-first, per the proven ``GET .../message`` contract."""
+
+        tool_call = {
+            "id": "msg_tool",
+            "type": "assistant",
+            "agent": PRIMARY_AGENT,
+            "content": [
+                {
+                    "type": "tool",
+                    "id": "call_1",
+                    "name": "read",
+                    "provider": {"executed": True},
+                    "state": {
+                        "status": "completed",
+                        "input": {"path": "README.md"},
+                        "content": [{"type": "text", "text": "file contents"}],
+                    },
+                }
+            ],
+        }
+        mid_round = [tool_call, message("user", "first read a file then answer")]
+        final = [message("assistant", "TOOLPATH_OK", at=2.0), tool_call]
+        service = FakeService(
+            self.captures,
+            [{"type": "running"}, None, {"type": "running"}, None],
+            [mid_round, final],
+        )
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(
+            [call for call in service.calls if call[0] == "messages"].__len__(), 2
+        )
 
     def test_cancel_before_any_message_lands_still_settles_as_cancelled(self):
         """v1 1.18.18: an ``/interrupt`` fired right after ``/prompt`` can
