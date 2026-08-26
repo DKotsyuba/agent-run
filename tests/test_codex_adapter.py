@@ -276,12 +276,162 @@ env_from = ["PATH"]
 
     # -- limits -------------------------------------------------------------
 
+    def write_rollout(
+        self, name: str, text: str, *, root: Path | None = None, mtime: float | None = None
+    ) -> Path:
+        session = (root or self.home) / "sessions" / "2026" / "08" / "26"
+        session.mkdir(parents=True, exist_ok=True)
+        path = session / f"rollout-{name}.jsonl"
+        path.write_text(text, encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def rollout_event(self, timestamp: str, *, secret: str = "not-sensitive") -> str:
+        return (
+            f'{{"timestamp":"{timestamp}","type":"event_msg","payload":{{'
+            '"type":"token_count","rate_limits":{'
+            '"primary":{"used_percent":25,"window_minutes":300,'
+            '"resets_at":4102444800,"target":"gpt-5.6-sol"},'
+            '"secondary":{"used_percent":125,"window_minutes":10080,'
+            '"resets_at":4102444800,"target":"sk-unsafe-target"},'
+            '"individual_limit":{"used_percent":-5,"window_minutes":60,'
+            '"resets_at":"2099-12-31T00:00:00Z",'
+            '"limit_name":"gpt-5.6-terra"}},'
+            f'"ignored":"{secret}"}}}}'
+        )
+
+    @staticmethod
+    def iso_time(epoch: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
     def test_limits_missing_evidence_is_empty(self) -> None:
         self.assertEqual(ADAPTER.limits(self.runtime_config(), self.home), ())
 
     def test_limits_survives_unreadable_evidence(self) -> None:
         (self.cache_dir / "rollout_evidence.json").write_bytes(b"\xff\xfe not utf-8")
         self.assertEqual(ADAPTER.limits(self.runtime_config(), self.home), ())
+
+    def test_limits_precomputed_evidence_wins_over_isolated_rollout(self) -> None:
+        now = time.time()
+        (self.cache_dir / "rollout_evidence.json").write_text(
+            f'{{"samples":[{{"lane":"primary","window":"5h",'
+            f'"remaining_percent":31,"observed_at":{now}}}]}}',
+            encoding="utf-8",
+        )
+        self.write_rollout("newer", self.rollout_event(self.iso_time(now)))
+
+        samples = ADAPTER.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].remaining_percent, 31)
+        self.assertEqual(samples[0].source, "rollout_evidence")
+
+    def test_limits_isolated_rollout_yields_three_normalized_samples(self) -> None:
+        secret = "raw-secret-must-not-escape"
+        self.write_rollout("valid", self.rollout_event(self.iso_time(time.time()), secret=secret))
+
+        samples = ADAPTER.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(
+            [(sample.lane, sample.window, sample.remaining_percent) for sample in samples],
+            [
+                ("primary", "session_5h", 75.0),
+                ("secondary", "weekly", 0.0),
+                ("individual_limit", "model_weekly", 100.0),
+            ],
+        )
+        self.assertEqual(
+            [sample.target for sample in samples],
+            ["gpt-5.6-sol", None, "gpt-5.6-terra"],
+        )
+        self.assertEqual({sample.source for sample in samples}, {"isolated_rollout_evidence"})
+        self.assertTrue(all(sample.reset_at is not None for sample in samples))
+        self.assertNotIn(secret, repr(samples))
+        self.assertNotIn("sk-unsafe-target", repr(samples))
+
+    def test_limits_invalid_precomputed_evidence_falls_back_to_rollout(self) -> None:
+        (self.cache_dir / "rollout_evidence.json").write_text("not json", encoding="utf-8")
+        self.write_rollout("valid", self.rollout_event(self.iso_time(time.time())))
+
+        self.assertEqual(len(ADAPTER.limits(self.runtime_config(), self.home)), 3)
+
+    def test_limits_ignores_ambient_global_rollout_lookalikes(self) -> None:
+        ambient_home = Path(self._mkdtemp())
+        event = self.rollout_event(self.iso_time(time.time()))
+        self.write_rollout("global", event, root=ambient_home / ".codex")
+        self.write_rollout("crew", event, root=ambient_home / ".codex-crew")
+
+        with patch.dict(os.environ, {"HOME": str(ambient_home)}):
+            self.assertEqual(ADAPTER.limits(self.runtime_config(), self.home), ())
+
+        (self.home / "sessions").symlink_to(
+            ambient_home / ".codex" / "sessions", target_is_directory=True
+        )
+        self.assertEqual(ADAPTER.limits(self.runtime_config(), self.home), ())
+
+    def test_limits_reads_only_a_bounded_rollout_tail(self) -> None:
+        secret_prefix = "prefix-secret\n" * 30_000
+        path = self.write_rollout(
+            "large", secret_prefix + self.rollout_event(self.iso_time(time.time()))
+        )
+        self.assertGreater(path.stat().st_size, 262_144)
+
+        samples = ADAPTER.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(len(samples), 3)
+        self.assertNotIn("prefix-secret", repr(samples))
+
+    def test_limits_newer_malformed_and_racing_files_fall_through(self) -> None:
+        now = time.time()
+        self.write_rollout(
+            "older", self.rollout_event(self.iso_time(now)), mtime=now - 30
+        )
+        self.write_rollout(
+            "malformed",
+            '{"type":"event_msg","payload":{"type":"token_count",'
+            '"rate_limits":"malformed-secret"',
+            mtime=now - 20,
+        )
+        racing = self.write_rollout(
+            "racing", self.rollout_event(self.iso_time(now)), mtime=now - 10
+        )
+        real_open = Path.open
+
+        def racing_open(path, *args, **kwargs):
+            if path == racing and args and args[0] == "rb":
+                raise FileNotFoundError("rollout disappeared")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", racing_open):
+            samples = ADAPTER.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(len(samples), 3)
+        self.assertNotIn("malformed-secret", repr(samples))
+        self.assertNotIn("rollout disappeared", repr(samples))
+
+    def test_limits_considers_only_24_newest_rollout_files(self) -> None:
+        now = time.time()
+        self.write_rollout(
+            "old-valid", self.rollout_event(self.iso_time(now)), mtime=now - 100
+        )
+        malformed = '{"type":"event_msg","payload":{"type":"token_count","rate_limits":'
+        for index in range(24):
+            self.write_rollout(f"new-{index}", malformed, mtime=now + index)
+
+        self.assertEqual(ADAPTER.limits(self.runtime_config(), self.home), ())
+
+    def test_limits_stale_isolated_rollout_has_unknown_remaining(self) -> None:
+        self.write_rollout(
+            "stale", self.rollout_event(self.iso_time(time.time() - 10_000))
+        )
+
+        samples = ADAPTER.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(len(samples), 3)
+        self.assertTrue(all(sample.observed_at is not None for sample in samples))
+        self.assertTrue(all(sample.remaining_percent is None for sample in samples))
+        self.assertEqual({sample.source for sample in samples}, {"unknown"})
 
     def test_limits_marks_nonfinite_or_out_of_range_timestamps_unknown(self) -> None:
         (self.cache_dir / "rollout_evidence.json").write_text(

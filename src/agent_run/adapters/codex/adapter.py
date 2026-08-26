@@ -43,6 +43,9 @@ _CONFIG_REL = "config.toml"
 _MODEL_CACHE_REL = "cache/models.json"
 _ROLLOUT_EVIDENCE_REL = "cache/rollout_evidence.json"
 _LIMITS_STALE_SECONDS = 900
+_ROLLOUT_FILES = 24
+_ROLLOUT_TAIL_BYTES = 262_144
+_ROLLOUT_TAIL_LINES = 2_048
 _APPROVAL_POLICY = "never"
 
 
@@ -77,6 +80,137 @@ def _timestamp(value: object) -> datetime | None:
         return datetime.fromtimestamp(value, tz=timezone.utc)
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def _rollout_timestamp(value: object) -> datetime | None:
+    """Normalize an epoch or offset-aware ISO timestamp through `_timestamp`."""
+
+    if isinstance(value, str) and len(value) <= 64:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return None
+            value = parsed.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _timestamp(value)
+
+
+def _tail_lines(path: Path) -> tuple[str, ...]:
+    """Read a bounded complete-line tail from one isolated rollout."""
+
+    with path.open("rb") as stream:
+        stream.seek(0, 2)
+        end = stream.tell()
+        stream.seek(max(0, end - _ROLLOUT_TAIL_BYTES))
+        data = stream.read(_ROLLOUT_TAIL_BYTES)
+    if end > _ROLLOUT_TAIL_BYTES:
+        data = data.split(b"\n", 1)[-1]
+    return tuple(data.decode("utf-8").splitlines()[-_ROLLOUT_TAIL_LINES:])
+
+
+def _rollout_limits(
+    home: Path, models: tuple[str, ...], now: float
+) -> tuple[LimitSample, ...]:
+    """Return the newest valid rate-limit event from this isolated Codex home."""
+
+    sessions = Path(home) / "sessions"
+    try:
+        home_root = Path(home).resolve(strict=True)
+        if sessions.is_symlink():
+            return ()
+        sessions_root = sessions.resolve(strict=True)
+        sessions_root.relative_to(home_root)
+        paths = sessions.glob("*/*/*/rollout-*.jsonl")
+    except (OSError, RuntimeError, ValueError):
+        return ()
+
+    newest: list[tuple[int, str, Path]] = []
+    try:
+        for path in paths:
+            try:
+                if path.is_symlink():
+                    continue
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(sessions_root)
+                if not resolved.is_file():
+                    continue
+                candidate = (resolved.stat().st_mtime_ns, str(resolved), resolved)
+                newest = sorted((*newest, candidate), reverse=True)[:_ROLLOUT_FILES]
+            except (OSError, RuntimeError, ValueError):
+                continue
+    except OSError:
+        pass
+
+    for _mtime, _name, path in newest:
+        try:
+            lines = _tail_lines(path)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line or '"token_count"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            limits = payload.get("rate_limits")
+            observed_at = _rollout_timestamp(event.get("timestamp"))
+            if not isinstance(limits, dict) or observed_at is None:
+                continue
+
+            stale = now - observed_at.timestamp() > _LIMITS_STALE_SECONDS
+            samples = []
+            for lane in ("primary", "secondary", "individual_limit"):
+                window = limits.get(lane)
+                if not isinstance(window, dict):
+                    continue
+                used = window.get("used_percent")
+                if (
+                    isinstance(used, bool)
+                    or not isinstance(used, (int, float))
+                    or not math.isfinite(used)
+                ):
+                    continue
+                minutes = window.get("window_minutes")
+                label = (
+                    "model_weekly"
+                    if lane == "individual_limit"
+                    else "session_5h"
+                    if minutes == 300
+                    else "weekly"
+                    if minutes == 10080
+                    else lane
+                )
+                target = next(
+                    (
+                        value
+                        for key in ("target", "model", "limit_name")
+                        if isinstance((value := window.get(key)), str) and value in models
+                    ),
+                    None,
+                )
+                samples.append(
+                    LimitSample(
+                        lane=lane,
+                        window=label,
+                        remaining_percent=None
+                        if stale
+                        else max(0.0, min(100.0, 100.0 - float(used))),
+                        reset_at=_rollout_timestamp(window.get("resets_at")),
+                        observed_at=observed_at,
+                        source="unknown" if stale else "isolated_rollout_evidence",
+                        target=target,
+                    )
+                )
+            if samples:
+                return tuple(samples)
+    return ()
 
 
 def _resolved_directory(value: object, label: str) -> Path:
@@ -281,42 +415,45 @@ class CodexAdapter:
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
         payload = _read_json(Path(home) / _ROLLOUT_EVIDENCE_REL)
         samples_raw = payload.get("samples") if isinstance(payload, dict) else None
-        if not isinstance(samples_raw, list):
-            return ()
         now = time.time()
         result = []
-        for item in samples_raw:
-            if not isinstance(item, dict):
-                continue
-            lane, window = item.get("lane"), item.get("window")
-            if not isinstance(lane, str) or not isinstance(window, str):
-                continue
-            observed_raw = item.get("observed_at")
-            observed_at = _timestamp(observed_raw)
-            stale = observed_at is None or (now - float(observed_raw)) > _LIMITS_STALE_SECONDS
-            remaining = item.get("remaining_percent")
-            if (
-                stale
-                or isinstance(remaining, bool)
-                or not isinstance(remaining, (int, float))
-                or not math.isfinite(remaining)
-            ):
-                remaining = None
-            reset_at = _timestamp(item.get("reset_at"))
-            valid_for = item.get("valid_for_seconds")
-            result.append(
-                LimitSample(
-                    lane=lane,
-                    window=window,
-                    remaining_percent=remaining,
-                    reset_at=reset_at,
-                    observed_at=observed_at,
-                    source="unknown" if stale else "rollout_evidence",
-                    target=item.get("target") if isinstance(item.get("target"), str) else None,
-                    valid_for_seconds=valid_for if isinstance(valid_for, int) and not isinstance(valid_for, bool) else None,
+        if isinstance(samples_raw, list):
+            for item in samples_raw:
+                if not isinstance(item, dict):
+                    continue
+                lane, window = item.get("lane"), item.get("window")
+                if not isinstance(lane, str) or not isinstance(window, str):
+                    continue
+                observed_raw = item.get("observed_at")
+                observed_at = _timestamp(observed_raw)
+                stale = observed_at is None or (now - float(observed_raw)) > _LIMITS_STALE_SECONDS
+                remaining = item.get("remaining_percent")
+                if (
+                    stale
+                    or isinstance(remaining, bool)
+                    or not isinstance(remaining, (int, float))
+                    or not math.isfinite(remaining)
+                ):
+                    remaining = None
+                reset_at = _timestamp(item.get("reset_at"))
+                valid_for = item.get("valid_for_seconds")
+                result.append(
+                    LimitSample(
+                        lane=lane,
+                        window=window,
+                        remaining_percent=remaining,
+                        reset_at=reset_at,
+                        observed_at=observed_at,
+                        source="unknown" if stale else "rollout_evidence",
+                        target=item.get("target")
+                        if isinstance(item.get("target"), str)
+                        else None,
+                        valid_for_seconds=valid_for
+                        if isinstance(valid_for, int) and not isinstance(valid_for, bool)
+                        else None,
+                    )
                 )
-            )
-        return tuple(result)
+        return tuple(result) or _rollout_limits(Path(home), config.models, now)
 
     def prepare(
         self,
