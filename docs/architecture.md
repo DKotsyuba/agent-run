@@ -808,8 +808,10 @@ Binding rules:
   orchestration session;
 - an unbound agent may continue running, but the hook must explicitly report that
   chat notification is not confirmed and keep the root turn alive for recovery;
-- binding may fill an empty target or repeat the same target;
-- binding to a different session is refused;
+- session identity is `(transport, external_session_id)`; `external_turn_id` is
+  latest non-null bookkeeping metadata, and an omitted turn does not clear it;
+- binding may fill an empty target or repeat the same session identity; binding
+  to a different identity is refused;
 - if binding happens after terminal completion, the waiting delivery is activated
   transactionally;
 - terminal completion must always create or activate exactly one local outbox
@@ -877,7 +879,10 @@ Rules:
   not on every elapsed minute;
 - capacity freshness comes from the collector's `valid_until`;
 - hook execution is read-only and does not perform network/provider calls;
-- per-session receipt prevents repeated injection of unchanged context.
+- per-session receipt prevents repeated injection of unchanged context;
+  reference-based receipt bookkeeping creates or reuses the session and updates
+  its conditional receipt atomically without advancing `injected_at` for an
+  unchanged key.
 
 ## 13. Unified service, CLI, and MCP
 

@@ -26,6 +26,7 @@ from agent_run.errors import StateTransitionError, ValidationError
 
 from . import delivery
 from .db import (
+    _upsert_context_receipt,
     agent_row,
     checked_supervisor_proof,
     count_agents,
@@ -173,19 +174,23 @@ class StateStore:
     ) -> bool:
         nonblank("orchestrator_session_id", orchestrator_session_id)
         nonblank("context_key", context_key)
+        with immediate(self.connection):
+            return _upsert_context_receipt(
+                self.connection, orchestrator_session_id, context_key, timestamp(at)
+            )
+
+    def record_context_receipt_for_ref(
+        self, ref: OrchestratorRef, context_key: str, *, at: float | None = None
+    ) -> tuple[str, bool]:
+        if not isinstance(ref, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        nonblank("context_key", context_key)
         injected_at = timestamp(at)
         with immediate(self.connection):
-            changed = self.connection.execute(
-                """INSERT INTO context_receipts (
-                       orchestrator_session_id, context_key, injected_at
-                   ) VALUES (?, ?, ?)
-                   ON CONFLICT(orchestrator_session_id) DO UPDATE SET
-                       context_key = excluded.context_key,
-                       injected_at = excluded.injected_at
-                   WHERE context_receipts.context_key <> excluded.context_key""",
-                (orchestrator_session_id, context_key, injected_at),
-            ).rowcount
-        return changed == 1
+            session_id = session_for_ref(self.connection, ref, injected_at)
+            return session_id, _upsert_context_receipt(
+                self.connection, session_id, context_key, injected_at
+            )
 
     def get_agent(self, agent_id: str | AgentId) -> dict[str, object]:
         return dict(agent_row(self.connection, validate_agent_id(agent_id)))
