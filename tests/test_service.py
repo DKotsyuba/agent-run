@@ -170,6 +170,44 @@ class AgentServiceTests(unittest.TestCase):
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
 
+    def test_launch_failure_is_durable_and_idempotent_retry_never_relaunches(self) -> None:
+        calls: list[tuple] = []
+
+        def fail_launch(*args) -> None:
+            calls.append(args)
+            raise ValidationError("ready failed")
+
+        service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=fail_launch,
+            now=lambda: 100.0,
+        )
+        request = self.request(request_id="launch-failure")
+        with self.assertRaisesRegex(ValidationError, "ready failed"):
+            service.start(request)
+
+        row = self.store.list_agents()[0]
+        agent_id = row["id"]
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["failure_kind"], "supervisor_start_failed")
+        self.assertEqual(row["failure_text"], "ready failed")
+        view = service.get(agent_id)
+        self.assertEqual(view.delivery.state, "waiting_binding")
+        event = self.store.connection.execute(
+            """SELECT kind, data_json FROM events
+               WHERE agent_id = ? ORDER BY seq DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+        self.assertEqual(event["kind"], "supervisor_start_failed")
+        self.assertIn(str(agent_id), event["data_json"])
+
+        retry = service.start(request)
+        self.assertFalse(retry.created)
+        self.assertIs(retry.agent.status, AgentStatus.FAILED)
+        self.assertEqual(len(calls), 1)
+
     def test_list_has_exact_total_and_explicit_offset_completeness(self) -> None:
         for index in range(3):
             self.start(f"request-{index}", task=f"task {index}")
@@ -185,6 +223,13 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(len(second.items), 1)
         self.assertTrue(second.complete)
         self.assertIsNone(second.next_offset)
+
+    def test_list_and_transcript_share_the_bounded_page_limit(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
+            AgentQuery(limit=1001)
+        agent_id = self.start("page-cap").agent_id
+        with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
+            self.service.transcript(agent_id, limit=1001)
 
     def test_transcript_cursor_is_explicit_and_raw_ref_is_preserved(self) -> None:
         agent_id = self.start("transcript").agent_id

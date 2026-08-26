@@ -21,6 +21,7 @@ from .domain import (
     AgentId,
     AgentStatus,
     OrchestratorRef,
+    Outcome,
     StartRequest,
     new_agent_id,
     validate_agent_id,
@@ -34,11 +35,25 @@ from .state.store import StateStore
 _SUMMARY_LIMIT = 50
 _TASK_SUMMARY_CHARS = 160
 _DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
+_MAX_PAGE_SIZE = 1000
+_FAILURE_TEXT_CHARS = 512
 _CHUNK = 65536
 
 LaunchAgent: TypeAlias = Callable[
     [AgentId, StartRequest, RuntimeAdapter, LaunchPlan, Path], None
 ]
+
+
+def _page_limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValidationError("limit must be a positive integer")
+    if value > _MAX_PAGE_SIZE:
+        raise ValidationError(f"limit must not exceed {_MAX_PAGE_SIZE}")
+    return value
+
+
+def _failure_text(error: BaseException) -> str:
+    return (str(error).strip() or type(error).__name__)[:_FAILURE_TEXT_CHARS]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,12 +112,13 @@ class AgentQuery:
             self.orchestrator, OrchestratorRef
         ):
             raise ValidationError("orchestrator must be an OrchestratorRef or None")
-        for name, value, minimum in (
-            ("offset", self.offset, 0),
-            ("limit", self.limit, 1),
+        if (
+            isinstance(self.offset, bool)
+            or not isinstance(self.offset, int)
+            or self.offset < 0
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-                raise ValidationError(f"{name} must be an integer >= {minimum}")
+            raise ValidationError("offset must be a nonnegative integer")
+        _page_limit(self.limit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,9 +289,25 @@ class AgentService:
             at=self._now(),
         )
         if creation.created:
-            self._launch(
-                creation.agent_id, request, adapter, plan, candidate_dir
-            )
+            try:
+                self._launch(
+                    creation.agent_id, request, adapter, plan, candidate_dir
+                )
+            except Exception as error:
+                outcome = Outcome(
+                    AgentStatus.FAILED,
+                    failure_kind="supervisor_start_failed",
+                    failure_text=_failure_text(error),
+                )
+                self._store.transition(
+                    creation.agent_id,
+                    AgentStatus.FAILED,
+                    outcome=outcome,
+                    kind="supervisor_start_failed",
+                    data={"agent_id": str(creation.agent_id)},
+                    at=self._now(),
+                )
+                raise
         return StartResult(
             creation.agent_id, creation.created, self.get(creation.agent_id)
         )
@@ -344,8 +376,7 @@ class AgentService:
         checked = validate_agent_id(agent_id)
         if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
             raise ValidationError("cursor must be a nonnegative integer")
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValidationError("limit must be a positive integer")
+        _page_limit(limit)
         rows = self._store.transcript(
             checked, after_seq=cursor, limit=limit + 1
         )
