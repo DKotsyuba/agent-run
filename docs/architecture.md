@@ -434,6 +434,7 @@ class LaunchPlan:
     initial_input: str | None
     runtime_stream_path: Path
     adapter_state: Mapping[str, object]
+    answer_path: Path | None = None
 
 class EventSink(Protocol):
     def message(self, message: Message) -> None: ...
@@ -443,6 +444,8 @@ class EventSink(Protocol):
 class RuntimeSession(Protocol):
     @property
     def pid(self) -> int | None: ...
+    @property
+    def owns_process_group(self) -> bool: ...
     def wait(self, timeout_seconds: float | None) -> Outcome | None: ...
     def steer(self, text: str) -> None: ...
     def cancel(self, grace_seconds: float) -> None: ...
@@ -456,6 +459,7 @@ class RuntimeAdapter(Protocol):
         home: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        skills_root: Path,
     ) -> str: ...
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth: ...
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]: ...
@@ -483,8 +487,16 @@ Contract rules:
 - `materialize` and `prepare` receive the resolved MCP servers as a required
   keyword-only `mcp_servers` mapping; adapters never read ambient config to
   resolve the names listed in `RuntimeConfig.mcp`;
+- `materialize` receives the explicit service-home `skills_root`; it never
+  discovers skills through ambient home or process state;
 - `prepare` receives only a request whose timeout is resolved to a positive,
   finite value; adapters never consume the omission marker;
+- `LaunchPlan.answer_path` is the canonical answer artifact; a successful
+  session seals nonblank answer text plus the completion sentinel there before
+  returning its outcome, and the supervisor independently verifies that file;
+- `RuntimeSession.owns_process_group` declares cleanup ownership. A shared
+  managed service returns false, uses native session abort only, and is never
+  signalled or reaped by the per-agent supervisor;
 - `prepare` starts nothing and returns no live handles;
 - `launch` runs only inside the detached supervisor;
 - `RuntimeSession.cancel` performs engine-native interruption before the shared
@@ -511,6 +523,11 @@ forecast code.
 - Launch `codex app-server` and verify the effective model, cwd, sandbox,
   approval policy, workspace roots, and writable roots returned by
   `thread/start`.
+- Bound initialize, thread/start, turn/start, steer, and interrupt RPCs by
+  monotonic absolute deadlines; elapsed work always reduces the remaining
+  budget rather than restarting it.
+- If startup or effective-parameter verification fails, terminate or close the
+  app-server transport before returning the failure.
 - Read roots may be visible but never become writable roots.
 - Preserve runtime-owned hook trust state during managed-config regeneration.
   A canary must prove this before the Codex adapter is accepted.
@@ -550,6 +567,9 @@ MCP, skill paths, and lifecycle hooks:
   `external_directory` grant fully contained by normalized read roots.
 - Poll message state; do not use the long `wait` endpoint and do not pipe large
   API responses through a transport known to truncate them.
+- The shared managed service is not an owned process group: per-agent cancel is
+  the native session abort, and supervisor cleanup never signals or reaps the
+  service pid.
 - The isolation canary must prove the service uses the generated home. If it
   cannot, the adapter remains unavailable; it must not attach to the user's
   global service as a silent fallback.
@@ -763,7 +783,8 @@ CLI / MCP / runtime hook
         |
         v
 service.start()
-  validate -> create SQLite row -> spawn detached supervisor -> ready ack -> agent_id
+  validate -> atomic admission/idempotent row -> private 0700 agent directory
+           -> prepare -> spawn detached supervisor -> ready ack -> agent_id
                                       |
                                       v
                        supervisor <agent_id>
@@ -803,17 +824,23 @@ Supervisor rules:
 
 - install signal handlers before reporting ready;
 - start the engine in its own process group;
+- honour the runtime session's process-group ownership declaration; never apply
+  group signals or reap operations to a shared service;
 - heartbeat every five seconds;
 - process durable cancel/steer commands;
 - at 90% of deadline, issue one model-visible completion steer when supported;
 - at 100%, perform native cancel then TERM/KILL the verified process group;
 - distinguish no answer from an answer cut off during write;
+- accept success only after the canonical answer and completion sentinel are
+  sealed and independently verified;
 - semantic completion checks remain profile/runtime-specific;
 - record terminal state only after the engine group is gone.
 
 Reconciliation checks PID, full command identity, heartbeat, and process group.
 A stale supervisor with a verified surviving engine group is terminated before
-`lost` is committed. An ambiguous execution is never automatically replayed.
+`lost` is committed. Reaping a leader or observing a nonleader does not count as
+group exit while the verified group or owned process is still live. An ambiguous
+execution is never automatically replayed.
 
 ## 11. Orchestrator binding and completion messages
 
@@ -949,6 +976,10 @@ class AgentService(Protocol):
 At the start boundary, `timeout_seconds=None` is replaced exactly once with
 `core.default_timeout_seconds` before adapter preparation, durable persistence,
 or detached launch. An explicit positive timeout is passed through unchanged.
+Atomic idempotent lookup and global/runtime cap admission happen before any
+private agent directory or adapter preparation. A duplicate returns before
+filesystem work; a newly admitted row receives a private `0700` directory, and
+prepare failure is committed durably without launching a supervisor.
 
 `summary` requires exactly one of `agent_id` or `orchestrator`. Trusted
 completion notices use `summary(agent_id)`; session-scoped views use the
@@ -1126,6 +1157,18 @@ Core acceptance tests:
     writes no credentials or inferred runtime configuration.
 25. Transcript follow is duplicate-free and terminal-bounded; raw hook envelopes
     ignore unrelated fields while normalized payloads remain strict.
+26. Adapter materialization consumes only the explicit service-home skills root;
+    ambient skill lookalikes never appear in generated runtime homes.
+27. Duplicate and over-cap starts create no private directory or prepared runtime
+    state; an admitted prepare failure is durable and launches nothing.
+28. Every successful runtime seals the canonical answer plus sentinel, and the
+    supervisor refuses success when the sealed artifact cannot be verified.
+29. Shared OpenCode service sessions use native abort and never signal or reap the
+    service process group; owned runtime groups still remove live descendants.
+30. Codex startup, steer, and interrupt share bounded monotonic deadline budgets,
+    and every startup failure closes or terminates its transport.
+31. Process cleanup never reports a group gone merely because its leader was
+    reaped or the owned pid is not the group leader while live members remain.
 
 ## 17. Decisions
 
