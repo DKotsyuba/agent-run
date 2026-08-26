@@ -60,27 +60,33 @@ def model_reference(value: str) -> Mapping[str, str]:
 def normalize_models(
     payload: Mapping[str, object], allowed: Sequence[str]
 ) -> tuple[ModelInfo, ...]:
-    """Intersect the reported roster with the configured allowlist, in order."""
+    """Intersect the reported ``/api/model`` roster with the configured allowlist.
+
+    Each entry is flat: ``providerID`` + ``id`` form the canonical
+    ``providerID/id`` identifier. An entry outside the allowlist is the normal
+    case for a builtin model (e.g. provider ``opencode``) and is silently
+    dropped; a malformed entry fails closed. An entry that cannot actually be
+    started right now (``enabled`` is ``False``, or ``status`` is not
+    ``"active"``) is not reported, even if it is on the allowlist.
+    """
 
     if not isinstance(payload, Mapping):
         raise ValidationError("opencode model roster must be a mapping")
     reported: dict[str, str] = {}
-    for provider in _sequence(payload.get("data", payload.get("providers"))):
-        if not isinstance(provider, Mapping):
-            raise ValidationError("opencode provider entry must be a mapping")
-        provider_id = provider.get("id")
-        models = provider.get("models")
-        items = models.values() if isinstance(models, Mapping) else _sequence(models)
-        for model in items:
-            if not isinstance(model, Mapping):
-                raise ValidationError("opencode model entry must be a mapping")
-            identifier = model.get("id")
-            if not isinstance(identifier, str) or not identifier.strip():
-                raise ValidationError("opencode model id must be a nonblank string")
-            if isinstance(provider_id, str) and provider_id.strip():
-                identifier = f"{provider_id}/{identifier}"
-            name = model.get("name")
-            reported.setdefault(identifier, name if isinstance(name, str) else identifier)
+    for entry in _sequence(payload.get("data")):
+        if not isinstance(entry, Mapping):
+            raise ValidationError("opencode model entry must be a mapping")
+        provider_id = entry.get("providerID")
+        model_id = entry.get("id")
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            raise ValidationError("opencode model entry providerID must be a nonblank string")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValidationError("opencode model entry id must be a nonblank string")
+        if entry.get("enabled") is False or entry.get("status") != "active":
+            continue
+        name = entry.get("name")
+        identifier = f"{provider_id}/{model_id}"
+        reported.setdefault(identifier, name if isinstance(name, str) else identifier)
     return tuple(
         ModelInfo(identifier, reported[identifier])
         for identifier in allowed

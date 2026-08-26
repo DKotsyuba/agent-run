@@ -314,7 +314,7 @@ class OpenCodeAdapter:
         except ValidationError:
             return ()
         client = OpenCodeHttpClient(descriptor.base_url, home)
-        return normalize_models(client.providers(), config.models)
+        return normalize_models(client.models(), config.models)
 
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
         return ()
