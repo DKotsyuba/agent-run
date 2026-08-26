@@ -22,6 +22,7 @@ from .lifecycle import (
 
 DEFAULT_READY_TIMEOUT_SECONDS = 5.0
 DEFAULT_DISPATCH_TIMEOUT_SECONDS = 5.0
+DEFAULT_REAP_TIMEOUT_SECONDS = 5.0
 DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
 DEFAULT_CLEANUP_KILL_SECONDS = 1.0
 _POLL_SECONDS = 0.01
@@ -33,6 +34,8 @@ def launch_detached(
     readiness_timeout_seconds: float = DEFAULT_READY_TIMEOUT_SECONDS,
     post_terminal: Callable[[], object] | None = None,
     post_terminal_timeout_seconds: float = DEFAULT_DISPATCH_TIMEOUT_SECONDS,
+    post_reap: Callable[[int, int], object] | None = None,
+    post_reap_timeout_seconds: float = DEFAULT_REAP_TIMEOUT_SECONDS,
     cleanup_grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
     cleanup_kill_seconds: float = DEFAULT_CLEANUP_KILL_SECONDS,
 ) -> int:
@@ -47,10 +50,13 @@ def launch_detached(
         raise ValidationError("detached child callback must be callable")
     if post_terminal is not None and not callable(post_terminal):
         raise ValidationError("post-terminal callback must be callable")
+    if post_reap is not None and not callable(post_reap):
+        raise ValidationError("post-reap callback must be callable")
     ready_timeout = _positive("readiness_timeout_seconds", readiness_timeout_seconds)
     dispatch_timeout = _positive(
         "post_terminal_timeout_seconds", post_terminal_timeout_seconds
     )
+    reap_timeout = _positive("post_reap_timeout_seconds", post_reap_timeout_seconds)
     grace = _positive("cleanup_grace_seconds", cleanup_grace_seconds)
     kill_grace = _positive("cleanup_kill_seconds", cleanup_kill_seconds)
 
@@ -97,7 +103,9 @@ def launch_detached(
         _close(identity_read)
 
     ready.close_read()
-    threading.Thread(target=_reap_child, args=(pid,), daemon=True).start()
+    threading.Thread(
+        target=_reap_child, args=(pid, post_reap, reap_timeout), daemon=True
+    ).start()
     return pid
 
 
@@ -210,9 +218,27 @@ def _wait_child(pid: int, timeout_seconds: float) -> bool:
         time.sleep(_POLL_SECONDS)
 
 
-def _reap_child(pid: int) -> None:
-    with suppress(ChildProcessError):
-        os.waitpid(pid, 0)
+def _reap_child(
+    pid: int,
+    callback: Callable[[int, int], object] | None = None,
+    timeout_seconds: float = DEFAULT_REAP_TIMEOUT_SECONDS,
+) -> None:
+    try:
+        waited, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return
+    if waited != pid:
+        return
+    if callback is None:
+        return
+
+    def invoke() -> None:
+        with suppress(Exception):
+            callback(pid, status)
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
 
 
 def _redirect_standard_streams() -> None:

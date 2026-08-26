@@ -578,7 +578,11 @@ def _configure(connection: sqlite3.Connection) -> None:
 def _private_path(path: Path, *, parent_created: bool) -> None:
     if parent_created:
         path.parent.chmod(0o700)
-    path.chmod(0o600)
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            candidate.chmod(0o600)
+        except FileNotFoundError:
+            pass
 
 
 @contextmanager
@@ -605,6 +609,7 @@ def initialize_database(database: str | Path) -> sqlite3.Connection:
     existed = path.exists()
     connection = _raw_connect(path)
     try:
+        _private_path(path, parent_created=parent_created)
         version = _version(connection)
         tables = _tables(connection)
         if version != 0 or tables:
@@ -627,6 +632,7 @@ def open_database(database: str | Path) -> sqlite3.Connection:
     path = Path(database).expanduser().resolve()
     if not path.is_file():
         raise ValidationError(f"state database does not exist: {path}")
+    _private_path(path, parent_created=False)
     connection = _raw_connect(path, existing=True)
     try:
         _validate_schema(connection)

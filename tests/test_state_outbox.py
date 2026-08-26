@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
-from agent_run.state import StateStore
+from agent_run.state import StateStore, reconcile_reaped_supervisor
 
 
 class StateOutboxTests(unittest.TestCase):
@@ -288,6 +288,35 @@ class StateOutboxTests(unittest.TestCase):
         )
         rows = self.store.recent_capacity_samples(at=10, runtime="codex")
         self.assertEqual([row["id"] for row in rows], [recent_id])
+
+    def test_reaped_supervisor_reconciles_only_its_active_rows(self) -> None:
+        dead = self.create()
+        other = self.create()
+        terminal = self.create()
+        for agent_id, pid in ((dead, 100), (other, 200), (terminal, 100)):
+            self.store.transition(agent_id, AgentStatus.STARTING, at=2)
+            self.store.record_supervisor(
+                agent_id,
+                pid=pid,
+                identity=f"pid-{pid}",
+                process_group_id=pid,
+                at=3,
+            )
+            self.store.transition(agent_id, AgentStatus.RUNNING, at=4)
+        self.store.transition(
+            terminal,
+            AgentStatus.FAILED,
+            outcome=Outcome(AgentStatus.FAILED),
+            at=5,
+        )
+
+        self.assertEqual(
+            reconcile_reaped_supervisor(self.store, 100, at=6), (dead,)
+        )
+        self.assertEqual(self.store.get_agent(dead)["status"], "lost")
+        self.assertEqual(self.store.get_agent(other)["status"], "running")
+        self.assertEqual(self.store.get_agent(terminal)["status"], "failed")
+        self.assertEqual(reconcile_reaped_supervisor(self.store, 100, at=7), ())
 
     def test_capacity_retention_is_global_deterministic_and_keeps_expired_rows(self) -> None:
         first = self.store.insert_capacity_sample(

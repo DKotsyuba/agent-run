@@ -6,7 +6,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.config import CapacityConfig, Config
-from agent_run.domain import AgentStatus, OrchestratorRef, StartRequest
+from agent_run.domain import (
+    AgentStatus,
+    Message,
+    MessageRole,
+    OrchestratorRef,
+    StartRequest,
+)
 from agent_run.hooks.context import (
     ACTIVE_BLOCK_MAX_CHARS,
     CONTEXT_HARD_LIMIT_CHARS,
@@ -92,6 +98,31 @@ class ContextHookTests(unittest.TestCase):
         self.assertTrue(third.injected)
         self.assertNotEqual(third.context_key, first.context_key)
         self.assertNotIn("Active agents", third.text)
+
+    def test_warning_and_silence_use_events_and_latest_message_time(self) -> None:
+        agent_id = self.store.create_agent(
+            self.request(), task_summary="summary", config_revision="cfg-1", at=1
+        ).agent_id
+        self.store.bind_orchestrator(agent_id, self.ref, at=1)
+        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
+        self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
+        first = build_context(self.store, self.ref, config=self.config, now=10)
+
+        self.store.append_event(agent_id, "deadline_warning", at=11)
+        warned = build_context(self.store, self.ref, config=self.config, now=12)
+        self.assertTrue(warned.injected)
+        self.assertNotEqual(warned.context_key, first.context_key)
+        self.assertIn(" warn", warned.text)
+
+        silent = build_context(self.store, self.ref, config=self.config, now=604)
+        self.assertTrue(silent.injected)
+        self.assertIn(" silent", silent.text)
+        self.store.append_message(
+            agent_id, Message(605, MessageRole.ASSISTANT, "progress")
+        )
+        recovered = build_context(self.store, self.ref, config=self.config, now=606)
+        self.assertTrue(recovered.injected)
+        self.assertNotIn(" silent", recovered.text)
 
     def test_context_budget_is_never_exceeded_with_many_active_agents(self) -> None:
         for index in range(12):
