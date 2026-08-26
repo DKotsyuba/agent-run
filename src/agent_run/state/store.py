@@ -27,6 +27,7 @@ from .db import (
     _upsert_context_receipt,
     agent_row,
     checked_supervisor_proof,
+    connection_path,
     count_agents,
     immediate,
     integer,
@@ -62,6 +63,15 @@ class StateStore:
 
     def close(self) -> None:
         self.connection.close()
+
+    def path(self) -> Path:
+        """The database file this store's connection was opened from.
+
+        Lets a caller open its own connection to the same database from a
+        different thread, since sqlite3 connections are thread-affine.
+        """
+
+        return connection_path(self.connection)
 
     def create_agent(
         self,

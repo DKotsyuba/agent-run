@@ -124,6 +124,18 @@ def row_dict(row: sqlite3.Row | None) -> dict[str, object] | None:
     return None if row is None else dict(row)
 
 
+def connection_path(connection: sqlite3.Connection) -> Path:
+    """The absolute path SQLite opened this connection's main database from.
+
+    Lets a caller that only holds a connection (not the path used to open it)
+    open its own second connection to the same file -- e.g. a StateStore user
+    that must hand a same-thread-safe store to a different thread.
+    """
+
+    row = connection.execute("PRAGMA database_list").fetchone()
+    return Path(str(row["file"]))
+
+
 def agent_row(
     connection: sqlite3.Connection, agent_id: str | AgentId
 ) -> sqlite3.Row:
