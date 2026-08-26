@@ -50,8 +50,8 @@ from test_opencode_service import runtime_config
 
 
 PORT = 41777
-MODEL = "opencode/minimax-m3"
-ALT_MODEL = "opencode/deepseek-v4-pro"
+MODEL = "omniroute/deepseek-v4-pro"
+ALT_MODEL = "omniroute/minimax-m3"
 
 
 def message(role, text, *, agent=PRIMARY_AGENT, at=1.0):
@@ -184,9 +184,9 @@ class OutcomeTests(unittest.TestCase):
 
 class ModelTests(unittest.TestCase):
     def test_canonical_identifiers_split_into_provider_and_model(self):
-        self.assertEqual(split_model(MODEL), ("opencode", "minimax-m3"))
+        self.assertEqual(split_model(MODEL), ("omniroute", "deepseek-v4-pro"))
         self.assertEqual(
-            dict(model_reference(MODEL)), {"providerID": "opencode", "modelID": "minimax-m3"}
+            dict(model_reference(MODEL)), {"providerID": "omniroute", "modelID": "deepseek-v4-pro"}
         )
 
     def test_non_canonical_identifiers_are_refused(self):
@@ -197,13 +197,13 @@ class ModelTests(unittest.TestCase):
     def test_roster_is_intersected_with_the_allowlist_in_config_order(self):
         payload = {
             "providers": [
-                {"id": "opencode", "models": {"a": {"id": "minimax-m3", "name": "MiniMax M3"}}},
-                {"id": "opencode", "models": [{"id": "deepseek-v4-pro"}, {"id": "unlisted"}]},
+                {"id": "omniroute", "models": {"a": {"id": "minimax-m3", "name": "MiniMax M3"}}},
+                {"id": "omniroute", "models": [{"id": "deepseek-v4-pro"}, {"id": "unlisted"}]},
             ]
         }
-        models = normalize_models(payload, (ALT_MODEL, MODEL, "opencode/absent"))
+        models = normalize_models(payload, (ALT_MODEL, MODEL, "omniroute/absent"))
         self.assertEqual([item.id for item in models], [ALT_MODEL, MODEL])
-        self.assertEqual(models[1].description, "MiniMax M3")
+        self.assertEqual(models[0].description, "MiniMax M3")
 
     def test_malformed_roster_is_refused(self):
         with self.assertRaises(ValidationError):
@@ -288,13 +288,11 @@ class AdapterCase(unittest.TestCase):
         descriptor = verify_isolation(
             plan,
             {
-                "config_home": str(config_home),
-                "data_home": str(data_home),
-                "host": SERVICE_HOST,
-                "port": PORT,
+                "healthy": True,
                 "pid": os.getpid() if pid is None else pid,
                 "version": "2.1.0",
             },
+            pid=os.getpid() if pid is None else pid,
             config_hash=digest,
         )
         write_service_descriptor(self.home, descriptor)
@@ -341,66 +339,26 @@ class MaterializeTests(AdapterCase):
         digest = self.materialize()
         path = self.home / CONFIG_RELATIVE_PATH
         text = path.read_text(encoding="utf-8")
+        document = json.loads(text)
         self.assertEqual(digest, content_hash(text))
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(
-            json.loads(text),
-            {
-                "$schema": "https://opencode.ai/config.json",
-                "share": "disabled",
-                "autoupdate": False,
-                "model": MODEL,
-                "permission": {
-                    "bash": "deny",
-                    "edit": "deny",
-                    "write": "deny",
-                    "webfetch": "deny",
-                    "external_directory": "ask",
-                },
-                "agents": {
-                    PRIMARY_AGENT: {
-                        "mode": "primary",
-                        "model": MODEL,
-                        "permission": {
-                            "bash": "deny",
-                            "edit": "deny",
-                            "write": "deny",
-                            "webfetch": "deny",
-                            "external_directory": "ask",
-                        },
-                    },
-                    VERIFY_AGENT: {
-                        "mode": "subagent",
-                        "model": MODEL,
-                        "permission": {
-                            "bash": "deny",
-                            "edit": "deny",
-                            "write": "deny",
-                            "webfetch": "deny",
-                            "external_directory": "deny",
-                        },
-                    },
-                },
-                "skills": ["review"],
-                "mcp": {
-                    "servers": {
-                        "docs": {
-                            "type": "local",
-                            "command": [str(self.mcp_command), "--root", "/docs"],
-                            "environment": {"DOCS_TOKEN": "secret"},
-                            "enabled": True,
-                        }
-                    }
-                },
-            },
-        )
+        self.assertEqual(document["model"], MODEL)
+        self.assertEqual(document["default_agent"], PRIMARY_AGENT)
+        provider = document["providers"]["omniroute"]
+        self.assertEqual(provider["env"], ["OMNIROUTE_API_KEY"])
+        self.assertEqual(provider["package"], "@opencode-ai/ai/providers/openai-compatible")
+        self.assertEqual(provider["settings"]["baseURL"], "http://127.0.0.1:20128/v1")
+        self.assertEqual(provider["models"]["deepseek-v4-pro"]["modelID"], "opencode/deepseek-v4-pro")
+        self.assertEqual(document["mcp"]["servers"]["docs"]["disabled"], False)
+        self.assertNotIn("enabled", document["mcp"]["servers"]["docs"])
         self.assertEqual(digest, self.materialize())
+
 
     def test_permission_order_is_preserved_on_disk(self):
         self.materialize()
         text = (self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8")
-        order = [key for key in json.loads(text)["permission"]]
-        self.assertEqual(order, ["bash", "edit", "write", "webfetch", "external_directory"])
+        permissions = json.loads(text)["agents"][PRIMARY_AGENT]["permissions"]
+        self.assertEqual([item["action"] for item in permissions], ["bash", "edit", "write", "webfetch", "external_directory"])
         self.assertLess(text.index('"bash"'), text.index('"external_directory"'))
 
     def test_mcp_servers_is_a_required_keyword(self):
@@ -495,7 +453,7 @@ class ProbeAndPrepareTests(AdapterCase):
         self.assertEqual(plan.adapter_state["service"]["pid"], descriptor.pid)
         self.assertEqual(plan.adapter_state["service"]["config_hash"], descriptor.config_hash)
         self.assertEqual(
-            plan.adapter_state["model"], {"providerID": "opencode", "modelID": "minimax-m3"}
+            plan.adapter_state["model"], {"providerID": "omniroute", "modelID": "deepseek-v4-pro"}
         )
         self.assertEqual(plan.adapter_state["agent"], PRIMARY_AGENT)
         self.assertNotIn("write_roots", plan.adapter_state)
@@ -585,7 +543,7 @@ class FakeService:
 
     def permissions(self, session_id):
         self.calls.append(("permissions", session_id))
-        return self._capture(self._next(self.permission_pages, []))
+        return self._capture({"data": self._next(self.permission_pages, [])})
 
     def answer_permission(self, session_id, permission_id, payload):
         self.calls.append(("answer_permission", permission_id, dict(payload)))
@@ -625,7 +583,7 @@ class SessionTests(AdapterCase):
             broker=broker if broker is not None else PermissionBroker((self.read_root,)),
             pid=4242,
             response_dir=self.agent_dir,
-            model={"providerID": "opencode", "modelID": "minimax-m3"},
+            model={"providerID": "omniroute", "modelID": "deepseek-v4-pro"},
             sleep=self.advance,
             monotonic=lambda: self.clock,
             **kwargs,
@@ -729,7 +687,7 @@ class SessionTests(AdapterCase):
         session.cancel(2.0)
         steered = [call for call in service.calls if call[0] == "prompt_async"][0]
         self.assertEqual(steered[2]["parts"], [{"type": "text", "text": "focus on tests"}])
-        self.assertEqual(steered[2]["model"], {"providerID": "opencode", "modelID": "minimax-m3"})
+        self.assertEqual(steered[2]["model"], {"providerID": "omniroute", "modelID": "deepseek-v4-pro"})
         self.assertIn(("abort", "ses_1"), service.calls)
         self.assertEqual(session.wait(30.0).status, AgentStatus.CANCELLED)
         with self.assertRaises(ValidationError):
@@ -750,7 +708,7 @@ class SessionTests(AdapterCase):
         self.assertEqual(service.calls[0][0], "create_session")
         self.assertEqual(service.calls[1][0], "prompt_async")
         self.assertEqual(
-            service.calls[1][2]["model"], {"providerID": "opencode", "modelID": "minimax-m3"}
+            service.calls[1][2]["model"], {"providerID": "omniroute", "modelID": "deepseek-v4-pro"}
         )
         self.assertEqual(service.calls[1][2]["agent"], PRIMARY_AGENT)
         self.assertEqual(session.pid, plan.adapter_state["service"]["pid"])

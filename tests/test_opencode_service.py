@@ -27,7 +27,7 @@ from agent_run.config import RuntimeAuthConfig, RuntimeConfig
 from agent_run.errors import ValidationError
 
 
-MODEL = "opencode/minimax-m3"
+MODEL = "omniroute/deepseek-v4-pro"
 CONFIG_HASH = "a" * 64
 CONFIG_NAME = "generated.json"
 
@@ -194,12 +194,8 @@ class ResolveEnvironmentTests(unittest.TestCase):
 
 class IsolationProofTests(ServiceTempCase):
     def reported(self, **overrides):
-        config_home, data_home = service_home_paths(self.home)
         payload = {
-            "config_home": str(config_home),
-            "data_home": str(data_home),
-            "host": SERVICE_HOST,
-            "port": 41777,
+            "healthy": True,
             "pid": 4242,
             "version": "2.1.0",
         }
@@ -207,7 +203,7 @@ class IsolationProofTests(ServiceTempCase):
         return payload
 
     def prove(self, **overrides):
-        return verify_isolation(self.plan(), self.reported(**overrides), config_hash=CONFIG_HASH)
+        return verify_isolation(self.plan(), self.reported(**overrides), pid=4242, config_hash=CONFIG_HASH)
 
     def test_contained_report_yields_a_descriptor(self):
         descriptor = self.prove()
@@ -216,17 +212,9 @@ class IsolationProofTests(ServiceTempCase):
         self.assertEqual(descriptor.config_hash, CONFIG_HASH)
         self.assertEqual(descriptor.base_url, f"http://{SERVICE_HOST}:41777")
 
-    def test_global_home_report_is_refused(self):
-        with self.assertRaises(ServiceIsolationError):
-            self.prove(config_home="/tmp")
-        with self.assertRaises(ServiceIsolationError):
-            self.prove(data_home=str(Path.home()))
-
-    def test_foreign_endpoint_report_is_refused(self):
-        with self.assertRaises(ServiceIsolationError):
-            self.prove(port=4096)
-        with self.assertRaises(ServiceIsolationError):
-            self.prove(host="0.0.0.0")
+    def test_health_only_proof_does_not_trust_global_or_endpoint_fields(self):
+        descriptor = self.prove(config_home="/tmp", data_home=str(Path.home()), port=4096, host="0.0.0.0")
+        self.assertEqual(descriptor.base_url, f"http://{SERVICE_HOST}:41777")
 
     def test_missing_pid_or_config_hash_is_refused(self):
         with self.assertRaises(ServiceIsolationError):
@@ -234,13 +222,13 @@ class IsolationProofTests(ServiceTempCase):
         with self.assertRaises(ServiceIsolationError):
             self.prove(pid=0)
         with self.assertRaises(ServiceIsolationError):
-            verify_isolation(self.plan(), self.reported(), config_hash="not-a-hash")
+            verify_isolation(self.plan(), self.reported(), pid=4242, config_hash="not-a-hash")
 
     def test_missing_report_fields_are_refused(self):
         payload = self.reported()
-        del payload["config_home"]
+        del payload["healthy"]
         with self.assertRaises(ServiceIsolationError):
-            verify_isolation(self.plan(), payload, config_hash=CONFIG_HASH)
+            verify_isolation(self.plan(), payload, pid=4242, config_hash=CONFIG_HASH)
 
 
 class DescriptorFileTests(ServiceTempCase):

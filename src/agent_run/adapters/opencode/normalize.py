@@ -43,7 +43,7 @@ def split_model(value: object) -> tuple[str, str]:
             f"opencode model must be canonical 'providerID/modelID', not {value!r}"
         )
     provider, model = value.split("/", 1)
-    if provider != "omniroute" or not model.startswith("opencode/") or not model[9:].strip():
+    if provider != "omniroute" or not model.strip():
         raise ValidationError(
             f"opencode model must be canonical 'providerID/modelID', not {value!r}"
         )

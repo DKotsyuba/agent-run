@@ -86,9 +86,19 @@ class ClientCase(unittest.TestCase):
 class AuthenticationTests(ClientCase):
     def test_explicit_password_authenticates_every_endpoint(self):
         password = "fixture-password"
-        client = self.client(*(FakeReply({}) for _ in range(10)), password=password)
+        client = self.client(
+            FakeReply({"healthy": True, "pid": 1, "version": "2.1.0"}),
+            FakeReply({"providers": []}),
+            FakeReply({"data": {}}),
+            FakeReply({"data": {"id": "ses_1"}}),
+            FakeReply({"data": {}}),
+            FakeReply({}),
+            FakeReply([]),
+            FakeReply([]),
+            FakeReply(b"", status=NO_CONTENT),
+            password=password,
+        )
         client.health()
-        client.isolation_report()
         client.providers()
         client.session_status()
         client.create_session({"agent": "agent-run"})
@@ -99,7 +109,7 @@ class AuthenticationTests(ClientCase):
         client.answer_permission("ses_1", "perm_1", {"response": "reject"})
 
         encoded = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
-        self.assertEqual(self.opener.authorizations, [f"Basic {encoded}"] * 10)
+        self.assertEqual(self.opener.authorizations, [f"Basic {encoded}"] * 9)
 
     def test_live_client_refuses_missing_or_blank_password(self):
         for environment in ({}, {PASSWORD_ENV: "   "}):
@@ -199,8 +209,8 @@ class CaptureLifetimeTests(ClientCase):
     def test_decoded_endpoints_keep_no_capture(self):
         client = self.client(
             FakeReply({"ok": True}),
-            FakeReply({"ses_1": {"state": "idle"}}),
-            FakeReply({"id": "ses_1"}),
+            FakeReply({"data": {"ses_1": {"state": "idle"}}}),
+            FakeReply({"data": {"id": "ses_1"}}),
             FakeReply(b"", status=NO_CONTENT),
         )
         client.health()
@@ -325,9 +335,9 @@ class EndpointTests(ClientCase):
     def test_proven_v2_paths_are_used(self):
         client = self.client(
             FakeReply({"ok": True}),
-            FakeReply({"ses_1": {"state": "busy"}}),
-            FakeReply({"id": "ses_1"}),
-            FakeReply({"ok": True}),
+            FakeReply({"data": {"ses_1": {"state": "busy"}}}),
+            FakeReply({"data": {"id": "ses_1"}}),
+            FakeReply({"data": {}}),
             FakeReply(b"", status=NO_CONTENT),
             FakeReply([]),
             FakeReply(b"", status=NO_CONTENT),
@@ -344,20 +354,20 @@ class EndpointTests(ClientCase):
             [
                 ("GET", f"http://127.0.0.1:41777{HEALTH_PATH}"),
                 ("GET", f"http://127.0.0.1:41777{SESSION_STATUS_PATH}"),
-                ("POST", "http://127.0.0.1:41777/session"),
-                ("POST", "http://127.0.0.1:41777/session/ses_1/prompt_async"),
-                ("POST", "http://127.0.0.1:41777/session/ses_1/abort"),
-                ("GET", "http://127.0.0.1:41777/session/ses_1/permission"),
-                ("POST", "http://127.0.0.1:41777/session/ses_1/permissions/perm_1"),
+                ("POST", "http://127.0.0.1:41777/api/session"),
+                ("POST", "http://127.0.0.1:41777/api/session/ses_1/prompt"),
+                ("POST", "http://127.0.0.1:41777/api/session/ses_1/interrupt"),
+                ("GET", "http://127.0.0.1:41777/api/session/ses_1/permission"),
+                ("POST", "http://127.0.0.1:41777/api/session/ses_1/permission/perm_1/reply"),
             ],
         )
-        self.assertEqual(HEALTH_PATH, "/global/health")
+        self.assertEqual(HEALTH_PATH, "/api/health")
 
     def test_session_calls_use_json_bodies_and_safe_identifiers(self):
-        client = self.client(FakeReply({"id": "ses_1"}))
+        client = self.client(FakeReply({"data": {"id": "ses_1"}}))
         client.create_session({"agent": "agent-run"})
         method, url, body = self.opener.calls[0]
-        self.assertEqual((method, url), ("POST", "http://127.0.0.1:41777/session"))
+        self.assertEqual((method, url), ("POST", "http://127.0.0.1:41777/api/session"))
         self.assertEqual(json.loads(body.decode("utf-8")), {"agent": "agent-run"})
         with self.assertRaises(ValidationError):
             client.abort("../other")

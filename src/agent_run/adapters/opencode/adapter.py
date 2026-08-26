@@ -173,7 +173,7 @@ def render_config(
                 "package": "@opencode-ai/ai/providers/openai-compatible",
                 "settings": {"baseURL": "http://127.0.0.1:20128/v1", "apiKey": "{env:OMNIROUTE_API_KEY}"},
                 "models": {
-                    model.split("/", 1)[1]: {"modelID": model.split("/", 1)[1]}
+                    model.split("/", 1)[1]: {"modelID": f"opencode/{model.split('/', 1)[1]}"}
                     for model in config.models
                 },
             }
