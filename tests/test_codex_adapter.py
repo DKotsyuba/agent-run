@@ -148,6 +148,35 @@ env_from = ["PATH"]
         second = ADAPTER.materialize(config, self.home, mcp_servers={})
         self.assertEqual(first, second)
 
+    def test_materialize_uses_only_each_explicit_service_skill_root(self) -> None:
+        config = self.runtime_config()
+        generated = []
+        for index, text in enumerate(("first isolated", "second isolated")):
+            service_home = Path(self._mkdtemp()).resolve()
+            skills_root = service_home / "skills" / "codex"
+            skill = skills_root / "demo" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(text, encoding="utf-8")
+            runtime_home = service_home / "runtimes" / "codex" / "home"
+            ADAPTER.materialize(
+                config,
+                runtime_home,
+                mcp_servers={},
+                skills_root=skills_root,
+            )
+            generated.append(
+                (runtime_home / "skills" / "demo" / "SKILL.md").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertEqual(generated, ["first isolated", "second isolated"])
+
+        missing = Path(self._mkdtemp()).resolve() / "skills" / "codex"
+        with self.assertRaisesRegex(ValidationError, "skill is not available"):
+            ADAPTER.materialize(
+                config, self.home, mcp_servers={}, skills_root=missing
+            )
+
     def test_materialize_fails_for_missing_skill_or_unresolved_mcp(self) -> None:
         with self.assertRaisesRegex(ValidationError, "codex skill is not available"):
             ADAPTER.materialize(
@@ -634,6 +663,23 @@ env_from = ["PATH"]
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
         with self.assertRaisesRegex(ValidationError, "not materialized"):
             self.prepare(self.start_request(), profile)
+
+    def test_launch_timeout_terminates_the_partially_started_transport(self) -> None:
+        from unittest.mock import Mock
+
+        from agent_run.adapters.codex import adapter as codex_adapter
+
+        transport = Mock()
+        with patch.object(
+            codex_adapter.app_server, "ProcessTransport", return_value=transport
+        ), patch.object(
+            codex_adapter.app_server,
+            "start_session",
+            side_effect=TimeoutError("startup timed out"),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "startup timed out"):
+                ADAPTER.launch(object(), object())
+        transport.terminate.assert_called_once_with(1.0)
 
 
 if __name__ == "__main__":

@@ -38,9 +38,12 @@ class FakeAdapter:
         self.capabilities = frozenset(Capability)
         self.validate_calls = 0
         self.materialize_calls = 0
+        self.skills_roots = []
         self.models_calls = 0
         self.limits_calls = 0
         self.prepare_calls = 0
+        self.prepare_dirs = []
+        self.prepare_error = None
 
     def describe(self):
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
@@ -48,8 +51,9 @@ class FakeAdapter:
     def validate(self, config):
         self.validate_calls += 1
 
-    def materialize(self, config, home, *, mcp_servers):
+    def materialize(self, config, home, *, mcp_servers, skills_root):
         self.materialize_calls += 1
+        self.skills_roots.append(skills_root)
         return "cfg-1"
 
     def probe(self, config, home):
@@ -65,8 +69,12 @@ class FakeAdapter:
 
     def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
         self.prepare_calls += 1
+        self.prepare_dirs.append(agent_dir)
+        if self.prepare_error is not None:
+            raise self.prepare_error
         return LaunchPlan(
-            ("fake",), request.workdir, {}, request.task, agent_dir / "runtime.jsonl", {}
+            ("fake",), request.workdir, {}, request.task, agent_dir / "runtime.jsonl", {},
+            agent_dir / "answer.md",
         )
 
     def launch(self, plan, sink):
@@ -238,6 +246,7 @@ class AgentServiceTests(unittest.TestCase):
         self.assertFalse(duplicate.created)
         self.assertEqual(duplicate.agent_id, existing.agent_id)
         self.assertEqual(launched, [])
+        self.assertEqual(ADAPTER.prepare_calls, 0)
         self.assertEqual(limited.call_count, 2)
         for call in limited.call_args_list:
             self.assertEqual(call.kwargs["global_limit"], 1)
@@ -250,6 +259,28 @@ class AgentServiceTests(unittest.TestCase):
             1,
         )
         self.assertFalse((self.root / "agents").exists())
+
+    def test_prepare_failure_is_durable_after_private_agent_directory(self) -> None:
+        ADAPTER.prepare_error = ValidationError("prepare exploded")
+        request = self.request(request_id="prepare-failure")
+
+        with self.assertRaisesRegex(ValidationError, "prepare exploded"):
+            self.service.start(request)
+
+        rows = self.store.list_agents()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], AgentStatus.FAILED.value)
+        self.assertEqual(rows[0]["failure_kind"], "prepare_failed")
+        path = self.root / "agents" / str(rows[0]["id"])
+        self.assertTrue(path.is_dir())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(ADAPTER.prepare_dirs, [path])
+        self.assertEqual(self.launched, [])
+
+        retry = self.service.start(request)
+        self.assertFalse(retry.created)
+        self.assertEqual(str(retry.agent_id), str(rows[0]["id"]))
+        self.assertEqual(ADAPTER.prepare_calls, 1)
 
     def test_launch_failure_is_durable_and_idempotent_retry_never_relaunches(self) -> None:
         calls: list[tuple] = []
@@ -339,7 +370,7 @@ class AgentServiceTests(unittest.TestCase):
     def test_answer_verifies_path_size_hash_and_bounds_inline_content(self) -> None:
         agent_id = self.start("answer").agent_id
         directory = agent_dir(agent_id, self.root)
-        directory.mkdir(parents=True)
+        self.assertTrue(directory.is_dir())
         path = directory / "answer.md"
         body = b"sealed answer"
         path.write_bytes(body)

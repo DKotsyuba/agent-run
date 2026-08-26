@@ -27,7 +27,7 @@ from .domain import (
     validate_agent_id,
 )
 from .errors import ValidationError
-from .paths import agent_dir, config_path, state_db_path
+from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from .profiles import load_profile
 from .state.store import StateStore
 
@@ -273,19 +273,14 @@ class AgentService:
             read_roots=request.read_roots,
         )
         mcp_servers = self._mcp_servers(runtime)
+        skills_root = runtime_skills_dir(request.runtime, self._home)
         revision = adapter.materialize(
-            runtime, runtime.home, mcp_servers=mcp_servers
-        )
-        candidate = new_agent_id()
-        candidate_dir = agent_dir(candidate, self._home)
-        plan = adapter.prepare(
-            request,
-            profile,
             runtime,
             runtime.home,
-            candidate_dir,
             mcp_servers=mcp_servers,
+            skills_root=skills_root,
         )
+        candidate = new_agent_id()
         creation = self._store.create_agent_limited(
             request,
             task_summary=self._task_summary(request.task),
@@ -295,28 +290,49 @@ class AgentService:
             agent_id=candidate,
             at=self._now(),
         )
-        if creation.created:
-            try:
-                self._launch(
-                    creation.agent_id, request, adapter, plan, candidate_dir
-                )
-            except Exception as error:
-                outcome = Outcome(
-                    AgentStatus.FAILED,
-                    failure_kind="supervisor_start_failed",
-                    failure_text=_failure_text(error),
-                )
-                self._store.transition(
-                    creation.agent_id,
-                    AgentStatus.FAILED,
-                    outcome=outcome,
-                    kind="supervisor_start_failed",
-                    data={"agent_id": str(creation.agent_id)},
-                    at=self._now(),
-                )
-                raise
+        if not creation.created:
+            return StartResult(
+                creation.agent_id, False, self.get(creation.agent_id)
+            )
+        try:
+            candidate_dir = create_agent_dir(creation.agent_id, self._home)
+            plan = adapter.prepare(
+                request,
+                profile,
+                runtime,
+                runtime.home,
+                candidate_dir,
+                mcp_servers=mcp_servers,
+            )
+        except Exception as error:
+            self._fail_created_start(creation.agent_id, error, "prepare_failed")
+            raise
+        try:
+            self._launch(creation.agent_id, request, adapter, plan, candidate_dir)
+        except Exception as error:
+            self._fail_created_start(
+                creation.agent_id, error, "supervisor_start_failed"
+            )
+            raise
         return StartResult(
-            creation.agent_id, creation.created, self.get(creation.agent_id)
+            creation.agent_id, True, self.get(creation.agent_id)
+        )
+
+    def _fail_created_start(
+        self, agent_id: AgentId, error: Exception, kind: str
+    ) -> None:
+        outcome = Outcome(
+            AgentStatus.FAILED,
+            failure_kind=kind,
+            failure_text=_failure_text(error),
+        )
+        self._store.transition(
+            agent_id,
+            AgentStatus.FAILED,
+            outcome=outcome,
+            kind=kind,
+            data={"agent_id": str(agent_id)},
+            at=self._now(),
         )
 
     def bind(

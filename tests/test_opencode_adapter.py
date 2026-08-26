@@ -640,13 +640,15 @@ class SessionTests(AdapterCase):
         self.assertEqual(self.sink.messages[0].raw_ref, str(self.captures / self.remaining()[0]))
 
     def test_answer_is_recorded_as_exact_utf8_bytes_and_hash(self):
+        from agent_run.verify import DEFAULT_SENTINEL
+
         answer = "готово ✅"
         service = FakeService(
             self.captures, ["busy", "idle"], [[message("assistant", answer, at=2.0)]]
         )
         outcome = self.session(service).wait(30.0)
         path = self.agent_dir / ANSWER_NAME
-        expected = answer.encode("utf-8")
+        expected = f"{answer}\n{DEFAULT_SENTINEL}\n".encode("utf-8")
         self.assertEqual(path.read_bytes(), expected)
         self.assertEqual(outcome.answer_path, path)
         self.assertEqual(outcome.answer_bytes, len(expected))

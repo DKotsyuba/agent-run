@@ -31,7 +31,7 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from ..home import content_hash, write_managed_file
+from ..home import content_hash, seal_answer, write_managed_file
 from .http import POLL_INTERVAL_SECONDS, OpenCodeHttpClient
 from .normalize import (
     PRIMARY_AGENT,
@@ -258,11 +258,16 @@ class OpenCodeAdapter:
         home: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        skills_root: Path | None = None,
         inherited_environment: Mapping[str, str] | None = None,
     ) -> str:
         """Render the generated service config; nothing outside home is touched."""
 
         self.validate(config)
+        if skills_root is None:
+            skills_root = Path(home)
+        if not isinstance(skills_root, Path) or not skills_root.is_absolute():
+            raise ValidationError("opencode skills_root must be absolute")
         content = render_config(
             config, mcp_servers, inherited_environment=inherited_environment
         )
@@ -349,6 +354,7 @@ class OpenCodeAdapter:
             initial_input=f"{profile.body}\n\n{request.task}",
             runtime_stream_path=agent_dir / "runtime.jsonl",
             adapter_state=MappingProxyType(state),
+            answer_path=agent_dir / ANSWER_NAME,
         )
 
     def launch(
@@ -429,6 +435,10 @@ class OpenCodeRuntimeSession:
 
         return self._pid
 
+    @property
+    def owns_process_group(self) -> bool:
+        return False
+
     def wait(self, timeout_seconds: float | None) -> Outcome | None:
         """Settle this session, answering its permissions while it works.
 
@@ -484,12 +494,12 @@ class OpenCodeRuntimeSession:
             self._sink.message(message)
         answer = extract_answer(payload, agent=self._agent)
         if answer and self._response_dir is not None:
-            data = answer.encode("utf-8")
-            digest = write_managed_file(self._response_dir, ANSWER_NAME, data)
+            path = Path(self._response_dir) / ANSWER_NAME
+            size, digest = seal_answer(path, answer)
             outcome = replace(
                 outcome,
-                answer_path=Path(self._response_dir) / ANSWER_NAME,
-                answer_bytes=len(data),
+                answer_path=path,
+                answer_bytes=size,
                 answer_sha256=digest,
             )
         blocked = self._broker.blocked_summary()

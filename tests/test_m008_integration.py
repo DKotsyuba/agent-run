@@ -107,7 +107,7 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.launches), 1, "start returns after the launch decision")
 
         agent_id, _request, _adapter, plan, directory = self.launches[0]
-        directory.mkdir(parents=True)
+        self.assertTrue(directory.is_dir())
         answer_path = directory / "answer.md"
         answer_path.write_text(f"done\n{DEFAULT_SENTINEL}\n", encoding="utf-8")
         ops = FakeOps()

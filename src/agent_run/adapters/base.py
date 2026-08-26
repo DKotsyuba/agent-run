@@ -72,6 +72,7 @@ class LaunchPlan:
     initial_input: str | None
     runtime_stream_path: Path
     adapter_state: Mapping[str, object]
+    answer_path: Path | None = None
 
 
 class EventSink(Protocol):
@@ -85,6 +86,9 @@ class EventSink(Protocol):
 class RuntimeSession(Protocol):
     @property
     def pid(self) -> int | None: ...
+
+    @property
+    def owns_process_group(self) -> bool: ...
 
     def wait(self, timeout_seconds: float | None) -> Outcome | None: ...
 
@@ -104,6 +108,7 @@ class RuntimeAdapter(Protocol):
         home: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        skills_root: Path,
     ) -> str: ...
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth: ...

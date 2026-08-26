@@ -15,7 +15,9 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from ..home import seal_answer
 from pathlib import Path
 from typing import Mapping, Protocol
 
@@ -35,7 +37,13 @@ class AppServerTransport(Protocol):
     @property
     def pid(self) -> int | None: ...
 
-    def request(self, method: str, params: Mapping[str, object]) -> Mapping[str, object]: ...
+    def request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> Mapping[str, object]: ...
 
     def poll_event(self, timeout: float | None) -> Mapping[str, object] | None: ...
 
@@ -166,10 +174,18 @@ def _normalize_outcome(turn: Mapping[str, object], thread_id: str) -> Outcome:
 class CodexAppServerSession:
     """Drives one codex thread and normalizes its events for an ``EventSink``."""
 
-    def __init__(self, transport: AppServerTransport, sink, thread_id: str) -> None:
+    def __init__(
+        self,
+        transport: AppServerTransport,
+        sink,
+        thread_id: str,
+        *,
+        answer_path: Path | None = None,
+    ) -> None:
         self._transport = transport
         self._sink = sink
         self._thread_id = thread_id
+        self._answer_path = answer_path
         self._buffered_outcome: Outcome | None = None
         self._pending_raw: list[Mapping[str, object]] = []
         self._closed = False
@@ -177,6 +193,10 @@ class CodexAppServerSession:
     @property
     def pid(self) -> int | None:
         return self._transport.pid
+
+    @property
+    def owns_process_group(self) -> bool:
+        return True
 
     def wait(self, timeout_seconds: float | None) -> Outcome | None:
         if self._buffered_outcome is not None:
@@ -193,7 +213,11 @@ class CodexAppServerSession:
         if not isinstance(text, str) or not text.strip():
             raise ValidationError("steer text must be nonblank")
         self._drain_pending()
-        response = self._transport.request("turn/steer", {"threadId": self._thread_id, "text": text})
+        response = self._transport.request(
+            "turn/steer",
+            {"threadId": self._thread_id, "text": text},
+            timeout_seconds=30.0,
+        )
         if not response.get("accepted"):
             reason = response.get("reason")
             raise SteerRejected(str(reason) if reason else "codex rejected the steer request")
@@ -202,7 +226,11 @@ class CodexAppServerSession:
         if isinstance(grace_seconds, bool) or not isinstance(grace_seconds, (int, float)) or grace_seconds < 0:
             raise ValidationError("grace_seconds must be a nonnegative number")
         self._drain_pending()
-        self._transport.request("turn/interrupt", {"threadId": self._thread_id})
+        self._transport.request(
+            "turn/interrupt",
+            {"threadId": self._thread_id},
+            timeout_seconds=max(float(grace_seconds), 0.001),
+        )
 
     def close(self) -> None:
         if not self._closed:
@@ -261,6 +289,20 @@ class CodexAppServerSession:
         turn = _mapping(params.get("turn"))
         outcome = _normalize_outcome(turn, self._thread_id)
         messages, malformed = _assistant_messages(turn)
+        if (
+            outcome.status is AgentStatus.SUCCEEDED
+            and self._answer_path is not None
+            and messages
+        ):
+            size, digest = seal_answer(
+                self._answer_path, "\n\n".join(message.content for message in messages)
+            )
+            outcome = replace(
+                outcome,
+                answer_path=self._answer_path,
+                answer_bytes=size,
+                answer_sha256=digest,
+            )
         self._consume_raw()
         self._buffered_outcome = outcome
         for message in messages:
@@ -273,7 +315,27 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     """Run initialize/thread/turn/start and verify the effective params."""
 
     state = plan.adapter_state
-    transport.request("initialize", {"clientInfo": {"name": "agent-run", "version": "1"}})
+    configured = state.get("request_timeout_seconds")
+    timeout = (
+        min(float(configured), 30.0)
+        if isinstance(configured, (int, float))
+        and not isinstance(configured, bool)
+        and configured > 0
+        else 30.0
+    )
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("codex app-server startup timed out")
+        return value
+
+    transport.request(
+        "initialize",
+        {"clientInfo": {"name": "agent-run", "version": "1"}},
+        timeout_seconds=remaining(),
+    )
     roots = tuple(state["roots"])
     writable_roots = tuple(state["writable_roots"])
     thread = transport.request(
@@ -289,6 +351,7 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
             "mcpServers": list(state.get("mcp", ())),
             "skills": list(state.get("skills", ())),
         },
+        timeout_seconds=remaining(),
     )
     expected = EffectiveTurnParams(
         model=state["model"],
@@ -303,8 +366,14 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     if not isinstance(thread_id, str) or not thread_id:
         raise VerificationError("codex thread/start did not return a threadId")
     sink.session(thread_id)
-    transport.request("turn/start", {"threadId": thread_id, "input": plan.initial_input})
-    return CodexAppServerSession(transport, sink, thread_id)
+    transport.request(
+        "turn/start",
+        {"threadId": thread_id, "input": plan.initial_input},
+        timeout_seconds=remaining(),
+    )
+    return CodexAppServerSession(
+        transport, sink, thread_id, answer_path=plan.answer_path
+    )
 
 
 _STREAM_CLOSED = object()
@@ -371,7 +440,20 @@ class ProcessTransport:
             return None
         return message
 
-    def request(self, method: str, params: Mapping[str, object]) -> Mapping[str, object]:
+    def request(
+        self,
+        method: str,
+        params: Mapping[str, object],
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> Mapping[str, object]:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds < float("inf")
+        ):
+            raise ValidationError("timeout_seconds must be positive and finite")
+        deadline = time.monotonic() + float(timeout_seconds)
         request_id = self._next_id
         self._next_id += 1
         payload = json.dumps(
@@ -385,8 +467,11 @@ class ProcessTransport:
         except (OSError, ValueError) as error:
             raise ConnectionError(f"codex app-server stdin is closed for {method}") from error
         while True:
-            message = self._take(None)
+            remaining = max(deadline - time.monotonic(), 0.0)
+            message = self._take(remaining)
             if message is None:
+                if self._process.poll() is None:
+                    raise TimeoutError(f"codex app-server timed out waiting for {method}")
                 raise ConnectionError(
                     f"codex app-server closed the stream while waiting for {method}"
                 )
