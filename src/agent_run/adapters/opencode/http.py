@@ -12,6 +12,7 @@ service; nothing here performs a live call on import.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
@@ -24,7 +25,7 @@ from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 from ...errors import AgentRunError, ValidationError
-from .service import SERVICE_HOST, ServiceDescriptor
+from .service import PASSWORD_ENV, SERVICE_HOST, ServiceDescriptor, require_server_password
 
 
 HEALTH_PATH = "/global/health"
@@ -42,6 +43,7 @@ NO_CONTENT = 204
 
 #: Statuses an adapter can prove are transient. 500 stays out: it is ambiguous.
 TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
+_AUTH_STATUSES = frozenset({401, 403})
 _RETRYABLE_METHODS = frozenset({"GET"})
 _WAIT_SEGMENTS = frozenset({"wait", "longpoll"})
 _WAIT_QUERY_KEYS = frozenset({"wait", "longpoll", "long_wait"})
@@ -223,9 +225,17 @@ class OpenCodeHttpClient:
         monotonic: Callable[[], float] = time.monotonic,
         timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
         max_bytes: int = MAX_RESPONSE_BYTES,
+        password: str | None = None,
     ) -> None:
         self._base_url = _check_base_url(base_url)
         self._response_dir = _response_dir(response_dir)
+        candidate = os.environ.get(PASSWORD_ENV) if password is None else password
+        if candidate is None and opener is not None:
+            self._authorization: str | None = None
+        else:
+            checked = require_server_password(candidate)
+            encoded = base64.b64encode(f"opencode:{checked}".encode("utf-8")).decode("ascii")
+            self._authorization = f"Basic {encoded}"
         self._opener = opener if opener is not None else urllib.request.urlopen
         self._retry = retry if retry is not None else RetryPolicy()
         self._sleep = sleep
@@ -277,6 +287,8 @@ class OpenCodeHttpClient:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(self._base_url + path, data=body, method=verb)
         request.add_header("Accept", "application/json")
+        if self._authorization is not None:
+            request.add_header("Authorization", self._authorization)
         if body is not None:
             request.add_header("Content-Type", "application/json")
         try:
@@ -285,7 +297,8 @@ class OpenCodeHttpClient:
             status = int(error.code)
             if status in TRANSIENT_STATUSES:
                 raise TransientHttpError(status, path) from error
-            raise HttpError(status, path, error.reason if isinstance(error.reason, str) else "") from error
+            detail = error.reason if isinstance(error.reason, str) else ""
+            raise HttpError(status, path, self._safe_detail(status, detail)) from error
         except (urllib.error.URLError, OSError) as error:
             raise TransientHttpError(503, path, str(error)) from error
         try:
@@ -304,8 +317,15 @@ class OpenCodeHttpClient:
                 detail = captured.text()[:200]
             finally:
                 captured.release()
-            raise HttpError(status, path, detail)
+            raise HttpError(status, path, self._safe_detail(status, detail))
         return captured
+
+    def _safe_detail(self, status: int, detail: str) -> str:
+        if status in _AUTH_STATUSES:
+            return "authentication failed"
+        if self._authorization is not None and self._authorization in detail:
+            return "response detail redacted"
+        return detail
 
     def get(self, path: str) -> HttpResponse:
         return self.request("GET", path)

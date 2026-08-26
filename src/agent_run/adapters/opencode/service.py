@@ -23,6 +23,7 @@ from ..home import content_hash, write_managed_file
 
 
 SERVICE_HOST = "127.0.0.1"
+PASSWORD_ENV = "OPENCODE_SERVER_PASSWORD"
 MIN_PORT = 1024
 MAX_PORT = 65535
 STARTUP_TIMEOUT_SECONDS = 20.0
@@ -40,6 +41,15 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
 class ServiceIsolationError(ValidationError):
     """A candidate service cannot be proven to use the generated home."""
+
+
+def require_server_password(value: str | None = None) -> str:
+    """Return the managed-service password without persisting it."""
+
+    candidate = os.environ.get(PASSWORD_ENV) if value is None else value
+    if not isinstance(candidate, str) or not candidate.strip():
+        raise ServiceIsolationError(f"{PASSWORD_ENV} must be set to a nonblank value")
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -403,4 +413,5 @@ def attach_service(
             "the generated opencode config changed after the service was proven; "
             f"expected {descriptor.config_hash}, found {observed}"
         )
+    require_server_password()
     return descriptor

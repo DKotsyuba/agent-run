@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -31,6 +32,7 @@ from agent_run.adapters.opencode.adapter import (
 )
 from agent_run.adapters.opencode.http import HttpResponse
 from agent_run.adapters.opencode.service import (
+    PASSWORD_ENV,
     SERVICE_HOST,
     SERVICE_PATH,
     ServiceIsolationError,
@@ -226,6 +228,9 @@ class FakeSink:
 
 class AdapterCase(unittest.TestCase):
     def setUp(self):
+        self._auth = mock.patch.dict(os.environ, {PASSWORD_ENV: "fixture-password"})
+        self._auth.start()
+        self.addCleanup(self._auth.stop)
         self._temp = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp.cleanup)
         self.root = Path(self._temp.name).resolve()
@@ -441,6 +446,16 @@ class ProbeAndPrepareTests(AdapterCase):
         proven = self.adapter.probe(self.config, self.home)
         self.assertTrue(proven.available)
         self.assertEqual(proven.version, "2.1.0")
+
+    def test_probe_refuses_a_proven_service_without_password(self):
+        self.prove_service()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            health = self.adapter.probe(self.config, self.home)
+        self.assertFalse(health.available)
+        self.assertEqual(
+            health.reason,
+            f"{PASSWORD_ENV} must be set to a nonblank value",
+        )
 
     def test_probe_reproves_the_pid_and_the_config_hash(self):
         self.prove_service(pid=2 ** 31 - 1)

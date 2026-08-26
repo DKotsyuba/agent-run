@@ -1,13 +1,17 @@
+import base64
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agent_run.adapters.opencode.service import PASSWORD_ENV
 from agent_run.adapters.opencode.http import (
     HEALTH_PATH,
     MAX_POLL_INTERVAL_SECONDS,
@@ -42,9 +46,11 @@ class FakeOpener:
     def __init__(self, *replies):
         self.replies = list(replies)
         self.calls = []
+        self.authorizations = []
 
     def __call__(self, request, timeout=None):
         self.calls.append((request.get_method(), request.full_url, request.data))
+        self.authorizations.append(request.get_header("Authorization"))
         reply = self.replies.pop(0)
         if isinstance(reply, BaseException):
             raise reply
@@ -75,6 +81,58 @@ class ClientCase(unittest.TestCase):
 
     def captures(self):
         return sorted(path.name for path in self.directory.iterdir())
+
+
+class AuthenticationTests(ClientCase):
+    def test_explicit_password_authenticates_every_endpoint(self):
+        password = "fixture-password"
+        client = self.client(*(FakeReply({}) for _ in range(10)), password=password)
+        client.health()
+        client.isolation_report()
+        client.providers()
+        client.session_status()
+        client.create_session({"agent": "agent-run"})
+        client.prompt_async("ses_1", {"parts": []})
+        client.abort("ses_1")
+        client.messages("ses_1").release()
+        client.permissions("ses_1").release()
+        client.answer_permission("ses_1", "perm_1", {"response": "reject"})
+
+        encoded = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
+        self.assertEqual(self.opener.authorizations, [f"Basic {encoded}"] * 10)
+
+    def test_live_client_refuses_missing_or_blank_password(self):
+        for environment in ({}, {PASSWORD_ENV: "   "}):
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaises(ValidationError) as caught:
+                        OpenCodeHttpClient("http://127.0.0.1:41777", self.directory)
+                self.assertEqual(
+                    str(caught.exception),
+                    f"{PASSWORD_ENV} must be set to a nonblank value",
+                )
+
+    def test_injected_opener_may_remain_unauthenticated(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            client = self.client(FakeReply({"ok": True}))
+            self.assertEqual(client.health(), {"ok": True})
+        self.assertEqual(self.opener.authorizations, [None])
+
+    def test_authentication_error_never_exposes_credentials_or_retries(self):
+        password = "fixture-password"
+        encoded = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
+        header = f"Basic {encoded}"
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:41777/global/health", 401, header, None, None
+        )
+        client = self.client(error, password=password)
+        with self.assertRaises(HttpError) as caught:
+            client.health()
+        message = str(caught.exception)
+        self.assertIn("authentication failed", message)
+        self.assertNotIn(password, message)
+        self.assertNotIn(header, message)
+        self.assertEqual(client.attempts, 1)
 
 
 class CaptureTests(ClientCase):

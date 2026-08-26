@@ -3,9 +3,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agent_run.adapters.opencode.service import PASSWORD_ENV
 from agent_run.adapters.home import content_hash, write_managed_file
 from agent_run.adapters.opencode.service import (
     SERVICE_HOST,
@@ -45,6 +47,9 @@ def runtime_config(binary, home, **overrides):
 
 class ServiceTempCase(unittest.TestCase):
     def setUp(self):
+        self._auth = mock.patch.dict(os.environ, {PASSWORD_ENV: "fixture-password"})
+        self._auth.start()
+        self.addCleanup(self._auth.stop)
         self._temp = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp.cleanup)
         self.root = Path(self._temp.name).resolve()
@@ -288,6 +293,18 @@ class DescriptorFileTests(ServiceTempCase):
         write_service_descriptor(self.home, self.descriptor())
         with self.assertRaises(ServiceIsolationError):
             attach_service(self.home, self.home / "absent.json")
+
+    def test_attach_refuses_missing_or_blank_password(self):
+        write_service_descriptor(self.home, self.descriptor())
+        for environment in ({}, {PASSWORD_ENV: "   "}):
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaises(ServiceIsolationError) as caught:
+                        attach_service(self.home, self.config_file)
+                self.assertEqual(
+                    str(caught.exception),
+                    f"{PASSWORD_ENV} must be set to a nonblank value",
+                )
 
 
 if __name__ == "__main__":
