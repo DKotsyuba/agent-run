@@ -620,21 +620,28 @@ class MaterializeTests(AdapterCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(document["model"], MODEL)
         self.assertEqual(document["default_agent"], PRIMARY_AGENT)
-        provider = document["providers"]["omniroute"]
+        provider = document["provider"]["omniroute"]
         self.assertEqual(provider["env"], ["OMNIROUTE_API_KEY"])
-        self.assertEqual(provider["package"], "@opencode-ai/ai/providers/openai-compatible")
-        self.assertEqual(provider["settings"]["baseURL"], "http://127.0.0.1:20128/v1")
-        self.assertEqual(provider["models"]["deepseek-v4-pro"]["modelID"], "opencode/deepseek-v4-pro")
-        self.assertEqual(document["mcp"]["servers"]["docs"]["disabled"], False)
-        self.assertNotIn("enabled", document["mcp"]["servers"]["docs"])
+        self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+        self.assertEqual(provider["options"]["baseURL"], "http://127.0.0.1:20128/v1")
+        self.assertEqual(provider["models"]["deepseek-v4-pro"]["id"], "opencode/deepseek-v4-pro")
+        self.assertNotIn("providers", document)
+        self.assertNotIn("agents", document)
+        self.assertEqual(document["skills"], {"paths": ["review"]})
+        self.assertEqual(document["mcp"]["docs"]["enabled"], True)
+        self.assertNotIn("disabled", document["mcp"]["docs"])
+        self.assertNotIn("servers", document["mcp"])
         self.assertEqual(digest, self.materialize())
 
 
     def test_permission_order_is_preserved_on_disk(self):
         self.materialize()
         text = (self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8")
-        permissions = json.loads(text)["agents"][PRIMARY_AGENT]["permissions"]
-        self.assertEqual([item["action"] for item in permissions], ["bash", "edit", "write", "webfetch", "external_directory"])
+        permission = json.loads(text)["agent"][PRIMARY_AGENT]["permission"]
+        self.assertEqual(
+            list(permission), ["bash", "edit", "write", "webfetch", "external_directory"]
+        )
+        self.assertEqual(permission["external_directory"], "ask")
         self.assertLess(text.index('"bash"'), text.index('"external_directory"'))
 
     def test_mcp_servers_is_a_required_keyword(self):
@@ -644,7 +651,7 @@ class MaterializeTests(AdapterCase):
     def test_only_selected_servers_are_written(self):
         self.materialize()
         document = json.loads((self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8"))
-        self.assertEqual(list(document["mcp"]["servers"]), ["docs"])
+        self.assertEqual(list(document["mcp"]), ["docs"])
 
     def test_unresolved_non_stdio_and_unset_mcp_definitions_are_refused(self):
         with self.assertRaises(ValidationError) as missing:
@@ -1058,8 +1065,10 @@ class SessionTests(AdapterCase):
         session.steer("focus on tests")
         session.cancel(2.0)
         steered = [call for call in service.calls if call[0] == "prompt_async"][0]
-        self.assertEqual(steered[2]["parts"], [{"type": "text", "text": "focus on tests"}])
-        self.assertEqual(steered[2]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"})
+        # v1's prompt body has no per-turn agent/model field; "delivery":
+        # "steer" is the engine-native way to interject into a running turn,
+        # proven live via v1's own /doc OpenAPI enum ["steer", "queue"].
+        self.assertEqual(steered[2], {"prompt": {"text": "focus on tests"}, "delivery": "steer"})
         self.assertIn(("abort", "ses_1"), service.calls)
         self.assertEqual(session.wait(30.0).status, AgentStatus.CANCELLED)
         with self.assertRaises(ValidationError):
@@ -1079,10 +1088,11 @@ class SessionTests(AdapterCase):
         self.assertEqual(sink.sessions, ["ses_1"])
         self.assertEqual(service.calls[0][0], "create_session")
         self.assertEqual(service.calls[1][0], "prompt_async")
-        self.assertEqual(
-            service.calls[1][2]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"}
-        )
-        self.assertEqual(service.calls[1][2]["agent"], PRIMARY_AGENT)
+        # v1's prompt body carries no per-turn agent/model at all -- proven
+        # live via v1's own /doc OpenAPI (additionalProperties: false on
+        # {id?, prompt, delivery?, resume?}); selection is fixed once, above,
+        # at session-create time.
+        self.assertEqual(service.calls[1][2], {"prompt": {"text": plan.initial_input}})
         self.assertEqual(session.pid, plan.adapter_state["service"]["pid"])
 
     def test_launch_session_create_uses_the_v2_model_ref_shape(self):
@@ -1090,7 +1100,9 @@ class SessionTests(AdapterCase):
         ``{"_tag": "InvalidRequestError", "message": "Missing key\\n  at
         [\\"model\\"][\\"id\\"]"}`` when the create body sends ``modelID``
         instead of the ``Model.Ref`` schema's ``id``; proven live against the
-        canary service before this fix landed.
+        canary service before this fix landed. v1 additionally rejects a
+        "title" field outright (additionalProperties: false on
+        {id?, agent?, model?, location?}), proven live via v1's own /doc.
         """
         self.prove_service()
         plan = self.prepare()
@@ -1099,6 +1111,7 @@ class SessionTests(AdapterCase):
         created = [call for call in service.calls if call[0] == "create_session"][0]
         self.assertEqual(created[1]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"})
         self.assertNotIn("modelID", created[1]["model"])
+        self.assertNotIn("title", created[1])
 
 
 class ProductionSizeTests(unittest.TestCase):
