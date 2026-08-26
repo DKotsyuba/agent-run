@@ -40,7 +40,10 @@ def _redact(value: object) -> object:
 
 
 def _safe_event_data(payload: Mapping[str, object]) -> Mapping[str, object]:
-    return MappingProxyType(dict(_redact(payload)))  # type: ignore[arg-type]
+    # A plain dict, not MappingProxyType: this return value is nested as a
+    # field value inside other event payloads (see ``_terminal_metadata``),
+    # and only the outer mapping gets unwrapped before JSON encoding.
+    return dict(_redact(payload))  # type: ignore[arg-type]
 
 
 def sanitize_line(raw_line: str, literal_secrets: Iterable[str]) -> str:
@@ -179,7 +182,7 @@ def _terminal_metadata(payload: Mapping[str, object], session_id: str | None) ->
             and not isinstance(payload.get("total_cost_usd"), bool)
             else None
         ),
-        usage=_safe_event_data(usage) if isinstance(usage, Mapping) else MappingProxyType({}),
+        usage=_safe_event_data(usage) if isinstance(usage, Mapping) else {},
     )
 
 
@@ -298,5 +301,5 @@ class StreamDecoder:
             duration_ms=None,
             num_turns=None,
             total_cost_usd=None,
-            usage=MappingProxyType({}),
+            usage={},
         )

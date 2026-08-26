@@ -8,6 +8,7 @@ owner-authored skill directories below ``~/.agent-run/skills/claude``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shlex
@@ -464,7 +465,10 @@ class ClaudeSession:
                 if result.event:
                     self._sink.event(*result.event)
                 if result.warning:
-                    self._sink.event("stream_diagnostic", {"reason": result.warning})
+                    # Best-effort: a bookkeeping write here must never mask
+                    # the real outcome already captured in ``result``/self._decoder.
+                    with contextlib.suppress(Exception):
+                        self._sink.event("stream_diagnostic", {"reason": result.warning})
                 if result.terminal:
                     self._sink.event("runtime_result", terminal_event_data(result.terminal))
             except BaseException as error:  # persisted for wait(); keep draining the pipe

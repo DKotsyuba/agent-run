@@ -481,7 +481,10 @@ class Supervisor:
         """Adapter-native control first; group signals are the enforcement."""
 
         reason = self._stop_reason
-        self._store.append_event(self._agent_id, "stopping", data={"reason": reason})
+        # Best-effort: stop_reason is already durable in memory for this run;
+        # losing this bookkeeping record must not abort the actual stop.
+        with contextlib.suppress(Exception):
+            self._store.append_event(self._agent_id, "stopping", data={"reason": reason})
         self._safe_cancel(session)
         return self._await_exit(session)
 
@@ -525,7 +528,10 @@ class Supervisor:
             kill_grace_seconds=self._settings.kill_grace_seconds,
             poll_seconds=min(self._settings.poll_seconds, 1.0),
         )
-        self._record_termination(termination)
+        # Best-effort, matching _fail_launched: termination is already proven
+        # by ``termination`` itself, so a failure recording it must not turn
+        # a known outcome (e.g. timed_out) into supervision_failed below.
+        self._record_termination(termination, best_effort=True)
         self._reap_session(session)
         proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
         outcome = verify_completion(

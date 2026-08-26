@@ -17,11 +17,12 @@ from agent_run.domain import AgentStatus, MessageRole
 
 
 class FakeSink:
-    def __init__(self, *, fail_message_once: bool = False) -> None:
+    def __init__(self, *, fail_message_once: bool = False, fail_event_kind: str | None = None) -> None:
         self.messages: list = []
         self.sessions: list = []
         self.events: list = []
         self._fail_message_once = fail_message_once
+        self._fail_event_kind = fail_event_kind
 
     def message(self, message) -> None:
         if self._fail_message_once:
@@ -33,6 +34,8 @@ class FakeSink:
         self.sessions.append(runtime_session_id)
 
     def event(self, kind: str, data) -> None:
+        if kind == self._fail_event_kind:
+            raise RuntimeError(f"{kind} write failed")
         self.events.append((kind, dict(data)))
 
 
@@ -188,6 +191,29 @@ class ClaudeSessionTests(unittest.TestCase):
         log_text = self.log_path.read_text(encoding="utf-8")
         self.assertIn("second", log_text)
         self.assertIn("\"type\": \"result\"", log_text)
+
+    def test_a_failing_stream_diagnostic_write_does_not_mask_a_real_outcome(self) -> None:
+        """Regression: the diagnostic event write is best-effort.
+
+        Unlike a message-sink failure (fatal, tested above), a durable-write
+        hiccup on the purely informational "stream_diagnostic" event must not
+        abort the read loop or turn a genuine outcome into a raised error
+        that the supervisor would otherwise report as supervision_failed.
+        """
+
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print('not json')\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-1', 'subtype': 'success', 'is_error': False, "
+            "'result': 'done', 'duration_ms': 1, 'num_turns': 1, 'total_cost_usd': 0.0, 'usage': {}}))\n"
+        )
+        sink = FakeSink(fail_event_kind="stream_diagnostic")
+        session = ADAPTER.launch(self.plan(script), sink)
+        outcome = session.wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertNotIn("stream_diagnostic", [kind for kind, _ in sink.events])
 
     def test_wait_yields_when_an_open_stream_keeps_the_reader_alive(self) -> None:
         script = (
