@@ -1,0 +1,154 @@
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from agent_run.errors import ValidationError
+from agent_run.launch import launch_detached
+
+
+@unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX only")
+class DetachedLaunchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def wait_for(self, predicate, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() >= deadline:
+                self.fail("timed out waiting for detached process evidence")
+            time.sleep(0.01)
+
+    def test_parent_returns_after_ready_before_terminal_and_dispatches_once(self) -> None:
+        events = self.root / "events"
+        gate = self.root / "gate"
+        dispatched = self.root / "dispatched"
+
+        def child(ready) -> None:
+            events.write_text("before-ready\n")
+            ready.ready()
+            while not gate.exists():
+                time.sleep(0.01)
+            with events.open("a") as stream:
+                stream.write("terminal\n")
+
+        def dispatch() -> None:
+            with dispatched.open("a") as stream:
+                stream.write("once\n")
+
+        pid = launch_detached(child, post_terminal=dispatch)
+        self.assertTrue(self.alive(pid))
+        self.assertEqual(events.read_text(), "before-ready\n")
+        self.assertFalse(dispatched.exists())
+
+        gate.touch()
+        self.wait_for(dispatched.exists)
+        self.wait_for(lambda: not self.alive(pid))
+        self.assertEqual(events.read_text(), "before-ready\nterminal\n")
+        self.assertEqual(dispatched.read_text(), "once\n")
+
+    def test_wrapper_and_grandchild_outlive_the_returning_caller(self) -> None:
+        evidence = self.root / "pids"
+        gate = self.root / "gate"
+
+        def child(ready) -> None:
+            grandchild = os.fork()
+            if grandchild == 0:
+                while not gate.exists():
+                    time.sleep(0.01)
+                os._exit(0)
+            evidence.write_text(f"{os.getpid()} {grandchild}")
+            ready.ready()
+            while not gate.exists():
+                time.sleep(0.01)
+            os.waitpid(grandchild, 0)
+
+        wrapper = launch_detached(child)
+        self.wait_for(evidence.exists)
+        reported_wrapper, grandchild = map(int, evidence.read_text().split())
+        self.assertEqual(reported_wrapper, wrapper)
+        self.assertTrue(self.alive(wrapper))
+        self.assertTrue(self.alive(grandchild))
+
+        gate.touch()
+        self.wait_for(lambda: not self.alive(wrapper))
+        self.wait_for(lambda: not self.alive(grandchild))
+
+    def test_pre_ready_failure_is_reported_reaped_and_dispatches_once(self) -> None:
+        pid_path = self.root / "pid"
+        dispatched = self.root / "dispatched"
+
+        def child(_ready) -> None:
+            pid_path.write_text(str(os.getpid()))
+            raise RuntimeError("startup broke")
+
+        def dispatch() -> None:
+            with dispatched.open("a") as stream:
+                stream.write("once\n")
+
+        with self.assertRaisesRegex(ValidationError, "RuntimeError: startup broke"):
+            launch_detached(child, post_terminal=dispatch, readiness_timeout_seconds=1)
+        pid = int(pid_path.read_text())
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        self.assertEqual(dispatched.read_text(), "once\n")
+
+    def test_readiness_timeout_kills_verified_wrapper_and_grandchild_group(self) -> None:
+        evidence = self.root / "pids"
+
+        def child(_ready) -> None:
+            grandchild = os.fork()
+            if grandchild == 0:
+                while True:
+                    time.sleep(1)
+            evidence.write_text(f"{os.getpid()} {grandchild}")
+            while True:
+                time.sleep(1)
+
+        with self.assertRaisesRegex(ValidationError, "ready in time"):
+            launch_detached(
+                child,
+                readiness_timeout_seconds=0.15,
+                cleanup_grace_seconds=0.05,
+                cleanup_kill_seconds=0.05,
+            )
+        wrapper, grandchild = map(int, evidence.read_text().split())
+        self.wait_for(lambda: not self.alive(wrapper))
+        self.wait_for(lambda: not self.alive(grandchild))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(wrapper, os.WNOHANG)
+
+    def test_post_terminal_callback_is_bounded_and_never_reruns_child(self) -> None:
+        ran = self.root / "ran"
+        dispatched = self.root / "dispatched"
+
+        def child(ready) -> None:
+            with ran.open("a") as stream:
+                stream.write("once\n")
+            ready.ready()
+
+        def dispatch() -> None:
+            with dispatched.open("a") as stream:
+                stream.write("once\n")
+            time.sleep(10)
+
+        pid = launch_detached(
+            child, post_terminal=dispatch, post_terminal_timeout_seconds=0.05
+        )
+        self.wait_for(dispatched.exists)
+        self.wait_for(lambda: not self.alive(pid))
+        self.assertEqual(ran.read_text(), "once\n")
+        self.assertEqual(dispatched.read_text(), "once\n")
+
+    @staticmethod
+    def alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
