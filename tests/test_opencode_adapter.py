@@ -101,7 +101,7 @@ class PermissionBrokerTests(unittest.TestCase):
         )
         self.assertTrue(first.granted)
         self.assertEqual(self.broker.granted_directory, str(self.allowed / "nested"))
-        self.assertEqual(dict(self.broker.reply(first)), {"reply": "once"})
+        self.assertEqual(self.broker.reply(first), {"reply": "once"})
         second = self.broker.decide(
             {"id": "p2", "type": "external_directory", "path": str(self.allowed)}
         )
@@ -110,8 +110,21 @@ class PermissionBrokerTests(unittest.TestCase):
 
     def test_reply_body_carries_only_the_reply(self):
         decision = self.broker.decide({"id": "p1", "type": "bash", "path": "/"})
-        self.assertEqual(dict(self.broker.reply(decision)), {"reply": "reject"})
+        self.assertEqual(self.broker.reply(decision), {"reply": "reject"})
         self.assertNotIn("response", self.broker.reply(decision))
+
+    def test_reply_and_blocked_summary_are_plain_json_safe_dicts(self):
+        """Both values are handed to json.dumps() with no dict()-unwrapping
+        step in between (OpenCodeHttpClient._once() for reply(), and
+        EventSink.event() only shallow-copies its top level for
+        blocked_summary()); a MappingProxyType blows up json.dumps() with
+        "Object of type mappingproxy is not JSON serializable", so neither
+        producer may return one, even though a Mapping is duck-type
+        compatible."""
+
+        decision = self.broker.decide({"id": "p1", "type": "bash", "path": "/"})
+        self.assertIs(type(self.broker.reply(decision)), dict)
+        self.assertIs(type(self.broker.blocked_summary()), dict)
 
     def test_directory_outside_read_roots_is_rejected(self):
         decision = self.broker.decide(

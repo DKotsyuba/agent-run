@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import MappingProxyType
 from typing import Mapping
 
 from ...errors import ValidationError
@@ -67,12 +66,19 @@ class PermissionBroker:
     def blocked_summary(self) -> Mapping[str, int]:
         """Bounded counts of rejected permissions, by requested type."""
 
-        return MappingProxyType(dict(sorted(self._blocked.items())))
+        # A plain dict, not MappingProxyType: this value is handed straight
+        # to EventSink.event() for the durable "permissions_blocked" event,
+        # and only a plain dict/list/str/int/bool/None tree is JSON-safe.
+        return dict(sorted(self._blocked.items()))
 
     def reply(self, decision: PermissionDecision) -> Mapping[str, object]:
         """The exact body the v2 permission reply endpoint accepts."""
 
-        return MappingProxyType({"reply": "once" if decision.granted else "reject"})
+        # A plain dict, not MappingProxyType: this value is passed straight
+        # to OpenCodeHttpClient.answer_permission(), whose request encoding
+        # calls json.dumps() directly on it with no dict()-unwrapping step --
+        # unlike a MappingProxyType, only a plain dict is JSON serializable.
+        return {"reply": "once" if decision.granted else "reject"}
 
 
 def permission_id(permission: Mapping[str, object]) -> str:
