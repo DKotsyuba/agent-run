@@ -505,9 +505,9 @@ class ClaudeSession:
             exit_code = self._process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             return None
-        self._reader.join(timeout=5)
+        self._reader.join(timeout=5 if timeout_seconds is None else timeout_seconds)
         if self._reader.is_alive():
-            raise RuntimeError("reader_timeout")
+            return None
         with self._lock:
             self._raw_stream.close()
         for pipe in (self._process.stdin, self._process.stdout):

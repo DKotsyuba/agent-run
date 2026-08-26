@@ -191,7 +191,9 @@ def _supervisors(rows, probe: ProcessProbe, findings) -> None:
         if alive and identity is None:
             _add(findings, "supervisor_identity_unavailable", "warning", f"agent:{row['id']}", "process identity unavailable")
             continue
-        dead = not alive or not isinstance(expected, str) or identity != expected
+        dead = not alive or not isinstance(expected, str) or not (
+            identity == expected or identity.endswith(f" {expected}")
+        )
         if dead:
             _add(findings, "dead_supervisor", "error", f"agent:{row['id']}", "dead or identity mismatch")
             if group_alive:

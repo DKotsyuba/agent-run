@@ -27,7 +27,7 @@ from .hooks.context import build_context
 from .launch import launch_detached
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
-from .state import StateStore, reconcile_reaped_agent
+from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
 from .supervisor import Supervisor, SupervisorSettings
 
 _MAX_STDIN_CHARS = 1_048_576
@@ -436,6 +436,8 @@ def _dispatch_once(home: Path):
         )
     store = StateStore.open(state_db_path(home))
     try:
+        if isinstance(store, StateStore):
+            reconcile_active_agents(store)
         sender = CodexQueueSender(str(executable), timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
         dispatcher = DeliveryDispatcher(
             store,

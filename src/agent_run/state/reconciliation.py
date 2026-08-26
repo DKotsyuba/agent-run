@@ -77,3 +77,46 @@ def reconcile_reaped_supervisor(
         ):
             changed.append(AgentId(str(row["id"])))
     return tuple(changed)
+
+
+def reconcile_active_agents(store, *, at: float | None = None, limit: int = 100) -> tuple[AgentId, ...]:
+    """Boundedly close dead detached supervisors during an independent sweep."""
+    from ..doctor import _probe_process
+
+    checked_at = timestamp(at)
+    statuses = tuple(sorted(status.value for status in ACTIVE))
+    placeholders = ",".join("?" for _ in statuses)
+    rows = store.connection.execute(
+        f"SELECT id, supervisor_pid, process_group_id, supervisor_identity FROM agents "
+        f"WHERE status IN ({placeholders}) ORDER BY created_at, id LIMIT ?",
+        (*statuses, limit),
+    )
+    changed = []
+    for row in rows:
+        pid, pgid, expected = row["supervisor_pid"], row["process_group_id"], row["supervisor_identity"]
+        if not isinstance(pid, int) or not isinstance(pgid, int) or not isinstance(expected, str):
+            continue
+        alive, identity, group_alive = _probe_process(pid, pgid)
+        matches = identity == expected or (isinstance(identity, str) and identity.endswith(f" {expected}"))
+        if alive and matches:
+            continue
+        if group_alive:
+            # A group is recorded only for adapter sessions that own it.
+            if alive:
+                continue
+            try:
+                import os, signal
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                pass
+            alive, identity, group_alive = _probe_process(pid, pgid)
+            if alive or group_alive:
+                continue
+        if store.reconcile(
+            str(row["id"]), verdict="dead" if not alive else "identity_mismatch",
+            supervisor_pid=pid, process_group_id=pgid, expected_identity=expected,
+            alive=alive, observed_identity=identity, checked_at=checked_at,
+            reason="periodic detached supervisor reconciliation",
+        ):
+            changed.append(AgentId(str(row["id"])))
+    return tuple(changed)

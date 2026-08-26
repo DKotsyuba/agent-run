@@ -189,7 +189,7 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertIn("second", log_text)
         self.assertIn("\"type\": \"result\"", log_text)
 
-    def test_wait_refuses_to_finalize_while_reader_is_still_alive(self) -> None:
+    def test_wait_yields_when_an_open_stream_keeps_the_reader_alive(self) -> None:
         script = (
             "import sys, json\n"
             "sys.stdin.readline()\n"
@@ -203,9 +203,8 @@ class ClaudeSessionTests(unittest.TestCase):
         with patch.object(session._reader, "join") as bounded_join, patch.object(
             session._reader, "is_alive", return_value=True
         ):
-            with self.assertRaisesRegex(RuntimeError, "reader_timeout"):
-                session.wait(timeout_seconds=5)
-            bounded_join.assert_called_once_with(timeout=5)
+            self.assertIsNone(session.wait(timeout_seconds=0.01))
+            bounded_join.assert_called_once()
         self.assertFalse(session._raw_stream.closed)
 
         outcome = session.wait(timeout_seconds=5)
