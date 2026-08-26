@@ -123,7 +123,15 @@ class FakeService:
         return self._return("delivery_dispatch", {"delivered": 1})
 
     def hook_context(self, payload):
-        return self._return("hook_context", payload)
+        return self._return(
+            "hook_context",
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "context",
+                }
+            },
+        )
 
     def hook_bind(self, payload):
         return self._return("hook_bind", payload)
@@ -280,12 +288,242 @@ class CliTests(unittest.TestCase):
                 self.assertTrue(output.startswith("{"))
                 self.assertIn(expected, service.calls)
 
-        for hook in ("context", "bind"):
-            code, output, error = self.run_cli(
-                ["hook", hook], service=service, stdin='{"agent_id":"x"}'
+        code, output, error = self.run_cli(
+            ["hook", "context"], service=service, stdin='{"agent_id":"x"}'
+        )
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(
+            json.loads(output),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "context",
+                }
+            },
+        )
+
+        code, output, error = self.run_cli(
+            ["hook", "bind"], service=service, stdin='{"agent_id":"x"}'
+        )
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output), {"agent_id": "x"})
+
+    def test_hook_context_wraps_first_injection_and_suppresses_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            payload = json.dumps(
+                {
+                    "transport": "codex_queue",
+                    "external_session_id": "session-1",
+                }
             )
+            args = ["--home", str(home), "hook", "context"]
+
+            code, output, error = self.run_cli(args, service=runtime, stdin=payload)
+
             self.assertEqual((code, error), (0, ""))
-            self.assertEqual(json.loads(output), {"agent_id": "x"})
+            envelope = json.loads(output)
+            self.assertEqual(set(envelope), {"hookSpecificOutput"})
+            hook_output = envelope["hookSpecificOutput"]
+            self.assertEqual(
+                set(hook_output), {"hookEventName", "additionalContext"}
+            )
+            self.assertEqual(hook_output["hookEventName"], "UserPromptSubmit")
+            self.assertTrue(hook_output["additionalContext"].strip())
+            self.assertLessEqual(len(hook_output["additionalContext"]), 2500)
+
+            code, output, error = self.run_cli(args, service=runtime, stdin=payload)
+
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(output), {})
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                receipt_count = check_store.connection.execute(
+                    "SELECT COUNT(*) FROM context_receipts"
+                ).fetchone()[0]
+            finally:
+                check_store.close()
+            self.assertEqual(receipt_count, 1)
+
+    def test_raw_codex_hooks_normalize_context_bind_and_refuse_bad_ids(self):
+        from agent_run.domain import AgentStatus, Outcome
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            workdir = home / "work"
+            workdir.mkdir()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            agent_id = str(
+                store.create_agent(
+                    StartRequest("codex", "model", "profile", "task", workdir),
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    at=1,
+                ).agent_id
+            )
+            store.transition(agent_id, AgentStatus.STARTING, at=2)
+            store.transition(agent_id, AgentStatus.RUNNING, at=3)
+            store.transition(
+                agent_id,
+                AgentStatus.SUCCEEDED,
+                outcome=Outcome(AgentStatus.SUCCEEDED),
+                at=4,
+            )
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            context_payload = {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "raw-session",
+                "turn_id": "turn-1",
+                "cwd": str(home),
+                "prompt": "must-not-be-logged",
+            }
+
+            with patch.object(
+                cli, "build_context", wraps=cli.build_context
+            ) as build_context:
+                code, output, error = self.run_cli(
+                    ["--home", str(home), "hook", "context"],
+                    service=runtime,
+                    stdin=json.dumps(context_payload),
+                )
+
+            self.assertEqual((code, error), (0, ""))
+            build_context.assert_called_once()
+            ref = build_context.call_args.args[1]
+            self.assertEqual(
+                (ref.transport, ref.external_session_id, ref.external_turn_id),
+                (cli.TRANSPORT_NAME, "raw-session", "turn-1"),
+            )
+            self.assertNotIn("must-not-be-logged", output)
+            self.assertEqual(
+                json.loads(output)["hookSpecificOutput"]["hookEventName"],
+                "UserPromptSubmit",
+            )
+
+            bind_payload = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "raw-session",
+                "turn_id": "turn-2",
+                "tool_name": "mcp__agent_run__start",
+                "tool_response": {
+                    "content": [{"type": "text", "text": "ignored"}],
+                    "structuredContent": {"agent_id": agent_id},
+                },
+            }
+            with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
+                code, output, error = self.run_cli(
+                    ["--home", str(home), "hook", "bind"],
+                    service=runtime,
+                    stdin=json.dumps(bind_payload),
+                )
+
+            self.assertEqual((code, error), (0, ""))
+            run_hook.assert_called_once()
+            self.assertEqual(
+                run_hook.call_args.args[1],
+                {
+                    "agent_id": agent_id,
+                    "transport": cli.TRANSPORT_NAME,
+                    "external_session_id": "raw-session",
+                    "external_turn_id": "turn-2",
+                },
+            )
+            bind_envelope = json.loads(output)
+            self.assertEqual(set(bind_envelope), {"hookSpecificOutput"})
+            bind_output = bind_envelope["hookSpecificOutput"]
+            self.assertEqual(
+                set(bind_output), {"hookEventName", "additionalContext"}
+            )
+            self.assertEqual(bind_output["hookEventName"], "PostToolUse")
+            self.assertIn(agent_id, bind_output["additionalContext"])
+            self.assertIn("completion will be delivered", bind_output["additionalContext"])
+
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                session = check_store.connection.execute(
+                    "SELECT * FROM orchestrator_sessions WHERE external_session_id = ?",
+                    ("raw-session",),
+                ).fetchone()
+                delivery = check_store.connection.execute(
+                    "SELECT * FROM deliveries WHERE agent_id = ?", (agent_id,)
+                ).fetchone()
+                claimed = check_store.claim_delivery("worker", at=10_000_000_000)
+            finally:
+                check_store.close()
+            self.assertEqual(cli.TRANSPORT_NAME, "codex_queue")
+            self.assertEqual(session["transport"], cli.TRANSPORT_NAME)
+            self.assertEqual(session["external_turn_id"], "turn-2")
+            self.assertEqual(delivery["orchestrator_session_id"], session["id"])
+            self.assertEqual(delivery["state"], "pending")
+            self.assertEqual(claimed["transport"], cli.TRANSPORT_NAME)
+
+            rebind_payload = dict(bind_payload, session_id="another-session")
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(rebind_payload),
+            )
+            self.assertEqual((code, output), (2, ""))
+            rebind_error = json.loads(error)["error"]
+            self.assertEqual(rebind_error["type"], "BindHookError")
+            self.assertIn("immutable", rebind_error["message"])
+
+            conflicting_id = agent_id[:-1] + ("0" if agent_id[-1] != "0" else "1")
+            refused = {
+                "missing": {
+                    "structuredContent": {"agentId": agent_id},
+                    "content": [{"text": f'{{"agent_id":"{agent_id}"}}'}],
+                },
+                "conflicting": [
+                    {"structuredContent": {"agent_id": agent_id}},
+                    {"agent_id": conflicting_id},
+                ],
+            }
+            with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
+                for label, tool_response in refused.items():
+                    with self.subTest(label=label):
+                        payload = dict(bind_payload, tool_response=tool_response)
+                        code, output, error = self.run_cli(
+                            ["--home", str(home), "hook", "bind"],
+                            service=runtime,
+                            stdin=json.dumps(payload),
+                        )
+                        self.assertEqual((code, output), (2, ""))
+                        self.assertEqual(
+                            json.loads(error)["error"]["type"], "ValidationError"
+                        )
+                run_hook.assert_not_called()
+
+            for hook, payload in (
+                ("context", dict(context_payload, hook_event_name="PostToolUse")),
+                ("bind", dict(bind_payload, hook_event_name="UserPromptSubmit")),
+            ):
+                with self.subTest(mismatched_event=hook):
+                    code, output, error = self.run_cli(
+                        ["--home", str(home), "hook", hook],
+                        service=runtime,
+                        stdin=json.dumps(payload),
+                    )
+                    self.assertEqual((code, output), (2, ""))
+                    self.assertEqual(
+                        json.loads(error)["error"]["type"], "ValidationError"
+                    )
+
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "context"],
+                service=runtime,
+                stdin=json.dumps({"session_id": " "}),
+            )
+            self.assertEqual((code, output), (2, ""))
+            self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
 
     def test_mcp_command_is_reserved_without_importing_parallel_module(self):
         sys.modules.pop("agent_run.mcp", None)

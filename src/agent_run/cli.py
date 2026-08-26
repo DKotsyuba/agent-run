@@ -152,6 +152,59 @@ def _payload(stream: TextIO) -> dict:
     return _object(_read(stream), "hook payload")
 
 
+def _hook_payload(payload: dict, *, bind: bool) -> dict:
+    if "session_id" not in payload:
+        return payload
+    unknown = set(payload) - {
+        "session_id",
+        "turn_id",
+        "cwd",
+        "hook_event_name",
+        "prompt",
+        "tool_name",
+        "tool_input",
+        "tool_response",
+    }
+    if unknown:
+        raise ValidationError(f"unknown raw hook payload keys: {sorted(unknown)}")
+    expected_event = "PostToolUse" if bind else "UserPromptSubmit"
+    event = payload.get("hook_event_name")
+    if event is not None and event != expected_event:
+        raise ValidationError(f"raw hook_event_name must be {expected_event}")
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValidationError("raw hook session_id must be nonblank")
+    normalized = {
+        "transport": TRANSPORT_NAME,
+        "external_session_id": session_id,
+    }
+    if "turn_id" in payload:
+        normalized["external_turn_id"] = payload["turn_id"]
+    if not bind:
+        return normalized
+
+    agent_ids: set[str] = set()
+    pending = [payload.get("tool_response")]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if key == "agent_id":
+                    if not isinstance(item, str):
+                        raise ValidationError("raw PostToolUse agent_id must be a string")
+                    agent_ids.add(item)
+                else:
+                    pending.append(item)
+        elif isinstance(value, list):
+            pending.extend(value)
+    if not agent_ids:
+        raise ValidationError("raw PostToolUse payload has no agent_id")
+    if len(agent_ids) != 1:
+        raise ValidationError("raw PostToolUse payload has conflicting agent_id values")
+    normalized["agent_id"] = agent_ids.pop()
+    return normalized
+
+
 def _ref(args: argparse.Namespace, *, required: bool = False) -> OrchestratorRef | None:
     transport = getattr(args, "session_transport", None)
     session_id = getattr(args, "session_id", None)
@@ -383,14 +436,30 @@ class _Runtime:
     def hook_context(self, payload: dict):
         config, store = self._inputs()
         try:
-            return build_context(store, ref_from_payload(payload), config=config)
+            result = build_context(
+                store, ref_from_payload(_hook_payload(payload, bind=False)), config=config
+            )
+            if result.injected and result.text.strip():
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": result.text,
+                    }
+                }
+            return {}
         finally:
             store.close()
 
     def hook_bind(self, payload: dict):
         _config, store = self._inputs()
         try:
-            return run_hook(store, payload)
+            result = run_hook(store, _hook_payload(payload, bind=True))
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": result.message(),
+                }
+            }
         finally:
             store.close()
 
