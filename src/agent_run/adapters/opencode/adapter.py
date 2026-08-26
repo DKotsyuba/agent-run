@@ -12,13 +12,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from ...config import McpConfig, RuntimeConfig
-from ...domain import AgentStatus, Message, MessageRole, Outcome, StartRequest
+from ...domain import Outcome, StartRequest
 from ...errors import ValidationError
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
@@ -33,6 +33,26 @@ from ..base import (
 )
 from ..home import content_hash, write_managed_file
 from .http import POLL_INTERVAL_SECONDS, OpenCodeHttpClient
+from .normalize import (
+    PRIMARY_AGENT,
+    _sequence,
+    extract_answer,
+    is_settled,
+    is_working,
+    model_reference,
+    normalize_models,
+    normalize_outcome,
+    normalize_transcript,
+    session_state,
+    split_model,
+)
+from .permissions import (
+    EXTERNAL_DIRECTORY,
+    PermissionBroker,
+    PermissionDecision,
+    permission_id,
+    permission_items as _permission_items,
+)
 from .service import (
     ServiceIsolationError,
     attach_service,
@@ -42,7 +62,6 @@ from .service import (
 
 
 RUNTIME_NAME = "opencode"
-PRIMARY_AGENT = "agent-run"
 VERIFY_AGENT = "agent-run-verify"
 CONFIG_RELATIVE_PATH = "xdg/config/opencode/opencode.json"
 ANSWER_NAME = "answer.md"
@@ -58,8 +77,6 @@ CAPABILITIES = frozenset(
         Capability.SKILLS,
     }
 )
-
-EXTERNAL_DIRECTORY = "external_directory"
 
 #: Ordered on purpose: the contained one-time grant is the last word, so no
 #: earlier entry can widen it and no later entry can shadow it.
@@ -93,321 +110,6 @@ _SCHEMA_KEYS = frozenset(
         "additionalProperties",
     }
 )
-_TERMINAL_STATES: Mapping[str, AgentStatus] = MappingProxyType(
-    {
-        "completed": AgentStatus.SUCCEEDED,
-        "idle": AgentStatus.SUCCEEDED,
-        "aborted": AgentStatus.CANCELLED,
-        "cancelled": AgentStatus.CANCELLED,
-        "error": AgentStatus.FAILED,
-        "failed": AgentStatus.FAILED,
-        "timeout": AgentStatus.TIMED_OUT,
-        "timed_out": AgentStatus.TIMED_OUT,
-    }
-)
-#: ``retrying`` is work, not a settled turn: the service is between attempts.
-_ACTIVE_STATES = frozenset(
-    {"running", "busy", "pending", "queued", "streaming", "retry", "retrying"}
-)
-_ROLES: Mapping[str, MessageRole] = MappingProxyType(
-    {
-        "user": MessageRole.USER,
-        "assistant": MessageRole.ASSISTANT,
-        "system": MessageRole.SYSTEM,
-    }
-)
-
-
-# --- permissions ---------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class PermissionDecision:
-    permission_id: str
-    granted: bool
-    reason: str
-
-
-@dataclass
-class PermissionBroker:
-    """Auto-reject every interactive permission except one contained grant."""
-
-    read_roots: tuple[Path, ...] = ()
-    _granted: str | None = field(default=None, init=False)
-    _blocked: dict[str, int] = field(default_factory=dict, init=False)
-
-    def __post_init__(self) -> None:
-        for index, root in enumerate(self.read_roots):
-            if not isinstance(root, Path) or not root.is_absolute():
-                raise ValidationError(f"read_roots[{index}] must be an absolute path")
-        self.read_roots = tuple(self.read_roots)
-
-    @property
-    def granted_directory(self) -> str | None:
-        return self._granted
-
-    def decide(self, permission: Mapping[str, object]) -> PermissionDecision:
-        if not isinstance(permission, Mapping):
-            raise ValidationError("permission must be a mapping")
-        identifier = permission_id(permission)
-        kind = permission.get("type")
-        if kind != EXTERNAL_DIRECTORY:
-            return self._block(identifier, str(kind), f"permission type is auto-rejected: {kind!r}")
-        if self._granted is not None:
-            return self._block(
-                identifier, kind, "external_directory was already granted once for this agent"
-            )
-        resolved = _resolve_directory(permission.get("path"))
-        if resolved is None:
-            return self._block(identifier, kind, "external_directory path is not usable")
-        if not any(_contains(root, resolved) for root in self.read_roots):
-            return self._block(
-                identifier, kind, f"external_directory {resolved} is outside the resolved read roots"
-            )
-        self._granted = str(resolved)
-        return PermissionDecision(identifier, True, f"external_directory contained by read roots: {resolved}")
-
-    def _block(self, identifier: str, kind: str, reason: str) -> PermissionDecision:
-        self._blocked[kind] = self._blocked.get(kind, 0) + 1
-        return PermissionDecision(identifier, False, reason)
-
-    def blocked_summary(self) -> Mapping[str, int]:
-        """Bounded counts of rejected permissions, by requested type."""
-
-        return MappingProxyType(dict(sorted(self._blocked.items())))
-
-    def reply(self, decision: PermissionDecision) -> Mapping[str, object]:
-        """The exact body the v2 permission reply endpoint accepts."""
-
-        return MappingProxyType({"response": "once" if decision.granted else "reject"})
-
-
-def permission_id(permission: Mapping[str, object]) -> str:
-    identifier = permission.get("id")
-    if not isinstance(identifier, str) or not identifier.strip():
-        raise ValidationError("permission id must be a nonblank string")
-    return identifier
-
-
-def _contains(root: Path, candidate: Path) -> bool:
-    return candidate == root or candidate.is_relative_to(root)
-
-
-def _resolve_directory(value: object) -> Path | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            return None
-        return path.resolve()
-    except (OSError, RuntimeError):
-        return None
-
-
-# --- models --------------------------------------------------------------
-
-
-def split_model(value: object) -> tuple[str, str]:
-    """Split a canonical ``providerID/modelID`` identifier, or refuse it."""
-
-    if not isinstance(value, str) or value.count("/") != 1:
-        raise ValidationError(
-            f"opencode model must be canonical 'providerID/modelID', not {value!r}"
-        )
-    provider, model = value.split("/", 1)
-    if not provider.strip() or not model.strip():
-        raise ValidationError(
-            f"opencode model must be canonical 'providerID/modelID', not {value!r}"
-        )
-    return provider, model
-
-
-def model_reference(value: str) -> Mapping[str, str]:
-    """The v2 prompt body's model shape."""
-
-    provider, model = split_model(value)
-    return {"providerID": provider, "modelID": model}
-
-
-def normalize_models(payload: Mapping[str, object], allowed: Sequence[str]) -> tuple[ModelInfo, ...]:
-    """Intersect the reported roster with the configured allowlist, in order."""
-
-    if not isinstance(payload, Mapping):
-        raise ValidationError("opencode model roster must be a mapping")
-    reported: dict[str, str] = {}
-    for provider in _sequence(payload.get("providers")):
-        if not isinstance(provider, Mapping):
-            raise ValidationError("opencode provider entry must be a mapping")
-        provider_id = provider.get("id")
-        models = provider.get("models")
-        items = models.values() if isinstance(models, Mapping) else _sequence(models)
-        for model in items:
-            if not isinstance(model, Mapping):
-                raise ValidationError("opencode model entry must be a mapping")
-            identifier = model.get("id")
-            if not isinstance(identifier, str) or not identifier.strip():
-                raise ValidationError("opencode model id must be a nonblank string")
-            if isinstance(provider_id, str) and provider_id.strip():
-                identifier = f"{provider_id}/{identifier}"
-            name = model.get("name")
-            reported.setdefault(identifier, name if isinstance(name, str) else identifier)
-    return tuple(
-        ModelInfo(identifier, reported[identifier])
-        for identifier in allowed
-        if identifier in reported
-    )
-
-
-def _sequence(value: object) -> tuple[object, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, (list, tuple)):
-        return tuple(value)
-    raise ValidationError("opencode payload expected an array")
-
-
-# --- transcript ----------------------------------------------------------
-
-
-def _info(item: Mapping[str, object]) -> Mapping[str, object]:
-    """A v2 message is ``{info, parts}``; the metadata lives in ``info``."""
-
-    info = item.get("info")
-    if isinstance(info, Mapping):
-        return info
-    if info is not None:
-        raise ValidationError("opencode message info must be a mapping")
-    return item
-
-
-def _text_parts(item: Mapping[str, object]) -> str:
-    chunks: list[str] = []
-    for part in _sequence(item.get("parts")):
-        if not isinstance(part, Mapping):
-            raise ValidationError("opencode message part must be a mapping")
-        if part.get("type") != "text":
-            continue
-        text = part.get("text")
-        if isinstance(text, str) and text.strip():
-            chunks.append(text.strip())
-    return "\n\n".join(chunks)
-
-
-def _at(item: Mapping[str, object]) -> float:
-    info = _info(item)
-    time_value = info.get("time")
-    raw = time_value.get("created") if isinstance(time_value, Mapping) else info.get("created")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
-        return 0.0
-    return float(raw)
-
-
-def _role(item: Mapping[str, object]) -> MessageRole:
-    raw = _info(item).get("role")
-    try:
-        return _ROLES[raw]  # type: ignore[index]
-    except (KeyError, TypeError) as error:
-        raise ValidationError(f"unknown opencode message role: {raw!r}") from error
-
-
-def _agent(item: Mapping[str, object]) -> str:
-    value = _info(item).get("agent")
-    return value if isinstance(value, str) and value.strip() else PRIMARY_AGENT
-
-
-def normalize_transcript(
-    payload: Mapping[str, object] | Sequence[object], *, raw_ref: str | None = None
-) -> tuple[Message, ...]:
-    """Turn a captured message page into domain messages, dropping empty text."""
-
-    messages: list[Message] = []
-    for item in _messages(payload):
-        content = _text_parts(item)
-        if not content:
-            continue
-        messages.append(
-            Message(_at(item), _role(item), content, name=_agent(item), raw_ref=raw_ref)
-        )
-    return tuple(messages)
-
-
-def _messages(payload: Mapping[str, object] | Sequence[object]) -> tuple[Mapping[str, object], ...]:
-    items = payload.get("messages") if isinstance(payload, Mapping) else payload
-    result = []
-    for item in _sequence(items):
-        if not isinstance(item, Mapping):
-            raise ValidationError("opencode message must be a mapping")
-        result.append(item)
-    return tuple(result)
-
-
-def extract_answer(
-    payload: Mapping[str, object] | Sequence[object], *, agent: str = PRIMARY_AGENT
-) -> str:
-    """Every assistant text this agent produced in the session, in order.
-
-    One session is one agent run, so nothing in it predates the task. Steering
-    inserts a real user message mid-run and retries insert a synthetic one;
-    neither starts a new answer, so text written before them is preserved. A
-    sub-agent's output is never mistaken for the primary agent's answer.
-    """
-
-    return "\n\n".join(
-        text
-        for item in _messages(payload)
-        if _role(item) is MessageRole.ASSISTANT and _agent(item) == agent
-        for text in (_text_parts(item),)
-        if text
-    )
-
-
-def normalize_outcome(
-    state: Mapping[str, object], *, runtime_session_id: str | None = None
-) -> Outcome:
-    """Map a reported session state to exactly one terminal outcome."""
-
-    if not isinstance(state, Mapping):
-        raise ValidationError("opencode session state must be a mapping")
-    raw = state.get("state", state.get("status"))
-    if not isinstance(raw, str) or raw not in _TERMINAL_STATES:
-        raise ValidationError(f"opencode session state is not terminal: {raw!r}")
-    status = _TERMINAL_STATES[raw]
-    error = state.get("error")
-    kind = None
-    text = None
-    if isinstance(error, Mapping):
-        name = error.get("name")
-        message = error.get("message")
-        kind = name if isinstance(name, str) else "opencode_error"
-        text = message if isinstance(message, str) else None
-    elif isinstance(error, str) and error.strip():
-        kind = "opencode_error"
-        text = error
-    if kind is not None and status is AgentStatus.SUCCEEDED:
-        status = AgentStatus.FAILED
-    return Outcome(
-        status=status,
-        failure_kind=kind if status is not AgentStatus.SUCCEEDED else None,
-        failure_text=text if status is not AgentStatus.SUCCEEDED else None,
-        runtime_session_id=runtime_session_id,
-    )
-
-
-def session_state(status: Mapping[str, object]) -> str | None:
-    raw = status.get("state", status.get("status")) if isinstance(status, Mapping) else None
-    return raw if isinstance(raw, str) else None
-
-
-def is_settled(state: Mapping[str, object]) -> bool:
-    raw = session_state(state)
-    return raw is not None and raw not in _ACTIVE_STATES and raw in _TERMINAL_STATES
-
-
-def is_working(state: Mapping[str, object]) -> bool:
-    return session_state(state) in _ACTIVE_STATES
-
-
 # --- generated config ----------------------------------------------------
 
 
@@ -832,18 +534,6 @@ class OpenCodeRuntimeSession:
             )
             decisions.append(decision)
         return tuple(decisions)
-
-
-def _permission_items(payload: object) -> tuple[Mapping[str, object], ...]:
-    if payload is None:
-        return ()
-    items = payload.get("permissions") if isinstance(payload, Mapping) else payload
-    result = []
-    for item in _sequence(items):
-        if not isinstance(item, Mapping):
-            raise ValidationError("permission must be a mapping")
-        result.append(item)
-    return tuple(result)
 
 
 ADAPTER = OpenCodeAdapter()
