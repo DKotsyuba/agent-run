@@ -123,6 +123,29 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
         with self.assertRaisesRegex(VerificationError, "sandbox mismatch"):
             verify_effective_params(self.expected(), actual)
 
+    def test_sandbox_beta_object_echo_matching_type_passes(self) -> None:
+        """The live contract drift: app-server echoes sandbox as an object."""
+        actual = thread_response("/work", writable_roots=())
+        actual["sandbox"] = {"type": "readOnly", "networkAccess": False}
+        verify_effective_params(self.expected(), actual)
+
+    def test_sandbox_legacy_string_echo_still_passes(self) -> None:
+        actual = thread_response("/work", writable_roots=())
+        actual["sandbox"] = "read-only"
+        verify_effective_params(self.expected(), actual)
+
+    def test_sandbox_beta_object_echo_mismatched_type_is_refused(self) -> None:
+        actual = thread_response("/work", writable_roots=())
+        actual["sandbox"] = {"type": "workspaceWrite", "networkAccess": True}
+        with self.assertRaisesRegex(VerificationError, "sandbox mismatch"):
+            verify_effective_params(self.expected(), actual)
+
+    def test_sandbox_beta_object_echo_unknown_type_is_refused(self) -> None:
+        actual = thread_response("/work", writable_roots=())
+        actual["sandbox"] = {"type": "somethingNew", "networkAccess": False}
+        with self.assertRaisesRegex(VerificationError, "sandbox mismatch"):
+            verify_effective_params(self.expected(), actual)
+
 
 class StartSessionTests(unittest.TestCase):
     def test_success_verifies_params_and_starts_the_turn(self) -> None:

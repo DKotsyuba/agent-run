@@ -62,6 +62,35 @@ class EffectiveTurnParams:
     writable_roots: tuple[str, ...]
 
 
+#: The app-server's beta contract echoes ``sandbox`` in ``thread/start`` as an
+#: object (``{'type': 'readOnly', 'networkAccess': False, ...}``) instead of
+#: the legacy kebab-case string. Map its camelCase ``type`` to this codebase's
+#: kebab-case sandbox names, following the same word-boundary convention the
+#: legacy names already use (``read-only``/``readOnly``,
+#: ``workspace-write``/``workspaceWrite``); ``danger-full-access`` is the
+#: third sandbox mode codex ships and follows the identical convention.
+#: ``networkAccess`` is not checked here: this codebase does not encode a
+#: per-sandbox network expectation, so it stays purely informational.
+_SANDBOX_ECHO_TYPES: Mapping[str, str] = {
+    "readOnly": "read-only",
+    "workspaceWrite": "workspace-write",
+    "dangerFullAccess": "danger-full-access",
+}
+
+
+def _normalized_sandbox_echo(value: object) -> object:
+    """Reduce a ``thread/start`` sandbox echo to its kebab-case form.
+
+    Passes the legacy string form through unchanged. Reduces the beta object
+    form via ``_SANDBOX_ECHO_TYPES``. Returns ``value`` unchanged for any
+    other shape (including an unrecognized ``type``), so the caller's
+    equality check against the requested sandbox still fails closed.
+    """
+    if isinstance(value, Mapping):
+        return _SANDBOX_ECHO_TYPES.get(value.get("type"), value)
+    return value
+
+
 def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, object]) -> None:
     """Refuse a thread whose effective params drift from what was requested.
 
@@ -77,7 +106,8 @@ def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, 
     )
     for key, wanted in scalar_checks:
         got = actual.get(key)
-        if got != wanted:
+        compare = _normalized_sandbox_echo(got) if key == "sandbox" else got
+        if compare != wanted:
             raise VerificationError(
                 f"codex thread/start {key} mismatch: expected {wanted!r}, got {got!r}"
             )
