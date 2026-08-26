@@ -234,6 +234,7 @@ def normalize_outcome(
     payload: Mapping[str, object] | Sequence[object] = (),
     *,
     runtime_session_id: str | None = None,
+    cancelled: bool = False,
 ) -> Outcome:
     """Map a session record's ``outcome`` to exactly one terminal Outcome.
 
@@ -244,7 +245,13 @@ def normalize_outcome(
     failure's detail, when the provider reported one, is read off the last
     assistant message's structured error in the already-fetched transcript
     ``payload``. When ``outcome`` is absent, the terminal status itself is
-    inferred from that same last message instead.
+    inferred from that same last message instead -- ``cancelled`` tells that
+    inference the one thing no message shape can: this adapter's own
+    ``OpenCodeRuntimeSession.cancel()`` already called ``/interrupt``
+    synchronously, before ``wait()`` resumed polling, so an error-shaped
+    message (or no settled message at all) after that call is a
+    cancellation, never a raised "indeterminate" error. Ignored when
+    ``outcome`` is present -- the server already told us.
     """
 
     if not isinstance(info, Mapping):
@@ -261,7 +268,7 @@ def normalize_outcome(
         )
     if raw is not None:
         raise ValidationError(f"opencode session outcome is not terminal: {raw!r}")
-    status, kind, text = _infer_settled_outcome(payload)
+    status, kind, text = _infer_settled_outcome(payload, cancelled=cancelled)
     return Outcome(
         status=status,
         failure_kind=kind,
@@ -270,11 +277,15 @@ def normalize_outcome(
     )
 
 
-#: The named v1 error that means "this turn was interrupted", not "it
-#: failed" -- proven live against v1 1.18.18's own ``/doc`` OpenAPI:
-#: ``MessageAbortedError`` is a distinct, literal ``name`` value in the
-#: session-error schema, separate from every genuine failure kind
-#: (``ProviderAuthError``, ``MessageOutputLengthError``, ``UnknownError``, ...).
+#: A named v1 error that, on the SSE session-error event stream, distinctly
+#: means "this session's own /interrupt fired," not "the turn failed" --
+#: documented in v1 1.18.18's own ``/doc`` OpenAPI for that stream's error
+#: union. Checked here as a defensive extra, not the primary signal: three
+#: live 401 captures through the persisted REST message endpoint (T041) all
+#: came back with the flatter ``{"type": "unknown", "message": ...}`` shape,
+#: never this named union member, so ``normalize_outcome``'s ``cancelled``
+#: argument -- what the adapter already knows it did, not a guess from
+#: message shape -- is what actually carries the interrupt signal for v1.
 _ABORTED_ERROR = "MessageAbortedError"
 
 
@@ -314,7 +325,7 @@ def _last_error(
 
 
 def _infer_settled_outcome(
-    payload: Mapping[str, object] | Sequence[object],
+    payload: Mapping[str, object] | Sequence[object], *, cancelled: bool = False
 ) -> tuple[AgentStatus, str | None, str | None]:
     """Derive success/failure/cancellation when the session record carries no
     ``outcome`` at all -- the only path on v1 1.18.18, and the fallback for a
@@ -322,26 +333,36 @@ def _infer_settled_outcome(
 
     ``GET .../message`` orders ``data`` newest-first (proven live against
     both beta-18314 and v1 1.18.18), so the most recent message is always the
-    first item. Only three shapes are determinate: an assistant message whose
-    structured error names ``MessageAbortedError`` is a cancellation (the
-    session's own ``/interrupt`` was called); any other structured error is a
-    failure; an assistant message with real text and no error is a success.
-    Anything else -- no messages at all, or the most recent message is not a
-    settled assistant turn -- is a genuinely indeterminate ending and still
-    fails closed.
+    first item. An assistant message with real text and no error is a
+    success. An assistant message with a structured error is a cancellation
+    when it names ``MessageAbortedError``, or when ``cancelled`` is set --
+    that local signal matters because a v1 ``/interrupt`` fired shortly after
+    ``prompt`` does not always leave an error-shaped message to check at all
+    (proven live, T041: it can settle with no assistant message whatsoever) --
+    and a failure otherwise. A session cancelled before any settled assistant
+    message ever landed is a cancellation too, not a raised error:
+    ``cancelled`` is a fact the caller already knows, never a guess, so it is
+    never indeterminate. Absent that signal, no messages at all or a
+    non-settled last message is genuinely indeterminate and still fails
+    closed.
     """
 
     messages = _messages(payload)
     if not messages or messages[0].get("type") != "assistant":
+        if cancelled:
+            return AgentStatus.CANCELLED, None, None
         raise ValidationError("opencode session outcome is not terminal: None")
     latest = messages[0]
     error = latest.get("error")
     if isinstance(error, Mapping):
         kind, text = _error_detail(error)
-        status = AgentStatus.CANCELLED if kind == _ABORTED_ERROR else AgentStatus.FAILED
-        return status, kind, text
+        if cancelled or kind == _ABORTED_ERROR:
+            return AgentStatus.CANCELLED, kind, text
+        return AgentStatus.FAILED, kind, text
     if _text(latest):
         return AgentStatus.SUCCEEDED, None, None
+    if cancelled:
+        return AgentStatus.CANCELLED, None, None
     raise ValidationError("opencode session outcome is not terminal: None")
 
 

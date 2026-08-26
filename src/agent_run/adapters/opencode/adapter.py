@@ -447,6 +447,7 @@ class OpenCodeRuntimeSession:
         self._monotonic = monotonic
         self._interval = float(interval_seconds)
         self._answered: set[str] = set()
+        self._cancel_requested = False
         sink.session(session_id)
 
     @property
@@ -465,8 +466,11 @@ class OpenCodeRuntimeSession:
         ``/api/session/active`` reports only a currently-running session; it
         cannot tell "not started yet" from "just finished". So an initial
         absence is not an outcome: the turn is only settled once the session
-        has been seen working, or the primary agent has actually produced
-        output.
+        has been seen working, the primary agent has actually produced
+        output, or this session's own ``cancel()`` already fired -- a v1
+        ``/interrupt`` sent right after ``prompt`` can settle with neither
+        (proven live, T041), and without this it would spin until timeout
+        instead of ever reaching ``_finish()``.
         """
 
         deadline = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
@@ -483,7 +487,11 @@ class OpenCodeRuntimeSession:
                 capture = self._client.messages(self._session_id)
                 try:
                     payload = capture.json()
-                    final = working or bool(extract_answer(payload, agent=self._agent))
+                    final = (
+                        working
+                        or self._cancel_requested
+                        or bool(extract_answer(payload, agent=self._agent))
+                    )
                 except BaseException:
                     capture.release()
                     raise
@@ -509,7 +517,9 @@ class OpenCodeRuntimeSession:
     def _finish(self, info, payload, capture) -> Outcome:
         """Emit the transcript, record answer.md, and keep only this capture."""
 
-        outcome = normalize_outcome(info, payload, runtime_session_id=self._session_id)
+        outcome = normalize_outcome(
+            info, payload, runtime_session_id=self._session_id, cancelled=self._cancel_requested
+        )
         # The capture lives directly under the agent's own directory (no
         # subdirectories), so its bare filename is already the normalized,
         # relative raw_ref the persistence guard requires -- the absolute
@@ -543,6 +553,10 @@ class OpenCodeRuntimeSession:
         self._client.prompt_async(self._session_id, payload)
 
     def cancel(self, grace_seconds: float) -> None:
+        # Recorded before the call, not after: the intent to interrupt is a
+        # fact regardless of whether the HTTP request itself succeeds, and
+        # wait()/normalize_outcome() need it even if abort() raises.
+        self._cancel_requested = True
         self._client.abort(self._session_id)
 
     def resolve_permissions(self) -> tuple[PermissionDecision, ...]:

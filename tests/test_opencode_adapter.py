@@ -310,6 +310,118 @@ class OutcomeTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             normalize_outcome(self.LIVE_V1_SESSION_INFO, self.LIVE_V1_MESSAGES)
 
+    def test_live_v1_indeterminate_state_is_cancelled_when_a_cancel_was_requested(self):
+        """The same real capture as above -- settled with only the user
+        message, no assistant reply ever landed -- but this time the caller
+        (this adapter's own ``cancel()``) already knows it asked the engine
+        to interrupt: nothing left to check in the message shape, so this
+        must resolve to ``CANCELLED``, not raise."""
+
+        outcome = normalize_outcome(
+            self.LIVE_V1_SESSION_INFO, self.LIVE_V1_MESSAGES, cancelled=True
+        )
+        self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+
+    def test_cancelled_overrides_a_non_abort_error_to_cancelled_not_failed(self):
+        """A real v1 error's ``type`` is always ``"unknown"`` on the
+        persisted REST message (proven live, T041 -- see
+        ``LIVE_V1_ERROR_MESSAGES`` below), never a named union member like
+        ``MessageAbortedError``. ``cancelled`` is what actually carries the
+        interrupt signal for that shape, not the error's own kind."""
+
+        payload = [message("assistant", "", at=2.0, error={"type": "unknown", "message": "aborted"})]
+        outcome = normalize_outcome({}, payload, cancelled=True)
+        self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+        self.assertEqual(outcome.failure_kind, "unknown")
+
+    def test_cancelled_does_not_override_a_real_success(self):
+        """A cancel racing in after the answer already landed must not
+        relabel a real success as cancelled."""
+
+        payload = [message("assistant", "done", at=2.0)]
+        outcome = normalize_outcome({}, payload, cancelled=True)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+
+    # -- a second real pinned v1 1.18.18 session (T041), this one settled
+    # with a genuine assistant reply: prompted "Reply with exactly one word:
+    # PONG" with model omniroute/gpt-5.6-luna through an isolated home,
+    # answered "PONG" and consumed real tokens.
+    LIVE_V1_SUCCESS_MESSAGES = {
+        "data": [
+            {
+                "agent": "agent-run",
+                "content": [
+                    {
+                        "id": "msg_0b180982cff69f70016a8f45919cb087d2bb8cf1799b1ab190",
+                        "text": "PONG",
+                        "type": "text",
+                    }
+                ],
+                "cost": 0,
+                "finish": "stop",
+                "id": "msg_03fa7c10a0010dQTOb6ds4KzN2",
+                "model": {"id": "gpt-5.6-luna", "providerID": "openai", "variant": "default"},
+                "time": {"completed": 1787774353892, "created": 1787774353674},
+                "tokens": {"cache": {"read": 0, "write": 0}, "input": 1905, "output": 6, "reasoning": 0},
+                "type": "assistant",
+            },
+            {
+                "id": "msg_03fa7b815001KzdD3nP86tuLTH",
+                "text": "Reply with exactly one word: PONG",
+                "time": {"created": 1787774351382},
+                "type": "user",
+            },
+        ]
+    }
+
+    def test_live_v1_success_reply_normalizes_and_extracts(self):
+        outcome = normalize_outcome({}, self.LIVE_V1_SUCCESS_MESSAGES)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertIsNone(outcome.failure_kind)
+        self.assertEqual(extract_answer(self.LIVE_V1_SUCCESS_MESSAGES), "PONG")
+
+    # -- a third real pinned v1 1.18.18 session (T041): a genuine provider
+    # 401 (misconfigured key), captured to pin the real persisted-message
+    # error shape -- flat ``{"type": "unknown", "message": ...}``, not the
+    # named ``{"name": ..., "data": {...}}`` shape the SSE event stream uses.
+    LIVE_V1_ERROR_MESSAGES = {
+        "data": [
+            {
+                "agent": "agent-run",
+                "content": [],
+                "error": {
+                    "message": (
+                        "Provider request failed with HTTP 401: "
+                        '{\n  "error": {\n    "message": "Missing bearer or basic '
+                        'authentication in header",\n    "type": "invalid_request_error",'
+                        '\n    "param": null,\n    "code": null\n  }\n}'
+                    ),
+                    "type": "unknown",
+                },
+                "finish": "error",
+                "id": "msg_03faea835001BLHvlsnYD96tJq",
+                "model": {"id": "gpt-5.6-luna", "providerID": "openai", "variant": "default"},
+                "time": {"completed": 1787774806072, "created": 1787774806069},
+                "type": "assistant",
+            },
+            {
+                "id": "msg_03faea3b4001dM1S8K7dvPP6Z4",
+                "text": "Reply with exactly one word: PONG",
+                "time": {"created": 1787774804917},
+                "type": "user",
+            },
+        ]
+    }
+
+    def test_live_v1_error_reply_normalizes_to_failed_with_unknown_kind(self):
+        """The real shape's ``type`` is always ``"unknown"`` -- the useful
+        detail is in ``message``, not ``kind``."""
+
+        outcome = normalize_outcome({}, self.LIVE_V1_ERROR_MESSAGES)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "unknown")
+        self.assertIn("HTTP 401", outcome.failure_text)
+
 
 class ModelTests(unittest.TestCase):
     def test_canonical_identifiers_split_into_provider_and_model(self):
@@ -901,6 +1013,21 @@ class SessionTests(AdapterCase):
         outcome = self.session(service).wait(30.0)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
         self.assertEqual(outcome.failure_kind, "MessageAbortedError")
+
+    def test_cancel_before_any_message_lands_still_settles_as_cancelled(self):
+        """v1 1.18.18: an ``/interrupt`` fired right after ``/prompt`` can
+        settle with zero assistant messages and "running" never observed
+        (proven live, T041). Without ``cancel()`` recording its own intent,
+        ``wait()``'s settle condition (working, or an extracted answer) would
+        never become true, and this would spin to a timeout -- never even
+        reaching ``_finish()`` -- instead of resolving to ``CANCELLED``."""
+
+        service = FakeService(self.captures, [None], [[]], outcome=None)
+        session = self.session(service)
+        session.cancel(2.0)
+        outcome = session.wait(1.0)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.CANCELLED)
 
     def test_permissions_of_this_session_are_answered_exactly_once(self):
         pending = [
