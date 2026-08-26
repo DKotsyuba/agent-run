@@ -428,6 +428,11 @@ import sys
 sys.stdin.readline()
 """
 
+_SLEEPING_SERVER = """
+import time
+time.sleep(30)
+"""
+
 
 class ProcessTransportTests(unittest.TestCase):
     def transport(self, script):
@@ -448,9 +453,12 @@ class ProcessTransportTests(unittest.TestCase):
         self.assertEqual(second["method"], "turn/log")
 
     def test_request_has_a_finite_deadline_while_stream_stays_open(self):
-        transport = self.transport(_SILENT_SERVER)
+        # Use a child that sleeps well past the deadline instead of exiting,
+        # so the stream is verifiably still open when the deadline fires and
+        # this can't flap into the "stream closed" ConnectionError branch.
+        transport = self.transport(_SLEEPING_SERVER)
         with self.assertRaisesRegex(TimeoutError, "timed out waiting"):
-            transport.request("initialize", {}, timeout_seconds=0.01)
+            transport.request("initialize", {}, timeout_seconds=0.2)
 
     def test_zero_timeout_never_blocks_and_finite_timeout_is_honored(self) -> None:
         transport = self.transport(_SILENT_SERVER)
