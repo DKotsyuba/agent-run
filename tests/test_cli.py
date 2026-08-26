@@ -508,6 +508,79 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(config.stat().st_ino, before)
 
+    def test_service_start_renders_the_proven_descriptor_without_secrets(self):
+        from agent_run.adapters.opencode import service as opencode_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            runtime_home = home / "runtimes" / "opencode" / "home"
+            runtime_home.mkdir(parents=True)
+            binary = home / "opencode2"
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            (home / "config.toml").write_text(
+                "schema_version = 1\n"
+                "[runtimes.opencode]\n"
+                "enabled = true\n"
+                'adapter = "agent_run.adapters.opencode.adapter:ADAPTER"\n'
+                f'binary = "{binary}"\n'
+                f'home = "{runtime_home}"\n'
+                'models = ["omniroute/deepseek-v4-pro"]\n'
+                'service_mode = "managed"\n',
+                encoding="utf-8",
+            )
+            started = opencode_service.ServiceStart(
+                opencode_service.ServiceDescriptor(
+                    host="127.0.0.1",
+                    port=41999,
+                    config_home=runtime_home / "xdg" / "config",
+                    data_home=runtime_home / "xdg" / "data",
+                    pid=4242,
+                    config_hash="a" * 64,
+                    version="2.1.0",
+                ),
+                False,
+            )
+
+            def run(argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                code = cli.main(
+                    ["--home", str(home), "service", *argv],
+                    stdin=io.StringIO(),
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                return code, stdout.getvalue(), stderr.getvalue()
+
+            with patch.object(
+                opencode_service, "start_service", return_value=started
+            ) as start:
+                code, output, error = run(["start", "--runtime", "opencode"])
+            self.assertEqual((code, error), (0, ""))
+            payload = json.loads(output)
+            self.assertEqual(payload["runtime"], "opencode")
+            self.assertFalse(payload["reused"])
+            self.assertEqual(payload["service"]["port"], 41999)
+            self.assertEqual(payload["service"]["pid"], 4242)
+            self.assertEqual(payload["service"]["version"], "2.1.0")
+            self.assertNotIn("password", output.lower())
+            runtime, passed_home = start.call_args.args
+            self.assertEqual((passed_home, runtime.binary), (runtime_home, binary))
+            self.assertIsNone(start.call_args.kwargs["port"])
+
+            with patch.object(
+                opencode_service, "start_service", return_value=started
+            ) as explicit:
+                code, _output, error = run(
+                    ["start", "--runtime", "opencode", "--port", "41999"]
+                )
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(explicit.call_args.kwargs["port"], 41999)
+
+            code, _output, error = run(["start", "--runtime", "codex"])
+            self.assertEqual(code, 2)
+            self.assertIn("opencode", json.loads(error)["error"]["message"])
+
     def test_doctor_delegates_to_the_structured_read_only_seam(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()

@@ -1,7 +1,12 @@
+import io
+import json
 import os
+import signal
+import socket
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -9,8 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.opencode.service import PASSWORD_ENV
 from agent_run.adapters.home import content_hash, write_managed_file
+from agent_run.adapters.opencode import service as service_module
+from agent_run.adapters.opencode.http import HEALTH_PATH, OpenCodeHttpClient, RetryPolicy
 from agent_run.adapters.opencode.service import (
+    CONFIG_API_PATH,
+    CONFIG_RELATIVE_PATH,
     SERVICE_HOST,
+    SERVICE_LOG_NAME,
     SERVICE_PATH,
     ServiceDescriptor,
     ServiceIsolationError,
@@ -20,6 +30,7 @@ from agent_run.adapters.opencode.service import (
     read_service_descriptor,
     resolve_environment_names,
     service_home_paths,
+    start_service,
     verify_isolation,
     write_service_descriptor,
 )
@@ -304,6 +315,280 @@ class DescriptorFileTests(ServiceTempCase):
                     str(caught.exception),
                     f"{PASSWORD_ENV} must be set to a nonblank value",
                 )
+
+
+class FakeReply:
+    """One captured HTTP reply, exactly as ``urlopen`` would hand it over."""
+
+    def __init__(self, payload, status=200):
+        self._buffer = io.BytesIO(json.dumps(payload).encode("utf-8"))
+        self.status = status
+
+    def read(self, size=-1):
+        return self._buffer.read(size)
+
+    def close(self):
+        pass
+
+
+class FakeOpener:
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def __call__(self, request, timeout=None):
+        self.calls.append((request.get_method(), request.full_url))
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+def http_error(code):
+    return urllib.error.HTTPError("http://127.0.0.1:1/x", code, "boom", {}, None)
+
+
+class FakeProcess:
+    """A spawned candidate whose liveness the test controls exactly."""
+
+    def __init__(self, pid, exit_code=None):
+        self.pid = pid
+        self.exit_code = exit_code
+
+    def poll(self):
+        return self.exit_code
+
+
+class RecordingOps:
+    """Process control that records signals instead of sending them."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.signals = []
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, seconds)
+
+    def process_group(self, pid):
+        return self.pid
+
+    def signal_group(self, pgid, signal_number):
+        self.signals.append((pgid, signal_number))
+        return True
+
+    def group_alive(self, pgid):
+        return True
+
+    def reap(self, pid):
+        return None
+
+
+class StartServiceTests(ServiceTempCase):
+    """Starting the one managed service: proof before use, cleanup on failure."""
+
+    def setUp(self):
+        super().setUp()
+        self.config_digest = write_managed_file(
+            self.home, CONFIG_RELATIVE_PATH, '{"generated": true}\n'
+        )
+        self.config_file = self.home / CONFIG_RELATIVE_PATH
+        self.pid = os.getpid()
+        self.process = FakeProcess(self.pid)
+        self.ops = RecordingOps(self.pid)
+        self.spawns = []
+        popen = mock.patch.object(
+            service_module.subprocess, "Popen", side_effect=self.record_spawn
+        )
+        popen.start()
+        self.addCleanup(popen.stop)
+
+    def record_spawn(self, argv, **kwargs):
+        self.spawns.append((tuple(argv), kwargs))
+        return self.process
+
+    def client_factory(self, *replies):
+        self.opener = FakeOpener(*replies)
+
+        def build(base_url):
+            return OpenCodeHttpClient(
+                base_url,
+                self.home,
+                opener=self.opener,
+                password="fixture-password",
+                retry=RetryPolicy(attempts=1, base_seconds=0.01, cap_seconds=0.02),
+                sleep=lambda seconds: None,
+            )
+
+        return build
+
+    def start(self, *replies, **kwargs):
+        kwargs.setdefault("client_factory", self.client_factory(*replies))
+        kwargs.setdefault("ops", self.ops)
+        kwargs.setdefault("sleep", lambda seconds: None)
+        kwargs.setdefault(
+            "inherited_environment", {PASSWORD_ENV: "fixture-password"}
+        )
+        return start_service(self.config, self.home, **kwargs)
+
+    def healthy(self, **overrides):
+        payload = {"healthy": True, "pid": self.pid, "version": "2.1.0"}
+        payload.update(overrides)
+        return FakeReply(payload)
+
+    def reported_config(self, *extra):
+        return FakeReply(
+            {
+                "data": {
+                    "path": str(self.config_file),
+                    "sources": [str(self.config_file), *extra],
+                }
+            }
+        )
+
+    def assert_candidate_cleaned_up(self):
+        self.assertEqual(
+            self.ops.signals,
+            [(self.pid, signal.SIGTERM), (self.pid, signal.SIGKILL)],
+        )
+        self.assertIsNone(read_service_descriptor(self.home))
+
+    def test_an_unmaterialized_home_starts_nothing(self):
+        self.config_file.unlink()
+        with self.assertRaises(ServiceIsolationError) as caught:
+            self.start()
+        self.assertIn("materialize", str(caught.exception))
+        self.assertEqual(self.spawns, [])
+
+    def test_a_pre_existing_listener_is_never_adopted(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind((SERVICE_HOST, 0))
+            listener.listen(1)
+            port = int(listener.getsockname()[1])
+            with self.assertRaises(ServiceIsolationError) as caught:
+                self.start(port=port)
+        self.assertIn("already listens", str(caught.exception))
+        self.assertEqual(self.spawns, [])
+
+    def test_one_start_spawns_one_default_serve_and_records_the_proof(self):
+        started = self.start(self.healthy(), self.reported_config())
+
+        self.assertFalse(started.reused)
+        self.assertEqual(len(self.spawns), 1)
+        argv, spawn = self.spawns[0]
+        self.assertEqual(
+            argv,
+            (
+                str(self.binary),
+                "serve",
+                "--hostname",
+                SERVICE_HOST,
+                "--port",
+                str(started.descriptor.port),
+            ),
+        )
+        self.assertNotIn("--service", argv)
+        self.assertTrue(spawn["start_new_session"])
+        self.assertEqual(spawn["cwd"], str(self.home))
+        self.assertEqual(spawn["env"]["PATH"], SERVICE_PATH)
+        self.assertEqual(
+            spawn["env"]["XDG_CONFIG_HOME"], str(service_home_paths(self.home)[0])
+        )
+        self.assertEqual(
+            [url for _method, url in self.opener.calls],
+            [
+                f"{started.descriptor.base_url}{HEALTH_PATH}",
+                f"{started.descriptor.base_url}{CONFIG_API_PATH}",
+            ],
+        )
+        self.assertEqual(started.descriptor.pid, self.pid)
+        self.assertEqual(started.descriptor.version, "2.1.0")
+        self.assertEqual(started.descriptor.config_hash, self.config_digest)
+        self.assertEqual(self.ops.signals, [])
+
+        recorded = descriptor_path(self.home)
+        self.assertEqual(recorded.stat().st_mode & 0o777, 0o600)
+        text = recorded.read_text(encoding="utf-8")
+        self.assertNotIn("fixture-password", text)
+        self.assertNotIn("password", text.lower())
+        self.assertEqual(
+            (self.home / SERVICE_LOG_NAME).stat().st_mode & 0o777, 0o600
+        )
+
+    def test_readiness_survives_a_refusal_before_the_service_is_up(self):
+        started = self.start(
+            http_error(503), self.healthy(), self.reported_config()
+        )
+        self.assertEqual(len(self.spawns), 1)
+        self.assertEqual(len(self.opener.calls), 3)
+        self.assertEqual(started.descriptor.pid, self.pid)
+
+    def test_a_health_pid_mismatch_terminates_only_the_candidate(self):
+        with self.assertRaises(ServiceIsolationError) as caught:
+            self.start(self.healthy(pid=self.pid + 1))
+        self.assertIn("does not match spawned pid", str(caught.exception))
+        self.assertEqual(len(self.spawns), 1)
+        self.assert_candidate_cleaned_up()
+
+    def test_refused_credentials_fail_closed_and_clean_up(self):
+        with self.assertRaises(ServiceIsolationError) as caught:
+            self.start(http_error(401))
+        self.assertIn("refused the managed credentials", str(caught.exception))
+        self.assertEqual(len(self.spawns), 1)
+        self.assert_candidate_cleaned_up()
+
+    def test_an_early_exit_and_a_stalled_start_both_fail_closed(self):
+        self.process.exit_code = 3
+        with self.assertRaises(ServiceIsolationError) as exited:
+            self.start()
+        self.assertIn("exited with status 3", str(exited.exception))
+        # Nothing is signalled: the candidate is already gone.
+        self.assertEqual(self.ops.signals, [])
+        self.assertIsNone(read_service_descriptor(self.home))
+
+        self.process.exit_code = None
+        clock = [0.0, 0.0, 100.0]
+        with self.assertRaises(ServiceIsolationError) as stalled:
+            self.start(
+                http_error(503),
+                http_error(503),
+                monotonic=lambda: clock.pop(0),
+            )
+        self.assertIn("did not report healthy", str(stalled.exception))
+        self.assertEqual(len(self.spawns), 2)
+        self.assert_candidate_cleaned_up()
+
+    def test_a_second_start_reuses_the_proven_service(self):
+        first = self.start(self.healthy(), self.reported_config())
+        second = self.start()
+        self.assertTrue(second.reused)
+        self.assertEqual(second.descriptor.as_dict(), first.descriptor.as_dict())
+        self.assertEqual(len(self.spawns), 1)
+        self.assertEqual(self.opener.calls, [])
+
+    def test_the_config_report_must_name_the_generated_source_only(self):
+        cases = (
+            (
+                FakeReply({"data": {"path": "/etc/opencode/opencode.json"}}),
+                "does not report the generated config",
+            ),
+            (
+                self.reported_config(str(Path.home() / ".config/opencode/opencode.json")),
+                "global path",
+            ),
+        )
+        for reply, expected in cases:
+            with self.subTest(expected=expected):
+                self.spawns.clear()
+                self.ops.signals.clear()
+                with self.assertRaises(ServiceIsolationError) as caught:
+                    self.start(self.healthy(), reply)
+                self.assertIn(expected, str(caught.exception))
+                self.assertEqual(len(self.spawns), 1)
+                self.assert_candidate_cleaned_up()
 
 
 if __name__ == "__main__":
