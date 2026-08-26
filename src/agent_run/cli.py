@@ -17,6 +17,8 @@ from .capacity.collect import collect_once
 from .capacity.launchd import argv as launchd_argv
 from .capacity.launchd import build_configured_job, render_plist
 from .config import load_config
+from .delivery.claude_uds import TRANSPORT_NAME as CLAUDE_UDS_TRANSPORT_NAME
+from .delivery.claude_uds import ClaudeSessionSender, ClaudeUdsTransport
 from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueSender, CodexQueueTransport
 from .delivery.dispatch import DeliveryDispatcher
 from .doctor import run_doctor
@@ -36,6 +38,10 @@ _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
 #: The only runtime that owns a managed service; there is no generic daemon.
 _SERVICE_RUNTIME = "opencode"
+#: Transports a `hook bind`/`hook context` may record, and the only names the
+#: dispatcher can route back to. An unknown name is refused at bind time
+#: rather than becoming an undeliverable row hours later.
+_HOOK_TRANSPORTS = (TRANSPORT_NAME, CLAUDE_UDS_TRANSPORT_NAME)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -141,8 +147,12 @@ def _parser() -> argparse.ArgumentParser:
     hook = commands.add_parser("hook").add_subparsers(
         dest="hook_command", required=True
     )
-    hook.add_parser("context")
-    hook.add_parser("bind")
+    # Each runtime's hook config names its own transport; the default keeps
+    # existing codex hook commands working unchanged.
+    for hook_name in ("context", "bind"):
+        hook.add_parser(hook_name).add_argument(
+            "--transport", choices=sorted(_HOOK_TRANSPORTS), default=TRANSPORT_NAME
+        )
 
     commands.add_parser("init")
     commands.add_parser("doctor")
@@ -178,7 +188,9 @@ def _payload(stream: TextIO) -> dict:
     return _object(_read(stream), "hook payload")
 
 
-def _hook_payload(payload: dict, *, bind: bool) -> dict:
+def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME) -> dict:
+    if transport not in _HOOK_TRANSPORTS:
+        raise ValidationError(f"unknown delivery transport: {transport!r}")
     if "session_id" not in payload:
         return payload
     expected_event = "PostToolUse" if bind else "UserPromptSubmit"
@@ -189,7 +201,7 @@ def _hook_payload(payload: dict, *, bind: bool) -> dict:
     if not isinstance(session_id, str) or not session_id.strip():
         raise ValidationError("raw hook session_id must be nonblank")
     normalized = {
-        "transport": TRANSPORT_NAME,
+        "transport": transport,
         "external_session_id": session_id,
     }
     if "turn_id" in payload:
@@ -352,9 +364,9 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     if command == "hook":
         payload = _payload(stream)
         return (
-            service.hook_context(payload)
+            service.hook_context(payload, args.transport)
             if args.hook_command == "context"
-            else service.hook_bind(payload)
+            else service.hook_bind(payload, args.transport)
         )
     if command == "init":
         return service.init()
@@ -469,7 +481,10 @@ def _dispatch_once(home: Path):
         sender = CodexQueueSender(str(executable), timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
         dispatcher = DeliveryDispatcher(
             store,
-            {TRANSPORT_NAME: CodexQueueTransport(sender)},
+            {
+                TRANSPORT_NAME: CodexQueueTransport(sender),
+                CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
+            },
             config.delivery,
         )
         return dispatcher.run(home=home)
@@ -556,11 +571,15 @@ class _Runtime:
     def delivery_dispatch(self):
         return _dispatch_once(self.home)
 
-    def hook_context(self, payload: dict):
+    def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
         config, store = self._inputs()
         try:
             result = build_context(
-                store, ref_from_payload(_hook_payload(payload, bind=False)), config=config
+                store,
+                ref_from_payload(
+                    _hook_payload(payload, bind=False, transport=transport)
+                ),
+                config=config,
             )
             if result.injected and result.text.strip():
                 return {
@@ -573,10 +592,12 @@ class _Runtime:
         finally:
             store.close()
 
-    def hook_bind(self, payload: dict):
+    def hook_bind(self, payload: dict, transport: str = TRANSPORT_NAME):
         _config, store = self._inputs()
         try:
-            result = run_hook(store, _hook_payload(payload, bind=True))
+            result = run_hook(
+                store, _hook_payload(payload, bind=True, transport=transport)
+            )
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",

@@ -122,7 +122,7 @@ class FakeService:
     def delivery_dispatch(self):
         return self._return("delivery_dispatch", {"delivered": 1})
 
-    def hook_context(self, payload):
+    def hook_context(self, payload, transport="codex_queue"):
         return self._return(
             "hook_context",
             {
@@ -133,7 +133,7 @@ class FakeService:
             },
         )
 
-    def hook_bind(self, payload):
+    def hook_bind(self, payload, transport="codex_queue"):
         return self._return("hook_bind", payload)
 
     def init(self):
@@ -884,6 +884,8 @@ class CliTests(unittest.TestCase):
             config = SimpleNamespace(
                 delivery=SimpleNamespace(codex_queue_bin=executable)
             )
+            uds_sender = Mock()
+            uds_transport = Mock()
             with patch.dict(os.environ, {}, clear=True), patch.object(
                 cli, "load_config", return_value=config
             ), patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
@@ -891,6 +893,10 @@ class CliTests(unittest.TestCase):
             ) as sender_type, patch.object(
                 cli, "CodexQueueTransport", return_value=transport
             ) as transport_type, patch.object(
+                cli, "ClaudeSessionSender", return_value=uds_sender
+            ) as uds_sender_type, patch.object(
+                cli, "ClaudeUdsTransport", return_value=uds_transport
+            ) as uds_transport_type, patch.object(
                 cli, "DeliveryDispatcher", return_value=dispatcher
             ) as dispatcher_type:
                 self.assertIs(cli._dispatch_once(home), result)
@@ -898,8 +904,15 @@ class CliTests(unittest.TestCase):
             opened.assert_called_once_with(home / "state.db")
             sender_type.assert_called_once_with(str(executable), timeout_seconds=30.0)
             transport_type.assert_called_once_with(sender)
+            uds_sender_type.assert_called_once_with()
+            uds_transport_type.assert_called_once_with(uds_sender)
             dispatcher_type.assert_called_once_with(
-                store, {cli.TRANSPORT_NAME: transport}, config.delivery
+                store,
+                {
+                    cli.TRANSPORT_NAME: transport,
+                    cli.CLAUDE_UDS_TRANSPORT_NAME: uds_transport,
+                },
+                config.delivery,
             )
             dispatcher.run.assert_called_once_with(home=home)
             store.close.assert_called_once_with()
@@ -931,6 +944,100 @@ class CliTests(unittest.TestCase):
             ), patch.object(cli, "DeliveryDispatcher", return_value=dispatcher):
                 cli._dispatch_once(home)
             sender.assert_called_once_with(str(override), timeout_seconds=30.0)
+
+    def test_hook_transport_is_per_runtime_and_dispatch_routes_by_the_recorded_name(self):
+        from agent_run.delivery.base import DeliveryReceipt
+        from agent_run.delivery.dispatch import DeliveryDispatcher
+        from agent_run.domain import Outcome
+
+        for command in ("context", "bind"):
+            args = cli._parser().parse_args(["hook", command])
+            self.assertEqual(args.transport, cli.TRANSPORT_NAME)
+            args = cli._parser().parse_args(
+                ["hook", command, "--transport", cli.CLAUDE_UDS_TRANSPORT_NAME]
+            )
+            self.assertEqual(args.transport, cli.CLAUDE_UDS_TRANSPORT_NAME)
+            with self.assertRaises(ValidationError):
+                cli._parser().parse_args(["hook", command, "--transport", "slack"])
+        with self.assertRaises(ValidationError):
+            cli._hook_payload({"session_id": "s"}, bind=False, transport="slack")
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            workdir = home / "work"
+            workdir.mkdir()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            agent_id = str(
+                store.create_agent(
+                    StartRequest(
+                        "claude", "model", "profile", "task", workdir,
+                        timeout_seconds=480,
+                    ),
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    at=1,
+                ).agent_id
+            )
+            store.transition(agent_id, AgentStatus.STARTING, at=2)
+            store.transition(agent_id, AgentStatus.RUNNING, at=3)
+            store.transition(
+                agent_id,
+                AgentStatus.SUCCEEDED,
+                outcome=Outcome(AgentStatus.SUCCEEDED),
+                at=4,
+            )
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            code, _output, error = self.run_cli(
+                [
+                    "--home", str(home), "hook", "bind",
+                    "--transport", cli.CLAUDE_UDS_TRANSPORT_NAME,
+                ],
+                service=runtime,
+                stdin=json.dumps(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "claude-session",
+                        "turn_id": "turn-9",
+                        "tool_response": {"structuredContent": {"agent_id": agent_id}},
+                    }
+                ),
+            )
+            self.assertEqual((code, error), (0, ""))
+
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                session = check_store.connection.execute(
+                    "SELECT * FROM orchestrator_sessions WHERE external_session_id = ?",
+                    ("claude-session",),
+                ).fetchone()
+                self.assertEqual(session["transport"], cli.CLAUDE_UDS_TRANSPORT_NAME)
+
+                codex = Mock(
+                    name="codex", api_version=1, **{"validate.return_value": None}
+                )
+                claude = Mock(
+                    name="claude", api_version=1, **{"validate.return_value": None}
+                )
+                claude.send.return_value = DeliveryReceipt()
+                DeliveryDispatcher(
+                    check_store,
+                    {
+                        cli.TRANSPORT_NAME: codex,
+                        cli.CLAUDE_UDS_TRANSPORT_NAME: claude,
+                    },
+                    owner="router",
+                ).drain(at=10_000_000_000)
+            finally:
+                check_store.close()
+            codex.send.assert_not_called()
+            claude.send.assert_called_once()
+            self.assertEqual(
+                claude.send.call_args.args[0].transport,
+                cli.CLAUDE_UDS_TRANSPORT_NAME,
+            )
 
     def test_dispatch_requires_an_absolute_codex_queue_binary(self):
         config = SimpleNamespace(
