@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Iterable, Iterator, Mapping
+from typing import Callable, Iterable, Mapping
 
 from ...config import RuntimeConfig
 from ...errors import PathEscapeError, ValidationError
@@ -46,8 +46,6 @@ PROBE_TIMEOUT_SECONDS = 0.5
 TERMINATE_GRACE_SECONDS = 5.0
 KILL_GRACE_SECONDS = 2.0
 
-#: Path fragments that only a user-global opencode install can produce.
-GLOBAL_CONFIG_MARKERS = ("/.config/opencode", "/.local/share/opencode", "/.opencode")
 _AUTH_REFUSED = frozenset({401, 403})
 
 #: The child never inherits PATH; a fixed one keeps argv resolution reproducible.
@@ -624,47 +622,58 @@ def _reported_config(client: object) -> object:
         capture.release()
 
 
-def _payload_strings(payload: object) -> Iterator[str]:
-    """Every string anywhere in a decoded payload, keys included."""
-
-    pending = [payload]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, str):
-            yield value
-        elif isinstance(value, Mapping):
-            pending.extend(value.keys())
-            pending.extend(value.values())
-        elif isinstance(value, (list, tuple)):
-            pending.extend(value)
-
-
 def verify_config_isolation(
     payload: object, home: str | Path, config_path: str | Path
 ) -> None:
-    """Prove the service is configured from the generated file and nothing global."""
+    """Prove the service is configured from the generated file and nothing global.
+
+    Only a "document" entry names a loaded configuration source. The engine
+    also reports well-known integration paths (~/.claude, ~/.agents,
+    ~/.opencode, and the generated-home directory) for every managed service,
+    isolated or not, so entries of any other type are never evidence either
+    way and are ignored here.
+
+    A document entry's `info` field carries the resolved provider settings,
+    secrets included, and must never be read, logged, or placed in an error.
+    """
+
+    if not isinstance(payload, list) or not all(
+        isinstance(entry, Mapping) for entry in payload
+    ):
+        raise ServiceIsolationError(
+            "opencode /api/config did not report a list of config entries; "
+            "refusing a service whose configuration cannot be proven"
+        )
 
     root = _service_root(home)
     roots = {root, root.resolve()}
     candidate = Path(config_path)
     expected = {str(candidate), str(candidate.resolve())}
-    reported = tuple(_payload_strings(payload))
-    if not expected.intersection(reported):
-        raise ServiceIsolationError(
-            f"opencode /api/config does not report the generated config {candidate}; "
-            "refusing a service configured from somewhere else"
-        )
-    for value in reported:
-        if not value.startswith("/"):
+
+    found_expected = False
+    for entry in payload:
+        if entry.get("type") != "document":
+            continue
+        value = entry.get("path")
+        if not isinstance(value, str):
+            continue
+        if value in expected:
+            found_expected = True
             continue
         path = Path(value)
         if any(path == item or path.is_relative_to(item) for item in roots):
             continue
-        if any(marker in value for marker in GLOBAL_CONFIG_MARKERS):
-            raise ServiceIsolationError(
-                f"opencode /api/config reports the global path {value} outside the "
-                f"generated home {root}"
-            )
+        raise ServiceIsolationError(
+            f"opencode /api/config reports the document {value} outside the "
+            f"generated home {root}; refusing a service configured from "
+            "somewhere else"
+        )
+
+    if not found_expected:
+        raise ServiceIsolationError(
+            f"opencode /api/config does not report the generated config {candidate}; "
+            "refusing a service configured from somewhere else"
+        )
 
 
 def _terminate_candidate(

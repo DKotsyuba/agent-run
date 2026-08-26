@@ -31,6 +31,7 @@ from agent_run.adapters.opencode.service import (
     resolve_environment_names,
     service_home_paths,
     start_service,
+    verify_config_isolation,
     verify_isolation,
     write_service_descriptor,
 )
@@ -242,6 +243,65 @@ class IsolationProofTests(ServiceTempCase):
             verify_isolation(self.plan(), payload, pid=4242, config_hash=CONFIG_HASH)
 
 
+class ConfigIsolationTests(ServiceTempCase):
+    """verify_config_isolation: only 'document' entries are ever evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.config_file = self.home / CONFIG_RELATIVE_PATH
+
+    def live_shape(self, *extra_entries):
+        """The real /api/config shape: a list of typed entries.
+
+        The claude/agents/directory entries name well-known integration
+        paths the engine reports for every service, isolated or not — they
+        must never be mistaken for evidence either way.
+        """
+        return [
+            {"type": "claude", "path": "/Users/pluto/.claude"},
+            {"type": "agents", "path": "/Users/pluto/.agents"},
+            {
+                "type": "document",
+                "path": str(self.config_file),
+                "info": {"provider": {"apiKey": "sk-fixture-secret"}},
+            },
+            {"type": "directory", "path": str(self.home / "xdg/config/opencode")},
+            {"type": "directory", "path": "/Users/pluto/.opencode"},
+            *extra_entries,
+        ]
+
+    def test_the_exact_live_shape_passes(self):
+        verify_config_isolation(self.live_shape(), self.home, self.config_file)
+
+    def test_a_document_at_a_global_path_is_refused_without_leaking_its_info(self):
+        secret = "sk-global-super-secret"
+        payload = self.live_shape(
+            {
+                "type": "document",
+                "path": "/Users/pluto/.config/opencode/opencode.json",
+                "info": {"provider": {"apiKey": secret}},
+            }
+        )
+        with self.assertRaises(ServiceIsolationError) as caught:
+            verify_config_isolation(payload, self.home, self.config_file)
+        message = str(caught.exception)
+        self.assertIn("outside the generated home", message)
+        self.assertNotIn(secret, message)
+
+    def test_no_document_for_the_generated_path_is_refused(self):
+        payload = [
+            {"type": "claude", "path": "/Users/pluto/.claude"},
+            {"type": "directory", "path": "/Users/pluto/.opencode"},
+        ]
+        with self.assertRaises(ServiceIsolationError) as caught:
+            verify_config_isolation(payload, self.home, self.config_file)
+        self.assertIn("does not report the generated config", str(caught.exception))
+
+    def test_a_non_list_payload_is_refused(self):
+        with self.assertRaises(ServiceIsolationError):
+            verify_config_isolation({"data": "not-a-list"}, self.home, self.config_file)
+
+
 class DescriptorFileTests(ServiceTempCase):
     def descriptor(self, **overrides):
         config_home, data_home = service_home_paths(self.home)
@@ -439,14 +499,27 @@ class StartServiceTests(ServiceTempCase):
         payload.update(overrides)
         return FakeReply(payload)
 
-    def reported_config(self, *extra):
+    def reported_config(self, *extra_documents):
+        """The live /api/config shape: a list of typed entries.
+
+        Non-document entries (claude, agents, directory) name well-known
+        integration paths the engine reports for every service, isolated or
+        not, and are included here to prove they are never mistaken for
+        evidence of a loaded configuration.
+        """
         return FakeReply(
-            {
-                "data": {
+            [
+                {"type": "claude", "path": "/Users/pluto/.claude"},
+                {"type": "agents", "path": "/Users/pluto/.agents"},
+                {
+                    "type": "document",
                     "path": str(self.config_file),
-                    "sources": [str(self.config_file), *extra],
-                }
-            }
+                    "info": {"provider": {"apiKey": "sk-fixture-secret"}},
+                },
+                {"type": "directory", "path": str(self.home / "xdg/config/opencode")},
+                {"type": "directory", "path": "/Users/pluto/.opencode"},
+                *extra_documents,
+            ]
         )
 
     def assert_candidate_cleaned_up(self):
@@ -572,12 +645,18 @@ class StartServiceTests(ServiceTempCase):
     def test_the_config_report_must_name_the_generated_source_only(self):
         cases = (
             (
-                FakeReply({"data": {"path": "/etc/opencode/opencode.json"}}),
+                FakeReply([{"type": "claude", "path": "/Users/pluto/.claude"}]),
                 "does not report the generated config",
             ),
             (
-                self.reported_config(str(Path.home() / ".config/opencode/opencode.json")),
-                "global path",
+                self.reported_config(
+                    {
+                        "type": "document",
+                        "path": str(Path.home() / ".config/opencode/opencode.json"),
+                        "info": {"provider": {"apiKey": "sk-global-secret"}},
+                    }
+                ),
+                "outside the generated home",
             ),
         )
         for reply, expected in cases:
@@ -586,7 +665,9 @@ class StartServiceTests(ServiceTempCase):
                 self.ops.signals.clear()
                 with self.assertRaises(ServiceIsolationError) as caught:
                     self.start(self.healthy(), reply)
-                self.assertIn(expected, str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn(expected, message)
+                self.assertNotIn("sk-global-secret", message)
                 self.assertEqual(len(self.spawns), 1)
                 self.assert_candidate_cleaned_up()
 
