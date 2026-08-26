@@ -283,23 +283,21 @@ def _contained(candidate: Path, expected: Path, key: str) -> None:
 
 
 def verify_isolation(
-    plan: ServicePlan, reported: Mapping[str, object], *, config_hash: str
+    plan: ServicePlan, health: Mapping[str, object], *, pid: int, config_hash: str
 ) -> ServiceDescriptor:
-    """Prove a candidate service uses the generated homes and private endpoint."""
+    """Prove the exact spawned service answered its authenticated health endpoint."""
 
     if not isinstance(plan, ServicePlan):
         raise ValidationError("isolation proof requires a ServicePlan")
-    if not isinstance(reported, Mapping):
-        raise ServiceIsolationError("service reported no isolation payload")
-    _contained(_reported_path(reported, "config_home"), plan.config_home, "config_home")
-    _contained(_reported_path(reported, "data_home"), plan.data_home, "data_home")
-    host = reported.get("host", plan.host)
-    port = reported.get("port")
-    if host != plan.host:
-        raise ServiceIsolationError(f"service answers on {host!r}, expected {plan.host!r}")
-    if port != plan.port:
-        raise ServiceIsolationError(f"service answers on port {port!r}, expected {plan.port}")
-    version = reported.get("version")
+    if not isinstance(health, Mapping) or health.get("healthy") is not True:
+        raise ServiceIsolationError("service reported unhealthy or invalid health payload")
+    candidate_pid = _pid(pid)
+    reported_pid = _pid(health.get("pid"))
+    if reported_pid != candidate_pid:
+        raise ServiceIsolationError(
+            f"service health pid {reported_pid} does not match spawned pid {candidate_pid}"
+        )
+    version = health.get("version")
     if version is not None and not isinstance(version, str):
         raise ServiceIsolationError("service reported an invalid version")
     return ServiceDescriptor(
@@ -307,7 +305,7 @@ def verify_isolation(
         port=plan.port,
         config_home=plan.config_home,
         data_home=plan.data_home,
-        pid=_pid(reported.get("pid")),
+        pid=candidate_pid,
         config_hash=_config_hash(config_hash),
         version=version,
     )

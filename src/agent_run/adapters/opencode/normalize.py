@@ -38,12 +38,12 @@ _ROLES: Mapping[str, MessageRole] = MappingProxyType(
 def split_model(value: object) -> tuple[str, str]:
     """Split a canonical ``providerID/modelID`` identifier, or refuse it."""
 
-    if not isinstance(value, str) or value.count("/") != 1:
+    if not isinstance(value, str) or "/" not in value:
         raise ValidationError(
             f"opencode model must be canonical 'providerID/modelID', not {value!r}"
         )
     provider, model = value.split("/", 1)
-    if not provider.strip() or not model.strip():
+    if provider != "omniroute" or not model.startswith("opencode/") or not model[9:].strip():
         raise ValidationError(
             f"opencode model must be canonical 'providerID/modelID', not {value!r}"
         )
@@ -65,7 +65,7 @@ def normalize_models(
     if not isinstance(payload, Mapping):
         raise ValidationError("opencode model roster must be a mapping")
     reported: dict[str, str] = {}
-    for provider in _sequence(payload.get("providers")):
+    for provider in _sequence(payload.get("data", payload.get("providers"))):
         if not isinstance(provider, Mapping):
             raise ValidationError("opencode provider entry must be a mapping")
         provider_id = provider.get("id")

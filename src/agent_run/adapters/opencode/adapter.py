@@ -143,7 +143,7 @@ def _mcp_servers(
             "environment": resolve_environment_names(
                 definition.env_from, inherited, what=f"mcp.{name}.env_from"
             ),
-            "enabled": True,
+            "disabled": False,
         }
     return servers
 
@@ -165,17 +165,35 @@ def render_config(
         "share": "disabled",
         "autoupdate": False,
         "model": default_model,
-        "permission": dict(SYSTEM_PERMISSION),
+        "default_agent": PRIMARY_AGENT,
+        "providers": {
+            "omniroute": {
+                "name": "OmniRoute",
+                "env": ["OMNIROUTE_API_KEY"],
+                "package": "@opencode-ai/ai/providers/openai-compatible",
+                "settings": {"baseURL": "http://127.0.0.1:20128/v1", "apiKey": "{env:OMNIROUTE_API_KEY}"},
+                "models": {
+                    model.split("/", 1)[1]: {"modelID": model.split("/", 1)[1]}
+                    for model in config.models
+                },
+            }
+        },
         "agents": {
             PRIMARY_AGENT: {
                 "mode": "primary",
                 "model": default_model,
-                "permission": dict(PRIMARY_PERMISSION),
+                "permissions": [
+                    {"action": action, "resource": resource, "effect": "allow"}
+                    for action, resource in PRIMARY_PERMISSION
+                ],
             },
             VERIFY_AGENT: {
                 "mode": "subagent",
                 "model": default_model,
-                "permission": dict(SUBAGENT_PERMISSION),
+                "permissions": [
+                    {"action": action, "resource": resource, "effect": "allow"}
+                    for action, resource in SUBAGENT_PERMISSION
+                ],
             },
         },
         "skills": list(config.skills),
@@ -372,7 +390,9 @@ class OpenCodeAdapter:
         model = state["model"]
         if not isinstance(model, Mapping) or "modelID" not in model:
             raise ValidationError("launch plan carries no canonical opencode model")
-        opened = client.create_session({"agent": PRIMARY_AGENT, "title": str(model["modelID"])})
+        opened = client.create_session(
+            {"agent": PRIMARY_AGENT, "model": dict(model), "title": str(model["modelID"])}
+        )
         session_id = opened.get("id")
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValidationError("opencode service returned no session id")
@@ -391,7 +411,7 @@ class OpenCodeAdapter:
             {
                 "agent": PRIMARY_AGENT,
                 "model": dict(model),
-                "parts": [{"type": "text", "text": plan.initial_input}],
+                "text": plan.initial_input,
             },
         )
         return session
@@ -529,8 +549,10 @@ class OpenCodeRuntimeSession:
             payload = capture.json()
         finally:
             capture.release()
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("data"), list):
+            raise ValidationError("opencode permission reply must contain a data array")
         decisions = []
-        for permission in _permission_items(payload):
+        for permission in _permission_items(payload["data"]):
             identifier = permission_id(permission)
             if identifier in self._answered:
                 continue

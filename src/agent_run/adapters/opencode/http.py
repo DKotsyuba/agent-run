@@ -28,11 +28,10 @@ from ...errors import AgentRunError, ValidationError
 from .service import PASSWORD_ENV, SERVICE_HOST, ServiceDescriptor, require_server_password
 
 
-HEALTH_PATH = "/global/health"
-CONFIG_PATH = "/config"
-PROVIDERS_PATH = "/config/providers"
-SESSION_PATH = "/session"
-SESSION_STATUS_PATH = "/session/status"
+HEALTH_PATH = "/api/health"
+PROVIDERS_PATH = "/api/provider"
+SESSION_PATH = "/api/session"
+SESSION_STATUS_PATH = "/api/session/active"
 
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
@@ -372,9 +371,6 @@ class OpenCodeHttpClient:
 
     # --- service and session endpoints -----------------------------------
 
-    def isolation_report(self) -> Mapping[str, object]:
-        return self._decoded(self.get(CONFIG_PATH))
-
     def health(self) -> Mapping[str, object]:
         return self._decoded(self.get(HEALTH_PATH))
 
@@ -384,17 +380,17 @@ class OpenCodeHttpClient:
     def session_status(self) -> Mapping[str, object]:
         """The whole service's status map, keyed by session id."""
 
-        return self._decoded(self.get(SESSION_STATUS_PATH))
+        return _data_mapping(self._decoded(self.get(SESSION_STATUS_PATH)))
 
     def create_session(self, payload: Mapping[str, object]) -> Mapping[str, object]:
-        return self._decoded(self.post(SESSION_PATH, payload))
+        return _data_mapping(self._decoded(self.post(SESSION_PATH, payload)))
 
     def prompt_async(self, session_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
         # A prompt is never retried: a failed model turn is ambiguous.
-        return self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/prompt_async", payload))
+        return _data_mapping(self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/prompt", payload)))
 
     def abort(self, session_id: str) -> Mapping[str, object]:
-        return self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/abort"))
+        return self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/interrupt"))
 
     def messages(self, session_id: str) -> HttpResponse:
         """The final transcript capture; the caller owns and releases it."""
@@ -407,9 +403,7 @@ class OpenCodeHttpClient:
     def answer_permission(
         self, session_id: str, permission_id: str, payload: Mapping[str, object]
     ) -> Mapping[str, object]:
-        path = (
-            f"{SESSION_PATH}/{_session(session_id)}/permissions/{_session(permission_id)}"
-        )
+        path = f"{SESSION_PATH}/{_session(session_id)}/permission/{_session(permission_id)}/reply"
         return self._decoded(self.post(path, payload))
 
 
@@ -419,6 +413,13 @@ def _session(value: str) -> str:
     if any(character in value for character in "/?#%"):
         raise ValidationError(f"opencode identifier must not contain path syntax: {value!r}")
     return value
+
+
+def _data_mapping(payload: Mapping[str, object]) -> Mapping[str, object]:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise ValidationError("opencode service reply must contain a data object")
+    return data
 
 
 def _check_base_url(base_url: str) -> str:
