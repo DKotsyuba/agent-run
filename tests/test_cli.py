@@ -123,7 +123,15 @@ class FakeService:
         return self._return("delivery_dispatch", {"delivered": 1})
 
     def hook_context(self, payload):
-        return self._return("hook_context", payload)
+        return self._return(
+            "hook_context",
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "context",
+                }
+            },
+        )
 
     def hook_bind(self, payload):
         return self._return("hook_bind", payload)
@@ -280,12 +288,67 @@ class CliTests(unittest.TestCase):
                 self.assertTrue(output.startswith("{"))
                 self.assertIn(expected, service.calls)
 
-        for hook in ("context", "bind"):
-            code, output, error = self.run_cli(
-                ["hook", hook], service=service, stdin='{"agent_id":"x"}'
+        code, output, error = self.run_cli(
+            ["hook", "context"], service=service, stdin='{"agent_id":"x"}'
+        )
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(
+            json.loads(output),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "context",
+                }
+            },
+        )
+
+        code, output, error = self.run_cli(
+            ["hook", "bind"], service=service, stdin='{"agent_id":"x"}'
+        )
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output), {"agent_id": "x"})
+
+    def test_hook_context_wraps_first_injection_and_suppresses_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            payload = json.dumps(
+                {
+                    "transport": "codex_queue",
+                    "external_session_id": "session-1",
+                }
             )
+            args = ["--home", str(home), "hook", "context"]
+
+            code, output, error = self.run_cli(args, service=runtime, stdin=payload)
+
             self.assertEqual((code, error), (0, ""))
-            self.assertEqual(json.loads(output), {"agent_id": "x"})
+            envelope = json.loads(output)
+            self.assertEqual(set(envelope), {"hookSpecificOutput"})
+            hook_output = envelope["hookSpecificOutput"]
+            self.assertEqual(
+                set(hook_output), {"hookEventName", "additionalContext"}
+            )
+            self.assertEqual(hook_output["hookEventName"], "UserPromptSubmit")
+            self.assertTrue(hook_output["additionalContext"].strip())
+            self.assertLessEqual(len(hook_output["additionalContext"]), 2500)
+
+            code, output, error = self.run_cli(args, service=runtime, stdin=payload)
+
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(output), {})
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                receipt_count = check_store.connection.execute(
+                    "SELECT COUNT(*) FROM context_receipts"
+                ).fetchone()[0]
+            finally:
+                check_store.close()
+            self.assertEqual(receipt_count, 1)
 
     def test_mcp_command_is_reserved_without_importing_parallel_module(self):
         sys.modules.pop("agent_run.mcp", None)

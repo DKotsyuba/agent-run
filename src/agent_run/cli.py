@@ -383,7 +383,15 @@ class _Runtime:
     def hook_context(self, payload: dict):
         config, store = self._inputs()
         try:
-            return build_context(store, ref_from_payload(payload), config=config)
+            result = build_context(store, ref_from_payload(payload), config=config)
+            if result.injected and result.text.strip():
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": result.text,
+                    }
+                }
+            return {}
         finally:
             store.close()
 
