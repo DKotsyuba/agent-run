@@ -134,14 +134,14 @@ class HttpResponse:
             raise ValidationError(f"cannot read captured reply {self.body_path}: {error}") from error
 
     def json(self) -> object:
-        """Decode the capture; a 204 carries no body and decodes to None."""
+        """Decode the capture; an empty body on a successful reply decodes to None."""
 
         self._readable()
-        if self.status == NO_CONTENT:
-            if self.body_bytes:
-                raise ValidationError(
-                    f"opencode service sent {self.body_bytes} bytes with a 204 for {self.path}"
-                )
+        if self.status == NO_CONTENT and self.body_bytes:
+            raise ValidationError(
+                f"opencode service sent {self.body_bytes} bytes with a 204 for {self.path}"
+            )
+        if self.body_bytes == 0:
             return None
         try:
             with self.body_path.open("rb") as stream:
@@ -155,7 +155,7 @@ class HttpResponse:
 
     def mapping(self) -> Mapping[str, object]:
         payload = self.json()
-        if payload is None and self.status == NO_CONTENT:
+        if payload is None and self.body_bytes == 0:
             return {}
         if not isinstance(payload, dict):
             raise ValidationError(f"opencode service reply for {self.path} must be a JSON object")

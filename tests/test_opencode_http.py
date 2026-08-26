@@ -380,5 +380,24 @@ class EndpointTests(ClientCase):
                 OpenCodeHttpClient(url, self.directory)
 
 
+class EmptyAcknowledgementTests(ClientCase):
+    """The beta service may ack interrupt/permission-reply with an empty body
+    on either a literal 204 or another successful status; neither is JSON."""
+
+    def test_interrupt_accepts_an_empty_body(self):
+        for status in (NO_CONTENT, 200):
+            with self.subTest(status=status):
+                client = self.client(FakeReply(b"", status=status))
+                self.assertEqual(dict(client.abort("ses_1")), {})
+
+    def test_permission_reply_accepts_an_empty_body(self):
+        for status in (NO_CONTENT, 200):
+            with self.subTest(status=status):
+                client = self.client(FakeReply(b"", status=status))
+                self.assertEqual(
+                    dict(client.answer_permission("ses_1", "perm_1", {"reply": "once"})), {}
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
