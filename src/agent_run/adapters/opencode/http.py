@@ -1,12 +1,13 @@
 """Private-file HTTP transport for the managed OpenCode v2 service.
 
-Two rules shape this module. Every reply is streamed to a private file before it
-is decoded, so no large API response passes through a transport that may
-truncate it; and message state is read by short bounded polls, never by the
-long ``wait`` endpoint.
+Three rules shape this module. Every reply is streamed to a private file before
+it is decoded, so no large API response passes through a transport that may
+truncate it; message state is read by short bounded polls, never by the long
+``wait`` endpoint; and every capture is deleted as soon as it has been decoded,
+so only the final transcript a ``raw_ref`` points at survives the run.
 
-Endpoint constants are the single place to correct once a live service is
-exercised in M011; nothing here performs a live call on import.
+Endpoint constants below are the shapes proven against a local OpenCode v2
+service; nothing here performs a live call on import.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
@@ -26,16 +27,18 @@ from ...errors import AgentRunError, ValidationError
 from .service import SERVICE_HOST, ServiceDescriptor
 
 
-HEALTH_PATH = "/health"
+HEALTH_PATH = "/global/health"
 CONFIG_PATH = "/config"
-MODELS_PATH = "/config/providers"
+PROVIDERS_PATH = "/config/providers"
 SESSION_PATH = "/session"
+SESSION_STATUS_PATH = "/session/status"
 
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
 REQUEST_TIMEOUT_SECONDS = 15.0
 POLL_INTERVAL_SECONDS = 0.25
 MAX_POLL_INTERVAL_SECONDS = 1.0
+NO_CONTENT = 204
 
 #: Statuses an adapter can prove are transient. 500 stays out: it is ambiguous.
 TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
@@ -82,26 +85,63 @@ class RetryPolicy:
         return min(self.cap_seconds, self.base_seconds * (2 ** (attempt - 1)))
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class HttpResponse:
-    """A reply already captured on disk; decoding reads the file, not a pipe."""
+    """A reply already captured on disk; decoding reads the file, not a pipe.
+
+    A capture is a private temporary file. ``release`` deletes it and may be
+    called any number of times, so a caller can free a reply in a ``finally``
+    without knowing whether an earlier step already did.
+    """
 
     status: int
     path: str
     body_path: Path
     body_bytes: int
+    released: bool = field(default=False)
 
     @property
     def raw_ref(self) -> str:
         return str(self.body_path)
 
+    def release(self) -> None:
+        """Delete the capture; idempotent and safe after a partial failure."""
+
+        if self.released:
+            return
+        self.released = True
+        try:
+            self.body_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "HttpResponse":
+        return self
+
+    def __exit__(self, *_exception: object) -> None:
+        self.release()
+
+    def _readable(self) -> None:
+        if self.released:
+            raise ValidationError(f"captured reply for {self.path} was already released")
+
     def text(self) -> str:
+        self._readable()
         try:
             return self.body_path.read_text(encoding="utf-8")
         except OSError as error:
             raise ValidationError(f"cannot read captured reply {self.body_path}: {error}") from error
 
     def json(self) -> object:
+        """Decode the capture; a 204 carries no body and decodes to None."""
+
+        self._readable()
+        if self.status == NO_CONTENT:
+            if self.body_bytes:
+                raise ValidationError(
+                    f"opencode service sent {self.body_bytes} bytes with a 204 for {self.path}"
+                )
+            return None
         try:
             with self.body_path.open("rb") as stream:
                 return json.load(stream)
@@ -114,6 +154,8 @@ class HttpResponse:
 
     def mapping(self) -> Mapping[str, object]:
         payload = self.json()
+        if payload is None and self.status == NO_CONTENT:
+            return {}
         if not isinstance(payload, dict):
             raise ValidationError(f"opencode service reply for {self.path} must be a JSON object")
         return payload
@@ -253,10 +295,16 @@ class OpenCodeHttpClient:
             close = getattr(response, "close", None)
             if callable(close):
                 close()
+        # A failed capture is never kept: only a final transcript survives a run.
         if status in TRANSIENT_STATUSES:
+            captured.release()
             raise TransientHttpError(status, path)
         if status >= 400:
-            raise HttpError(status, path, captured.text()[:200])
+            try:
+                detail = captured.text()[:200]
+            finally:
+                captured.release()
+            raise HttpError(status, path, detail)
         return captured
 
     def get(self, path: str) -> HttpResponse:
@@ -266,6 +314,14 @@ class OpenCodeHttpClient:
         self, path: str, payload: Mapping[str, object] | None = None, *, retry: bool = False
     ) -> HttpResponse:
         return self.request("POST", path, payload, retry=retry)
+
+    def _decoded(self, response: HttpResponse) -> Mapping[str, object]:
+        """Decode and immediately drop a capture nobody will reference again."""
+
+        try:
+            return response.mapping()
+        finally:
+            response.release()
 
     def poll(
         self,
@@ -285,7 +341,7 @@ class OpenCodeHttpClient:
             raise ValidationError("opencode poll deadline must be positive")
         started = self._monotonic()
         while True:
-            payload = self.get(path).mapping()
+            payload = self._decoded(self.get(path))
             if ready(payload):
                 return payload
             if self._monotonic() - started >= deadline_seconds:
@@ -297,28 +353,32 @@ class OpenCodeHttpClient:
     # --- service and session endpoints -----------------------------------
 
     def isolation_report(self) -> Mapping[str, object]:
-        return self.get(CONFIG_PATH).mapping()
+        return self._decoded(self.get(CONFIG_PATH))
 
     def health(self) -> Mapping[str, object]:
-        return self.get(HEALTH_PATH).mapping()
+        return self._decoded(self.get(HEALTH_PATH))
 
     def providers(self) -> Mapping[str, object]:
-        return self.get(MODELS_PATH).mapping()
+        return self._decoded(self.get(PROVIDERS_PATH))
+
+    def session_status(self) -> Mapping[str, object]:
+        """The whole service's status map, keyed by session id."""
+
+        return self._decoded(self.get(SESSION_STATUS_PATH))
 
     def create_session(self, payload: Mapping[str, object]) -> Mapping[str, object]:
-        return self.post(SESSION_PATH, payload).mapping()
+        return self._decoded(self.post(SESSION_PATH, payload))
 
-    def prompt(self, session_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
+    def prompt_async(self, session_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
         # A prompt is never retried: a failed model turn is ambiguous.
-        return self.post(f"{SESSION_PATH}/{_session(session_id)}/message", payload).mapping()
+        return self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/prompt_async", payload))
 
-    def steer(self, session_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
-        return self.post(f"{SESSION_PATH}/{_session(session_id)}/message", payload).mapping()
-
-    def interrupt(self, session_id: str) -> Mapping[str, object]:
-        return self.post(f"{SESSION_PATH}/{_session(session_id)}/abort").mapping()
+    def abort(self, session_id: str) -> Mapping[str, object]:
+        return self._decoded(self.post(f"{SESSION_PATH}/{_session(session_id)}/abort"))
 
     def messages(self, session_id: str) -> HttpResponse:
+        """The final transcript capture; the caller owns and releases it."""
+
         return self.get(f"{SESSION_PATH}/{_session(session_id)}/message")
 
     def permissions(self, session_id: str) -> HttpResponse:
@@ -327,8 +387,10 @@ class OpenCodeHttpClient:
     def answer_permission(
         self, session_id: str, permission_id: str, payload: Mapping[str, object]
     ) -> Mapping[str, object]:
-        path = f"{SESSION_PATH}/{_session(session_id)}/permission/{_session(permission_id)}"
-        return self.post(path, payload).mapping()
+        path = (
+            f"{SESSION_PATH}/{_session(session_id)}/permissions/{_session(permission_id)}"
+        )
+        return self._decoded(self.post(path, payload))
 
 
 def _session(value: str) -> str:

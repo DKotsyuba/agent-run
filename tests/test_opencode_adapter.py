@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -7,7 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import ADAPTER_API_VERSION, Capability
+from agent_run.adapters.home import content_hash
 from agent_run.adapters.opencode.adapter import (
+    ANSWER_NAME,
     CONFIG_RELATIVE_PATH,
     PRIMARY_AGENT,
     RUNTIME_NAME,
@@ -17,18 +21,25 @@ from agent_run.adapters.opencode.adapter import (
     PermissionBroker,
     extract_answer,
     is_settled,
+    is_working,
+    model_reference,
     normalize_models,
     normalize_outcome,
     normalize_transcript,
+    render_config,
+    split_model,
 )
+from agent_run.adapters.opencode.http import HttpResponse
 from agent_run.adapters.opencode.service import (
     SERVICE_HOST,
+    SERVICE_PATH,
     ServiceIsolationError,
+    build_service_plan,
     service_home_paths,
     verify_isolation,
     write_service_descriptor,
 )
-from agent_run.config import RuntimeConfig, RuntimeHookConfig
+from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import AgentStatus, MessageRole, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
@@ -37,14 +48,15 @@ from test_opencode_service import runtime_config
 
 
 PORT = 41777
+MODEL = "opencode/minimax-m3"
+ALT_MODEL = "opencode/deepseek-v4-pro"
 
 
-def message(role, text, *, agent=PRIMARY_AGENT, synthetic=False, at=1.0):
+def message(role, text, *, agent=PRIMARY_AGENT, at=1.0):
+    """One v2 transcript entry: metadata in ``info``, content in ``parts``."""
+
     return {
-        "role": role,
-        "agent": agent,
-        "synthetic": synthetic,
-        "time": {"created": at},
+        "info": {"role": role, "agent": agent, "time": {"created": at}, "sessionID": "ses_1"},
         "parts": [{"type": "text", "text": text}],
     }
 
@@ -65,12 +77,16 @@ class PermissionBrokerTests(unittest.TestCase):
         )
         self.assertTrue(first.granted)
         self.assertEqual(self.broker.granted_directory, str(self.allowed / "nested"))
-        self.assertEqual(self.broker.reply(first)["response"], "once")
+        self.assertEqual(dict(self.broker.reply(first)), {"response": "once"})
         second = self.broker.decide(
             {"id": "p2", "type": "external_directory", "path": str(self.allowed)}
         )
         self.assertFalse(second.granted)
         self.assertIn("already granted once", second.reason)
+
+    def test_reply_body_carries_only_the_response(self):
+        decision = self.broker.decide({"id": "p1", "type": "bash", "path": "/"})
+        self.assertEqual(dict(self.broker.reply(decision)), {"response": "reject"})
 
     def test_directory_outside_read_roots_is_rejected(self):
         decision = self.broker.decide(
@@ -81,12 +97,12 @@ class PermissionBrokerTests(unittest.TestCase):
         self.assertEqual(self.broker.reply(decision)["response"], "reject")
 
     def test_every_other_permission_is_auto_rejected(self):
-        for kind in ("bash", "edit", "webfetch", None):
+        for kind in ("bash", "edit", "write", "webfetch", None):
             decision = self.broker.decide({"id": f"p-{kind}", "type": kind, "path": "/"})
             self.assertFalse(decision.granted)
         self.assertEqual(
             dict(self.broker.blocked_summary()),
-            {"None": 1, "bash": 1, "edit": 1, "webfetch": 1},
+            {"None": 1, "bash": 1, "edit": 1, "webfetch": 1, "write": 1},
         )
 
     def test_unusable_permission_payloads_are_refused(self):
@@ -97,22 +113,18 @@ class PermissionBrokerTests(unittest.TestCase):
 
 
 class TranscriptTests(unittest.TestCase):
-    def test_all_assistant_text_after_the_last_real_user_is_preserved(self):
-        payload = {
-            "messages": [
-                message("user", "first task"),
-                message("assistant", "old answer"),
-                message("user", "real task", at=2.0),
-                message("assistant", "attempt one failed", at=3.0),
-                message("user", "retrying", synthetic=True, at=4.0),
-                message("assistant", "attempt two answer", at=5.0),
-            ]
-        }
-        self.assertEqual(
-            extract_answer(payload), "attempt one failed\n\nattempt two answer"
-        )
+    def test_primary_text_is_preserved_across_a_steer_and_a_retry(self):
+        payload = [
+            message("user", "real task"),
+            message("assistant", "part one", at=2.0),
+            message("user", "also check the parser", at=3.0),
+            message("assistant", "part two", at=4.0),
+            message("user", "retrying", at=5.0),
+            message("assistant", "part three", at=6.0),
+        ]
+        self.assertEqual(extract_answer(payload), "part one\n\npart two\n\npart three")
 
-    def test_sub_agent_output_is_not_mistaken_for_the_answer(self):
+    def test_sub_agent_output_is_excluded_from_the_answer(self):
         payload = {
             "messages": [
                 message("user", "task"),
@@ -124,55 +136,71 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(extract_answer(payload, agent=VERIFY_AGENT), "verifier notes")
 
     def test_transcript_keeps_every_agent_and_drops_empty_text(self):
-        payload = {
-            "messages": [
-                message("user", "task"),
-                {"role": "assistant", "parts": [{"type": "tool", "tool": "bash"}]},
-                message("assistant", "answer", agent=VERIFY_AGENT, at=2.0),
-            ]
-        }
+        payload = [
+            message("user", "task"),
+            {"info": {"role": "assistant"}, "parts": [{"type": "tool", "tool": "bash"}]},
+            message("assistant", "answer", agent=VERIFY_AGENT, at=2.0),
+        ]
         messages = normalize_transcript(payload, raw_ref="/tmp/reply.json")
         self.assertEqual([item.role for item in messages], [MessageRole.USER, MessageRole.ASSISTANT])
         self.assertEqual(messages[1].name, VERIFY_AGENT)
         self.assertEqual(messages[1].raw_ref, "/tmp/reply.json")
+        self.assertEqual(messages[1].at, 2.0)
 
-    def test_unknown_role_is_refused(self):
+    def test_unknown_role_and_malformed_info_are_refused(self):
         with self.assertRaises(ValidationError):
-            normalize_transcript({"messages": [message("tool", "x")]})
+            normalize_transcript([message("tool", "x")])
+        with self.assertRaises(ValidationError):
+            normalize_transcript([{"info": "assistant", "parts": [{"type": "text", "text": "x"}]}])
 
 
 class OutcomeTests(unittest.TestCase):
     def test_states_normalize_to_terminal_outcomes(self):
         self.assertEqual(normalize_outcome({"state": "completed"}).status, AgentStatus.SUCCEEDED)
+        self.assertEqual(normalize_outcome({"state": "idle"}).status, AgentStatus.SUCCEEDED)
         self.assertEqual(normalize_outcome({"state": "aborted"}).status, AgentStatus.CANCELLED)
         self.assertEqual(normalize_outcome({"state": "timeout"}).status, AgentStatus.TIMED_OUT)
 
     def test_reported_error_wins_over_a_completed_state(self):
         outcome = normalize_outcome(
-            {"state": "completed", "error": {"name": "ProviderError", "message": "429"}},
-            runtime_session_id="s1",
+            {"state": "idle", "error": {"name": "ProviderError", "message": "429"}},
+            runtime_session_id="ses_1",
         )
         self.assertEqual(outcome.status, AgentStatus.FAILED)
         self.assertEqual(outcome.failure_kind, "ProviderError")
-        self.assertEqual(outcome.runtime_session_id, "s1")
+        self.assertEqual(outcome.runtime_session_id, "ses_1")
 
-    def test_active_states_are_not_terminal(self):
-        self.assertFalse(is_settled({"state": "running"}))
-        self.assertTrue(is_settled({"state": "aborted"}))
-        with self.assertRaises(ValidationError):
-            normalize_outcome({"state": "running"})
+    def test_busy_and_retrying_are_work_not_outcomes(self):
+        for state in ("busy", "retrying"):
+            self.assertTrue(is_working({"state": state}))
+            self.assertFalse(is_settled({"state": state}))
+            with self.assertRaises(ValidationError):
+                normalize_outcome({"state": state})
+        self.assertTrue(is_settled({"state": "idle"}))
+        self.assertFalse(is_working({}))
 
 
-class ModelRosterTests(unittest.TestCase):
+class ModelTests(unittest.TestCase):
+    def test_canonical_identifiers_split_into_provider_and_model(self):
+        self.assertEqual(split_model(MODEL), ("opencode", "minimax-m3"))
+        self.assertEqual(
+            dict(model_reference(MODEL)), {"providerID": "opencode", "modelID": "minimax-m3"}
+        )
+
+    def test_non_canonical_identifiers_are_refused(self):
+        for value in ("minimax-m3", "a/b/c", "/model", "provider/", 7, None):
+            with self.assertRaises(ValidationError):
+                split_model(value)
+
     def test_roster_is_intersected_with_the_allowlist_in_config_order(self):
         payload = {
             "providers": [
-                {"models": {"a": {"id": "MiniMaxM3", "name": "MiniMax M3"}}},
-                {"models": [{"id": "deepseek-v4-pro"}, {"id": "unlisted"}]},
+                {"id": "opencode", "models": {"a": {"id": "minimax-m3", "name": "MiniMax M3"}}},
+                {"id": "opencode", "models": [{"id": "deepseek-v4-pro"}, {"id": "unlisted"}]},
             ]
         }
-        models = normalize_models(payload, ("deepseek-v4-pro", "MiniMaxM3", "absent"))
-        self.assertEqual([item.id for item in models], ["deepseek-v4-pro", "MiniMaxM3"])
+        models = normalize_models(payload, (ALT_MODEL, MODEL, "opencode/absent"))
+        self.assertEqual([item.id for item in models], [ALT_MODEL, MODEL])
         self.assertEqual(models[1].description, "MiniMax M3")
 
     def test_malformed_roster_is_refused(self):
@@ -207,26 +235,50 @@ class AdapterCase(unittest.TestCase):
         self.workdir.mkdir()
         self.read_root = self.root / "read"
         self.read_root.mkdir()
+        self.request_root = self.root / "also-read"
+        self.request_root.mkdir()
         self.agent_dir = self.root / "agent"
         self.agent_dir.mkdir()
         self.binary = self.root / "opencode2"
         self.binary.write_text("#!/bin/sh\n", encoding="utf-8")
-        self.config = runtime_config(self.binary, self.home, models=("MiniMaxM3", "deepseek-v4-pro"))
+        self.mcp_command = self.root / "docs-mcp"
+        self.mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.mcp_servers = {
+            "docs": McpConfig("stdio", self.mcp_command, ("--root", "/docs"), ("DOCS_TOKEN",)),
+            "unused": McpConfig("stdio", self.mcp_command),
+        }
+        self.environment = {"DOCS_TOKEN": "secret", "PATH": "/tmp/shim"}
+        self.config = runtime_config(
+            self.binary,
+            self.home,
+            models=(MODEL, ALT_MODEL),
+            skills=("review",),
+            mcp=("docs",),
+        )
         self.adapter = OpenCodeAdapter()
-        self.profile = AgentProfile("implement", "profile body", True, (self.read_root,))
+        self.profile = AgentProfile("implement", "profile body", False, (self.read_root,))
         self.request = StartRequest(
             runtime=RUNTIME_NAME,
-            model="MiniMaxM3",
+            model=MODEL,
             profile="implement",
             task="do the thing",
             workdir=self.workdir,
-            write=True,
+            read_roots=(self.request_root,),
         )
 
-    def prove_service(self):
-        from agent_run.adapters.opencode.service import build_service_plan
+    def materialize(self, config=None, mcp_servers=None):
+        return self.adapter.materialize(
+            config or self.config,
+            self.home,
+            mcp_servers=self.mcp_servers if mcp_servers is None else mcp_servers,
+            inherited_environment=self.environment,
+        )
 
-        plan = build_service_plan(self.config, self.home, port=PORT)
+    def prove_service(self, *, pid=None, digest=None):
+        digest = self.materialize() if digest is None else digest
+        plan = build_service_plan(
+            self.config, self.home, port=PORT, inherited_environment=self.environment
+        )
         config_home, data_home = service_home_paths(self.home)
         descriptor = verify_isolation(
             plan,
@@ -235,22 +287,36 @@ class AdapterCase(unittest.TestCase):
                 "data_home": str(data_home),
                 "host": SERVICE_HOST,
                 "port": PORT,
+                "pid": os.getpid() if pid is None else pid,
                 "version": "2.1.0",
             },
+            config_hash=digest,
         )
         write_service_descriptor(self.home, descriptor)
         return descriptor
 
+    def prepare(self, request=None, profile=None, mcp_servers=None):
+        return self.adapter.prepare(
+            request or self.request,
+            profile or self.profile,
+            self.config,
+            self.home,
+            self.agent_dir,
+            mcp_servers=self.mcp_servers if mcp_servers is None else mcp_servers,
+            inherited_environment=self.environment,
+        )
+
 
 class DescribeValidateTests(AdapterCase):
-    def test_describe_reports_the_frozen_api_and_no_effort(self):
+    def test_describe_reports_the_frozen_api_and_no_write(self):
         info = self.adapter.describe()
         self.assertEqual((info.name, info.adapter_api_version), (RUNTIME_NAME, ADAPTER_API_VERSION))
         self.assertIn(Capability.STEER, info.capabilities)
+        self.assertNotIn(Capability.WRITE, info.capabilities)
         self.assertNotIn(Capability.EFFORT, info.capabilities)
         self.assertNotIn(Capability.HOOKS, info.capabilities)
 
-    def test_validate_refuses_cli_mode_and_hooks(self):
+    def test_validate_refuses_cli_mode_hooks_and_uncanonical_models(self):
         with self.assertRaises(ValidationError):
             self.adapter.validate(runtime_config(self.binary, self.home, service_mode=None))
         with self.assertRaises(ValidationError):
@@ -261,17 +327,109 @@ class DescribeValidateTests(AdapterCase):
                     hooks=(RuntimeHookConfig("PostToolUse", ("agent-run",)),),
                 )
             )
+        with self.assertRaises(ValidationError):
+            self.adapter.validate(runtime_config(self.binary, self.home, models=("minimax-m3",)))
 
-    def test_materialize_writes_only_below_the_generated_config_home(self):
-        digest = self.adapter.materialize(self.config, self.home)
+
+class MaterializeTests(AdapterCase):
+    def test_generated_config_is_the_exact_proven_v2_document(self):
+        digest = self.materialize()
         path = self.home / CONFIG_RELATIVE_PATH
-        document = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(len(digest), 64)
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(digest, content_hash(text))
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertIn(PRIMARY_AGENT, document["agent"])
-        self.assertEqual(document["permission"]["external_directory"], "ask")
-        self.assertEqual(document["permission"]["bash"], "deny")
-        self.assertEqual(digest, self.adapter.materialize(self.config, self.home))
+        self.assertEqual(
+            json.loads(text),
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "share": "disabled",
+                "autoupdate": False,
+                "model": MODEL,
+                "permission": {
+                    "bash": "deny",
+                    "edit": "deny",
+                    "write": "deny",
+                    "webfetch": "deny",
+                    "external_directory": "ask",
+                },
+                "agents": {
+                    PRIMARY_AGENT: {
+                        "mode": "primary",
+                        "model": MODEL,
+                        "permission": {
+                            "bash": "deny",
+                            "edit": "deny",
+                            "write": "deny",
+                            "webfetch": "deny",
+                            "external_directory": "ask",
+                        },
+                    },
+                    VERIFY_AGENT: {
+                        "mode": "subagent",
+                        "model": MODEL,
+                        "permission": {
+                            "bash": "deny",
+                            "edit": "deny",
+                            "write": "deny",
+                            "webfetch": "deny",
+                            "external_directory": "deny",
+                        },
+                    },
+                },
+                "skills": ["review"],
+                "mcp": {
+                    "servers": {
+                        "docs": {
+                            "type": "local",
+                            "command": [str(self.mcp_command), "--root", "/docs"],
+                            "environment": {"DOCS_TOKEN": "secret"},
+                            "enabled": True,
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(digest, self.materialize())
+
+    def test_permission_order_is_preserved_on_disk(self):
+        self.materialize()
+        text = (self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8")
+        order = [key for key in json.loads(text)["permission"]]
+        self.assertEqual(order, ["bash", "edit", "write", "webfetch", "external_directory"])
+        self.assertLess(text.index('"bash"'), text.index('"external_directory"'))
+
+    def test_mcp_servers_is_a_required_keyword(self):
+        with self.assertRaises(TypeError):
+            self.adapter.materialize(self.config, self.home)
+
+    def test_only_selected_servers_are_written(self):
+        self.materialize()
+        document = json.loads((self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(list(document["mcp"]["servers"]), ["docs"])
+
+    def test_unresolved_non_stdio_and_unset_mcp_definitions_are_refused(self):
+        with self.assertRaises(ValidationError) as missing:
+            self.materialize(mcp_servers={})
+        self.assertIn("not in the resolved", str(missing.exception))
+        with self.assertRaises(ValidationError) as transport:
+            self.materialize(
+                mcp_servers={"docs": McpConfig("http", self.mcp_command, (), ())}
+            )
+        self.assertIn("stdio", str(transport.exception))
+        with self.assertRaises(ValidationError):
+            self.adapter.materialize(
+                self.config,
+                self.home,
+                mcp_servers=self.mcp_servers,
+                inherited_environment={"PATH": "/usr/bin"},
+            )
+        with self.assertRaises(ValidationError):
+            self.materialize(mcp_servers={"docs": {"transport": "stdio"}})
+
+    def test_render_is_pure_and_writes_nothing(self):
+        before = sorted(path.name for path in self.home.iterdir())
+        render_config(self.config, self.mcp_servers, inherited_environment=self.environment)
+        self.assertEqual(sorted(path.name for path in self.home.iterdir()), before)
 
 
 class ProbeAndPrepareTests(AdapterCase):
@@ -284,165 +442,301 @@ class ProbeAndPrepareTests(AdapterCase):
         self.assertTrue(proven.available)
         self.assertEqual(proven.version, "2.1.0")
 
+    def test_probe_reproves_the_pid_and_the_config_hash(self):
+        self.prove_service(pid=2 ** 31 - 1)
+        dead = self.adapter.probe(self.config, self.home)
+        self.assertFalse(dead.available)
+        self.assertIn("is gone", dead.reason)
+
+        self.prove_service()
+        self.assertTrue(self.adapter.probe(self.config, self.home).available)
+        self.adapter.materialize(
+            self.config,
+            self.home,
+            mcp_servers={"docs": McpConfig("stdio", self.mcp_command, ("--root", "/other"), ())},
+            inherited_environment=self.environment,
+        )
+        changed = self.adapter.probe(self.config, self.home)
+        self.assertFalse(changed.available)
+        self.assertIn("changed after the service was proven", changed.reason)
+
     def test_models_and_prepare_refuse_without_a_proven_service(self):
         self.assertEqual(self.adapter.models(self.config, self.home), ())
         with self.assertRaises(ServiceIsolationError):
+            self.prepare()
+
+    def test_prepare_attaches_to_the_proven_service_and_starts_no_second_serve(self):
+        descriptor = self.prove_service()
+        plan = self.prepare()
+        config_home, _ = service_home_paths(self.home)
+        self.assertEqual(plan.argv, ())
+        self.assertEqual(plan.cwd, self.workdir)
+        self.assertEqual(plan.environment["XDG_CONFIG_HOME"], str(config_home))
+        self.assertEqual(plan.environment["OPENCODE_DISABLE_CLAUDE_CODE"], "1")
+        self.assertEqual(plan.environment["PATH"], SERVICE_PATH)
+        self.assertNotIn("DOCS_TOKEN", plan.environment)
+        self.assertEqual(plan.runtime_stream_path, self.agent_dir / "runtime.jsonl")
+        self.assertIn("do the thing", plan.initial_input)
+        self.assertEqual(plan.adapter_state["service"]["pid"], descriptor.pid)
+        self.assertEqual(plan.adapter_state["service"]["config_hash"], descriptor.config_hash)
+        self.assertEqual(
+            plan.adapter_state["model"], {"providerID": "opencode", "modelID": "minimax-m3"}
+        )
+        self.assertEqual(plan.adapter_state["agent"], PRIMARY_AGENT)
+        self.assertNotIn("write_roots", plan.adapter_state)
+
+    def test_prepare_unions_the_profile_and_request_read_roots(self):
+        self.prove_service()
+        plan = self.prepare()
+        self.assertEqual(
+            sorted(plan.adapter_state["read_roots"]),
+            sorted([str(self.read_root), str(self.request_root)]),
+        )
+
+    def test_prepare_collapses_a_nested_request_root_into_the_profile_root(self):
+        self.prove_service()
+        nested = self.read_root / "inner"
+        nested.mkdir()
+        request = _replace(self.request, read_roots=(nested,))
+        plan = self.prepare(request=request)
+        self.assertEqual(plan.adapter_state["read_roots"], [str(self.read_root)])
+
+    def test_prepare_refuses_a_config_the_service_was_not_proven_with(self):
+        self.prove_service()
+        with self.assertRaises(ServiceIsolationError) as caught:
+            self.prepare(
+                mcp_servers={"docs": McpConfig("stdio", self.mcp_command, ("--root", "/other"), ())}
+            )
+        self.assertIn("proven with a different generated config", str(caught.exception))
+
+    def test_prepare_refuses_write(self):
+        self.prove_service()
+        writable = AgentProfile("implement", "body", True, (self.read_root,))
+        with self.assertRaises(ValidationError) as caught:
+            self.prepare(request=_replace(self.request, write=True), profile=writable)
+        self.assertIn("no write capability", str(caught.exception))
+
+    def test_prepare_refuses_unsupported_requests(self):
+        self.prove_service()
+        with self.assertRaises(ValidationError):
+            self.prepare(request=_replace(self.request, model="opencode/unlisted"))
+        with self.assertRaises(ValidationError):
+            self.prepare(request=_replace(self.request, effort="high"))
+        with self.assertRaises(ValidationError):
+            self.prepare(
+                request=_replace(self.request, output_schema={"type": "object", "raw": True})
+            )
+        with self.assertRaises(ValidationError):
+            self.prepare(request=_replace(self.request, output_schema={"type": "string"}))
+
+    def test_prepare_requires_the_mcp_servers_keyword(self):
+        self.prove_service()
+        with self.assertRaises(TypeError):
             self.adapter.prepare(
                 self.request, self.profile, self.config, self.home, self.agent_dir
             )
 
-    def test_prepare_carries_isolated_environment_and_bounded_state(self):
-        self.prove_service()
-        plan = self.adapter.prepare(
-            self.request, self.profile, self.config, self.home, self.agent_dir
-        )
-        config_home, _ = service_home_paths(self.home)
-        self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(plan.environment["XDG_CONFIG_HOME"], str(config_home))
-        self.assertEqual(plan.environment["OPENCODE_DISABLE_CLAUDE_CODE"], "1")
-        self.assertEqual(plan.runtime_stream_path, self.agent_dir / "runtime.jsonl")
-        self.assertIn("do the thing", plan.initial_input)
-        self.assertEqual(plan.adapter_state["write_roots"], [str(self.workdir)])
-        self.assertEqual(plan.adapter_state["read_roots"], [str(self.read_root)])
-        self.assertEqual(plan.adapter_state["agent"], PRIMARY_AGENT)
 
-    def test_prepare_refuses_unsupported_requests(self):
-        self.prove_service()
+class FakeService:
+    """Enough of the proven v2 service to drive one session end to end."""
 
-        def prepare(request, profile=None):
-            return self.adapter.prepare(
-                request, profile or self.profile, self.config, self.home, self.agent_dir
-            )
-
-        with self.assertRaises(ValidationError):
-            prepare(_replace(self.request, model="unlisted-model"))
-        with self.assertRaises(ValidationError):
-            prepare(_replace(self.request, effort="high"))
-        with self.assertRaises(ValidationError):
-            prepare(_replace(self.request, output_schema={"type": "object", "raw": True}))
-        with self.assertRaises(ValidationError):
-            prepare(_replace(self.request, output_schema={"type": "string"}))
-        with self.assertRaises(ValidationError):
-            prepare(self.request, AgentProfile("review", "body", False, ()))
-
-    def test_read_root_never_becomes_a_write_root(self):
-        self.prove_service()
-        nested = self.read_root / "inner"
-        nested.mkdir()
-        profile = AgentProfile("implement", "body", True, (self.read_root,))
-        request = _replace(self.request, workdir=nested)
-        with self.assertRaises(ValidationError):
-            self.adapter.prepare(request, profile, self.config, self.home, self.agent_dir)
-
-
-class FakeClient:
-    def __init__(self, states, messages):
-        self.states = list(states)
-        self._messages = messages
+    def __init__(self, directory, statuses, message_pages, permission_pages=()):
+        self.directory = Path(directory)
+        self.statuses = list(statuses)
+        self.message_pages = list(message_pages)
+        self.permission_pages = list(permission_pages)
         self.calls = []
 
-    def poll(self, path, ready, *, deadline_seconds, interval_seconds=0.25):
-        while self.states:
-            payload = self.states.pop(0)
-            if ready(payload):
-                return payload
-        raise AssertionError("state never settled")
+    def _capture(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        descriptor, name = tempfile.mkstemp(dir=self.directory, prefix="reply.", suffix=".json")
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(body)
+        return HttpResponse(status=200, path="/fake", body_path=Path(name), body_bytes=len(body))
+
+    def _next(self, pages, default):
+        if not pages:
+            return default
+        return pages.pop(0) if len(pages) > 1 else pages[0]
+
+    def session_status(self):
+        self.calls.append(("session_status",))
+        entry = self._next(self.statuses, None)
+        return {} if entry is None else {"ses_1": entry}
 
     def messages(self, session_id):
         self.calls.append(("messages", session_id))
-        return _Captured(self._messages)
+        return self._capture(self._next(self.message_pages, []))
 
-    def create_session(self, payload):
-        self.calls.append(("create_session", payload))
-        return {"id": "ses_1"}
-
-    def prompt(self, session_id, payload):
-        self.calls.append(("prompt", session_id, payload))
-        return {"ok": True}
-
-    def steer(self, session_id, payload):
-        self.calls.append(("steer", session_id, payload))
-        return {"ok": True}
-
-    def interrupt(self, session_id):
-        self.calls.append(("interrupt", session_id))
-        return {"ok": True}
+    def permissions(self, session_id):
+        self.calls.append(("permissions", session_id))
+        return self._capture(self._next(self.permission_pages, []))
 
     def answer_permission(self, session_id, permission_id, payload):
-        self.calls.append(("permission", permission_id, dict(payload)))
-        return {"ok": True}
+        self.calls.append(("answer_permission", permission_id, dict(payload)))
+        return {}
 
+    def create_session(self, payload):
+        self.calls.append(("create_session", dict(payload)))
+        return {"id": "ses_1"}
 
-class _Captured:
-    def __init__(self, payload):
-        self._payload = payload
+    def prompt_async(self, session_id, payload):
+        self.calls.append(("prompt_async", session_id, dict(payload)))
+        return {}
 
-    def mapping(self):
-        return self._payload
+    def abort(self, session_id):
+        self.calls.append(("abort", session_id))
+        return {}
 
 
 class SessionTests(AdapterCase):
-    def session(self, client, broker=None):
-        self.sink = FakeSink()
-        return OpenCodeRuntimeSession(client, "ses_1", self.sink, broker=broker)
+    def setUp(self):
+        super().setUp()
+        self.captures = self.root / "captures"
+        self.captures.mkdir()
+        self.clock = 0.0
+        self.slept = []
 
-    def test_wait_emits_transcript_and_blocked_summary(self):
-        client = FakeClient(
-            [{"state": "running"}, {"state": "completed"}],
-            {"messages": [message("user", "task"), message("assistant", "answer", at=2.0)]},
+    def advance(self, seconds):
+        self.slept.append(seconds)
+        self.clock += seconds
+
+    def session(self, service, broker=None, **kwargs):
+        self.sink = FakeSink()
+        return OpenCodeRuntimeSession(
+            service,
+            "ses_1",
+            self.sink,
+            broker=broker if broker is not None else PermissionBroker((self.read_root,)),
+            pid=4242,
+            response_dir=self.agent_dir,
+            model={"providerID": "opencode", "modelID": "minimax-m3"},
+            sleep=self.advance,
+            monotonic=lambda: self.clock,
+            **kwargs,
         )
-        broker = PermissionBroker((self.read_root,))
-        broker.decide({"id": "p1", "type": "bash", "path": "/"})
-        session = self.session(client, broker)
-        outcome = session.wait(5.0)
+
+    def remaining(self):
+        return sorted(path.name for path in self.captures.iterdir())
+
+    def test_initial_idle_is_ignored_until_the_session_is_busy(self):
+        answer = "готово ✅"
+        service = FakeService(
+            self.captures,
+            ["idle", "busy", "retrying", "idle"],
+            # One page per fetch: the first idle finds nothing, the last one the answer.
+            [[], [message("user", "task"), message("assistant", answer, at=2.0)]],
+        )
+        session = self.session(service)
+        outcome = session.wait(30.0)
         self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
         self.assertEqual(outcome.runtime_session_id, "ses_1")
+        self.assertEqual(session.pid, 4242)
         self.assertEqual(self.sink.sessions, ["ses_1"])
-        self.assertEqual([item.content for item in self.sink.messages], ["task", "answer"])
+        self.assertEqual([item.content for item in self.sink.messages], ["task", answer])
+        # The first idle was probed for output, found none, and kept waiting.
+        self.assertEqual([call for call in service.calls if call[0] == "messages"].__len__(), 2)
+        self.assertEqual(len(self.remaining()), 1)
+        self.assertEqual(self.sink.messages[0].raw_ref, str(self.captures / self.remaining()[0]))
+
+    def test_answer_is_recorded_as_exact_utf8_bytes_and_hash(self):
+        answer = "готово ✅"
+        service = FakeService(
+            self.captures, ["busy", "idle"], [[message("assistant", answer, at=2.0)]]
+        )
+        outcome = self.session(service).wait(30.0)
+        path = self.agent_dir / ANSWER_NAME
+        expected = answer.encode("utf-8")
+        self.assertEqual(path.read_bytes(), expected)
+        self.assertEqual(outcome.answer_path, path)
+        self.assertEqual(outcome.answer_bytes, len(expected))
+        self.assertEqual(outcome.answer_sha256, hashlib.sha256(expected).hexdigest())
+        self.assertNotEqual(outcome.answer_bytes, len(answer))
+
+    def test_idle_with_primary_output_settles_immediately(self):
+        service = FakeService(self.captures, ["idle"], [[message("assistant", "done", at=1.0)]])
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(self.slept, [])
+
+    def test_sub_agent_output_alone_does_not_settle_an_idle_session(self):
+        service = FakeService(
+            self.captures,
+            ["idle"],
+            [[message("assistant", "verifier notes", agent=VERIFY_AGENT, at=1.0)]],
+        )
+        session = self.session(service)
+        self.assertIsNone(session.wait(0.5))
+        self.assertEqual(self.remaining(), [])
+
+    def test_wait_times_out_without_leaking_captures(self):
+        service = FakeService(self.captures, ["idle"], [[]])
+        session = self.session(service)
+        self.assertIsNone(session.wait(1.0))
+        self.assertEqual(self.remaining(), [])
+        self.assertGreater(len(self.slept), 0)
+
+    def test_error_state_reports_a_failure_and_still_emits_the_transcript(self):
+        service = FakeService(
+            self.captures,
+            ["busy", {"state": "error", "error": {"name": "ProviderError", "message": "429"}}],
+            [[message("assistant", "partial", at=2.0)]],
+        )
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "ProviderError")
+        self.assertEqual([item.content for item in self.sink.messages], ["partial"])
+
+    def test_permissions_of_this_session_are_answered_exactly_once(self):
+        pending = [
+            {"id": "p1", "type": "external_directory", "path": str(self.read_root), "sessionID": "ses_1"},
+            {"id": "p2", "type": "bash", "sessionID": "ses_1"},
+            {"id": "p3", "type": "external_directory", "path": "/etc", "sessionID": "other"},
+        ]
+        service = FakeService(
+            self.captures, ["busy", "idle"], [[message("assistant", "done", at=1.0)]], [pending, pending]
+        )
+        outcome = self.session(service).wait(30.0)
+        answered = [call for call in service.calls if call[0] == "answer_permission"]
+        self.assertEqual(
+            [(call[1], call[2]["response"]) for call in answered],
+            [("p1", "once"), ("p2", "reject")],
+        )
         self.assertEqual(self.sink.events, [("permissions_blocked", {"bash": 1})])
-        self.assertIsNone(session.pid)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
 
     def test_steer_and_cancel_use_engine_native_calls(self):
-        client = FakeClient([{"state": "aborted"}], {"messages": []})
-        session = self.session(client)
+        service = FakeService(self.captures, ["busy", "aborted"], [[]])
+        session = self.session(service)
         session.steer("focus on tests")
         session.cancel(2.0)
-        self.assertEqual(client.calls[0][0], "steer")
-        self.assertEqual(client.calls[1], ("interrupt", "ses_1"))
-        self.assertEqual(session.wait(1.0).status, AgentStatus.CANCELLED)
+        steered = [call for call in service.calls if call[0] == "prompt_async"][0]
+        self.assertEqual(steered[2]["parts"], [{"type": "text", "text": "focus on tests"}])
+        self.assertEqual(steered[2]["model"], {"providerID": "opencode", "modelID": "minimax-m3"})
+        self.assertIn(("abort", "ses_1"), service.calls)
+        self.assertEqual(session.wait(30.0).status, AgentStatus.CANCELLED)
         with self.assertRaises(ValidationError):
             session.steer("  ")
 
-    def test_permissions_are_answered_once_and_rejected_otherwise(self):
-        client = FakeClient([{"state": "completed"}], {"messages": []})
-        session = self.session(client, PermissionBroker((self.read_root,)))
-        decisions = session.resolve_permissions(
-            {
-                "permissions": [
-                    {"id": "p1", "type": "external_directory", "path": str(self.read_root)},
-                    {"id": "p2", "type": "external_directory", "path": str(self.root)},
-                    {"id": "p3", "type": "bash", "path": "/"},
-                ]
-            }
-        )
-        self.assertEqual([item.granted for item in decisions], [True, False, False])
-        self.assertEqual(
-            [call[2]["response"] for call in client.calls], ["once", "reject", "reject"]
-        )
+    def test_malformed_status_payloads_are_refused(self):
+        service = FakeService(self.captures, [["not", "a", "status"]], [[]])
+        with self.assertRaises(ValidationError):
+            self.session(service).wait(30.0)
 
-    def test_launch_opens_a_session_and_prompts_it(self):
+    def test_launch_opens_a_session_and_prompts_it_asynchronously(self):
         self.prove_service()
-        plan = self.adapter.prepare(
-            self.request, self.profile, self.config, self.home, self.agent_dir
-        )
-        client = FakeClient([], {"messages": []})
+        plan = self.prepare()
+        service = FakeService(self.captures, ["busy"], [[]])
         sink = FakeSink()
-        session = self.adapter.launch(plan, sink, client=client)
+        session = self.adapter.launch(plan, sink, client=service)
         self.assertEqual(sink.sessions, ["ses_1"])
-        self.assertEqual(client.calls[0][0], "create_session")
-        self.assertEqual(client.calls[1][0], "prompt")
-        self.assertEqual(client.calls[1][2]["model"], "MiniMaxM3")
-        self.assertIsNone(session.pid)
+        self.assertEqual(service.calls[0][0], "create_session")
+        self.assertEqual(service.calls[1][0], "prompt_async")
+        self.assertEqual(
+            service.calls[1][2]["model"], {"providerID": "opencode", "modelID": "minimax-m3"}
+        )
+        self.assertEqual(service.calls[1][2]["agent"], PRIMARY_AGENT)
+        self.assertEqual(session.pid, plan.adapter_state["service"]["pid"])
 
 
 def _replace(request, **changes):
