@@ -28,7 +28,6 @@ from .launch import launch_detached
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
-from .supervisor import Supervisor, SupervisorSettings
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
@@ -482,7 +481,7 @@ def _launch_callback(home: Path):
     def launch(
         agent_id: AgentId,
         request: StartRequest,
-        adapter,
+        _adapter,
         plan,
         candidate_dir: Path,
     ) -> None:
@@ -493,28 +492,20 @@ def _launch_callback(home: Path):
             finally:
                 store.close()
 
-        def child(ready) -> None:
-            store = StateStore.open(state_db_path(home))
-            try:
-                config = load_config(config_path(home))
-                Supervisor(
-                    store,
-                    agent_id,
-                    adapter,
-                    plan,
-                    answer_path=candidate_dir / "answer.md",
-                    timeout_seconds=request.timeout_seconds,
-                    settings=SupervisorSettings(
-                        warning_fraction=config.core.warning_fraction
-                    ),
-                    ready=ready,
-                ).run()
-            finally:
-                store.close()
-
+        # The exec'd supervisor reloads config and adapter itself; only the plan
+        # travels, because its environment carries live secrets.
         launch_detached(
-            child,
-            post_terminal=lambda: _dispatch_once(home),
+            {
+                "agent_id": str(agent_id),
+                "home": str(home),
+                "runtime": request.runtime,
+                "timeout_seconds": request.timeout_seconds,
+                "answer_path": str(candidate_dir / "answer.md"),
+                "agent_dir": str(candidate_dir),
+                "warning_fraction": load_config(config_path(home)).core.warning_fraction,
+                "plan": plan.to_payload(),
+            },
+            executable=sys.executable,
             post_terminal_timeout_seconds=_POST_TERMINAL_TIMEOUT_SECONDS,
             post_reap=post_reap,
         )

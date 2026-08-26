@@ -807,7 +807,7 @@ CLI / MCP / runtime hook
         v
 service.start()
   validate -> atomic admission/idempotent row -> private 0700 agent directory
-           -> prepare -> spawn detached supervisor -> ready ack -> agent_id
+           -> prepare -> fork+exec detached supervisor -> ready ack -> agent_id
                                       |
                                       v
                        supervisor <agent_id>
@@ -842,6 +842,19 @@ UserPromptSubmit hook
   -> read-only SQLite query
   -> bounded capacity + active-agent summary
 ```
+
+The supervisor is detached by `fork` immediately followed by `execv` of
+`python -m agent_run.supervisor_main`, never by a bare fork. The start CLI always
+has `state.db` open at that point, and on macOS a forked child of a process that
+has used SQLite segfaults inside `sqlite3.connect` roughly half the time; only a
+fresh interpreter image clears that inherited state. Between fork and exec the
+child runs nothing but `setsid` and the `execv`. Everything the supervisor needs
+— agent id, home, runtime name, timeout, answer path, warning fraction, and the
+serialized `LaunchPlan` — crosses one private pipe as JSON, because
+`LaunchPlan.environment` carries live secrets that must never reach argv or disk.
+The parent still verifies the reported pid, waits for the same READY token, and
+cleans up the exact child group on timeout; the exec'd child performs its own
+post-terminal delivery dispatch.
 
 Supervisor rules:
 

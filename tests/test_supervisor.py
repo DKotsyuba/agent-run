@@ -520,6 +520,31 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.agent()["status"], "failed")
         self.assertEqual(self.agent()["failure_text"], "engine missing")
 
+    def test_a_base_exception_during_launch_is_durable_and_re_raised(self) -> None:
+        adapter = FakeAdapter(None)
+
+        def interrupt() -> None:
+            raise KeyboardInterrupt("supervisor killed")
+
+        adapter.on_launch = interrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.supervisor(adapter, FakeOps()).run()
+        self.assertEqual(self.agent()["status"], "failed")
+        self.assertEqual(self.agent()["failure_kind"], "launch_failed")
+        self.assertEqual(self.agent()["failure_text"], "supervisor killed")
+
+    def test_a_base_exception_after_launch_is_durable_and_re_raised(self) -> None:
+        ops = FakeOps()
+
+        def interrupt(_polls: int) -> None:
+            raise KeyboardInterrupt("supervisor killed mid-run")
+
+        session = FakeSession(ops, on_wait=interrupt)
+        with self.assertRaises(KeyboardInterrupt):
+            self.supervisor(FakeAdapter(session), ops).run()
+        self.assertEqual(self.agent()["status"], "failed")
+        self.assertEqual(self.agent()["failure_kind"], "supervision_failed")
+
     def test_invalid_settings_are_refused_before_adapter_launch(self) -> None:
         adapter = FakeAdapter(FakeSession(FakeOps()))
         invalid = (
