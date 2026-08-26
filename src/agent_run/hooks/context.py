@@ -55,7 +55,9 @@ def build_context(
     at = float(at)
     session_id = store.find_orchestrator_session(ref)
 
-    capacity_text, capacity_key = _capacity_block(store, at)
+    capacity_text, capacity_key = _capacity_block(
+        store, at, config.capacity.sample_retention
+    )
     agents = () if session_id is None else _active_agents(store, session_id)
     active_text, active_key = _active_block(agents, at)
     context_key = _combine_key(capacity_key, active_key)
@@ -66,8 +68,10 @@ def build_context(
     return ContextResult(session_id, context_key, text if changed else "", changed)
 
 
-def _capacity_block(store: StateStore, at: float) -> tuple[str, str]:
-    series = history_module.load_series(store)
+def _capacity_block(
+    store: StateStore, at: float, retention: int
+) -> tuple[str, str]:
+    series = history_module.load_series(store, retention=retention)
     forecasts = forecast_module.build_forecasts(series, now=at)
     items = advice_module.build_advice(forecasts)
     key = advice_module.advice_key(items)

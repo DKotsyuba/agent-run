@@ -32,20 +32,17 @@ class CapacitySeries:
 
 
 def load_series(
-    store: StateStore, *, runtime: str | None = None, limit: int = 500
+    store: StateStore, *, retention: int, runtime: str | None = None
 ) -> tuple[CapacitySeries, ...]:
-    """Load stored samples grouped per identity, newest first, unfiltered by staleness.
+    """Load globally bounded samples grouped per identity, newest first.
 
-    ``recent_capacity_samples`` filters rows by validity as of a reference time;
-    passing ``at=0.0`` keeps every stored row (valid_until is always >= 0 when
-    set) so trend calculations retain history that has since expired for
-    "current" reporting purposes. Freshness for reporting is decided later by
-    the forecast, using each row's own ``valid_until``.
+    Freshness for reporting is decided later by the forecast, using each row's
+    own ``valid_until``; expired rows remain available for same-reset trends.
     """
 
     if not isinstance(store, StateStore):
         raise ValidationError("store must be a StateStore")
-    rows = store.recent_capacity_samples(at=0.0, runtime=runtime, limit=limit)
+    rows = store.capacity_sample_history(retention=retention, runtime=runtime)
     grouped: dict[CapacityKey, list[NormalizedSample]] = {}
     for row in rows:
         key = CapacityKey(

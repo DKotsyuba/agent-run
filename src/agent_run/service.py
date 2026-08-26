@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeAlias
@@ -247,6 +247,11 @@ class AgentService:
     def start(self, request: StartRequest) -> StartResult:
         if not isinstance(request, StartRequest):
             raise ValidationError("request must be a StartRequest")
+        if request.timeout_seconds is None:
+            request = replace(
+                request,
+                timeout_seconds=self._config.core.default_timeout_seconds,
+            )
         runtime = self._runtime_config(request.runtime)
         adapter = self._registry.load(
             request.runtime, self._required_capabilities(request, runtime)
@@ -491,7 +496,11 @@ class AgentService:
             name for name, runtime in self._config.runtimes.items() if runtime.enabled
         }
         series = tuple(
-            item for item in load_series(self._store) if item.key.runtime in enabled
+            item
+            for item in load_series(
+                self._store, retention=self._config.capacity.sample_retention
+            )
+            if item.key.runtime in enabled
         )
         items = build_advice(build_forecasts(series, now=observed_at))
         ordered = tuple(

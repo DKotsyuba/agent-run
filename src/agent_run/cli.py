@@ -60,7 +60,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--workdir", default=os.getcwd())
     start.add_argument("--write", action="store_true")
     start.add_argument("--effort")
-    start.add_argument("--timeout", type=float, default=480)
+    start.add_argument("--timeout", type=float)
     start.add_argument("--read-root", action="append", default=[])
     start.add_argument("--output-schema")
     start.add_argument("--request-id")
@@ -228,6 +228,7 @@ def _ref(args: argparse.Namespace, *, required: bool = False) -> OrchestratorRef
 
 def _request(args: argparse.Namespace, stream: TextIO) -> StartRequest:
     schema = None if args.output_schema is None else _object(args.output_schema, "output schema")
+    timeout = {} if args.timeout is None else {"timeout_seconds": args.timeout}
     return StartRequest(
         args.runtime,
         args.model,
@@ -236,7 +237,7 @@ def _request(args: argparse.Namespace, stream: TextIO) -> StartRequest:
         Path(args.workdir),
         write=args.write,
         effort=args.effort,
-        timeout_seconds=args.timeout,
+        **timeout,
         read_roots=tuple(Path(root) for root in args.read_root),
         output_schema=schema,
         orchestrator=_ref(args),

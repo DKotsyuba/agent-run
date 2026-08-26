@@ -140,7 +140,7 @@ class CapacityForecastTests(unittest.TestCase):
                     observed_at=now,
                     valid_until=now + 60,
                 )
-                (series,) = load_series(store)
+                (series,) = load_series(store, retention=2)
                 (forecast,) = build_forecasts([series], now=now)
             finally:
                 store.close()

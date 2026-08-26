@@ -172,6 +172,33 @@ class AgentServiceTests(unittest.TestCase):
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
 
+    def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
+        config = replace(
+            self.config,
+            core=replace(self.config.core, default_timeout_seconds=7),
+        )
+        launched = []
+        service = AgentService(
+            config,
+            self.store,
+            self.root,
+            launch=lambda *args: launched.append(args),
+            now=lambda: 100.0,
+        )
+
+        defaulted = service.start(self.request(request_id="default-timeout"))
+        explicit = service.start(
+            replace(
+                self.request(request_id="explicit-timeout"),
+                timeout_seconds=480,
+            )
+        )
+
+        self.assertEqual(launched[0][1].timeout_seconds, 7)
+        self.assertEqual(launched[1][1].timeout_seconds, 480)
+        self.assertEqual(self.store.get_agent(defaulted.agent_id)["timeout_seconds"], 7)
+        self.assertEqual(self.store.get_agent(explicit.agent_id)["timeout_seconds"], 480)
+
     def test_service_passes_caps_and_refusal_never_launches_or_creates_artifacts(self) -> None:
         runtime = replace(
             self.config.runtimes["fake"], max_active_agents=1
@@ -183,7 +210,7 @@ class AgentServiceTests(unittest.TestCase):
         )
         request = self.request(request_id="already-active")
         existing = self.store.create_agent(
-            request,
+            replace(request, timeout_seconds=480),
             task_summary="do work",
             config_revision="cfg-1",
             at=99,

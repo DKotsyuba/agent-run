@@ -120,5 +120,6 @@ def collect_once(
         for name, runtime_config in config.runtimes.items()
         if runtime_config.enabled
     )
+    store.prune_capacity_samples(config.capacity.sample_retention)
     finished = time.time() if at is None else at
     return CollectionReport(started, finished, results)

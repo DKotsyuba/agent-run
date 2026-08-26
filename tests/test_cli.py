@@ -212,6 +212,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(request.request_id, "request-1")
         self.assertEqual(request.orchestrator.external_turn_id, "turn-1")
 
+    def test_start_preserves_omitted_and_explicit_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = [
+                "start", "--runtime", "fake", "--model", "model",
+                "--profile", "p", "--task", "t", "--workdir", directory,
+            ]
+            omitted = FakeService()
+            explicit = FakeService()
+            self.assertEqual(self.run_cli(base, service=omitted)[0], 0)
+            self.assertEqual(
+                self.run_cli(base + ["--timeout", "480"], service=explicit)[0], 0
+            )
+        self.assertIsNone(omitted.request.timeout_seconds)
+        self.assertEqual(explicit.request.timeout_seconds, 480)
+
     def test_json_supports_dataclasses_enums_paths_and_mappingproxy(self):
         code, output, error = self.run_cli(["status", AGENT_ID])
         self.assertEqual(code, 0)
@@ -438,7 +453,10 @@ class CliTests(unittest.TestCase):
             store = cli.StateStore.initialize(home / "state.db")
             agent_id = str(
                 store.create_agent(
-                    StartRequest("codex", "model", "profile", "task", workdir),
+                    StartRequest(
+                        "codex", "model", "profile", "task", workdir,
+                        timeout_seconds=480,
+                    ),
                     task_summary="summary",
                     config_revision="cfg-1",
                     at=1,
@@ -686,7 +704,10 @@ class CliTests(unittest.TestCase):
             home = Path(directory)
             workdir = home / "work"
             workdir.mkdir()
-            request = StartRequest("codex", "model", "review", "task", workdir)
+            request = StartRequest(
+                "codex", "model", "review", "task", workdir,
+                timeout_seconds=480,
+            )
             store = Mock()
             supervisor = Mock()
             ready = object()

@@ -81,6 +81,13 @@ class DomainTests(unittest.TestCase):
             root = Path(directory).resolve()
             request = StartRequest("codex", "model", "profile", "task", root)
             self.assertEqual(request.workdir, root)
+            self.assertIsNone(request.timeout_seconds)
+            self.assertEqual(
+                StartRequest(
+                    "codex", "model", "profile", "task", root, timeout_seconds=480
+                ).timeout_seconds,
+                480,
+            )
             with self.assertRaises(ValidationError):
                 StartRequest(
                     "codex",
