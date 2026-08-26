@@ -270,6 +270,11 @@ Rules:
   runtime adapter;
 - `env_from` and auth bridges name environment variables or source files but do
   not contain secret values;
+- `core.default_timeout_seconds` applies only when a start request omits its
+  timeout; an explicit positive timeout is preserved;
+- `capacity.sample_retention` bounds collector-managed history to the global
+  newest rows ordered by `observed_at DESC, id DESC`, including expired rows
+  used for trends;
 - a runtime disabled in config cannot be launched or queried for live capacity;
 - generated runtime configuration is content-addressed by a configuration hash;
 - runtime-owned session/cache/trust state is not erased during regeneration;
@@ -313,7 +318,7 @@ class StartRequest:
     workdir: Path
     write: bool = False
     effort: str | None = None
-    timeout_seconds: float = 480
+    timeout_seconds: float | None = None
     read_roots: tuple[Path, ...] = ()
     output_schema: dict | None = None
     orchestrator: OrchestratorRef | None = None
@@ -349,7 +354,8 @@ class Outcome:
 Public agent ids use `ag-YYYYMMDD-HHMMSS-<10 lowercase hex>`. Domain constructors
 require actual enum instances rather than accepting equal raw strings. Message
 timestamps are finite and nonnegative, message content is nonblank, outcomes are
-terminal, and answer byte counts are nonnegative.
+terminal, and answer byte counts are nonnegative. `timeout_seconds=None` means
+the caller omitted the timeout; any supplied timeout remains positive and finite.
 
 Transitions:
 
@@ -473,6 +479,8 @@ Contract rules:
 - `materialize` and `prepare` receive the resolved MCP servers as a required
   keyword-only `mcp_servers` mapping; adapters never read ambient config to
   resolve the names listed in `RuntimeConfig.mcp`;
+- `prepare` receives only a request whose timeout is resolved to a positive,
+  finite value; adapters never consume the omission marker;
 - `prepare` starts nothing and returns no live handles;
 - `launch` runs only inside the detached supervisor;
 - `RuntimeSession.cancel` performs engine-native interruption before the shared
@@ -705,9 +713,19 @@ class StateStore:
         agent_id: str | AgentId | None = None,
         at: float | None = None,
     ) -> AgentCreation: ...
+
+    def prune_capacity_samples(self, retention: int) -> int: ...
+
+    def capacity_sample_history(
+        self,
+        *,
+        retention: int,
+        runtime: str | None = None,
+    ) -> list[dict[str, object]]: ...
 ```
 
 - `BEGIN IMMEDIATE` for state transitions and outbox claims;
+- agent creation refuses a request whose timeout omission has not been resolved;
 - start inserts the agent and initial event before supervisor spawn;
 - a caller-supplied `request_id` is globally idempotent before binding; under
   `BEGIN IMMEDIATE`, retries must match the serialized request, task summary,
@@ -723,6 +741,9 @@ class StateStore:
 - if terminal completion happens before orchestration binding, delivery remains
   `waiting_binding`; immutable binding later activates it in the same transaction;
 - expired delivery leases are reclaimable;
+- capacity pruning runs under `BEGIN IMMEDIATE` and atomically keeps the global
+  newest `retention` rows by `observed_at DESC, id DESC`; history uses the same
+  global bound and ordering without filtering expired rows;
 - terminal states never transition back;
 - state migrations are numbered SQL files, backed up before application, and
   applied in one transaction. No migration framework is needed.
@@ -861,6 +882,11 @@ Preserved behavior:
 - samples are normalized and private;
 - stale or incomplete sources become `unknown`;
 - limits are segmented by lane, window, target, reset, and source;
+- collection prunes once after all enabled runtimes produce success, failure, or
+  unsupported results, so a partial source failure cannot bypass retention;
+- service and context history readers use the same configured
+  `capacity.sample_retention`; expired rows remain available for reset-aligned
+  trends within that global bound;
 - advice is advisory and explicit owner choice wins;
 - partial source failure does not suppress healthy sources;
 - credential values and raw provider responses are never stored.
@@ -911,6 +937,10 @@ class AgentService(Protocol):
     def models(self) -> Mapping[str, tuple[ModelInfo, ...]]: ...
     def limits(self) -> CapacityReport: ...
 ```
+
+At the start boundary, `timeout_seconds=None` is replaced exactly once with
+`core.default_timeout_seconds` before adapter preparation, durable persistence,
+or detached launch. An explicit positive timeout is passed through unchanged.
 
 `summary` requires exactly one of `agent_id` or `orchestrator`. Trusted
 completion notices use `summary(agent_id)`; session-scoped views use the
@@ -1064,6 +1094,15 @@ Core acceptance tests:
 18. `doctor` flags plaintext-looking secrets, missing homes, untrusted hooks,
     stale capacity, dead supervisors, and suspected orphans without mutating
     state.
+19. CLI, MCP, and direct service starts apply the configured timeout when it is
+    omitted, preserve an explicit timeout, and refuse unresolved direct
+    persistence.
+20. Capacity collection prunes after all runtime results, including partial
+    failures, and keeps exactly the configured global newest rows with `id` as
+    the stable tie-breaker.
+21. Service and context capacity history use the configured retention, include
+    expired trend rows within that bound, and do not fall back to a separate
+    hardcoded limit.
 
 ## 17. Decisions
 
