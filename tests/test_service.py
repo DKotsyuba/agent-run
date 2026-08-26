@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
@@ -169,6 +171,58 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(launched[0], first.agent_id)
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
+
+    def test_service_passes_caps_and_refusal_never_launches_or_creates_artifacts(self) -> None:
+        runtime = replace(
+            self.config.runtimes["fake"], max_active_agents=1
+        )
+        config = replace(
+            self.config,
+            core=replace(self.config.core, max_active_agents=1),
+            runtimes={"fake": runtime},
+        )
+        request = self.request(request_id="already-active")
+        existing = self.store.create_agent(
+            request,
+            task_summary="do work",
+            config_revision="cfg-1",
+            at=99,
+        )
+        launched = []
+        service = AgentService(
+            config,
+            self.store,
+            self.root,
+            launch=lambda *args: launched.append(args),
+            now=lambda: 100.0,
+        )
+
+        with patch.object(
+            self.store,
+            "create_agent_limited",
+            wraps=self.store.create_agent_limited,
+        ) as limited:
+            duplicate = service.start(request)
+            with self.assertRaisesRegex(
+                ValidationError, "global active agent limit reached"
+            ):
+                service.start(self.request(request_id="distinct-request"))
+
+        self.assertFalse(duplicate.created)
+        self.assertEqual(duplicate.agent_id, existing.agent_id)
+        self.assertEqual(launched, [])
+        self.assertEqual(limited.call_count, 2)
+        for call in limited.call_args_list:
+            self.assertEqual(call.kwargs["global_limit"], 1)
+            self.assertEqual(call.kwargs["runtime_limit"], 1)
+        self.assertEqual(len(self.store.list_agents()), 1)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM events WHERE kind = 'created'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertFalse((self.root / "agents").exists())
 
     def test_launch_failure_is_durable_and_idempotent_retry_never_relaunches(self) -> None:
         calls: list[tuple] = []

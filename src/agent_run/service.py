@@ -281,10 +281,12 @@ class AgentService:
             candidate_dir,
             mcp_servers=mcp_servers,
         )
-        creation = self._store.create_agent(
+        creation = self._store.create_agent_limited(
             request,
             task_summary=self._task_summary(request.task),
             config_revision=revision,
+            global_limit=self._config.core.max_active_agents,
+            runtime_limit=runtime.max_active_agents,
             agent_id=candidate,
             at=self._now(),
         )

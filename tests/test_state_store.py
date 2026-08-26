@@ -146,6 +146,183 @@ class StateStoreTests(unittest.TestCase):
         self.assertTrue(first.created and second.created)
         self.assertNotEqual(first.agent_id, second.agent_id)
 
+    def test_concurrent_limited_creation_allows_exactly_one_process(self) -> None:
+        requests = (
+            self.request(
+                request_id="cap-a",
+                orchestrator=OrchestratorRef("codex_queue", "cap-a"),
+            ),
+            self.request(
+                request_id="cap-b",
+                orchestrator=OrchestratorRef("codex_queue", "cap-b"),
+            ),
+        )
+        barrier = Barrier(2)
+        database = self.root / "state.db"
+
+        def create_once(request):
+            store = StateStore.open(database)
+            try:
+                barrier.wait()
+                return store.create_agent_limited(
+                    request,
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    global_limit=1,
+                    runtime_limit=1,
+                    at=2,
+                )
+            finally:
+                store.close()
+
+        created = []
+        refused = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(create_once, request) for request in requests]
+            for future in futures:
+                try:
+                    created.append(future.result())
+                except ValidationError as error:
+                    refused.append(str(error))
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(refused, ["global active agent limit reached"])
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM events WHERE kind = 'created'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM orchestrator_sessions"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_limited_creation_checks_idempotency_before_caps_and_validates_limits(self) -> None:
+        request = self.request(
+            request_id="limited-duplicate",
+            orchestrator=OrchestratorRef("codex_queue", "limited-session"),
+        )
+        first = self.store.create_agent_limited(
+            request,
+            task_summary="summary",
+            config_revision="cfg-1",
+            global_limit=1,
+            runtime_limit=1,
+        )
+        duplicate = self.store.create_agent_limited(
+            request,
+            task_summary="summary",
+            config_revision="cfg-1",
+            global_limit=1,
+            runtime_limit=1,
+        )
+        self.assertTrue(first.created)
+        self.assertFalse(duplicate.created)
+        self.assertEqual(first.agent_id, duplicate.agent_id)
+        with self.assertRaisesRegex(ValidationError, "request_id was reused"):
+            self.store.create_agent_limited(
+                self.request(request_id="limited-duplicate", task="different"),
+                task_summary="summary",
+                config_revision="cfg-1",
+                global_limit=1,
+                runtime_limit=1,
+            )
+        for name, global_limit, runtime_limit in (
+            ("global bool", True, 1),
+            ("global fraction", 1.5, 1),
+            ("global zero", 0, 1),
+            ("runtime bool", 1, True),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValidationError, "must be a positive integer"
+            ):
+                self.store.create_agent_limited(
+                    self.request(task=name),
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    global_limit=global_limit,  # type: ignore[arg-type]
+                    runtime_limit=runtime_limit,  # type: ignore[arg-type]
+                )
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM orchestrator_sessions"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_global_runtime_caps_and_terminal_rows_release_capacity(self) -> None:
+        def request_for(runtime: str, task: str) -> StartRequest:
+            return StartRequest(runtime, "model", "profile", task, self.root)
+
+        first = self.store.create_agent_limited(
+            request_for("codex", "first"),
+            task_summary="first",
+            config_revision="cfg-1",
+            global_limit=2,
+            runtime_limit=1,
+        ).agent_id
+        with self.assertRaisesRegex(ValidationError, "runtime active agent limit"):
+            self.store.create_agent_limited(
+                request_for("codex", "runtime-refused"),
+                task_summary="runtime-refused",
+                config_revision="cfg-1",
+                global_limit=2,
+                runtime_limit=1,
+            )
+        self.store.create_agent_limited(
+            request_for("claude", "other"),
+            task_summary="other",
+            config_revision="cfg-1",
+            global_limit=2,
+            runtime_limit=1,
+        )
+        with self.assertRaisesRegex(ValidationError, "global active agent limit"):
+            self.store.create_agent_limited(
+                request_for("opencode", "global-refused"),
+                task_summary="global-refused",
+                config_revision="cfg-1",
+                global_limit=2,
+                runtime_limit=1,
+            )
+
+        self.store.transition(first, AgentStatus.STARTING, at=2)
+        self.store.transition(first, AgentStatus.RUNNING, at=3)
+        self.store.transition(
+            first,
+            AgentStatus.FAILED,
+            outcome=Outcome(AgentStatus.FAILED),
+            at=4,
+        )
+        replacement = self.store.create_agent_limited(
+            request_for("codex", "replacement"),
+            task_summary="replacement",
+            config_revision="cfg-1",
+            global_limit=2,
+            runtime_limit=1,
+        )
+        self.assertTrue(replacement.created)
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM agents").fetchone()[0],
+            3,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM events WHERE kind = 'created'"
+            ).fetchone()[0],
+            3,
+        )
+
     def test_session_lookup_and_agent_filter_are_read_only_and_composable(self) -> None:
         first = self.create(self.request(task="first"))
         second = self.create(self.request(task="second"))
