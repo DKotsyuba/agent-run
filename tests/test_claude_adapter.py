@@ -2,13 +2,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.adapters.base import Capability
+from agent_run.adapters.base import Capability, LimitSample
 from agent_run.adapters.claude.adapter import ADAPTER, ADAPTER_API_VERSION, ClaudeAdapter
 from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
@@ -84,12 +85,12 @@ class ClaudeAdapterTests(unittest.TestCase):
 
     # -- describe -----------------------------------------------------
 
-    def test_describe_reports_api_version_and_excludes_live_limits(self) -> None:
+    def test_describe_reports_api_version_and_supports_live_limits(self) -> None:
         info = self.adapter.describe()
         self.assertEqual(info.name, "claude")
         self.assertEqual(info.adapter_api_version, ADAPTER_API_VERSION)
         self.assertIn(Capability.WRITE, info.capabilities)
-        self.assertNotIn(Capability.LIVE_LIMITS, info.capabilities)
+        self.assertIn(Capability.LIVE_LIMITS, info.capabilities)
 
     # -- validate -------------------------------------------------------
 
@@ -121,7 +122,152 @@ class ClaudeAdapterTests(unittest.TestCase):
         models = self.adapter.models(self.runtime_config(), self.home)
         self.assertEqual(tuple(model.id for model in models), ("sonnet", "opus"))
 
+    def write_agent_runtime(self, agent_id: str, text: str, *, mtime: float | None = None) -> Path:
+        """Write one agent's runtime.jsonl, matching the real on-disk layout.
+
+        Agent dirs sit at ``<agent_run_home>/agents/<id>/``, a sibling of
+        this adapter's own ``<agent_run_home>/runtimes/claude/home`` (see
+        ``self.home``) -- both are three levels below the same root.
+        """
+
+        agent_dir = self.root / "agents" / agent_id
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        path = agent_dir / "runtime.jsonl"
+        path.write_text(text, encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def rate_limit_line(
+        self,
+        *,
+        five_hour: float = 0.14,
+        seven_day: float = 0.72,
+        five_hour_reset: int = 4102444800,
+        seven_day_reset: int = 4102444800,
+        secret: str = "not-sensitive",
+    ) -> str:
+        """One line matching the real captured ``rate_limit_event`` schema.
+
+        Shape confirmed from live canary transcripts (stream-json mode):
+        ``{"rate_limit_info": {..., "unifiedWindows": {"five_hour": {...},
+        "seven_day": {...}}}, "session_id": ..., "type": "rate_limit_event",
+        "uuid": ...}``.
+        """
+
+        return json.dumps(
+            {
+                "rate_limit_info": {
+                    "isUsingOverage": False,
+                    "overageDisabledReason": "org_level_disabled",
+                    "overageStatus": "rejected",
+                    "rateLimitType": "five_hour",
+                    "resetsAt": five_hour_reset,
+                    "status": "allowed",
+                    "unifiedWindows": {
+                        "five_hour": {"resetsAt": five_hour_reset, "utilization": five_hour},
+                        "seven_day": {"resetsAt": seven_day_reset, "utilization": seven_day},
+                    },
+                },
+                "session_id": "f27ed2f4-309e-4aed-b322-97a0c46759f8",
+                "type": "rate_limit_event",
+                "ignored": secret,
+            },
+            sort_keys=True,
+        )
+
     def test_limits_never_makes_a_live_call(self) -> None:
+        self.assertEqual(self.adapter.limits(self.runtime_config(), self.home), ())
+
+    def test_limits_missing_agents_dir_is_empty(self) -> None:
+        self.home.mkdir(parents=True)
+        self.assertEqual(self.adapter.limits(self.runtime_config(), self.home), ())
+
+    def test_limits_reads_the_newest_rate_limit_event_into_two_window_samples(self) -> None:
+        self.home.mkdir(parents=True)
+        secret = "raw-secret-must-not-escape"
+        self.write_agent_runtime("ag-1", self.rate_limit_line(secret=secret))
+
+        samples = self.adapter.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(
+            [(sample.lane, sample.window) for sample in samples],
+            [("usage", "five_hour"), ("usage", "seven_day")],
+        )
+        five_hour, seven_day = samples
+        self.assertAlmostEqual(five_hour.remaining_percent, 86.0)
+        self.assertAlmostEqual(seven_day.remaining_percent, 28.0)
+        self.assertEqual({sample.source for sample in samples}, {"runtime_stream_evidence"})
+        self.assertTrue(all(sample.observed_at is not None for sample in samples))
+        self.assertTrue(all(sample.reset_at is not None for sample in samples))
+        self.assertTrue(all(sample.target is None for sample in samples))
+        self.assertNotIn(secret, repr(samples))
+
+    def test_limits_prefers_the_newest_agent_directory(self) -> None:
+        self.home.mkdir(parents=True)
+        now = time.time()
+        self.write_agent_runtime(
+            "ag-older", self.rate_limit_line(five_hour=0.9), mtime=now - 30
+        )
+        self.write_agent_runtime(
+            "ag-newer", self.rate_limit_line(five_hour=0.1), mtime=now - 5
+        )
+
+        samples = self.adapter.limits(self.runtime_config(), self.home)
+
+        five_hour = next(sample for sample in samples if sample.window == "five_hour")
+        self.assertAlmostEqual(five_hour.remaining_percent, 90.0)
+
+    def test_limits_stale_event_has_unknown_remaining(self) -> None:
+        self.home.mkdir(parents=True)
+        now = time.time()
+        self.write_agent_runtime("ag-1", self.rate_limit_line(), mtime=now - 10_000)
+
+        samples = self.adapter.limits(self.runtime_config(), self.home)
+
+        self.assertEqual(len(samples), 2)
+        self.assertTrue(all(sample.observed_at is not None for sample in samples))
+        self.assertTrue(all(sample.remaining_percent is None for sample in samples))
+        self.assertEqual({sample.source for sample in samples}, {"unknown"})
+
+    def test_limits_malformed_or_shape_mismatched_events_yield_no_samples(self) -> None:
+        self.home.mkdir(parents=True)
+        cases = {
+            "not-json": "not json at all",
+            "wrong-type": json.dumps({"type": "assistant"}),
+            "missing-info": json.dumps({"type": "rate_limit_event"}),
+            "non-dict-windows": json.dumps(
+                {"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": "nope"}}
+            ),
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                agent_dir = self.root / "agents" / f"ag-{label}"
+                agent_dir.mkdir(parents=True)
+                (agent_dir / "runtime.jsonl").write_text(text, encoding="utf-8")
+                self.assertEqual(self.adapter.limits(self.runtime_config(), self.home), ())
+                agent_dir.joinpath("runtime.jsonl").unlink()
+                agent_dir.rmdir()
+
+    def test_limits_never_leaks_unrelated_fields_into_samples(self) -> None:
+        self.home.mkdir(parents=True)
+        secret = "sk-super-secret-value"
+        self.write_agent_runtime("ag-1", self.rate_limit_line(secret=secret))
+
+        samples = self.adapter.limits(self.runtime_config(), self.home)
+
+        for sample in samples:
+            self.assertIsInstance(sample, LimitSample)
+        self.assertNotIn(secret, repr(samples))
+        self.assertNotIn("f27ed2f4", repr(samples))
+
+    def test_limits_considers_only_the_newest_bounded_agent_files(self) -> None:
+        self.home.mkdir(parents=True)
+        now = time.time()
+        self.write_agent_runtime("ag-old-valid", self.rate_limit_line(), mtime=now - 100)
+        for index in range(24):
+            self.write_agent_runtime(f"ag-new-{index}", "not json at all", mtime=now + index)
+
         self.assertEqual(self.adapter.limits(self.runtime_config(), self.home), ())
 
     # -- probe -------------------------------------------------------------
