@@ -1,4 +1,7 @@
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,7 +15,7 @@ from agent_run.delivery.base import (
     CompletionNotice,
     DeliveryError,
 )
-from agent_run.delivery.codex_queue import CodexQueueTransport
+from agent_run.delivery.codex_queue import CodexQueueSender, CodexQueueTransport
 
 
 AGENT_ID = "ag-20260825-120000-0123456789"
@@ -104,6 +107,137 @@ class CodexQueueTransportTests(unittest.TestCase):
             transport.send("session-1", self.notice)  # type: ignore[arg-type]
         with self.assertRaises(ValidationError):
             transport.send(self.target, "done")  # type: ignore[arg-type]
+
+
+class RecordingRunner:
+    def __init__(self, *, returncode=0, stdout="", stderr="", error=None):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.error = error
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        if self.error is not None:
+            raise self.error
+        return subprocess.CompletedProcess(argv, self.returncode, self.stdout, self.stderr)
+
+
+class CodexQueueSenderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.executable = Path(self.temporary.name) / "codex"
+        self.executable.write_text("fake executable")
+        os.chmod(self.executable, 0o700)
+        self.environment = {
+            "SAFE": "present",
+            "CLAUDE_CODE_OAUTH_TOKEN": "secret",
+            "ANTHROPIC_API_KEY": "secret",
+            "ANTHROPIC_AUTH_TOKEN": "secret",
+        }
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def sender(self, runner, **kwargs) -> CodexQueueSender:
+        return CodexQueueSender(
+            self.executable,
+            runner=runner,
+            environment=self.environment,
+            **kwargs,
+        )
+
+    def test_exact_legacy_argv_no_stdin_and_sanitized_environment(self) -> None:
+        runner = RecordingRunner(stdout="Queued message remote-1 for thread session-1.\n")
+        sender = self.sender(runner)
+        message = "Trusted completion notice"
+
+        self.assertEqual(sender("session-1", message), "remote-1")
+        self.assertEqual(len(runner.calls), 1)
+        argv, kwargs = runner.calls[0]
+        self.assertEqual(
+            argv,
+            [
+                str(self.executable.resolve()),
+                "queue",
+                "--thread",
+                "session-1",
+                "--message",
+                message,
+            ],
+        )
+        self.assertEqual(kwargs["env"], {"SAFE": "present"})
+        self.assertEqual(kwargs["timeout"], 30.0)
+        self.assertEqual(
+            {name: kwargs[name] for name in ("capture_output", "text", "check", "shell")},
+            {"capture_output": True, "text": True, "check": False, "shell": False},
+        )
+        self.assertNotIn("stdin", kwargs)
+        self.assertNotIn("input", kwargs)
+
+    def test_zero_exit_without_message_id_is_still_proven_acceptance(self) -> None:
+        runner = RecordingRunner(stdout="message accepted")
+        self.assertIsNone(self.sender(runner)("session-1", "trusted message"))
+
+    def test_timeout_is_ambiguous_for_sender_and_transport(self) -> None:
+        runner = RecordingRunner(error=subprocess.TimeoutExpired(["codex"], 1))
+        sender = self.sender(runner)
+        with self.assertRaises(TimeoutError):
+            sender("session-1", "trusted message")
+
+        transport = CodexQueueTransport(sender)
+        notice = CompletionNotice("ntf_sender", AGENT_ID, AgentStatus.SUCCEEDED)
+        with self.assertRaises(AmbiguousDeliveryError):
+            transport.send(OrchestratorRef("codex_queue", "session-1"), notice)
+
+    def test_exact_missing_session_result_is_narrowly_classified(self) -> None:
+        runner = RecordingRunner(
+            returncode=1,
+            stderr="warning: harmless\nError: thread not found: gone\n",
+        )
+        with self.assertRaises(SessionGoneError):
+            self.sender(runner)("gone", "trusted message")
+
+        generic = RecordingRunner(returncode=1, stderr="thread not found: someone-else")
+        with self.assertRaises(DeliveryError):
+            self.sender(generic)("gone", "trusted message")
+
+    def test_generic_and_io_failures_are_stable_and_do_not_leak_output(self) -> None:
+        runner = RecordingRunner(returncode=7, stderr="credential-shaped secret")
+        with self.assertRaises(DeliveryError) as caught:
+            self.sender(runner)("session-1", "trusted message")
+        self.assertEqual(str(caught.exception), "codex queue exited with status 7")
+        self.assertNotIn("secret", str(caught.exception))
+
+        io_error = OSError("launch failed")
+        with self.assertRaises(OSError) as caught_io:
+            self.sender(RecordingRunner(error=io_error))("session-1", "trusted message")
+        self.assertIs(caught_io.exception, io_error)
+
+    def test_constructor_inputs_and_outputs_are_bounded_without_replacement_paths(self) -> None:
+        with self.assertRaises(ValidationError):
+            CodexQueueSender("codex")
+        os.chmod(self.executable, 0o600)
+        with self.assertRaises(ValidationError):
+            CodexQueueSender(self.executable)
+        os.chmod(self.executable, 0o700)
+        for kwargs in ({"timeout_seconds": 0}, {"max_output_bytes": 0}):
+            with self.assertRaises(ValidationError):
+                CodexQueueSender(self.executable, **kwargs)
+
+        sender = self.sender(RecordingRunner())
+        for session in ("", "x" * 513, "bad\x00session"):
+            with self.assertRaises(ValidationError):
+                sender(session, "trusted message")
+        with self.assertRaises(ValidationError):
+            sender("session-1", "x" * 4097)
+        with self.assertRaises(DeliveryError):
+            self.sender(RecordingRunner(stdout="x" * 9), max_output_bytes=8)(
+                "session-1", "trusted message"
+            )
+        for forbidden in ("start", "open", "create", "spawn", "launch"):
+            self.assertFalse(any(forbidden in name for name in dir(sender)))
 
 
 if __name__ == "__main__":
