@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from agent_run.domain import ACTIVE, AgentId
-from agent_run.errors import ValidationError
+from agent_run.errors import StateTransitionError, ValidationError
 
 from .db import integer, timestamp
 
@@ -65,16 +65,20 @@ def reconcile_reaped_supervisor(
         identity = row["supervisor_identity"]
         if not isinstance(pid, int) or not isinstance(pgid, int) or not isinstance(identity, str):
             continue
-        if store.reconcile(
-            str(row["id"]),
-            verdict="dead",
-            supervisor_pid=pid,
-            process_group_id=pgid,
-            expected_identity=identity,
-            alive=False,
-            checked_at=checked_at,
-            reason="detached supervisor exited",
-        ):
+        try:
+            committed = store.reconcile(
+                str(row["id"]),
+                verdict="dead",
+                supervisor_pid=pid,
+                process_group_id=pgid,
+                expected_identity=identity,
+                alive=False,
+                checked_at=checked_at,
+                reason="detached supervisor exited",
+            )
+        except (ValidationError, StateTransitionError):
+            continue  # one stale or concurrently changed row never aborts the sweep
+        if committed:
             changed.append(AgentId(str(row["id"])))
     return tuple(changed)
 
@@ -83,40 +87,40 @@ def reconcile_active_agents(store, *, at: float | None = None, limit: int = 100)
     """Boundedly close dead detached supervisors during an independent sweep."""
     from ..doctor import _probe_process
 
-    checked_at = timestamp(at)
     statuses = tuple(sorted(status.value for status in ACTIVE))
     placeholders = ",".join("?" for _ in statuses)
-    rows = store.connection.execute(
-        f"SELECT id, supervisor_pid, process_group_id, supervisor_identity FROM agents "
-        f"WHERE status IN ({placeholders}) ORDER BY created_at, id LIMIT ?",
-        (*statuses, limit),
+    rows = list(
+        store.connection.execute(
+            f"SELECT id, supervisor_pid, process_group_id, supervisor_identity FROM agents "
+            f"WHERE status IN ({placeholders}) ORDER BY created_at, id LIMIT ?",
+            (*statuses, limit),
+        )
     )
     changed = []
     for row in rows:
         pid, pgid, expected = row["supervisor_pid"], row["process_group_id"], row["supervisor_identity"]
         if not isinstance(pid, int) or not isinstance(pgid, int) or not isinstance(expected, str):
             continue
-        alive, identity, group_alive = _probe_process(pid, pgid)
+        # The recorded group is never signalled here: it may be reused, foreign,
+        # or shared, and orphan reporting stays diagnostic in the doctor.
+        alive, identity, _group_alive = _probe_process(pid, pgid)
+        # Time the proof after this row's probe, so a slow probe cannot be judged
+        # against a clock captured before the sweep started.
+        checked_at = timestamp(at)
+        if alive and identity is None:
+            continue  # a live supervisor without identity is unknown, not a verdict
         matches = identity == expected or (isinstance(identity, str) and identity.endswith(f" {expected}"))
         if alive and matches:
             continue
-        if group_alive:
-            # A group is recorded only for adapter sessions that own it.
-            if alive:
-                continue
-            try:
-                import os, signal
-                os.killpg(pgid, signal.SIGTERM)
-            except OSError:
-                pass
-            alive, identity, group_alive = _probe_process(pid, pgid)
-            if alive or group_alive:
-                continue
-        if store.reconcile(
-            str(row["id"]), verdict="dead" if not alive else "identity_mismatch",
-            supervisor_pid=pid, process_group_id=pgid, expected_identity=expected,
-            alive=alive, observed_identity=identity, checked_at=checked_at,
-            reason="periodic detached supervisor reconciliation",
-        ):
+        try:
+            committed = store.reconcile(
+                str(row["id"]), verdict="dead" if not alive else "identity_mismatch",
+                supervisor_pid=pid, process_group_id=pgid, expected_identity=expected,
+                alive=alive, observed_identity=identity, checked_at=checked_at,
+                reason="periodic detached supervisor reconciliation",
+            )
+        except (ValidationError, StateTransitionError):
+            continue  # one stale or concurrently changed row never aborts the sweep
+        if committed:
             changed.append(AgentId(str(row["id"])))
     return tuple(changed)

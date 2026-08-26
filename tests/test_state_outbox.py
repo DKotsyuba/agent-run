@@ -1,7 +1,9 @@
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -9,6 +11,7 @@ from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.state import (
     StateStore,
+    reconcile_active_agents,
     reconcile_reaped_agent,
     reconcile_reaped_supervisor,
 )
@@ -24,13 +27,46 @@ class StateOutboxTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def create(self):
+    def create(self, at: float = 1):
         request = StartRequest(
             "codex", "model", "profile", "task", self.root, timeout_seconds=480
         )
         return self.store.create_agent(
-            request, task_summary="summary", config_revision="cfg-1", at=1
+            request, task_summary="summary", config_revision="cfg-1", at=at
         ).agent_id
+
+    def supervised(self, pid: int, identity: str, *, pgid=None, created_at=1, heartbeat_at=6):
+        """One running row with a complete supervisor identity to sweep."""
+
+        agent_id = self.create(at=created_at)
+        self.store.transition(agent_id, AgentStatus.STARTING, at=5)
+        self.store.record_supervisor(
+            agent_id,
+            pid=pid,
+            identity=identity,
+            process_group_id=pid if pgid is None else pgid,
+            at=heartbeat_at,
+        )
+        self.store.transition(agent_id, AgentStatus.RUNNING, at=7)
+        return agent_id
+
+    def probing(self, replies):
+        """Answer the sweep from a fake process table, recording every probe."""
+
+        probed: list = []
+
+        def probe(pid, pgid):
+            probed.append((pid, pgid))
+            reply = replies(pid) if callable(replies) else replies[pid]
+            return reply
+
+        return mock.patch("agent_run.doctor._probe_process", probe), probed
+
+    def forbid_signals(self):
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("the sweep must never signal a recorded group")
+
+        return mock.patch.multiple("os", kill=refuse, killpg=refuse)
 
     def finish(self, agent_id) -> None:
         self.store.transition(agent_id, AgentStatus.STARTING, at=2)
@@ -343,6 +379,113 @@ class StateOutboxTests(unittest.TestCase):
         )
         self.assertFalse(reconcile_reaped_agent(self.store, other, 321, at=7))
         self.assertEqual(self.store.get_agent(other)["status"], "starting")
+
+    def test_supervisor_group_refines_once_from_the_supervisors_own_group(self) -> None:
+        agent_id = self.supervised(100, "pid-100", created_at=1)
+
+        self.store.record_supervisor(
+            agent_id, pid=100, identity="pid-100", process_group_id=4242, at=8
+        )
+        self.assertEqual(self.store.get_agent(agent_id)["process_group_id"], 4242)
+
+        for pid, identity, pgid in (
+            (100, "pid-100", 4243),
+            (100, "pid-100", 100),
+            (101, "pid-100", 4242),
+            (100, "other", 4242),
+        ):
+            with self.assertRaisesRegex(ValidationError, "immutable"):
+                self.store.record_supervisor(
+                    agent_id, pid=pid, identity=identity, process_group_id=pgid, at=9
+                )
+        agent = self.store.get_agent(agent_id)
+        self.assertEqual(
+            (agent["supervisor_pid"], agent["supervisor_identity"], agent["process_group_id"]),
+            (100, "pid-100", 4242),
+        )
+
+    def test_sweep_closes_dead_supervisors_with_live_groups_without_signalling(self) -> None:
+        surviving = self.supervised(100, "pid-100", pgid=4242, created_at=1)
+        foreign = self.supervised(101, "pid-101", pgid=1, created_at=2)
+        terminal = self.supervised(102, "pid-102", created_at=3)
+        self.store.transition(
+            terminal, AgentStatus.FAILED, outcome=Outcome(AgentStatus.FAILED), at=8
+        )
+        patch, probed = self.probing(lambda pid: (False, None, True))
+
+        with patch, self.forbid_signals():
+            self.assertEqual(
+                reconcile_active_agents(self.store, at=10), (surviving, foreign)
+            )
+
+        self.assertEqual(probed, [(100, 4242), (101, 1)])
+        for agent_id in (surviving, foreign):
+            agent = self.store.get_agent(agent_id)
+            self.assertEqual(agent["status"], "lost")
+            self.assertEqual(agent["failure_kind"], "supervisor_dead")
+        self.assertEqual(self.store.get_agent(terminal)["status"], "failed")
+
+    def test_sweep_reconciles_only_a_proven_live_identity_mismatch(self) -> None:
+        exact = self.supervised(200, "agent-run supervisor", created_at=1)
+        boundary = self.supervised(201, "agent-run supervisor", created_at=2)
+        unavailable = self.supervised(202, "agent-run supervisor", created_at=3)
+        mismatch = self.supervised(203, "agent-run supervisor", created_at=4)
+        patch, probed = self.probing(
+            {
+                200: (True, "agent-run supervisor", False),
+                201: (True, "/usr/bin/python3 agent-run supervisor", True),
+                202: (True, None, False),
+                203: (True, "/usr/bin/vim notes.md", False),
+            }
+        )
+
+        with patch, self.forbid_signals():
+            self.assertEqual(reconcile_active_agents(self.store, at=10), (mismatch,))
+
+        self.assertEqual(len(probed), 4)
+        for agent_id in (exact, boundary, unavailable):
+            self.assertEqual(self.store.get_agent(agent_id)["status"], "running")
+        agent = self.store.get_agent(mismatch)
+        self.assertEqual(agent["status"], "lost")
+        self.assertEqual(agent["failure_kind"], "supervisor_identity_mismatch")
+
+    def test_one_stale_row_does_not_abort_the_rest_of_the_sweep(self) -> None:
+        stale = self.supervised(300, "pid-300", created_at=1)
+        healthy = self.supervised(301, "pid-301", created_at=2)
+        self.store.record_supervisor(
+            stale, pid=300, identity="pid-300", process_group_id=300, at=100
+        )
+        patch, probed = self.probing(lambda pid: (False, None, False))
+
+        with patch, self.forbid_signals():
+            self.assertEqual(reconcile_active_agents(self.store, at=50), (healthy,))
+
+        self.assertEqual(len(probed), 2)
+        self.assertEqual(self.store.get_agent(stale)["status"], "running")
+        self.assertEqual(self.store.get_agent(healthy)["status"], "lost")
+
+    def test_each_row_is_timed_after_its_own_probe(self) -> None:
+        now = time.time()
+        first = self.supervised(400, "pid-400", created_at=1, heartbeat_at=now - 1)
+        second = self.supervised(401, "pid-401", created_at=2, heartbeat_at=now - 1)
+
+        def replies(pid):
+            if pid == 400:
+                # A heartbeat lands after the sweep began but before the next probe.
+                time.sleep(0.01)
+                self.store.record_supervisor(
+                    second, pid=401, identity="pid-401", process_group_id=401, at=time.time()
+                )
+                time.sleep(0.01)
+            return False, None, False
+
+        patch, probed = self.probing(replies)
+        with patch, self.forbid_signals():
+            self.assertEqual(reconcile_active_agents(self.store), (first, second))
+
+        self.assertEqual(probed, [(400, 400), (401, 401)])
+        self.assertEqual(self.store.get_agent(second)["status"], "lost")
+
 
     def test_capacity_retention_is_global_deterministic_and_keeps_expired_rows(self) -> None:
         first = self.store.insert_capacity_sample(

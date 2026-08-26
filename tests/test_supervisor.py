@@ -18,7 +18,12 @@ from agent_run.adapters.base import (
 from agent_run.domain import AgentStatus, Outcome, StartRequest
 from agent_run.lifecycle import ReadyChannel, terminate_process_group
 from agent_run.state.store import StateStore
-from agent_run.supervisor import DEFAULT_WARNING_TEXT, Supervisor, SupervisorSettings
+from agent_run.supervisor import (
+    DEFAULT_WARNING_TEXT,
+    Supervisor,
+    SupervisorSettings,
+    supervisor_identity,
+)
 from agent_run.verify import ANSWER_INCOMPLETE, DEFAULT_SENTINEL, NO_ANSWER
 
 from agent_run.domain import TERMINAL
@@ -293,6 +298,59 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotIn(channel.observed_handler, (signal.SIG_DFL, signal.SIG_IGN))
         self.assertEqual(channel.wait(1.0), "ready")
         self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def ready_snapshot(self, seen: list) -> ReadyChannel:
+        read_fd, write_fd = os.pipe()
+        outer = self
+
+        class SnapshotReady(ReadyChannel):
+            def ready(self) -> None:
+                seen.append(dict(outer.agent()))
+                super().ready()
+
+        channel = SnapshotReady(read_fd, write_fd)
+        self.addCleanup(channel.close_read)
+        return channel
+
+    def test_identity_is_durable_before_ready_and_the_group_refines_once(self) -> None:
+        seen: list[dict] = []
+        channel = self.ready_snapshot(seen)
+        ops = FakeOps()
+        session = FakeSession(ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1)
+        self.write_answer(f"answer {DEFAULT_SENTINEL}")
+
+        self.supervisor(FakeAdapter(session), ops, ready=channel).run()
+
+        self.assertEqual(seen[0]["status"], "starting")
+        self.assertEqual(seen[0]["supervisor_pid"], os.getpid())
+        self.assertEqual(seen[0]["supervisor_identity"], supervisor_identity())
+        self.assertEqual(seen[0]["process_group_id"], os.getpid())
+        self.assertIsNotNone(seen[0]["heartbeat_at"])
+        agent = self.agent()
+        self.assertEqual(agent["supervisor_pid"], os.getpid())
+        self.assertEqual(agent["supervisor_identity"], seen[0]["supervisor_identity"])
+        self.assertEqual(agent["process_group_id"], ENGINE_PID)
+        self.assertGreaterEqual(self.store.heartbeats, 2)
+
+    def test_shared_service_row_keeps_the_supervisor_group(self) -> None:
+        seen: list[dict] = []
+        channel = self.ready_snapshot(seen)
+        ops = FakeOps()
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED),
+            exit_after_polls=1,
+            owns_process_group=False,
+            pid=9000,
+        )
+        self.write_answer(f"shared service done {DEFAULT_SENTINEL}")
+
+        self.supervisor(FakeAdapter(session), ops, ready=channel).run()
+
+        self.assertEqual(seen[0]["process_group_id"], os.getpid())
+        self.assertEqual(self.agent()["process_group_id"], os.getpid())
+        self.assertEqual(ops.sent, [])
+
 
     def test_cancel_queued_before_launch_cannot_orphan_the_engine(self) -> None:
         self.store.enqueue_command(self.agent_id, "cancel", {"reason": "user"})

@@ -188,6 +188,14 @@ class Supervisor:
             self._store.transition(
                 self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
             )
+            # Persist pid and identity before ready so every ready row can later
+            # be converged by reconciliation, even if launch never returns.
+            self._store.record_supervisor(
+                self._agent_id,
+                pid=self._pid,
+                identity=self._identity,
+                process_group_id=self._pid,
+            )
             if self._ready is not None:
                 self._ready.ready()
         except Exception as error:

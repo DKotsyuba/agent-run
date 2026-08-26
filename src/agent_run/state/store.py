@@ -361,7 +361,11 @@ class StateStore:
             if any(value is not None for value in stored) and stored != (
                 pid, identity, process_group_id
             ):
-                raise ValidationError("supervisor identity is immutable")
+                # The pre-ready row records the detached supervisor's own group
+                # (it is its own group leader), so refining that one value once to
+                # the verified engine group is the only permitted rewrite.
+                if stored != (pid, identity, pid) or process_group_id == pid:
+                    raise ValidationError("supervisor identity is immutable")
             self.connection.execute(
                 """UPDATE agents SET supervisor_pid = ?, supervisor_identity = ?,
                    process_group_id = ?, heartbeat_at = ? WHERE id = ?""",
