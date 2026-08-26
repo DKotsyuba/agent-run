@@ -45,8 +45,17 @@ def build_advice(forecasts: Iterable[CapacityForecast]) -> tuple[CapacityAdvice,
     )
 
 
+def capacity_label(key: CapacityKey) -> str:
+    parts = [f"{key.runtime}/{key.lane}", key.window]
+    if key.target:
+        parts.append(f"target={key.target}")
+    if key.source:
+        parts.append(f"source={key.source}")
+    return " ".join(parts)
+
+
 def _recommendations(forecast: CapacityForecast) -> tuple[str, ...]:
-    label = f"{forecast.key.runtime}/{forecast.key.lane} {forecast.key.window}"
+    label = capacity_label(forecast.key)
     if forecast.risk == RISK_UNKNOWN:
         return (f"{label} capacity is unknown; treat limits as unverified.",)
     if forecast.risk == RISK_HIGH:

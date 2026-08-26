@@ -9,6 +9,7 @@ re-injected. Nothing here performs a network or provider call.
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from dataclasses import dataclass
 
@@ -19,7 +20,6 @@ from ..config import Config
 from ..domain import ACTIVE, OrchestratorRef
 from ..errors import ValidationError
 from ..state import StateStore
-from ..state.db import immediate, timestamp
 
 
 CONTEXT_HARD_LIMIT_CHARS = 2500
@@ -49,13 +49,11 @@ def build_context(
         raise ValidationError("ref must be an OrchestratorRef")
     if not isinstance(config, Config):
         raise ValidationError("config must be a Config")
-    at = timestamp(time.time() if now is None else now)
-
-    session_row = store.connection.execute(
-        "SELECT id FROM orchestrator_sessions WHERE transport = ? AND external_session_id = ?",
-        (ref.transport, ref.external_session_id),
-    ).fetchone()
-    session_id = None if session_row is None else str(session_row["id"])
+    at = time.time() if now is None else now
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+        raise ValidationError("now must be a finite number")
+    at = float(at)
+    session_id = store.find_orchestrator_session(ref)
 
     capacity_text, capacity_key = _capacity_block(store, at)
     agents = () if session_id is None else _active_agents(store, session_id)
@@ -64,24 +62,8 @@ def build_context(
     budget = min(max(config.capacity.context_max_chars, 0), CONTEXT_HARD_LIMIT_CHARS)
     text = _assemble(capacity_text, active_text, budget)
 
-    if session_id is None:
-        return ContextResult(None, context_key, text, True)
-
-    with immediate(store.connection):
-        previous = store.connection.execute(
-            "SELECT context_key FROM context_receipts WHERE orchestrator_session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if previous is not None and previous["context_key"] == context_key:
-            return ContextResult(session_id, context_key, "", False)
-        store.connection.execute(
-            """INSERT INTO context_receipts (orchestrator_session_id, context_key, injected_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(orchestrator_session_id) DO UPDATE SET
-                 context_key = excluded.context_key, injected_at = excluded.injected_at""",
-            (session_id, context_key, at),
-        )
-    return ContextResult(session_id, context_key, text, True)
+    session_id, changed = store.record_context_receipt_for_ref(ref, context_key, at=at)
+    return ContextResult(session_id, context_key, text if changed else "", changed)
 
 
 def _capacity_block(store: StateStore, at: float) -> tuple[str, str]:
@@ -91,11 +73,20 @@ def _capacity_block(store: StateStore, at: float) -> tuple[str, str]:
     key = advice_module.advice_key(items)
     lines = [
         (
-            f"{item.key.runtime}/{item.key.lane} {item.key.window}: "
+            f"{advice_module.capacity_label(item.key)}: "
             f"{'unknown' if item.remaining_percent is None else f'{item.remaining_percent:.0f}%'} "
             f"remaining, risk={item.risk}"
         )
-        for item in sorted(items, key=lambda item: (item.key.runtime, item.key.lane, item.key.window))
+        for item in sorted(
+            items,
+            key=lambda item: (
+                item.key.runtime,
+                item.key.lane,
+                item.key.window,
+                item.key.target or "",
+                item.key.source,
+            ),
+        )
         if item.risk != forecast_module.RISK_LOW
     ]
     text = "Capacity: " + ("; ".join(lines) if lines else "nominal") + "."
@@ -103,22 +94,21 @@ def _capacity_block(store: StateStore, at: float) -> tuple[str, str]:
 
 
 def _active_agents(store: StateStore, session_id: str) -> tuple[dict, ...]:
-    statuses = tuple(status.value for status in ACTIVE)
-    placeholders = ",".join("?" for _ in statuses)
-    rows = store.connection.execute(
-        f"""SELECT id, runtime, model, profile, task_summary, status, created_at,
-                   started_at, warned, silent_seconds
-            FROM agents
-            WHERE orchestrator_session_id = ? AND status IN ({placeholders})
-            ORDER BY created_at""",
-        (session_id, *statuses),
-    ).fetchall()
-    return tuple(dict(row) for row in rows)
+    return tuple(
+        store.list_agents(
+            statuses=ACTIVE, orchestrator_session_id=session_id, limit=1_000_000
+        )
+    )
 
 
 def _material_silence(agent: dict) -> bool:
     silent = agent["silent_seconds"]
     return isinstance(silent, (int, float)) and silent >= _SILENCE_THRESHOLD_SECONDS
+
+
+def _safe_summary(value: object) -> str:
+    printable = "".join(char if char.isprintable() else " " for char in str(value))
+    return _truncate(" ".join(printable.split()), 48)
 
 
 def _active_block(agents: tuple[dict, ...], at: float) -> tuple[str, str]:
@@ -138,12 +128,15 @@ def _active_block(agents: tuple[dict, ...], at: float) -> tuple[str, str]:
         )
         entries.append(
             f"{agent['id']} {agent['runtime']}/{agent['model']} {agent['profile']} "
-            f"{agent['status']} {elapsed_minutes}m{flags}"
+            f"{_safe_summary(agent['task_summary'])} {agent['status']} "
+            f"{elapsed_minutes}m{flags}"
         )
         key_parts.append(f"{agent['id']}:{agent['status']}:{warned}:{silent}")
     more = total - len(listed)
     suffix = f"; +{more} more" if more > 0 else ""
-    text = f"Active agents ({total}): " + "; ".join(entries) + suffix + "."
+    guidance = " Use agent-run status/transcript; do not start replacements for existing ids."
+    body = f"Active agents ({total}): " + "; ".join(entries) + suffix + "."
+    text = _truncate(body, ACTIVE_BLOCK_MAX_CHARS - len(guidance)) + guidance
     return text, "|".join(key_parts)
 
 

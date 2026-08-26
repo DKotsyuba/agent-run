@@ -85,29 +85,22 @@ def _store_sample(
 def _collect_runtime(
     store: StateStore, name: str, runtime_config: RuntimeConfig, load: AdapterLoader, started: float
 ) -> CollectResult:
+    count = 0
     try:
         adapter = load(name, runtime_config)
-    except Exception as error:  # isolate one runtime's failure from the rest
-        return CollectResult(name, STATUS_FAILED, 0, str(error))
-    try:
         info = adapter.describe()
-    except Exception as error:
-        return CollectResult(name, STATUS_FAILED, 0, str(error))
-    if Capability.LIVE_LIMITS not in info.capabilities:
-        return CollectResult(name, STATUS_UNSUPPORTED, 0)
-    try:
-        samples = adapter.limits(runtime_config, runtime_config.home)
-    except Exception as error:
-        return CollectResult(name, STATUS_FAILED, 0, str(error))
-    count = 0
-    for sample in samples:
-        if not isinstance(sample, LimitSample):
-            continue
-        observed_epoch = _epoch(sample.observed_at)
-        if observed_epoch is None:
-            observed_epoch = started
-        _store_sample(store, name, sample, observed_epoch)
-        count += 1
+        if Capability.LIVE_LIMITS not in info.capabilities:
+            return CollectResult(name, STATUS_UNSUPPORTED, 0)
+        for sample in adapter.limits(runtime_config, runtime_config.home):
+            if not isinstance(sample, LimitSample):
+                raise TypeError("limit sample must be a LimitSample")
+            observed_epoch = _epoch(sample.observed_at)
+            if observed_epoch is None:
+                observed_epoch = started
+            _store_sample(store, name, sample, observed_epoch)
+            count += 1
+    except Exception as error:  # isolate provider, generator, and sample failures
+        return CollectResult(name, STATUS_FAILED, count, type(error).__name__)
     return CollectResult(name, STATUS_COLLECTED, count)
 
 

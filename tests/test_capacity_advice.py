@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.capacity.advice import build_advice, advice_key
+from agent_run.capacity.advice import advice_key, build_advice, capacity_label
 from agent_run.capacity.forecast import RISK_HIGH, RISK_LOW, RISK_MEDIUM, RISK_UNKNOWN, CapacityForecast
 from agent_run.capacity.history import CapacityKey
 
@@ -54,6 +54,12 @@ class CapacityAdviceTests(unittest.TestCase):
         self.assertIn("unknown", unknown.recommendations[0])
         self.assertIn("pace", medium.recommendations[0])
         self.assertIn("exhaustion", high.recommendations[0])
+        self.assertIn("target=gpt-5.6-sol", high.recommendations[0])
+        self.assertIn("source=app_server", high.recommendations[0])
+        self.assertEqual(
+            capacity_label(KEY),
+            "codex/requests 5h target=gpt-5.6-sol source=app_server",
+        )
 
     def test_advice_key_ignores_observed_at_noise(self) -> None:
         stable_a = _forecast(remaining=41.0, reset_at=1_010_000.0)

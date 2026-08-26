@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,7 +12,8 @@ from agent_run.capacity.forecast import (
     RISK_UNKNOWN,
     build_forecasts,
 )
-from agent_run.capacity.history import CapacityKey, CapacitySeries, NormalizedSample
+from agent_run.capacity.history import CapacityKey, CapacitySeries, NormalizedSample, load_series
+from agent_run.state import StateStore
 
 
 KEY = CapacityKey("codex", "requests", "5h", "gpt-5.6-sol", "app_server")
@@ -34,6 +36,16 @@ class CapacityForecastTests(unittest.TestCase):
         )
         series = CapacitySeries(KEY, (stale,))
         (forecast,) = build_forecasts([series], now=now)
+        self.assertFalse(forecast.known)
+        self.assertEqual(forecast.risk, RISK_UNKNOWN)
+
+    def test_stale_latest_is_unknown_even_when_older_sample_is_fresh(self) -> None:
+        now = 1_000_000.0
+        stale_latest = NormalizedSample(50.0, None, now, now - 1)
+        older_fresh = NormalizedSample(60.0, None, now - 3600, None)
+        (forecast,) = build_forecasts(
+            [CapacitySeries(KEY, (stale_latest, older_fresh))], now=now
+        )
         self.assertFalse(forecast.known)
         self.assertEqual(forecast.risk, RISK_UNKNOWN)
 
@@ -87,6 +99,53 @@ class CapacityForecastTests(unittest.TestCase):
         self.assertTrue(forecast.warmup)
         self.assertIsNone(forecast.burn_percent_per_hour)
         self.assertEqual(forecast.remaining_percent, 90.0)
+
+    def test_exhausted_zero_is_high_risk_even_with_zero_burn_and_pace(self) -> None:
+        now = 1_000_000.0
+        reset_at = now + 3600
+        samples = (
+            NormalizedSample(0.0, reset_at, now, None),
+            NormalizedSample(0.0, reset_at, now - 3600, None),
+        )
+        (forecast,) = build_forecasts([CapacitySeries(KEY, samples)], now=now)
+        self.assertEqual(forecast.burn_percent_per_hour, 0.0)
+        self.assertEqual(forecast.sustainable_percent_per_hour, 0.0)
+        self.assertEqual(forecast.risk, RISK_HIGH)
+
+    def test_expired_same_reset_history_still_drives_burn(self) -> None:
+        now = 1_000_000.0
+        reset_at = now + 3600
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                store.insert_capacity_sample(
+                    runtime="codex",
+                    lane="requests",
+                    window="5h",
+                    source="provider",
+                    payload={},
+                    remaining_percent=80,
+                    reset_at=reset_at,
+                    observed_at=now - 3600,
+                    valid_until=now - 1,
+                )
+                store.insert_capacity_sample(
+                    runtime="codex",
+                    lane="requests",
+                    window="5h",
+                    source="provider",
+                    payload={},
+                    remaining_percent=60,
+                    reset_at=reset_at,
+                    observed_at=now,
+                    valid_until=now + 60,
+                )
+                (series,) = load_series(store)
+                (forecast,) = build_forecasts([series], now=now)
+            finally:
+                store.close()
+        self.assertFalse(forecast.warmup)
+        self.assertEqual(forecast.burn_percent_per_hour, 20.0)
 
 
 if __name__ == "__main__":

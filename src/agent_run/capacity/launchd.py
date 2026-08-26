@@ -29,7 +29,7 @@ class LaunchdJob:
 def build_job(
     label: str,
     binary: Path,
-    interval_seconds: float,
+    interval_seconds: int,
     *,
     stdout_log: Path,
     stderr_log: Path,
@@ -38,10 +38,10 @@ def build_job(
         raise ValidationError("launchd label must be a nonblank string")
     if (
         isinstance(interval_seconds, bool)
-        or not isinstance(interval_seconds, (int, float))
-        or interval_seconds <= 0
+        or not isinstance(interval_seconds, int)
+        or interval_seconds < 1
     ):
-        raise ValidationError("interval_seconds must be positive")
+        raise ValidationError("interval_seconds must be an integer of at least 1")
     for name, path in (
         ("binary", binary),
         ("stdout_log", stdout_log),
@@ -49,7 +49,7 @@ def build_job(
     ):
         if not isinstance(path, Path) or not path.is_absolute():
             raise ValidationError(f"{name} must be an absolute path")
-    return LaunchdJob(label, binary, int(interval_seconds), stdout_log, stderr_log)
+    return LaunchdJob(label, binary, interval_seconds, stdout_log, stderr_log)
 
 
 def argv(job: LaunchdJob) -> tuple[str, ...]:

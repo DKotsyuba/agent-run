@@ -115,7 +115,7 @@ class CapacityCollectTests(unittest.TestCase):
         self.assertEqual(by_runtime["codex"].status, STATUS_COLLECTED)
         self.assertEqual(by_runtime["codex"].sample_count, 2)
         self.assertEqual(by_runtime["claude"].status, STATUS_FAILED)
-        self.assertIn("provider unreachable", by_runtime["claude"].error)
+        self.assertEqual(by_runtime["claude"].error, "RuntimeError")
         self.assertEqual(by_runtime["opencode"].status, STATUS_UNSUPPORTED)
 
         stored = self.store.recent_capacity_samples(at=0.0, limit=100)
@@ -128,6 +128,59 @@ class CapacityCollectTests(unittest.TestCase):
         self.assertIsNone(by_lane["tokens"]["remaining_percent"])
         self.assertEqual(by_lane["tokens"]["observed_at"], 1_704_110_400.0)
         self.assertIsNone(by_lane["tokens"]["valid_until"])
+
+    def test_malformed_samples_and_raising_generators_are_runtime_local(self) -> None:
+        sample = LimitSample(
+            lane="requests",
+            window="5h",
+            remaining_percent=50.0,
+            reset_at=None,
+            observed_at=None,
+            source="provider",
+        )
+        malformed = LimitSample(
+            lane="requests",
+            window="5h",
+            remaining_percent=50.0,
+            reset_at=None,
+            observed_at=None,
+            source="provider",
+            valid_for_seconds="secret-value",  # type: ignore[arg-type]
+        )
+
+        def raising_samples():
+            yield sample
+            raise RuntimeError("api_key=must-not-leak")
+
+        adapters = {
+            "wrong_type": FakeAdapter(
+                capabilities=frozenset({Capability.LIVE_LIMITS}), samples=(object(),)
+            ),
+            "malformed": FakeAdapter(
+                capabilities=frozenset({Capability.LIVE_LIMITS}), samples=(malformed,)
+            ),
+            "raising": FakeAdapter(
+                capabilities=frozenset({Capability.LIVE_LIMITS}), samples=raising_samples()
+            ),
+            "healthy": FakeAdapter(
+                capabilities=frozenset({Capability.LIVE_LIMITS}), samples=(sample,)
+            ),
+        }
+        config = Config(
+            schema_version=1,
+            runtimes={name: _runtime_config() for name in adapters},
+        )
+        report = collect_once(
+            self.store, config, at=1.0, loader=lambda name, cfg: adapters[name]
+        )
+        by_runtime = {result.runtime: result for result in report.results}
+
+        self.assertEqual(by_runtime["wrong_type"].error, "TypeError")
+        self.assertEqual(by_runtime["malformed"].error, "ValueError")
+        self.assertEqual(by_runtime["raising"].error, "RuntimeError")
+        self.assertNotIn("api_key", by_runtime["raising"].error)
+        self.assertEqual(by_runtime["healthy"].status, STATUS_COLLECTED)
+        self.assertEqual(by_runtime["healthy"].sample_count, 1)
 
     def test_no_secrets_or_raw_payload_beyond_structured_sample_fields(self) -> None:
         sample = LimitSample(

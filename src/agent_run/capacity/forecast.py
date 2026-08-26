@@ -49,8 +49,11 @@ def _is_fresh(sample: NormalizedSample, now: float) -> bool:
 
 
 def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
-    fresh = [sample for sample in series.samples if _is_fresh(sample, now)]
-    if not fresh or fresh[0].remaining_percent is None:
+    if (
+        not series.samples
+        or not _is_fresh(series.samples[0], now)
+        or series.samples[0].remaining_percent is None
+    ):
         return CapacityForecast(
             key=series.key,
             known=False,
@@ -62,10 +65,10 @@ def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
             sustainable_percent_per_hour=None,
             risk=RISK_UNKNOWN,
         )
-    latest = fresh[0]
+    latest = series.samples[0]
     remaining = latest.remaining_percent
     reset_at = latest.reset_at
-    window_samples = [sample for sample in fresh if sample.reset_at == reset_at]
+    window_samples = [sample for sample in series.samples if sample.reset_at == reset_at]
     burn = _burn_rate(window_samples)
     warmup = burn is None
     sustainable = _sustainable_pace(remaining, reset_at, now)
@@ -119,14 +122,14 @@ def _risk(
     sustainable: float | None,
     warmup: bool,
 ) -> str:
+    if remaining <= _HIGH_REMAINING_THRESHOLD:
+        return RISK_HIGH
+    if remaining <= _LOW_REMAINING_THRESHOLD:
+        return RISK_MEDIUM
     if not warmup and burn is not None and sustainable is not None:
         if burn > sustainable * _BURN_HIGH_MULTIPLIER:
             return RISK_HIGH
         if burn > sustainable * _BURN_MEDIUM_MULTIPLIER:
             return RISK_MEDIUM
         return RISK_LOW
-    if remaining <= _HIGH_REMAINING_THRESHOLD:
-        return RISK_HIGH
-    if remaining <= _LOW_REMAINING_THRESHOLD:
-        return RISK_MEDIUM
     return RISK_LOW
