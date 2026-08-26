@@ -35,6 +35,8 @@ _EXPECTED_ERROR_EXIT = 2
 _QUEUE_TIMEOUT_SECONDS = 30.0
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
+#: The only runtime that owns a managed service; there is no generic daemon.
+_SERVICE_RUNTIME = "opencode"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -129,6 +131,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     delivery_launchd.add_argument("--stdout-log", default="/dev/null")
     delivery_launchd.add_argument("--stderr-log")
+
+    runtime_service = commands.add_parser("service").add_subparsers(
+        dest="service_command", required=True
+    )
+    service_start = runtime_service.add_parser("start")
+    service_start.add_argument("--runtime", required=True)
+    service_start.add_argument("--port", type=int)
 
     hook = commands.add_parser("hook").add_subparsers(
         dest="hook_command", required=True
@@ -423,6 +432,26 @@ def _delivery_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]
     }
 
 
+def _service_start(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    """Start (or reuse) the one managed service of a runtime that owns one."""
+
+    from .adapters.opencode.service import start_service
+
+    if args.runtime != _SERVICE_RUNTIME:
+        raise ValidationError(
+            f"service start supports --runtime {_SERVICE_RUNTIME} only, not {args.runtime!r}"
+        )
+    runtime = load_config(config_path(home)).runtimes.get(_SERVICE_RUNTIME)
+    if runtime is None or not runtime.enabled:
+        raise ValidationError(f"runtime is not configured or not enabled: {_SERVICE_RUNTIME}")
+    started = start_service(runtime, runtime.home, port=args.port)
+    return {
+        "runtime": _SERVICE_RUNTIME,
+        "reused": started.reused,
+        "service": started.descriptor.as_dict(),
+    }
+
+
 def _dispatch_once(home: Path):
     config = load_config(config_path(home))
     executable = (
@@ -631,6 +660,8 @@ def main(
             result = _capacity_launchd(home, args)
         elif args.command == "delivery" and args.delivery_command == "launchd":
             result = _delivery_launchd(home, args)
+        elif args.command == "service":
+            result = _service_start(home, args)
         else:
             if service is None:
                 owned = _Runtime(home)

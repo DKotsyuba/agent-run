@@ -12,13 +12,23 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 from ...config import RuntimeConfig
 from ...errors import PathEscapeError, ValidationError
+from ...lifecycle import (
+    ProcessOps,
+    SystemProcessOps,
+    Termination,
+    terminate_process_group,
+    verify_process_group,
+)
 from ..home import content_hash, write_managed_file
 
 
@@ -29,6 +39,16 @@ MAX_PORT = 65535
 STARTUP_TIMEOUT_SECONDS = 20.0
 STARTUP_POLL_SECONDS = 0.2
 DESCRIPTOR_NAME = "service.json"
+SERVICE_LOG_NAME = "service.log"
+CONFIG_RELATIVE_PATH = "xdg/config/opencode/opencode.json"
+CONFIG_API_PATH = "/api/config"
+PROBE_TIMEOUT_SECONDS = 0.5
+TERMINATE_GRACE_SECONDS = 5.0
+KILL_GRACE_SECONDS = 2.0
+
+#: Path fragments that only a user-global opencode install can produce.
+GLOBAL_CONFIG_MARKERS = ("/.config/opencode", "/.local/share/opencode", "/.opencode")
+_AUTH_REFUSED = frozenset({401, 403})
 
 #: The child never inherits PATH; a fixed one keeps argv resolution reproducible.
 SERVICE_PATH = "/usr/local/bin:/usr/bin:/bin"
@@ -414,3 +434,251 @@ def attach_service(
         )
     require_server_password()
     return descriptor
+
+
+# --- starting the one managed service ------------------------------------
+
+
+def generated_config_path(home: str | Path) -> Path:
+    """The one generated config a managed service may be started with."""
+
+    return _service_root(home) / CONFIG_RELATIVE_PATH
+
+
+@dataclass(frozen=True)
+class ServiceStart:
+    """The proven service this call owns, and whether it was already live."""
+
+    descriptor: ServiceDescriptor
+    reused: bool
+
+
+def start_service(
+    config: RuntimeConfig,
+    home: str | Path,
+    *,
+    port: int | None = None,
+    inherited_environment: Mapping[str, str] | None = None,
+    client_factory: Callable[[str], object] | None = None,
+    ops: ProcessOps | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> ServiceStart:
+    """Start one private service, or reuse the live one already proven here.
+
+    Nothing is ever adopted: a foreign listener on the candidate port is
+    refused, and a candidate that cannot prove its pid, its credentials and its
+    generated config is terminated by its own process group before returning.
+    """
+
+    root = _service_root(home)
+    config_file = generated_config_path(root)
+    if not config_file.is_file():
+        raise ServiceIsolationError(
+            f"generated opencode config is missing: {config_file}; materialize the "
+            "opencode home before starting the managed service"
+        )
+    try:
+        return ServiceStart(attach_service(root, config_file), True)
+    except ServiceIsolationError:
+        pass  # nothing proven is live here, so start exactly one candidate
+    inherited = dict(os.environ if inherited_environment is None else inherited_environment)
+    number = _free_port() if port is None else _port(port)
+    _require_free_port(number)
+    # No argv override: a managed service is always the default 'serve'.
+    plan = build_service_plan(config, root, port=number, inherited_environment=inherited)
+    config_hash = config_file_hash(config_file)
+    process = _spawn(plan)
+    try:
+        client = _client(plan, root) if client_factory is None else client_factory(plan.base_url)
+        descriptor = verify_isolation(
+            plan,
+            _await_health(plan, process, client, sleep=sleep, monotonic=monotonic),
+            pid=process.pid,
+            config_hash=config_hash,
+        )
+        verify_config_isolation(_reported_config(client), root, config_file)
+        # Recorded last, and inside the guard: a service nothing can attach to
+        # is a leak, so a failed write takes the candidate down with it.
+        write_service_descriptor(root, descriptor)
+    except BaseException:
+        # Cleanup is never allowed to mask the failure that caused it.
+        try:
+            _terminate_candidate(process, ops)
+        except Exception:
+            pass
+        raise
+    return ServiceStart(descriptor, False)
+
+
+def _client(plan: ServicePlan, root: Path) -> object:
+    from .http import OpenCodeHttpClient
+
+    return OpenCodeHttpClient(plan.base_url, root)
+
+
+def _free_port() -> int:
+    """Ask the kernel for a free loopback port and release it immediately.
+
+    A foreign process can still take the port before the child binds it; the
+    child then exits at once and the readiness loop refuses that candidate.
+    """
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((SERVICE_HOST, 0))
+        return _port(int(probe.getsockname()[1]))
+
+
+def _require_free_port(port: int) -> None:
+    """Refuse a candidate port unless nothing at all answers on it."""
+
+    try:
+        with socket.create_connection((SERVICE_HOST, port), PROBE_TIMEOUT_SECONDS):
+            pass
+    except ConnectionRefusedError:
+        return
+    except OSError as error:
+        raise ServiceIsolationError(
+            f"cannot prove {SERVICE_HOST}:{port} is free: {error}"
+        ) from error
+    raise ServiceIsolationError(
+        f"something already listens on {SERVICE_HOST}:{port}; the managed opencode "
+        "service never adopts a process it did not start"
+    )
+
+
+def _open_service_log(path: Path):
+    """Append to one private log; a symlink there is refused, not followed."""
+
+    descriptor = os.open(
+        str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return os.fdopen(descriptor, "ab")
+
+
+def _spawn(plan: ServicePlan) -> subprocess.Popen:
+    """Start exactly one child, in its own session, with its own private log."""
+
+    if not plan.argv:
+        raise ValidationError("a service plan without argv starts nothing")
+    with _open_service_log(plan.cwd / SERVICE_LOG_NAME) as log:
+        return subprocess.Popen(
+            list(plan.argv),
+            cwd=str(plan.cwd),
+            env=dict(plan.environment),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+
+def _await_health(
+    plan: ServicePlan,
+    process: subprocess.Popen,
+    client: object,
+    *,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> Mapping[str, object]:
+    """Poll health until the candidate answers, dies, refuses, or runs out."""
+
+    from .http import HttpError, TransientHttpError
+
+    deadline = monotonic() + plan.startup_timeout_seconds
+    while True:
+        code = process.poll()
+        if code is not None:
+            raise ServiceIsolationError(
+                f"opencode service exited with status {code} before it reported healthy"
+            )
+        try:
+            return client.health()
+        except TransientHttpError:
+            pass
+        except HttpError as error:
+            if error.status in _AUTH_REFUSED:
+                raise ServiceIsolationError(
+                    f"opencode service refused the managed credentials with {error.status}; "
+                    f"{PASSWORD_ENV} does not match the running service"
+                ) from error
+            raise
+        if monotonic() >= deadline:
+            raise ServiceIsolationError(
+                "opencode service did not report healthy within "
+                f"{plan.startup_timeout_seconds} seconds"
+            )
+        sleep(plan.poll_interval_seconds)
+
+
+def _reported_config(client: object) -> object:
+    capture = client.get(CONFIG_API_PATH)
+    try:
+        return capture.json()
+    finally:
+        capture.release()
+
+
+def _payload_strings(payload: object) -> Iterator[str]:
+    """Every string anywhere in a decoded payload, keys included."""
+
+    pending = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, Mapping):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+
+
+def verify_config_isolation(
+    payload: object, home: str | Path, config_path: str | Path
+) -> None:
+    """Prove the service is configured from the generated file and nothing global."""
+
+    root = _service_root(home)
+    roots = {root, root.resolve()}
+    candidate = Path(config_path)
+    expected = {str(candidate), str(candidate.resolve())}
+    reported = tuple(_payload_strings(payload))
+    if not expected.intersection(reported):
+        raise ServiceIsolationError(
+            f"opencode /api/config does not report the generated config {candidate}; "
+            "refusing a service configured from somewhere else"
+        )
+    for value in reported:
+        if not value.startswith("/"):
+            continue
+        path = Path(value)
+        if any(path == item or path.is_relative_to(item) for item in roots):
+            continue
+        if any(marker in value for marker in GLOBAL_CONFIG_MARKERS):
+            raise ServiceIsolationError(
+                f"opencode /api/config reports the global path {value} outside the "
+                f"generated home {root}"
+            )
+
+
+def _terminate_candidate(
+    process: subprocess.Popen, ops: ProcessOps | None = None
+) -> Termination:
+    """TERM, wait, then KILL exactly the group this call spawned, and nothing else."""
+
+    operations = SystemProcessOps() if ops is None else ops
+    if process.poll() is not None:
+        return Termination((), True, 0.0)
+    return terminate_process_group(
+        operations,
+        verify_process_group(operations, process.pid),
+        owned_pid=process.pid,
+        grace_seconds=TERMINATE_GRACE_SECONDS,
+        kill_grace_seconds=KILL_GRACE_SECONDS,
+    )
