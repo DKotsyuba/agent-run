@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import sqlite3
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -18,7 +17,6 @@ from agent_run.domain import (
     OrchestratorRef,
     Outcome,
     StartRequest,
-    new_agent_id,
     validate_agent_id,
     validate_transition,
 )
@@ -30,10 +28,8 @@ from .db import (
     agent_row,
     checked_supervisor_proof,
     count_agents,
-    idempotent_agent,
     immediate,
     integer,
-    insert_agent_row,
     insert_capacity_row,
     initialize_database,
     insert_event,
@@ -41,7 +37,6 @@ from .db import (
     message_rows,
     nonblank,
     open_database,
-    request_json,
     recent_capacity_rows,
     require_attempt,
     row_dict,
@@ -49,12 +44,7 @@ from .db import (
     timestamp,
     validate_message_storage,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentCreation:
-    agent_id: AgentId
-    created: bool
+from .start import AgentCreation, create_agent as create_agent_record
 
 
 class StateStore:
@@ -82,49 +72,36 @@ class StateStore:
         agent_id: str | AgentId | None = None,
         at: float | None = None,
     ) -> AgentCreation:
-        """Insert an agent and its initial event, or return its idempotent peer."""
+        return create_agent_record(
+            self.connection,
+            request,
+            task_summary=task_summary,
+            config_revision=config_revision,
+            agent_id=agent_id,
+            at=at,
+        )
 
-        if not isinstance(request, StartRequest):
-            raise ValidationError("request must be a StartRequest")
-        nonblank("task_summary", task_summary)
-        nonblank("config_revision", config_revision)
-        created_at = timestamp(at)
-        candidate = new_agent_id() if agent_id is None else validate_agent_id(agent_id)
-        serialized = request_json(request)
-        with immediate(self.connection):
-            if request.request_id is not None:
-                existing = idempotent_agent(self.connection, request.request_id)
-                if existing is not None:
-                    if (
-                        existing["request_json"] != serialized
-                        or existing["task_summary"] != task_summary
-                        or existing["config_revision"] != config_revision
-                    ):
-                        raise ValidationError("request_id was reused for a different request")
-                    return AgentCreation(AgentId(str(existing["id"])), False)
-            session_id = (
-                None
-                if request.orchestrator is None
-                else session_for_ref(self.connection, request.orchestrator, created_at)
-            )
-            insert_agent_row(
-                self.connection,
-                candidate,
-                request,
-                session_id,
-                task_summary,
-                serialized,
-                config_revision,
-                created_at,
-            )
-            insert_event(
-                self.connection,
-                candidate,
-                created_at,
-                "created",
-                to_status=AgentStatus.CREATED.value,
-            )
-        return AgentCreation(candidate, True)
+    def create_agent_limited(
+        self,
+        request: StartRequest,
+        *,
+        task_summary: str,
+        config_revision: str,
+        global_limit: int,
+        runtime_limit: int | None,
+        agent_id: str | AgentId | None = None,
+        at: float | None = None,
+    ) -> AgentCreation:
+        return create_agent_record(
+            self.connection,
+            request,
+            task_summary=task_summary,
+            config_revision=config_revision,
+            global_limit=global_limit,
+            runtime_limit=runtime_limit,
+            agent_id=agent_id,
+            at=at,
+        )
 
     def bind_orchestrator(
         self,
