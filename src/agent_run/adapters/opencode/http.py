@@ -29,7 +29,7 @@ from .service import PASSWORD_ENV, SERVICE_HOST, ServiceDescriptor, require_serv
 
 
 HEALTH_PATH = "/api/health"
-PROVIDERS_PATH = "/api/provider"
+MODEL_PATH = "/api/model"
 SESSION_PATH = "/api/session"
 SESSION_STATUS_PATH = "/api/session/active"
 
@@ -374,8 +374,10 @@ class OpenCodeHttpClient:
     def health(self) -> Mapping[str, object]:
         return self._decoded(self.get(HEALTH_PATH))
 
-    def providers(self) -> Mapping[str, object]:
-        return self._decoded(self.get(PROVIDERS_PATH))
+    def models(self) -> Mapping[str, object]:
+        """The full ``/api/model`` roster: ``{"data": [entry, ...], ...}``."""
+
+        return self._decoded(self.get(MODEL_PATH))
 
     def session_status(self) -> Mapping[str, object]:
         """The whole service's status map, keyed by session id."""

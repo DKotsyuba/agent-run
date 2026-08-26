@@ -197,18 +197,53 @@ class ModelTests(unittest.TestCase):
 
     def test_roster_is_intersected_with_the_allowlist_in_config_order(self):
         payload = {
-            "providers": [
-                {"id": "omniroute", "models": {"a": {"id": "minimax-m3", "name": "MiniMax M3"}}},
-                {"id": "omniroute", "models": [{"id": "deepseek-v4-pro"}, {"id": "unlisted"}]},
-            ]
+            "data": [
+                {"providerID": "opencode", "id": "grok-4-fast", "enabled": True, "status": "active"},
+                {"providerID": "omniroute", "id": "minimax-m3", "enabled": True, "status": "active", "name": "MiniMax M3"},
+                {"providerID": "omniroute", "id": "deepseek-v4-pro", "enabled": True, "status": "active"},
+                {"providerID": "omniroute", "id": "unlisted", "enabled": True, "status": "active"},
+            ],
+            "location": {},
         }
         models = normalize_models(payload, (ALT_MODEL, MODEL, "omniroute/absent"))
         self.assertEqual([item.id for item in models], [ALT_MODEL, MODEL])
         self.assertEqual(models[0].description, "MiniMax M3")
 
+    def test_disabled_or_inactive_entries_are_not_reported(self):
+        payload = {
+            "data": [
+                {"providerID": "omniroute", "id": "deepseek-v4-pro", "enabled": False, "status": "active"},
+                {"providerID": "omniroute", "id": "minimax-m3", "enabled": True, "status": "disabled"},
+            ]
+        }
+        self.assertEqual(normalize_models(payload, (MODEL, ALT_MODEL)), ())
+
     def test_malformed_roster_is_refused(self):
-        with self.assertRaises(ValidationError):
-            normalize_models({"providers": [{"models": [{"name": "no id"}]}]}, ("x",))
+        bad_payloads = [
+            {"data": ["not-a-mapping"]},
+            {"data": [{"id": "deepseek-v4-pro"}]},  # missing providerID
+            {"data": [{"providerID": "omniroute"}]},  # missing id
+            {"data": [{"providerID": "  ", "id": "deepseek-v4-pro"}]},  # blank providerID
+            {"data": [{"providerID": "omniroute", "id": ""}]},  # blank id
+        ]
+        for payload in bad_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    normalize_models(payload, (MODEL,))
+
+    def test_live_beta_18286_triple_normalizes_in_allowlist_order(self):
+        allowed = ("omniroute/deepseek-v4-pro", "omniroute/gpt-5.6-luna", "omniroute/MiniMaxM3")
+        payload = {
+            "data": [
+                {"providerID": "opencode", "id": "grok-4-fast", "enabled": True, "status": "active"},
+                {"providerID": "omniroute", "id": "gpt-5.6-luna", "enabled": True, "status": "active", "name": "GPT 5.6 Luna"},
+                {"providerID": "omniroute", "id": "deepseek-v4-pro", "enabled": True, "status": "active", "name": "DeepSeek V4 Pro"},
+                {"providerID": "omniroute", "id": "MiniMaxM3", "enabled": True, "status": "active", "name": "MiniMax M3"},
+            ],
+            "location": {},
+        }
+        models = normalize_models(payload, allowed)
+        self.assertEqual([item.id for item in models], list(allowed))
 
 
 class FakeSink:

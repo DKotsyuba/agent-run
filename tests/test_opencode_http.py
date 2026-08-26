@@ -15,6 +15,7 @@ from agent_run.adapters.opencode.service import PASSWORD_ENV
 from agent_run.adapters.opencode.http import (
     HEALTH_PATH,
     MAX_POLL_INTERVAL_SECONDS,
+    MODEL_PATH,
     NO_CONTENT,
     SESSION_STATUS_PATH,
     HttpError,
@@ -88,7 +89,7 @@ class AuthenticationTests(ClientCase):
         password = "fixture-password"
         client = self.client(
             FakeReply({"healthy": True, "pid": 1, "version": "2.1.0"}),
-            FakeReply({"providers": []}),
+            FakeReply({"data": [], "location": {}}),
             FakeReply({"data": {}}),
             FakeReply({"data": {"id": "ses_1"}}),
             FakeReply({"data": {}}),
@@ -99,7 +100,7 @@ class AuthenticationTests(ClientCase):
             password=password,
         )
         client.health()
-        client.providers()
+        client.models()
         client.session_status()
         client.create_session({"agent": "agent-run"})
         client.prompt_async("ses_1", {"parts": []})
@@ -362,6 +363,14 @@ class EndpointTests(ClientCase):
             ],
         )
         self.assertEqual(HEALTH_PATH, "/api/health")
+
+    def test_model_roster_uses_the_dedicated_route(self):
+        client = self.client(FakeReply({"data": [{"providerID": "omniroute", "id": "x"}], "location": {}}))
+        payload = client.models()
+        self.assertEqual(dict(payload)["data"], [{"providerID": "omniroute", "id": "x"}])
+        method, url, _ = self.opener.calls[0]
+        self.assertEqual((method, url), ("GET", f"http://127.0.0.1:41777{MODEL_PATH}"))
+        self.assertEqual(MODEL_PATH, "/api/model")
 
     def test_session_calls_use_json_bodies_and_safe_identifiers(self):
         client = self.client(FakeReply({"data": {"id": "ses_1"}}))
