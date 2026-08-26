@@ -180,8 +180,13 @@ class CountingStore(StateStore):
         self.fail_starting_once = False
         self.fail_running_once = False
         self.reject_terminal = False
+        self.starting_error: Exception | None = None
 
     def transition(self, agent_id, target, **kwargs):
+        if target is AgentStatus.STARTING and self.starting_error is not None:
+            error = self.starting_error
+            self.starting_error = None
+            raise error
         if target is AgentStatus.STARTING and self.fail_starting_once:
             self.fail_starting_once = False
             raise RuntimeError("starting write failed")
@@ -434,6 +439,27 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.agent()["status"], "failed")
         self.assertEqual(self.agent()["failure_text"], "engine missing")
 
+    def test_invalid_settings_are_refused_before_adapter_launch(self) -> None:
+        adapter = FakeAdapter(FakeSession(FakeOps()))
+        invalid = (
+            {"heartbeat_seconds": 0},
+            {"poll_seconds": float("nan")},
+            {"grace_seconds": 0},
+            {"kill_grace_seconds": float("inf")},
+            {"natural_grace_seconds": -1},
+            {"warning_fraction": 0},
+            {"warning_fraction": 1},
+            {"warning_fraction": float("nan")},
+            {"silence_threshold_seconds": -1},
+            {"warning_text": "  "},
+            {"sentinel": ""},
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValidationError):
+                settings = SupervisorSettings(**values)
+                self.supervisor(adapter, FakeOps(), settings=settings).run()
+        self.assertEqual(adapter.launches, 0)
+
     def test_natural_quiesce_allows_answer_flush_without_term(self) -> None:
         body = f"flushed answer\n{DEFAULT_SENTINEL}\n"
         ops = FakeOps(
@@ -548,6 +574,33 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "supervisor failed to start"):
             channel.wait(1.0)
         self.assertEqual(adapter.launches, 0)
+
+    def test_blank_startup_error_uses_exception_type_in_ready_failure(self) -> None:
+        self.store.starting_error = RuntimeError()
+        channel = ReadyChannel.open()
+        self.addCleanup(channel.close_read)
+        adapter = FakeAdapter(FakeSession(FakeOps()))
+
+        with self.assertRaises(RuntimeError):
+            self.supervisor(adapter, FakeOps(), ready=channel).run()
+        with self.assertRaisesRegex(ValidationError, "RuntimeError"):
+            channel.wait(1.0)
+        self.assertEqual(adapter.launches, 0)
+
+    def test_answer_inspection_failure_after_cleanup_is_durable(self) -> None:
+        self.answer.mkdir()
+        ops = FakeOps()
+        session = FakeSession(
+            ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "answer_inspection_failed")
+        self.assertEqual(self.agent()["status"], "failed")
+        self.assertEqual(self.agent()["failure_kind"], "answer_inspection_failed")
+        self.assertEqual(ops.alive_members(), set())
 
     def test_commit_rejection_is_not_swallowed_while_agent_is_active(self) -> None:
         self.store.reject_terminal = True

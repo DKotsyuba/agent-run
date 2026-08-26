@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -48,6 +49,10 @@ def supervisor_identity() -> str:
     return " ".join(sys.argv) or "agent-run-supervisor"
 
 
+def _error_text(error: BaseException) -> str:
+    return str(error).strip() or type(error).__name__
+
+
 @dataclass(frozen=True)
 class SupervisorSettings:
     heartbeat_seconds: float = 5.0
@@ -59,6 +64,45 @@ class SupervisorSettings:
     warning_text: str = DEFAULT_WARNING_TEXT
     silence_threshold_seconds: float = 60.0
     sentinel: str | None = DEFAULT_SENTINEL
+
+    def __post_init__(self) -> None:
+        for name in (
+            "heartbeat_seconds",
+            "poll_seconds",
+            "grace_seconds",
+            "kill_grace_seconds",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValidationError(f"{name} must be positive and finite")
+        for name in ("natural_grace_seconds", "silence_threshold_seconds"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValidationError(f"{name} must be nonnegative and finite")
+        fraction = self.warning_fraction
+        if (
+            isinstance(fraction, bool)
+            or not isinstance(fraction, (int, float))
+            or not math.isfinite(fraction)
+            or not 0 < fraction < 1
+        ):
+            raise ValidationError("warning_fraction must be strictly between 0 and 1")
+        if not isinstance(self.warning_text, str) or not self.warning_text.strip():
+            raise ValidationError("warning_text must be a nonblank string")
+        if self.sentinel is not None and (
+            not isinstance(self.sentinel, str) or not self.sentinel.strip()
+        ):
+            raise ValidationError("sentinel must be a nonblank string or None")
 
 
 class StoreEventSink:
@@ -145,7 +189,7 @@ class Supervisor:
                 self._ready.ready()
         except Exception as error:
             if self._ready is not None:
-                self._ready.failed(str(error))
+                self._ready.failed(_error_text(error))
             raise
 
     def _on_signal(self, received: int) -> None:
@@ -202,21 +246,39 @@ class Supervisor:
         )
         self._record_termination(termination, best_effort=True)
         self._reap_session(session)
-        proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
-        outcome = verify_completion(
-            session_outcome=Outcome(
-                AgentStatus.FAILED,
-                failure_kind="supervision_failed",
-                failure_text=str(error),
-                runtime_session_id=self._sink.runtime_session_id,
-            ),
-            stop_reason=None,
-            answer=proof,
-            group_gone=termination.group_gone,
-            last_progress_at=self._sink.last_progress_at,
-            now=self._ops.monotonic(),
-            silence_threshold_seconds=self._settings.silence_threshold_seconds,
-        )
+        try:
+            proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
+        except Exception as inspection_error:
+            proof = None
+            if termination.group_gone:
+                outcome = Outcome(
+                    AgentStatus.FAILED,
+                    failure_kind="answer_inspection_failed",
+                    failure_text=_error_text(inspection_error),
+                    runtime_session_id=self._sink.runtime_session_id,
+                )
+            else:
+                outcome = verify_completion(
+                    session_outcome=None,
+                    stop_reason=None,
+                    answer=None,
+                    group_gone=False,
+                )
+        else:
+            outcome = verify_completion(
+                session_outcome=Outcome(
+                    AgentStatus.FAILED,
+                    failure_kind="supervision_failed",
+                    failure_text=_error_text(error),
+                    runtime_session_id=self._sink.runtime_session_id,
+                ),
+                stop_reason=None,
+                answer=proof,
+                group_gone=termination.group_gone,
+                last_progress_at=self._sink.last_progress_at,
+                now=self._ops.monotonic(),
+                silence_threshold_seconds=self._settings.silence_threshold_seconds,
+            )
         committed = self._commit(outcome)
         self._drain_terminal_commands()
         return committed
