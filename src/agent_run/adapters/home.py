@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from ..errors import PathEscapeError, ValidationError
+from ..verify import DEFAULT_SENTINEL
 
 
 def content_hash(content: str | bytes) -> str:
@@ -91,6 +92,17 @@ def write_managed_file(
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
     return digest
+
+
+def seal_answer(path: Path, text: str) -> tuple[int, str]:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValidationError("answer path must be absolute")
+    if not isinstance(text, str) or not text.strip():
+        raise ValidationError("answer text must be nonblank")
+    separator = "" if text.endswith("\n") else "\n"
+    data = f"{text}{separator}{DEFAULT_SENTINEL}\n".encode("utf-8")
+    digest = write_managed_file(path.parent, path.name, data)
+    return len(data), digest
 
 
 def create_symlink_bridge(

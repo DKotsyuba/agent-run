@@ -29,7 +29,7 @@ class FakeAdapter:
     def validate(self, config):
         return None
 
-    def materialize(self, config, home, *, mcp_servers):
+    def materialize(self, config, home, *, mcp_servers, skills_root):
         return "hash"
 
     def probe(self, config, home):
@@ -110,14 +110,20 @@ class AdapterTests(unittest.TestCase):
                 self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
                 self.assertIs(parameter.default, inspect.Parameter.empty)
                 self.assertEqual(parameter.annotation, "Mapping[str, McpConfig]")
+                kwargs = {"mcp_servers": servers}
+                if method == "materialize":
+                    skills = contract.parameters["skills_root"]
+                    self.assertIs(skills.kind, inspect.Parameter.KEYWORD_ONLY)
+                    self.assertIs(skills.default, inspect.Parameter.empty)
+                    kwargs["skills_root"] = home / "skills"
                 with self.assertRaises(TypeError):
                     contract.bind(FakeAdapter(), *args)
-                contract.bind(FakeAdapter(), *args, mcp_servers=servers)
+                contract.bind(FakeAdapter(), *args, **kwargs)
                 current = inspect.signature(getattr(FakeAdapter(), method))
-                current.bind(*args, mcp_servers=servers)
+                current.bind(*args, **kwargs)
                 legacy = inspect.signature(getattr(LegacyAdapter(), method))
                 with self.assertRaises(TypeError):
-                    legacy.bind(*args, mcp_servers=servers)
+                    legacy.bind(*args, **kwargs)
 
     def test_registry_refuses_unknown_and_disabled_runtimes(self) -> None:
         registry = AdapterRegistry({"fake": self.runtime(enabled=False)})

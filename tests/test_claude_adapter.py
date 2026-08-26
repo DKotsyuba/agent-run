@@ -72,7 +72,15 @@ class ClaudeAdapterTests(unittest.TestCase):
         return self.adapter.prepare(*args, mcp_servers=mcp_servers, **kwargs)
 
     def materialize(self, *args, mcp_servers: dict = {}, **kwargs):
-        return self.adapter.materialize(*args, mcp_servers=mcp_servers, **kwargs)
+        skills_root = kwargs.pop(
+            "skills_root", self.root / "skills" / "claude"
+        )
+        return self.adapter.materialize(
+            *args,
+            mcp_servers=mcp_servers,
+            skills_root=skills_root,
+            **kwargs,
+        )
 
     # -- describe -----------------------------------------------------
 
@@ -190,6 +198,34 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(skill_link.read_text(encoding="utf-8"), "Delegate work.")
         self.assertTrue(scripts_link.is_symlink())
         self.assertEqual((scripts_link / "run.sh").read_text(encoding="utf-8"), "#!/bin/sh\necho hi\n")
+
+    def test_materialize_uses_only_each_explicit_service_skill_root(self) -> None:
+        config = self.runtime_config(skills=("delegate",))
+        observed = []
+        for index, text in enumerate(("first service", "second service")):
+            service_home = self.root / f"service-{index}"
+            skills_root = service_home / "skills" / "claude"
+            source = skills_root / "delegate" / "SKILL.md"
+            source.parent.mkdir(parents=True)
+            source.write_text(text, encoding="utf-8")
+            runtime_home = service_home / "runtimes" / "claude" / "home"
+            self.materialize(
+                config, runtime_home, skills_root=skills_root
+            )
+            generated = (
+                runtime_home
+                / "plugins"
+                / "delegate"
+                / "skills"
+                / "delegate"
+                / "SKILL.md"
+            )
+            observed.append(generated.read_text(encoding="utf-8"))
+        self.assertEqual(observed, ["first service", "second service"])
+
+        missing = self.root / "missing" / "skills" / "claude"
+        with self.assertRaisesRegex(ValidationError, "skill not found"):
+            self.materialize(config, self.home, skills_root=missing)
 
     def test_materialize_fails_closed_on_missing_skill(self) -> None:
         config = self.runtime_config(skills=("missing-skill",))

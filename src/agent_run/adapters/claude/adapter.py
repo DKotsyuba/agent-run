@@ -23,7 +23,7 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from ...domain import AgentStatus, Outcome, StartRequest
 from ...errors import ValidationError
-from ...paths import agent_run_home
+from ..home import seal_answer
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -73,10 +73,6 @@ _KNOWN_HOOK_EVENTS = frozenset(
         "SessionEnd",
     }
 )
-
-
-def _skills_root() -> Path:
-    return agent_run_home() / "skills" / "claude"
 
 
 def _render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
@@ -173,6 +169,7 @@ class ClaudeAdapter:
         home: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        skills_root: Path | None = None,
     ) -> str:
         """Render settings, strict MCP config, and plugin dirs into ``home``.
 
@@ -184,7 +181,11 @@ class ClaudeAdapter:
 
         settings_digest = _render_settings(home, config.hooks)
         mcp_digest = _render_mcp_config(home, config.mcp, mcp_servers)
-        plugin_digest = _render_plugin_dirs(home, _skills_root(), config.skills)
+        if skills_root is None and not config.skills:
+            skills_root = Path(home)
+        if not isinstance(skills_root, Path) or not skills_root.is_absolute():
+            raise ValidationError("claude skills_root must be absolute")
+        plugin_digest = _render_plugin_dirs(home, skills_root, config.skills)
         return "\n".join((settings_digest, mcp_digest, plugin_digest))
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
@@ -340,6 +341,7 @@ class ClaudeAdapter:
                     "secret_env_names": tuple(dict.fromkeys((*auth_names, *mcp_env_names))),
                 }
             ),
+            answer_path=agent_dir / "answer.md",
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> "ClaudeSession":
@@ -440,6 +442,10 @@ class ClaudeSession:
     def pid(self) -> int | None:
         return self._process.pid
 
+    @property
+    def owns_process_group(self) -> bool:
+        return True
+
     def _read_stdout(self) -> None:
         stdout = self._process.stdout
         if stdout is None:
@@ -537,12 +543,25 @@ class ClaudeSession:
             )
             failure_kind = "empty_result" if empty_result else (metadata.subtype or "error")
             failure_text = metadata.result_text
+        answer_path = None
+        answer_bytes = None
+        answer_sha256 = None
+        if status is AgentStatus.SUCCEEDED:
+            answer_path = self._plan.answer_path or self._plan.runtime_stream_path.with_name(
+                "answer.md"
+            )
+            answer_bytes, answer_sha256 = seal_answer(
+                answer_path, metadata.result_text or ""
+            )
         return Outcome(
             status=status,
             exit_code=exit_code,
             failure_kind=failure_kind,
             failure_text=failure_text,
             runtime_session_id=metadata.runtime_session_id,
+            answer_path=answer_path,
+            answer_bytes=answer_bytes,
+            answer_sha256=answer_sha256,
         )
 
 

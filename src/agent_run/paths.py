@@ -42,3 +42,22 @@ def agent_dir(agent_id: str | AgentId, home: str | Path | None = None) -> Path:
     candidate = (agents_root / validate_agent_id(agent_id)).resolve()
     _require_beneath(agents_root, candidate)
     return candidate
+
+
+def create_agent_dir(agent_id: str | AgentId, home: str | Path | None = None) -> Path:
+    candidate = agent_dir(agent_id, home)
+    candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    candidate.mkdir(mode=0o700)
+    candidate.chmod(0o700)
+    return candidate
+
+
+def runtime_skills_dir(runtime: str, home: str | Path | None = None) -> Path:
+    if not isinstance(runtime, str) or not runtime.strip():
+        raise ValidationError("runtime must be a nonblank string")
+    root = agent_run_home(home)
+    skills_root = (root / "skills").resolve()
+    _require_beneath(root, skills_root)
+    candidate = (skills_root / runtime).resolve()
+    _require_beneath(skills_root, candidate)
+    return candidate

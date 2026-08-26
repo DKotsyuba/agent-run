@@ -21,7 +21,6 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import PathEscapeError, ValidationError
-from ...paths import agent_run_home
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -313,10 +312,14 @@ class CodexAdapter:
         home: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        skills_root: Path | None = None,
     ) -> str:
         self.validate(config)
         _require_resolved_mcp(config, mcp_servers, "materialize")
-        skills_root = agent_run_home() / "skills" / "codex"
+        if skills_root is None:
+            skills_root = Path(home).parents[2] / "skills" / "codex"
+        if not isinstance(skills_root, Path) or not skills_root.is_absolute():
+            raise ValidationError("codex skills_root must be absolute")
         skill_hashes: dict[str, str] = {}
         for name in config.skills:
             source = skills_root / name / "SKILL.md"
@@ -525,6 +528,7 @@ class CodexAdapter:
             "mcp": tuple(config.mcp),
             "skills": tuple(config.skills),
             "profile": profile.name,
+            "request_timeout_seconds": request.timeout_seconds,
         }
         return LaunchPlan(
             argv=(str(config.binary), "app-server"),
@@ -533,11 +537,19 @@ class CodexAdapter:
             initial_input=request.task,
             runtime_stream_path=Path(agent_dir) / "runtime.jsonl",
             adapter_state=MappingProxyType(adapter_state),
+            answer_path=Path(agent_dir) / "answer.md",
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession:
         transport = app_server.ProcessTransport(plan)
-        return app_server.start_session(transport, plan, sink)
+        try:
+            return app_server.start_session(transport, plan, sink)
+        except Exception:
+            try:
+                transport.terminate(1.0)
+            except Exception:
+                transport.close()
+            raise
 
 
 ADAPTER: RuntimeAdapter = CodexAdapter()

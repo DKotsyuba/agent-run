@@ -26,6 +26,7 @@ class FakeTransport:
         self._events = list(events or [])
         self._pid = pid
         self.requests = []
+        self.timeouts = []
         self.terminated = None
         self.closed = False
 
@@ -33,8 +34,9 @@ class FakeTransport:
     def pid(self):
         return self._pid
 
-    def request(self, method, params):
+    def request(self, method, params, *, timeout_seconds=30.0):
         self.requests.append((method, dict(params)))
+        self.timeouts.append(timeout_seconds)
         queue = self._responses.get(method)
         if not queue:
             return {}
@@ -149,6 +151,8 @@ class StartSessionTests(unittest.TestCase):
         self.assertEqual(sink.sessions, ["th_1"])
         methods = [method for method, _ in transport.requests]
         self.assertEqual(methods, ["initialize", "thread/start", "turn/start"])
+        self.assertEqual(len(transport.timeouts), 3)
+        self.assertTrue(all(0 < value <= 30 for value in transport.timeouts))
         self.assertEqual(transport.requests[-1][1]["input"], "do the thing")
 
     def test_refuses_when_effective_params_drift(self) -> None:
@@ -247,6 +251,40 @@ class CodexAppServerSessionTests(unittest.TestCase):
         self.assertEqual(sink.messages[0].raw_ref, "item_1")
 
         self.assertIsNone(session.wait(0))
+
+    def test_success_seals_one_canonical_answer_with_proof(self) -> None:
+        import hashlib
+
+        from agent_run.adapters.codex.app_server import CodexAppServerSession
+        from agent_run.verify import DEFAULT_SENTINEL
+
+        with tempfile.TemporaryDirectory() as directory:
+            answer = Path(directory).resolve() / "answer.md"
+            transport = FakeTransport(
+                events=[
+                    completed(
+                        items=[
+                            {
+                                "type": "agentMessage",
+                                "text": "final answer",
+                                "at": 1.0,
+                                "id": "item_1",
+                            }
+                        ],
+                        exit_code=0,
+                    )
+                ]
+            )
+            session = CodexAppServerSession(
+                transport, FakeSink(), "th_1", answer_path=answer
+            )
+            outcome = session.wait(0)
+            data = answer.read_bytes()
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertTrue(data.endswith(f"{DEFAULT_SENTINEL}\n".encode()))
+        self.assertEqual(outcome.answer_path, answer)
+        self.assertEqual(outcome.answer_bytes, len(data))
+        self.assertEqual(outcome.answer_sha256, hashlib.sha256(data).hexdigest())
 
     def test_terminal_statuses_map_to_domain_outcomes(self) -> None:
         for status, expected in (
@@ -408,6 +446,11 @@ class ProcessTransportTests(unittest.TestCase):
         second = transport.poll_event(2)
         self.assertEqual(first["method"], "turn/started")
         self.assertEqual(second["method"], "turn/log")
+
+    def test_request_has_a_finite_deadline_while_stream_stays_open(self):
+        transport = self.transport(_SILENT_SERVER)
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting"):
+            transport.request("initialize", {}, timeout_seconds=0.01)
 
     def test_zero_timeout_never_blocks_and_finite_timeout_is_honored(self) -> None:
         transport = self.transport(_SILENT_SERVER)

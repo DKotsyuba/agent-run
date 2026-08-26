@@ -192,6 +192,7 @@ def terminate_process_group(
     group: VerifiedProcessGroup | None,
     *,
     natural_grace_seconds: float = 0.0,
+    owned_pid: int | None = None,
     grace_seconds: float = 10.0,
     kill_grace_seconds: float = 5.0,
     poll_seconds: float = 0.05,
@@ -210,7 +211,8 @@ def terminate_process_group(
     poll_seconds = _positive("poll_seconds", poll_seconds)
     started = ops.monotonic()
     if group is None:
-        return Termination((), True, ops.monotonic() - started)
+        gone = owned_pid is None or ops.process_group(checked_pgid(owned_pid)) is None
+        return Termination((), gone, ops.monotonic() - started)
 
     gone, _ = _await_group_exit(
         ops, group, natural_grace_seconds, poll_seconds

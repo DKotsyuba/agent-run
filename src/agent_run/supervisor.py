@@ -165,6 +165,9 @@ class Supervisor:
         self._pid = os.getpid() if supervisor_pid is None else supervisor_pid
         self._sink = StoreEventSink(store, self._agent_id, self._ops)
         self._group: VerifiedProcessGroup | None = None
+        self._owned_pid: int | None = None
+        self._owns_process_group = True
+        self._recorded_group_id: int | None = None
         self._stop_reason: str | None = None
         self._signalled = False
         self._warned = False
@@ -213,17 +216,27 @@ class Supervisor:
             return self._fail_launched(session, error)
 
     def _run_launched(self, session: RuntimeSession, steerable: bool) -> Outcome:
-        if session.pid is None:
-            raise ValidationError("runtime session has no engine pid")
-        self._group = verify_process_group(self._ops, session.pid)
-        if self._group is None:
-            raise ValidationError("engine exited before process-group verification")
+        self._owns_process_group = bool(
+            getattr(session, "owns_process_group", True)
+        )
+        if self._owns_process_group:
+            if session.pid is None:
+                raise ValidationError("runtime session has no engine pid")
+            self._owned_pid = session.pid
+            self._group = verify_process_group(self._ops, self._owned_pid)
+            if self._group is None:
+                raise ValidationError("engine exited before process-group verification")
+            self._recorded_group_id = self._group.pgid
+        else:
+            self._owned_pid = None
+            self._group = None
+            self._recorded_group_id = self._pid
         started_at = self._ops.monotonic()
         self._store.record_supervisor(
             self._agent_id,
             pid=self._pid,
             identity=self._identity,
-            process_group_id=self._group.pgid,
+            process_group_id=self._recorded_group_id,
         )
         self._last_heartbeat = started_at
         self._store.transition(self._agent_id, AgentStatus.RUNNING, kind="running")
@@ -240,6 +253,7 @@ class Supervisor:
         termination = terminate_process_group(
             self._ops,
             self._group,
+            owned_pid=self._owned_pid,
             grace_seconds=self._settings.grace_seconds,
             kill_grace_seconds=self._settings.kill_grace_seconds,
             poll_seconds=min(self._settings.poll_seconds, 1.0),
@@ -320,13 +334,13 @@ class Supervisor:
         ):
             return
         self._last_heartbeat = now
-        if self._group is None:
-            raise ValidationError("engine process group was not verified")
+        if self._recorded_group_id is None:
+            raise ValidationError("supervisor process identity was not recorded")
         self._store.record_supervisor(
             self._agent_id,
             pid=self._pid,
             identity=self._identity,
-            process_group_id=self._group.pgid,
+            process_group_id=self._recorded_group_id,
         )
 
     def _warn(
@@ -429,7 +443,7 @@ class Supervisor:
     ) -> Outcome:
         """Verify the group is gone and the answer is real before going terminal."""
 
-        if self._group is None:
+        if self._owns_process_group and self._group is None:
             raise ValidationError("engine process group was not verified")
         natural_grace = (
             self._settings.natural_grace_seconds
@@ -440,6 +454,7 @@ class Supervisor:
             self._ops,
             self._group,
             natural_grace_seconds=natural_grace,
+            owned_pid=self._owned_pid,
             grace_seconds=self._settings.grace_seconds,
             kill_grace_seconds=self._settings.kill_grace_seconds,
             poll_seconds=min(self._settings.poll_seconds, 1.0),
@@ -478,6 +493,8 @@ class Supervisor:
                 raise
 
     def _reap_session(self, session: RuntimeSession) -> None:
+        if not self._owns_process_group:
+            return
         pid = session.pid
         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1:
             self._ops.reap(pid)

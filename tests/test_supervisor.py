@@ -111,8 +111,11 @@ class FakeSession:
         steer_error: str | None = None,
         on_wait=None,
         on_cancel=None,
+        owns_process_group: bool = True,
+        pid: int = ENGINE_PID,
     ):
-        self.pid = ENGINE_PID
+        self.pid = pid
+        self.owns_process_group = owns_process_group
         self._ops = ops
         self._outcome = outcome
         self._exit_after_polls = exit_after_polls
@@ -134,7 +137,8 @@ class FakeSession:
             return self._outcome
         if self._exit_after_polls is not None and self.polls >= self._exit_after_polls:
             self._exited = True
-            self._ops.groups[ENGINE_PID].discard(self.pid)
+            if self.owns_process_group:
+                self._ops.groups[ENGINE_PID].discard(self.pid)
             return self._outcome
         return None
 
@@ -147,7 +151,7 @@ class FakeSession:
         self.cancels += 1
         if self._on_cancel is not None:
             self._on_cancel()
-        if self._native_cancel:
+        if self._native_cancel and self.owns_process_group:
             self._ops.groups[ENGINE_PID].discard(self.pid)
 
 
@@ -309,6 +313,23 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(
             [row["from_status"] for row in self.events("cancelling")], ["running"]
         )
+
+    def test_stuck_native_interrupt_cannot_block_group_enforcement(self) -> None:
+        self.store.enqueue_command(self.agent_id, "cancel", {})
+        ops = FakeOps()
+
+        def stuck_interrupt() -> None:
+            raise TimeoutError("interrupt timed out")
+
+        session = FakeSession(
+            ops, native_cancel=False, on_cancel=stuck_interrupt
+        )
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.CANCELLED)
+        self.assertEqual(session.cancels, 1)
+        self.assertEqual(ops.sent, [signal.SIGTERM])
+        self.assertEqual(ops.alive_members(), set())
 
     def test_a_grandchild_is_killed_and_reaped_after_a_clean_exit(self) -> None:
         ops = FakeOps()
@@ -502,6 +523,36 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(session.cancels, 1)
         self.assertEqual(ops.sent, [])
         self.assertIn(GRANDCHILD_PID, ops.reaped)
+
+    def test_surviving_nonleader_never_claims_group_gone(self) -> None:
+        ops = FakeOps()
+        session = FakeSession(
+            ops, native_cancel=False, pid=GRANDCHILD_PID
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "engine_group_survived")
+        self.assertEqual(ops.sent, [])
+        self.assertIn(GRANDCHILD_PID, ops.alive_members())
+
+    def test_shared_service_session_is_never_signalled_or_reaped(self) -> None:
+        self.write_answer(f"shared service done\n{DEFAULT_SENTINEL}\n")
+        ops = FakeOps()
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED),
+            exit_after_polls=1,
+            owns_process_group=False,
+            pid=9000,
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(ops.sent, [])
+        self.assertEqual(ops.reaped, [])
 
     def test_session_wait_exception_reaches_cleanup_and_durable_failure(self) -> None:
         ops = FakeOps()
