@@ -54,6 +54,7 @@ from .permissions import (
     permission_items as _permission_items,
 )
 from .service import (
+    CONFIG_RELATIVE_PATH,
     ServiceIsolationError,
     attach_service,
     build_service_plan,
@@ -63,7 +64,6 @@ from .service import (
 
 RUNTIME_NAME = "opencode"
 VERIFY_AGENT = "agent-run-verify"
-CONFIG_RELATIVE_PATH = "xdg/config/opencode/opencode.json"
 ANSWER_NAME = "answer.md"
 DEFAULT_WAIT_SECONDS = 480.0
 CAPABILITIES = frozenset(

@@ -72,7 +72,7 @@ class PermissionBroker:
     def reply(self, decision: PermissionDecision) -> Mapping[str, object]:
         """The exact body the v2 permission reply endpoint accepts."""
 
-        return MappingProxyType({"response": "once" if decision.granted else "reject"})
+        return MappingProxyType({"reply": "once" if decision.granted else "reject"})
 
 
 def permission_id(permission: Mapping[str, object]) -> str:

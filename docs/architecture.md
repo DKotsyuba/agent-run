@@ -567,6 +567,12 @@ MCP, skill paths, and lifecycle hooks:
   argv, logs, or the service descriptor.
 - Start an agent-run-owned service with generated config and isolated
   `XDG_CONFIG_HOME`/`XDG_DATA_HOME` under the runtime home.
+- `service start` is the only thing that spawns it, and it is not a daemon: it
+  reuses the live proven descriptor when there is one, refuses a port anything
+  already listens on, spawns the default `serve` in its own session, proves
+  `/api/health` (healthy, exact spawned pid) and `/api/config` (the generated
+  config, no global path), and terminates exactly the candidate group it
+  spawned — TERM, bounded wait, KILL — when any of that fails.
 - Set `OPENCODE_DISABLE_CLAUDE_CODE=1`.
 - Generate roles, skills, MCP, and provider routes only from agent-run config.
 - Auto-reject every interactive permission except a one-time
@@ -1021,6 +1027,7 @@ agent-run limits
 agent-run context
 agent-run capacity collect --once
 agent-run delivery status|cancel|dispatch|launchd
+agent-run service start --runtime opencode [--port N]
 agent-run doctor
 agent-run init
 ```

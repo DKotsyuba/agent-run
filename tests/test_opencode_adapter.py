@@ -79,16 +79,17 @@ class PermissionBrokerTests(unittest.TestCase):
         )
         self.assertTrue(first.granted)
         self.assertEqual(self.broker.granted_directory, str(self.allowed / "nested"))
-        self.assertEqual(dict(self.broker.reply(first)), {"response": "once"})
+        self.assertEqual(dict(self.broker.reply(first)), {"reply": "once"})
         second = self.broker.decide(
             {"id": "p2", "type": "external_directory", "path": str(self.allowed)}
         )
         self.assertFalse(second.granted)
         self.assertIn("already granted once", second.reason)
 
-    def test_reply_body_carries_only_the_response(self):
+    def test_reply_body_carries_only_the_reply(self):
         decision = self.broker.decide({"id": "p1", "type": "bash", "path": "/"})
-        self.assertEqual(dict(self.broker.reply(decision)), {"response": "reject"})
+        self.assertEqual(dict(self.broker.reply(decision)), {"reply": "reject"})
+        self.assertNotIn("response", self.broker.reply(decision))
 
     def test_directory_outside_read_roots_is_rejected(self):
         decision = self.broker.decide(
@@ -96,7 +97,7 @@ class PermissionBrokerTests(unittest.TestCase):
         )
         self.assertFalse(decision.granted)
         self.assertIsNone(self.broker.granted_directory)
-        self.assertEqual(self.broker.reply(decision)["response"], "reject")
+        self.assertEqual(self.broker.reply(decision)["reply"], "reject")
 
     def test_every_other_permission_is_auto_rejected(self):
         for kind in ("bash", "edit", "write", "webfetch", None):
@@ -674,7 +675,7 @@ class SessionTests(AdapterCase):
         outcome = self.session(service).wait(30.0)
         answered = [call for call in service.calls if call[0] == "answer_permission"]
         self.assertEqual(
-            [(call[1], call[2]["response"]) for call in answered],
+            [(call[1], call[2]["reply"]) for call in answered],
             [("p1", "once"), ("p2", "reject")],
         )
         self.assertEqual(self.sink.events, [("permissions_blocked", {"bash": 1})])
