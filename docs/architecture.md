@@ -266,6 +266,9 @@ service_mode = "managed"
 Rules:
 
 - runtime model discovery is intersected with the configured allowlist;
+- an absent or unreadable isolated Codex roster exposes only configured models
+  with unknown metadata; a readable roster remains authoritative and is still
+  intersected with the configured allowlist;
 - skill names resolve only below `~/.agent-run/skills/<runtime>`;
 - MCP names resolve only from `[mcp.<name>]` and are rendered by the selected
   runtime adapter;

@@ -395,24 +395,40 @@ class CodexAdapter:
         cache = _read_json(Path(home) / _MODEL_CACHE_REL)
         entries = cache.get("models") if isinstance(cache, dict) else None
         if not isinstance(entries, list):
-            return ()
+            return tuple(ModelInfo(model_id, "", ()) for model_id in config.models)
         by_id: dict[str, dict] = {}
         for item in entries:
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                by_id[item["id"]] = item
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("slug")
+            if not isinstance(model_id, str):
+                model_id = item.get("id")
+            if isinstance(model_id, str):
+                by_id[model_id] = item
         result = []
         for model_id in config.models:
             item = by_id.get(model_id)
             if item is None:
                 continue
             description = item.get("description")
-            efforts_raw = item.get("efforts")
-            efforts = (
-                tuple(effort for effort in efforts_raw if isinstance(effort, str))
-                if isinstance(efforts_raw, list)
-                else ()
+            efforts_raw = item.get("supported_reasoning_levels")
+            if not isinstance(efforts_raw, list):
+                efforts_raw = item.get("efforts")
+            efforts: list[str] = []
+            if isinstance(efforts_raw, list):
+                for level in efforts_raw:
+                    effort = level if isinstance(level, str) else (
+                        level.get("effort") if isinstance(level, Mapping) else None
+                    )
+                    if isinstance(effort, str) and effort not in efforts:
+                        efforts.append(effort)
+            result.append(
+                ModelInfo(
+                    model_id,
+                    description if isinstance(description, str) else "",
+                    tuple(efforts),
+                )
             )
-            result.append(ModelInfo(model_id, description if isinstance(description, str) else "", efforts))
         return tuple(result)
 
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
