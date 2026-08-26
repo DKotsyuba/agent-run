@@ -60,6 +60,7 @@ class ServiceTempCase(unittest.TestCase):
         self.config = runtime_config(self.binary, self.home)
 
     def plan(self, **kwargs):
+        kwargs.setdefault("inherited_environment", {PASSWORD_ENV: "fixture-password"})
         return build_service_plan(self.config, self.home, port=41777, **kwargs)
 
 
@@ -71,6 +72,7 @@ class BuildServicePlanTests(ServiceTempCase):
         self.assertEqual(plan.environment["XDG_DATA_HOME"], str(data_home))
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.environment["OPENCODE_DISABLE_CLAUDE_CODE"], "1")
+        self.assertEqual(plan.environment[PASSWORD_ENV], "fixture-password")
         self.assertTrue(config_home.is_relative_to(self.home))
         self.assertEqual(plan.host, SERVICE_HOST)
         self.assertEqual(plan.base_url, f"http://{SERVICE_HOST}:41777")
@@ -88,6 +90,7 @@ class BuildServicePlanTests(ServiceTempCase):
     def test_ambient_secrets_never_reach_the_child(self):
         plan = self.plan(
             inherited_environment={
+                PASSWORD_ENV: "fixture-password",
                 "AWS_SECRET_ACCESS_KEY": "leak",
                 "ANTHROPIC_API_KEY": "leak",
                 "SECRET": "leak",
@@ -98,6 +101,7 @@ class BuildServicePlanTests(ServiceTempCase):
             [
                 "HOME",
                 "OPENCODE_DISABLE_CLAUDE_CODE",
+                PASSWORD_ENV,
                 "PATH",
                 "XDG_CACHE_HOME",
                 "XDG_CONFIG_HOME",
@@ -112,15 +116,22 @@ class BuildServicePlanTests(ServiceTempCase):
             self.home,
             auth=RuntimeAuthConfig("environment", names=("OPENAI_API_KEY",)),
         )
+        inherited = {PASSWORD_ENV: "fixture-password", "OPENAI_API_KEY": "token"}
         plan = build_service_plan(
-            config, self.home, port=41777, inherited_environment={"OPENAI_API_KEY": "token"}
+            config, self.home, port=41777, inherited_environment=inherited
         )
         self.assertEqual(plan.environment["OPENAI_API_KEY"], "token")
         with self.assertRaises(ValidationError):
             build_service_plan(config, self.home, port=41777)
         with self.assertRaises(ValidationError):
             build_service_plan(
-                config, self.home, port=41777, inherited_environment={"OPENAI_API_KEY": "  "}
+                config,
+                self.home,
+                port=41777,
+                inherited_environment={
+                    PASSWORD_ENV: "fixture-password",
+                    "OPENAI_API_KEY": "  ",
+                },
             )
 
     def test_global_service_environment_is_refused(self):

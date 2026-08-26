@@ -154,7 +154,7 @@ def _binary(config: RuntimeConfig) -> Path:
 
 def _refuse_global_attach(inherited: Mapping[str, str]) -> None:
     for name in sorted(inherited):
-        if name.startswith(ATTACH_PREFIX):
+        if name != PASSWORD_ENV and name.startswith(ATTACH_PREFIX):
             raise ServiceIsolationError(
                 f"refusing to inherit {name}; the managed opencode service never "
                 "attaches to a global service"
@@ -206,6 +206,7 @@ def _environment(
         # Never inherited: an ambient PATH makes the launched argv nondeterministic.
         "PATH": SERVICE_PATH,
     }
+    environment[PASSWORD_ENV] = require_server_password(inherited.get(PASSWORD_ENV))
     auth = config.auth
     if auth is not None:
         if auth.kind != "environment":
