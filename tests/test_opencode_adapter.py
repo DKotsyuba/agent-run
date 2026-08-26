@@ -228,6 +228,88 @@ class OutcomeTests(unittest.TestCase):
         self.assertTrue(is_settled({}))
         self.assertFalse(is_working({}))
 
+    def test_v1_shape_infers_success_from_last_assistant_text(self):
+        """v1 1.18.18 never reports ``outcome`` at all (proven live, T041):
+        an empty session info still normalizes correctly from the message
+        list alone once the caller has already decided the turn is settled."""
+
+        # newest-first, matching the real GET .../message ordering.
+        payload = [message("assistant", "PONG", at=2.0), message("user", "task", at=1.0)]
+        outcome = normalize_outcome({}, payload, runtime_session_id="ses_1")
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertIsNone(outcome.failure_kind)
+        self.assertEqual(outcome.runtime_session_id, "ses_1")
+
+    def test_v1_shape_infers_failure_from_a_non_abort_error(self):
+        payload = [message(
+            "assistant", "", at=2.0,
+            error={"name": "ProviderAuthError", "data": {"message": "no api key"}},
+        )]
+        outcome = normalize_outcome({}, payload)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "ProviderAuthError")
+        self.assertEqual(outcome.failure_text, "no api key")
+
+    def test_v1_shape_infers_cancelled_from_message_aborted_error(self):
+        """``MessageAbortedError`` is the one named v1 error (proven live via
+        v1's own ``/doc`` OpenAPI) that means the session's own ``/interrupt``
+        fired, not that the turn failed."""
+
+        payload = [message(
+            "assistant", "", at=2.0,
+            error={"name": "MessageAbortedError", "data": {"message": "aborted by user"}},
+        )]
+        outcome = normalize_outcome({}, payload)
+        self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+        self.assertEqual(outcome.failure_kind, "MessageAbortedError")
+        self.assertEqual(outcome.failure_text, "aborted by user")
+
+    def test_v1_shape_with_no_settled_assistant_message_fails_closed(self):
+        # Empty transcript, or the newest entry not a settled assistant turn
+        # (here: only a user message) -- genuinely indeterminate either way.
+        for payload in ((), [message("user", "task")]):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    normalize_outcome({}, payload)
+
+    # -- pinned to a real pinned v1 1.18.18 `opencode serve` session (T041):
+    # session created and prompted with model omniroute/gpt-5.6-luna through
+    # an isolated home, captured before any assistant reply landed.
+    LIVE_V1_SESSION_INFO = {
+        "agent": "agent-run",
+        "cost": 0,
+        "id": "ses_fc0617c30ffen2sajH7MOh213F",
+        "location": {"directory": "/private/var/folders/q0/t041-opencode-v1-lt20shbs"},
+        "model": {"id": "gpt-5.6-luna", "providerID": "openai", "variant": "default"},
+        "projectID": "global",
+        "subpath": "private/var/folders/q0/t041-opencode-v1-lt20shbs",
+        "time": {"created": 1787773748181, "updated": 1787773748181},
+        "title": "New session - 2026-08-26T19:49:08.181Z",
+        "tokens": {"cache": {"read": 0, "write": 0}, "input": 0, "output": 0, "reasoning": 0},
+    }
+    LIVE_V1_MESSAGES = {
+        "cursor": {"next": "eyJpZCI6...", "previous": "eyJpZCI6..."},
+        "data": [
+            {
+                "id": "msg_03f8d9067001DluE7kkEbyO0Wn",
+                "text": "Reply with exactly one word: PONG",
+                "time": {"created": 1787772637288},
+                "type": "user",
+            }
+        ],
+    }
+
+    def test_live_v1_session_info_has_no_outcome_key(self):
+        self.assertNotIn("outcome", self.LIVE_V1_SESSION_INFO)
+
+    def test_live_v1_indeterminate_state_still_fails_closed(self):
+        """The real session settled with only its user message durably
+        recorded (no assistant reply yet): a genuinely indeterminate ending,
+        which must still refuse rather than guess "succeeded"."""
+
+        with self.assertRaises(ValidationError):
+            normalize_outcome(self.LIVE_V1_SESSION_INFO, self.LIVE_V1_MESSAGES)
+
 
 class ModelTests(unittest.TestCase):
     def test_canonical_identifiers_split_into_provider_and_model(self):
@@ -599,7 +681,9 @@ class FakeService:
     "running"}`` while a turn is in flight, or ``None`` when the session is
     absent from that map (idle or settled). ``outcome`` is what
     ``GET /api/session/{id}`` reports once ``wait()`` decides the turn is
-    final -- the only source of the terminal status on the real service.
+    final. ``outcome=None`` (the default is ``"succeeded"``, not ``None``)
+    simulates the pinned v1 1.18.18 shape proven live: no ``outcome`` key at
+    all, forcing the terminal status to be inferred from the last message.
     """
 
     def __init__(self, directory, statuses, message_pages, permission_pages=(), outcome="succeeded"):
@@ -629,7 +713,7 @@ class FakeService:
 
     def session_info(self, session_id):
         self.calls.append(("session_info", session_id))
-        return {"outcome": self.outcome}
+        return {} if self.outcome is None else {"outcome": self.outcome}
 
     def messages(self, session_id):
         self.calls.append(("messages", session_id))
@@ -789,6 +873,34 @@ class SessionTests(AdapterCase):
         self.assertEqual(outcome.status, AgentStatus.FAILED)
         self.assertEqual(outcome.failure_kind, "ProviderError")
         self.assertEqual([item.content for item in self.sink.messages], ["partial"])
+
+    def test_v1_shaped_service_settles_from_the_last_message_with_no_outcome_field(self):
+        """v1 1.18.18's ``GET /api/session/{id}`` never carries ``outcome``
+        (proven live, T041): ``wait()`` must still reach a terminal Outcome
+        from ``/api/session/active`` absence plus the last assistant message."""
+
+        answer = "PONG"
+        service = FakeService(
+            self.captures, [{"type": "running"}, None], [[message("assistant", answer, at=2.0)]],
+            outcome=None,
+        )
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(outcome.runtime_session_id, "ses_1")
+
+    def test_v1_shaped_service_reports_cancelled_on_message_aborted_error(self):
+        service = FakeService(
+            self.captures,
+            [{"type": "running"}, None],
+            [[message(
+                "assistant", "", at=2.0,
+                error={"name": "MessageAbortedError", "data": {"message": "aborted"}},
+            )]],
+            outcome=None,
+        )
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+        self.assertEqual(outcome.failure_kind, "MessageAbortedError")
 
     def test_permissions_of_this_session_are_answered_exactly_once(self):
         pending = [
