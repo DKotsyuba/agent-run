@@ -516,6 +516,40 @@ class StateStore:
             )
         return True
 
+    def reconcile_reaped(
+        self,
+        agent_id: str | AgentId,
+        supervisor_pid: int,
+        *,
+        checked_at: float | None = None,
+    ) -> bool:
+        """Commit exact waitpid proof, including the pre-identity STARTING window."""
+
+        checked = validate_agent_id(agent_id)
+        integer("supervisor_pid", supervisor_pid, minimum=1)
+        changed_at = timestamp(checked_at)
+        with immediate(self.connection):
+            agent = agent_row(self.connection, checked)
+            if AgentStatus(str(agent["status"])) in TERMINAL:
+                return False
+            recorded_pid = agent["supervisor_pid"]
+            if recorded_pid is not None and int(recorded_pid) != supervisor_pid:
+                return False
+            self._transition(
+                checked,
+                AgentStatus.LOST,
+                changed_at,
+                outcome=Outcome(
+                    AgentStatus.LOST,
+                    failure_kind="supervisor_dead",
+                    failure_text="detached supervisor exited",
+                ),
+                attempt_id=None,
+                kind="reconciled_lost",
+                data={"verdict": "reaped", "supervisor_pid": supervisor_pid},
+            )
+        return True
+
     def enqueue_command(
         self,
         agent_id: str | AgentId,

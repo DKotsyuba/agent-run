@@ -895,8 +895,9 @@ class CliTests(unittest.TestCase):
                 events.append("dispatch")
                 raise RuntimeError("delivery failed")
 
-            def reconciled(reconcile_store, pid):
+            def reconciled(reconcile_store, reconciled_agent_id, pid):
                 self.assertIs(reconcile_store, store)
+                self.assertEqual(reconciled_agent_id, AgentId(AGENT_ID))
                 self.assertEqual(pid, 123)
                 events.append("reconcile")
 
@@ -920,7 +921,7 @@ class CliTests(unittest.TestCase):
             ), patch.object(
                 cli, "_dispatch_once", side_effect=failed_dispatch
             ), patch.object(
-                cli, "reconcile_reaped_supervisor", side_effect=reconciled
+                cli, "reconcile_reaped_agent", side_effect=reconciled
             ):
                 cli._launch_callback(home)(
                     AgentId(AGENT_ID), request, object(), object(), home / "agents" / AGENT_ID

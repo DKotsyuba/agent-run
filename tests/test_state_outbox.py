@@ -7,7 +7,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
-from agent_run.state import StateStore, reconcile_reaped_supervisor
+from agent_run.state import (
+    StateStore,
+    reconcile_reaped_agent,
+    reconcile_reaped_supervisor,
+)
 
 
 class StateOutboxTests(unittest.TestCase):
@@ -317,6 +321,28 @@ class StateOutboxTests(unittest.TestCase):
         self.assertEqual(self.store.get_agent(other)["status"], "running")
         self.assertEqual(self.store.get_agent(terminal)["status"], "failed")
         self.assertEqual(reconcile_reaped_supervisor(self.store, 100, at=7), ())
+
+    def test_reaped_agent_closes_the_pre_identity_starting_window(self) -> None:
+        agent_id = self.create()
+        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
+
+        self.assertTrue(reconcile_reaped_agent(self.store, agent_id, 321, at=3))
+        self.assertEqual(self.store.get_agent(agent_id)["status"], "lost")
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT state FROM deliveries WHERE agent_id = ?", (agent_id,)
+            ).fetchone()[0],
+            "waiting_binding",
+        )
+        self.assertFalse(reconcile_reaped_agent(self.store, agent_id, 321, at=4))
+
+        other = self.create()
+        self.store.transition(other, AgentStatus.STARTING, at=5)
+        self.store.record_supervisor(
+            other, pid=999, identity="pid-999", process_group_id=999, at=6
+        )
+        self.assertFalse(reconcile_reaped_agent(self.store, other, 321, at=7))
+        self.assertEqual(self.store.get_agent(other)["status"], "starting")
 
     def test_capacity_retention_is_global_deterministic_and_keeps_expired_rows(self) -> None:
         first = self.store.insert_capacity_sample(

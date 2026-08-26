@@ -13,6 +13,22 @@ if TYPE_CHECKING:
     from .store import StateStore
 
 
+def reconcile_reaped_agent(
+    store: StateStore,
+    agent_id: str | AgentId,
+    supervisor_pid: int,
+    *,
+    at: float | None = None,
+) -> bool:
+    """Close the exact agent whose detached supervisor was reaped by waitpid."""
+
+    from .store import StateStore
+
+    if not isinstance(store, StateStore):
+        raise ValidationError("store must be a StateStore")
+    return store.reconcile_reaped(agent_id, supervisor_pid, checked_at=at)
+
+
 def reconcile_reaped_supervisor(
     store: StateStore,
     supervisor_pid: int,

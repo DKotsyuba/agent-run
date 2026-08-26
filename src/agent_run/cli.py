@@ -27,7 +27,7 @@ from .hooks.context import build_context
 from .launch import launch_detached
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
-from .state import StateStore, reconcile_reaped_supervisor
+from .state import StateStore, reconcile_reaped_agent
 from .supervisor import Supervisor, SupervisorSettings
 
 _MAX_STDIN_CHARS = 1_048_576
@@ -448,13 +448,6 @@ def _dispatch_once(home: Path):
 
 
 def _launch_callback(home: Path):
-    def post_reap(pid: int, _wait_status: int) -> None:
-        store = StateStore.open(state_db_path(home))
-        try:
-            reconcile_reaped_supervisor(store, pid)
-        finally:
-            store.close()
-
     def launch(
         agent_id: AgentId,
         request: StartRequest,
@@ -462,6 +455,13 @@ def _launch_callback(home: Path):
         plan,
         candidate_dir: Path,
     ) -> None:
+        def post_reap(pid: int, _wait_status: int) -> None:
+            store = StateStore.open(state_db_path(home))
+            try:
+                reconcile_reaped_agent(store, agent_id, pid)
+            finally:
+                store.close()
+
         def child(ready) -> None:
             store = StateStore.open(state_db_path(home))
             try:
