@@ -712,6 +712,10 @@ class StateStore:
 - a caller-supplied `request_id` is globally idempotent before binding; under
   `BEGIN IMMEDIATE`, retries must match the serialized request, task summary,
   and configuration revision exactly;
+- configured global and per-runtime active-agent caps are checked in that same
+  `BEGIN IMMEDIATE` after the idempotent duplicate lookup and before session,
+  agent, or initial-event insertion, so concurrent starts cannot exceed either
+  cap and a retry still returns its existing agent when capacity is full;
 - worker claims use conditional status/attempt updates;
 - the final artifact is flushed and hashed before terminal commit;
 - terminal commit updates the agent, appends the terminal event, and activates
