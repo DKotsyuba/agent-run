@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -218,10 +219,24 @@ class Supervisor:
                     failure_text=str(error),
                 )
             )
+        except BaseException as error:  # a kill still leaves the row terminal
+            with contextlib.suppress(Exception):
+                self._commit(
+                    Outcome(
+                        AgentStatus.FAILED,
+                        failure_kind="launch_failed",
+                        failure_text=_error_text(error),
+                    )
+                )
+            raise
         try:
             return self._run_launched(session, steerable)
         except Exception as error:
             return self._fail_launched(session, error)
+        except BaseException as error:
+            with contextlib.suppress(Exception):
+                self._fail_launched(session, error)
+            raise
 
     def _run_launched(self, session: RuntimeSession, steerable: bool) -> Outcome:
         self._owns_process_group = bool(
@@ -254,7 +269,7 @@ class Supervisor:
         session_outcome = self._supervise(session, deadline, steerable)
         return self._finish(session, session_outcome)
 
-    def _fail_launched(self, session: RuntimeSession, error: Exception) -> Outcome:
+    def _fail_launched(self, session: RuntimeSession, error: BaseException) -> Outcome:
         """Native-cancel, prove cleanup, then persist every post-launch fault."""
 
         self._safe_cancel(session)
