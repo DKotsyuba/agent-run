@@ -29,7 +29,7 @@ class CoreConfig:
 
 @dataclass(frozen=True)
 class CapacityConfig:
-    collect_interval_seconds: float = 300
+    collect_interval_seconds: int = 300
     sample_retention: int = 1000
     context_max_chars: int = 2500
 
@@ -200,8 +200,8 @@ def _parse_core(value: object) -> CoreConfig:
         "core",
     )
     warning = _number(table.get("warning_fraction", 0.90), "core.warning_fraction", minimum=0)
-    if warning > 1:
-        raise ValidationError("core.warning_fraction must be <= 1")
+    if not 0 < warning < 1:
+        raise ValidationError("core.warning_fraction must be strictly between 0 and 1")
     return CoreConfig(
         _number(
             table.get("default_timeout_seconds", 480),
@@ -220,14 +220,22 @@ def _parse_capacity(value: object) -> CapacityConfig:
         {"collect_interval_seconds", "sample_retention", "context_max_chars"},
         "capacity",
     )
+    interval = _int(
+        table.get("collect_interval_seconds", 300),
+        "capacity.collect_interval_seconds",
+        minimum=1,
+    )
+    context_max_chars = _int(
+        table.get("context_max_chars", 2500),
+        "capacity.context_max_chars",
+        minimum=1,
+    )
+    if context_max_chars > 2500:
+        raise ValidationError("capacity.context_max_chars must be <= 2500")
     return CapacityConfig(
-        _number(
-            table.get("collect_interval_seconds", 300),
-            "capacity.collect_interval_seconds",
-            minimum=0.000001,
-        ),
+        interval,
         _int(table.get("sample_retention", 1000), "capacity.sample_retention", minimum=1),
-        _int(table.get("context_max_chars", 2500), "capacity.context_max_chars", minimum=1),
+        context_max_chars,
     )
 
 

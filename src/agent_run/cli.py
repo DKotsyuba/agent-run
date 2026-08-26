@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import TextIO
 
 from .capacity.collect import collect_once
+from .capacity.launchd import argv as launchd_argv
+from .capacity.launchd import build_configured_job, render_plist
 from .config import load_config
 from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueSender, CodexQueueTransport
 from .delivery.dispatch import DeliveryDispatcher
@@ -31,6 +33,7 @@ _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
 _QUEUE_TIMEOUT_SECONDS = 30.0
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
+_CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -102,6 +105,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     collect = capacity.add_parser("collect")
     collect.add_argument("--once", action="store_true", required=True)
+    launchd = capacity.add_parser("launchd")
+    launchd.add_argument("--binary", required=True)
+    launchd.add_argument("--label", default=_CAPACITY_LAUNCHD_LABEL)
+    launchd.add_argument("--stdout-log", default="/dev/null")
+    launchd.add_argument("--stderr-log")
 
     delivery = commands.add_parser("delivery").add_subparsers(
         dest="delivery_command", required=True
@@ -336,6 +344,27 @@ def _emit(value, stream: TextIO) -> None:
     stream.write("\n")
 
 
+def _capacity_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    config = load_config(config_path(home))
+    job = build_configured_job(
+        config.capacity,
+        args.label,
+        Path(args.binary),
+        stdout_log=Path(args.stdout_log),
+        stderr_log=(
+            home / "capacity-worker.err.log"
+            if args.stderr_log is None
+            else Path(args.stderr_log)
+        ),
+    )
+    return {
+        "label": job.label,
+        "interval_seconds": job.interval_seconds,
+        "argv": launchd_argv(job),
+        "plist": render_plist(job),
+    }
+
+
 def _dispatch_once(home: Path):
     executable = os.environ.get("CODEX_QUEUE_BIN")
     if not executable or not Path(executable).is_absolute():
@@ -504,6 +533,8 @@ def main(
             result = _initialize(home)
         elif service is None and args.command == "doctor":
             result = _doctor(home)
+        elif args.command == "capacity" and args.capacity_command == "launchd":
+            result = _capacity_launchd(home, args)
         else:
             if service is None:
                 owned = _Runtime(home)
