@@ -95,6 +95,65 @@ def thread_response(cwd, roots=("/work",), writable_roots=(), thread_id="th_1", 
     return response
 
 
+#: Captured live 2026-08-26 from a real probe against codex CLI 0.149.1's
+#: app-server (see app_server.py's normalization comment), for a read-only
+#: thread/start whose request had roots=("/Users/pluto/projects/agent-run",)
+#: and writable_roots=(). This is the exact echo shape that broke
+#: verify_effective_params in production: no top-level roots, writableRoots,
+#: or threadId at all.
+_LIVE_READ_ONLY_ECHO = {
+    "thread": {
+        "id": "01a03e9c-4cf3-7081-a577-879ea9dda343",
+        "sessionId": "01a03e9c-4cf3-7081-a577-879ea9dda343",
+        "cwd": "/Users/pluto/projects/agent-run",
+        "cliVersion": "0.149.1",
+    },
+    "model": "gpt-5.6-luna",
+    "modelProvider": "openai",
+    "serviceTier": None,
+    "cwd": "/Users/pluto/projects/agent-run",
+    "runtimeWorkspaceRoots": ["/Users/pluto/projects/agent-run"],
+    "instructionSources": [],
+    "approvalPolicy": "never",
+    "approvalsReviewer": "user",
+    "sandbox": {"type": "readOnly", "networkAccess": False},
+    "activePermissionProfile": None,
+    "reasoningEffort": None,
+    "multiAgentMode": "explicitRequestOnly",
+}
+
+#: Same live probe, workspace-write: the request's writable_roots was
+#: ("/Users/pluto/projects/agent-run",) (the cwd only), and the echo's
+#: sandbox.writableRoots came back empty -- the cwd's writability is implied
+#: by the workspaceWrite sandbox type rather than listed explicitly.
+_LIVE_WORKSPACE_WRITE_ECHO = {
+    "thread": {
+        "id": "01a03e9c-cf76-7fb0-9af3-68b2361573ac",
+        "sessionId": "01a03e9c-cf76-7fb0-9af3-68b2361573ac",
+        "cwd": "/Users/pluto/projects/agent-run",
+        "cliVersion": "0.149.1",
+    },
+    "model": "gpt-5.6-luna",
+    "modelProvider": "openai",
+    "serviceTier": None,
+    "cwd": "/Users/pluto/projects/agent-run",
+    "runtimeWorkspaceRoots": ["/Users/pluto/projects/agent-run"],
+    "instructionSources": [],
+    "approvalPolicy": "never",
+    "approvalsReviewer": "user",
+    "sandbox": {
+        "type": "workspaceWrite",
+        "writableRoots": [],
+        "networkAccess": False,
+        "excludeTmpdirEnvVar": False,
+        "excludeSlashTmp": False,
+    },
+    "activePermissionProfile": None,
+    "reasoningEffort": None,
+    "multiAgentMode": "explicitRequestOnly",
+}
+
+
 class VerifyEffectiveParamsTests(unittest.TestCase):
     def expected(self, **overrides):
         values = dict(
@@ -145,6 +204,63 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
         actual["sandbox"] = {"type": "somethingNew", "networkAccess": False}
         with self.assertRaisesRegex(VerificationError, "sandbox mismatch"):
             verify_effective_params(self.expected(), actual)
+
+    def test_live_read_only_echo_shape_passes(self) -> None:
+        """Regression for the proven-live failure: codex CLI 0.149.1 dropped
+        the top-level ``roots`` key entirely, breaking every read-only launch
+        with "roots mismatch: expected (...), got ()"."""
+        expected = EffectiveTurnParams(
+            model="gpt-5.6-luna",
+            cwd="/Users/pluto/projects/agent-run",
+            roots=("/Users/pluto/projects/agent-run",),
+            sandbox="read-only",
+            approval_policy="never",
+            writable_roots=(),
+        )
+        verify_effective_params(expected, _LIVE_READ_ONLY_ECHO)
+
+    def test_live_workspace_write_echo_shape_passes(self) -> None:
+        """The same live probe in workspace-write mode: writableRoots moved
+        inside ``sandbox`` and omits the implicitly-writable cwd."""
+        expected = EffectiveTurnParams(
+            model="gpt-5.6-luna",
+            cwd="/Users/pluto/projects/agent-run",
+            roots=("/Users/pluto/projects/agent-run",),
+            sandbox="workspace-write",
+            approval_policy="never",
+            writable_roots=("/Users/pluto/projects/agent-run",),
+        )
+        verify_effective_params(expected, _LIVE_WORKSPACE_WRITE_ECHO)
+
+    def test_beta_roots_key_missing_entirely_is_refused(self) -> None:
+        actual = dict(_LIVE_READ_ONLY_ECHO)
+        del actual["runtimeWorkspaceRoots"]
+        expected = EffectiveTurnParams(
+            model="gpt-5.6-luna",
+            cwd="/Users/pluto/projects/agent-run",
+            roots=("/Users/pluto/projects/agent-run",),
+            sandbox="read-only",
+            approval_policy="never",
+            writable_roots=(),
+        )
+        with self.assertRaisesRegex(VerificationError, "roots mismatch: expected .*, got \\(\\)"):
+            verify_effective_params(expected, actual)
+
+    def test_beta_writable_roots_unexpected_entry_is_reported_verbatim(self) -> None:
+        """A genuine writable-roots mismatch under the beta shape still fails closed."""
+        actual = dict(_LIVE_WORKSPACE_WRITE_ECHO)
+        actual["sandbox"] = dict(actual["sandbox"])
+        actual["sandbox"]["writableRoots"] = ["/other"]
+        expected = EffectiveTurnParams(
+            model="gpt-5.6-luna",
+            cwd="/Users/pluto/projects/agent-run",
+            roots=("/Users/pluto/projects/agent-run",),
+            sandbox="workspace-write",
+            approval_policy="never",
+            writable_roots=("/Users/pluto/projects/agent-run",),
+        )
+        with self.assertRaisesRegex(VerificationError, "writableRoots mismatch.*'/other'"):
+            verify_effective_params(expected, actual)
 
 
 class StartSessionTests(unittest.TestCase):
@@ -200,6 +316,34 @@ class StartSessionTests(unittest.TestCase):
             start_session(transport, plan, FakeSink())
         methods = [method for method, _ in transport.requests]
         self.assertNotIn("turn/start", methods)
+
+    def test_success_with_the_live_beta_echo_shape(self) -> None:
+        """Regression: the live app-server also nests the thread id under
+        ``thread.id`` instead of a top-level ``threadId``, alongside the
+        renamed roots key covered by ``VerifyEffectiveParamsTests``."""
+        cwd = Path("/Users/pluto/projects/agent-run")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-luna",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "roots": (str(cwd),),
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [_LIVE_READ_ONLY_ECHO],
+                "turn/start": [{}],
+            }
+        )
+        sink = FakeSink()
+        session = start_session(transport, plan, sink)
+        self.assertEqual(sink.sessions, ["01a03e9c-4cf3-7081-a577-879ea9dda343"])
+        self.assertEqual(session.pid, 4242)
 
 
 def notification(method, params=None):

@@ -91,6 +91,65 @@ def _normalized_sandbox_echo(value: object) -> object:
     return value
 
 
+#: The same beta contract renames ``thread/start``'s top-level ``roots`` echo
+#: to ``runtimeWorkspaceRoots``, and moves ``writableRoots`` inside the
+#: ``sandbox`` object -- dropping ``cwd`` from that list entirely, since a
+#: ``workspaceWrite`` sandbox already implies the cwd is writable. The
+#: ``sandbox`` scalar check above verifies the sandbox *type* against the
+#: request separately, so this cwd substitution below never masks a genuine
+#: sandbox-mode mismatch. It also renames the started thread's top-level
+#: ``threadId`` to a nested ``thread.id``.
+def _normalized_roots_echo(actual: Mapping[str, object]) -> tuple[str, ...]:
+    """Reduce a ``thread/start`` roots echo to a tuple.
+
+    Prefers the legacy top-level ``roots`` key when present (covers any
+    codex version still using it); falls back to the beta contract's
+    ``runtimeWorkspaceRoots``. Neither key present normalizes to ``()``, so
+    the caller's equality check against the requested roots still fails
+    closed.
+    """
+    if "roots" in actual:
+        return tuple(actual.get("roots") or ())
+    return tuple(actual.get("runtimeWorkspaceRoots") or ())
+
+
+def _normalized_writable_roots_echo(actual: Mapping[str, object]) -> tuple[str, ...]:
+    """Reduce a ``thread/start`` writableRoots echo to a tuple.
+
+    Prefers the legacy top-level ``writableRoots`` key when present. The
+    beta contract nests it under ``sandbox`` instead and omits ``cwd`` from
+    the list, so an empty nested list under a ``workspaceWrite`` sandbox is
+    normalized back to ``(cwd,)``. Any other shape -- a non-empty nested
+    list, a non-``workspaceWrite`` sandbox, or no ``sandbox`` object at all
+    -- passes through unchanged, so a genuine mismatch still fails closed.
+    """
+    if "writableRoots" in actual:
+        return tuple(actual.get("writableRoots") or ())
+    sandbox = actual.get("sandbox")
+    if not isinstance(sandbox, Mapping):
+        return ()
+    nested = tuple(sandbox.get("writableRoots") or ())
+    if nested:
+        return nested
+    if sandbox.get("type") == "workspaceWrite":
+        cwd = actual.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            return (cwd,)
+    return nested
+
+
+def _thread_id_echo(actual: Mapping[str, object]) -> object:
+    """Locate the started thread's id.
+
+    Prefers the legacy top-level ``threadId``; falls back to the beta
+    contract's nested ``thread.id``.
+    """
+    if "threadId" in actual:
+        return actual.get("threadId")
+    nested = actual.get("thread")
+    return nested.get("id") if isinstance(nested, Mapping) else None
+
+
 def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, object]) -> None:
     """Refuse a thread whose effective params drift from what was requested.
 
@@ -111,12 +170,12 @@ def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, 
             raise VerificationError(
                 f"codex thread/start {key} mismatch: expected {wanted!r}, got {got!r}"
             )
-    got_roots = tuple(actual.get("roots") or ())
+    got_roots = _normalized_roots_echo(actual)
     if got_roots != expected.roots:
         raise VerificationError(
             f"codex thread/start roots mismatch: expected {expected.roots!r}, got {got_roots!r}"
         )
-    got_writable = tuple(actual.get("writableRoots") or ())
+    got_writable = _normalized_writable_roots_echo(actual)
     if got_writable != expected.writable_roots:
         raise VerificationError(
             "codex thread/start writableRoots mismatch: expected "
@@ -392,7 +451,7 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
         writable_roots=writable_roots,
     )
     verify_effective_params(expected, thread)
-    thread_id = thread.get("threadId")
+    thread_id = _thread_id_echo(thread)
     if not isinstance(thread_id, str) or not thread_id:
         raise VerificationError("codex thread/start did not return a threadId")
     sink.session(thread_id)
