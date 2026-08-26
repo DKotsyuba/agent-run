@@ -400,7 +400,7 @@ class CliTests(unittest.TestCase):
             ref = build_context.call_args.args[1]
             self.assertEqual(
                 (ref.transport, ref.external_session_id, ref.external_turn_id),
-                ("codex", "raw-session", "turn-1"),
+                (cli.TRANSPORT_NAME, "raw-session", "turn-1"),
             )
             self.assertNotIn("must-not-be-logged", output)
             self.assertEqual(
@@ -431,7 +431,7 @@ class CliTests(unittest.TestCase):
                 run_hook.call_args.args[1],
                 {
                     "agent_id": agent_id,
-                    "transport": "codex",
+                    "transport": cli.TRANSPORT_NAME,
                     "external_session_id": "raw-session",
                     "external_turn_id": "turn-2",
                 },
@@ -455,12 +455,15 @@ class CliTests(unittest.TestCase):
                 delivery = check_store.connection.execute(
                     "SELECT * FROM deliveries WHERE agent_id = ?", (agent_id,)
                 ).fetchone()
+                claimed = check_store.claim_delivery("worker", at=10_000_000_000)
             finally:
                 check_store.close()
-            self.assertEqual(session["transport"], "codex")
+            self.assertEqual(cli.TRANSPORT_NAME, "codex_queue")
+            self.assertEqual(session["transport"], cli.TRANSPORT_NAME)
             self.assertEqual(session["external_turn_id"], "turn-2")
             self.assertEqual(delivery["orchestrator_session_id"], session["id"])
             self.assertEqual(delivery["state"], "pending")
+            self.assertEqual(claimed["transport"], cli.TRANSPORT_NAME)
 
             rebind_payload = dict(bind_payload, session_id="another-session")
             code, output, error = self.run_cli(
@@ -498,6 +501,21 @@ class CliTests(unittest.TestCase):
                             json.loads(error)["error"]["type"], "ValidationError"
                         )
                 run_hook.assert_not_called()
+
+            for hook, payload in (
+                ("context", dict(context_payload, hook_event_name="PostToolUse")),
+                ("bind", dict(bind_payload, hook_event_name="UserPromptSubmit")),
+            ):
+                with self.subTest(mismatched_event=hook):
+                    code, output, error = self.run_cli(
+                        ["--home", str(home), "hook", hook],
+                        service=runtime,
+                        stdin=json.dumps(payload),
+                    )
+                    self.assertEqual((code, output), (2, ""))
+                    self.assertEqual(
+                        json.loads(error)["error"]["type"], "ValidationError"
+                    )
 
             code, output, error = self.run_cli(
                 ["--home", str(home), "hook", "context"],

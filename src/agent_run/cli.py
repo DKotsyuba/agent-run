@@ -167,11 +167,15 @@ def _hook_payload(payload: dict, *, bind: bool) -> dict:
     }
     if unknown:
         raise ValidationError(f"unknown raw hook payload keys: {sorted(unknown)}")
+    expected_event = "PostToolUse" if bind else "UserPromptSubmit"
+    event = payload.get("hook_event_name")
+    if event is not None and event != expected_event:
+        raise ValidationError(f"raw hook_event_name must be {expected_event}")
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or not session_id.strip():
         raise ValidationError("raw hook session_id must be nonblank")
     normalized = {
-        "transport": "codex",
+        "transport": TRANSPORT_NAME,
         "external_session_id": session_id,
     }
     if "turn_id" in payload:
