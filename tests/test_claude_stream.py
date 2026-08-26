@@ -127,6 +127,98 @@ class StreamDecoderTests(unittest.TestCase):
         self.assertEqual(metadata.subtype, "success")
         self.assertEqual(decoder.diagnostic_count, before)
 
+    def test_replays_the_captured_double_init_result_cycle_and_settles_on_the_first(self) -> None:
+        """Regression for a real claude 2.1.245 canary (shapes embedded, long
+
+        text redacted): the engine emitted a full system/init...result
+        cycle, then -- on the very same session id -- a second full
+        system/init...result cycle. The decoder must settle on the first
+        result/success and discard the second as a duplicate, exactly as it
+        would need to for ``ClaudeSession.wait`` to ever report succeeded.
+        """
+
+        # Line-for-line shape of the captured 12-line runtime.jsonl, with
+        # long/irrelevant fields (thinking signatures, tool lists) redacted.
+        lines = [
+            {"type": "system", "subtype": "init", "session_id": "sess-live", "model": "claude-sonnet-5"},
+            {"type": "rate_limit_event", "session_id": "sess-live"},
+            {"type": "system", "subtype": "thinking_tokens", "session_id": "sess-live", "estimated_tokens": 50},
+            {"type": "system", "subtype": "thinking_tokens", "session_id": "sess-live", "estimated_tokens": 250},
+            {"type": "system", "subtype": "thinking_tokens", "session_id": "sess-live", "estimated_tokens": 318},
+            {
+                "type": "assistant",
+                "session_id": "sess-live",
+                "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "<redacted>"}]},
+            },
+            {
+                "type": "assistant",
+                "session_id": "sess-live",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "CANARY_OK"}]},
+            },
+            {
+                "type": "result",
+                "session_id": "sess-live",
+                "subtype": "success",
+                "is_error": False,
+                "result": "CANARY_OK",
+                "duration_ms": 4376,
+                "num_turns": 1,
+                "total_cost_usd": 0.136404,
+                "usage": {"input_tokens": 2, "output_tokens": 334},
+            },
+            # Second cycle: the live engine re-emitted a full init-to-result
+            # sequence on the SAME session id, unprompted, minutes later.
+            {"type": "system", "subtype": "init", "session_id": "sess-live", "model": "claude-sonnet-5"},
+            {
+                "type": "assistant",
+                "session_id": "sess-live",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "CANARY_OK"}]},
+            },
+            {"type": "rate_limit_event", "session_id": "sess-live"},
+            {
+                "type": "result",
+                "session_id": "sess-live",
+                "subtype": "success",
+                "is_error": False,
+                "result": "CANARY_OK",
+                "duration_ms": 1779,
+                "num_turns": 1,
+                "total_cost_usd": 0.1447108,
+                "usage": {"input_tokens": 4, "output_tokens": 9},
+            },
+        ]
+        self.assertEqual(len(lines), 12)
+        decoder = StreamDecoder()
+        warnings = []
+        for index, payload in enumerate(lines):
+            result = decoder.feed(json.dumps(payload), at=float(index))
+            if result.warning:
+                warnings.append(result.warning)
+        self.assertIsNotNone(decoder.terminal)
+        self.assertEqual(decoder.terminal.subtype, "success")
+        self.assertFalse(decoder.terminal.is_error)
+        self.assertEqual(decoder.terminal.result_text, "CANARY_OK")
+        # First cycle's metadata wins, not the second cycle's.
+        self.assertEqual(decoder.terminal.duration_ms, 4376)
+        self.assertEqual(decoder.terminal.total_cost_usd, 0.136404)
+        self.assertEqual(warnings.count("duplicate_terminal_line"), 1)
+
+    def test_result_with_error_subtype_is_terminal_and_marked_as_error(self) -> None:
+        decoder = StreamDecoder()
+        line = json.dumps(
+            {
+                "type": "result",
+                "session_id": "sess-1",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "boom",
+            }
+        )
+        result = decoder.feed(line, at=0.0)
+        self.assertIsNotNone(result.terminal)
+        self.assertEqual(result.terminal.subtype, "error_during_execution")
+        self.assertTrue(result.terminal.is_error)
+
 
 class SanitizeLineTests(unittest.TestCase):
     def test_literal_secret_is_redacted_even_in_a_malformed_line(self) -> None:
