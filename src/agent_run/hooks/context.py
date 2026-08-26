@@ -89,7 +89,8 @@ def _capacity_block(store: StateStore, at: float) -> tuple[str, str]:
         )
         if item.risk != forecast_module.RISK_LOW
     ]
-    text = "Capacity: " + ("; ".join(lines) if lines else "nominal") + "."
+    summary = "unknown" if not items else ("; ".join(lines) if lines else "nominal")
+    text = f"Capacity: {summary}."
     return text, key
 
 

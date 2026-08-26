@@ -41,7 +41,7 @@ class ContextHookTests(unittest.TestCase):
         self.assertEqual(self.store.list_agents(), [])
         self.assertTrue(first.injected)
         self.assertLessEqual(len(first.text), CONTEXT_HARD_LIMIT_CHARS)
-        self.assertIn("Capacity:", first.text)
+        self.assertIn("Capacity: unknown.", first.text)
 
         second = build_context(self.store, self.ref, config=self.config, now=1001.0)
         self.assertFalse(second.injected)
