@@ -26,6 +26,20 @@ class CapacityLaunchdTests(unittest.TestCase):
                     **self.paths(),
                 )
 
+    def test_configured_job_consumes_the_capacity_interval(self) -> None:
+        from agent_run.capacity.launchd import build_configured_job
+        from agent_run.config import CapacityConfig
+
+        job = build_configured_job(
+            CapacityConfig(collect_interval_seconds=17),
+            "com.example.capacity",
+            **self.paths(),
+        )
+        self.assertEqual(job.interval_seconds, 17)
+        self.assertEqual(
+            argv(job), ("/opt/agent&run", "capacity", "collect", "--once")
+        )
+
     def test_plist_is_escaped_bounded_and_one_shot(self) -> None:
         job = build_job("com.example.<capacity&>", interval_seconds=60, **self.paths())
         self.assertEqual(

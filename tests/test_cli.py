@@ -308,6 +308,83 @@ class CliTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(output), {"agent_id": "x"})
 
+    def test_capacity_launchd_renders_config_without_state_or_collection(self):
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            config_path = home / "config.toml"
+            config_path.write_text(
+                "schema_version = 1\n[capacity]\ncollect_interval_seconds = 17\n",
+                encoding="utf-8",
+            )
+            binary = home / "agent&<run>"
+            args = [
+                "--home",
+                str(home),
+                "capacity",
+                "launchd",
+                "--binary",
+                str(binary),
+            ]
+
+            with patch.object(cli, "collect_once") as collect_once:
+                code, output, error = self.run_cli(args)
+
+            self.assertEqual((code, error), (0, ""))
+            collect_once.assert_not_called()
+            self.assertFalse((home / "state.db").exists())
+            rendered = json.loads(output)
+            self.assertEqual(
+                set(rendered), {"argv", "interval_seconds", "label", "plist"}
+            )
+            self.assertEqual(rendered["label"], "com.pluto.agent-run.capacity")
+            self.assertEqual(rendered["interval_seconds"], 17)
+            self.assertEqual(
+                rendered["argv"], [str(binary), "capacity", "collect", "--once"]
+            )
+            parsed = plistlib.loads(rendered["plist"].encode("utf-8"))
+            self.assertEqual(parsed["ProgramArguments"], rendered["argv"])
+            self.assertEqual(parsed["StartInterval"], 17)
+            self.assertEqual(parsed["StandardOutPath"], "/dev/null")
+            self.assertEqual(
+                parsed["StandardErrorPath"], str(home / "capacity-worker.err.log")
+            )
+            self.assertIs(parsed["RunAtLoad"], False)
+            self.assertNotIn("KeepAlive", parsed)
+
+            config_path.write_text(
+                "schema_version = 1\n[capacity]\ncollect_interval_seconds = 19\n",
+                encoding="utf-8",
+            )
+            stdout_log = home / "capacity<&out.log"
+            stderr_log = home / "capacity&err.log"
+            code, output, error = self.run_cli(
+                [
+                    *args,
+                    "--label",
+                    "com.example.<capacity&>",
+                    "--stdout-log",
+                    str(stdout_log),
+                    "--stderr-log",
+                    str(stderr_log),
+                ]
+            )
+            self.assertEqual((code, error), (0, ""))
+            rendered = json.loads(output)
+            parsed = plistlib.loads(rendered["plist"].encode("utf-8"))
+            self.assertEqual(rendered["interval_seconds"], 19)
+            self.assertEqual(parsed["Label"], "com.example.<capacity&>")
+            self.assertEqual(parsed["StandardOutPath"], str(stdout_log))
+            self.assertEqual(parsed["StandardErrorPath"], str(stderr_log))
+            self.assertNotIn("KeepAlive", parsed)
+
+            code, output, error = self.run_cli(
+                ["--home", str(home), "capacity", "launchd", "--binary", "agent-run"]
+            )
+            self.assertEqual((code, output), (2, ""))
+            self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
+
     def test_hook_context_wraps_first_injection_and_suppresses_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()

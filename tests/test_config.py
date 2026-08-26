@@ -66,6 +66,50 @@ command = ["echo", "done"]
         self.assertEqual(config.runtimes["fake"].models, ("test",))
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))
 
+    def test_core_and_capacity_bounds_fail_during_load(self) -> None:
+        invalid = (
+            ("core", "warning_fraction", "true"),
+            ("core", "warning_fraction", '"0.5"'),
+            ("core", "warning_fraction", "0"),
+            ("core", "warning_fraction", "1"),
+            ("capacity", "collect_interval_seconds", "true"),
+            ("capacity", "collect_interval_seconds", "0.5"),
+            ("capacity", "collect_interval_seconds", "0"),
+            ("capacity", "context_max_chars", "true"),
+            ("capacity", "context_max_chars", "1.5"),
+            ("capacity", "context_max_chars", "0"),
+            ("capacity", "context_max_chars", "2501"),
+        )
+        for section, field, value in invalid:
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                ValidationError, field
+            ):
+                self.load(
+                    f"schema_version = 1\n[{section}]\n{field} = {value}\n"
+                )
+
+        lower = self.load(
+            """schema_version = 1
+[core]
+warning_fraction = 0.1
+[capacity]
+collect_interval_seconds = 1
+context_max_chars = 1
+"""
+        )
+        upper = self.load(
+            """schema_version = 1
+[core]
+warning_fraction = 0.9
+[capacity]
+collect_interval_seconds = 300
+context_max_chars = 2500
+"""
+        )
+        self.assertEqual(lower.capacity.collect_interval_seconds, 1)
+        self.assertEqual(lower.capacity.context_max_chars, 1)
+        self.assertEqual(upper.capacity.context_max_chars, 2500)
+
     def test_unknown_fields_report_the_recursive_path(self) -> None:
         cases = (
             ("schema_version = 1\nextra = true\n", "extra"),

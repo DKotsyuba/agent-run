@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..config import CapacityConfig
 from ..errors import ValidationError
 
 
@@ -50,6 +51,25 @@ def build_job(
         if not isinstance(path, Path) or not path.is_absolute():
             raise ValidationError(f"{name} must be an absolute path")
     return LaunchdJob(label, binary, interval_seconds, stdout_log, stderr_log)
+
+
+def build_configured_job(
+    config: CapacityConfig,
+    label: str,
+    binary: Path,
+    *,
+    stdout_log: Path,
+    stderr_log: Path,
+) -> LaunchdJob:
+    if not isinstance(config, CapacityConfig):
+        raise ValidationError("config must be a CapacityConfig")
+    return build_job(
+        label,
+        binary,
+        config.collect_interval_seconds,
+        stdout_log=stdout_log,
+        stderr_log=stderr_log,
+    )
 
 
 def argv(job: LaunchdJob) -> tuple[str, ...]:
