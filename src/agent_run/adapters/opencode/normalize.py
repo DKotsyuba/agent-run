@@ -1,14 +1,20 @@
 """Pure OpenCode model, transcript, and status normalization.
 
-Every shape here is the flat beta-18286 v2 contract proven live against the
-service's own ``/openapi.json``: a session's ``model`` is ``Model.Ref``
-(``providerID`` + ``id``, not ``modelID``); ``/api/session/active`` reports only
-``{sessionID: {"type": "running"}}`` for a session currently executing a turn,
-and omits any session that is not; the terminal ``outcome`` (succeeded, failed,
-interrupted) lives on the session record itself, not on that active map; and a
+The flat contract proven live against both the beta-18286 service's own
+``/openapi.json`` and the pinned v1 1.18.18 service's ``/doc``: a session's
+``model`` is ``Model.Ref`` (``providerID`` + ``id``, not ``modelID``);
+``/api/session/active`` reports only ``{sessionID: {"type": "running"}}`` for a
+session currently executing a turn, and omits any session that is not; a
 ``Session.Message.Info`` is a flat, ``type``-discriminated object -- no
 ``info``/``parts`` wrapper -- with a direct ``text`` field for user/system
-messages and a ``content`` parts array for assistant messages.
+messages and a ``content`` parts array for assistant messages, ordered
+newest-first by ``GET .../message``. The terminal ``outcome`` (succeeded,
+failed, interrupted) lives on the session record on beta, but is optional
+there too (permanently absent, not delayed, when a turn ends through an
+aborted tool call) and is never present at all on v1 1.18.18's
+``SessionV2Info`` -- proven live: a real v1 session that has left
+``/api/session/active`` carries no ``outcome`` key whatsoever. Either way that
+ending is inferred from the most recent message instead.
 """
 
 from __future__ import annotations
@@ -228,27 +234,81 @@ def normalize_outcome(
     payload: Mapping[str, object] | Sequence[object] = (),
     *,
     runtime_session_id: str | None = None,
+    cancelled: bool = False,
 ) -> Outcome:
     """Map a session record's ``outcome`` to exactly one terminal Outcome.
 
-    The session record carries no error detail; a non-``succeeded`` outcome's
-    detail, when the provider reported one, is read off the last assistant
-    message's structured error in the already-fetched transcript ``payload``.
+    ``outcome`` is an optional ``Session.Info`` field, not a required one:
+    beta reports it once a turn finishes cleanly but omits it when a turn
+    instead ends through an aborted tool call, and v1 1.18.18 never reports it
+    at all. The session record carries no error detail either way; a
+    failure's detail, when the provider reported one, is read off the last
+    assistant message's structured error in the already-fetched transcript
+    ``payload``. When ``outcome`` is absent, the terminal status itself is
+    inferred from that same last message instead -- ``cancelled`` tells that
+    inference the one thing no message shape can: this adapter's own
+    ``OpenCodeRuntimeSession.cancel()`` already called ``/interrupt``
+    synchronously, before ``wait()`` resumed polling, so an error-shaped
+    message (or no settled message at all) after that call is a
+    cancellation, never a raised "indeterminate" error. Ignored when
+    ``outcome`` is present -- the server already told us.
     """
 
     if not isinstance(info, Mapping):
         raise ValidationError("opencode session info must be a mapping")
     raw = info.get("outcome")
-    if not isinstance(raw, str) or raw not in _OUTCOME_STATUS:
+    if isinstance(raw, str) and raw in _OUTCOME_STATUS:
+        status = _OUTCOME_STATUS[raw]
+        kind, text = (None, None) if status is AgentStatus.SUCCEEDED else _last_error(payload)
+        return Outcome(
+            status=status,
+            failure_kind=kind,
+            failure_text=text,
+            runtime_session_id=runtime_session_id,
+        )
+    if raw is not None:
         raise ValidationError(f"opencode session outcome is not terminal: {raw!r}")
-    status = _OUTCOME_STATUS[raw]
-    kind, text = (None, None) if status is AgentStatus.SUCCEEDED else _last_error(payload)
+    status, kind, text = _infer_settled_outcome(payload, cancelled=cancelled)
     return Outcome(
         status=status,
         failure_kind=kind,
         failure_text=text,
         runtime_session_id=runtime_session_id,
     )
+
+
+#: A named v1 error that, on the SSE session-error event stream, distinctly
+#: means "this session's own /interrupt fired," not "the turn failed" --
+#: documented in v1 1.18.18's own ``/doc`` OpenAPI for that stream's error
+#: union. Checked here as a defensive extra, not the primary signal: three
+#: live 401 captures through the persisted REST message endpoint (T041) all
+#: came back with the flatter ``{"type": "unknown", "message": ...}`` shape,
+#: never this named union member, so ``normalize_outcome``'s ``cancelled``
+#: argument -- what the adapter already knows it did, not a guess from
+#: message shape -- is what actually carries the interrupt signal for v1.
+_ABORTED_ERROR = "MessageAbortedError"
+
+
+def _error_detail(error: Mapping[str, object]) -> tuple[str, str | None]:
+    """A structured error's kind and message.
+
+    Beta names the discriminant ``type`` and carries the message directly;
+    v1 names it ``name`` and nests the message under ``data`` instead
+    (``{"name": "MessageAbortedError", "data": {"message": ...}}``, proven
+    live via v1's ``/doc``). Both are accepted so one call site works for
+    either service generation.
+    """
+
+    name = error.get("type")
+    if not isinstance(name, str):
+        name = error.get("name")
+    kind = name if isinstance(name, str) else "opencode_error"
+    message = error.get("message")
+    if not isinstance(message, str):
+        data = error.get("data")
+        message = data.get("message") if isinstance(data, Mapping) else None
+    text = message if isinstance(message, str) else None
+    return kind, text
 
 
 def _last_error(
@@ -260,11 +320,50 @@ def _last_error(
     for item in _messages(payload):
         error = item.get("error") if item.get("type") == "assistant" else None
         if isinstance(error, Mapping):
-            name = error.get("type")
-            message = error.get("message")
-            kind = name if isinstance(name, str) else "opencode_error"
-            text = message if isinstance(message, str) else None
+            kind, text = _error_detail(error)
     return kind, text
+
+
+def _infer_settled_outcome(
+    payload: Mapping[str, object] | Sequence[object], *, cancelled: bool = False
+) -> tuple[AgentStatus, str | None, str | None]:
+    """Derive success/failure/cancellation when the session record carries no
+    ``outcome`` at all -- the only path on v1 1.18.18, and the fallback for a
+    beta turn that ended through an aborted tool call.
+
+    ``GET .../message`` orders ``data`` newest-first (proven live against
+    both beta-18314 and v1 1.18.18), so the most recent message is always the
+    first item. An assistant message with real text and no error is a
+    success. An assistant message with a structured error is a cancellation
+    when it names ``MessageAbortedError``, or when ``cancelled`` is set --
+    that local signal matters because a v1 ``/interrupt`` fired shortly after
+    ``prompt`` does not always leave an error-shaped message to check at all
+    (proven live, T041: it can settle with no assistant message whatsoever) --
+    and a failure otherwise. A session cancelled before any settled assistant
+    message ever landed is a cancellation too, not a raised error:
+    ``cancelled`` is a fact the caller already knows, never a guess, so it is
+    never indeterminate. Absent that signal, no messages at all or a
+    non-settled last message is genuinely indeterminate and still fails
+    closed.
+    """
+
+    messages = _messages(payload)
+    if not messages or messages[0].get("type") != "assistant":
+        if cancelled:
+            return AgentStatus.CANCELLED, None, None
+        raise ValidationError("opencode session outcome is not terminal: None")
+    latest = messages[0]
+    error = latest.get("error")
+    if isinstance(error, Mapping):
+        kind, text = _error_detail(error)
+        if cancelled or kind == _ABORTED_ERROR:
+            return AgentStatus.CANCELLED, kind, text
+        return AgentStatus.FAILED, kind, text
+    if _text(latest):
+        return AgentStatus.SUCCEEDED, None, None
+    if cancelled:
+        return AgentStatus.CANCELLED, None, None
+    raise ValidationError("opencode session outcome is not terminal: None")
 
 
 def session_state(status: Mapping[str, object]) -> str | None:

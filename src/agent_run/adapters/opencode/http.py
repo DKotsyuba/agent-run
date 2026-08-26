@@ -99,6 +99,7 @@ class HttpResponse:
     path: str
     body_path: Path
     body_bytes: int
+    content_type: str = ""
     released: bool = field(default=False)
 
     @property
@@ -143,6 +144,16 @@ class HttpResponse:
             )
         if self.body_bytes == 0:
             return None
+        if (
+            200 <= self.status < 300
+            and self.content_type
+            and not _is_json_content_type(self.content_type)
+        ):
+            raise ValidationError(
+                f"opencode service replied to {self.path} with Content-Type "
+                f"{self.content_type!r}, not JSON; this is the v1 web UI's catch-all "
+                "for an unrecognized path, not the API"
+            )
         try:
             with self.body_path.open("rb") as stream:
                 return json.load(stream)
@@ -179,8 +190,33 @@ def _check_path(path: str) -> str:
     return path
 
 
+#: application/json, plus a +json structured suffix (e.g. a JSON:API media
+#: type); a charset or other parameter after ';' never changes the verdict.
+def _is_json_content_type(value: str) -> bool:
+    media_type = value.split(";", 1)[0].strip().lower()
+    return media_type == "application/json" or media_type.endswith("+json")
+
+
+def _response_content_type(response: object) -> str:
+    """The reply's Content-Type, or "" when the transport does not carry one."""
+
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return ""
+    try:
+        value = headers.get("Content-Type", "")
+    except AttributeError:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 def _capture(
-    response: object, directory: Path, status: int, path: str, max_bytes: int
+    response: object,
+    directory: Path,
+    status: int,
+    path: str,
+    max_bytes: int,
+    content_type: str = "",
 ) -> HttpResponse:
     descriptor, name = tempfile.mkstemp(dir=str(directory), prefix="reply.", suffix=".json")
     body_path = Path(name)
@@ -207,7 +243,13 @@ def _capture(
             os.close(descriptor)
         body_path.unlink(missing_ok=True)
         raise
-    return HttpResponse(status=status, path=path, body_path=body_path, body_bytes=written)
+    return HttpResponse(
+        status=status,
+        path=path,
+        body_path=body_path,
+        body_bytes=written,
+        content_type=content_type,
+    )
 
 
 class OpenCodeHttpClient:
@@ -302,7 +344,10 @@ class OpenCodeHttpClient:
             raise TransientHttpError(503, path, str(error)) from error
         try:
             status = int(getattr(response, "status", None) or response.getcode())
-            captured = _capture(response, self._response_dir, status, path, self._max_bytes)
+            content_type = _response_content_type(response)
+            captured = _capture(
+                response, self._response_dir, status, path, self._max_bytes, content_type
+            )
         finally:
             close = getattr(response, "close", None)
             if callable(close):

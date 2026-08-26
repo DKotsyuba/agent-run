@@ -143,9 +143,16 @@ def _mcp_servers(
             "environment": resolve_environment_names(
                 definition.env_from, inherited, what=f"mcp.{name}.env_from"
             ),
-            "disabled": False,
+            "enabled": True,
         }
     return servers
+
+
+#: The real Vercel AI SDK package for a custom OpenAI-compatible endpoint --
+#: verified to exist on the npm registry and to be what v1 1.18.18's own
+#: bundled provider loader falls back to for this kind (proven by reading the
+#: pinned binary's own strings: ``npm:X?.api.npm??"@ai-sdk/openai-compatible"``).
+OMNIROUTE_PROVIDER_NPM = "@ai-sdk/openai-compatible"
 
 
 def render_config(
@@ -154,7 +161,18 @@ def render_config(
     *,
     inherited_environment: Mapping[str, str] | None = None,
 ) -> str:
-    """Render the generated v2 service config as exact bytes-to-be."""
+    """Render the generated v1 stable service config as exact bytes-to-be.
+
+    Shapes below are proven live against the pinned v1 1.18.18 ``/doc``
+    OpenAPI and a real accepted config, not the beta-18286 contract: the
+    provider table is singular ``provider`` (keyed by id) with ``npm`` +
+    ``options`` (not ``package`` + ``settings``); a provider's model entry
+    carries ``id`` (not ``modelID``); agents live under singular ``agent``
+    with a flat ``permission`` object (kind -> "allow"/"ask"/"deny"), not a
+    list of ``{action, resource, effect}``; ``skills`` is ``{"paths": [...]}``,
+    not a bare array; and ``mcp`` maps server name directly to its definition
+    (no ``"servers"`` wrapper), with ``enabled`` (not ``disabled``).
+    """
 
     inherited = os.environ if inherited_environment is None else inherited_environment
     default_model = config.models[0]
@@ -166,40 +184,34 @@ def render_config(
         "autoupdate": False,
         "model": default_model,
         "default_agent": PRIMARY_AGENT,
-        "providers": {
+        "provider": {
             "omniroute": {
                 "name": "OmniRoute",
                 "env": ["OMNIROUTE_API_KEY"],
-                "package": "@opencode-ai/ai/providers/openai-compatible",
-                "settings": {"baseURL": "http://127.0.0.1:20128/v1", "apiKey": "{env:OMNIROUTE_API_KEY}"},
+                "npm": OMNIROUTE_PROVIDER_NPM,
+                "options": {"baseURL": "http://127.0.0.1:20128/v1", "apiKey": "{env:OMNIROUTE_API_KEY}"},
                 "models": {
-                    model.split("/", 1)[1]: {"modelID": f"opencode/{model.split('/', 1)[1]}"}
+                    model.split("/", 1)[1]: {"id": f"opencode/{model.split('/', 1)[1]}"}
                     for model in config.models
                 },
             }
         },
-        "agents": {
+        "agent": {
             PRIMARY_AGENT: {
                 "mode": "primary",
                 "model": default_model,
-                "permissions": [
-                    {"action": action, "resource": resource, "effect": "allow"}
-                    for action, resource in PRIMARY_PERMISSION
-                ],
+                "permission": dict(PRIMARY_PERMISSION),
             },
             VERIFY_AGENT: {
                 "mode": "subagent",
                 "model": default_model,
-                "permissions": [
-                    {"action": action, "resource": resource, "effect": "allow"}
-                    for action, resource in SUBAGENT_PERMISSION
-                ],
+                "permission": dict(SUBAGENT_PERMISSION),
             },
         },
-        "skills": list(config.skills),
-        "mcp": {"servers": _mcp_servers(config, mcp_servers, inherited)},
+        "skills": {"paths": list(config.skills)},
+        "mcp": _mcp_servers(config, mcp_servers, inherited),
     }
-    # Key order is meaningful here: permissions are read in the order written.
+    # Key order is meaningful here: permission entries are read in this order.
     return json.dumps(document, indent=2, sort_keys=False) + "\n"
 
 
@@ -390,9 +402,10 @@ class OpenCodeAdapter:
         model = state["model"]
         if not isinstance(model, Mapping) or "id" not in model:
             raise ValidationError("launch plan carries no canonical opencode model")
-        opened = client.create_session(
-            {"agent": PRIMARY_AGENT, "model": dict(model), "title": str(model["id"])}
-        )
+        # v1's create-session schema is strictly {id?, agent?, model?,
+        # location?} with additionalProperties: false -- a "title" field is
+        # rejected outright (proven live via v1's own /doc OpenAPI).
+        opened = client.create_session({"agent": PRIMARY_AGENT, "model": dict(model)})
         session_id = opened.get("id")
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValidationError("opencode service returned no session id")
@@ -406,14 +419,13 @@ class OpenCodeAdapter:
             response_dir=response_dir,
             model=dict(model),
         )
-        client.prompt_async(
-            session_id,
-            {
-                "agent": PRIMARY_AGENT,
-                "model": dict(model),
-                "text": plan.initial_input,
-            },
-        )
+        # v1's prompt body carries no per-turn agent/model at all -- selection
+        # is fixed at session-create time above (proven live via v1's own
+        # /doc OpenAPI: {id?, prompt: {text, files?, agents?}, delivery?,
+        # resume?}, additionalProperties: false). No "delivery" here: this is
+        # the session's first turn, nothing is running to queue behind or
+        # interrupt.
+        client.prompt_async(session_id, {"prompt": {"text": plan.initial_input}})
         return session
 
 
@@ -447,6 +459,7 @@ class OpenCodeRuntimeSession:
         self._monotonic = monotonic
         self._interval = float(interval_seconds)
         self._answered: set[str] = set()
+        self._cancel_requested = False
         sink.session(session_id)
 
     @property
@@ -465,8 +478,11 @@ class OpenCodeRuntimeSession:
         ``/api/session/active`` reports only a currently-running session; it
         cannot tell "not started yet" from "just finished". So an initial
         absence is not an outcome: the turn is only settled once the session
-        has been seen working, or the primary agent has actually produced
-        output.
+        has been seen working, the primary agent has actually produced
+        output, or this session's own ``cancel()`` already fired -- a v1
+        ``/interrupt`` sent right after ``prompt`` can settle with neither
+        (proven live, T041), and without this it would spin until timeout
+        instead of ever reaching ``_finish()``.
         """
 
         deadline = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
@@ -483,7 +499,11 @@ class OpenCodeRuntimeSession:
                 capture = self._client.messages(self._session_id)
                 try:
                     payload = capture.json()
-                    final = working or bool(extract_answer(payload, agent=self._agent))
+                    final = (
+                        working
+                        or self._cancel_requested
+                        or bool(extract_answer(payload, agent=self._agent))
+                    )
                 except BaseException:
                     capture.release()
                     raise
@@ -509,7 +529,9 @@ class OpenCodeRuntimeSession:
     def _finish(self, info, payload, capture) -> Outcome:
         """Emit the transcript, record answer.md, and keep only this capture."""
 
-        outcome = normalize_outcome(info, payload, runtime_session_id=self._session_id)
+        outcome = normalize_outcome(
+            info, payload, runtime_session_id=self._session_id, cancelled=self._cancel_requested
+        )
         # The capture lives directly under the agent's own directory (no
         # subdirectories), so its bare filename is already the normalized,
         # relative raw_ref the persistence guard requires -- the absolute
@@ -534,15 +556,18 @@ class OpenCodeRuntimeSession:
     def steer(self, text: str) -> None:
         if not isinstance(text, str) or not text.strip():
             raise ValidationError("steer text must be a nonblank string")
-        payload: dict[str, object] = {
-            "agent": self._agent,
-            "parts": [{"type": "text", "text": text}],
-        }
-        if self._model is not None:
-            payload["model"] = dict(self._model)
-        self._client.prompt_async(self._session_id, payload)
+        # v1's prompt body has no per-turn agent/model field; "delivery":
+        # "steer" is the engine-native way to interject into a running turn
+        # (proven live via v1's own /doc OpenAPI enum ["steer", "queue"]).
+        self._client.prompt_async(
+            self._session_id, {"prompt": {"text": text}, "delivery": "steer"}
+        )
 
     def cancel(self, grace_seconds: float) -> None:
+        # Recorded before the call, not after: the intent to interrupt is a
+        # fact regardless of whether the HTTP request itself succeeds, and
+        # wait()/normalize_outcome() need it even if abort() raises.
+        self._cancel_requested = True
         self._client.abort(self._session_id)
 
     def resolve_permissions(self) -> tuple[PermissionDecision, ...]:
