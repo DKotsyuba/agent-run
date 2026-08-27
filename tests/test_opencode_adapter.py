@@ -778,6 +778,13 @@ class DescribeValidateTests(AdapterCase):
         with self.assertRaises(ValidationError):
             self.adapter.validate(runtime_config(self.binary, self.home, models=("minimax-m3",)))
 
+    def test_prepare_refuses_network_profiles(self):
+        profile = AgentProfile("research", "Research.", False, (self.read_root,), True)
+        with self.assertRaisesRegex(
+            ValidationError, "opencode runtime does not support network profiles"
+        ):
+            self.prepare(profile=profile)
+
 
 class MaterializeTests(AdapterCase):
     def test_generated_config_is_the_exact_proven_v2_document(self):

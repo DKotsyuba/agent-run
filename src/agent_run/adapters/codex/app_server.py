@@ -54,12 +54,15 @@ class AppServerTransport(Protocol):
 
 @dataclass(frozen=True)
 class EffectiveTurnParams:
+    """Security-relevant parameters requested for one Codex thread."""
+
     model: str
     cwd: str
     roots: tuple[str, ...]
     sandbox: str
     approval_policy: str
     writable_roots: tuple[str, ...]
+    network_access: bool = False
 
 
 #: The app-server's beta contract echoes ``sandbox`` in ``thread/start`` as an
@@ -181,6 +184,10 @@ def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, 
             "codex thread/start writableRoots mismatch: expected "
             f"{expected.writable_roots!r}, got {got_writable!r}"
         )
+    if expected.network_access:
+        sandbox = actual.get("sandbox")
+        if not isinstance(sandbox, Mapping) or sandbox.get("networkAccess") is not True:
+            raise VerificationError("codex thread/start did not enable requested network access")
 
 
 #: Only these turn statuses end a turn; ``inProgress`` is not a completion.
@@ -433,13 +440,14 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     )
     roots = tuple(state["roots"])
     writable_roots = tuple(state["writable_roots"])
+    sandbox = state.get("sandbox", state["sandbox_mode"])
     thread = transport.request(
         "thread/start",
         {
             "cwd": str(plan.cwd),
             "model": state["model"],
             "effort": state.get("effort"),
-            "sandbox": state["sandbox_mode"],
+            "sandbox": sandbox,
             "approvalPolicy": state["approval_policy"],
             "roots": list(roots),
             "writableRoots": list(writable_roots),
@@ -455,6 +463,7 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
         sandbox=state["sandbox_mode"],
         approval_policy=state["approval_policy"],
         writable_roots=writable_roots,
+        network_access=isinstance(sandbox, Mapping) and sandbox.get("networkAccess") is True,
     )
     verify_effective_params(expected, thread)
     thread_id = _thread_id_echo(thread)
