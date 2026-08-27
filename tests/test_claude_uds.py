@@ -160,6 +160,19 @@ class FakeInboxServer:
             pass
         self._thread.join(timeout=5.0)
 
+    def drain(self) -> None:
+        """Wait for the one served connection before asserting on its lines.
+
+        Closing the listener straight after the sender returns races the
+        serve thread's accept(): the client's bytes sit in the kernel while
+        accept() has not been scheduled yet, close() then kills it and the
+        assertion sees an empty line list. Join first; the thread exits on
+        its own once the client has connected and hung up.
+        """
+
+        self._thread.join(timeout=5.0)
+        self.close()
+
 
 class ClaudeSessionSenderTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -210,7 +223,7 @@ class ClaudeSessionSenderTests(unittest.TestCase):
         message = "agent-run: agent finished"
 
         self.assertIsNone(self.sender()(SESSION, message))
-        server.close()
+        server.drain()
         self.assertEqual(
             server.lines,
             [
@@ -288,7 +301,7 @@ class ClaudeSessionSenderTests(unittest.TestCase):
         self.key()
         server = self.listen()
         self.assertIsNone(self.sender()(SESSION, "trusted message"))
-        server.close()
+        server.drain()
         self.assertEqual(len(server.lines), 2)
 
     def test_constructor_and_arguments_are_bounded_without_replacement_paths(self) -> None:
