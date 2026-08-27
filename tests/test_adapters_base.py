@@ -132,6 +132,28 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "not configured"):
             registry.load("missing")
 
+    def test_registry_preloads_enabled_adapter_modules_and_surfaces_errors(self) -> None:
+        modules = (
+            "agent_run.adapters.claude.adapter",
+            "agent_run.adapters.codex.adapter",
+            "agent_run.adapters.opencode.adapter",
+        )
+        for module in modules:
+            __import__("sys").modules.pop(module, None)
+        runtimes = {
+            name: RuntimeConfig(True, f"{module}:ADAPTER", Path("/bin/echo"), Path("/tmp"), ())
+            for name, module in zip(("claude", "codex", "opencode"), modules)
+        }
+        AdapterRegistry(runtimes).preload_enabled()
+        for module in modules:
+            self.assertIn(module, __import__("sys").modules)
+
+        broken = AdapterRegistry(
+            {"broken": RuntimeConfig(True, "missing_adapter:ADAPTER", Path("/bin/echo"), Path("/tmp"), ())}
+        )
+        with self.assertRaisesRegex(ValidationError, "cannot import adapter module missing_adapter"):
+            broken.preload_enabled()
+
     def test_adapter_family_sources_stay_below_hard_gate(self) -> None:
         """One 700-line ceiling per adapter source file, for every family.
 
