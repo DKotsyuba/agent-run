@@ -135,10 +135,13 @@ tests/
 docs/architecture.md
 ```
 
-Production Python files receive a review warning at 400 lines and fail the
-repository size check above 700 lines. Generated files and test fixtures are
-excluded. The intent is one owner and one contract per module, not mechanical
-line splitting.
+Production Python files receive a review warning at 400 lines; the enforced
+700-line ceiling is a suite gate covering the adapter families
+(`src/agent_run/adapters/{claude,codex,opencode}/*.py` — see
+`tests/test_adapters_base.py`); other production files follow the same budget
+by review discipline. Generated files and test fixtures are excluded. The
+intent is one owner and one contract per module, not mechanical line
+splitting.
 
 ### System home
 
