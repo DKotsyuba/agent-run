@@ -335,6 +335,69 @@ class StartSessionTests(unittest.TestCase):
             [{"type": "text", "text": "do the thing"}],
         )
 
+    def test_non_network_sandbox_mode_is_sent_as_a_plain_string(self) -> None:
+        """The legacy non-network request continues to send a string sandbox."""
+
+        cwd = Path("/work")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "roots": (str(cwd),),
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [thread_response(cwd)],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            }
+        )
+
+        start_session(transport, plan, FakeSink())
+
+        self.assertEqual(transport.requests[1][1]["sandbox"], "read-only")
+
+    def test_network_sandbox_is_sent_as_a_tagged_mapping(self) -> None:
+        """Tagged network requests are unwrapped only for echo verification."""
+
+        cwd = Path("/work")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "sandbox": {"readOnly": {"networkAccess": True}},
+                "approval_policy": "never",
+                "roots": (str(cwd),),
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [
+                    thread_response(
+                        cwd,
+                        sandbox={"type": "readOnly", "networkAccess": True},
+                    )
+                ],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            }
+        )
+
+        start_session(transport, plan, FakeSink())
+
+        self.assertEqual(
+            transport.requests[1][1]["sandbox"],
+            {"readOnly": {"networkAccess": True}},
+        )
+
     def test_refuses_when_effective_params_drift(self) -> None:
         cwd = Path("/work")
         plan = make_plan(

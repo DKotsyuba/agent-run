@@ -797,12 +797,23 @@ env_from = ["PATH"]
         self.assertEqual(read_only.adapter_state["writable_roots"], ())
 
     def test_prepare_enables_network_in_the_child_sandbox(self) -> None:
+        """Network profiles use the app-server's tagged sandbox request form."""
+
         config = self.materialized()
         profile = AgentProfile("research", "body", False, (self.auth_source_dir,), True)
         plan = self.prepare(self.start_request(), profile, config)
         self.assertEqual(
-            plan.adapter_state["sandbox"], {"type": "readOnly", "networkAccess": True}
+            plan.adapter_state["sandbox"], {"readOnly": {"networkAccess": True}}
         )
+
+    def test_prepare_keeps_non_network_sandbox_mode_plain(self) -> None:
+        """Profiles without network permission do not add a sandbox mapping."""
+
+        config = self.materialized()
+        profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
+        plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
+        self.assertNotIn("sandbox", plan.adapter_state)
 
     def test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents(self) -> None:
         """A read-only sandbox cannot spool before execution, so the outside

@@ -414,7 +414,12 @@ class CodexAppServerSession:
 
 
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:
-    """Run initialize/thread/turn/start and verify the effective params."""
+    """Start a Codex session and verify its effective parameters.
+
+    Forwards the adapter's sandbox request unchanged, including a tagged
+    network sandbox, then compares the server's flat echo to the requested
+    permissions. Raises ``VerificationError`` for any effective-param drift.
+    """
 
     state = plan.adapter_state
     configured = state.get("request_timeout_seconds")
@@ -441,6 +446,13 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     roots = tuple(state["roots"])
     writable_roots = tuple(state["writable_roots"])
     sandbox = state.get("sandbox", state["sandbox_mode"])
+    network_access = False
+    if isinstance(sandbox, Mapping) and len(sandbox) == 1:
+        _, sandbox_params = next(iter(sandbox.items()))
+        network_access = (
+            isinstance(sandbox_params, Mapping)
+            and sandbox_params.get("networkAccess") is True
+        )
     thread = transport.request(
         "thread/start",
         {
@@ -463,7 +475,7 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
         sandbox=state["sandbox_mode"],
         approval_policy=state["approval_policy"],
         writable_roots=writable_roots,
-        network_access=isinstance(sandbox, Mapping) and sandbox.get("networkAccess") is True,
+        network_access=network_access,
     )
     verify_effective_params(expected, thread)
     thread_id = _thread_id_echo(thread)

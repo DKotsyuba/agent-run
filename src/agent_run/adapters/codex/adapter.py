@@ -516,6 +516,13 @@ class CodexAdapter:
         *,
         mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan:
+        """Build an isolated Codex launch plan for an authorized request.
+
+        Validates ``request`` against ``profile`` and ``config``. Network
+        profiles receive app-server's tagged sandbox request form; other
+        profiles retain the legacy string sandbox mode. Raises
+        ``ValidationError`` when an authorization or runtime constraint fails.
+        """
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
         if not isinstance(profile, AgentProfile):
@@ -596,8 +603,9 @@ class CodexAdapter:
         }
         if profile.network:
             adapter_state["sandbox"] = {
-                "type": "workspaceWrite" if effective_write else "readOnly",
-                "networkAccess": True,
+                "workspaceWrite" if effective_write else "readOnly": {
+                    "networkAccess": True,
+                }
             }
         return LaunchPlan(
             argv=(str(config.binary), "app-server"),
