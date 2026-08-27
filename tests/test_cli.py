@@ -909,7 +909,7 @@ class CliTests(unittest.TestCase):
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
                 "start", "cancel", "steer", "status", "list_agents",
-                "summary", "transcript", "answer", "models", "limits",
+                "summary", "transcript", "answer", "models", "limits", "doc",
             ],
         )
 

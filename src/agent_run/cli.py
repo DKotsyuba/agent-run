@@ -157,6 +157,8 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("init")
     commands.add_parser("doctor")
     commands.add_parser("mcp")
+    doc = commands.add_parser("doc")
+    doc.add_argument("topic", nargs="?")
     return parser
 
 
@@ -650,6 +652,13 @@ def _doctor(home: Path):
     return run_doctor(home)
 
 
+def _doc(args: argparse.Namespace) -> dict[str, object]:
+    from .doc import topic_text
+
+    topic = args.topic
+    return {"topic": topic or "index", "text": topic_text(topic)}
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -676,6 +685,8 @@ def main(
             result = _initialize(home)
         elif service is None and args.command == "doctor":
             result = _doctor(home)
+        elif service is None and args.command == "doc":
+            result = _doc(args)
         elif args.command == "capacity" and args.capacity_command == "launchd":
             result = _capacity_launchd(home, args)
         elif args.command == "delivery" and args.delivery_command == "launchd":

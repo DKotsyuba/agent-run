@@ -1246,6 +1246,7 @@ agent-run delivery status|cancel|dispatch|launchd
 agent-run service start --runtime opencode [--port N]
 agent-run doctor
 agent-run init
+agent-run doc [topic]
 ```
 
 `transcript --follow` advances its cursor without duplicates, polls at a bounded
@@ -1254,7 +1255,9 @@ transcript. `--full` keeps its finite current-pagination semantics. On a fresh
 home, `init` creates a private minimal config and state database without inventing
 runtime, delivery, or credential values; an existing config is never replaced.
 
-Minimum MCP tools:
+Minimum MCP tools (11 as of T069, 2026-08-27 — `doc` is a deliberate
+versioned extension of the prior 10-tool surface, serving the operator
+guide alongside `agent-run doc [topic]`):
 
 ```text
 start
@@ -1267,6 +1270,7 @@ transcript
 answer
 models
 limits
+doc
 ```
 
 `start` always returns immediately. `list_agents` returns an exact SQL count in
