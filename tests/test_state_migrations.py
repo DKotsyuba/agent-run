@@ -137,6 +137,21 @@ class MigrationRegistryTests(unittest.TestCase):
             list(range(2, SCHEMA_VERSION + 1)),
         )
 
+    def test_stale_backup_cleanup_spares_newer_versions_snapshots(self) -> None:
+        from agent_run.state.migrations import _drop_stale_backups
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            own = database.with_name(f"state.db.pre-v{SCHEMA_VERSION}.backup")
+            newer = database.with_name(f"state.db.pre-v{SCHEMA_VERSION + 1}.backup")
+            own.touch()
+            newer.touch()
+
+            _drop_stale_backups(database)
+
+            self.assertFalse(own.exists())
+            self.assertTrue(newer.exists())
+
     def test_foreign_key_check_is_clean_after_each_migration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.db"

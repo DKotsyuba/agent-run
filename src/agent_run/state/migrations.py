@@ -141,10 +141,17 @@ def _refuse_newer(path: Path, version: int) -> None:
 
 
 def _drop_stale_backups(path: Path) -> None:
-    """Remove snapshots left by a migration that committed but died before cleanup."""
+    """Remove snapshots left by a migration that committed but died before cleanup.
+
+    Only versions this binary understands are dropped: during a rollout an older
+    binary runs beside a newer one, and a ``pre-v*`` glob without the version
+    guard deletes the newer binary's in-flight snapshot out from under it.
+    """
 
     for stale in path.parent.glob(f"{path.name}.pre-v*.backup"):
-        stale.unlink(missing_ok=True)
+        suffix = stale.name[len(path.name) + len(".pre-v") : -len(".backup")]
+        if suffix.isdigit() and int(suffix) <= SCHEMA_VERSION:
+            stale.unlink(missing_ok=True)
 
 
 def _snapshot(connection: sqlite3.Connection, path: Path, target: int) -> Path:
