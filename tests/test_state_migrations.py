@@ -323,7 +323,9 @@ class MigrationRefusalTests(unittest.TestCase):
             with self.assertRaises(ValidationError) as caught:
                 open_database(database)
             message = str(caught.exception)
-            backup = backup_path(database, SCHEMA_VERSION)
+            # The failing step is v1->v2, so the surviving backup is pre-v2 --
+            # not pre-v<terminal>: later migrations never ran.
+            backup = backup_path(database, 2)
             self.assertIn(str(backup), message)
             self.assertIn("rolled back", message)
 
