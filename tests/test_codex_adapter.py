@@ -803,7 +803,7 @@ env_from = ["PATH"]
         profile = AgentProfile("research", "body", False, (self.auth_source_dir,), True)
         plan = self.prepare(self.start_request(), profile, config)
         self.assertEqual(
-            plan.adapter_state["sandbox"], {"readOnly": {"networkAccess": True}}
+            plan.adapter_state["sandbox"], {"read-only": {"networkAccess": True}}
         )
 
     def test_prepare_keeps_non_network_sandbox_mode_plain(self) -> None:

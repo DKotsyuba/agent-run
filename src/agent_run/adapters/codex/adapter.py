@@ -603,7 +603,7 @@ class CodexAdapter:
         }
         if profile.network:
             adapter_state["sandbox"] = {
-                "workspaceWrite" if effective_write else "readOnly": {
+                "workspace-write" if effective_write else "read-only": {
                     "networkAccess": True,
                 }
             }
