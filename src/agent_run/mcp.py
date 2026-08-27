@@ -129,6 +129,11 @@ _TOOLS = (
         "description": "Read stored fresh capacity projections without provider calls.",
         "inputSchema": _schema({}),
     },
+    {
+        "name": "doc",
+        "description": "Read one operator guide topic, or the index when omitted.",
+        "inputSchema": _schema({"topic": {"type": ["string", "null"]}}),
+    },
 )
 _TOOL_NAMES = frozenset(tool["name"] for tool in _TOOLS)
 
@@ -305,6 +310,12 @@ def _call_tool(service: AgentService, name: str, raw: dict) -> object:
             cursor=args.get("cursor", 0),
             limit=args.get("limit", 200),
         )
+    if name == "doc":
+        from .doc import topic_text
+
+        args = _arguments(raw, {"topic"})
+        topic = _optional_string(args, "topic")
+        return {"topic": topic or "index", "text": topic_text(topic)}
     args = _arguments(raw, set())
     return service.models() if name == "models" else service.limits()
 
