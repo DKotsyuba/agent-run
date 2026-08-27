@@ -8,6 +8,7 @@ some live process owns -- or the launch failed and the run is already ``lost``.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import sys
 from collections.abc import Mapping, Sequence
@@ -25,6 +26,7 @@ WORKFLOW_RUNNER_MODULE = "agent_run.workflow_runner_main"
 STEP_KINDS = frozenset({"sleep"})
 MAX_PLAN_STEPS = 100
 MAX_STEP_SECONDS = 3600.0
+RESUMABLE_RUN_STATUSES = frozenset({"failed", "cancelled", "lost"})
 
 
 def validate_plan(plan: object) -> tuple[dict[str, object], ...]:
@@ -90,11 +92,12 @@ def start_workflow(
 
     nonblank("workflow name", name)
     steps = validate_plan(plan)
+    plan_payload = [dict(step) for step in steps]
     root = agent_run_home(home)
     database = state_db_path(root)
     store = StateStore.open(database)
     try:
-        run_id = store.create_workflow_run(name, plan_sha(steps))
+        run_id = store.create_workflow_run(name, plan_sha(steps), plan=plan_payload)
     finally:
         store.close()
 
@@ -103,7 +106,68 @@ def start_workflow(
             {
                 "home": str(root),
                 "run_id": run_id,
-                "plan": [dict(step) for step in steps],
+                "plan": plan_payload,
+            },
+            executable=sys.executable if executable is None else executable,
+            module=WORKFLOW_RUNNER_MODULE,
+            readiness_timeout_seconds=readiness_timeout_seconds,
+        )
+    except BaseException:
+        with suppress(Exception):  # the launch failure is the reportable one
+            _abandon(database, run_id)
+        raise
+    return run_id
+
+
+def resume_workflow(
+    home: str | Path | None,
+    run_id: str,
+    *,
+    executable: str | None = None,
+    readiness_timeout_seconds: float = DEFAULT_READY_TIMEOUT_SECONDS,
+) -> str:
+    """Relaunch a detached runner for one already-created run, replaying its journal.
+
+    The run keeps its own id and its stored ``plan_json``; only a fresh runner
+    identity claims it.  ``StateStore.open`` reconciles first, so a run whose
+    owner died is already ``lost`` by the time it is inspected here -- a
+    ``running`` status this sees is still owned by a live process, and
+    resuming it would put two runners on one run, which is refused.  A step
+    whose journal already holds a ``succeeded`` result is replayed from the
+    journal rather than re-executed; see the module docstring of
+    :mod:`agent_run.state.workflow` for exactly what that replay leaves behind.
+    """
+
+    nonblank("run_id", run_id)
+    root = agent_run_home(home)
+    database = state_db_path(root)
+    store = StateStore.open(database)
+    try:
+        run = store.workflow_run_status(run_id)["run"]
+    finally:
+        store.close()
+
+    status = run["status"]
+    if status == "succeeded":
+        raise ValidationError(f"workflow run has already succeeded: {run_id}")
+    if status == "running":
+        raise StateTransitionError(
+            f"workflow run is still running under a live owner: {run_id}"
+        )
+    if status not in RESUMABLE_RUN_STATUSES:
+        raise ValidationError(f"workflow run cannot be resumed from status: {status}")
+    plan_json = run["plan_json"]
+    if plan_json is None:
+        raise ValidationError(f"workflow run has no stored plan to resume: {run_id}")
+    plan_payload = json.loads(plan_json)
+
+    try:
+        launch_detached(
+            {
+                "home": str(root),
+                "run_id": run_id,
+                "plan": plan_payload,
+                "resume": True,
             },
             executable=sys.executable if executable is None else executable,
             module=WORKFLOW_RUNNER_MODULE,
@@ -117,7 +181,13 @@ def start_workflow(
 
 
 def _abandon(database: Path, run_id: str) -> None:
-    """Close a run whose runner never proved it owns it."""
+    """Close a run whose runner never proved it owns it.
+
+    A no-op when the run is already terminal -- which is exactly the case for
+    a resume attempt whose runner never got far enough to re-claim the row: the
+    run is simply left in whatever resumable status it already had, ready to
+    be resumed again.
+    """
 
     store = StateStore.open(database)
     try:

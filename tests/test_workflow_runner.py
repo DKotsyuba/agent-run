@@ -16,7 +16,7 @@ from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.launch import launch_detached
 from agent_run.paths import state_db_path
 from agent_run.state import StateStore, step_key, workflow_owner_identity
-from agent_run.workflow_run import plan_sha, start_workflow, validate_plan
+from agent_run.workflow_run import plan_sha, resume_workflow, start_workflow, validate_plan
 from agent_run.workflow_runner_main import execute_plan, runner_identity
 
 
@@ -274,6 +274,54 @@ class DetachedWorkflowRunnerTests(unittest.TestCase):
         self.assertEqual(
             store.workflow_run_status(run_id)["run"]["owner_pid_identity"], owner
         )
+
+    def test_resume_reconciles_a_dead_owner_then_replays_and_finishes(self) -> None:
+        plan = [
+            {"kind": "sleep", "seconds": 0.05, "key_hint": "first"},
+            {"kind": "sleep", "seconds": 0.05, "key_hint": "second"},
+        ]
+        steps = validate_plan(plan)
+
+        # A prior runner claimed the run, finished step 1, then vanished
+        # without a trace -- exactly what a dead owner_pid_identity looks like.
+        store = StateStore.open(state_db_path(self.root))
+        run_id = store.create_workflow_run(
+            "demo", plan_sha(steps), plan=[dict(step) for step in steps]
+        )
+        store.claim_workflow_run(run_id, DEAD_OWNER)
+        store.record_step_start(run_id, step_key(steps[0], 0), steps[0])
+        store.finish_step(
+            run_id, step_key(steps[0], 0), "succeeded", result={"slept_seconds": 0.05}
+        )
+        store.close()
+
+        launched: list[int] = []
+
+        def spy(payload, **kwargs):
+            pid = launch_detached(payload, **kwargs)
+            launched.append(pid)
+            return pid
+
+        with mock.patch("agent_run.workflow_run.launch_detached", spy):
+            resume_workflow(self.root, run_id, readiness_timeout_seconds=15.0)
+
+        store = StateStore.open(state_db_path(self.root))
+        self.addCleanup(store.close)
+        claimed = store.workflow_run_status(run_id)["run"]
+        owner = str(claimed["owner_pid_identity"])
+        self.assertEqual(int(owner.split(" ", 1)[0]), launched[0])
+        self.assertNotEqual(owner, DEAD_OWNER)
+
+        def finished() -> object:
+            report = store.workflow_run_status(run_id)
+            return report if report["run"]["status"] == "succeeded" else None
+
+        report = self.wait_for(finished)
+        self.assertEqual(
+            [step["step_key"] for step in report["steps"]],
+            [step_key(steps[0], 0), step_key(steps[1], 1)],
+        )
+        self.assertEqual({step["status"] for step in report["steps"]}, {"succeeded"})
 
     @staticmethod
     def alive(pid: int) -> bool:

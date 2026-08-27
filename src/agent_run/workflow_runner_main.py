@@ -78,6 +78,7 @@ def execute_plan(
     identity: str,
     ready: ReadyChannel | None = None,
     poll_seconds: float = POLL_SECONDS,
+    resume: bool = False,
 ) -> str:
     """Claim the run, journal every placeholder step, and finish the run.
 
@@ -85,11 +86,20 @@ def execute_plan(
     that has seen READY knows reconciliation can find -- and lose -- this run.
     A stop signal fails the in-flight step as ``runner_cancelled`` and finishes
     the run ``cancelled``: the journal never shows a step that merely stopped.
+
+    ``resume=True`` re-claims a finished-but-resumable run instead of claiming
+    a freshly created one (see :func:`agent_run.state.workflow.resume_workflow_run`).
+    Either way, a step whose ``step_key`` already has a ``succeeded`` journal
+    row is replayed by skipping it rather than re-executed -- this is a no-op
+    check on a fresh run, since its journal starts empty.
     """
 
     nonblank("run_id", run_id)
     nonblank("identity", identity)
-    store.claim_workflow_run(run_id, identity)
+    if resume:
+        store.resume_workflow_run(run_id, identity)
+    else:
+        store.claim_workflow_run(run_id, identity)
     if ready is not None:
         ready.ready()
     stop = _StopRequest()
@@ -99,6 +109,8 @@ def execute_plan(
             if stop.requested:
                 break
             key = step_key(step, position)
+            if store.cached_step_result(run_id, key) is not None:
+                continue  # already succeeded in an earlier pass -- replay, don't re-run
             seconds = float(step["seconds"])
             store.record_step_start(run_id, key, step)
             if _sleep(seconds, stop, poll_seconds):
@@ -147,9 +159,12 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
 def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None:
     run_id = _text(payload, "run_id")
     steps = validate_plan(payload.get("plan"))
+    resume = bool(payload.get("resume", False))
     store = StateStore.open(state_db_path(home))
     try:
-        execute_plan(store, run_id, steps, identity=runner_identity(), ready=ready)
+        execute_plan(
+            store, run_id, steps, identity=runner_identity(), ready=ready, resume=resume
+        )
     finally:
         store.close()
 

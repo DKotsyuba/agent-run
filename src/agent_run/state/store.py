@@ -767,6 +767,7 @@ class StateStore:
         owner_identity: str | None = None,
         run_id: str | None = None,
         at: float | None = None,
+        plan: object = None,
     ) -> str:
         return workflow.create_workflow_run(
             self.connection,
@@ -775,6 +776,7 @@ class StateStore:
             owner_identity=owner_identity,
             run_id=run_id,
             at=at,
+            plan=plan,
         )
 
     def start_workflow_run(self, run_id: str) -> None:
@@ -782,6 +784,9 @@ class StateStore:
 
     def claim_workflow_run(self, run_id: str, owner_identity: str) -> None:
         workflow.claim_workflow_run(self.connection, run_id, owner_identity)
+
+    def resume_workflow_run(self, run_id: str, owner_identity: str) -> None:
+        workflow.resume_workflow_run(self.connection, run_id, owner_identity)
 
     def finish_workflow_run(
         self, run_id: str, status: str, *, at: float | None = None

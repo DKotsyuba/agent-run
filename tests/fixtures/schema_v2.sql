@@ -144,8 +144,7 @@ CREATE TABLE workflow_runs (
   ),
   owner_pid_identity TEXT,
   created_at REAL NOT NULL,
-  finished_at REAL,
-  plan_json TEXT
+  finished_at REAL
 );
 
 CREATE TABLE workflow_steps (
@@ -181,4 +180,4 @@ CREATE INDEX idx_workflow_steps_agent
   ON workflow_steps(agent_id)
   WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 2;

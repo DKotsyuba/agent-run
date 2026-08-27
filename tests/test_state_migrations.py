@@ -23,6 +23,9 @@ from agent_run.state.migrations import pending_files
 # The byte-for-byte schema.sql that shipped as v1, kept so these tests migrate a
 # real v1 store rather than a hand-rolled approximation of one.
 _V1_SCHEMA = Path(__file__).resolve().parent / "fixtures" / "schema_v1.sql"
+# Same idea, one version later: schema.sql as it shipped as v2, before 003
+# added workflow_runs.plan_json.
+_V2_SCHEMA = Path(__file__).resolve().parent / "fixtures" / "schema_v2.sql"
 _AGENTS = ("agt_alpha", "agt_beta", "agt_gamma")
 
 
@@ -48,6 +51,23 @@ def _build_v1_store(path: Path, *, extra: str | None = None) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def _build_v2_store(path: Path) -> str:
+    """A real v2 store with one resumable run, returning that run's id."""
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(_V2_SCHEMA.read_text(encoding="utf-8"))
+        connection.execute(
+            """INSERT INTO workflow_runs
+               (id, name, script_sha, status, created_at)
+               VALUES ('wr_1', 'flow', 'sha', 'failed', 1.0)"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return "wr_1"
 
 
 def _scalar(path: Path, sql: str) -> object:
@@ -209,6 +229,56 @@ class V1UpgradeTests(unittest.TestCase):
             stale.write_bytes(b"stale")
             self.assertEqual(migrate(database), SCHEMA_VERSION)
             self.assertFalse(stale.exists())
+
+
+class V2UpgradeTests(unittest.TestCase):
+    def test_v2_home_opens_to_v3_with_plan_json_present(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            run_id = _build_v2_store(database)
+            self.assertEqual(_scalar(database, "PRAGMA user_version"), 2)
+
+            connection = open_database(database)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(workflow_runs)")
+                }
+                self.assertIn("plan_json", columns)
+                # A row that predates the column reads back NULL, not an error.
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT plan_json FROM workflow_runs WHERE id = ?", (run_id,)
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    "UPDATE workflow_runs SET plan_json = '[]' WHERE id = ?", (run_id,)
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+    def test_v2_migrated_store_is_indistinguishable_from_a_fresh_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            migrated = Path(directory) / "migrated.db"
+            _build_v2_store(migrated)
+            self.assertEqual(migrate(migrated), SCHEMA_VERSION)
+
+            fresh = Path(directory) / "fresh.db"
+            fresh_connection = initialize_database(fresh)
+            migrated_connection = sqlite3.connect(migrated)
+            try:
+                self.assertEqual(
+                    _schema_objects(migrated_connection),
+                    _schema_objects(fresh_connection),
+                )
+            finally:
+                fresh_connection.close()
+                migrated_connection.close()
 
 
 class MigrationRefusalTests(unittest.TestCase):

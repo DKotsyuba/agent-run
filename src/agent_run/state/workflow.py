@@ -12,6 +12,16 @@ A step's terminal statuses (``succeeded``, ``failed``, ``skipped``, ``cached``)
 are final: once written, a step row cannot be restarted or refinished, and a
 finished run refuses to record any further step.  This mirrors the agent
 transition guards in :mod:`agent_run.state.store`.
+
+Replay representation: when a run is resumed (see :func:`resume_workflow_run`
+and :mod:`agent_run.workflow_run`), a step whose ``step_key`` already has a
+``succeeded`` row is *not* re-executed and its journal row is left completely
+untouched -- no new ``record_step_start``/``finish_step`` call is made for it.
+``workflow_run_status`` therefore still reports that step's original
+``succeeded`` status for the replayed pass; a caller that needs to know how
+many steps a given pass actually executed (as opposed to replayed from cache)
+counts the run's ``record_step_start`` calls for that pass, since the journal
+does not stamp *when* -- only *whether* -- a step ran.
 """
 
 from __future__ import annotations
@@ -27,6 +37,7 @@ from .db import immediate, integer, json_text, nonblank, row_dict, timestamp
 
 RUN_STATUSES = frozenset({"created", "running", "succeeded", "failed", "cancelled", "lost"})
 RUN_TERMINAL = frozenset({"succeeded", "failed", "cancelled", "lost"})
+RUN_RESUMABLE = frozenset({"failed", "cancelled", "lost"})
 STEP_STATUSES = frozenset({"pending", "running", "succeeded", "failed", "skipped", "cached"})
 STEP_TERMINAL = frozenset({"succeeded", "failed", "skipped", "cached"})
 
@@ -65,7 +76,16 @@ def create_workflow_run(
     owner_identity: str | None = None,
     run_id: str | None = None,
     at: float | None = None,
+    plan: object = None,
 ) -> str:
+    """Insert one new run row, optionally recording the plan it will execute.
+
+    ``plan`` is stored verbatim as JSON so a later :func:`resume_workflow_run`
+    can relaunch the same steps without the caller having to keep them around;
+    a run created without one (``plan`` left ``None``) simply cannot be
+    resumed later -- see :func:`agent_run.workflow_run.resume_workflow`.
+    """
+
     nonblank("name", name)
     nonblank("script_sha", script_sha)
     if owner_identity is not None:
@@ -73,12 +93,13 @@ def create_workflow_run(
     candidate = run_id or f"wf_{uuid.uuid4().hex}"
     nonblank("run_id", candidate)
     created_at = timestamp(at)
+    plan_json = None if plan is None else json_text(list(plan))
     with immediate(connection):
         connection.execute(
             """INSERT INTO workflow_runs
-               (id, name, script_sha, status, owner_pid_identity, created_at)
-               VALUES (?, ?, ?, 'created', ?, ?)""",
-            (candidate, name, script_sha, owner_identity, created_at),
+               (id, name, script_sha, status, owner_pid_identity, created_at, plan_json)
+               VALUES (?, ?, ?, 'created', ?, ?, ?)""",
+            (candidate, name, script_sha, owner_identity, created_at, plan_json),
         )
     return candidate
 
@@ -120,6 +141,36 @@ def claim_workflow_run(
             )
         connection.execute(
             """UPDATE workflow_runs SET status = 'running', owner_pid_identity = ?
+               WHERE id = ?""",
+            (owner_identity, run_id),
+        )
+
+
+def resume_workflow_run(
+    connection: sqlite3.Connection, run_id: str, owner_identity: str
+) -> None:
+    """Re-claim a finished-but-resumable run's row for a fresh runner.
+
+    Unlike :func:`claim_workflow_run`, the row already carries a *terminal*
+    status (``failed``, ``cancelled``, or ``lost``) and a stale owner from the
+    runner that stopped short -- there is no live owner to protect here, only
+    the run's own resumability.  The caller
+    (:func:`agent_run.workflow_run.resume_workflow`) has already refused a
+    ``running`` or ``succeeded`` run before a fresh runner is ever launched, so
+    this only re-checks the row under the write lock against a race.
+    """
+
+    nonblank("run_id", run_id)
+    nonblank("owner_identity", owner_identity)
+    with immediate(connection):
+        run = _run_row(connection, run_id)
+        if run["status"] not in RUN_RESUMABLE:
+            raise StateTransitionError(
+                f"workflow run cannot resume from status: {run['status']}"
+            )
+        connection.execute(
+            """UPDATE workflow_runs
+               SET status = 'running', owner_pid_identity = ?, finished_at = NULL
                WHERE id = ?""",
             (owner_identity, run_id),
         )

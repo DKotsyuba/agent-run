@@ -30,7 +30,7 @@ from typing import Iterator
 from agent_run.errors import SchemaMigrationRequired, ValidationError
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The tables schema v1 created.  A store stamped with a version at or above 1
 # must still have all of them before any migration is allowed to touch it, so
