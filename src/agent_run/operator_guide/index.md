@@ -4,6 +4,9 @@ This is the map. Run `agent-run doc <topic>` (CLI) or call the MCP tool
 `doc` with `{"topic": "<topic>"}` to read one topic in full. Omit the
 topic for this index.
 
+`agent-run batch --file jobs.json` is a convenience alias for starting a flat
+parallel workflow from a JSON array of agent job specifications.
+
 | Topic | Covers |
 |---|---|
 | config | ~/.agent-run/config.toml: source of truth, fail-closed, safe-edit discipline |

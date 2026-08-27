@@ -167,6 +167,11 @@ def _parser() -> argparse.ArgumentParser:
     workflow_start.add_argument("script")
     workflow_start.add_argument("--args")
     _session(workflow_start)
+
+    batch = commands.add_parser("batch")
+    batch.add_argument("--file", required=True)
+    batch.add_argument("--name", default="batch")
+
     for workflow_name in ("status", "cancel", "answer"):
         workflow.add_parser(workflow_name).add_argument("run_id")
     return parser
@@ -198,6 +203,31 @@ def _object(value: str, what: str) -> dict:
 
 def _payload(stream: TextIO) -> dict:
     return _object(_read(stream), "hook payload")
+
+
+def _batch_source(value: str) -> str:
+    """Validate batch JSON and render one flat parallel workflow script.
+
+    ``value`` is the complete JSON text from ``--file`` or standard input.  It
+    must decode to a non-empty JSON array whose elements are dictionaries; the
+    workflow executor remains responsible for validating each job's fields.
+    The returned source embeds each original JSON object and preserves all JSON
+    value types through the sandbox-approved ``json`` module.
+    """
+
+    try:
+        jobs = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValidationError("batch file must be valid JSON") from error
+    if not isinstance(jobs, list):
+        raise ValidationError("batch file must contain a JSON array")
+    if not jobs:
+        raise ValidationError("batch file must contain at least one job")
+    if any(not isinstance(job, dict) for job in jobs):
+        raise ValidationError("batch jobs must be JSON objects")
+    encoded = [json.dumps(job, separators=(",", ":"), allow_nan=False) for job in jobs]
+    calls = ", ".join(f"lambda: agent(json.loads({item!r}))" for item in encoded)
+    return f"import json\nparallel([{calls}])"
 
 
 def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME) -> dict:
@@ -353,6 +383,9 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
             "cancel": service.workflow_cancel,
             "answer": service.workflow_answer,
         }[args.workflow_command](args.run_id)
+    if command == "batch":
+        value = _read(stream) if args.file == "-" else Path(args.file).read_text()
+        return service.workflow_start(args.name, _batch_source(value), None, _ref(args))
     if command == "start":
         result = service.start(_request(args, stream))
         return {"agent_id": result.agent_id, "created": result.created}

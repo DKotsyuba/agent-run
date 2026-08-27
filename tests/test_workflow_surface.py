@@ -101,6 +101,35 @@ class WorkflowSurfaceTests(unittest.TestCase):
             _execute(args, service, StringIO())
         self.assertEqual([call[0] for call in service.calls], ["start", "status", "cancel", "answer"])
 
+    def test_cli_batch_generates_flat_parallel_workflow(self) -> None:
+        """Validate batch shape, embed each task, and reuse workflow start."""
+
+        service = _WorkflowService()
+        with tempfile.TemporaryDirectory() as directory:
+            jobs = [
+                {"runtime": "codex", "model": "m", "profile": "p", "task": "first task"},
+                {"runtime": "claude", "model": "m", "profile": "p", "task": "second task"},
+            ]
+            path = Path(directory) / "jobs.json"
+            path.write_text(json.dumps(jobs))
+            args = _parser().parse_args(["batch", "--file", str(path)])
+            self.assertEqual(_execute(args, service, StringIO()), {"run_id": "wf_test"})
+        _, name, script, script_args, _ = service.calls[0]
+        self.assertEqual(name, "batch")
+        self.assertIsNone(script_args)
+        self.assertIn("parallel", script)
+        self.assertIn("first task", script)
+        self.assertIn("second task", script)
+
+    def test_cli_batch_refuses_invalid_shapes(self) -> None:
+        """Reject empty, non-array, and non-object batch input."""
+
+        service = _WorkflowService()
+        for value in ("[]", "{}", "[1]"):
+            args = _parser().parse_args(["batch", "--file", "-"])
+            with self.assertRaises(ValidationError):
+                _execute(args, service, StringIO(value))
+
     def test_terminal_transition_creates_and_dispatches_workflow_notice(self) -> None:
         """Commit terminal state and outbox row atomically, then drain it."""
 

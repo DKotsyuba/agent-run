@@ -1249,6 +1249,7 @@ agent-run doctor
 agent-run init
 agent-run doc [topic]
 agent-run workflow start|status|cancel|answer
+agent-run batch --file jobs.json [--name NAME]
 ```
 
 `transcript --follow` advances its cursor without duplicates, polls at a bounded
