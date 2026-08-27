@@ -31,7 +31,7 @@ from agent_run.adapters.opencode.adapter import (
     render_config,
     split_model,
 )
-from agent_run.adapters.opencode.http import HttpResponse
+from agent_run.adapters.opencode.http import HttpError, HttpResponse
 from agent_run.adapters.opencode.service import (
     PASSWORD_ENV,
     SERVICE_HOST,
@@ -86,6 +86,35 @@ def message(role, text, *, agent=PRIMARY_AGENT, at=1.0, error=None):
     }
 
 
+def permission(identifier, action, resources, *, session="ses_1", **extra):
+    """A v1 ``PermissionV2Request``, shaped exactly like the live captures.
+
+    Verbatim from the pinned v1 1.18.18 canary service, an external read::
+
+        {"id": "per_04062a5b300108nkvKMDl0lPvl",
+         "sessionID": "ses_fbf9d98bbffeagK7kbCYE9CGwr",
+         "action": "external_directory",
+         "resources": ["/private/tmp/.../outside/*"],
+         "save": ["/private/tmp/.../outside/*"],
+         "source": {"type": "tool", "messageID": "msg_04062a266001Zf4mMiBBDcyYrA",
+                    "callID": "call_875c994901054faab986d206"}}
+
+    There is no ``type`` key and no ``path`` key anywhere in it, and the
+    directory is stated as its glob.
+    """
+
+    item = {
+        "id": identifier,
+        "sessionID": session,
+        "action": action,
+        "resources": list(resources),
+        "save": list(resources),
+        "source": {"type": "tool", "messageID": "msg_1", "callID": "call_1"},
+    }
+    item.update(extra)
+    return item
+
+
 class PermissionBrokerTests(unittest.TestCase):
     def setUp(self):
         self._temp = tempfile.TemporaryDirectory()
@@ -98,19 +127,19 @@ class PermissionBrokerTests(unittest.TestCase):
 
     def test_contained_external_directory_is_granted_once(self):
         first = self.broker.decide(
-            {"id": "p1", "type": "external_directory", "path": str(self.allowed / "nested")}
+            permission("p1", "external_directory", [f"{self.allowed / 'nested'}/*"])
         )
         self.assertTrue(first.granted)
         self.assertEqual(self.broker.granted_directory, str(self.allowed / "nested"))
         self.assertEqual(self.broker.reply(first), {"reply": "once"})
         second = self.broker.decide(
-            {"id": "p2", "type": "external_directory", "path": str(self.allowed)}
+            permission("p2", "external_directory", [f"{self.allowed}/*"])
         )
         self.assertFalse(second.granted)
         self.assertIn("already granted once", second.reason)
 
     def test_reply_body_carries_only_the_reply(self):
-        decision = self.broker.decide({"id": "p1", "type": "bash", "path": "/"})
+        decision = self.broker.decide(permission("p1", "bash", ["ls"]))
         self.assertEqual(self.broker.reply(decision), {"reply": "reject"})
         self.assertNotIn("response", self.broker.reply(decision))
 
@@ -123,32 +152,54 @@ class PermissionBrokerTests(unittest.TestCase):
         producer may return one, even though a Mapping is duck-type
         compatible."""
 
-        decision = self.broker.decide({"id": "p1", "type": "bash", "path": "/"})
+        decision = self.broker.decide(permission("p1", "bash", ["ls"]))
         self.assertIs(type(self.broker.reply(decision)), dict)
         self.assertIs(type(self.broker.blocked_summary()), dict)
 
     def test_directory_outside_read_roots_is_rejected(self):
         decision = self.broker.decide(
-            {"id": "p1", "type": "external_directory", "path": str(self.root / "other")}
+            permission("p1", "external_directory", [f"{self.root / 'other'}/*"])
         )
         self.assertFalse(decision.granted)
         self.assertIsNone(self.broker.granted_directory)
         self.assertEqual(self.broker.reply(decision)["reply"], "reject")
 
-    def test_every_other_permission_is_auto_rejected(self):
-        for kind in ("bash", "edit", "write", "webfetch", None):
-            decision = self.broker.decide({"id": f"p-{kind}", "type": kind, "path": "/"})
+    def test_one_resource_outside_the_roots_rejects_the_whole_request(self):
+        decision = self.broker.decide(
+            permission(
+                "p1",
+                "external_directory",
+                [f"{self.allowed}/*", f"{self.root / 'other'}/*"],
+            )
+        )
+        self.assertFalse(decision.granted)
+        self.assertIsNone(self.broker.granted_directory)
+
+    def test_every_other_action_is_auto_rejected_under_its_own_name(self):
+        """The blocked summary is keyed by the v1 ``action``. It used to be
+        keyed by ``str(permission.get("type"))`` -- a key v1 never sends --
+        so every rejection landed under the literal string "None" and the
+        durable permissions_blocked event said nothing (proven live:
+        ``permissions_blocked {"None": 2}``)."""
+
+        for action in ("bash", "edit", "write", "webfetch", "read"):
+            decision = self.broker.decide(permission(f"p-{action}", action, ["/"]))
             self.assertFalse(decision.granted)
+        malformed = self.broker.decide({"id": "p-x", "sessionID": "ses_1", "resources": []})
+        self.assertFalse(malformed.granted)
         self.assertEqual(
             dict(self.broker.blocked_summary()),
-            {"None": 1, "bash": 1, "edit": 1, "webfetch": 1, "write": 1},
+            {"bash": 1, "edit": 1, "read": 1, "unknown": 1, "webfetch": 1, "write": 1},
         )
+        self.assertNotIn("None", self.broker.blocked_summary())
 
     def test_unusable_permission_payloads_are_refused(self):
         with self.assertRaises(ValidationError):
-            self.broker.decide({"type": "external_directory", "path": str(self.allowed)})
-        relative = self.broker.decide({"id": "p1", "type": "external_directory", "path": "allowed"})
+            self.broker.decide(permission(None, "external_directory", [f"{self.allowed}/*"]))
+        relative = self.broker.decide(permission("p1", "external_directory", ["allowed/*"]))
         self.assertFalse(relative.granted)
+        empty = self.broker.decide(permission("p2", "external_directory", []))
+        self.assertFalse(empty.granted)
 
 
 class TranscriptTests(unittest.TestCase):
@@ -745,12 +796,41 @@ class MaterializeTests(AdapterCase):
     def test_permission_order_is_preserved_on_disk(self):
         self.materialize()
         text = (self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8")
-        permission = json.loads(text)["agent"][PRIMARY_AGENT]["permission"]
-        self.assertEqual(
-            list(permission), ["bash", "edit", "write", "webfetch", "external_directory"]
-        )
-        self.assertEqual(permission["external_directory"], "ask")
+        document = json.loads(text)
+        rules = document["agent"][PRIMARY_AGENT]["permission"]
+        self.assertEqual(rules["external_directory"], "ask")
+        self.assertEqual(list(rules)[-1], "external_directory")
         self.assertLess(text.index('"bash"'), text.index('"external_directory"'))
+        self.assertEqual(
+            document["agent"][VERIFY_AGENT]["permission"]["external_directory"], "deny"
+        )
+
+    def test_every_permission_action_v1_knows_is_stated_explicitly(self):
+        """v1 1.18.18 treats an *unstated* action as "ask", not as a default
+        (proven live: with only bash/edit/write/webfetch/external_directory
+        set, reading a file inside the session's own directory raised a
+        pending permission, and so did ``glob`` and ``todowrite``). An ask
+        nobody can answer blocks the tool, so every action v1's own
+        PermissionConfig schema names must carry an explicit verdict."""
+
+        self.materialize()
+        document = json.loads((self.home / CONFIG_RELATIVE_PATH).read_text(encoding="utf-8"))
+        # The key set of v1 1.18.18's PermissionConfig object, read off the
+        # running service's own /doc OpenAPI.
+        declared = {
+            "read", "edit", "glob", "grep", "list", "bash", "task",
+            "external_directory", "todowrite", "question", "webfetch",
+            "websearch", "lsp", "doom_loop",
+        }
+        for agent in (PRIMARY_AGENT, VERIFY_AGENT):
+            with self.subTest(agent=agent):
+                rules = document["agent"][agent]["permission"]
+                self.assertEqual(declared - set(rules), set())
+                self.assertEqual(rules["read"], "allow")
+                self.assertEqual(rules["bash"], "deny")
+                self.assertEqual(rules["write"], "deny")
+                self.assertEqual(rules["websearch"], "deny")
+                self.assertNotIn("ask", set(rules.values()) - {rules["external_directory"]})
 
     def test_mcp_servers_is_a_required_keyword(self):
         with self.assertRaises(TypeError):
@@ -913,12 +993,21 @@ class FakeService:
     all, forcing the terminal status to be inferred from the last message.
     """
 
-    def __init__(self, directory, statuses, message_pages, permission_pages=(), outcome="succeeded"):
+    def __init__(
+        self,
+        directory,
+        statuses,
+        message_pages,
+        permission_pages=(),
+        outcome="succeeded",
+        permission_error=None,
+    ):
         self.directory = Path(directory)
         self.statuses = list(statuses)
         self.message_pages = list(message_pages)
         self.permission_pages = list(permission_pages)
         self.outcome = outcome
+        self.permission_error = permission_error
         self.calls = []
 
     def _capture(self, payload):
@@ -948,6 +1037,8 @@ class FakeService:
 
     def permissions(self, session_id):
         self.calls.append(("permissions", session_id))
+        if self.permission_error is not None:
+            raise self.permission_error
         return self._capture({"data": self._next(self.permission_pages, [])})
 
     def answer_permission(self, session_id, permission_id, payload):
@@ -1204,9 +1295,9 @@ class SessionTests(AdapterCase):
 
     def test_permissions_of_this_session_are_answered_exactly_once(self):
         pending = [
-            {"id": "p1", "type": "external_directory", "path": str(self.read_root), "sessionID": "ses_1"},
-            {"id": "p2", "type": "bash", "sessionID": "ses_1"},
-            {"id": "p3", "type": "external_directory", "path": "/etc", "sessionID": "other"},
+            permission("p1", "external_directory", [f"{self.read_root}/*"]),
+            permission("p2", "bash", ["ls"]),
+            permission("p3", "external_directory", ["/etc/*"], session="other"),
         ]
         service = FakeService(
             self.captures,
@@ -1222,6 +1313,84 @@ class SessionTests(AdapterCase):
         )
         self.assertEqual(self.sink.events, [("permissions_blocked", {"bash": 1})])
         self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+
+    def test_a_400_on_the_permission_list_is_reported_once_and_never_fatal(self):
+        """v1 1.18.18 fails its own response schema whenever a pending
+        permission's metadata carries a present-but-undefined property --
+        proven live twice against the canary service::
+
+            400 {"_tag": "InvalidRequestError",
+                 "message": "Expected JSON value, got undefined\\n
+                             at [\\"data\\"][0][\\"metadata\\"][\\"path\\"]",
+                 "kind": "Body"}
+
+        It fires exactly while there is something to answer, and it used to
+        propagate out of wait() and kill the run with supervision_failed."""
+
+        service = FakeService(
+            self.captures,
+            [{"type": "running"}, None, {"type": "running"}, None],
+            [[], [message("assistant", "done", at=2.0)]],
+            permission_error=HttpError(400, "/api/session/ses_1/permission", "InvalidRequestError"),
+        )
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(self.sink.events, [("permissions_unreadable", {"status": 400})])
+
+    def test_a_non_400_permission_failure_still_fails_closed(self):
+        service = FakeService(
+            self.captures,
+            [{"type": "running"}, None],
+            [[message("assistant", "done", at=1.0)]],
+            permission_error=HttpError(500, "/api/session/ses_1/permission"),
+        )
+        with self.assertRaises(HttpError):
+            self.session(service).wait(30.0)
+
+    def test_a_rejected_permission_settles_the_dead_turn_instead_of_timing_out(self):
+        """Proven live on v1 1.18.18: replying "reject" interrupts the tool
+        within ~100ms and ends the turn, leaving one assistant message that
+        carries only the errored tool part -- no text, no message-level
+        error. That is exactly the shape the T17B mid-tool-round rule keeps
+        waiting on, so the run polled a dead session to its deadline and
+        timed out with no answer at all."""
+
+        interrupted = {
+            "id": "msg_tool",
+            "type": "assistant",
+            "agent": PRIMARY_AGENT,
+            "time": {"created": 1.0},
+            "content": [
+                {
+                    "type": "tool",
+                    "id": "call_1",
+                    "name": "read",
+                    "provider": {"executed": False},
+                    "state": {
+                        "status": "error",
+                        "input": {"path": "/etc/passwd"},
+                        "content": [],
+                        "structured": {},
+                        "error": {"type": "unknown", "message": "Tool execution interrupted"},
+                    },
+                }
+            ],
+        }
+        service = FakeService(
+            self.captures,
+            [{"type": "running"}, None],
+            [[interrupted, message("user", "read /etc/passwd")]],
+            [[permission("p1", "external_directory", ["/etc/*"])]],
+            outcome=None,
+        )
+        outcome = self.session(service).wait(30.0)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "permission_rejected")
+        self.assertEqual(outcome.failure_text, "Tool execution interrupted")
+        # One poll interval, not the 30s deadline this used to burn.
+        self.assertEqual(self.slept, [0.25])
+        # Exactly the one capture the emitted transcript's raw_ref points at.
+        self.assertEqual(len(self.remaining()), 1)
 
     def test_steer_and_cancel_use_engine_native_calls(self):
         service = FakeService(
@@ -1278,6 +1447,20 @@ class SessionTests(AdapterCase):
         self.assertEqual(created[1]["model"], {"providerID": "omniroute", "id": "deepseek-v4-pro"})
         self.assertNotIn("modelID", created[1]["model"])
         self.assertNotIn("title", created[1])
+
+    def test_launch_anchors_the_session_at_the_requests_workdir(self):
+        """Without ``location``, a v1 session inherits the *service* process's
+        cwd -- the generated runtime home -- so every read of the task's own
+        files is an external directory and raises a permission ask. Both final
+        canaries died on exactly that ask (proven live: the pending request
+        named the instance directory, not anything the task asked for)."""
+
+        self.prove_service()
+        plan = self.prepare()
+        service = FakeService(self.captures, [{"type": "running"}], [[]])
+        self.adapter.launch(plan, FakeSink(), client=service)
+        created = [call for call in service.calls if call[0] == "create_session"][0]
+        self.assertEqual(created[1]["location"], {"directory": str(self.request.workdir)})
 
 
 class ProductionSizeTests(unittest.TestCase):

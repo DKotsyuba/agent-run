@@ -32,7 +32,7 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash, seal_answer, write_managed_file
-from .http import POLL_INTERVAL_SECONDS, OpenCodeHttpClient
+from .http import POLL_INTERVAL_SECONDS, HttpError, OpenCodeHttpClient
 from .normalize import (
     PRIMARY_AGENT,
     _sequence,
@@ -79,22 +79,52 @@ CAPABILITIES = frozenset(
     }
 )
 
-#: Ordered on purpose: the contained one-time grant is the last word, so no
-#: earlier entry can widen it and no later entry can shadow it.
-SYSTEM_PERMISSION: tuple[tuple[str, str], ...] = (
+#: Every action v1's own ``PermissionConfig`` names, stated explicitly.
+#:
+#: An action left out of this table is not "default"; v1 1.18.18 treats it as
+#: ``ask`` (proven live: with only bash/edit/write/webfetch/external_directory
+#: set, a plain ``read`` of a file *inside* the session directory raised a
+#: pending permission, and so did ``glob`` and ``todowrite``). That is what
+#: made the runtime unusable: an unanswered ask blocks the tool, and one whose
+#: metadata carries an undefined property also 400s the whole permission list
+#: (see ``OpenCodeRuntimeSession.resolve_permissions``). So the read-only tools
+#: this read-and-answer runtime actually needs are allowed outright, and
+#: everything that writes or reaches the network is denied outright -- neither
+#: can produce a pending ask.
+_READ_ONLY_ALLOW: tuple[tuple[str, str], ...] = (
+    ("read", "allow"),
+    ("list", "allow"),
+    ("glob", "allow"),
+    ("grep", "allow"),
+    ("lsp", "allow"),
+    ("skill", "allow"),
+    ("todowrite", "allow"),
+    ("task", "allow"),
+)
+_DENY: tuple[tuple[str, str], ...] = (
     ("bash", "deny"),
     ("edit", "deny"),
     ("write", "deny"),
     ("webfetch", "deny"),
+    ("websearch", "deny"),
+    # No human is attached to a headless run, so a question can only hang.
+    ("question", "deny"),
+    ("doom_loop", "deny"),
+)
+#: Ordered on purpose: the contained one-time grant is the last word, so no
+#: earlier entry can widen it and no later entry can shadow it.
+SYSTEM_PERMISSION: tuple[tuple[str, str], ...] = (
+    *_DENY,
+    *_READ_ONLY_ALLOW,
     (EXTERNAL_DIRECTORY, "ask"),
 )
 PRIMARY_PERMISSION = SYSTEM_PERMISSION
 #: A sub-agent never gets even the contained grant; only the primary may ask.
+#: This is the only enforcement there is: a v1 ``PermissionV2Request`` carries
+#: no agent field, so the broker cannot tell a sub-agent's ask apart.
 SUBAGENT_PERMISSION: tuple[tuple[str, str], ...] = (
-    ("bash", "deny"),
-    ("edit", "deny"),
-    ("write", "deny"),
-    ("webfetch", "deny"),
+    *_DENY,
+    *_READ_ONLY_ALLOW,
     (EXTERNAL_DIRECTORY, "deny"),
 )
 
@@ -406,7 +436,20 @@ class OpenCodeAdapter:
         # v1's create-session schema is strictly {id?, agent?, model?,
         # location?} with additionalProperties: false -- a "title" field is
         # rejected outright (proven live via v1's own /doc OpenAPI).
-        opened = client.create_session({"agent": PRIMARY_AGENT, "model": dict(model)})
+        #
+        # "location" is what makes the agent's own workdir its session
+        # directory. Without it the session inherits the *service* process's
+        # cwd (the generated runtime home), so every read of the task's own
+        # files counted as an external directory and raised a permission ask
+        # -- the ask that both final canaries died on.
+        workdir = str(state["workdir"])
+        opened = client.create_session(
+            {
+                "agent": PRIMARY_AGENT,
+                "model": dict(model),
+                "location": {"directory": workdir},
+            }
+        )
         session_id = opened.get("id")
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValidationError("opencode service returned no session id")
@@ -461,6 +504,8 @@ class OpenCodeRuntimeSession:
         self._interval = float(interval_seconds)
         self._answered: set[str] = set()
         self._cancel_requested = False
+        self._refused = False
+        self._unreadable_permissions = False
         sink.session(session_id)
 
     @property
@@ -490,6 +535,13 @@ class OpenCodeRuntimeSession:
         that must keep waiting rather than be read as done (proven live,
         T17B: v1 1.18.18 settled mid-tool-round on a bare tool-call message
         and raised "opencode session outcome is not terminal: None").
+
+        A rejected permission is the fourth terminal signal, for the same
+        reason ``cancel()`` is: v1 answers a rejection by interrupting the
+        tool and ending the turn outright, leaving the exact text-less
+        tool-only message the T17B rule keeps waiting on. Without this the run
+        polled that dead turn until its deadline and timed out with no answer
+        (proven live: the reject landed in ~100ms, the turn never reopened).
         """
 
         deadline = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
@@ -505,6 +557,7 @@ class OpenCodeRuntimeSession:
                     payload = capture.json()
                     final = (
                         self._cancel_requested
+                        or self._refused
                         or bool(extract_answer(payload, agent=self._agent))
                         or has_reported_error(payload, agent=self._agent)
                     )
@@ -534,7 +587,11 @@ class OpenCodeRuntimeSession:
         """Emit the transcript, record answer.md, and keep only this capture."""
 
         outcome = normalize_outcome(
-            info, payload, runtime_session_id=self._session_id, cancelled=self._cancel_requested
+            info,
+            payload,
+            runtime_session_id=self._session_id,
+            cancelled=self._cancel_requested,
+            refused=self._refused,
         )
         # The capture lives directly under the agent's own directory (no
         # subdirectories), so its bare filename is already the normalized,
@@ -575,9 +632,34 @@ class OpenCodeRuntimeSession:
         self._client.abort(self._session_id)
 
     def resolve_permissions(self) -> tuple[PermissionDecision, ...]:
-        """Answer each pending permission of this session exactly once."""
+        """Answer each pending permission of this session exactly once.
 
-        capture = self._client.permissions(self._session_id)
+        A 400 from the list endpoint is reported once and skipped, never
+        raised. v1 1.18.18 fails its *own* response schema whenever a pending
+        permission's ``metadata`` carries a present-but-undefined property --
+        proven live twice: ``Expected JSON value, got undefined at
+        ["data"][0]["metadata"]["limit"]`` (pending ``read``) and
+        ``...["metadata"]["path"]`` (pending ``glob``). It fires exactly when
+        there is something to answer, and used to kill the run outright.
+
+        No other route escapes it: measured live with an ask pending,
+        ``GET /api/permission/request`` and legacy ``GET /permission`` both
+        answered 200 with an empty array (they scope to the service's own
+        project, not the session's directory), and
+        ``GET .../permission/{requestID}`` serializes the same schema and
+        needs an id only the broken list can hand out. The real defence is
+        the generated config: nothing that carries metadata becomes an ask.
+        """
+
+        try:
+            capture = self._client.permissions(self._session_id)
+        except HttpError as error:
+            if error.status != 400:
+                raise
+            if not self._unreadable_permissions:
+                self._unreadable_permissions = True
+                self._sink.event("permissions_unreadable", {"status": error.status})
+            return ()
         try:
             payload = capture.json()
         finally:
@@ -594,6 +676,8 @@ class OpenCodeRuntimeSession:
                 continue
             decision = self._broker.decide(permission)
             self._answered.add(identifier)
+            if not decision.granted:
+                self._refused = True
             self._client.answer_permission(
                 self._session_id, identifier, self._broker.reply(decision)
             )
