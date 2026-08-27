@@ -798,6 +798,26 @@ class CliTests(unittest.TestCase):
                 json.loads(output)["hookSpecificOutput"]["additionalContext"],
             )
 
+            # A real Claude Code PostToolUse payload may serialize the whole
+            # MCP tool result as one JSON string in tool_response, rather than
+            # a dict or content-block list; that shape alone must still bind.
+            string_variant_payload = dict(
+                bind_payload,
+                tool_response=json.dumps(
+                    {"agent_id": agent_id, "created": True, "agent": {"status": "starting"}}
+                ),
+            )
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(string_variant_payload),
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn(
+                agent_id,
+                json.loads(output)["hookSpecificOutput"]["additionalContext"],
+            )
+
             conflicting_id = agent_id[:-1] + ("0" if agent_id[-1] != "0" else "1")
             refused = {
                 "missing": {
@@ -808,6 +828,7 @@ class CliTests(unittest.TestCase):
                     {"structuredContent": {"agent_id": agent_id}},
                     {"agent_id": conflicting_id},
                 ],
+                "not_json_string": "plain text, not json at all",
             }
             with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
                 for label, tool_response in refused.items():
