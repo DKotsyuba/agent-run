@@ -15,7 +15,12 @@ from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.codex import plugins as codex_plugins
 from agent_run.adapters.codex.adapter import ADAPTER as CODEX
 from agent_run.adapters.opencode.adapter import render_config
-from agent_run.adapters.plugin_skills import local_skill_names, plugin_skill_dir, skill_dirs
+from agent_run.adapters.plugin_skills import (
+    local_skill_names,
+    plugin_skill_dir,
+    skill_dirs,
+    unlisted_plugin_skills,
+)
 from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.errors import ValidationError
 
@@ -114,6 +119,38 @@ class PluginSkillSourceTests(unittest.TestCase):
         self.assertTrue((home / "plugins" / "delegate").is_dir())
         self.assertFalse((home / "plugins" / "lsp-first").exists())
         self.assertFalse((home / "plugins" / "code-reading").exists())
+
+    def test_unlisted_plugin_skills_are_reported_for_the_wholesale_host(self) -> None:
+        routing = _plugin(self.root, "routing-plugin", skills=("role-review", "delegate"))
+        self.assertEqual(
+            unlisted_plugin_skills((routing,), ("role-review", "lsp-first")),
+            ("delegate",),
+        )
+        self.assertEqual(unlisted_plugin_skills((routing,), ("role-review", "delegate")), ())
+        self.assertEqual(unlisted_plugin_skills((), ("delegate",)), ())
+
+    def test_claude_refuses_a_plugin_shipping_an_unlisted_skill(self) -> None:
+        """``--plugin-dir`` exports the whole plugin, so listed names only.
+
+        Selecting ``role-review`` out of a plugin that also ships ``delegate``
+        would hand the child a routing skill nobody asked for; the config fails
+        instead of leaking it.
+        """
+
+        routing = _plugin(self.root, "routing-plugin", skills=("role-review", "delegate"))
+        config = RuntimeConfig(
+            enabled=True,
+            adapter="a:b",
+            binary=Path("/bin/echo"),
+            home=self.root / "claude-home",
+            models=("sonnet",),
+            skills=("role-review",),
+            auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+            plugins=(routing,),
+        )
+        with self.assertRaises(ValidationError) as caught:
+            CLAUDE.validate(config)
+        self.assertIn("unlisted: delegate", str(caught.exception))
 
     def test_opencode_skill_paths_point_at_the_plugin_copy(self) -> None:
         config = RuntimeConfig(

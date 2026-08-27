@@ -182,6 +182,11 @@ line splitting.
 engine-native state. Files below `skills`, `hooks`, and `profiles` are owner
 inputs and are never rewritten by runtime adapters.
 
+A `skills/<runtime>/<skill>` entry may be a symlink to a directory a workflow
+repository owns, which is how the shared `role-*` contracts stay single-copy:
+the adapters read `SKILL.md` through the link and never copy the prompt into
+this tree. A skill directory that no runtime lists is inert, not deleted.
+
 ## 5. Configuration contract
 
 The file uses TOML because Python 3.11 includes `tomllib`. Schema versioning is
@@ -222,7 +227,7 @@ adapter = "agent_run.adapters.codex.adapter:ADAPTER"
 binary = "/absolute/path/to/codex"
 home = "~/.agent-run/runtimes/codex/home"
 models = ["gpt-5.6-sol", "gpt-5.6-terra"]
-skills = ["delegate", "code-reading"]
+skills = ["code-reading", "role-explore", "role-implement", "role-review"]
 mcp = ["agent_lsp"]
 plugins = ["/absolute/path/to/agent-pipline-compressor"]
 max_active_agents = 4
@@ -247,7 +252,7 @@ adapter = "agent_run.adapters.claude.adapter:ADAPTER"
 binary = "/absolute/path/to/claude"
 home = "~/.agent-run/runtimes/claude/home"
 models = ["fable", "opus", "sonnet"]
-skills = ["delegate", "code-reading"]
+skills = ["code-reading", "role-explore", "role-implement", "role-review"]
 mcp = ["agent_lsp"]
 
 [runtimes.claude.auth]
@@ -260,7 +265,7 @@ adapter = "agent_run.adapters.opencode.adapter:ADAPTER"
 binary = "/absolute/path/to/opencode2"
 home = "~/.agent-run/runtimes/opencode/home"
 models = ["MiniMaxM3", "deepseek-v4-pro"]
-skills = ["delegate", "code-reading"]
+skills = ["code-reading", "role-explore", "role-implement", "role-review"]
 mcp = ["agent_lsp"]
 service_mode = "managed"
 ```
@@ -284,6 +289,12 @@ Rules:
   `plugins/cache/personal/<name>/<version>`, lists it in the generated home's
   `.agents/plugins/marketplace.json`, enables it, and pre-seeds the
   `[hooks.state]` trust digests codex would otherwise prompt for;
+- codex and opencode read a declared plugin one selected name at a time, but
+  claude loads the whole directory, so **every** skill a claude-declared plugin
+  ships reaches the child. `runtimes.claude.skills` must therefore list all of
+  them; an unlisted one is refused by `validate` rather than delivered. This is
+  what keeps a routing skill that happens to sit beside a wanted one out of a
+  child that is itself a subagent;
 - MCP names resolve only from `[mcp.<name>]` and are rendered by the selected
   runtime adapter;
 - `env_from` and auth bridges name environment variables or source files but do
@@ -302,6 +313,32 @@ Rules:
 - `agent-run doctor` reports missing skills, hooks, MCP executables, auth
   bridges, unsupported features, stale homes, plaintext-looking secrets, and
   untrusted hooks.
+
+### Profiles assign the role contract
+
+The shared `role-*` skills are explicit-only: a child may load one only after a
+runtime adapter has assigned that role. agent-run's profile system *is* that
+adapter. `AgentService.start` resolves the profile, and `profiles.assign_role`
+appends the assignment sentence to its body when the runtime ships the matching
+`role-<profile>` skill — profile `review` points the child at `role-review`, and
+a profile with no shipped role is left untouched rather than naming a skill the
+child cannot load. It happens once, in the service, so no runtime can quietly
+skip it; the adapters only ever inject `profile.body`.
+
+`codex` + `role-research` is refused loudly, whether or not codex lists the
+skill: codex `read-only` still permits filesystem reads, so it cannot enforce
+that role's `filesystem: none` boundary.
+
+Children carry no routing skill. `delegate` and `fanout` decide who does the
+work; an agent-run child *is* the delegate and routes nothing, so neither is
+listed for any runtime — and the wholesale-plugin rule above is what keeps them
+from arriving anyway.
+
+Deliberately not consumed: the workflow repository's native agent metadata
+(`adapters/claude/*.md`, `adapters/codex/*.toml`, `adapters/opencode/agents.json`)
+registers host-native subagents. agent-run children are already one agent with
+one role, so there is nothing to register; the profile preamble carries the
+assignment instead.
 
 ## 6. Domain model and state machine
 

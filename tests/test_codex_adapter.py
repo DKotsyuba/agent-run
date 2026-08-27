@@ -741,6 +741,19 @@ env_from = ["PATH"]
             sorted((str(self.workdir), str(self.auth_source_dir))),
         )
 
+    def test_prepare_prefixes_the_task_with_the_profile_preamble(self) -> None:
+        """codex takes no system prompt, so the preamble rides the first turn.
+
+        Without it the child got the profile's sandbox but none of its wording
+        -- and no role assignment could ever reach a codex child.
+        """
+
+        config = self.materialized()
+        request = self.start_request()
+        profile = AgentProfile("review", "Review only.", False, (self.auth_source_dir,))
+        plan = self.prepare(request, profile, config)
+        self.assertEqual(plan.initial_input, f"Review only.\n\n{request.task}")
+
     def test_prepare_pins_home_to_the_generated_home(self) -> None:
         """The engine reads ``~/.agents/skills`` from ``HOME``, not ``CODEX_HOME``.
 

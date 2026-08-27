@@ -43,6 +43,7 @@ class FakeAdapter:
         self.limits_calls = 0
         self.prepare_calls = 0
         self.prepare_dirs = []
+        self.prepare_profiles = []
         self.prepare_error = None
 
     def describe(self):
@@ -70,6 +71,7 @@ class FakeAdapter:
     def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
         self.prepare_calls += 1
         self.prepare_dirs.append(agent_dir)
+        self.prepare_profiles.append(profile)
         if self.prepare_error is not None:
             raise self.prepare_error
         return LaunchPlan(
@@ -147,6 +149,33 @@ class AgentServiceTests(unittest.TestCase):
 
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
+
+    def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
+        """The profile is where agent-run assigns the shared role contract.
+
+        The adapters only inject ``profile.body``, so if this wiring were
+        dropped every runtime would silently stop assigning roles.
+        """
+
+        runtime = self.config.runtimes["fake"]
+        service = AgentService(
+            replace(
+                self.config,
+                runtimes={"fake": replace(runtime, skills=("role-profile",))},
+            ),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        service.start(self.request(request_id="assigned"))
+        body = ADAPTER.prepare_profiles[-1].body
+        self.assertTrue(body.startswith("Do the requested work."))
+        self.assertIn("Your assigned role is role-profile.", body)
+
+        # No matching skill shipped: the same start leaves the body alone.
+        self.start("unassigned")
+        self.assertEqual(ADAPTER.prepare_profiles[-1].body, "Do the requested work.")
 
     def test_complete_refusal_happens_before_agent_row(self) -> None:
         ADAPTER.capabilities = frozenset(

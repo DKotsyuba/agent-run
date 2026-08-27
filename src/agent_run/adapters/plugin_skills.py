@@ -19,7 +19,12 @@ from typing import Iterable, Mapping
 
 from ..errors import ValidationError
 
-__all__ = ["local_skill_names", "plugin_skill_dir", "skill_dirs"]
+__all__ = [
+    "local_skill_names",
+    "plugin_skill_dir",
+    "skill_dirs",
+    "unlisted_plugin_skills",
+]
 
 
 def plugin_skill_dir(plugins: Iterable[Path], name: str) -> Path | None:
@@ -64,3 +69,28 @@ def local_skill_names(plugins: Iterable[Path], names: Iterable[str]) -> tuple[st
 
     plugins = tuple(plugins)
     return tuple(name for name in names if plugin_skill_dir(plugins, name) is None)
+
+
+def unlisted_plugin_skills(
+    plugins: Iterable[Path], names: Iterable[str]
+) -> tuple[str, ...]:
+    """Skill names a declared plugin ships that the runtime did not select.
+
+    The ownership mechanism above resolves only names the runtime listed, so a
+    runtime that reads its skills one name at a time cannot be surprised. A host
+    that instead loads a declared plugin *wholesale* -- claude's ``--plugin-dir``
+    -- exports everything inside it, selected or not, which is how a routing
+    skill nobody listed would reach a child. Reporting the difference lets that
+    adapter fail closed on listed names only.
+    """
+
+    selected = frozenset(names)
+    found: set[str] = set()
+    for plugin in plugins:
+        skills_dir = Path(plugin) / "skills"
+        if not skills_dir.is_dir():
+            continue
+        for child in sorted(skills_dir.iterdir()):
+            if child.name not in selected and (child / "SKILL.md").is_file():
+                found.add(child.name)
+    return tuple(sorted(found))

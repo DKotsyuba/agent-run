@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .config import ProfilesConfig
 from .errors import PathEscapeError, ValidationError
@@ -118,3 +118,40 @@ def load_profile(
         raise ValidationError(f"cannot read profile {name}: {error}") from error
     allow_write, body = _parse_profile(text, name)
     return AgentProfile(name, body, requested_write and allow_write, normalize_read_roots(read_roots))
+
+
+ROLE_PREFIX = "role-"
+
+# A ``role-*`` contract is explicit-only: a child may load one only after a
+# runtime adapter assigned that role. agent-run's profile system *is* that
+# adapter -- the profile name selects the role, and the sentence appended below
+# is the assignment the contract requires. A child whose runtime does not ship
+# the matching skill is simply never pointed at it.
+_ASSIGNMENT = (
+    "Your assigned role is {role}. Load the {role} skill now and follow its "
+    "contract for this task."
+)
+
+# adapters/codex/README.md: codex ``read-only`` still permits filesystem reads,
+# so it cannot enforce ``role-research``'s ``filesystem: none`` boundary. The
+# route is refused loudly rather than silently downgraded to a weaker sandbox.
+_ROLE_DENIED: Mapping[str, frozenset[str]] = {"codex": frozenset({"role-research"})}
+
+
+def assign_role(profile: AgentProfile, runtime: str, skills: Iterable[str]) -> AgentProfile:
+    """Point the profile preamble at the matching role contract, when shipped.
+
+    Refuses first and asks whether the skill is shipped second: a denied
+    runtime/role pair must fail whether or not that runtime happens to list
+    the skill today.
+    """
+
+    role = f"{ROLE_PREFIX}{profile.name}"
+    if role in _ROLE_DENIED.get(runtime, frozenset()):
+        raise ValidationError(
+            f"runtime {runtime} has no {role} adapter: its read-only sandbox still "
+            f"permits filesystem reads, so it cannot enforce that role's boundary"
+        )
+    if role not in tuple(skills):
+        return profile
+    return replace(profile, body=f"{profile.body}\n\n{_ASSIGNMENT.format(role=role)}")

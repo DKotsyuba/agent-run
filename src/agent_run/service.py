@@ -28,7 +28,7 @@ from .domain import (
 )
 from .errors import AuthError, ValidationError
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
-from .profiles import load_profile
+from .profiles import assign_role, load_profile
 from .state.store import StateStore
 
 
@@ -266,11 +266,19 @@ class AgentService:
             raise ValidationError(
                 f"model is not available for runtime {request.runtime}: {request.model}"
             )
-        profile = load_profile(
-            self._config.profiles,
-            request.profile,
-            requested_write=request.write,
-            read_roots=request.read_roots,
+        # The profile is agent-run's runtime adapter for the shared role
+        # contracts: it names the role, and this is where the child is told to
+        # load it. One place, so every runtime's preamble carries the same
+        # assignment and one runtime cannot quietly skip a denied role.
+        profile = assign_role(
+            load_profile(
+                self._config.profiles,
+                request.profile,
+                requested_write=request.write,
+                read_roots=request.read_roots,
+            ),
+            request.runtime,
+            runtime.skills,
         )
         mcp_servers = self._mcp_servers(runtime)
         skills_root = runtime_skills_dir(request.runtime, self._home)

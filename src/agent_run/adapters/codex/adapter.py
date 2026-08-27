@@ -598,7 +598,12 @@ class CodexAdapter:
             argv=(str(config.binary), "app-server"),
             cwd=workdir,
             environment=MappingProxyType(environment),
-            initial_input=request.task,
+            # The profile preamble reaches this engine only here: codex
+            # app-server takes no system-prompt argument, and the generated
+            # home carries no instructions file. Without this the child ran
+            # the task with the profile's permissions but none of its wording
+            # -- including the role assignment a ``role-*`` contract requires.
+            initial_input=f"{profile.body}\n\n{request.task}",
             runtime_stream_path=Path(agent_dir) / "runtime.jsonl",
             adapter_state=MappingProxyType(adapter_state),
             answer_path=Path(agent_dir) / "answer.md",

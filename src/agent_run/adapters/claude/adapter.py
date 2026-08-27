@@ -36,7 +36,7 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash
-from ..plugin_skills import local_skill_names
+from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .limits import agent_rate_limit_samples
 from .materialize import render_mcp_config, render_plugin_dirs, render_settings
@@ -98,6 +98,16 @@ class ClaudeAdapter:
         if unknown:
             raise ValidationError(
                 f"claude runtime auth.names has unsupported entries: {', '.join(unknown)}"
+            )
+        # Unlike codex and opencode, this runtime hands claude the whole
+        # declared plugin directory, so every skill inside it reaches the child
+        # whether or not ``skills`` selected it. Listed names only: an unlisted
+        # one is a config defect, not a bonus.
+        unlisted = unlisted_plugin_skills(config.plugins, config.skills)
+        if unlisted:
+            raise ValidationError(
+                "claude loads each declared plugin whole, so runtimes.claude.skills "
+                "must list every skill they ship; unlisted: " + ", ".join(unlisted)
             )
         allowed_events = _KNOWN_HOOK_EVENTS
         for index, hook in enumerate(config.hooks):
