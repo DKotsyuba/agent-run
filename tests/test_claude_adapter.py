@@ -438,6 +438,39 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertNotIn("Bash", tools)
         self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "acceptEdits")
 
+    def test_declared_plugins_are_loaded_by_path_without_widening_tools(self) -> None:
+        plugin = self.root / "compressor"
+        (plugin / "hooks").mkdir(parents=True)
+        (plugin / "hooks" / "hooks.json").write_text("{}", encoding="utf-8")
+        config = self.runtime_config(plugins=(plugin,))
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            bare = self.prepare(
+                self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir
+            )
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir
+            )
+
+        self.assertNotIn("--plugin-dir", bare.argv)
+        argv = list(plan.argv)
+        self.assertEqual(argv[argv.index("--plugin-dir") + 1], str(plugin))
+        # A plugin never buys the child a tool it was not already granted.
+        tools = argv[argv.index("--tools") + 1].split(",")
+        allowed = argv[argv.index("--allowedTools") + 1].split(",")
+        self.assertEqual(set(tools), {"Read", "Grep", "Glob"})
+        self.assertNotIn("Bash", allowed)
+
+    def test_materialize_fingerprint_tracks_declared_plugins(self) -> None:
+        plugin = self.root / "compressor"
+        plugin.mkdir()
+        bare = self.materialize(self.runtime_config(), self.home)
+        declared = self.materialize(self.runtime_config(plugins=(plugin,)), self.home)
+        self.assertNotEqual(bare, declared)
+        # Plugins are loaded from their own directory, never copied into the
+        # generated home, so no plugin file is materialized for them.
+        self.assertFalse((self.home / "plugins" / "compressor").exists())
+
     def test_request_can_narrow_but_not_widen_profile_write(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
             narrowed = self.prepare(

@@ -83,6 +83,7 @@ class RuntimeConfig:
     auth: RuntimeAuthConfig | None = None
     hooks: tuple[RuntimeHookConfig, ...] = ()
     service_mode: str | None = None
+    plugins: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,23 @@ def _relative_target(value: object, path: str) -> str:
     if target.is_absolute() or ".." in target.parts or text in {".", ".."}:
         raise ValidationError(f"{path} must be a relative path without '..'")
     return text
+
+
+def _plugin_dirs(value: object, path: str) -> tuple[Path, ...]:
+    """Absolute, existing plugin directories; anything else fails closed."""
+
+    if not isinstance(value, list):
+        raise ValidationError(f"{path} must be an array of absolute plugin directories")
+    plugins = []
+    for index, item in enumerate(value):
+        entry = f"{path}[{index}]"
+        directory = _path(item, entry)
+        if not directory.is_dir():
+            raise ValidationError(f"{entry} must be an existing directory: {directory}")
+        if directory in plugins:
+            raise ValidationError(f"{entry} is declared twice: {directory}")
+        plugins.append(directory)
+    return tuple(plugins)
 
 
 def _env_names(value: object, path: str) -> tuple[str, ...]:
@@ -350,6 +368,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "auth",
         "hooks",
         "service_mode",
+        "plugins",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -375,6 +394,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             None if auth is None else _parse_auth(auth, f"{path}.auth"),
             _parse_hooks(table.get("hooks", []), f"{path}.hooks"),
             None if service_mode is None else _string(service_mode, f"{path}.service_mode"),
+            _plugin_dirs(table.get("plugins", []), f"{path}.plugins"),
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")

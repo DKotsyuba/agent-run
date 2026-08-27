@@ -224,6 +224,7 @@ home = "~/.agent-run/runtimes/codex/home"
 models = ["gpt-5.6-sol", "gpt-5.6-terra"]
 skills = ["delegate", "code-reading"]
 mcp = ["agent_lsp"]
+plugins = ["/absolute/path/to/agent-pipline-compressor"]
 max_active_agents = 4
 
 [runtimes.codex.auth]
@@ -271,6 +272,14 @@ Rules:
   with unknown metadata; a readable roster remains authoritative and is still
   intersected with the configured allowlist;
 - skill names resolve only below `~/.agent-run/skills/<runtime>`;
+- `plugins` are absolute existing directories holding a plugin manifest;
+  undeclared means nothing is wired. The claude adapter passes each one to
+  `--plugin-dir` and the plugin's own `hooks/hooks.json` loads with it, without
+  any entry in the generated `settings.json` and without widening the tool
+  allowlist. The codex adapter copies each into
+  `plugins/cache/personal/<name>/<version>`, lists it in the generated home's
+  `.agents/plugins/marketplace.json`, enables it, and pre-seeds the
+  `[hooks.state]` trust digests codex would otherwise prompt for;
 - MCP names resolve only from `[mcp.<name>]` and are rendered by the selected
   runtime adapter;
 - `env_from` and auth bridges name environment variables or source files but do

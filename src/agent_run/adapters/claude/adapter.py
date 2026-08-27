@@ -335,7 +335,8 @@ class ClaudeAdapter:
         if not isinstance(skills_root, Path) or not skills_root.is_absolute():
             raise ValidationError("claude skills_root must be absolute")
         plugin_digest = _render_plugin_dirs(home, skills_root, config.skills)
-        return "\n".join((settings_digest, mcp_digest, plugin_digest))
+        declared_digest = content_hash(",".join(str(plugin) for plugin in config.plugins))
+        return "\n".join((settings_digest, mcp_digest, plugin_digest, declared_digest))
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
@@ -435,6 +436,14 @@ class ClaudeAdapter:
             argv += ["--mcp-config", str(home / "mcp" / "mcp-config.json")]
         for name in config.skills:
             argv += ["--plugin-dir", str(home / "plugins" / name)]
+        # Declared plugins load straight from their own directory. Verified
+        # live against claude 2.1.245: a plugin's own hooks/hooks.json is
+        # picked up from --plugin-dir alone, with the generated settings.json
+        # holding no hook entry of its own. Hooks matching a tool this
+        # runtime never grants (the plugin ships ^Bash$ matchers) simply
+        # never fire -- the tool allowlist below is not widened for them.
+        for plugin in config.plugins:
+            argv += ["--plugin-dir", str(plugin)]
         for root in roots:
             argv += ["--add-dir", str(root)]
         argv += ["--tools", ",".join(base_tools)]

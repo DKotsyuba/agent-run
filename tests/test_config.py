@@ -77,6 +77,43 @@ command = ["echo", "done"]
                 'schema_version = 1\n[delivery]\ncodex_queue_bin = "relative"\n'
             )
 
+    def runtime_with_plugins(self, value: str, directory: Path):
+        return self.load(
+            f"""schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "{directory}"
+models = ["test"]
+plugins = {value}
+"""
+        )
+
+    def test_runtime_plugins_default_to_none_and_must_be_existing_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw).resolve()
+            plugin = directory / "compressor"
+            plugin.mkdir()
+            regular = directory / "manifest.json"
+            regular.write_text("{}", encoding="utf-8")
+
+            self.assertEqual(self.runtime_with_plugins("[]", directory).runtimes["fake"].plugins, ())
+            declared = self.runtime_with_plugins(f'["{plugin}"]', directory)
+            self.assertEqual(declared.runtimes["fake"].plugins, (plugin,))
+
+            for value in (f'["{directory / "missing"}"]', f'["{regular}"]'):
+                with self.subTest(value=value), self.assertRaisesRegex(
+                    ValidationError, r"runtimes\.fake\.plugins\[0\] must be an existing directory"
+                ):
+                    self.runtime_with_plugins(value, directory)
+            with self.assertRaisesRegex(ValidationError, r"runtimes\.fake\.plugins\[0\]"):
+                self.runtime_with_plugins('["relative/path"]', directory)
+            with self.assertRaisesRegex(ValidationError, "must be an array"):
+                self.runtime_with_plugins(f'"{plugin}"', directory)
+            with self.assertRaisesRegex(ValidationError, "declared twice"):
+                self.runtime_with_plugins(f'["{plugin}", "{plugin}"]', directory)
+
     def test_core_and_capacity_bounds_fail_during_load(self) -> None:
         invalid = (
             ("core", "warning_fraction", "true"),

@@ -1,4 +1,5 @@
 import inspect
+import json
 import os
 import sys
 import tempfile
@@ -147,6 +148,107 @@ env_from = ["PATH"]
         self.assertNotEqual(digest_one, digest_two)
         self.assertEqual(runtime_owned.read_text(encoding="utf-8"), '{"trusted": true}')
         self.assertIn("PostToolUse", (self.home / "config.toml").read_text(encoding="utf-8"))
+
+    def make_plugin(self, **manifest) -> Path:
+        """A plugin whose PreToolUse hook matches the real compressor byte for byte."""
+
+        directory = Path(self._mkdtemp()).resolve() / "compressor"
+        (directory / ".codex-plugin").mkdir(parents=True)
+        (directory / "hooks").mkdir()
+        (directory / ".git").mkdir()
+        (directory / ".git" / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+        payload = {"name": "agent-pipline-compressor", "version": "0.1.0+codex.20260825100009"}
+        payload.update(manifest)
+        (directory / ".codex-plugin" / "plugin.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        (directory / "hooks" / "hooks.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "^Bash$",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": (
+                                            "/Library/Frameworks/Python.framework/Versions/"
+                                            "3.8/bin/python3 \"${PLUGIN_ROOT:-"
+                                            "$CLAUDE_PLUGIN_ROOT}/hooks/pre_tool.py\""
+                                        ),
+                                        "timeout": 10,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / "hooks" / "pre_tool.py").write_text("print(1)", encoding="utf-8")
+        return directory
+
+    def test_materialize_installs_declared_plugins_with_codex_own_trust_digest(self) -> None:
+        plugin = self.make_plugin()
+        config = self.runtime_config(plugins=(plugin,))
+        digest = ADAPTER.materialize(config, self.home, mcp_servers={})
+
+        installed = (
+            self.home
+            / "plugins"
+            / "cache"
+            / "personal"
+            / "agent-pipline-compressor"
+            / "0.1.0+codex.20260825100009"
+        )
+        # Real files, not a bridge: codex reports a symlinked version
+        # directory as "not installed" and never loads its hooks.
+        self.assertFalse(installed.is_symlink())
+        self.assertEqual((installed / "hooks" / "pre_tool.py").read_text(encoding="utf-8"), "print(1)")
+        self.assertFalse((installed / ".git").exists())
+
+        catalog = json.loads(
+            (self.home / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(catalog["name"], "personal")
+        self.assertEqual(
+            catalog["plugins"][0]["source"]["path"],
+            "./plugins/cache/personal/agent-pipline-compressor/0.1.0+codex.20260825100009",
+        )
+
+        generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('[plugins."agent-pipline-compressor@personal"]\nenabled = true', generated)
+        # This exact digest was produced by codex itself and read back out of
+        # the owner's live ~/.codex/config.toml; it pins the algorithm.
+        self.assertIn(
+            '[hooks.state."agent-pipline-compressor@personal:hooks/hooks.json:pre_tool_use:0:0"]\n'
+            'trusted_hash = "sha256:'
+            '12d96d056f33b8d47b4421084706b4a0a4e8f368a16911bd64a0290344017231"',
+            generated,
+        )
+        self.assertNotEqual(digest, ADAPTER.materialize(self.runtime_config(), self.home, mcp_servers={}))
+
+    def test_materialize_refuses_plugin_hooks_it_cannot_trust(self) -> None:
+        no_manifest = Path(self._mkdtemp()).resolve()
+        with self.assertRaisesRegex(ValidationError, "no usable manifest"):
+            ADAPTER.materialize(
+                self.runtime_config(plugins=(no_manifest,)), self.home, mcp_servers={}
+            )
+
+        plugin = self.make_plugin()
+        hooks = plugin / "hooks" / "hooks.json"
+        hooks.write_text(
+            json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "prompt", "prompt": "hi"}]}]}}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValidationError, "not a command hook"):
+            ADAPTER.materialize(self.runtime_config(plugins=(plugin,)), self.home, mcp_servers={})
+
+        hooks.write_text(json.dumps({"hooks": {"Bogus": []}}), encoding="utf-8")
+        with self.assertRaisesRegex(ValidationError, "unsupported hook event"):
+            ADAPTER.materialize(self.runtime_config(plugins=(plugin,)), self.home, mcp_servers={})
 
     def test_materialize_is_deterministic_for_identical_input(self) -> None:
         config = self.runtime_config()
@@ -672,6 +774,24 @@ env_from = ["PATH"]
         read_only = self.prepare(self.start_request(write=False), profile, config)
         self.assertEqual(read_only.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(read_only.adapter_state["writable_roots"], ())
+
+    def test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents(self) -> None:
+        """A read-only sandbox cannot spool before execution, so the outside
+        PostToolUse hook has to do the replacing; a write-capable agent
+        spools natively and must not get the fallback."""
+
+        plugin = self.make_plugin()
+        config = self.materialized(plugins=(plugin,))
+        profile = AgentProfile("implement", "body", True, ())
+
+        read_only = self.prepare(self.start_request(write=False), profile, config)
+        self.assertEqual(read_only.environment["TOKENPIPE_POST_REPLACE"], "1")
+        writable = self.prepare(self.start_request(write=True), profile, config)
+        self.assertNotIn("TOKENPIPE_POST_REPLACE", writable.environment)
+
+        # Undeclared means nothing is wired, for either sandbox mode.
+        bare = self.prepare(self.start_request(write=False), profile, self.materialized())
+        self.assertNotIn("TOKENPIPE_POST_REPLACE", bare.environment)
 
     def test_prepare_never_widens_the_writable_root_to_a_containing_read_root(self) -> None:
         config = self.materialized()
