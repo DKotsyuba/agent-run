@@ -39,7 +39,8 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash, create_symlink_bridge, write_managed_file
-from .stream import StreamDecoder, sanitize_line, terminal_event_data
+from .auth import TOKEN_ENV_NAME, keychain_token, resolve_token
+from .stream import StreamDecoder, classify_failure, sanitize_line, terminal_event_data
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
 
@@ -60,6 +61,7 @@ _CAPABILITIES = frozenset(
 )
 
 _READ_TOOLS = ("Read", "Grep", "Glob")
+_SKILL_TOOLS = ("Skill",)
 _WRITE_TOOLS = ("Edit", "Write", "NotebookEdit")
 _ALWAYS_DISALLOWED = ("WebFetch", "WebSearch")
 _AUTH_NAMES = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
@@ -261,6 +263,30 @@ def _render_plugin_dirs(home: Path, skills_root: Path, names: tuple[str, ...]) -
     return content_hash(",".join(digests)) if digests else content_hash("no_skills")
 
 
+def _auth_environment(binary: Path, auth_names: tuple[str, ...]) -> dict[str, str]:
+    """Resolve the child's auth variables for one launch.
+
+    An explicitly exported variable wins unchanged, so an API key or a
+    token supplied by the caller keeps behaving exactly as before. Only
+    when none is exported does the adapter fall back to the macOS
+    Keychain -- and only if the runtime actually declares the OAuth
+    variable, since exporting a credential under a name the owner did not
+    declare would silently widen the configured auth bridge.
+    """
+
+    inherited = {
+        name: value for name in auth_names if (value := os.environ.get(name))
+    }
+    if inherited:
+        return inherited
+    if TOKEN_ENV_NAME not in auth_names:
+        raise ValidationError(
+            "claude runtime auth requires one of the declared environment "
+            f"variables to be set: {', '.join(auth_names)}"
+        )
+    return {TOKEN_ENV_NAME: resolve_token(binary)}
+
+
 class ClaudeAdapter:
     """Runtime adapter for the ``claude`` engine."""
 
@@ -316,6 +342,11 @@ class ClaudeAdapter:
         authenticated: bool | None = None
         if config.auth is not None and config.auth.kind == "environment":
             authenticated = any(name in os.environ for name in config.auth.names)
+            if not authenticated and TOKEN_ENV_NAME in config.auth.names:
+                # ``prepare`` can source this launch from the Keychain, so
+                # reporting "unauthenticated" on a bare environment would be
+                # a false alarm. Read only -- probe never refreshes.
+                authenticated = keychain_token(time.time()) is not None
         reason = None if available else f"claude binary not executable: {config.binary}"
         return RuntimeHealth(available, None, authenticated, reason)
 
@@ -358,9 +389,17 @@ class ClaudeAdapter:
                         f"inside a writable workdir: {root}"
                     )
 
-        base_tools = _READ_TOOLS + (_WRITE_TOOLS if allow_write else ())
+        # Skills are registered by --plugin-dir, but the child can only see
+        # and invoke them through the built-in Skill tool; without it in the
+        # --tools allowlist the generated plugins load and stay invisible
+        # (observed live: a child that listed the MCP server's own prompt
+        # skills and none of ours).
+        skill_tools = _SKILL_TOOLS if config.skills else ()
+        base_tools = _READ_TOOLS + skill_tools + (_WRITE_TOOLS if allow_write else ())
         write_scope = tuple(f"{tool}({request.workdir}/**)" for tool in _WRITE_TOOLS) if allow_write else ()
-        allowed_tools = _READ_TOOLS + write_scope + tuple(f"mcp__{name}" for name in config.mcp)
+        allowed_tools = (
+            _READ_TOOLS + skill_tools + write_scope + tuple(f"mcp__{name}" for name in config.mcp)
+        )
         permission_mode = "acceptEdits" if allow_write else "default"
 
         system_prompt_parts = [profile.body]
@@ -414,15 +453,7 @@ class ClaudeAdapter:
         auth_names: tuple[str, ...] = ()
         if config.auth is not None:
             auth_names = config.auth.names
-            if not any(os.environ.get(name) for name in auth_names):
-                raise ValidationError(
-                    "claude runtime auth requires one of the declared environment "
-                    f"variables to be set: {', '.join(auth_names)}"
-                )
-            for name in auth_names:
-                value = os.environ.get(name)
-                if value:
-                    environment[name] = value
+            environment.update(_auth_environment(config.binary, auth_names))
 
         mcp_env_names: list[str] = []
         for name in config.mcp:
@@ -731,7 +762,7 @@ class ClaudeSession:
                 and metadata.subtype != "no_answer"
                 and not metadata.result_text
             )
-            failure_kind = "empty_result" if empty_result else (metadata.subtype or "error")
+            failure_kind = "empty_result" if empty_result else classify_failure(metadata)
             failure_text = metadata.result_text
         answer_path = None
         answer_bytes = None

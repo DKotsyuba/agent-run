@@ -554,6 +554,23 @@ MCP, skill paths, and lifecycle hooks:
   permission mode.
 - Pass only named Claude auth environment variables into the Claude child; strip
   them from every other runtime.
+- Acquire the credential in a fixed order at `prepare`: an exported auth variable
+  wins unchanged; otherwise, when `CLAUDE_CODE_OAUTH_TOKEN` is a declared name,
+  read the macOS Keychain item `Claude Code-credentials`
+  (`claudeAiOauth.accessToken`, stale when `expiresAt` is within five minutes).
+  A missing or stale item triggers exactly one bare-CLI refresh -- `claude
+  --print ping` with every auth variable stripped from the child's environment,
+  which is what makes the CLI renew the Keychain itself -- bounded to 60s, then
+  one re-read. A still-unusable credential fails the start with
+  `failure_kind = "auth_failed"`; there is no retry loop. Token values never
+  reach argv, logs, events, transcripts, or exception text.
+- Allow the built-in `Skill` tool whenever skills are configured: `--plugin-dir`
+  only registers them, and without the tool the child can neither list nor
+  invoke them.
+- Classify a terminal `result` line from what it says, never from its subtype
+  alone: the CLI reports engine errors on lines that still call themselves
+  `subtype: "success"`, so an authentication failure surfaces as `auth_failed`
+  and any other unexplained engine error as `engine_error`.
 - Treat `~/.agent-run/runtimes/claude/home` as generated runtime assets even if
   `CLAUDE_CONFIG_DIR` cannot be changed without losing subscription auth.
 - Canary `CLAUDE_CONFIG_DIR` isolation. If it breaks keychain auth, retain the

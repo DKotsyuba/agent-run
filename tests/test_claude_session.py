@@ -115,6 +115,42 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(outcome.failure_kind, "empty_result")
 
+    def test_engine_error_labelled_success_never_becomes_failure_kind_success(self) -> None:
+        # Shaped byte-for-byte like the live regression (canary agent
+        # ag-20260827-062657-dae47a2121): the CLI reports an expired OAuth
+        # token on a result line that still calls its own subtype "success"
+        # and exits 0, which used to be copied straight into failure_kind.
+        expired = (
+            "Failed to authenticate. API Error: 401 OAuth access token has expired. "
+            "Re-authenticate to continue."
+        )
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': True, "
+            "'duration_ms': 2433, 'num_turns': 1, 'permission_denials': [], "
+            f"'result': {expired!r}}}))\n"
+        )
+        outcome = ADAPTER.launch(self.plan(script), FakeSink()).wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertNotEqual(outcome.failure_kind, "success")
+        self.assertEqual(outcome.failure_kind, "auth_failed")
+        self.assertEqual(outcome.failure_text, expired)
+
+    def test_unexplained_engine_error_labelled_success_falls_back_to_engine_error(self) -> None:
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': True, "
+            "'result': 'the model refused to continue'}))\n"
+        )
+        outcome = ADAPTER.launch(self.plan(script), FakeSink()).wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "engine_error")
+
     # -- redaction ---------------------------------------------------------
 
     def test_literal_secret_value_is_redacted_from_messages_and_the_disk_log(self) -> None:

@@ -26,7 +26,7 @@ from .domain import (
     new_agent_id,
     validate_agent_id,
 )
-from .errors import ValidationError
+from .errors import AuthError, ValidationError
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from .profiles import load_profile
 from .state.store import StateStore
@@ -321,6 +321,10 @@ class AgentService:
     def _fail_created_start(
         self, agent_id: AgentId, error: Exception, kind: str
     ) -> None:
+        # A missing or unrenewable credential is its own diagnosis, not a
+        # generic prepare/launch fault: name it so the row says what to fix.
+        if isinstance(error, AuthError):
+            kind = "auth_failed"
         outcome = Outcome(
             AgentStatus.FAILED,
             failure_kind=kind,

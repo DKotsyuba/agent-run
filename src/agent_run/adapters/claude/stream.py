@@ -186,6 +186,41 @@ def _terminal_metadata(payload: Mapping[str, object], session_id: str | None) ->
     )
 
 
+_AUTH_MARKERS = (
+    "failed to authenticate",
+    "oauth access token has expired",
+    "oauth token has expired",
+    "authentication_error",
+    "invalid api key",
+    "invalid bearer token",
+    "please run /login",
+)
+
+#: Subtypes the engine reports on its happy path. The CLI labels an
+#: engine-level error line ``subtype: "success"`` while setting
+#: ``is_error: true`` (observed live on an expired OAuth token), so the
+#: subtype alone can never be trusted to name a failure.
+_NON_FAILURE_SUBTYPES = frozenset({"success", "", "none"})
+
+
+def classify_failure(metadata: StreamMetadata) -> str:
+    """Name the failure behind a terminal line that did not succeed.
+
+    Never returns a success-shaped label: a ``result`` line that carries an
+    engine error while still calling itself ``success`` is classified from
+    what it actually said, and anything left unexplained becomes the honest
+    generic ``engine_error``.
+    """
+
+    text = (metadata.result_text or "").casefold()
+    if any(marker in text for marker in _AUTH_MARKERS):
+        return "auth_failed"
+    subtype = (metadata.subtype or "").strip()
+    if subtype.casefold() in _NON_FAILURE_SUBTYPES:
+        return "engine_error"
+    return subtype
+
+
 def terminal_event_data(metadata: StreamMetadata) -> Mapping[str, object]:
     """Bounded terminal metadata for a ``runtime_result`` event.
 

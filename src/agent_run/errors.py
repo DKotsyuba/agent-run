@@ -15,3 +15,7 @@ class StateTransitionError(ValidationError):
 
 class PathEscapeError(ValidationError):
     """A derived path escapes its declared root."""
+
+
+class AuthError(AgentRunError):
+    """A runtime could not obtain a usable credential."""
