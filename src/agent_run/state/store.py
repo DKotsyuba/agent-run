@@ -22,7 +22,7 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 
-from . import capacity, delivery
+from . import capacity, delivery, workflow
 from .db import (
     _upsert_context_receipt,
     agent_row,
@@ -40,10 +40,10 @@ from .db import (
     open_database,
     recent_capacity_rows,
     require_attempt,
+    resolve_message_storage,
     row_dict,
     session_for_ref,
     timestamp,
-    validate_message_storage,
 )
 from .start import AgentCreation, create_agent as create_agent_record
 
@@ -59,7 +59,22 @@ class StateStore:
 
     @classmethod
     def open(cls, database: str | Path) -> StateStore:
-        return cls(open_database(database))
+        """Open an existing state database, sweeping abandoned workflow runs.
+
+        Only a live process can notice that a detached workflow runner is gone,
+        so every open pays for one bounded reconciliation pass. An abandoned run
+        is flipped to ``lost`` there -- it is never silently resumed.
+        """
+
+        from .reconciliation import reconcile_workflow_runs
+
+        store = cls(open_database(database))
+        try:
+            reconcile_workflow_runs(store)
+        except BaseException:
+            store.close()
+            raise
+        return store
 
     def close(self) -> None:
         self.connection.close()
@@ -308,7 +323,12 @@ class StateStore:
         agent_id = validate_agent_id(agent_id)
         if not isinstance(message, Message):
             raise ValidationError("message must be a Message")
-        validate_message_storage(message.content, message.raw_ref)
+        content, raw_ref = resolve_message_storage(
+            message.content,
+            message.raw_ref,
+            agent_id=agent_id,
+            home=connection_path(self.connection).parent,
+        )
         with immediate(self.connection):
             agent_row(self.connection, agent_id)
             require_attempt(self.connection, agent_id, attempt_id)
@@ -322,8 +342,8 @@ class StateStore:
                     message.at,
                     message.role.value,
                     message.name,
-                    message.content,
-                    message.raw_ref,
+                    content,
+                    raw_ref,
                 ),
             )
         return int(cursor.lastrowid)
@@ -738,3 +758,186 @@ class StateStore:
 
     def cancel_delivery(self, delivery_id: str) -> bool:
         return delivery.cancel_delivery(self.connection, delivery_id)
+
+    def claim_workflow_delivery(
+        self, owner: str, *, at: float | None = None, lease_seconds: float = 30
+    ) -> dict[str, object] | None:
+        """Claim one due workflow notice for an owner until its lease expires."""
+
+        nonblank("lease owner", owner)
+        now = timestamp(at)
+        with immediate(self.connection):
+            row = self.connection.execute(
+                """SELECT wd.*, wr.status AS run_status, os.transport,
+                          os.external_session_id, os.external_turn_id
+                   FROM workflow_deliveries wd
+                   JOIN workflow_runs wr ON wr.id = wd.run_id
+                   JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
+                   WHERE wd.state IN ('pending', 'retry_wait')
+                     AND wd.next_attempt_at <= ?
+                     AND (wd.lease_until IS NULL OR wd.lease_until <= ?)
+                   ORDER BY wd.next_attempt_at, wd.id LIMIT 1""",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = self.connection.execute(
+                """UPDATE workflow_deliveries
+                   SET state = 'sending', lease_owner = ?, lease_until = ?,
+                       attempts = attempts + 1
+                   WHERE id = ? AND state IN ('pending', 'retry_wait')""",
+                (owner, now + lease_seconds, row["id"]),
+            ).rowcount
+            if updated != 1:
+                return None
+            row = self.connection.execute(
+                """SELECT wd.*, wr.status AS run_status, os.transport,
+                          os.external_session_id, os.external_turn_id
+                   FROM workflow_deliveries wd
+                   JOIN workflow_runs wr ON wr.id = wd.run_id
+                   JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
+                   WHERE wd.id = ?""",
+                (row["id"],),
+            ).fetchone()
+        return dict(row)
+
+    def complete_workflow_delivery(
+        self, delivery_id: str, owner: str, *, remote_message_id: str | None = None,
+        at: float | None = None,
+    ) -> None:
+        """Complete a workflow delivery only while its lease belongs to the caller."""
+
+        with immediate(self.connection):
+            updated = self.connection.execute(
+                """UPDATE workflow_deliveries SET state = 'delivered', lease_owner = NULL,
+                       lease_until = NULL, remote_message_id = ?
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?""",
+                (remote_message_id, delivery_id, owner),
+            ).rowcount
+            if updated != 1:
+                raise ValidationError("workflow delivery lease is not owned by caller")
+
+    def retry_workflow_delivery(
+        self, delivery_id: str, owner: str, error: str, *, at: float | None = None,
+        base_delay: float = 1, max_delay: float = 300,
+    ) -> float:
+        """Release an owned workflow notice claim with capped exponential delay."""
+
+        now = timestamp(at)
+        with immediate(self.connection):
+            row = self.connection.execute(
+                "SELECT attempts FROM workflow_deliveries WHERE id = ? AND state = 'sending' AND lease_owner = ?",
+                (delivery_id, owner),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("workflow delivery lease is not owned by caller")
+            delay = min(max_delay, base_delay * (2 ** min(int(row["attempts"]) - 1, 20)))
+            next_attempt = now + delay
+            self.connection.execute(
+                """UPDATE workflow_deliveries SET state = 'retry_wait', lease_owner = NULL,
+                       lease_until = NULL, last_error = ?, next_attempt_at = ? WHERE id = ?""",
+                (error, next_attempt, delivery_id),
+            )
+        return next_attempt
+
+    def fail_workflow_delivery(
+        self, delivery_id: str, owner: str, error: str, *, at: float | None = None
+    ) -> None:
+        """Permanently fail a workflow notice whose lease belongs to the caller."""
+
+        with immediate(self.connection):
+            updated = self.connection.execute(
+                """UPDATE workflow_deliveries SET state = 'failed', lease_owner = NULL,
+                       lease_until = NULL, last_error = ?
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?""",
+                (error, delivery_id, owner),
+            ).rowcount
+            if updated != 1:
+                raise ValidationError("workflow delivery lease is not owned by caller")
+
+    def create_workflow_run(
+        self,
+        name: str,
+        script_sha: str,
+        *,
+        owner_identity: str | None = None,
+        run_id: str | None = None,
+        at: float | None = None,
+        plan: object = None,
+        orchestrator: object = None,
+    ) -> str:
+        return workflow.create_workflow_run(
+            self.connection,
+            name,
+            script_sha,
+            owner_identity=owner_identity,
+            run_id=run_id,
+            at=at,
+            plan=plan,
+            orchestrator=orchestrator,
+        )
+
+    def start_workflow_run(self, run_id: str) -> None:
+        workflow.start_workflow_run(self.connection, run_id)
+
+    def claim_workflow_run(self, run_id: str, owner_identity: str) -> None:
+        workflow.claim_workflow_run(self.connection, run_id, owner_identity)
+
+    def resume_workflow_run(self, run_id: str, owner_identity: str) -> None:
+        workflow.resume_workflow_run(self.connection, run_id, owner_identity)
+
+    def finish_workflow_run(
+        self, run_id: str, status: str, *, result: object = None, at: float | None = None
+    ) -> None:
+        """Persist a terminal workflow status and optional JSON-safe result."""
+
+        workflow.finish_workflow_run(
+            self.connection, run_id, status, result=result, at=at
+        )
+
+    def record_step_start(
+        self,
+        run_id: str,
+        step_key: str,
+        spec: object,
+        *,
+        agent_id: str | None = None,
+    ) -> None:
+        workflow.record_step_start(
+            self.connection, run_id, step_key, spec, agent_id=agent_id
+        )
+
+    def finish_step(
+        self,
+        run_id: str,
+        step_key: str,
+        status: str,
+        *,
+        result: object = None,
+        failure_kind: str | None = None,
+        failure_params: object = None,
+    ) -> None:
+        workflow.finish_step(
+            self.connection,
+            run_id,
+            step_key,
+            status,
+            result=result,
+            failure_kind=failure_kind,
+            failure_params=failure_params,
+        )
+
+    def cached_step_result(self, run_id: str, step_key: str) -> object | None:
+        return workflow.cached_step_result(self.connection, run_id, step_key)
+
+    def workflow_run_status(
+        self, run_id: str, *, step_limit: int = 100
+    ) -> dict[str, object]:
+        return workflow.workflow_run_status(self.connection, run_id, step_limit=step_limit)
+
+    def list_workflow_runs(
+        self, *, active_only: bool = False, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, object]]:
+        return workflow.list_workflow_runs(
+            self.connection, active_only=active_only, limit=limit, offset=offset
+        )

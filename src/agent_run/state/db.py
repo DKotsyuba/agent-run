@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import math
 import os
 import sqlite3
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -16,24 +16,22 @@ from typing import Iterator
 
 from agent_run.domain import AgentId, OrchestratorRef, StartRequest
 from agent_run.errors import ValidationError
+from agent_run.paths import agent_dir as _agent_dir
 
-
-SCHEMA_VERSION = 1
-MAX_INLINE_MESSAGE_BYTES = 32 * 1024
-_SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-_TABLES = frozenset(
-    {
-        "orchestrator_sessions",
-        "agents",
-        "attempts",
-        "events",
-        "messages",
-        "commands",
-        "deliveries",
-        "capacity_samples",
-        "context_receipts",
-    }
+from .migrations import (
+    SCHEMA_VERSION,
+    migrate,
+    require_current,
+    schema_lock as _initialization_lock,
+    sql_statements,
+    table_names as _tables,
+    version_of as _version,
 )
+
+
+MAX_INLINE_MESSAGE_BYTES = 32 * 1024
+INLINE_STUB_HEAD_CHARS = 4096
+_SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
 def timestamp(value: float | None = None) -> float:
@@ -69,11 +67,7 @@ def positive_number(name: str, value: float) -> float:
     return float(value)
 
 
-def validate_message_storage(content: str, raw_ref: str | None) -> None:
-    if len(content.encode("utf-8")) > MAX_INLINE_MESSAGE_BYTES:
-        raise ValidationError("message content exceeds the 32 KiB inline limit")
-    if raw_ref is None:
-        return
+def _validate_raw_ref(raw_ref: str) -> None:
     if not isinstance(raw_ref, str) or not raw_ref or "\\" in raw_ref:
         raise ValidationError("raw_ref must be a normalized relative path")
     path = PurePosixPath(raw_ref)
@@ -85,6 +79,52 @@ def validate_message_storage(content: str, raw_ref: str | None) -> None:
         or path.parts[0].startswith("~")
     ):
         raise ValidationError("raw_ref must be a normalized relative path")
+
+
+def _spool_oversized_message(agent_directory: Path, content: str) -> tuple[str, str]:
+    """Spool content over the inline limit to a raw file directly under the
+    agent's own directory (same mkstemp-in-place convention as
+    adapters/opencode/http.py:_capture, so its bare filename is already a
+    normalized raw_ref) and return a bounded inline stub plus that raw_ref.
+    """
+
+    agent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    encoded = content.encode("utf-8")
+    descriptor, name = tempfile.mkstemp(dir=str(agent_directory), prefix="message.", suffix=".raw")
+    body_path = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as sink:
+            descriptor = -1
+            sink.write(encoded)
+            sink.flush()
+            os.fsync(sink.fileno())
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        body_path.unlink(missing_ok=True)
+        raise
+    raw_ref = body_path.name
+    stub = (
+        f"{content[:INLINE_STUB_HEAD_CHARS]}\n"
+        f"[...spooled: {len(encoded)} bytes exceed the 32 KiB inline limit; "
+        f"full content in raw_ref={raw_ref}]"
+    )
+    return stub, raw_ref
+
+
+def resolve_message_storage(
+    content: str, raw_ref: str | None, *, agent_id: AgentId, home: Path
+) -> tuple[str, str | None]:
+    """Content within the inline limit is returned unchanged; content over it
+    is spooled (see :func:`_spool_oversized_message`) so an oversized message
+    degrades the row instead of failing the whole write."""
+
+    if raw_ref is not None:
+        _validate_raw_ref(raw_ref)
+    if len(content.encode("utf-8")) <= MAX_INLINE_MESSAGE_BYTES:
+        return content, raw_ref
+    return _spool_oversized_message(_agent_dir(agent_id, home), content)
 
 
 def json_text(value: object) -> str:
@@ -502,17 +542,6 @@ def _raw_connect(path: Path, *, existing: bool = False) -> sqlite3.Connection:
     return connection
 
 
-def _version(connection: sqlite3.Connection) -> int:
-    return int(connection.execute("PRAGMA user_version").fetchone()[0])
-
-
-def _tables(connection: sqlite3.Connection) -> frozenset[str]:
-    rows = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-    )
-    return frozenset(row[0] for row in rows)
-
-
 def _table_shape(
     connection: sqlite3.Connection, table: str
 ) -> tuple[tuple[str, str, int, int], ...]:
@@ -524,43 +553,42 @@ def _table_shape(
 
 @lru_cache(maxsize=1)
 def _expected_shapes() -> dict[str, tuple[tuple[str, str, int, int], ...]]:
+    """Table shapes of the current schema, read from schema.sql itself.
+
+    Deriving the table set from the file keeps it from drifting out of step
+    with a hand-maintained list every time a migration adds a table.
+    """
+
     reference = sqlite3.connect(":memory:")
     reference.row_factory = sqlite3.Row
     try:
         reference.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
-        return {table: _table_shape(reference, table) for table in _TABLES}
+        return {table: _table_shape(reference, table) for table in _tables(reference)}
     finally:
         reference.close()
 
 
 @lru_cache(maxsize=1)
 def _schema_statements() -> tuple[str, ...]:
-    statements: list[str] = []
-    pending = ""
-    for line in _SCHEMA_PATH.read_text(encoding="utf-8").splitlines(keepends=True):
-        pending += line
-        if sqlite3.complete_statement(pending):
-            statements.append(pending)
-            pending = ""
-    if pending.strip():
-        raise ValidationError("schema.sql contains an incomplete statement")
-    return tuple(statements)
+    return sql_statements(_SCHEMA_PATH.read_text(encoding="utf-8"), "schema.sql")
 
 
 def _validate_schema(connection: sqlite3.Connection) -> None:
+    expected = _expected_shapes()
     version = _version(connection)
-    tables = _tables(connection)
-    if version != SCHEMA_VERSION or not _TABLES.issubset(tables):
+    require_current(version)
+    if version != SCHEMA_VERSION or not expected.keys() <= _tables(connection):
         raise ValidationError(
             f"unsupported or incomplete state schema: version {version}; "
             f"expected {SCHEMA_VERSION}"
         )
-    expected = _expected_shapes()
-    if any(_table_shape(connection, table) != expected[table] for table in _TABLES):
-        raise ValidationError("state schema columns or primary keys do not match schema v1")
+    if any(_table_shape(connection, table) != shape for table, shape in expected.items()):
+        raise ValidationError(
+            f"state schema columns or primary keys do not match schema v{SCHEMA_VERSION}"
+        )
 
 
-def _initialize_v1(connection: sqlite3.Connection) -> None:
+def _initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute("BEGIN IMMEDIATE")
     try:
         version = _version(connection)
@@ -597,21 +625,8 @@ def _private_path(path: Path, *, parent_created: bool) -> None:
             pass
 
 
-@contextmanager
-def _initialization_lock(path: Path) -> Iterator[None]:
-    lock_path = path.with_name(f".{path.name}.init.lock")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-
-
 def initialize_database(database: str | Path) -> sqlite3.Connection:
-    """Create schema v1 or open an already-valid v1 database."""
+    """Create the current schema, or migrate and open an older database."""
 
     path = Path(database).expanduser().resolve()
     parent_created = not path.parent.exists()
@@ -619,6 +634,8 @@ def initialize_database(database: str | Path) -> sqlite3.Connection:
     if parent_created:
         path.parent.chmod(0o700)
     existed = path.exists()
+    if existed and path.stat().st_size:
+        migrate(path)
     connection = _raw_connect(path)
     try:
         _private_path(path, parent_created=parent_created)
@@ -627,7 +644,7 @@ def initialize_database(database: str | Path) -> sqlite3.Connection:
         if version != 0 or tables:
             _validate_schema(connection)
         with _initialization_lock(path):
-            _initialize_v1(connection)
+            _initialize_schema(connection)
             _configure(connection)
         _private_path(path, parent_created=parent_created)
         return connection
@@ -639,12 +656,17 @@ def initialize_database(database: str | Path) -> sqlite3.Connection:
 
 
 def open_database(database: str | Path) -> sqlite3.Connection:
-    """Open an existing schema-v1 database without migrating it."""
+    """Open an existing database, migrating it up to the current schema first.
+
+    An older home therefore needs no manual step; a newer one is refused by
+    :func:`migrate` rather than silently opened.
+    """
 
     path = Path(database).expanduser().resolve()
     if not path.is_file():
         raise ValidationError(f"state database does not exist: {path}")
     _private_path(path, parent_created=False)
+    migrate(path)
     connection = _raw_connect(path, existing=True)
     try:
         _validate_schema(connection)

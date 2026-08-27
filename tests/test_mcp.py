@@ -116,7 +116,8 @@ class McpTests(unittest.TestCase):
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
                 "start", "cancel", "steer", "status", "list_agents",
-                "summary", "transcript", "answer", "models", "limits",
+                "summary", "transcript", "answer", "models", "limits", "doc",
+                "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
             ],
         )
         self.assertEqual(responses[0]["result"]["capabilities"], {"tools": {"listChanged": False}})
@@ -130,7 +131,8 @@ class McpTests(unittest.TestCase):
         )
         expected = [
             "start", "cancel", "steer", "status", "list_agents",
-            "summary", "transcript", "answer", "models", "limits",
+            "summary", "transcript", "answer", "models", "limits", "doc",
+            "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
         ]
         for response in responses:
             self.assertEqual([tool["name"] for tool in response["result"]["tools"]], expected)

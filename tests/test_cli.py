@@ -775,16 +775,60 @@ class CliTests(unittest.TestCase):
             self.assertEqual(rebind_error["type"], "BindHookError")
             self.assertIn("immutable", rebind_error["message"])
 
+            # Claude Code's MCP client may drop/mis-key structuredContent and
+            # carry the id only as JSON text inside a content block. Rebinding
+            # the same (agent_id, transport, session) target is idempotent, so
+            # this doubles as proof the text-content variant alone is enough
+            # to resolve the agent_id.
+            text_variant_payload = dict(
+                bind_payload,
+                tool_response={
+                    "structuredContent": {"agentId": agent_id},
+                    "content": [{"type": "text", "text": f'{{"agent_id":"{agent_id}"}}'}],
+                },
+            )
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(text_variant_payload),
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn(
+                agent_id,
+                json.loads(output)["hookSpecificOutput"]["additionalContext"],
+            )
+
+            # A real Claude Code PostToolUse payload may serialize the whole
+            # MCP tool result as one JSON string in tool_response, rather than
+            # a dict or content-block list; that shape alone must still bind.
+            string_variant_payload = dict(
+                bind_payload,
+                tool_response=json.dumps(
+                    {"agent_id": agent_id, "created": True, "agent": {"status": "starting"}}
+                ),
+            )
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(string_variant_payload),
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn(
+                agent_id,
+                json.loads(output)["hookSpecificOutput"]["additionalContext"],
+            )
+
             conflicting_id = agent_id[:-1] + ("0" if agent_id[-1] != "0" else "1")
             refused = {
                 "missing": {
                     "structuredContent": {"agentId": agent_id},
-                    "content": [{"text": f'{{"agent_id":"{agent_id}"}}'}],
+                    "content": [{"type": "text", "text": "not json"}],
                 },
                 "conflicting": [
                     {"structuredContent": {"agent_id": agent_id}},
                     {"agent_id": conflicting_id},
                 ],
+                "not_json_string": "plain text, not json at all",
             }
             with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
                 for label, tool_response in refused.items():
@@ -865,7 +909,8 @@ class CliTests(unittest.TestCase):
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
                 "start", "cancel", "steer", "status", "list_agents",
-                "summary", "transcript", "answer", "models", "limits",
+                "summary", "transcript", "answer", "models", "limits", "doc",
+                "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
             ],
         )
 

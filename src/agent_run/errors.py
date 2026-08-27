@@ -17,5 +17,21 @@ class PathEscapeError(ValidationError):
     """A derived path escapes its declared root."""
 
 
+class SchemaMigrationRequired(ValidationError):
+    """The state store predates this code and has not been migrated yet.
+
+    Raised only by read-only callers, which must not write.  Any path that
+    opens the store for writing migrates it instead of raising.
+    """
+
+    def __init__(self, found: int, expected: int):
+        super().__init__(
+            f"state schema is v{found} and this agent-run needs v{expected}; "
+            "the next command that opens the store for writing migrates it"
+        )
+        self.found = found
+        self.expected = expected
+
+
 class AuthError(AgentRunError):
     """A runtime could not obtain a usable credential."""

@@ -37,7 +37,7 @@ class StateDatabaseTests(unittest.TestCase):
 
     def test_invalid_and_newer_versions_refuse_without_schema_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            for version in (0, 2):
+            for version in (0, SCHEMA_VERSION + 1):
                 with self.subTest(version=version):
                     database = Path(directory) / f"state-{version}.db"
                     connection = sqlite3.connect(database)
@@ -91,7 +91,9 @@ class StateDatabaseTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=1")
             connection.close()
 
-            with self.assertRaisesRegex(ValidationError, "columns or primary keys"):
+            with self.assertRaisesRegex(
+                ValidationError, "columns or primary keys|foreign key"
+            ):
                 open_database(database)
 
     def test_concurrent_first_initializers_share_one_atomic_schema(self) -> None:

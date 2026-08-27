@@ -218,6 +218,14 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
         actual["sandbox"] = {"type": "readOnly", "networkAccess": False}
         verify_effective_params(self.expected(), actual)
 
+    def test_requested_network_access_must_be_echoed(self) -> None:
+        actual = thread_response("/work", writable_roots=())
+        actual["sandbox"] = {"type": "readOnly", "networkAccess": True}
+        verify_effective_params(self.expected(network_access=True), actual)
+        actual["sandbox"]["networkAccess"] = False
+        with self.assertRaisesRegex(VerificationError, "network access"):
+            verify_effective_params(self.expected(network_access=True), actual)
+
     def test_sandbox_legacy_string_echo_still_passes(self) -> None:
         actual = thread_response("/work", writable_roots=())
         actual["sandbox"] = "read-only"
@@ -325,6 +333,69 @@ class StartSessionTests(unittest.TestCase):
         self.assertEqual(
             transport.requests[-1][1]["input"],
             [{"type": "text", "text": "do the thing"}],
+        )
+
+    def test_non_network_sandbox_mode_is_sent_as_a_plain_string(self) -> None:
+        """The legacy non-network request continues to send a string sandbox."""
+
+        cwd = Path("/work")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "roots": (str(cwd),),
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [thread_response(cwd)],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            }
+        )
+
+        start_session(transport, plan, FakeSink())
+
+        self.assertEqual(transport.requests[1][1]["sandbox"], "read-only")
+
+    def test_network_sandbox_is_sent_as_a_tagged_mapping(self) -> None:
+        """Tagged network requests are unwrapped only for echo verification."""
+
+        cwd = Path("/work")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol",
+                "effort": None,
+                "sandbox_mode": "workspace-write",
+                "sandbox": {"workspace-write": {"networkAccess": True}},
+                "approval_policy": "never",
+                "roots": (str(cwd),),
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [
+                    thread_response(
+                        cwd,
+                        sandbox={"type": "workspaceWrite", "networkAccess": True},
+                    )
+                ],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            }
+        )
+
+        start_session(transport, plan, FakeSink())
+
+        self.assertEqual(
+            transport.requests[1][1]["sandbox"],
+            {"workspace-write": {"networkAccess": True}},
         )
 
     def test_refuses_when_effective_params_drift(self) -> None:

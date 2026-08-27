@@ -135,10 +135,13 @@ tests/
 docs/architecture.md
 ```
 
-Production Python files receive a review warning at 400 lines and fail the
-repository size check above 700 lines. Generated files and test fixtures are
-excluded. The intent is one owner and one contract per module, not mechanical
-line splitting.
+Production Python files receive a review warning at 400 lines; the enforced
+700-line ceiling is a suite gate covering the adapter families
+(`src/agent_run/adapters/{claude,codex,opencode}/*.py` — see
+`tests/test_adapters_base.py`); other production files follow the same budget
+by review discipline. Generated files and test fixtures are excluded. The
+intent is one owner and one contract per module, not mechanical line
+splitting.
 
 ### System home
 
@@ -916,6 +919,47 @@ class StateStore:
 - state migrations are numbered SQL files, backed up before application, and
   applied in one transaction. No migration framework is needed.
 
+### 9.1 Schema migrations
+
+`schema.sql` always describes the current schema and stamps `PRAGMA
+user_version`, which is the only version marker. Every later version adds one
+file `state/migrations/NNN_slug.sql` holding just its delta, where `NNN` is the
+version the file produces; `migrations.py` refuses a set of files that does not
+cover `2..SCHEMA_VERSION` contiguously.
+
+`migrate(store_path)` runs each pending migration under `BEGIN IMMEDIATE`,
+holding the same `.state.db.init.lock` flock that first-time creation takes, so
+schema creation and migration cannot race across processes. `user_version` is
+stamped inside that transaction and rolls back with it, which means an
+interrupted migration leaves the store at its previous version, never
+half-upgraded.
+
+Before each transaction the store is snapshotted to
+`state.db.pre-vN.backup` beside itself through SQLite's backup API. The backup
+API copies pages under a read transaction and is consistent in WAL mode; a
+plain file copy is not, because committed pages may still live only in the
+`-wal` sidecar. The snapshot is deleted only after the transaction commits, so
+a failed migration refuses with the backup path in its message, and a snapshot
+found next to an already-current store is stale and removed.
+
+Both `initialize_database` and `open_database` migrate on the way in, so an
+existing home needs no manual step. A store stamped *newer* than
+`SCHEMA_VERSION` is refused outright rather than opened. Read-only callers do
+not migrate: `diagnostic_snapshot` raises `SchemaMigrationRequired`, which
+`doctor` reports as `state_migration_pending`.
+
+Schema v2 adds the workflow journal tables. Their status enums are enforced by
+`CHECK` constraints:
+
+| table | column | values |
+|---|---|---|
+| `workflow_runs` | `status` | `created`, `running`, `succeeded`, `failed`, `cancelled`, `lost` |
+| `workflow_steps` | `status` | `pending`, `running`, `succeeded`, `failed`, `skipped`, `cached` |
+
+`workflow_steps` is keyed by `(run_id, step_key)` and references
+`workflow_runs(id)`; its nullable `agent_id` references `agents(id)` and carries
+a partial index, since a step only has an agent once it has been dispatched.
+
 Large raw runtime streams are not SQLite blobs. Normalized chat messages are
 stored in SQLite; raw or oversized tool content is referenced through `raw_ref`.
 `transcript --full` follows all references without silent truncation.
@@ -1182,7 +1226,8 @@ prepare failure is committed durably without launching a supervisor.
 completion notices use `summary(agent_id)`; session-scoped views use the
 orchestrator reference.
 
-Minimum CLI:
+Minimum CLI (workflow verbs added as a versioned extension in T066,
+2026-08-27):
 
 ```text
 agent-run start
@@ -1202,6 +1247,9 @@ agent-run delivery status|cancel|dispatch|launchd
 agent-run service start --runtime opencode [--port N]
 agent-run doctor
 agent-run init
+agent-run doc [topic]
+agent-run workflow start|status|cancel|answer
+agent-run batch --file jobs.json [--name NAME]
 ```
 
 `transcript --follow` advances its cursor without duplicates, polls at a bounded
@@ -1210,7 +1258,9 @@ transcript. `--full` keeps its finite current-pagination semantics. On a fresh
 home, `init` creates a private minimal config and state database without inventing
 runtime, delivery, or credential values; an existing config is never replaced.
 
-Minimum MCP tools:
+Minimum MCP tools (15 as of T066, 2026-08-27 — the four `workflow_*` tools are
+a deliberate versioned extension of the prior 11-tool surface, exactly as
+`doc` previously extended the 10-tool surface):
 
 ```text
 start
@@ -1223,6 +1273,11 @@ transcript
 answer
 models
 limits
+doc
+workflow_start
+workflow_status
+workflow_cancel
+workflow_answer
 ```
 
 `start` always returns immediately. `list_agents` returns an exact SQL count in

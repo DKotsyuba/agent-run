@@ -63,7 +63,9 @@ _CAPABILITIES = frozenset(
 _READ_TOOLS = ("Read", "Grep", "Glob")
 _SKILL_TOOLS = ("Skill",)
 _WRITE_TOOLS = ("Edit", "Write", "NotebookEdit")
-_ALWAYS_DISALLOWED = ("WebFetch", "WebSearch")
+_SHELL_TOOLS = ("Bash",)
+_NETWORK_TOOLS = ("WebFetch", "WebSearch")
+_ALWAYS_DISALLOWED = _NETWORK_TOOLS
 _AUTH_NAMES = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _KNOWN_HOOK_EVENTS = frozenset(
@@ -200,11 +202,17 @@ class ClaudeAdapter:
         # (observed live: a child that listed the MCP server's own prompt
         # skills and none of ours).
         skill_tools = _SKILL_TOOLS if config.skills else ()
-        base_tools = _READ_TOOLS + skill_tools + (_WRITE_TOOLS if allow_write else ())
+        shell_tools = _SHELL_TOOLS if allow_write else ()
+        network_tools = _NETWORK_TOOLS if profile.network else ()
+        base_tools = (
+            _READ_TOOLS + skill_tools + (_WRITE_TOOLS if allow_write else ()) + shell_tools + network_tools
+        )
         write_scope = tuple(f"{tool}({request.workdir}/**)" for tool in _WRITE_TOOLS) if allow_write else ()
         allowed_tools = (
-            _READ_TOOLS + skill_tools + write_scope + tuple(f"mcp__{name}" for name in config.mcp)
+            _READ_TOOLS + skill_tools + write_scope + shell_tools + network_tools
+            + tuple(f"mcp__{name}" for name in config.mcp)
         )
+        disallowed_tools = () if profile.network else _ALWAYS_DISALLOWED
         permission_mode = "acceptEdits" if allow_write else "default"
 
         system_prompt_parts = [profile.body]
@@ -243,16 +251,16 @@ class ClaudeAdapter:
         # Declared plugins load straight from their own directory. Verified
         # live against claude 2.1.245: a plugin's own hooks/hooks.json is
         # picked up from --plugin-dir alone, with the generated settings.json
-        # holding no hook entry of its own. Hooks matching a tool this
-        # runtime never grants (the plugin ships ^Bash$ matchers) simply
-        # never fire -- the tool allowlist below is not widened for them.
+        # holding no hook entry of its own. Write-enabled children also grant
+        # Bash, so plugin ^Bash$ matchers fire with the same shell-hook
+        # coverage as Codex children.
         for plugin in config.plugins:
             argv += ["--plugin-dir", str(plugin)]
         for root in roots:
             argv += ["--add-dir", str(root)]
         argv += ["--tools", ",".join(base_tools)]
         argv += ["--allowedTools", ",".join(allowed_tools)]
-        argv += ["--disallowedTools", ",".join(_ALWAYS_DISALLOWED)]
+        argv += ["--disallowedTools", ",".join(disallowed_tools)]
         if request.effort is not None:
             argv += ["--effort", request.effort]
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]

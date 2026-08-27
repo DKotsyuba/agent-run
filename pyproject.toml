@@ -15,4 +15,5 @@ agent-run = "agent_run.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"agent_run.state" = ["schema.sql"]
+"agent_run" = ["operator_guide/*.md"]
+"agent_run.state" = ["schema.sql", "migrations/*.sql"]

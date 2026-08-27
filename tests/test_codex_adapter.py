@@ -796,6 +796,33 @@ env_from = ["PATH"]
         self.assertEqual(read_only.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(read_only.adapter_state["writable_roots"], ())
 
+    def test_prepare_refuses_network_without_write(self) -> None:
+        """Read-only is a unit sandbox variant: no network knob, so refuse."""
+
+        config = self.materialized()
+        profile = AgentProfile("research", "body", False, (self.auth_source_dir,), True)
+        with self.assertRaisesRegex(ValidationError, "cannot grant network access"):
+            self.prepare(self.start_request(), profile, config)
+
+    def test_prepare_enables_network_in_a_write_sandbox(self) -> None:
+        """Write-capable network profiles use the tagged workspace-write form."""
+
+        config = self.materialized()
+        profile = AgentProfile("research", "body", True, (self.auth_source_dir,), True)
+        plan = self.prepare(self.start_request(write=True), profile, config)
+        self.assertEqual(
+            plan.adapter_state["sandbox"], {"workspace-write": {"networkAccess": True}}
+        )
+
+    def test_prepare_keeps_non_network_sandbox_mode_plain(self) -> None:
+        """Profiles without network permission do not add a sandbox mapping."""
+
+        config = self.materialized()
+        profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
+        plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
+        self.assertNotIn("sandbox", plan.adapter_state)
+
     def test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents(self) -> None:
         """A read-only sandbox cannot spool before execution, so the outside
         PostToolUse hook has to do the replacing; a write-capable agent

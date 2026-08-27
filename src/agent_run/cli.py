@@ -157,6 +157,23 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("init")
     commands.add_parser("doctor")
     commands.add_parser("mcp")
+    doc = commands.add_parser("doc")
+    doc.add_argument("topic", nargs="?")
+    workflow = commands.add_parser("workflow").add_subparsers(
+        dest="workflow_command", required=True
+    )
+    workflow_start = workflow.add_parser("start")
+    workflow_start.add_argument("name")
+    workflow_start.add_argument("script")
+    workflow_start.add_argument("--args")
+    _session(workflow_start)
+
+    batch = commands.add_parser("batch")
+    batch.add_argument("--file", required=True)
+    batch.add_argument("--name", default="batch")
+
+    for workflow_name in ("status", "cancel", "answer"):
+        workflow.add_parser(workflow_name).add_argument("run_id")
     return parser
 
 
@@ -186,6 +203,31 @@ def _object(value: str, what: str) -> dict:
 
 def _payload(stream: TextIO) -> dict:
     return _object(_read(stream), "hook payload")
+
+
+def _batch_source(value: str) -> str:
+    """Validate batch JSON and render one flat parallel workflow script.
+
+    ``value`` is the complete JSON text from ``--file`` or standard input.  It
+    must decode to a non-empty JSON array whose elements are dictionaries; the
+    workflow executor remains responsible for validating each job's fields.
+    The returned source embeds each original JSON object and preserves all JSON
+    value types through the sandbox-approved ``json`` module.
+    """
+
+    try:
+        jobs = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValidationError("batch file must be valid JSON") from error
+    if not isinstance(jobs, list):
+        raise ValidationError("batch file must contain a JSON array")
+    if not jobs:
+        raise ValidationError("batch file must contain at least one job")
+    if any(not isinstance(job, dict) for job in jobs):
+        raise ValidationError("batch jobs must be JSON objects")
+    encoded = [json.dumps(job, separators=(",", ":"), allow_nan=False) for job in jobs]
+    calls = ", ".join(f"lambda: agent(json.loads({item!r}))" for item in encoded)
+    return f"import json\nparallel([{calls}])"
 
 
 def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME) -> dict:
@@ -223,6 +265,14 @@ def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME)
                     pending.append(item)
         elif isinstance(value, list):
             pending.extend(value)
+        elif isinstance(value, str):
+            # Claude Code's MCP envelope may carry the id only as JSON text,
+            # either the whole tool_response or a content block's "text"
+            # field; decode once and keep searching, skip silently if not JSON.
+            try:
+                pending.append(json.loads(value))
+            except ValueError:
+                pass
     if not agent_ids:
         raise ValidationError("raw PostToolUse payload has no agent_id")
     if len(agent_ids) != 1:
@@ -319,7 +369,23 @@ def _follow_transcript(service, args: argparse.Namespace):
 
 
 def _execute(args: argparse.Namespace, service, stream: TextIO):
+    """Dispatch one parsed CLI command to its service operation."""
+
     command = args.command
+    if command == "workflow":
+        if args.workflow_command == "start":
+            values = None if args.args is None else _object(args.args, "workflow args")
+            return service.workflow_start(
+                args.name, args.script, values, _ref(args)
+            )
+        return {
+            "status": service.workflow_status,
+            "cancel": service.workflow_cancel,
+            "answer": service.workflow_answer,
+        }[args.workflow_command](args.run_id)
+    if command == "batch":
+        value = _read(stream) if args.file == "-" else Path(args.file).read_text()
+        return service.workflow_start(args.name, _batch_source(value), None, _ref(args))
     if command == "start":
         result = service.start(_request(args, stream))
         return {"agent_id": result.agent_id, "created": result.created}
@@ -464,6 +530,8 @@ def _service_start(home: Path, args: argparse.Namespace) -> dict[str, object]:
 
 
 def _dispatch_once(home: Path):
+    """Drain both agent and workflow lifecycle outboxes once."""
+
     config = load_config(config_path(home))
     executable = (
         os.environ["CODEX_QUEUE_BIN"]
@@ -487,7 +555,19 @@ def _dispatch_once(home: Path):
             },
             config.delivery,
         )
-        return dispatcher.run(home=home)
+        result = dispatcher.run(home=home)
+        from .delivery.workflow_dispatch import WorkflowDeliveryDispatcher
+
+        if isinstance(store, StateStore):
+            WorkflowDeliveryDispatcher(
+                store,
+                {
+                    TRANSPORT_NAME: CodexQueueTransport(sender),
+                    CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
+                },
+                config.delivery,
+            ).drain()
+        return result
     finally:
         store.close()
 
@@ -571,6 +651,62 @@ class _Runtime:
     def delivery_dispatch(self):
         return _dispatch_once(self.home)
 
+    def workflow_start(self, name: str, script: str, args: dict | None = None,
+                       orchestrator: OrchestratorRef | None = None) -> dict[str, str]:
+        """Launch a script workflow, optionally binding its lifecycle notice."""
+
+        from .workflow_run import start_workflow
+
+        source = script if args is None else f"args = {args!r}\n{script}"
+        return {"run_id": start_workflow(
+            self.home, name, {"script": source}, orchestrator=orchestrator
+        )}
+
+    def workflow_status(self, run_id: str) -> dict[str, object]:
+        """Return the durable journal summary for one workflow run."""
+
+        _config, store = self._inputs()
+        try:
+            return store.workflow_run_status(run_id)
+        finally:
+            store.close()
+
+    def workflow_cancel(self, run_id: str) -> dict[str, object]:
+        """Request SIGTERM from a live workflow runner, refusing terminal runs."""
+
+        import signal
+
+        _config, store = self._inputs()
+        try:
+            run = store.workflow_run_status(run_id)["run"]
+            if run["status"] in {"succeeded", "failed", "cancelled", "lost"}:
+                raise ValidationError("terminal workflow run cannot be cancelled")
+            identity = run["owner_pid_identity"]
+            if not isinstance(identity, str) or not identity.split(" ", 1)[0].isdigit():
+                raise ValidationError("workflow runner identity is not recorded")
+            os.kill(int(identity.split(" ", 1)[0]), signal.SIGTERM)
+            return {"run_id": run_id, "cancel_requested": True}
+        finally:
+            store.close()
+
+    def workflow_answer(self, run_id: str) -> object:
+        """Return a terminal workflow's last persisted step result, if any."""
+
+        _config, store = self._inputs()
+        try:
+            run = store.workflow_run_status(run_id)["run"]
+            if run["status"] not in {"succeeded", "failed", "cancelled", "lost"}:
+                raise ValidationError("workflow run has not finished")
+            row = store.connection.execute(
+                """SELECT result_json FROM workflow_steps
+                   WHERE run_id = ? AND result_json IS NOT NULL ORDER BY rowid DESC LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+            return {"run_id": run_id, "status": run["status"],
+                    "result": None if row is None else json.loads(row["result_json"])}
+        finally:
+            store.close()
+
     def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
         config, store = self._inputs()
         try:
@@ -642,6 +778,13 @@ def _doctor(home: Path):
     return run_doctor(home)
 
 
+def _doc(args: argparse.Namespace) -> dict[str, object]:
+    from .doc import topic_text
+
+    topic = args.topic
+    return {"topic": topic or "index", "text": topic_text(topic)}
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -668,6 +811,8 @@ def main(
             result = _initialize(home)
         elif service is None and args.command == "doctor":
             result = _doctor(home)
+        elif service is None and args.command == "doc":
+            result = _doc(args)
         elif args.command == "capacity" and args.capacity_command == "launchd":
             result = _capacity_launchd(home, args)
         elif args.command == "delivery" and args.delivery_command == "launchd":
@@ -683,6 +828,8 @@ def main(
             if args.command == "mcp":
                 from .mcp import serve
 
+                if owned is not None:
+                    owned.core._registry.preload_enabled()
                 returned = serve(
                     owned.core if owned is not None else target,
                     stdin=stdin,
