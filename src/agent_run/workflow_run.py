@@ -82,6 +82,7 @@ def start_workflow(
     *,
     executable: str | None = None,
     readiness_timeout_seconds: float = DEFAULT_READY_TIMEOUT_SECONDS,
+    orchestrator: object = None,
 ) -> str:
     """Create the run row, launch its detached runner, and return the run id.
 
@@ -102,7 +103,9 @@ def start_workflow(
     database = state_db_path(root)
     store = StateStore.open(database)
     try:
-        run_id = store.create_workflow_run(name, digest, plan=plan_payload)
+        run_id = store.create_workflow_run(
+            name, digest, plan=plan_payload, orchestrator=orchestrator
+        )
     finally:
         store.close()
 

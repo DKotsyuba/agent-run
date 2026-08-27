@@ -135,6 +135,24 @@ _TOOLS = (
         "inputSchema": _schema({"topic": {"type": ["string", "null"]}}),
     },
 )
+_TOOLS += (
+    {
+        "name": "workflow_start",
+        "description": "Start one asynchronous durable script workflow.",
+        "inputSchema": _schema(
+            {"name": {"type": "string"}, "script": {"type": "string"},
+             "args": {"type": ["object", "null"]}, "orchestrator": _ORCHESTRATOR},
+            ("name", "script"),
+        ),
+    },
+    {"name": "workflow_status", "description": "Get one workflow journal status.",
+     "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
+    {"name": "workflow_cancel", "description": "Request cancellation of a live workflow.",
+     "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
+    {"name": "workflow_answer", "description": "Read one terminal workflow result.",
+     "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
+)
+
 _TOOL_NAMES = frozenset(tool["name"] for tool in _TOOLS)
 
 
@@ -233,6 +251,25 @@ def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
 
 
 def _call_tool(service: AgentService, name: str, raw: dict) -> object:
+    """Validate one MCP tool request and dispatch it to the service."""
+
+    if name == "workflow_start":
+        args = _arguments(raw, {"name", "script", "args", "orchestrator"},
+                          {"name", "script"})
+        values = args.get("args")
+        if values is not None and not isinstance(values, dict):
+            raise ValidationError("args must be an object or null")
+        return service.workflow_start(
+            _string(args, "name"), _string(args, "script"), values,
+            _optional_orchestrator(args.get("orchestrator")),
+        )
+    if name in {"workflow_status", "workflow_cancel", "workflow_answer"}:
+        args = _arguments(raw, {"run_id"}, {"run_id"})
+        return {
+            "workflow_status": service.workflow_status,
+            "workflow_cancel": service.workflow_cancel,
+            "workflow_answer": service.workflow_answer,
+        }[name](_string(args, "run_id"))
     if name == "start":
         args = _arguments(
             raw,

@@ -1226,7 +1226,8 @@ prepare failure is committed durably without launching a supervisor.
 completion notices use `summary(agent_id)`; session-scoped views use the
 orchestrator reference.
 
-Minimum CLI:
+Minimum CLI (workflow verbs added as a versioned extension in T066,
+2026-08-27):
 
 ```text
 agent-run start
@@ -1247,6 +1248,7 @@ agent-run service start --runtime opencode [--port N]
 agent-run doctor
 agent-run init
 agent-run doc [topic]
+agent-run workflow start|status|cancel|answer
 ```
 
 `transcript --follow` advances its cursor without duplicates, polls at a bounded
@@ -1255,9 +1257,9 @@ transcript. `--full` keeps its finite current-pagination semantics. On a fresh
 home, `init` creates a private minimal config and state database without inventing
 runtime, delivery, or credential values; an existing config is never replaced.
 
-Minimum MCP tools (11 as of T069, 2026-08-27 — `doc` is a deliberate
-versioned extension of the prior 10-tool surface, serving the operator
-guide alongside `agent-run doc [topic]`):
+Minimum MCP tools (15 as of T066, 2026-08-27 — the four `workflow_*` tools are
+a deliberate versioned extension of the prior 11-tool surface, exactly as
+`doc` previously extended the 10-tool surface):
 
 ```text
 start
@@ -1271,6 +1273,10 @@ answer
 models
 limits
 doc
+workflow_start
+workflow_status
+workflow_cancel
+workflow_answer
 ```
 
 `start` always returns immediately. `list_agents` returns an exact SQL count in

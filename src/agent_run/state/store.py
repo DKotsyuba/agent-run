@@ -759,6 +759,102 @@ class StateStore:
     def cancel_delivery(self, delivery_id: str) -> bool:
         return delivery.cancel_delivery(self.connection, delivery_id)
 
+    def claim_workflow_delivery(
+        self, owner: str, *, at: float | None = None, lease_seconds: float = 30
+    ) -> dict[str, object] | None:
+        """Claim one due workflow notice for an owner until its lease expires."""
+
+        nonblank("lease owner", owner)
+        now = timestamp(at)
+        with immediate(self.connection):
+            row = self.connection.execute(
+                """SELECT wd.*, wr.status AS run_status, os.transport,
+                          os.external_session_id, os.external_turn_id
+                   FROM workflow_deliveries wd
+                   JOIN workflow_runs wr ON wr.id = wd.run_id
+                   JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
+                   WHERE wd.state IN ('pending', 'retry_wait')
+                     AND wd.next_attempt_at <= ?
+                     AND (wd.lease_until IS NULL OR wd.lease_until <= ?)
+                   ORDER BY wd.next_attempt_at, wd.id LIMIT 1""",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = self.connection.execute(
+                """UPDATE workflow_deliveries
+                   SET state = 'sending', lease_owner = ?, lease_until = ?,
+                       attempts = attempts + 1
+                   WHERE id = ? AND state IN ('pending', 'retry_wait')""",
+                (owner, now + lease_seconds, row["id"]),
+            ).rowcount
+            if updated != 1:
+                return None
+            row = self.connection.execute(
+                """SELECT wd.*, wr.status AS run_status, os.transport,
+                          os.external_session_id, os.external_turn_id
+                   FROM workflow_deliveries wd
+                   JOIN workflow_runs wr ON wr.id = wd.run_id
+                   JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
+                   WHERE wd.id = ?""",
+                (row["id"],),
+            ).fetchone()
+        return dict(row)
+
+    def complete_workflow_delivery(
+        self, delivery_id: str, owner: str, *, remote_message_id: str | None = None,
+        at: float | None = None,
+    ) -> None:
+        """Complete a workflow delivery only while its lease belongs to the caller."""
+
+        with immediate(self.connection):
+            updated = self.connection.execute(
+                """UPDATE workflow_deliveries SET state = 'delivered', lease_owner = NULL,
+                       lease_until = NULL, remote_message_id = ?
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?""",
+                (remote_message_id, delivery_id, owner),
+            ).rowcount
+            if updated != 1:
+                raise ValidationError("workflow delivery lease is not owned by caller")
+
+    def retry_workflow_delivery(
+        self, delivery_id: str, owner: str, error: str, *, at: float | None = None,
+        base_delay: float = 1, max_delay: float = 300,
+    ) -> float:
+        """Release an owned workflow notice claim with capped exponential delay."""
+
+        now = timestamp(at)
+        with immediate(self.connection):
+            row = self.connection.execute(
+                "SELECT attempts FROM workflow_deliveries WHERE id = ? AND state = 'sending' AND lease_owner = ?",
+                (delivery_id, owner),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("workflow delivery lease is not owned by caller")
+            delay = min(max_delay, base_delay * (2 ** min(int(row["attempts"]) - 1, 20)))
+            next_attempt = now + delay
+            self.connection.execute(
+                """UPDATE workflow_deliveries SET state = 'retry_wait', lease_owner = NULL,
+                       lease_until = NULL, last_error = ?, next_attempt_at = ? WHERE id = ?""",
+                (error, next_attempt, delivery_id),
+            )
+        return next_attempt
+
+    def fail_workflow_delivery(
+        self, delivery_id: str, owner: str, error: str, *, at: float | None = None
+    ) -> None:
+        """Permanently fail a workflow notice whose lease belongs to the caller."""
+
+        with immediate(self.connection):
+            updated = self.connection.execute(
+                """UPDATE workflow_deliveries SET state = 'failed', lease_owner = NULL,
+                       lease_until = NULL, last_error = ?
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?""",
+                (error, delivery_id, owner),
+            ).rowcount
+            if updated != 1:
+                raise ValidationError("workflow delivery lease is not owned by caller")
+
     def create_workflow_run(
         self,
         name: str,
@@ -768,6 +864,7 @@ class StateStore:
         run_id: str | None = None,
         at: float | None = None,
         plan: object = None,
+        orchestrator: object = None,
     ) -> str:
         return workflow.create_workflow_run(
             self.connection,
@@ -777,6 +874,7 @@ class StateStore:
             run_id=run_id,
             at=at,
             plan=plan,
+            orchestrator=orchestrator,
         )
 
     def start_workflow_run(self, run_id: str) -> None:

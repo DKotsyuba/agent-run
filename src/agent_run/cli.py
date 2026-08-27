@@ -159,6 +159,16 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("mcp")
     doc = commands.add_parser("doc")
     doc.add_argument("topic", nargs="?")
+    workflow = commands.add_parser("workflow").add_subparsers(
+        dest="workflow_command", required=True
+    )
+    workflow_start = workflow.add_parser("start")
+    workflow_start.add_argument("name")
+    workflow_start.add_argument("script")
+    workflow_start.add_argument("--args")
+    _session(workflow_start)
+    for workflow_name in ("status", "cancel", "answer"):
+        workflow.add_parser(workflow_name).add_argument("run_id")
     return parser
 
 
@@ -329,7 +339,20 @@ def _follow_transcript(service, args: argparse.Namespace):
 
 
 def _execute(args: argparse.Namespace, service, stream: TextIO):
+    """Dispatch one parsed CLI command to its service operation."""
+
     command = args.command
+    if command == "workflow":
+        if args.workflow_command == "start":
+            values = None if args.args is None else _object(args.args, "workflow args")
+            return service.workflow_start(
+                args.name, args.script, values, _ref(args)
+            )
+        return {
+            "status": service.workflow_status,
+            "cancel": service.workflow_cancel,
+            "answer": service.workflow_answer,
+        }[args.workflow_command](args.run_id)
     if command == "start":
         result = service.start(_request(args, stream))
         return {"agent_id": result.agent_id, "created": result.created}
@@ -474,6 +497,8 @@ def _service_start(home: Path, args: argparse.Namespace) -> dict[str, object]:
 
 
 def _dispatch_once(home: Path):
+    """Drain both agent and workflow lifecycle outboxes once."""
+
     config = load_config(config_path(home))
     executable = (
         os.environ["CODEX_QUEUE_BIN"]
@@ -497,7 +522,19 @@ def _dispatch_once(home: Path):
             },
             config.delivery,
         )
-        return dispatcher.run(home=home)
+        result = dispatcher.run(home=home)
+        from .delivery.workflow_dispatch import WorkflowDeliveryDispatcher
+
+        if isinstance(store, StateStore):
+            WorkflowDeliveryDispatcher(
+                store,
+                {
+                    TRANSPORT_NAME: CodexQueueTransport(sender),
+                    CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
+                },
+                config.delivery,
+            ).drain()
+        return result
     finally:
         store.close()
 
@@ -580,6 +617,62 @@ class _Runtime:
 
     def delivery_dispatch(self):
         return _dispatch_once(self.home)
+
+    def workflow_start(self, name: str, script: str, args: dict | None = None,
+                       orchestrator: OrchestratorRef | None = None) -> dict[str, str]:
+        """Launch a script workflow, optionally binding its lifecycle notice."""
+
+        from .workflow_run import start_workflow
+
+        source = script if args is None else f"args = {args!r}\n{script}"
+        return {"run_id": start_workflow(
+            self.home, name, {"script": source}, orchestrator=orchestrator
+        )}
+
+    def workflow_status(self, run_id: str) -> dict[str, object]:
+        """Return the durable journal summary for one workflow run."""
+
+        _config, store = self._inputs()
+        try:
+            return store.workflow_run_status(run_id)
+        finally:
+            store.close()
+
+    def workflow_cancel(self, run_id: str) -> dict[str, object]:
+        """Request SIGTERM from a live workflow runner, refusing terminal runs."""
+
+        import signal
+
+        _config, store = self._inputs()
+        try:
+            run = store.workflow_run_status(run_id)["run"]
+            if run["status"] in {"succeeded", "failed", "cancelled", "lost"}:
+                raise ValidationError("terminal workflow run cannot be cancelled")
+            identity = run["owner_pid_identity"]
+            if not isinstance(identity, str) or not identity.split(" ", 1)[0].isdigit():
+                raise ValidationError("workflow runner identity is not recorded")
+            os.kill(int(identity.split(" ", 1)[0]), signal.SIGTERM)
+            return {"run_id": run_id, "cancel_requested": True}
+        finally:
+            store.close()
+
+    def workflow_answer(self, run_id: str) -> object:
+        """Return a terminal workflow's last persisted step result, if any."""
+
+        _config, store = self._inputs()
+        try:
+            run = store.workflow_run_status(run_id)["run"]
+            if run["status"] not in {"succeeded", "failed", "cancelled", "lost"}:
+                raise ValidationError("workflow run has not finished")
+            row = store.connection.execute(
+                """SELECT result_json FROM workflow_steps
+                   WHERE run_id = ? AND result_json IS NOT NULL ORDER BY rowid DESC LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+            return {"run_id": run_id, "status": run["status"],
+                    "result": None if row is None else json.loads(row["result_json"])}
+        finally:
+            store.close()
 
     def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
         config, store = self._inputs()

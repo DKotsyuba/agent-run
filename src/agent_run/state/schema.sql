@@ -145,8 +145,29 @@ CREATE TABLE workflow_runs (
   owner_pid_identity TEXT,
   created_at REAL NOT NULL,
   finished_at REAL,
-  plan_json TEXT
+  plan_json TEXT,
+  orchestrator_session_id TEXT REFERENCES orchestrator_sessions(id)
 );
+
+CREATE TABLE workflow_deliveries (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+  orchestrator_session_id TEXT NOT NULL REFERENCES orchestrator_sessions(id),
+  state TEXT NOT NULL CHECK (
+    state IN ('pending', 'sending', 'delivered', 'retry_wait', 'failed', 'cancelled')
+  ),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT,
+  lease_until REAL,
+  next_attempt_at REAL,
+  remote_message_id TEXT,
+  last_error TEXT,
+  ambiguous_result INTEGER NOT NULL DEFAULT 0 CHECK (ambiguous_result IN (0, 1)),
+  UNIQUE (run_id)
+);
+
+CREATE INDEX workflow_deliveries_due
+  ON workflow_deliveries(state, next_attempt_at, lease_until);
 
 CREATE TABLE workflow_steps (
   run_id TEXT NOT NULL REFERENCES workflow_runs(id),
@@ -181,4 +202,4 @@ CREATE INDEX idx_workflow_steps_agent
   ON workflow_steps(agent_id)
   WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;

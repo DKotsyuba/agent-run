@@ -77,6 +77,7 @@ def create_workflow_run(
     run_id: str | None = None,
     at: float | None = None,
     plan: object = None,
+    orchestrator: object = None,
 ) -> str:
     """Insert one new run row, optionally recording the plan it will execute.
 
@@ -93,13 +94,22 @@ def create_workflow_run(
     candidate = run_id or f"wf_{uuid.uuid4().hex}"
     nonblank("run_id", candidate)
     created_at = timestamp(at)
-    plan_json = None if plan is None else json_text(list(plan))
+    plan_json = None if plan is None else json_text(plan)
     with immediate(connection):
+        session_id = None
+        if orchestrator is not None:
+            from ..domain import OrchestratorRef
+            from .db import session_for_ref
+
+            if not isinstance(orchestrator, OrchestratorRef):
+                raise ValidationError("orchestrator must be an OrchestratorRef")
+            session_id = session_for_ref(connection, orchestrator, created_at)
         connection.execute(
             """INSERT INTO workflow_runs
-               (id, name, script_sha, status, owner_pid_identity, created_at, plan_json)
-               VALUES (?, ?, ?, 'created', ?, ?, ?)""",
-            (candidate, name, script_sha, owner_identity, created_at, plan_json),
+               (id, name, script_sha, status, owner_pid_identity, created_at, plan_json,
+                orchestrator_session_id)
+               VALUES (?, ?, ?, 'created', ?, ?, ?, ?)""",
+            (candidate, name, script_sha, owner_identity, created_at, plan_json, session_id),
         )
     return candidate
 
@@ -183,6 +193,8 @@ def finish_workflow_run(
     *,
     at: float | None = None,
 ) -> None:
+    """Commit a terminal workflow state and its bound notice atomically."""
+
     nonblank("run_id", run_id)
     if status not in RUN_TERMINAL:
         raise ValidationError(f"workflow run status must be one of {sorted(RUN_TERMINAL)}")
@@ -196,6 +208,15 @@ def finish_workflow_run(
         ).rowcount
         if updated != 1:
             raise StateTransitionError("workflow run is already finished")
+        run = _run_row(connection, run_id)
+        if run["orchestrator_session_id"] is not None:
+            connection.execute(
+                """INSERT INTO workflow_deliveries
+                   (id, run_id, orchestrator_session_id, state, next_attempt_at)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (f"wnt_{uuid.uuid4().hex}", run_id,
+                 run["orchestrator_session_id"], finished_at),
+            )
 
 
 def record_step_start(
