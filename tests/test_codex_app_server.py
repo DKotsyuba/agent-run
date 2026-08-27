@@ -218,6 +218,14 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
         actual["sandbox"] = {"type": "readOnly", "networkAccess": False}
         verify_effective_params(self.expected(), actual)
 
+    def test_requested_network_access_must_be_echoed(self) -> None:
+        actual = thread_response("/work", writable_roots=())
+        actual["sandbox"] = {"type": "readOnly", "networkAccess": True}
+        verify_effective_params(self.expected(network_access=True), actual)
+        actual["sandbox"]["networkAccess"] = False
+        with self.assertRaisesRegex(VerificationError, "network access"):
+            verify_effective_params(self.expected(network_access=True), actual)
+
     def test_sandbox_legacy_string_echo_still_passes(self) -> None:
         actual = thread_response("/work", writable_roots=())
         actual["sandbox"] = "read-only"

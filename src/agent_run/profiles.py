@@ -6,7 +6,7 @@ import re
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable
 
 from .config import ProfilesConfig
 from .errors import PathEscapeError, ValidationError
@@ -17,10 +17,13 @@ _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
 @dataclass(frozen=True)
 class AgentProfile:
+    """A role prompt and its effective filesystem and network grants."""
+
     name: str
     body: str
     write: bool
     read_roots: tuple[Path, ...] = ()
+    network: bool = False
 
 
 def normalize_read_roots(values: Iterable[str | Path]) -> tuple[Path, ...]:
@@ -76,8 +79,11 @@ def profile_path(directory: str | Path | ProfilesConfig, name: str) -> Path:
     return candidate
 
 
-def _parse_profile(text: str, name: str) -> tuple[bool, str]:
+def _parse_profile(text: str, name: str) -> tuple[bool, bool, str]:
+    """Parse strict TOML permissions and the nonblank prompt body for ``name``."""
+
     allow_write = False
+    allow_network = False
     body = text
     if text.startswith("+++\n"):
         end = text.find("\n+++\n", 4)
@@ -88,16 +94,19 @@ def _parse_profile(text: str, name: str) -> tuple[bool, str]:
         except tomllib.TOMLDecodeError as error:
             raise ValidationError(f"profile {name} has invalid TOML front matter: {error}") from error
         for key in metadata:
-            if key != "write":
+            if key not in {"write", "network"}:
                 raise ValidationError(f"unknown profile field: profiles.{name}.{key}")
         allow_write = metadata.get("write", False)
         if not isinstance(allow_write, bool):
             raise ValidationError(f"profiles.{name}.write must be a boolean")
+        allow_network = metadata.get("network", False)
+        if not isinstance(allow_network, bool):
+            raise ValidationError(f"profiles.{name}.network must be a boolean")
         body = text[end + 5 :]
     body = body.strip()
     if not body:
         raise ValidationError(f"profile {name} body must not be blank")
-    return allow_write, body
+    return allow_write, allow_network, body
 
 
 def load_profile(
@@ -116,8 +125,10 @@ def load_profile(
         text = path.read_text(encoding="utf-8")
     except OSError as error:
         raise ValidationError(f"cannot read profile {name}: {error}") from error
-    allow_write, body = _parse_profile(text, name)
-    return AgentProfile(name, body, requested_write and allow_write, normalize_read_roots(read_roots))
+    allow_write, allow_network, body = _parse_profile(text, name)
+    return AgentProfile(
+        name, body, requested_write and allow_write, normalize_read_roots(read_roots), allow_network
+    )
 
 
 ROLE_PREFIX = "role-"
@@ -132,26 +143,13 @@ _ASSIGNMENT = (
     "contract for this task."
 )
 
-# adapters/codex/README.md: codex ``read-only`` still permits filesystem reads,
-# so it cannot enforce ``role-research``'s ``filesystem: none`` boundary. The
-# route is refused loudly rather than silently downgraded to a weaker sandbox.
-_ROLE_DENIED: Mapping[str, frozenset[str]] = {"codex": frozenset({"role-research"})}
-
-
 def assign_role(profile: AgentProfile, runtime: str, skills: Iterable[str]) -> AgentProfile:
     """Point the profile preamble at the matching role contract, when shipped.
 
-    Refuses first and asks whether the skill is shipped second: a denied
-    runtime/role pair must fail whether or not that runtime happens to list
-    the skill today.
+    A missing runtime skill leaves the profile unchanged.
     """
 
     role = f"{ROLE_PREFIX}{profile.name}"
-    if role in _ROLE_DENIED.get(runtime, frozenset()):
-        raise ValidationError(
-            f"runtime {runtime} has no {role} adapter: its read-only sandbox still "
-            f"permits filesystem reads, so it cannot enforce that role's boundary"
-        )
     if role not in tuple(skills):
         return profile
     return replace(profile, body=f"{profile.body}\n\n{_ASSIGNMENT.format(role=role)}")

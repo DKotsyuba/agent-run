@@ -796,6 +796,14 @@ env_from = ["PATH"]
         self.assertEqual(read_only.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(read_only.adapter_state["writable_roots"], ())
 
+    def test_prepare_enables_network_in_the_child_sandbox(self) -> None:
+        config = self.materialized()
+        profile = AgentProfile("research", "body", False, (self.auth_source_dir,), True)
+        plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(
+            plan.adapter_state["sandbox"], {"type": "readOnly", "networkAccess": True}
+        )
+
     def test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents(self) -> None:
         """A read-only sandbox cannot spool before execution, so the outside
         PostToolUse hook has to do the replacing; a write-capable agent

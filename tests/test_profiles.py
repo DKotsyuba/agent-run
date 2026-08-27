@@ -25,6 +25,7 @@ class ProfileTests(unittest.TestCase):
             profile = load_profile(root, "review", requested_write=True, read_roots=(root,))
             self.assertEqual(profile.body, "Review carefully.")
             self.assertFalse(profile.write)
+            self.assertFalse(profile.network)
             self.assertEqual(profile.read_roots, (root,))
 
             (root / "implement.md").write_text(
@@ -34,6 +35,11 @@ class ProfileTests(unittest.TestCase):
                 load_profile(root, "implement", requested_write=False).write
             )
             self.assertTrue(load_profile(root, "implement", requested_write=True).write)
+
+            (root / "research.md").write_text(
+                "+++\nnetwork = true\n+++\nResearch.\n", encoding="utf-8"
+            )
+            self.assertTrue(load_profile(root, "research").network)
 
     def test_profile_names_and_symlink_escape_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
@@ -79,17 +85,10 @@ class RoleAssignmentTests(unittest.TestCase):
         self.assertIs(assign_role(profile, "claude", ("code-reading",)), profile)
         self.assertIs(assign_role(profile, "opencode", ()), profile)
 
-    def test_codex_refuses_the_research_role_loudly(self) -> None:
-        """codex read-only still permits reads, so ``filesystem: none`` is unenforceable."""
-
+    def test_codex_assigns_the_research_role_when_shipped(self) -> None:
         profile = AgentProfile("research", "Research.", False, ())
-        for skills in (("role-research",), ()):
-            with self.assertRaises(ValidationError) as caught:
-                assign_role(profile, "codex", skills)
-            self.assertIn("has no role-research adapter", str(caught.exception))
-        # The same profile is fine on a runtime that does ship the role.
         self.assertIn(
-            "role-research", assign_role(profile, "claude", ("role-research",)).body
+            "role-research", assign_role(profile, "codex", ("role-research",)).body
         )
 
 

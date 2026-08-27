@@ -56,8 +56,10 @@ class ClaudeAdapterTests(unittest.TestCase):
         values.update(overrides)
         return RuntimeConfig(**values)
 
-    def profile(self, *, write: bool = False, read_roots: tuple[Path, ...] = ()) -> AgentProfile:
-        return AgentProfile("review", "Review carefully.", write, read_roots)
+    def profile(
+        self, *, write: bool = False, read_roots: tuple[Path, ...] = (), network: bool = False
+    ) -> AgentProfile:
+        return AgentProfile("review", "Review carefully.", write, read_roots, network)
 
     def request(self, **overrides) -> StartRequest:
         values = dict(
@@ -439,6 +441,19 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertFalse(any("sandbox" in item.lower() for item in plan.argv))
         self.assertIn("Bash", plan.adapter_state["allowed_tools"])
         self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "acceptEdits")
+
+    def test_prepare_grants_web_tools_only_to_network_profiles(self) -> None:
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(), self.profile(network=True), self.runtime_config(), self.home, self.agent_dir
+            )
+        tools = plan.argv[plan.argv.index("--tools") + 1].split(",")
+        allowed = plan.argv[plan.argv.index("--allowedTools") + 1].split(",")
+        disallowed = plan.argv[plan.argv.index("--disallowedTools") + 1].split(",")
+        for tool in ("WebFetch", "WebSearch"):
+            self.assertIn(tool, tools)
+            self.assertIn(tool, allowed)
+            self.assertNotIn(tool, disallowed)
 
     def test_declared_plugins_are_loaded_by_path_without_widening_tools(self) -> None:
         plugin = self.root / "compressor"

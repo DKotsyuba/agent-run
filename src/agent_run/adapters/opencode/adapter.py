@@ -269,6 +269,8 @@ def _check_request(request: StartRequest, profile: AgentProfile, config: Runtime
         raise ValidationError("opencode prepare requires a StartRequest and an AgentProfile")
     if request.runtime != RUNTIME_NAME:
         raise ValidationError(f"request targets runtime {request.runtime!r}, not {RUNTIME_NAME!r}")
+    if profile.network:
+        raise ValidationError("opencode runtime does not support network profiles")
     if request.model not in config.models:
         raise ValidationError(f"model is not in the configured allowlist: {request.model}")
     split_model(request.model)

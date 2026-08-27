@@ -594,6 +594,11 @@ class CodexAdapter:
             "profile": profile.name,
             "request_timeout_seconds": request.timeout_seconds,
         }
+        if profile.network:
+            adapter_state["sandbox"] = {
+                "type": "workspaceWrite" if effective_write else "readOnly",
+                "networkAccess": True,
+            }
         return LaunchPlan(
             argv=(str(config.binary), "app-server"),
             cwd=workdir,
