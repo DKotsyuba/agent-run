@@ -602,8 +602,17 @@ class CodexAdapter:
             "request_timeout_seconds": request.timeout_seconds,
         }
         if profile.network:
+            # The app-server's read-only sandbox is a unit variant: it takes
+            # no parameters, so network access cannot be granted without also
+            # granting workspace writes. Refuse rather than widen the sandbox
+            # behind a read-only profile's back; research runs on claude.
+            if not effective_write:
+                raise ValidationError(
+                    "codex read-only sandbox cannot grant network access; "
+                    "run network profiles on claude or grant write"
+                )
             adapter_state["sandbox"] = {
-                "workspace-write" if effective_write else "read-only": {
+                "workspace-write": {
                     "networkAccess": True,
                 }
             }
