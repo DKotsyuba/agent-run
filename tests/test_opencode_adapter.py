@@ -1522,14 +1522,6 @@ class SessionTests(AdapterCase):
         self.assertEqual(created[1]["location"], {"directory": str(self.request.workdir)})
 
 
-class ProductionSizeTests(unittest.TestCase):
-    def test_opencode_production_files_stay_below_hard_gate(self) -> None:
-        root = Path(__file__).parents[1] / "src" / "agent_run" / "adapters" / "opencode"
-        for path in root.glob("*.py"):
-            with self.subTest(path=path.name):
-                self.assertLessEqual(len(path.read_text().splitlines()), 700)
-
-
 def _replace(request, **changes):
     values = {
         "runtime": request.runtime,

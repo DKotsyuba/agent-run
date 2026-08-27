@@ -132,6 +132,21 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "not configured"):
             registry.load("missing")
 
+    def test_adapter_family_sources_stay_below_hard_gate(self) -> None:
+        """One 700-line ceiling per adapter source file, for every family.
+
+        Splitting an adapter back down is cheap only while the split is
+        still small, so the ceiling is enforced rather than remembered.
+        """
+
+        root = Path(__file__).parents[1] / "src" / "agent_run" / "adapters"
+        for family in ("claude", "codex", "opencode"):
+            paths = sorted((root / family).glob("*.py"))
+            self.assertTrue(paths, f"no adapter sources found for {family}")
+            for path in paths:
+                with self.subTest(path=f"{family}/{path.name}"):
+                    self.assertLessEqual(len(path.read_text().splitlines()), 700)
+
 
 if __name__ == "__main__":
     unittest.main()

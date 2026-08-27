@@ -10,20 +10,17 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
-import shlex
 import signal
 import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from ...config import McpConfig, RuntimeConfig, RuntimeHookConfig
+from ...config import McpConfig, RuntimeConfig
 from ...domain import AgentStatus, Outcome, StartRequest
 from ...errors import ValidationError
 from ..home import seal_answer
@@ -38,9 +35,11 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from ..home import content_hash, create_symlink_bridge, write_managed_file
+from ..home import content_hash
 from ..plugin_skills import local_skill_names
-from .auth import TOKEN_ENV_NAME, keychain_token, resolve_token
+from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
+from .limits import agent_rate_limit_samples
+from .materialize import render_mcp_config, render_plugin_dirs, render_settings
 from .stream import StreamDecoder, classify_failure, sanitize_line, terminal_event_data
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
@@ -80,212 +79,6 @@ _KNOWN_HOOK_EVENTS = frozenset(
         "SessionEnd",
     }
 )
-
-_LIMITS_STALE_SECONDS = 900
-_AGENT_RUNTIME_FILES = 24
-_RUNTIME_TAIL_BYTES = 262_144
-_RUNTIME_TAIL_LINES = 2_048
-
-
-def _timestamp(value: object) -> datetime | None:
-    """Convert an epoch second to UTC; anything unrepresentable is unknown."""
-
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if not math.isfinite(value):
-        return None
-    try:
-        return datetime.fromtimestamp(value, tz=timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def _tail_lines(path: Path) -> tuple[str, ...]:
-    """Read a bounded complete-line tail from one agent's runtime stream."""
-
-    with path.open("rb") as stream:
-        stream.seek(0, 2)
-        end = stream.tell()
-        stream.seek(max(0, end - _RUNTIME_TAIL_BYTES))
-        data = stream.read(_RUNTIME_TAIL_BYTES)
-    if end > _RUNTIME_TAIL_BYTES:
-        data = data.split(b"\n", 1)[-1]
-    return tuple(data.decode("utf-8").splitlines()[-_RUNTIME_TAIL_LINES:])
-
-
-def _agent_rate_limit_samples(home: Path, now: float) -> tuple[LimitSample, ...]:
-    """Return the newest ``rate_limit_event`` samples from sibling agent dirs.
-
-    In stream-json mode the claude CLI emits a ``rate_limit_event`` line on
-    stdout; ``ClaudeSession._read_stdout`` already persists every sanitized
-    stdout line verbatim to each agent's ``runtime.jsonl`` below the shared
-    agent-run home (``<agent_run_home>/agents/<agent_id>/runtime.jsonl``),
-    three levels above this adapter's own generated
-    ``<agent_run_home>/runtimes/claude/home``. This scans the newest such
-    files for the latest event; anything unreadable, malformed, or older
-    than ``_LIMITS_STALE_SECONDS`` yields ``unknown`` per the M009 contract.
-    """
-
-    try:
-        agents_root = Path(home).resolve(strict=True).parents[2] / "agents"
-        if agents_root.is_symlink():
-            return ()
-        agents_root = agents_root.resolve(strict=True)
-        paths = agents_root.glob("*/runtime.jsonl")
-    except (IndexError, OSError, RuntimeError, ValueError):
-        return ()
-
-    newest: list[tuple[float, str, Path]] = []
-    try:
-        for path in paths:
-            try:
-                if path.is_symlink():
-                    continue
-                resolved = path.resolve(strict=True)
-                resolved.relative_to(agents_root)
-                if not resolved.is_file():
-                    continue
-                candidate = (resolved.stat().st_mtime, str(resolved), resolved)
-                newest = sorted((*newest, candidate), reverse=True)[:_AGENT_RUNTIME_FILES]
-            except (OSError, RuntimeError, ValueError):
-                continue
-    except OSError:
-        pass
-
-    for mtime, _name, path in newest:
-        try:
-            lines = _tail_lines(path)
-        except (OSError, UnicodeError, ValueError):
-            continue
-        stale = now - mtime > _LIMITS_STALE_SECONDS
-        observed_at = _timestamp(mtime)
-        for line in reversed(lines):
-            if '"rate_limit_event"' not in line:
-                continue
-            try:
-                event = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
-                continue
-            info = event.get("rate_limit_info")
-            windows = info.get("unifiedWindows") if isinstance(info, dict) else None
-            if not isinstance(windows, dict):
-                continue
-            samples = []
-            for window_name in sorted(windows):
-                window = windows[window_name]
-                if not isinstance(window, dict):
-                    continue
-                utilization = window.get("utilization")
-                if (
-                    isinstance(utilization, bool)
-                    or not isinstance(utilization, (int, float))
-                    or not math.isfinite(utilization)
-                ):
-                    continue
-                samples.append(
-                    LimitSample(
-                        lane="usage",
-                        window=window_name,
-                        remaining_percent=None
-                        if stale
-                        else max(0.0, min(100.0, (1.0 - float(utilization)) * 100.0)),
-                        reset_at=_timestamp(window.get("resetsAt")),
-                        observed_at=observed_at,
-                        source="unknown" if stale else "runtime_stream_evidence",
-                    )
-                )
-            if samples:
-                return tuple(samples)
-    return ()
-
-
-def _render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
-    """Write the generated settings.json holding only declared hooks."""
-
-    grouped: dict[str, list[dict[str, object]]] = {}
-    for hook in hooks:
-        entry: dict[str, object] = {"hooks": [{"type": "command", "command": shlex.join(hook.command)}]}
-        if hook.matcher is not None:
-            entry["matcher"] = hook.matcher
-        grouped.setdefault(hook.event, []).append(entry)
-    settings = {"hooks": grouped} if grouped else {}
-    return write_managed_file(home, "settings.json", json.dumps(settings, sort_keys=True))
-
-
-def _render_mcp_config(
-    home: Path, names: tuple[str, ...], mcp_servers: Mapping[str, McpConfig]
-) -> str:
-    """Write the strict MCP config for the selected names only.
-
-    Fails closed when a configured name has no resolved definition rather
-    than emitting a non-functional entry.
-    """
-
-    if not names:
-        return content_hash("no_mcp")
-    servers: dict[str, object] = {}
-    for name in names:
-        server = mcp_servers.get(name)
-        if server is None:
-            raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
-        servers[name] = {
-            "type": server.transport,
-            "command": str(server.command),
-            "args": list(server.args),
-        }
-    return write_managed_file(home, "mcp/mcp-config.json", json.dumps({"mcpServers": servers}, sort_keys=True))
-
-
-def _render_plugin_dirs(home: Path, skills_root: Path, names: tuple[str, ...]) -> str:
-    """Generate one plugin directory per selected skill.
-
-    Every top-level child of the owner-authored skill directory (SKILL.md,
-    plus any scripts/, references/, assets/, or other sibling) is bridged
-    into the generated plugin's skill directory through the same validated
-    symlink bridge, not just the manifest file.
-    """
-
-    digests = []
-    for name in sorted(names):
-        skill_dir = skills_root / name
-        manifest_source = skill_dir / "SKILL.md"
-        if not manifest_source.exists():
-            raise ValidationError(f"claude skill not found: {name}")
-        manifest_digest = write_managed_file(
-            home, f"plugins/{name}/.claude-plugin/plugin.json", json.dumps({"name": name}, sort_keys=True)
-        )
-        children = []
-        for child in sorted(skill_dir.iterdir()):
-            create_symlink_bridge(home, f"plugins/{name}/skills/{name}/{child.name}", child)
-            children.append(child.name)
-        digests.append(f"{name}:{manifest_digest}:{','.join(children)}")
-    return content_hash(",".join(digests)) if digests else content_hash("no_skills")
-
-
-def _auth_environment(binary: Path, auth_names: tuple[str, ...]) -> dict[str, str]:
-    """Resolve the child's auth variables for one launch.
-
-    An explicitly exported variable wins unchanged, so an API key or a
-    token supplied by the caller keeps behaving exactly as before. Only
-    when none is exported does the adapter fall back to the macOS
-    Keychain -- and only if the runtime actually declares the OAuth
-    variable, since exporting a credential under a name the owner did not
-    declare would silently widen the configured auth bridge.
-    """
-
-    inherited = {
-        name: value for name in auth_names if (value := os.environ.get(name))
-    }
-    if inherited:
-        return inherited
-    if TOKEN_ENV_NAME not in auth_names:
-        raise ValidationError(
-            "claude runtime auth requires one of the declared environment "
-            f"variables to be set: {', '.join(auth_names)}"
-        )
-    return {TOKEN_ENV_NAME: resolve_token(binary)}
 
 
 class ClaudeAdapter:
@@ -329,13 +122,13 @@ class ClaudeAdapter:
         emitting a non-functional entry.
         """
 
-        settings_digest = _render_settings(home, config.hooks)
-        mcp_digest = _render_mcp_config(home, config.mcp, mcp_servers)
+        settings_digest = render_settings(home, config.hooks)
+        mcp_digest = render_mcp_config(home, config.mcp, mcp_servers)
         if skills_root is None and not config.skills:
             skills_root = Path(home)
         if not isinstance(skills_root, Path) or not skills_root.is_absolute():
             raise ValidationError("claude skills_root must be absolute")
-        plugin_digest = _render_plugin_dirs(home, skills_root, local_skill_names(config.plugins, config.skills))
+        plugin_digest = render_plugin_dirs(home, skills_root, local_skill_names(config.plugins, config.skills))
         declared_digest = content_hash(",".join(str(plugin) for plugin in config.plugins))
         return "\n".join((settings_digest, mcp_digest, plugin_digest, declared_digest))
 
@@ -356,7 +149,7 @@ class ClaudeAdapter:
         return tuple(ModelInfo(model, f"configured claude model: {model}") for model in config.models)
 
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
-        return _agent_rate_limit_samples(Path(home), time.time())
+        return agent_rate_limit_samples(Path(home), time.time())
 
     def prepare(
         self,
@@ -463,7 +256,7 @@ class ClaudeAdapter:
         auth_names: tuple[str, ...] = ()
         if config.auth is not None:
             auth_names = config.auth.names
-            environment.update(_auth_environment(config.binary, auth_names))
+            environment.update(auth_environment(config.binary, auth_names))
 
         mcp_env_names: list[str] = []
         for name in config.mcp:

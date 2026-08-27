@@ -21,9 +21,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from ...errors import AuthError
+from ...errors import AuthError, ValidationError
 
-__all__ = ["TOKEN_ENV_NAME", "keychain_token", "refresh_keychain", "resolve_token"]
+__all__ = ["TOKEN_ENV_NAME", "auth_environment", "keychain_token", "refresh_keychain", "resolve_token"]
 
 TOKEN_ENV_NAME = "CLAUDE_CODE_OAUTH_TOKEN"
 
@@ -127,3 +127,27 @@ def resolve_token(binary: Path, *, now: float | None = None) -> str:
             "refresh did not renew it"
         )
     return token
+
+
+def auth_environment(binary: Path, auth_names: tuple[str, ...]) -> dict[str, str]:
+    """Resolve the child's auth variables for one launch.
+
+    An explicitly exported variable wins unchanged, so an API key or a
+    token supplied by the caller keeps behaving exactly as before. Only
+    when none is exported does the adapter fall back to the macOS
+    Keychain -- and only if the runtime actually declares the OAuth
+    variable, since exporting a credential under a name the owner did not
+    declare would silently widen the configured auth bridge.
+    """
+
+    inherited = {
+        name: value for name in auth_names if (value := os.environ.get(name))
+    }
+    if inherited:
+        return inherited
+    if TOKEN_ENV_NAME not in auth_names:
+        raise ValidationError(
+            "claude runtime auth requires one of the declared environment "
+            f"variables to be set: {', '.join(auth_names)}"
+        )
+    return {TOKEN_ENV_NAME: resolve_token(binary)}
