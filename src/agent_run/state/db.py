@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -14,6 +16,7 @@ from typing import Iterator
 
 from agent_run.domain import AgentId, OrchestratorRef, StartRequest
 from agent_run.errors import ValidationError
+from agent_run.paths import agent_dir as _agent_dir
 
 from .migrations import (
     SCHEMA_VERSION,
@@ -27,6 +30,7 @@ from .migrations import (
 
 
 MAX_INLINE_MESSAGE_BYTES = 32 * 1024
+INLINE_STUB_HEAD_CHARS = 4096
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -63,11 +67,7 @@ def positive_number(name: str, value: float) -> float:
     return float(value)
 
 
-def validate_message_storage(content: str, raw_ref: str | None) -> None:
-    if len(content.encode("utf-8")) > MAX_INLINE_MESSAGE_BYTES:
-        raise ValidationError("message content exceeds the 32 KiB inline limit")
-    if raw_ref is None:
-        return
+def _validate_raw_ref(raw_ref: str) -> None:
     if not isinstance(raw_ref, str) or not raw_ref or "\\" in raw_ref:
         raise ValidationError("raw_ref must be a normalized relative path")
     path = PurePosixPath(raw_ref)
@@ -79,6 +79,52 @@ def validate_message_storage(content: str, raw_ref: str | None) -> None:
         or path.parts[0].startswith("~")
     ):
         raise ValidationError("raw_ref must be a normalized relative path")
+
+
+def _spool_oversized_message(agent_directory: Path, content: str) -> tuple[str, str]:
+    """Spool content over the inline limit to a raw file directly under the
+    agent's own directory (same mkstemp-in-place convention as
+    adapters/opencode/http.py:_capture, so its bare filename is already a
+    normalized raw_ref) and return a bounded inline stub plus that raw_ref.
+    """
+
+    agent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    encoded = content.encode("utf-8")
+    descriptor, name = tempfile.mkstemp(dir=str(agent_directory), prefix="message.", suffix=".raw")
+    body_path = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as sink:
+            descriptor = -1
+            sink.write(encoded)
+            sink.flush()
+            os.fsync(sink.fileno())
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        body_path.unlink(missing_ok=True)
+        raise
+    raw_ref = body_path.name
+    stub = (
+        f"{content[:INLINE_STUB_HEAD_CHARS]}\n"
+        f"[...spooled: {len(encoded)} bytes exceed the 32 KiB inline limit; "
+        f"full content in raw_ref={raw_ref}]"
+    )
+    return stub, raw_ref
+
+
+def resolve_message_storage(
+    content: str, raw_ref: str | None, *, agent_id: AgentId, home: Path
+) -> tuple[str, str | None]:
+    """Content within the inline limit is returned unchanged; content over it
+    is spooled (see :func:`_spool_oversized_message`) so an oversized message
+    degrades the row instead of failing the whole write."""
+
+    if raw_ref is not None:
+        _validate_raw_ref(raw_ref)
+    if len(content.encode("utf-8")) <= MAX_INLINE_MESSAGE_BYTES:
+        return content, raw_ref
+    return _spool_oversized_message(_agent_dir(agent_id, home), content)
 
 
 def json_text(value: object) -> str:

@@ -40,10 +40,10 @@ from .db import (
     open_database,
     recent_capacity_rows,
     require_attempt,
+    resolve_message_storage,
     row_dict,
     session_for_ref,
     timestamp,
-    validate_message_storage,
 )
 from .start import AgentCreation, create_agent as create_agent_record
 
@@ -308,7 +308,12 @@ class StateStore:
         agent_id = validate_agent_id(agent_id)
         if not isinstance(message, Message):
             raise ValidationError("message must be a Message")
-        validate_message_storage(message.content, message.raw_ref)
+        content, raw_ref = resolve_message_storage(
+            message.content,
+            message.raw_ref,
+            agent_id=agent_id,
+            home=connection_path(self.connection).parent,
+        )
         with immediate(self.connection):
             agent_row(self.connection, agent_id)
             require_attempt(self.connection, agent_id, attempt_id)
@@ -322,8 +327,8 @@ class StateStore:
                     message.at,
                     message.role.value,
                     message.name,
-                    message.content,
-                    message.raw_ref,
+                    content,
+                    raw_ref,
                 ),
             )
         return int(cursor.lastrowid)
