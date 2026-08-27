@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
@@ -155,7 +156,10 @@ class WorkflowStepExecutor:
         """Bind execution to one run and injectable service/time dependencies."""
 
         self._home = Path(home).resolve()
-        self._store = store
+        self._owner_thread_id = threading.get_ident()
+        self._owner_store = store
+        self._database_path = store.path()
+        self._thread_local = threading.local()
         self._run_id = run_id
         self._service = service
         self._stop = stop
@@ -165,13 +169,38 @@ class WorkflowStepExecutor:
         self.failed = False
         self.active_agent_id: str | None = None
 
-    def __call__(self, step_key: str, spec: dict[str, object]) -> dict[str, object]:
-        """Execute one spec once, returning its agent outcome for script use."""
+    def _store_for_caller(self) -> StateStore:
+        """Return a SQLite store owned by the current calling thread."""
 
-        cached = self._store.cached_step_result(self._run_id, step_key)
+        if threading.get_ident() == self._owner_thread_id:
+            return self._owner_store
+        store = getattr(self._thread_local, "store", None)
+        if store is None:
+            store = StateStore.open(self._database_path)
+            self._thread_local.store = store
+        return store
+
+    def __call__(self, step_key: str, spec: dict[str, object]) -> dict[str, object]:
+        """Execute and journal one spec, converting executor errors to failed results.
+
+        Journal I/O errors are deliberately allowed to escape so a tolerant
+        parallel script cannot turn a missing durable record into success.
+        """
+
+        try:
+            return self._execute(step_key, spec)
+        except BaseException as error:
+            return self._fail(
+                step_key, "step_executor_failed", {"exception": repr(error)}
+            )
+
+    def _execute(self, step_key: str, spec: dict[str, object]) -> dict[str, object]:
+        """Execute one spec after establishing its durable journal row."""
+
+        cached = self._store_for_caller().cached_step_result(self._run_id, step_key)
         if cached is not None:
             return cached  # type: ignore[return-value]
-        self._store.record_step_start(self._run_id, step_key, spec)
+        self._store_for_caller().record_step_start(self._run_id, step_key, spec)
         try:
             request = validate_agent_spec(spec)
         except ValidationError as error:
@@ -228,7 +257,9 @@ class WorkflowStepExecutor:
                         else str(answer.path),
                     }
                     return self._fail(step_key, "step_output_invalid", params, result)
-            self._store.finish_step(self._run_id, step_key, "succeeded", result=result)
+            self._store_for_caller().finish_step(
+                self._run_id, step_key, "succeeded", result=result
+            )
             return result
         kind = getattr(agent, "failure_kind", None) or "agent_failed"
         params = getattr(agent, "failure_params", None) or {"agent_id": agent_id, "status": status}
@@ -245,7 +276,7 @@ class WorkflowStepExecutor:
         output = result or {"status": "failed"}
         output["failure_kind"] = kind
         output["failure_params"] = params
-        self._store.finish_step(
+        self._store_for_caller().finish_step(
             self._run_id, step_key, "failed", failure_kind=kind, failure_params=params
         )
         return output

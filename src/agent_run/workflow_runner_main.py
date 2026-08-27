@@ -15,6 +15,7 @@ before the script engine exists.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -42,6 +43,53 @@ from .workflow_run import validate_plan
 
 CANCELLED_FAILURE_KIND = "runner_cancelled"
 POLL_SECONDS = 0.05
+_RESULT_JSON_LIMIT = 1024 * 1024
+
+
+def _run_directory(home: Path, run_id: str) -> Path:
+    """Create and return the private artifact directory for one workflow run."""
+
+    directory = home / "workflows" / run_id
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def _append_runner_log(path: Path, kind: str, message: object) -> None:
+    """Append one timestamped durable runner line with private permissions."""
+
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(f"{time.time():.6f} {kind} {message}\n")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _stored_result(home: Path, run_id: str, result: object) -> object:
+    """Return a bounded JSON-safe result, spooling oversized JSON privately."""
+
+    try:
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise ValidationError("workflow result must be JSON-safe") from error
+    payload = encoded.encode("utf-8")
+    if len(payload) <= _RESULT_JSON_LIMIT:
+        return result
+    path = _run_directory(home, run_id) / "result.json"
+    descriptor = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return {"spool_path": str(path.relative_to(home)), "bytes": len(payload)}
 
 
 class _StopRequest:
@@ -177,9 +225,14 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
             previous = install_signal_handlers(stop.request)
             service = AgentService.from_home(home, launch=_launch_callback(home))
             try:
+                log_path = _run_directory(home, run_id) / "runner.log"
                 executor = make_step_executor(home, store, run_id, service=service, stop=stop)
                 outcome = run_script(
-                    plan["script"], executor, lambda _name: None, lambda _text: None, 4
+                    plan["script"],
+                    executor,
+                    lambda name: _append_runner_log(log_path, "phase", name),
+                    lambda text: _append_runner_log(log_path, "log", text),
+                    4,
                 )
                 store.finish_workflow_run(
                     run_id,
@@ -189,7 +242,11 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
                     if executor.failed
                     or (isinstance(outcome, Mapping) and "failure_kind" in outcome)
                     else "succeeded",
+                    result=_stored_result(home, run_id, outcome),
                 )
+            except BaseException as error:
+                _append_runner_log(log_path, "runner_error", repr(error))
+                raise
             finally:
                 service.close()
                 restore_signal_handlers(previous)
@@ -221,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
         _redirect_standard_streams()
         _run(payload, home, ready)
     except BaseException as error:
+        with suppress(Exception):
+            run_id = _text(payload, "run_id")
+            _append_runner_log(
+                _run_directory(home, run_id) / "runner.log", "runner_error", repr(error)
+            )
         ready.failed(_failure_reason(error))
         exit_code = 1
     finally:

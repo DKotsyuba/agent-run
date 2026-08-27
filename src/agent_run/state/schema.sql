@@ -146,6 +146,7 @@ CREATE TABLE workflow_runs (
   created_at REAL NOT NULL,
   finished_at REAL,
   plan_json TEXT,
+  result_json TEXT,
   orchestrator_session_id TEXT REFERENCES orchestrator_sessions(id)
 );
 
@@ -202,4 +203,4 @@ CREATE INDEX idx_workflow_steps_agent
   ON workflow_steps(agent_id)
   WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

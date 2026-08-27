@@ -93,6 +93,8 @@ def start_workflow(
 
     nonblank("workflow name", name)
     if isinstance(plan, Mapping) and set(plan) == {"script"} and isinstance(plan["script"], str):
+        if not plan["script"].strip():
+            raise ValidationError("workflow script must not be empty")
         plan_payload: object = {"script": plan["script"]}
         digest = plan_sha(({"script": plan["script"]},))
     else:
