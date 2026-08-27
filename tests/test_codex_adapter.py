@@ -623,13 +623,29 @@ env_from = ["PATH"]
         self.assertIsInstance(plan, LaunchPlan)
         self.assertEqual(plan.argv, (str(config.binary), "app-server"))
         self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(set(plan.environment), {"CODEX_HOME", "PATH"})
+        self.assertEqual(set(plan.environment), {"CODEX_HOME", "HOME", "PATH"})
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(plan.adapter_state["writable_roots"], ())
         self.assertEqual(
             sorted(plan.adapter_state["roots"]),
             sorted((str(self.workdir), str(self.auth_source_dir))),
         )
+
+    def test_prepare_pins_home_to_the_generated_home(self) -> None:
+        """The engine reads ``~/.agents/skills`` from ``HOME``, not ``CODEX_HOME``.
+
+        The launch environment fully replaces the parent's, so an absent
+        ``HOME`` is not an unset one: the engine falls back to the passwd entry
+        and picks up the operator's global skills (defect T20B).
+        """
+
+        config = self.materialized()
+        profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
+        with patch.dict(os.environ, {"HOME": "/Users/operator"}):
+            plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(plan.environment["HOME"], str(self.home))
+        self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
+        self.assertFalse((self.home / ".agents" / "skills").exists())
 
     def test_prepare_unions_request_roots_into_a_normalized_antichain(self) -> None:
         config = self.materialized()

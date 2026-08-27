@@ -528,8 +528,16 @@ class CodexAdapter:
         writable_roots = (str(workdir),) if effective_write else ()
         sandbox_mode = "workspace-write" if effective_write else "read-only"
 
+        # ``HOME`` is part of the isolation, not a convenience: the engine
+        # resolves its personal skill/plugin roots (``~/.agents/skills``,
+        # ``~/.agents/plugins``) from the home directory rather than from
+        # ``CODEX_HOME``. This mapping fully replaces the parent environment,
+        # so leaving ``HOME`` out does not unset it -- the engine falls back to
+        # the passwd entry and reads the operator's own global skills straight
+        # past this generated home (defect T20B).
         environment = {
             "CODEX_HOME": str(home_path),
+            "HOME": str(home_path),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         }
         adapter_state = {
