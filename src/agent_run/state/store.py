@@ -22,7 +22,7 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 
-from . import capacity, delivery
+from . import capacity, delivery, workflow
 from .db import (
     _upsert_context_receipt,
     agent_row,
@@ -738,3 +738,76 @@ class StateStore:
 
     def cancel_delivery(self, delivery_id: str) -> bool:
         return delivery.cancel_delivery(self.connection, delivery_id)
+
+    def create_workflow_run(
+        self,
+        name: str,
+        script_sha: str,
+        *,
+        owner_identity: str | None = None,
+        run_id: str | None = None,
+        at: float | None = None,
+    ) -> str:
+        return workflow.create_workflow_run(
+            self.connection,
+            name,
+            script_sha,
+            owner_identity=owner_identity,
+            run_id=run_id,
+            at=at,
+        )
+
+    def start_workflow_run(self, run_id: str) -> None:
+        workflow.start_workflow_run(self.connection, run_id)
+
+    def finish_workflow_run(
+        self, run_id: str, status: str, *, at: float | None = None
+    ) -> None:
+        workflow.finish_workflow_run(self.connection, run_id, status, at=at)
+
+    def record_step_start(
+        self,
+        run_id: str,
+        step_key: str,
+        spec: object,
+        *,
+        agent_id: str | None = None,
+    ) -> None:
+        workflow.record_step_start(
+            self.connection, run_id, step_key, spec, agent_id=agent_id
+        )
+
+    def finish_step(
+        self,
+        run_id: str,
+        step_key: str,
+        status: str,
+        *,
+        result: object = None,
+        failure_kind: str | None = None,
+        failure_params: object = None,
+    ) -> None:
+        workflow.finish_step(
+            self.connection,
+            run_id,
+            step_key,
+            status,
+            result=result,
+            failure_kind=failure_kind,
+            failure_params=failure_params,
+        )
+
+    def cached_step_result(self, run_id: str, step_key: str) -> object | None:
+        return workflow.cached_step_result(self.connection, run_id, step_key)
+
+    def workflow_run_status(
+        self, run_id: str, *, step_limit: int = 100
+    ) -> dict[str, object]:
+        return workflow.workflow_run_status(self.connection, run_id, step_limit=step_limit)
+
+    def list_workflow_runs(
+        self, *, active_only: bool = False, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, object]]:
+        return workflow.list_workflow_runs(
+            self.connection, active_only=active_only, limit=limit, offset=offset
+        )

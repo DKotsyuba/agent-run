@@ -6,6 +6,7 @@ from .activity import context_agents
 from .diagnostics import DiagnosticSnapshot, diagnostic_snapshot
 from .reconciliation import reconcile_active_agents, reconcile_reaped_agent, reconcile_reaped_supervisor
 from .store import AgentCreation, StateStore
+from .workflow import step_key
 
 __all__ = [
     "AgentCreation",
@@ -20,4 +21,5 @@ __all__ = [
     "open_database",
     "reconcile_reaped_agent",
     "reconcile_reaped_supervisor",
+    "step_key",
 ]
