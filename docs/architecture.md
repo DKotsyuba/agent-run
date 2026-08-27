@@ -987,6 +987,22 @@ Preserved behavior:
 - partial source failure does not suppress healthy sources;
 - credential values and raw provider responses are never stored.
 
+Where each runtime's samples actually come from. All three are local reads on
+the collector's cadence; no adapter reaches the network for limits, and none is
+consulted at agent start.
+
+| Runtime | Source | Lanes / windows | Notes |
+|---|---|---|---|
+| codex | `<home>/cache/rollout_evidence.json`, else the newest `<home>/sessions/*/*/*/rollout-*.jsonl` `token_count` event | `primary`, `secondary`, `individual_limit` | The engine currently fills `primary` only, so a live run yields one `weekly` sample; the precomputed cache file is an accepted input that nothing in-tree writes today. |
+| claude | `rate_limit_event` lines in sibling `<agent_run_home>/agents/*/runtime.jsonl` | `usage` lane, one window per `unifiedWindows` key | Written by the CLI's own stream-json output. |
+| opencode | `~/.omniroute/storage.sqlite` -> `quota_snapshots`, joined to active + quota-visible `provider_connections` | `pool` lane; `session_5h`, `weekly`, `mcp_monthly` | OmniRoute routes every model through one `opencode-go` account pool, so quota is pool-wide, not per model. Equal accounts average; the soonest reset wins. OmniRoute refreshes these roughly every 70 minutes, so samples are routinely past the 15-minute freshness bound and correctly report `unknown`. |
+
+OmniRoute exposes no HTTP quota surface -- `/v1/usage`, `/v1/quota`,
+`/v1/limits` and `/v1/organization/usage` all 404, completions carry no
+`x-ratelimit-*` headers, and every `/api/*` path answers the same 401 whether or
+not it exists. `src/agent_run/adapters/opencode/capacity.py` records the full
+probe.
+
 The hook projection adds a compact session-scoped activity block:
 
 ```text

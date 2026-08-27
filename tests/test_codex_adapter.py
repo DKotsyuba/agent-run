@@ -4,13 +4,14 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
-from agent_run.adapters.codex.adapter import ADAPTER
+from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
@@ -372,6 +373,53 @@ env_from = ["PATH"]
     @staticmethod
     def iso_time(epoch: float) -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+    #: One ``token_count`` line copied verbatim out of a real codex rollout on
+    #: this machine -- ``.../canaries/M011-final/home/runtimes/codex/home/
+    #: sessions/2026/08/26/rollout-2026-08-26T20-52-58-*.jsonl``, the newest of
+    #: the 13 rollouts a live M011 run left behind. It is here because the
+    #: engine's live shape is narrower than the synthetic one above: today it
+    #: fills ``primary`` only, with ``secondary`` and ``individual_limit`` both
+    #: null, and it carries ``credits`` / ``plan_type`` / ``limit_id`` keys the
+    #: parser must ignore. So one real run yields exactly one weekly sample,
+    #: and 100 - 57 = 43% is the number the collector recorded that day.
+    LIVE_ROLLOUT_LINE = (
+        '{"timestamp":"2026-08-26T18:53:02.949Z","type":"event_msg","payload":'
+        '{"type":"token_count","info":{"total_token_usage":{"input_tokens":16444,'
+        '"cached_input_tokens":9984,"cache_write_input_tokens":0,"output_tokens":7,'
+        '"reasoning_output_tokens":0,"total_tokens":16451},"model_context_window":258400},'
+        '"rate_limits":{"limit_id":"codex","limit_name":null,'
+        '"primary":{"used_percent":57.0,"window_minutes":10080,"resets_at":1788272105},'
+        '"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},'
+        '"individual_limit":null,"spend_control_reached":null,"plan_type":"pro",'
+        '"rate_limit_reached_type":null}}}'
+    )
+
+    def test_limits_materialize_from_a_real_engine_rollout(self) -> None:
+        """A real codex run's own rollout file yields a usable weekly sample."""
+
+        observed = datetime(2026, 8, 26, 18, 53, 2, 949000, tzinfo=timezone.utc)
+        self.write_rollout("live", self.LIVE_ROLLOUT_LINE + "\n")
+
+        samples = _rollout_limits(self.home, ("gpt-5.6-sol",), observed.timestamp() + 60)
+
+        self.assertEqual(len(samples), 1)
+        sample = samples[0]
+        self.assertEqual((sample.lane, sample.window), ("primary", "weekly"))
+        self.assertEqual(sample.remaining_percent, 43.0)
+        self.assertEqual(sample.source, "isolated_rollout_evidence")
+        self.assertEqual(sample.observed_at, observed)
+        self.assertEqual(
+            sample.reset_at, datetime.fromtimestamp(1788272105, tz=timezone.utc)
+        )
+        # Past the freshness bound the same file must degrade, never fabricate.
+        stale = _rollout_limits(
+            self.home, ("gpt-5.6-sol",), observed.timestamp() + 86400
+        )
+        self.assertEqual(len(stale), 1)
+        self.assertIsNone(stale[0].remaining_percent)
+        self.assertEqual(stale[0].source, "unknown")
+        self.assertEqual(stale[0].reset_at, sample.reset_at)
 
     def test_limits_missing_evidence_is_empty(self) -> None:
         self.assertEqual(ADAPTER.limits(self.runtime_config(), self.home), ())

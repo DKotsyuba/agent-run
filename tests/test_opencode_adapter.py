@@ -1,9 +1,12 @@
 import hashlib
 import json
 import os
+import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -11,6 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import ADAPTER_API_VERSION, Capability
 from agent_run.adapters.home import content_hash
+from agent_run.adapters.opencode import adapter as opencode_adapter
+from agent_run.adapters.opencode import capacity as opencode_capacity
+from agent_run.adapters.opencode.capacity import LIMITS_STALE_SECONDS, pool_samples
 from agent_run.adapters.opencode.adapter import (
     ANSWER_NAME,
     CONFIG_RELATIVE_PATH,
@@ -750,6 +756,9 @@ class DescribeValidateTests(AdapterCase):
         info = self.adapter.describe()
         self.assertEqual((info.name, info.adapter_api_version), (RUNTIME_NAME, ADAPTER_API_VERSION))
         self.assertIn(Capability.STEER, info.capabilities)
+        # Without this the capacity collector skips the runtime outright and
+        # limits() is never called at all.
+        self.assertIn(Capability.LIVE_LIMITS, info.capabilities)
         self.assertNotIn(Capability.WRITE, info.capabilities)
         self.assertNotIn(Capability.EFFORT, info.capabilities)
         self.assertNotIn(Capability.HOOKS, info.capabilities)
@@ -1486,6 +1495,168 @@ def _replace(request, **changes):
     }
     values.update(changes)
     return StartRequest(**values)
+
+
+#: Verbatim ``quota_snapshots`` rows copied out of this machine's live
+#: ``~/.omniroute/storage.sqlite`` (ids 27506-27511, the newest opencode-go
+#: round), plus one deliberately superseded older weekly row for account A.
+#: Averaged they reproduce the pool figures OmniRoute itself recorded that
+#: round: weekly 92, session 95, mcp_monthly 99.
+_REAL_SNAPSHOT_ROWS = (
+    # id, provider, connection_id, window_key, remaining, next_reset_at, created_at
+    (27496, "opencode-go", "conn-a", "weekly", 10.0,
+     "2026-08-31T00:00:01.161Z", "2026-08-24T18:07:03.162Z"),
+    (27506, "opencode-go", "conn-a", "session", 90.0,
+     "2026-08-24T19:20:58.435Z", "2026-08-24T19:17:02.435Z"),
+    (27507, "opencode-go", "conn-a", "weekly", 84.0,
+     "2026-08-31T00:00:00.435Z", "2026-08-24T19:17:02.436Z"),
+    (27508, "opencode-go", "conn-a", "mcp_monthly", 98.0,
+     "2026-09-24T13:23:17.435Z", "2026-08-24T19:17:02.437Z"),
+    (27509, "opencode-go", "conn-b", "session", 100.0,
+     "2026-08-24T19:24:59.554Z", "2026-08-24T19:17:02.555Z"),
+    (27510, "opencode-go", "conn-b", "weekly", 100.0,
+     "2026-08-31T00:00:00.555Z", "2026-08-24T19:17:02.555Z"),
+    (27511, "opencode-go", "conn-b", "mcp_monthly", 100.0,
+     "2026-09-23T22:16:31.555Z", "2026-08-24T19:17:02.555Z"),
+    # A quota-blind pool member: real column, and a zero that must never average in.
+    (27512, "opencode-go", "conn-blind", "weekly", 0.0,
+     "2026-08-31T00:00:00.555Z", "2026-08-24T19:17:02.555Z"),
+)
+_NEWEST_OBSERVATION = "2026-08-24T19:17:02.555Z"
+
+
+class OmniRouteQuotaPoolTests(unittest.TestCase):
+    """limits() over the only real OmniRoute quota surface: its own sqlite."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.database = self.root / "storage.sqlite"
+        self.fresh = (
+            datetime.fromisoformat(_NEWEST_OBSERVATION).timestamp() + 60.0
+        )
+
+    def write_store(self, rows=_REAL_SNAPSHOT_ROWS, connections=None):
+        connection = sqlite3.connect(self.database)
+        with connection:
+            connection.execute(
+                "CREATE TABLE quota_snapshots (id INTEGER PRIMARY KEY, provider TEXT, "
+                "connection_id TEXT, window_key TEXT, remaining_percentage REAL, "
+                "is_exhausted INTEGER, next_reset_at TEXT, window_duration_ms INTEGER, "
+                "raw_data TEXT, created_at TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE provider_connections (id TEXT PRIMARY KEY, provider TEXT, "
+                "is_active INTEGER, quota_visible INTEGER)"
+            )
+            connection.executemany(
+                "INSERT INTO quota_snapshots (id, provider, connection_id, window_key, "
+                "remaining_percentage, next_reset_at, created_at) VALUES (?,?,?,?,?,?,?)",
+                rows,
+            )
+            connection.executemany(
+                "INSERT INTO provider_connections VALUES (?,?,?,?)",
+                connections
+                or (
+                    ("conn-a", "opencode-go", 1, 1),
+                    ("conn-b", "opencode-go", 1, 1),
+                    ("conn-blind", "opencode-go", 1, 0),
+                ),
+            )
+        connection.close()
+
+    def samples_by_window(self, now):
+        return {
+            sample.window: sample
+            for sample in pool_samples(now, database=self.database)
+        }
+
+    def test_pool_windows_average_equal_accounts_and_take_the_soonest_reset(self):
+        self.write_store()
+        samples = self.samples_by_window(self.fresh)
+        self.assertEqual(sorted(samples), ["mcp_monthly", "session_5h", "weekly"])
+        self.assertEqual(
+            {window: sample.remaining_percent for window, sample in samples.items()},
+            {"weekly": 92.0, "session_5h": 95.0, "mcp_monthly": 99.0},
+        )
+        for sample in samples.values():
+            self.assertEqual(sample.source, "omniroute_quota_pool")
+            self.assertEqual((sample.lane, sample.target), ("pool", "opencode-go:pool"))
+            self.assertEqual(
+                sample.observed_at, datetime.fromisoformat(_NEWEST_OBSERVATION)
+            )
+        # The soonest reset in the pool is the one that bites first.
+        self.assertEqual(
+            samples["session_5h"].reset_at,
+            datetime.fromisoformat("2026-08-24T19:20:58.435Z"),
+        )
+        self.assertEqual(
+            samples["mcp_monthly"].reset_at,
+            datetime.fromisoformat("2026-09-23T22:16:31.555Z"),
+        )
+
+    def test_a_stale_round_keeps_its_reset_but_reports_unknown_not_zero(self):
+        self.write_store()
+        samples = self.samples_by_window(self.fresh + LIMITS_STALE_SECONDS)
+        self.assertEqual(len(samples), 3)
+        for sample in samples.values():
+            self.assertIsNone(sample.remaining_percent)
+            self.assertEqual(sample.source, "unknown")
+            self.assertIsNotNone(sample.reset_at)
+            self.assertIsNotNone(sample.observed_at)
+
+    def test_superseded_and_quota_blind_rows_never_reach_the_average(self):
+        self.write_store()
+        weekly = self.samples_by_window(self.fresh)["weekly"]
+        # 84 and 100 only: the older 10.0 row and the blind member's 0.0 are out.
+        self.assertEqual(weekly.remaining_percent, 92.0)
+
+    def test_an_inactive_account_leaves_the_pool(self):
+        self.write_store(
+            connections=(
+                ("conn-a", "opencode-go", 1, 1),
+                ("conn-b", "opencode-go", 0, 1),
+                ("conn-blind", "opencode-go", 1, 0),
+            )
+        )
+        self.assertEqual(self.samples_by_window(self.fresh)["weekly"].remaining_percent, 84.0)
+
+    def test_unnamed_windows_and_unusable_percentages_are_not_reported(self):
+        self.write_store(
+            rows=(
+                (1, "opencode-go", "conn-a", "some_new_window", 50.0,
+                 None, _NEWEST_OBSERVATION),
+                (2, "opencode-go", "conn-a", "weekly", None,
+                 None, _NEWEST_OBSERVATION),
+                (3, "opencode-go", "conn-a", "session", 90.0,
+                 None, "not-a-timestamp"),
+                (4, "opencode-go", "conn-b", "session", 100.0,
+                 None, _NEWEST_OBSERVATION),
+            ),
+        )
+        samples = self.samples_by_window(self.fresh)
+        self.assertEqual(sorted(samples), ["session_5h"])
+        self.assertEqual(samples["session_5h"].remaining_percent, 100.0)
+        self.assertIsNone(samples["session_5h"].reset_at)
+
+    def test_a_missing_or_drifted_store_is_no_evidence(self):
+        self.assertEqual(pool_samples(self.fresh, database=self.database), ())
+        sqlite3.connect(self.database).close()
+        self.assertEqual(pool_samples(self.fresh, database=self.database), ())
+
+    def test_limits_reads_the_omniroute_store_and_never_the_runtime_home(self):
+        self.write_store()
+        with mock.patch.object(opencode_capacity, "OMNIROUTE_STORAGE", self.database):
+            with mock.patch.object(opencode_adapter.time, "time", lambda: self.fresh):
+                samples = OpenCodeAdapter().limits(
+                    runtime_config(self.root / "bin", self.root / "home"),
+                    self.root / "nonexistent-home",
+                )
+        self.assertEqual(
+            sorted(sample.window for sample in samples),
+            ["mcp_monthly", "session_5h", "weekly"],
+        )
+        self.assertTrue(all(s.source == "omniroute_quota_pool" for s in samples))
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash, seal_answer, write_managed_file
+from .capacity import pool_samples
 from .http import POLL_INTERVAL_SECONDS, HttpError, OpenCodeHttpClient
 from .normalize import (
     PRIMARY_AGENT,
@@ -74,6 +75,7 @@ CAPABILITIES = frozenset(
         Capability.READ_ROOTS,
         Capability.TRANSCRIPT,
         Capability.MODEL_ROSTER,
+        Capability.LIVE_LIMITS,
         Capability.MCP,
         Capability.SKILLS,
     }
@@ -360,7 +362,15 @@ class OpenCodeAdapter:
         return normalize_models(client.models(), config.models)
 
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
-        return ()
+        """Report the OmniRoute account pool this runtime's models are served from.
+
+        Pool-wide, not per model: OmniRoute meters the ``opencode-go`` accounts,
+        not the individual models routed over them, so one set of window samples
+        covers every configured model. See :mod:`.capacity` for what was probed
+        and why OmniRoute's own sqlite store is the only real source.
+        """
+
+        return pool_samples(time.time())
 
     def prepare(
         self,
