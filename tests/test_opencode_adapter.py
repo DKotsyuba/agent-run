@@ -45,6 +45,7 @@ from agent_run.adapters.opencode.service import (
     ServiceIsolationError,
     build_service_plan,
     service_home_paths,
+    skills_root_for,
     verify_isolation,
     write_service_descriptor,
 )
@@ -795,7 +796,12 @@ class MaterializeTests(AdapterCase):
         self.assertEqual(provider["models"]["deepseek-v4-pro"]["id"], "opencode/deepseek-v4-pro")
         self.assertNotIn("providers", document)
         self.assertNotIn("agents", document)
-        self.assertEqual(document["skills"], {"paths": ["review"]})
+        # v1 resolves skills.paths against the *session* directory, so a bare
+        # name is looked up under the agent's workdir and dropped.
+        self.assertEqual(
+            document["skills"],
+            {"paths": [str(skills_root_for(self.home) / "review")]},
+        )
         self.assertEqual(document["mcp"]["docs"]["enabled"], True)
         self.assertNotIn("disabled", document["mcp"]["docs"])
         self.assertNotIn("servers", document["mcp"])
@@ -871,8 +877,52 @@ class MaterializeTests(AdapterCase):
 
     def test_render_is_pure_and_writes_nothing(self):
         before = sorted(path.name for path in self.home.iterdir())
-        render_config(self.config, self.mcp_servers, inherited_environment=self.environment)
+        render_config(
+            self.config,
+            self.mcp_servers,
+            skills_root=self.root / "skills",
+            inherited_environment=self.environment,
+        )
         self.assertEqual(sorted(path.name for path in self.home.iterdir()), before)
+
+    def test_skill_paths_are_absolute_directories_of_the_physical_copies(self):
+        """The child saw only opencode's built-in skill because bare names in
+        ``skills.paths`` are resolved against the session's workdir: the live
+        service logged 'skill path not found path=<workdir>/delegate' for every
+        configured skill. Absolute directories of the materialized copies are
+        what v1 scans for ``**/SKILL.md``."""
+
+        document = json.loads(
+            render_config(
+                self.config,
+                self.mcp_servers,
+                skills_root=self.root / "skills" / "opencode",
+                inherited_environment=self.environment,
+            )
+        )
+        self.assertEqual(
+            document["skills"]["paths"],
+            [str(self.root / "skills" / "opencode" / "review")],
+        )
+        for path in document["skills"]["paths"]:
+            self.assertTrue(Path(path).is_absolute())
+
+    def test_prepare_renders_the_same_skill_paths_materialize_wrote(self):
+        """prepare re-renders the config and refuses the service on any hash
+        drift, so its skills root has to be the one materialize used."""
+
+        digest = self.materialize()
+        self.prove_service(digest=digest)
+        plan = self.adapter.prepare(
+            self.request,
+            self.profile,
+            self.config,
+            self.home,
+            self.agent_dir,
+            mcp_servers=self.mcp_servers,
+            inherited_environment=self.environment,
+        )
+        self.assertEqual(plan.adapter_state["service"]["config_hash"], digest)
 
 
 class ProbeAndPrepareTests(AdapterCase):

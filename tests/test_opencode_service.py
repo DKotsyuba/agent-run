@@ -754,5 +754,29 @@ class StartServiceTests(ServiceTempCase):
         self.assert_candidate_cleaned_up()
 
 
+class SkillsRootTests(unittest.TestCase):
+    """The adapter derives the skills root from the runtime home in prepare,
+    while the service layer passes ``runtime_skills_dir`` into materialize; the
+    two have to name the same directory or prepare's hash check refuses the
+    proven service."""
+
+    def test_derived_root_matches_the_service_layer_skills_dir(self):
+        from agent_run.paths import runtime_skills_dir
+
+        home = Path("/opt/agent-run")
+        self.assertEqual(
+            service_module.skills_root_for(home / "runtimes" / "opencode" / "home"),
+            runtime_skills_dir("opencode", home),
+        )
+
+    def test_an_explicit_root_is_honoured_and_must_be_absolute(self):
+        home = Path("/opt/agent-run/runtimes/opencode/home")
+        self.assertEqual(
+            service_module.skills_root_for(home, "/srv/skills"), Path("/srv/skills")
+        )
+        with self.assertRaises(ValidationError):
+            service_module.skills_root_for(home, "skills")
+
+
 if __name__ == "__main__":
     unittest.main()
