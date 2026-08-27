@@ -129,8 +129,16 @@ env_from = ["PATH"]
             ["demo"],
         )
         self.assertIn("[mcp_servers.agent_lsp]", generated)
-        self.assertIn("[[hooks]]", generated)
-        self.assertIn("UserPromptSubmit", generated)
+        # Codex reads config-level hooks as per-event array-of-tables groups and
+        # runs none of them without a matching trust digest.
+        self.assertIn("[[hooks.UserPromptSubmit]]", generated)
+        self.assertIn("[[hooks.UserPromptSubmit.hooks]]", generated)
+        self.assertIn('type = "command"', generated)
+        self.assertIn(
+            f'[hooks.state."{self.home / "config.toml"}:user_prompt_submit:0:0"]',
+            generated,
+        )
+        self.assertIn("trusted_hash = \"sha256:", generated)
         bridge = self.home / "auth.json"
         self.assertTrue(bridge.is_symlink())
         self.assertEqual(bridge.resolve(strict=True), self.auth_source.resolve(strict=True))

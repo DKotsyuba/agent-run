@@ -32,6 +32,7 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash, seal_answer, write_managed_file
+from ..plugin_skills import skill_dirs
 from .capacity import pool_samples
 from .http import POLL_INTERVAL_SECONDS, HttpError, OpenCodeHttpClient
 from .normalize import (
@@ -236,7 +237,9 @@ def render_config(
                 "permission": dict(SUBAGENT_PERMISSION),
             },
         },
-        "skills": {"paths": [str(skills_root / name) for name in config.skills]},
+        "skills": {
+            "paths": [str(p) for p in skill_dirs(config.plugins, skills_root, config.skills).values()]
+        },
         "mcp": _mcp_servers(config, mcp_servers, inherited),
     }
     # Key order is meaningful here: permission entries are read in this order.

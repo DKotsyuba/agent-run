@@ -39,6 +39,7 @@ from ..base import (
     RuntimeInfo,
 )
 from ..home import content_hash, create_symlink_bridge, write_managed_file
+from ..plugin_skills import local_skill_names
 from .auth import TOKEN_ENV_NAME, keychain_token, resolve_token
 from .stream import StreamDecoder, classify_failure, sanitize_line, terminal_event_data
 
@@ -334,7 +335,7 @@ class ClaudeAdapter:
             skills_root = Path(home)
         if not isinstance(skills_root, Path) or not skills_root.is_absolute():
             raise ValidationError("claude skills_root must be absolute")
-        plugin_digest = _render_plugin_dirs(home, skills_root, config.skills)
+        plugin_digest = _render_plugin_dirs(home, skills_root, local_skill_names(config.plugins, config.skills))
         declared_digest = content_hash(",".join(str(plugin) for plugin in config.plugins))
         return "\n".join((settings_digest, mcp_digest, plugin_digest, declared_digest))
 
@@ -434,7 +435,7 @@ class ClaudeAdapter:
         ]
         if config.mcp:
             argv += ["--mcp-config", str(home / "mcp" / "mcp-config.json")]
-        for name in config.skills:
+        for name in local_skill_names(config.plugins, config.skills):
             argv += ["--plugin-dir", str(home / "plugins" / name)]
         # Declared plugins load straight from their own directory. Verified
         # live against claude 2.1.245: a plugin's own hooks/hooks.json is

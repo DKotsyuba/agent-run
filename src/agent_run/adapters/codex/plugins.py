@@ -25,20 +25,22 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Iterable, Mapping
 
 from ...errors import ValidationError
 from ..home import content_hash, write_managed_file
 
-__all__ = ["MARKETPLACE", "install"]
+__all__ = ["DEFAULT_TIMEOUT_SEC", "MARKETPLACE", "expand", "hook_trust", "install"]
 
 MARKETPLACE = "personal"
 
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\Z")
+_PLUGIN_TOKEN = re.compile(r"\{plugin:([A-Za-z0-9][A-Za-z0-9_.+-]*)\}")
 _HOOKS_REL = "hooks/hooks.json"
 _SKIP_DIRS = frozenset({".git", "__pycache__"})
 # codex-rs/hooks: a command handler with no explicit timeout is normalized to
 # 600 seconds before hashing, and never below one second.
-_DEFAULT_TIMEOUT_SEC = 600
+DEFAULT_TIMEOUT_SEC = 600
 _EVENT_LABELS = {
     "PreToolUse": "pre_tool_use",
     "PermissionRequest": "permission_request",
@@ -49,6 +51,7 @@ _EVENT_LABELS = {
     "UserPromptSubmit": "user_prompt_submit",
     "SubagentStart": "subagent_start",
     "SubagentStop": "subagent_stop",
+    "SessionEnd": "session_end",
     "Stop": "stop",
 }
 # Codex drops the matcher for these events before hashing, so a manifest that
@@ -93,7 +96,7 @@ def _handler(raw: object, where: str) -> dict[str, object]:
             f"{where}.additionalContextLimit is not supported; its trusted digest "
             "depends on a codex-internal default agent-run cannot read"
         )
-    timeout = raw.get("timeout", _DEFAULT_TIMEOUT_SEC)
+    timeout = raw.get("timeout", DEFAULT_TIMEOUT_SEC)
     if isinstance(timeout, bool) or not isinstance(timeout, int):
         raise ValidationError(f"{where}.timeout must be an integer number of seconds")
     asynchronous = raw.get("async", False)
@@ -189,11 +192,64 @@ def _copy_tree(home: Path, relative: str, directory: Path) -> str:
     return content_hash("\n".join(digests))
 
 
-def install(home: Path, plugins: tuple[Path, ...]) -> tuple[tuple[str, ...], str]:
-    """Materialize declared plugins; return config.toml lines and a fingerprint."""
+def expand(command: Iterable[str], roots: Mapping[str, Path]) -> tuple[str, ...]:
+    """Resolve ``{plugin:NAME}`` to that plugin's copy inside the generated home.
 
+    A hook may only reach a plugin file through the home's own installed copy,
+    so the child stays self-contained; the checkout it came from is never on
+    the command line. An unknown name fails closed rather than rendering a
+    command that silently cannot run.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        try:
+            return str(roots[match.group(1)])
+        except KeyError:
+            raise ValidationError(
+                f"codex hook command references {match.group(0)}, which is not a declared plugin"
+            ) from None
+
+    return tuple(_PLUGIN_TOKEN.sub(replace, word) for word in command)
+
+
+def hook_trust(
+    config_path: Path, event: str, group: int, matcher: str | None, command: str
+) -> tuple[str, str]:
+    """Return the ``[hooks.state]`` key and digest for one config-level hook.
+
+    Codex refuses an untrusted config-level hook exactly as it refuses an
+    untrusted plugin hook, and ``codex app-server`` -- what this adapter
+    launches -- has no bypass flag. Only the key prefix differs from the plugin
+    case: the absolute path of the config file declaring the hook replaces
+    ``<plugin>@<marketplace>:hooks/hooks.json``. Verified against the owner's
+    live trusted entries, whose digests this same hashing reproduces exactly.
+
+    The caller must write the ``timeout`` this hashes, never leave it implicit:
+    a digest over a default codex might normalize differently would leave the
+    hook installed, untrusted, and silently inert.
+    """
+
+    label = _EVENT_LABELS.get(event)
+    if label is None:
+        raise ValidationError(f"codex hook event is not supported: {event}")
+    handler = _handler(
+        {"type": "command", "command": command, "timeout": DEFAULT_TIMEOUT_SEC},
+        f"codex hook {event}[{group}]",
+    )
+    return (
+        f"{config_path}:{label}:{group}:0",
+        _digest(label, None if label in _MATCHERLESS else matcher, handler),
+    )
+
+
+def install(
+    home: Path, plugins: tuple[Path, ...]
+) -> tuple[tuple[str, ...], str, dict[str, Path]]:
+    """Materialize declared plugins; return config lines, fingerprint, and roots."""
+
+    roots: dict[str, Path] = {}
     if not plugins:
-        return (), content_hash("no_plugins")
+        return (), content_hash("no_plugins"), roots
     lines: list[str] = []
     fingerprint: list[str] = []
     listed: list[dict[str, object]] = []
@@ -201,6 +257,7 @@ def install(home: Path, plugins: tuple[Path, ...]) -> tuple[tuple[str, ...], str
         name, version = _manifest(directory)
         relative = f"plugins/cache/{MARKETPLACE}/{name}/{version}"
         tree_digest = _copy_tree(home, relative, directory)
+        roots[name] = Path(home) / relative
         listed.append(
             {
                 "name": name,
@@ -227,4 +284,4 @@ def install(home: Path, plugins: tuple[Path, ...]) -> tuple[tuple[str, ...], str
     fingerprint.append(
         write_managed_file(home, ".agents/plugins/marketplace.json", catalog)
     )
-    return tuple(lines), content_hash("\n".join(fingerprint))
+    return tuple(lines), content_hash("\n".join(fingerprint)), roots

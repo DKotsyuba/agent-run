@@ -271,7 +271,11 @@ Rules:
 - an absent or unreadable isolated Codex roster exposes only configured models
   with unknown metadata; a readable roster remains authoritative and is still
   intersected with the configured allowlist;
-- skill names resolve only below `~/.agent-run/skills/<runtime>`;
+- skill names resolve only below `~/.agent-run/skills/<runtime>`, unless a
+  declared plugin ships `skills/<name>/SKILL.md`, in which case that plugin owns
+  the name for every runtime and the copy below the skills root is not read.
+  One name therefore has exactly one source, and the child never sees a skill
+  twice; two plugins claiming one name fail closed;
 - `plugins` are absolute existing directories holding a plugin manifest;
   undeclared means nothing is wired. The claude adapter passes each one to
   `--plugin-dir` and the plugin's own `hooks/hooks.json` loads with it, without
@@ -544,6 +548,16 @@ forecast code.
 - Read roots may be visible but never become writable roots.
 - Preserve runtime-owned hook trust state during managed-config regeneration.
   A canary must prove this before the Codex adapter is accepted.
+- Render `runtimes.codex.hooks` as per-event `[[hooks.<Event>]]` groups, each
+  with its own `[[hooks.<Event>.hooks]]` command handler, and emit the matching
+  `[hooks.state]` trust digest keyed by
+  `<absolute generated config.toml>:<event_snake>:<group>:<handler>`. Codex runs
+  no hook it has not trusted and `codex app-server` has no bypass flag, so an
+  untrusted entry is installed and silently inert. Write the handler `timeout`
+  explicitly: the digest covers the value that was written.
+- A hook command may reference a declared plugin as `{plugin:<name>}`, which
+  resolves to that plugin's copy inside the generated home. Hooks never point at
+  the source checkout, and an undeclared name fails closed.
 
 Official Codex documentation confirms that `CODEX_HOME` roots configuration,
 auth, logs, sessions, skills, and package metadata, while `config.toml` supports
@@ -602,6 +616,8 @@ MCP, skill paths, and lifecycle hooks:
   spawned — TERM, bounded wait, KILL — when any of that fails.
 - Set `OPENCODE_DISABLE_CLAUDE_CODE=1`.
 - Generate roles, skills, MCP, and provider routes only from agent-run config.
+- Skills only: OpenCode exposes no synchronous pre-tool decision hook, so the
+  `lsp-first` guard cannot run there. The same rules apply, unenforced.
 - `skills.paths` carries **absolute directories** of the materialized skill
   copies (`<home>/skills/opencode/<name>`), never bare names: v1 resolves each
   entry against the *session* directory, so a bare name is looked up under the
