@@ -84,6 +84,17 @@ class AdapterRegistry:
     def __init__(self, config: Config | Mapping[str, RuntimeConfig]) -> None:
         self._runtimes = config.runtimes if isinstance(config, Config) else config
 
+    def preload_enabled(self) -> None:
+        """Import and validate every enabled runtime adapter before serving requests.
+
+        Disabled runtimes are left unloaded. Any adapter import or validation error
+        is propagated exactly as it would be when that runtime is first used.
+        """
+
+        for name, config in self._runtimes.items():
+            if config.enabled:
+                self.load(name)
+
     def load(
         self, name: str, required_capabilities: Iterable[Capability] = ()
     ) -> RuntimeAdapter:

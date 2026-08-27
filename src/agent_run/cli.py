@@ -828,6 +828,8 @@ def main(
             if args.command == "mcp":
                 from .mcp import serve
 
+                if owned is not None:
+                    owned.core._registry.preload_enabled()
                 returned = serve(
                     owned.core if owned is not None else target,
                     stdin=stdin,
