@@ -431,11 +431,13 @@ class ClaudeAdapterTests(unittest.TestCase):
         allowed = plan.argv[plan.argv.index("--allowedTools") + 1].split(",")
         self.assertIn(f"Write({self.workdir}/**)", allowed)
         self.assertIn(f"Edit({self.workdir}/**)", allowed)
-        self.assertNotIn("Bash", allowed)
-        self.assertFalse(any(item == "Bash" or item.startswith("Bash(") for item in allowed))
+        self.assertIn("Bash", allowed)
+        self.assertFalse(any(item.startswith("Bash(") for item in allowed))
         tools = plan.argv[plan.argv.index("--tools") + 1].split(",")
         self.assertIn("Write", tools)
-        self.assertNotIn("Bash", tools)
+        self.assertIn("Bash", tools)
+        self.assertFalse(any("sandbox" in item.lower() for item in plan.argv))
+        self.assertIn("Bash", plan.adapter_state["allowed_tools"])
         self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "acceptEdits")
 
     def test_declared_plugins_are_loaded_by_path_without_widening_tools(self) -> None:
@@ -492,7 +494,9 @@ class ClaudeAdapterTests(unittest.TestCase):
         allowed = narrowed.argv[narrowed.argv.index("--allowedTools") + 1].split(",")
         self.assertNotIn("Write", tools)
         self.assertNotIn("Edit", tools)
+        self.assertNotIn("Bash", tools)
         self.assertFalse(any(item.startswith(("Write(", "Edit(")) for item in allowed))
+        self.assertNotIn("Bash", allowed)
         self.assertEqual(
             narrowed.argv[narrowed.argv.index("--permission-mode") + 1], "default"
         )
