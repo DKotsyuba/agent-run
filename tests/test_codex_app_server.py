@@ -372,7 +372,7 @@ class StartSessionTests(unittest.TestCase):
                 "model": "gpt-5.6-sol",
                 "effort": None,
                 "sandbox_mode": "read-only",
-                "sandbox": {"readOnly": {"networkAccess": True}},
+                "sandbox": {"read-only": {"networkAccess": True}},
                 "approval_policy": "never",
                 "roots": (str(cwd),),
                 "writable_roots": (),
@@ -395,7 +395,7 @@ class StartSessionTests(unittest.TestCase):
 
         self.assertEqual(
             transport.requests[1][1]["sandbox"],
-            {"readOnly": {"networkAccess": True}},
+            {"read-only": {"networkAccess": True}},
         )
 
     def test_refuses_when_effective_params_drift(self) -> None:
