@@ -133,36 +133,6 @@ CREATE TABLE context_receipts (
   injected_at REAL NOT NULL
 );
 
-CREATE TABLE workflow_runs (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  script_sha TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (
-    status IN (
-      'created', 'running', 'succeeded', 'failed', 'cancelled', 'lost'
-    )
-  ),
-  owner_pid_identity TEXT,
-  created_at REAL NOT NULL,
-  finished_at REAL
-);
-
-CREATE TABLE workflow_steps (
-  run_id TEXT NOT NULL REFERENCES workflow_runs(id),
-  step_key TEXT NOT NULL,
-  spec_json TEXT NOT NULL,
-  agent_id TEXT REFERENCES agents(id),
-  status TEXT NOT NULL CHECK (
-    status IN (
-      'pending', 'running', 'succeeded', 'failed', 'skipped', 'cached'
-    )
-  ),
-  result_json TEXT,
-  failure_kind TEXT,
-  failure_params_json TEXT,
-  PRIMARY KEY (run_id, step_key)
-);
-
 CREATE INDEX idx_agents_active
   ON agents(status, created_at, id)
   WHERE status IN ('created', 'starting', 'running', 'cancelling');
@@ -173,11 +143,5 @@ CREATE INDEX idx_deliveries_due
   ON deliveries(state, next_attempt_at, lease_until, id);
 CREATE INDEX idx_capacity_lane_window_source_reset
   ON capacity_samples(lane, window, source, reset_at, observed_at);
-CREATE INDEX idx_workflow_runs_active
-  ON workflow_runs(status, created_at, id)
-  WHERE status IN ('created', 'running');
-CREATE INDEX idx_workflow_steps_agent
-  ON workflow_steps(agent_id)
-  WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 1;

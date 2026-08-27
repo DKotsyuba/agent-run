@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Config, RuntimeConfig, load_config
-from .errors import AgentRunError
+from .errors import AgentRunError, SchemaMigrationRequired
 from .paths import config_path, state_db_path
 from .state import diagnostic_snapshot
 
@@ -69,6 +69,15 @@ def run_doctor(
         snapshot = diagnostic_snapshot(
             state_db_path(root), at=checked_at, limit=_LIMIT
         )
+    except SchemaMigrationRequired as error:
+        _add(
+            findings,
+            "state_migration_pending",
+            "error",
+            "state",
+            f"schema v{error.found} awaits migration to v{error.expected}",
+        )
+        return DoctorReport(root, checked_at, tuple(findings))
     except (OSError, AgentRunError) as error:
         _add(findings, "state_invalid", "error", "state", type(error).__name__)
         return DoctorReport(root, checked_at, tuple(findings))

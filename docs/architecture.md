@@ -916,6 +916,47 @@ class StateStore:
 - state migrations are numbered SQL files, backed up before application, and
   applied in one transaction. No migration framework is needed.
 
+### 9.1 Schema migrations
+
+`schema.sql` always describes the current schema and stamps `PRAGMA
+user_version`, which is the only version marker. Every later version adds one
+file `state/migrations/NNN_slug.sql` holding just its delta, where `NNN` is the
+version the file produces; `migrations.py` refuses a set of files that does not
+cover `2..SCHEMA_VERSION` contiguously.
+
+`migrate(store_path)` runs each pending migration under `BEGIN IMMEDIATE`,
+holding the same `.state.db.init.lock` flock that first-time creation takes, so
+schema creation and migration cannot race across processes. `user_version` is
+stamped inside that transaction and rolls back with it, which means an
+interrupted migration leaves the store at its previous version, never
+half-upgraded.
+
+Before each transaction the store is snapshotted to
+`state.db.pre-vN.backup` beside itself through SQLite's backup API. The backup
+API copies pages under a read transaction and is consistent in WAL mode; a
+plain file copy is not, because committed pages may still live only in the
+`-wal` sidecar. The snapshot is deleted only after the transaction commits, so
+a failed migration refuses with the backup path in its message, and a snapshot
+found next to an already-current store is stale and removed.
+
+Both `initialize_database` and `open_database` migrate on the way in, so an
+existing home needs no manual step. A store stamped *newer* than
+`SCHEMA_VERSION` is refused outright rather than opened. Read-only callers do
+not migrate: `diagnostic_snapshot` raises `SchemaMigrationRequired`, which
+`doctor` reports as `state_migration_pending`.
+
+Schema v2 adds the workflow journal tables. Their status enums are enforced by
+`CHECK` constraints:
+
+| table | column | values |
+|---|---|---|
+| `workflow_runs` | `status` | `created`, `running`, `succeeded`, `failed`, `cancelled`, `lost` |
+| `workflow_steps` | `status` | `pending`, `running`, `succeeded`, `failed`, `skipped`, `cached` |
+
+`workflow_steps` is keyed by `(run_id, step_key)` and references
+`workflow_runs(id)`; its nullable `agent_id` references `agents(id)` and carries
+a partial index, since a step only has an agent once it has been dispatched.
+
 Large raw runtime streams are not SQLite blobs. Normalized chat messages are
 stored in SQLite; raw or oversized tool content is referenced through `raw_ref`.
 `transcript --full` follows all references without silent truncation.
