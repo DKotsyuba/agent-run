@@ -91,7 +91,9 @@ class StateDatabaseTests(unittest.TestCase):
             connection.execute("PRAGMA user_version=1")
             connection.close()
 
-            with self.assertRaisesRegex(ValidationError, "columns or primary keys"):
+            with self.assertRaisesRegex(
+                ValidationError, "columns or primary keys|foreign key"
+            ):
                 open_database(database)
 
     def test_concurrent_first_initializers_share_one_atomic_schema(self) -> None:

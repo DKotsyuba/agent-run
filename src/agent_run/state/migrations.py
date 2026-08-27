@@ -30,7 +30,7 @@ from typing import Iterator
 from agent_run.errors import SchemaMigrationRequired, ValidationError
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # The tables schema v1 created.  A store stamped with a version at or above 1
 # must still have all of them before any migration is allowed to touch it, so
@@ -162,18 +162,42 @@ def _snapshot(connection: sqlite3.Connection, path: Path, target: int) -> Path:
 def _apply_one(
     connection: sqlite3.Connection, path: Path, target: int, source: Path
 ) -> None:
+    """Apply one numbered migration atomically under safe SQLite rebuild settings.
+
+    The connection temporarily disables foreign-key enforcement and enables
+    legacy ALTER TABLE behavior so table renames cannot rewrite references in
+    other tables.  The migration is rolled back if execution or the explicit
+    foreign-key audit fails, and both connection settings are restored before
+    returning or raising :class:`ValidationError`.
+    """
+
     backup = _snapshot(connection, path, target)
     statements = sql_statements(source.read_text(encoding="utf-8"), source.name)
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    legacy_alter_table = int(
+        connection.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    )
     try:
-        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("PRAGMA legacy_alter_table=ON")
         try:
-            for statement in statements:
-                connection.execute(statement)
-            connection.execute(f"PRAGMA user_version={int(target)}")
-        except BaseException:
-            connection.rollback()
-            raise
-        connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    connection.execute(statement)
+                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        f"foreign_key_check found {len(violations)} violation(s)"
+                    )
+                connection.execute(f"PRAGMA user_version={int(target)}")
+            except BaseException:
+                connection.rollback()
+                raise
+            connection.commit()
+        finally:
+            connection.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
+            connection.execute(f"PRAGMA foreign_keys={foreign_keys}")
     except BaseException as error:
         raise ValidationError(
             f"state schema migration to v{target} failed and was rolled back: {error}. "

@@ -203,4 +203,4 @@ CREATE INDEX idx_workflow_steps_agent
   ON workflow_steps(agent_id)
   WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
