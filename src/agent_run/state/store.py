@@ -59,7 +59,22 @@ class StateStore:
 
     @classmethod
     def open(cls, database: str | Path) -> StateStore:
-        return cls(open_database(database))
+        """Open an existing state database, sweeping abandoned workflow runs.
+
+        Only a live process can notice that a detached workflow runner is gone,
+        so every open pays for one bounded reconciliation pass. An abandoned run
+        is flipped to ``lost`` there -- it is never silently resumed.
+        """
+
+        from .reconciliation import reconcile_workflow_runs
+
+        store = cls(open_database(database))
+        try:
+            reconcile_workflow_runs(store)
+        except BaseException:
+            store.close()
+            raise
+        return store
 
     def close(self) -> None:
         self.connection.close()
@@ -759,6 +774,9 @@ class StateStore:
 
     def start_workflow_run(self, run_id: str) -> None:
         workflow.start_workflow_run(self.connection, run_id)
+
+    def claim_workflow_run(self, run_id: str, owner_identity: str) -> None:
+        workflow.claim_workflow_run(self.connection, run_id, owner_identity)
 
     def finish_workflow_run(
         self, run_id: str, status: str, *, at: float | None = None
