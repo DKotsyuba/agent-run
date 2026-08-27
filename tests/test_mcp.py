@@ -121,6 +121,48 @@ class McpTests(unittest.TestCase):
         )
         self.assertEqual(responses[0]["result"]["capabilities"], {"tools": {"listChanged": False}})
 
+    def test_tools_list_ignores_pagination_and_other_params(self) -> None:
+        _, responses = self.run_server(
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": None}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            ]
+        )
+        expected = [
+            "start", "cancel", "steer", "status", "list_agents",
+            "summary", "transcript", "answer", "models", "limits",
+        ]
+        for response in responses:
+            self.assertEqual([tool["name"] for tool in response["result"]["tools"]], expected)
+            self.assertNotIn("nextCursor", response["result"])
+
+    def test_tools_call_tolerates_meta_but_still_enforces_name_and_arguments(self) -> None:
+        service, responses = self.run_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "limits",
+                        "arguments": {},
+                        "_meta": {"progressToken": "abc"},
+                    },
+                },
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"arguments": {}}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "limits", "arguments": "not-a-dict"},
+                },
+            ]
+        )
+        self.assertFalse(responses[0]["result"]["isError"])
+        self.assertEqual(service.calls[-1], ("limits", None))
+        self.assertEqual(responses[1]["error"]["code"], -32602)
+        self.assertEqual(responses[2]["error"]["code"], -32602)
+
     def test_all_tools_decode_to_one_service_and_serialize_safely(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workdir = Path(directory).resolve()

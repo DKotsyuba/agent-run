@@ -196,8 +196,8 @@ def _handle(service: AgentService, request: object) -> dict | None:
         elif method == "notifications/initialized":
             result = {}
         elif method == "tools/list":
-            if params:
-                return _error(request_id, -32602, "tools/list takes no params")
+            # Pagination params (e.g. cursor) are spec-legal but irrelevant: we
+            # always serve the single, complete page.
             result = {"tools": list(_TOOLS)}
         elif method == "tools/call":
             return _tool_call(service, request_id, params)
@@ -213,8 +213,8 @@ def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
     arguments = params.get("arguments", {})
     if not isinstance(name, str) or not isinstance(arguments, dict):
         return _error(request_id, -32602, "tools/call requires name and object arguments")
-    if set(params) - {"name", "arguments"}:
-        return _error(request_id, -32602, "unknown tools/call params")
+    # Tolerate standard extra fields (e.g. _meta) per JSON-RPC/MCP robustness;
+    # only name/arguments carry tool-call semantics and stay strictly checked.
     if name not in _TOOL_NAMES:
         result = _tool_error("unknown_tool", f"unknown tool: {name}")
     else:
