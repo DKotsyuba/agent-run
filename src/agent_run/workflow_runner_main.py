@@ -223,10 +223,18 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
             ready.ready()
             stop = _StopRequest()
             previous = install_signal_handlers(stop.request)
-            service = AgentService.from_home(home, launch=_launch_callback(home))
+            launch = _launch_callback(home)
+            service = AgentService.from_home(home, launch=launch)
             try:
                 log_path = _run_directory(home, run_id) / "runner.log"
-                executor = make_step_executor(home, store, run_id, service=service, stop=stop)
+                executor = make_step_executor(
+                    home,
+                    store,
+                    run_id,
+                    service=service,
+                    service_factory=lambda: AgentService.from_home(home, launch=launch),
+                    stop=stop,
+                )
                 outcome = run_script(
                     plan["script"],
                     executor,
