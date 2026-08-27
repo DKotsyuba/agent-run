@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from agent_run.state import (
     open_database,
 )
 from agent_run.state.migrations import pending_files
+from agent_run.state.migrations import _apply_one
+from agent_run.state.store import StateStore
 
 # The byte-for-byte schema.sql that shipped as v1, kept so these tests migrate a
 # real v1 store rather than a hand-rolled approximation of one.
@@ -79,12 +82,52 @@ def _scalar(path: Path, sql: str) -> object:
 
 
 def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    """Return every application table/index with deliberately normalized SQL.
+
+    Whitespace and SQLite-added identifier quotes are ignored, while all other
+    CREATE text remains significant so foreign-key targets cannot drift.
+    """
+
+    def normalized(sql: object) -> str:
+        """Normalize insignificant CREATE-SQL whitespace and identifier quotes."""
+
+        text = re.sub(r'"([A-Za-z_][A-Za-z0-9_]*)"', r"\1", str(sql or ""))
+        return " ".join(text.split())
+
     return sorted(
-        (str(row[0]), str(row[1]), str(row[2] or ""))
+        (str(row[0]), str(row[1]), normalized(row[2]))
         for row in connection.execute(
-            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            """SELECT type, name, sql FROM sqlite_master
+               WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"""
         )
     )
+
+
+def _build_poisoned_v5_store(path: Path, run_id: str) -> None:
+    """Create a v5 store whose workflow foreign keys name a dropped rebuild table."""
+
+    connection = initialize_database(path)
+    try:
+        connection.execute(
+            """INSERT INTO workflow_runs
+               (id, name, script_sha, status, owner_pid_identity, created_at)
+               VALUES (?, 'flow', 'sha', 'running', '999999 dead-owner', 1.0)""",
+            (run_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migration_five = dict(pending_files())[5]
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA legacy_alter_table=OFF")
+        connection.executescript(migration_five.read_text(encoding="utf-8"))
+        connection.execute("PRAGMA user_version=5")
+        connection.commit()
+    finally:
+        connection.close()
 
 
 class MigrationRegistryTests(unittest.TestCase):
@@ -93,6 +136,56 @@ class MigrationRegistryTests(unittest.TestCase):
             [version for version, _ in pending_files()],
             list(range(2, SCHEMA_VERSION + 1)),
         )
+
+    def test_foreign_key_check_is_clean_after_each_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            _build_v1_store(database)
+            connection = sqlite3.connect(database, isolation_level=None)
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA legacy_alter_table=OFF")
+                for target, source in pending_files():
+                    _apply_one(connection, database, target, source)
+                    self.assertEqual(
+                        connection.execute("PRAGMA foreign_key_check").fetchall(), []
+                    )
+                    self.assertEqual(
+                        connection.execute("PRAGMA foreign_keys").fetchone()[0], 1
+                    )
+                    self.assertEqual(
+                        connection.execute("PRAGMA legacy_alter_table").fetchone()[0],
+                        0,
+                    )
+            finally:
+                connection.close()
+
+    def test_open_repairs_poisoned_v5_store_before_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            run_id = "wf_poisoned"
+            _build_poisoned_v5_store(database, run_id)
+
+            store = StateStore.open(database)
+            try:
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
+                    ).fetchone()[0],
+                    "lost",
+                )
+                store.connection.execute(
+                    """INSERT INTO workflow_steps
+                       (run_id, step_key, spec_json, status)
+                       VALUES (?, 'step', '{}', 'pending')""",
+                    (run_id,),
+                )
+                store.connection.commit()
+                self.assertEqual(
+                    store.connection.execute("PRAGMA foreign_key_check").fetchall(), []
+                )
+            finally:
+                store.close()
 
 
 class V1UpgradeTests(unittest.TestCase):
