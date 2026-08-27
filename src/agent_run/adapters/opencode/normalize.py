@@ -253,6 +253,7 @@ def normalize_outcome(
     *,
     runtime_session_id: str | None = None,
     cancelled: bool = False,
+    refused: bool = False,
 ) -> Outcome:
     """Map a session record's ``outcome`` to exactly one terminal Outcome.
 
@@ -270,6 +271,12 @@ def normalize_outcome(
     message (or no settled message at all) after that call is a
     cancellation, never a raised "indeterminate" error. Ignored when
     ``outcome`` is present -- the server already told us.
+
+    ``refused`` carries the same kind of local fact for the other silent
+    ending: this adapter's broker rejected a permission, and v1 answers a
+    rejection by interrupting the tool and closing the turn with no assistant
+    text and no message-level error (proven live). Without it that shape is
+    indeterminate and raises.
     """
 
     if not isinstance(info, Mapping):
@@ -286,7 +293,7 @@ def normalize_outcome(
         )
     if raw is not None:
         raise ValidationError(f"opencode session outcome is not terminal: {raw!r}")
-    status, kind, text = _infer_settled_outcome(payload, cancelled=cancelled)
+    status, kind, text = _infer_settled_outcome(payload, cancelled=cancelled, refused=refused)
     return Outcome(
         status=status,
         failure_kind=kind,
@@ -305,6 +312,32 @@ def normalize_outcome(
 #: argument -- what the adapter already knows it did, not a guess from
 #: message shape -- is what actually carries the interrupt signal for v1.
 _ABORTED_ERROR = "MessageAbortedError"
+
+#: Failure kind for a turn this adapter's own permission broker killed.
+REFUSED_KIND = "permission_rejected"
+
+
+def _interrupted_tool_text(message: Mapping[str, object]) -> str | None:
+    """The message of the tool call a rejected permission interrupted.
+
+    Proven live on v1 1.18.18: replying ``reject`` leaves the tool part as
+    ``{"state": {"status": "error", "error": {"type": "unknown", "message":
+    "Tool execution interrupted"}}}`` and ends the turn with no assistant
+    text at all -- so this is the only detail there is to report.
+    """
+
+    for part in reversed(_sequence(message.get("content"))):
+        if not isinstance(part, Mapping):
+            continue
+        state = part.get("state")
+        if not isinstance(state, Mapping) or state.get("status") != "error":
+            continue
+        error = state.get("error")
+        if isinstance(error, Mapping):
+            return _error_detail(error)[1]
+        if isinstance(error, str) and error.strip():
+            return error
+    return None
 
 
 def _error_detail(error: Mapping[str, object]) -> tuple[str, str | None]:
@@ -343,7 +376,10 @@ def _last_error(
 
 
 def _infer_settled_outcome(
-    payload: Mapping[str, object] | Sequence[object], *, cancelled: bool = False
+    payload: Mapping[str, object] | Sequence[object],
+    *,
+    cancelled: bool = False,
+    refused: bool = False,
 ) -> tuple[AgentStatus, str | None, str | None]:
     """Derive success/failure/cancellation when the session record carries no
     ``outcome`` at all -- the only path on v1 1.18.18, and the fallback for a
@@ -369,6 +405,8 @@ def _infer_settled_outcome(
     if not messages or messages[0].get("type") != "assistant":
         if cancelled:
             return AgentStatus.CANCELLED, None, None
+        if refused:
+            return AgentStatus.FAILED, REFUSED_KIND, None
         raise ValidationError("opencode session outcome is not terminal: None")
     latest = messages[0]
     error = latest.get("error")
@@ -381,6 +419,8 @@ def _infer_settled_outcome(
         return AgentStatus.SUCCEEDED, None, None
     if cancelled:
         return AgentStatus.CANCELLED, None, None
+    if refused:
+        return AgentStatus.FAILED, REFUSED_KIND, _interrupted_tool_text(latest)
     raise ValidationError("opencode session outcome is not terminal: None")
 
 
