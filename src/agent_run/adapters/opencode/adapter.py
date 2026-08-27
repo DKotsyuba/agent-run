@@ -61,6 +61,7 @@ from .service import (
     attach_service,
     build_service_plan,
     resolve_environment_names,
+    skills_root_for,
 )
 
 
@@ -131,17 +132,8 @@ SUBAGENT_PERMISSION: tuple[tuple[str, str], ...] = (
 )
 
 _SCHEMA_KEYS = frozenset(
-    {
-        "$schema",
-        "title",
-        "description",
-        "type",
-        "properties",
-        "required",
-        "items",
-        "enum",
-        "additionalProperties",
-    }
+    {"$schema", "title", "description", "type", "properties", "required",
+     "items", "enum", "additionalProperties"}
 )
 # --- generated config ----------------------------------------------------
 
@@ -192,6 +184,7 @@ def render_config(
     config: RuntimeConfig,
     mcp_servers: Mapping[str, McpConfig],
     *,
+    skills_root: Path,
     inherited_environment: Mapping[str, str] | None = None,
 ) -> str:
     """Render the generated v1 stable service config as exact bytes-to-be.
@@ -202,8 +195,10 @@ def render_config(
     ``options`` (not ``package`` + ``settings``); a provider's model entry
     carries ``id`` (not ``modelID``); agents live under singular ``agent``
     with a flat ``permission`` object (kind -> "allow"/"ask"/"deny"), not a
-    list of ``{action, resource, effect}``; ``skills`` is ``{"paths": [...]}``,
-    not a bare array; and ``mcp`` maps server name directly to its definition
+    list of ``{action, resource, effect}``; ``skills`` is ``{"paths": [...]}``
+    of absolute dirs scanned for ``**/SKILL.md`` -- a bare name resolves
+    against the session workdir and is dropped; and ``mcp`` maps a name to its
+    definition
     (no ``"servers"`` wrapper), with ``enabled`` (not ``disabled``).
     """
 
@@ -241,7 +236,7 @@ def render_config(
                 "permission": dict(SUBAGENT_PERMISSION),
             },
         },
-        "skills": {"paths": list(config.skills)},
+        "skills": {"paths": [str(skills_root / name) for name in config.skills]},
         "mcp": _mcp_servers(config, mcp_servers, inherited),
     }
     # Key order is meaningful here: permission entries are read in this order.
@@ -327,12 +322,9 @@ class OpenCodeAdapter:
         """Render the generated service config; nothing outside home is touched."""
 
         self.validate(config)
-        if skills_root is None:
-            skills_root = Path(home)
-        if not isinstance(skills_root, Path) or not skills_root.is_absolute():
-            raise ValidationError("opencode skills_root must be absolute")
         content = render_config(
-            config, mcp_servers, inherited_environment=inherited_environment
+            config, mcp_servers, skills_root=skills_root_for(home, skills_root),
+            inherited_environment=inherited_environment,
         )
         return write_managed_file(home, CONFIG_RELATIVE_PATH, content)
 
@@ -387,7 +379,10 @@ class OpenCodeAdapter:
         _check_request(request, profile, config)
         inherited = os.environ if inherited_environment is None else inherited_environment
         descriptor = attach_service(home, Path(home) / CONFIG_RELATIVE_PATH)
-        rendered = render_config(config, mcp_servers, inherited_environment=inherited)
+        rendered = render_config(
+            config, mcp_servers, skills_root=skills_root_for(home),
+            inherited_environment=inherited,
+        )
         if content_hash(rendered) != descriptor.config_hash:
             raise ServiceIsolationError(
                 "the running opencode service was proven with a different generated "

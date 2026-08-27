@@ -454,6 +454,24 @@ def generated_config_path(home: str | Path) -> Path:
     return _service_root(home) / CONFIG_RELATIVE_PATH
 
 
+def skills_root_for(home: str | Path, skills_root: str | Path | None = None) -> Path:
+    """Where this runtime's physical skill copies live, as an absolute path.
+
+    v1 resolves every ``skills.paths`` entry against the *session* directory, so
+    a bare skill name is looked up under the agent's workdir, logged as "skill
+    path not found", and silently dropped. The generated config therefore has to
+    carry absolute directories, and ``prepare`` must derive the same ones the
+    materialized config was rendered with or its hash check refuses the service.
+    """
+
+    if skills_root is None:
+        return _service_root(home).parent.parent.parent / "skills" / "opencode"
+    path = Path(skills_root)
+    if not path.is_absolute():
+        raise ValidationError("opencode skills_root must be absolute")
+    return path
+
+
 @dataclass(frozen=True)
 class ServiceStart:
     """The proven service this call owns, and whether it was already live."""

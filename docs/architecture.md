@@ -576,6 +576,30 @@ MCP, skill paths, and lifecycle hooks:
   spawned — TERM, bounded wait, KILL — when any of that fails.
 - Set `OPENCODE_DISABLE_CLAUDE_CODE=1`.
 - Generate roles, skills, MCP, and provider routes only from agent-run config.
+- `skills.paths` carries **absolute directories** of the materialized skill
+  copies (`<home>/skills/opencode/<name>`), never bare names: v1 resolves each
+  entry against the *session* directory, so a bare name is looked up under the
+  agent's workdir, logged as `skill path not found`, and silently dropped.
+  `materialize` and `prepare` must derive the same root or the config-hash
+  check refuses the proven service.
+- **Known v1 1.18.18 gap — MCP tools never reach a v2 prompt.** The generated
+  `mcp` block is correct and the server connects (`GET /mcp` reports
+  `connected` and spawns the child), but a turn admitted through
+  `POST /api/session/{id}/prompt` resolves zero MCP clients: no MCP tool, and
+  not even `list_mcp_resources`, is offered to the model, and the prompt never
+  spawns an MCP child. Proven live on one service, one config, one agent:
+  prompting the same session through the legacy
+  `POST /session/{id}/prompt_async?directory=<workdir>` yields all 65
+  `agent_lsp_*` tools (19.9k prompt tokens) while the v2 prompt yields five
+  built-ins (~2k). Ruled out as causes: agent `tools` map with an
+  `agent_lsp*` wildcard, permission entries (v1 only hides a tool whose rule is
+  `deny` at pattern `*`), warming `GET /mcp?directory=<workdir>` first, the
+  stock `build` agent, both directory scopes, a second turn in a warm session,
+  and an extra `?directory=` on the v2 prompt. No generated-config shape
+  changes it; the ways out are an opencode upgrade or moving the whole
+  prompt/read/permission pipeline onto the legacy endpoints — which have no
+  per-session permission-list endpoint, so the broker would need the SSE event
+  stream first.
 - Auto-reject every interactive permission except a one-time
   `external_directory` grant fully contained by normalized read roots.
 - Poll message state; do not use the long `wait` endpoint and do not pipe large
