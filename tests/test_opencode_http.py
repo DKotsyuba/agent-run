@@ -119,7 +119,10 @@ class AuthenticationTests(ClientCase):
     def test_live_client_refuses_missing_or_blank_password(self):
         for environment in ({}, {PASSWORD_ENV: "   "}):
             with self.subTest(environment=environment):
-                with mock.patch.dict(os.environ, environment, clear=True):
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch(
+                    "agent_run.adapters.opencode.service.keychain_server_password",
+                    return_value=None,
+                ):
                     with self.assertRaises(ValidationError) as caught:
                         OpenCodeHttpClient("http://127.0.0.1:41777", self.directory)
                 self.assertEqual(

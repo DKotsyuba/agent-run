@@ -9,6 +9,8 @@ endpoint, the generated homes, and the hash of the generated config file.
 
 from __future__ import annotations
 
+from agent_run.adapters.opencode.password import keychain_server_password
+
 import json
 import os
 import re
@@ -65,9 +67,15 @@ class ServiceIsolationError(ValidationError):
 
 
 def require_server_password(value: str | None = None) -> str:
-    """Return the managed-service password without persisting it."""
+    """Return the managed-service password without persisting or exposing it.
+
+    An explicit nonblank environment value wins. Otherwise the per-process
+    cached Keychain lookup is used; failures keep the existing isolation error.
+    """
 
     candidate = os.environ.get(PASSWORD_ENV) if value is None else value
+    if not isinstance(candidate, str) or not candidate.strip():
+        candidate = keychain_server_password()
     if not isinstance(candidate, str) or not candidate.strip():
         raise ServiceIsolationError(f"{PASSWORD_ENV} must be set to a nonblank value")
     return candidate
