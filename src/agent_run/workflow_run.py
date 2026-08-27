@@ -91,13 +91,18 @@ def start_workflow(
     """
 
     nonblank("workflow name", name)
-    steps = validate_plan(plan)
-    plan_payload = [dict(step) for step in steps]
+    if isinstance(plan, Mapping) and set(plan) == {"script"} and isinstance(plan["script"], str):
+        plan_payload: object = {"script": plan["script"]}
+        digest = plan_sha(({"script": plan["script"]},))
+    else:
+        steps = validate_plan(plan)
+        plan_payload = [dict(step) for step in steps]
+        digest = plan_sha(steps)
     root = agent_run_home(home)
     database = state_db_path(root)
     store = StateStore.open(database)
     try:
-        run_id = store.create_workflow_run(name, plan_sha(steps), plan=plan_payload)
+        run_id = store.create_workflow_run(name, digest, plan=plan_payload)
     finally:
         store.close()
 

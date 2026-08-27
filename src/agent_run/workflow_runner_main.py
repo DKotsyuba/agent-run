@@ -158,10 +158,43 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
 
 def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None:
     run_id = _text(payload, "run_id")
-    steps = validate_plan(payload.get("plan"))
     resume = bool(payload.get("resume", False))
     store = StateStore.open(state_db_path(home))
     try:
+        plan = payload.get("plan")
+        if isinstance(plan, Mapping) and set(plan) == {"script"} and isinstance(plan["script"], str):
+            from agent_run.cli import _launch_callback
+            from agent_run.service import AgentService
+            from agent_run.workflow_executor import make_step_executor
+            from agent_run.workflow_script import run_script
+
+            if resume:
+                store.resume_workflow_run(run_id, runner_identity())
+            else:
+                store.claim_workflow_run(run_id, runner_identity())
+            ready.ready()
+            stop = _StopRequest()
+            previous = install_signal_handlers(stop.request)
+            service = AgentService.from_home(home, launch=_launch_callback(home))
+            try:
+                executor = make_step_executor(home, store, run_id, service=service, stop=stop)
+                outcome = run_script(
+                    plan["script"], executor, lambda _name: None, lambda _text: None, 4
+                )
+                store.finish_workflow_run(
+                    run_id,
+                    "cancelled"
+                    if stop.requested
+                    else "failed"
+                    if executor.failed
+                    or (isinstance(outcome, Mapping) and "failure_kind" in outcome)
+                    else "succeeded",
+                )
+            finally:
+                service.close()
+                restore_signal_handlers(previous)
+            return
+        steps = validate_plan(plan)
         execute_plan(
             store, run_id, steps, identity=runner_identity(), ready=ready, resume=resume
         )
