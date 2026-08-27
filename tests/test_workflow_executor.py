@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -136,21 +137,68 @@ class WorkflowExecutorTests(unittest.TestCase):
         self.assertEqual(result["failure_kind"], "step_output_invalid")
         self.assertEqual(result["failure_params"]["raw_answer"], "not json")
 
-    def test_worker_threads_use_their_own_connections_and_journal_rows(self) -> None:
-        """Persist successful executor rows when parallel workers invoke it."""
+    def test_worker_threads_use_thread_owned_services_and_journal_rows(self) -> None:
+        """Persist parallel rows through distinct worker services, not the owner one."""
 
-        executor = self.executor(_Service(AgentStatus.SUCCEEDED, "ok"))
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(
-                pool.map(
-                    lambda item: executor(item, self.spec(task=item)),
-                    ("thread-one", "thread-two"),
-                )
-            )
+        owner_service = _Service(AgentStatus.SUCCEEDED, "owner")
+        created: list[_Service] = []
+
+        def service_factory() -> _Service:
+            """Create and retain a terminal service fake for one worker thread."""
+
+            service = _Service(AgentStatus.SUCCEEDED, "ok")
+            created.append(service)
+            return service
+
+        executor = self.executor(owner_service, service_factory=service_factory)
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(3)
+
+        def worker(step_key: str) -> None:
+            """Synchronize then execute one independent workflow step."""
+
+            try:
+                barrier.wait()
+                results.append(executor(step_key, self.spec(task=step_key)))
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=worker, args=(step_key,))
+            for step_key in ("thread-one", "thread-two")
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
         self.assertEqual([result["status"] for result in results], ["succeeded"] * 2)
+        self.assertEqual(len(created), 2)
+        self.assertEqual(len({id(service) for service in created}), 2)
+        self.assertEqual(owner_service.requests, [])
         report = self.store.workflow_run_status(self.run_id)
         self.assertEqual(len(report["steps"]), 2)
         self.assertEqual({step["status"] for step in report["steps"]}, {"succeeded"})
+
+    def test_owner_thread_uses_injected_service_without_factory_call(self) -> None:
+        """Keep owner-thread execution bound to the original injected service."""
+
+        owner_service = _Service(AgentStatus.SUCCEEDED, "ok")
+        factory_calls: list[bool] = []
+
+        def service_factory() -> _Service:
+            """Fail if owner-thread execution tries to create a worker service."""
+
+            factory_calls.append(True)
+            return _Service(AgentStatus.SUCCEEDED, "unexpected")
+
+        executor = self.executor(owner_service, service_factory=service_factory)
+        result = executor("owner-thread", self.spec())
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(len(owner_service.requests), 1)
 
 
 if __name__ == "__main__":

@@ -148,12 +148,17 @@ class WorkflowStepExecutor:
         run_id: str,
         *,
         service: AgentService,
+        service_factory: Callable[[], AgentService] | None = None,
         stop: _Stop | None = None,
         poll_seconds: float = POLL_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        """Bind execution to one run and injectable service/time dependencies."""
+        """Bind execution to one run and injectable service/time dependencies.
+
+        ``service_factory`` creates one service per non-owner calling thread;
+        absent a factory, callers retain the injected service behavior.
+        """
 
         self._home = Path(home).resolve()
         self._owner_thread_id = threading.get_ident()
@@ -162,6 +167,7 @@ class WorkflowStepExecutor:
         self._thread_local = threading.local()
         self._run_id = run_id
         self._service = service
+        self._service_factory = service_factory
         self._stop = stop
         self._poll_seconds = poll_seconds
         self._monotonic = monotonic
@@ -179,6 +185,24 @@ class WorkflowStepExecutor:
             store = StateStore.open(self._database_path)
             self._thread_local.store = store
         return store
+
+    def _service_for_caller(self) -> AgentService:
+        """Return the owner service or this worker thread's lazily built service.
+
+        Worker services are retained in thread-local storage for the lifetime of
+        their threads. Without a factory, the injected service is returned for
+        backward-compatible single-threaded use.
+        """
+
+        if threading.get_ident() == self._owner_thread_id:
+            return self._service
+        service = getattr(self._thread_local, "service", None)
+        if service is None:
+            if self._service_factory is None:
+                return self._service
+            service = self._service_factory()
+            self._thread_local.service = service
+        return service
 
     def __call__(self, step_key: str, spec: dict[str, object]) -> dict[str, object]:
         """Execute and journal one spec, converting executor errors to failed results.
@@ -206,7 +230,7 @@ class WorkflowStepExecutor:
         except ValidationError as error:
             return self._fail(step_key, "step_spec_invalid", {"message": str(error)})
         try:
-            started = self._service.start(request)
+            started = self._service_for_caller().start(request)
         except BaseException as error:
             return self._fail(step_key, "step_start_failed", {"exception": repr(error)})
         agent_id = str(started.agent_id)
@@ -226,7 +250,7 @@ class WorkflowStepExecutor:
                         "step_timeout",
                         {"agent_id": agent_id, "timeout_seconds": request.timeout_seconds},
                     )
-                agent = self._service.get(agent_id)
+                agent = self._service_for_caller().get(agent_id)
                 status = getattr(agent.status, "value", agent.status)
                 if status in {item.value for item in AgentStatus if item not in {AgentStatus.CREATED, AgentStatus.STARTING, AgentStatus.RUNNING, AgentStatus.CANCELLING}}:
                     return self._terminal(step_key, agent_id, str(status), request.output_schema, agent)
@@ -240,7 +264,7 @@ class WorkflowStepExecutor:
         """Persist a terminal service view, validating successful inline output."""
 
         result: dict[str, object] = {"agent_id": agent_id, "status": status}
-        answer = self._service.answer(agent_id)
+        answer = self._service_for_caller().answer(agent_id)
         if getattr(answer, "available", False) and getattr(answer, "content", None) is not None:
             result["answer"] = answer.content
         if status == AgentStatus.SUCCEEDED.value:
@@ -285,7 +309,7 @@ class WorkflowStepExecutor:
         """Best-effort enqueue of the service cancellation command for one agent."""
 
         try:
-            self._service.cancel(agent_id)
+            self._service_for_caller().cancel(agent_id)
         except BaseException:
             pass
 
@@ -296,8 +320,20 @@ def make_step_executor(
     run_id: str,
     *,
     service: AgentService,
+    service_factory: Callable[[], AgentService] | None = None,
     stop: _Stop | None = None,
 ) -> WorkflowStepExecutor:
-    """Create the callable that ``run_script`` invokes for this workflow run."""
+    """Create the callable that ``run_script`` invokes for this workflow run.
 
-    return WorkflowStepExecutor(home, store, run_id, service=service, stop=stop)
+    ``service_factory`` optionally supplies thread-owned worker services while
+    the injected ``service`` remains reserved for the creating thread.
+    """
+
+    return WorkflowStepExecutor(
+        home,
+        store,
+        run_id,
+        service=service,
+        service_factory=service_factory,
+        stop=stop,
+    )
