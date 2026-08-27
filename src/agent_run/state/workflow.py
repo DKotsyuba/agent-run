@@ -96,6 +96,35 @@ def start_workflow_run(connection: sqlite3.Connection, run_id: str) -> None:
         )
 
 
+def claim_workflow_run(
+    connection: sqlite3.Connection, run_id: str, owner_identity: str
+) -> None:
+    """Take durable ownership of a created run and start it, in one transaction.
+
+    The detached runner may report READY only after this returns: an owner
+    identity that outlives the process is exactly what lets reconciliation flip
+    an abandoned run to ``lost`` instead of silently resuming it.  A run some
+    other identity already owns is refused -- ownership is never stolen.
+    """
+
+    nonblank("run_id", run_id)
+    nonblank("owner_identity", owner_identity)
+    with immediate(connection):
+        run = _run_row(connection, run_id)
+        owner = run["owner_pid_identity"]
+        if owner is not None and owner != owner_identity:
+            raise StateTransitionError(f"workflow run is already owned: {owner}")
+        if run["status"] != "created":
+            raise StateTransitionError(
+                f"workflow run cannot start from status: {run['status']}"
+            )
+        connection.execute(
+            """UPDATE workflow_runs SET status = 'running', owner_pid_identity = ?
+               WHERE id = ?""",
+            (owner_identity, run_id),
+        )
+
+
 def finish_workflow_run(
     connection: sqlite3.Connection,
     run_id: str,
