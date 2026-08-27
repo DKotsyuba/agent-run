@@ -661,24 +661,41 @@ MCP, skill paths, and lifecycle hooks:
   agent's workdir, logged as `skill path not found`, and silently dropped.
   `materialize` and `prepare` must derive the same root or the config-hash
   check refuses the proven service.
-- **Known v1 1.18.18 gap — MCP tools never reach a v2 prompt.** The generated
+- **Known v1 gap — MCP tools never reach a v2 prompt (T051).** The generated
   `mcp` block is correct and the server connects (`GET /mcp` reports
   `connected` and spawns the child), but a turn admitted through
   `POST /api/session/{id}/prompt` resolves zero MCP clients: no MCP tool, and
   not even `list_mcp_resources`, is offered to the model, and the prompt never
-  spawns an MCP child. Proven live on one service, one config, one agent:
-  prompting the same session through the legacy
-  `POST /session/{id}/prompt_async?directory=<workdir>` yields all 65
-  `agent_lsp_*` tools (19.9k prompt tokens) while the v2 prompt yields five
-  built-ins (~2k). Ruled out as causes: agent `tools` map with an
-  `agent_lsp*` wildcard, permission entries (v1 only hides a tool whose rule is
-  `deny` at pattern `*`), warming `GET /mcp?directory=<workdir>` first, the
-  stock `build` agent, both directory scopes, a second turn in a warm session,
-  and an extra `?directory=` on the v2 prompt. No generated-config shape
-  changes it; the ways out are an opencode upgrade or moving the whole
-  prompt/read/permission pipeline onto the legacy endpoints — which have no
-  per-session permission-list endpoint, so the broker would need the SSE event
-  stream first.
+  spawns an MCP child. The same session prompted through the legacy
+  `POST /session/{id}/prompt_async?directory=<workdir>` resolves MCP normally.
+  Ruled out as causes: agent `tools` map with an `agent_lsp*` wildcard,
+  permission entries (v1 only hides a tool whose rule is `deny` at pattern
+  `*`), warming `GET /mcp?directory=<workdir>` first, the stock `build` agent,
+  both directory scopes, a second turn in a warm session, an extra
+  `?directory=` on the v2 prompt, creating the session through the legacy
+  `POST /session?directory=` endpoint, and a stock config with no custom agent
+  at all. **No opencode version fixes it:** probed live on 1.18.18 through
+  1.18.23 (`latest`), every one broken on v2 and working on legacy.
+- The same v2 prompt path also ignores the agent's `permission` map when
+  building the tool list — it offers `bash`/`edit`/`write` that the generated
+  agent denies. It still **refuses to execute** them (proven live by driving a
+  denied `bash` call: nothing ran, no ask was raised), so the read-only
+  isolation invariant holds; the offered list is misleading, not permissive.
+  Both symptoms look like one root cause: the v2 prompt runs the turn without
+  resolving the config-derived agent or its MCP clients.
+- The two endpoint families are **disjoint scopes**: a turn is only visible
+  through the family that admitted it, and `GET /api/session/active` never
+  reports a legacy turn. So a partial move of just the prompt call is not
+  viable — prompt, message list and permissions have to move together.
+- Correction to an earlier claim recorded here: the legacy family **does** have
+  a pollable permission list, `GET /permission?directory=<workdir>`, replied to
+  through `POST /permission/{id}/reply?directory=` with the same body the
+  broker already builds. A switch would **not** need the SSE event stream
+  first. Measured cost, surface inventory and the recommendation live in
+  [`opencode-legacy-pipeline-design.md`](opencode-legacy-pipeline-design.md);
+  the stock-config upstream repro is in
+  [`upstream-opencode-v2-prompt-mcp.md`](upstream-opencode-v2-prompt-mcp.md).
+  Current decision: keep the v2 pipeline, file upstream, do not migrate.
 - Auto-reject every interactive permission except a one-time
   `external_directory` grant fully contained by normalized read roots.
 - Poll message state; do not use the long `wait` endpoint and do not pipe large
