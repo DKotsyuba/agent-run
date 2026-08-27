@@ -219,6 +219,14 @@ def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME)
                     if not isinstance(item, str):
                         raise ValidationError("raw PostToolUse agent_id must be a string")
                     agent_ids.add(item)
+                elif key == "text" and isinstance(item, str):
+                    # Claude Code's MCP envelope may carry the id only as a
+                    # JSON-encoded content block (tool_response.content[*].text)
+                    # rather than structuredContent; decode and keep searching.
+                    try:
+                        pending.append(json.loads(item))
+                    except ValueError:
+                        pass
                 else:
                     pending.append(item)
         elif isinstance(value, list):
