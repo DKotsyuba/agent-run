@@ -65,6 +65,14 @@ class WorkflowStoreTests(unittest.TestCase):
         self.assertEqual(status["run"]["status"], "succeeded")
         self.assertEqual(status["run"]["finished_at"], 2)
 
+    def test_finish_persists_the_workflow_result(self) -> None:
+        """Round-trip a JSON-safe script result through the run row."""
+
+        run_id = self.running_run()
+        self.store.finish_workflow_run(run_id, "succeeded", result={"ok": [1, 2]})
+        row = self.store.workflow_run_status(run_id)["run"]
+        self.assertEqual(json.loads(row["result_json"]), {"ok": [1, 2]})
+
     def test_finished_run_refuses_new_steps_and_unstarted_run_refuses_steps(self) -> None:
         run_id = self.store.create_workflow_run("wf", "sha-1", at=1)
         key = step_key({"op": "noop"}, 0)

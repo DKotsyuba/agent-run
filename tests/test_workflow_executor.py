@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -134,6 +135,22 @@ class WorkflowExecutorTests(unittest.TestCase):
         )
         self.assertEqual(result["failure_kind"], "step_output_invalid")
         self.assertEqual(result["failure_params"]["raw_answer"], "not json")
+
+    def test_worker_threads_use_their_own_connections_and_journal_rows(self) -> None:
+        """Persist successful executor rows when parallel workers invoke it."""
+
+        executor = self.executor(_Service(AgentStatus.SUCCEEDED, "ok"))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda item: executor(item, self.spec(task=item)),
+                    ("thread-one", "thread-two"),
+                )
+            )
+        self.assertEqual([result["status"] for result in results], ["succeeded"] * 2)
+        report = self.store.workflow_run_status(self.run_id)
+        self.assertEqual(len(report["steps"]), 2)
+        self.assertEqual({step["status"] for step in report["steps"]}, {"succeeded"})
 
 
 if __name__ == "__main__":

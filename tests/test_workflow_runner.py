@@ -17,7 +17,13 @@ from agent_run.launch import launch_detached
 from agent_run.paths import state_db_path
 from agent_run.state import StateStore, step_key, workflow_owner_identity
 from agent_run.workflow_run import plan_sha, resume_workflow, start_workflow, validate_plan
-from agent_run.workflow_runner_main import execute_plan, runner_identity
+from agent_run.workflow_runner_main import (
+    _append_runner_log,
+    _run_directory,
+    _stored_result,
+    execute_plan,
+    runner_identity,
+)
 
 
 # A pid that cannot be running this command: reconciliation must lose its run
@@ -80,6 +86,36 @@ class PlanValidationTests(unittest.TestCase):
             plan_sha(steps),
             plan_sha(validate_plan([{"kind": "sleep", "seconds": 1, "key_hint": "b"}])),
         )
+
+    def test_empty_script_is_refused_before_launch_or_persistence(self) -> None:
+        """Reject whitespace-only scripts before creating a run or launching."""
+
+        with tempfile.TemporaryDirectory() as temporary, mock.patch(
+            "agent_run.workflow_run.launch_detached"
+        ) as launch:
+            with self.assertRaisesRegex(ValidationError, "must not be empty"):
+                start_workflow(temporary, "blank", {"script": " \n\t"})
+            launch.assert_not_called()
+            self.assertFalse(state_db_path(Path(temporary)).exists())
+
+    def test_runner_sinks_and_oversized_results_use_private_files(self) -> None:
+        """Write timestamped sink lines and spool oversized result JSON privately."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            directory = _run_directory(home, "wf_test")
+            log_path = directory / "runner.log"
+            _append_runner_log(log_path, "phase", "build")
+            _append_runner_log(log_path, "log", "hello")
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                [line.split(" ", 2)[1:] for line in lines],
+                [["phase", "build"], ["log", "hello"]],
+            )
+            stored = _stored_result(home, "wf_test", "x" * (1024 * 1024))
+            self.assertIn("spool_path", stored)
+            self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
 
 
 class RunnerLoopTests(unittest.TestCase):

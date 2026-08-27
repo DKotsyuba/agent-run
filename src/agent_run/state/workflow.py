@@ -191,20 +191,22 @@ def finish_workflow_run(
     run_id: str,
     status: str,
     *,
+    result: object = None,
     at: float | None = None,
 ) -> None:
-    """Commit a terminal workflow state and its bound notice atomically."""
+    """Commit a terminal workflow state, JSON result, and notice atomically."""
 
     nonblank("run_id", run_id)
     if status not in RUN_TERMINAL:
         raise ValidationError(f"workflow run status must be one of {sorted(RUN_TERMINAL)}")
     finished_at = timestamp(at)
+    result_json = json_text(result)
     with immediate(connection):
         _run_row(connection, run_id)
         updated = connection.execute(
-            """UPDATE workflow_runs SET status = ?, finished_at = ?
+            """UPDATE workflow_runs SET status = ?, finished_at = ?, result_json = ?
                WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')""",
-            (status, finished_at, run_id),
+            (status, finished_at, result_json, run_id),
         ).rowcount
         if updated != 1:
             raise StateTransitionError("workflow run is already finished")

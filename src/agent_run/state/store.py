@@ -887,9 +887,13 @@ class StateStore:
         workflow.resume_workflow_run(self.connection, run_id, owner_identity)
 
     def finish_workflow_run(
-        self, run_id: str, status: str, *, at: float | None = None
+        self, run_id: str, status: str, *, result: object = None, at: float | None = None
     ) -> None:
-        workflow.finish_workflow_run(self.connection, run_id, status, at=at)
+        """Persist a terminal workflow status and optional JSON-safe result."""
+
+        workflow.finish_workflow_run(
+            self.connection, run_id, status, result=result, at=at
+        )
 
     def record_step_start(
         self,
