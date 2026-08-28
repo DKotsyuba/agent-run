@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: Orchestrate multi-step, multi-family agent runs through the agent-run workflow engine — deterministic Python scripts with phases, parallel fan-out, and pipelines over codex/claude/opencode children, journaled and survivable across orchestrator sessions. Use when a delegation has two or more dependent stages, a fan-out plus verification, or must outlive the session; on the words «воркфлоу», «запусти цепочку», «фан-аут с проверкой», "workflow", "fan out and verify". For one job use agent-run start; for one flat parallel batch use batch.
+description: Orchestrate multi-step, multi-family agent runs through the agent-run workflow engine — deterministic Python scripts with phases, parallel fan-out, and pipelines over codex/claude/qwen children, journaled and survivable across orchestrator sessions. Use when a delegation has two or more dependent stages, a fan-out plus verification, or must outlive the session; on the words «воркфлоу», «запусти цепочку», «фан-аут с проверкой», "workflow", "fan out and verify". For one job use agent-run start; for one flat parallel batch use batch.
 ---
 
 # Running agent-run workflows
@@ -40,7 +40,7 @@ Example (fan across three families, verify one answer):
 ```python
 phase("fan")
 results = parallel([
-    lambda: agent({"runtime": "opencode", "model": "omniroute/MiniMaxM3",
+    lambda: agent({"runtime": "qwen", "model": "opencode/MiniMaxM3",
                    "profile": "review", "task": "...", "workdir": WORK}),
     lambda: agent({"runtime": "claude", "model": "sonnet",
                    "profile": "review", "task": "...", "workdir": WORK}),
@@ -51,7 +51,7 @@ results = parallel([
 phase("verify")
 oks = [r for r in results if r and r.get("status") == "succeeded"]
 checked = pipeline(oks[:1],
-    lambda r: agent({"runtime": "opencode", "model": "omniroute/MiniMaxM3",
+    lambda r: agent({"runtime": "qwen", "model": "opencode/MiniMaxM3",
                      "profile": "review",
                      "task": "Verify: " + str(r.get("answer", ""))[:80],
                      "workdir": WORK}),
@@ -74,10 +74,11 @@ stable specs give stable keys, which is what makes the journal replayable.
   refused ("no-filesystem"). Give it `read_roots: [workdir]` at minimum.
   Known open bug: codex + external read_roots on an implement/write step is
   refused ("roots mismatch") — copy the material into the workdir instead.
-- **opencode**: models must be in the LIVE roster (`models` tool/verb — the
-  config list is not the truth; dead OmniRoute combos are silently absent).
-  `omniroute/MiniMaxM3` answers one-liners in seconds — the default smoke and
-  verify model.
+- **qwen**: the cheap-OSS lane (Chinese models through the local OmniRoute
+  router; combo aliases keep the historical `opencode/` prefix). Check the
+  LIVE roster with the `models` tool. `opencode/MiniMaxM3` answers one-liners
+  in seconds — the default smoke and verify model. Write children have no
+  shell (qwen sandbox): acceptance runs their tests and commits for them.
 - **claude**: watch the capacity advisory before fanning out; sonnet steps
   are the cheap option.
 
