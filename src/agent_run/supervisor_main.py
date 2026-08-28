@@ -5,6 +5,14 @@ between fork and exec: on macOS a forked child of a process that has used SQLite
 segfaults inside ``sqlite3.connect`` roughly half the time, and the start CLI
 always has ``state.db`` open. Everything the supervisor needs therefore arrives
 here as one JSON payload on an inherited pipe.
+
+The module-level imports below are themselves a failure window: if this
+package's own release directory was deleted while this interpreter was still
+alive, importing ``.adapters``/``.config``/``.state`` here is exactly where
+that shows up -- before ``main()``, and therefore before argparse, even runs.
+``_bootstrap_error_fd``/``_write_early_failure`` stay stdlib-only and
+self-contained (not imported from ``launch_evidence``) so they still work
+when importing this package's own submodules is exactly what is failing.
 """
 
 from __future__ import annotations
@@ -14,18 +22,53 @@ import json
 import os
 import signal
 import sys
-from collections.abc import Callable, Mapping
+import traceback
 from contextlib import suppress
 from pathlib import Path
 
-from .adapters.base import LaunchPlan
-from .adapters.registry import AdapterRegistry
-from .config import load_config
-from .errors import ValidationError
-from .lifecycle import ReadyChannel
-from .paths import config_path, state_db_path
-from .state.store import StateStore
-from .supervisor import Supervisor, SupervisorSettings
+
+def _bootstrap_error_fd(argv: list[str]) -> int | None:
+    """Pull ``--error-fd`` out of argv without argparse, before risky imports run."""
+
+    for index, item in enumerate(argv):
+        if item == "--error-fd" and index + 1 < len(argv):
+            with suppress(ValueError):
+                return int(argv[index + 1])
+    return None
+
+
+def _write_early_failure(fd: int | None, stage: str, error: BaseException) -> None:
+    """Best-effort, bounded, stdlib-only failure record for the pre-identity window."""
+
+    if fd is None:
+        return
+    record = {
+        "stage": stage,
+        "type": type(error).__name__,
+        "message": str(error).strip()[:500],
+        "traceback": "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )[-2000:],
+    }
+    with suppress(OSError):
+        os.write(fd, (json.dumps(record) + "\n").encode("utf-8", "replace")[:4096])
+
+
+_ERROR_FD = _bootstrap_error_fd(sys.argv)
+try:
+    from collections.abc import Callable, Mapping
+
+    from .adapters.base import LaunchPlan
+    from .adapters.registry import AdapterRegistry
+    from .config import load_config
+    from .errors import ValidationError
+    from .lifecycle import ReadyChannel
+    from .paths import config_path, state_db_path
+    from .state.store import StateStore
+    from .supervisor import Supervisor, SupervisorSettings
+except BaseException as _import_error:  # fail closed with evidence, no partial module
+    _write_early_failure(_ERROR_FD, "import", _import_error)
+    os._exit(1)
 
 
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
@@ -33,6 +76,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--payload-fd", type=int, required=True)
     parser.add_argument("--ready-fd", type=int, required=True)
     parser.add_argument("--identity-fd", type=int, required=True)
+    parser.add_argument("--error-fd", type=int, required=True)
     return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
 
@@ -114,12 +158,24 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _arguments(argv)
     ready = ReadyChannel.from_write_fd(args.ready_fd)
+    error_fd = args.error_fd
     try:
         _report_identity(args.identity_fd)
+    except BaseException as error:  # identity was never proven: the error pipe
+        # is the only channel the parent still reads at this point.
+        _write_early_failure(error_fd, "identity", error)
+        ready.failed(_failure_reason(error))
+        ready.close_write()
+        return 1
+    with suppress(OSError):
+        os.close(error_fd)
+
+    try:
         payload = _read_payload(args.payload_fd)
         home = Path(_text(payload, "home"))
         dispatch_timeout = _number(payload, "post_terminal_timeout_seconds")
-    except BaseException as error:  # fail closed: the parent surfaces the reason
+    except BaseException as error:  # identity is already proven: the ready
+        # pipe alone carries this reason back to the parent.
         ready.failed(_failure_reason(error))
         ready.close_write()
         return 1

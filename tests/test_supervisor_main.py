@@ -257,6 +257,7 @@ class SupervisorMainTests(unittest.TestCase):
         payload_read, payload_write = os.pipe()
         ready_read, ready_write = os.pipe()
         identity_read, identity_write = os.pipe()
+        error_read, error_write = os.pipe()
         process = subprocess.Popen(
             [
                 sys.executable,
@@ -268,12 +269,14 @@ class SupervisorMainTests(unittest.TestCase):
                 str(ready_write),
                 "--identity-fd",
                 str(identity_write),
+                "--error-fd",
+                str(error_write),
             ],
-            pass_fds=(payload_read, ready_write, identity_write),
+            pass_fds=(payload_read, ready_write, identity_write, error_write),
             env=self.environment,
             start_new_session=True,
         )
-        for descriptor in (payload_read, ready_write, identity_write):
+        for descriptor in (payload_read, ready_write, identity_write, error_write):
             os.close(descriptor)
         try:
             os.write(payload_write, blob)
@@ -284,4 +287,5 @@ class SupervisorMainTests(unittest.TestCase):
         finally:
             os.close(ready_read)
             os.close(identity_read)
+            os.close(error_read)
         return token, process.wait(timeout=20)

@@ -27,6 +27,7 @@ from .errors import AgentRunError, ValidationError
 from .hooks.bind import ref_from_payload, run_hook
 from .hooks.context import build_context
 from .launch import launch_detached
+from .launch_evidence import bootstrap_error_fields
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
@@ -464,6 +465,18 @@ def _emit(value, stream: TextIO) -> None:
     stream.write("\n")
 
 
+def _error_payload(error: AgentRunError) -> dict:
+    """The standard error envelope, extended with a bootstrap failure's evidence."""
+
+    return {
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            **bootstrap_error_fields(error),
+        }
+    }
+
+
 def _capacity_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
     config = load_config(config_path(home))
     job = build_configured_job(
@@ -802,7 +815,7 @@ def main(
     except SystemExit as error:
         return int(error.code)
     except AgentRunError as error:
-        _emit({"error": {"type": type(error).__name__, "message": str(error)}}, stderr)
+        _emit(_error_payload(error), stderr)
         return _EXPECTED_ERROR_EXIT
     owned: _Runtime | None = None
     try:
@@ -840,7 +853,7 @@ def main(
         _emit(result, stdout)
         return 0
     except AgentRunError as error:
-        _emit({"error": {"type": type(error).__name__, "message": str(error)}}, stderr)
+        _emit(_error_payload(error), stderr)
         return _EXPECTED_ERROR_EXIT
     finally:
         if owned is not None:
