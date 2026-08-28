@@ -2,8 +2,10 @@
 
 Freshness comes from each sample's ``valid_until`` (per the architecture
 contract); missing or stale data becomes ``unknown`` and never blocks a
-caller. Identity (runtime/lane/window/target/source) is preserved end to end
-from :mod:`agent_run.capacity.history`.
+caller. A sample whose ``reset_at`` has already passed is treated the same
+way: the window it describes has already reset, so it can no longer speak
+for the current window. Identity (runtime/lane/window/target/source) is
+preserved end to end from :mod:`agent_run.capacity.history`.
 """
 
 from __future__ import annotations
@@ -45,7 +47,9 @@ def build_forecasts(
 
 
 def _is_fresh(sample: NormalizedSample, now: float) -> bool:
-    return sample.valid_until is None or sample.valid_until >= now
+    valid = sample.valid_until is None or sample.valid_until >= now
+    not_yet_reset = sample.reset_at is None or sample.reset_at >= now
+    return valid and not_yet_reset
 
 
 def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
