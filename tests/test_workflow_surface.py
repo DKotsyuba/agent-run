@@ -9,12 +9,13 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_run.cli import _Runtime, _execute, _parser
+from agent_run.cli import _execute, _parser
 from agent_run.delivery.base import DeliveryReceipt
 from agent_run.delivery.workflow_dispatch import WorkflowDeliveryDispatcher
 from agent_run.domain import OrchestratorRef
 from agent_run.errors import ValidationError
 from agent_run.mcp import _TOOLS, _call_tool
+from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
 
@@ -160,11 +161,64 @@ class WorkflowSurfaceTests(unittest.TestCase):
             run_id = store.create_workflow_run("named", "sha", plan=[])
             store.start_workflow_run(run_id)
             store.finish_workflow_run(run_id, "succeeded")
-            runtime = object.__new__(_Runtime)
-            runtime._inputs = lambda: (None, store)
+            service = object.__new__(AgentService)
+            service._store = store
             with patch("os.kill") as kill, self.assertRaises(ValidationError):
-                runtime.workflow_cancel(run_id)
+                service.workflow_cancel(run_id)
             kill.assert_not_called()
+
+    def test_mcp_dispatch_service_methods_all_exist_on_the_real_agent_service(self) -> None:
+        """Pin every `service.<name>` the real MCP dispatch reaches to a callable on
+        the real AgentService, so a fake test double can never again hide a method
+        the live service does not implement."""
+
+        import ast
+        import inspect
+
+        from agent_run.mcp import _call_tool
+
+        tree = ast.parse(inspect.getsource(_call_tool))
+        names = sorted({
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "service"
+        })
+        self.assertTrue(names)
+        for name in names:
+            self.assertTrue(
+                callable(getattr(AgentService, name, None)),
+                f"AgentService has no callable {name!r}, but mcp.py dispatches to it",
+            )
+
+    def test_mcp_workflow_start_happy_path_dispatches_to_the_real_service(self) -> None:
+        """Drive the real MCP dispatch for workflow_start through a real AgentService,
+        not a fake, so the wiring from mcp.py to AgentService is actually exercised."""
+
+        from agent_run.config import Config
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = StateStore.initialize(root / "state.db")
+            service = AgentService(
+                Config(schema_version=1), store, root,
+                launch=lambda *args: None, now=lambda: 0.0,
+            )
+            try:
+                with patch(
+                    "agent_run.workflow_run.start_workflow", return_value="wf_live"
+                ) as start:
+                    result = _call_tool(
+                        service, "workflow_start", {"name": "n", "script": "result = 1"}
+                    )
+                self.assertEqual(result, {"run_id": "wf_live"})
+                start.assert_called_once_with(
+                    service._home, "n", {"script": "result = 1"}, orchestrator=None
+                )
+            finally:
+                store.close()
+
 
 
 if __name__ == "__main__":
