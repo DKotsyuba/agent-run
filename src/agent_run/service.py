@@ -187,6 +187,26 @@ class CapacityReport:
     items: tuple[CapacityAdvice, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeModels:
+    """One runtime's model discovery snapshot: roster plus capability/health context.
+
+    ``models`` keeps the pre-existing :class:`ModelInfo` shape unchanged so
+    current consumers of individual model entries do not break. ``capabilities``
+    is the adapter's declared :class:`Capability` set (sorted string values), so
+    a router can check whether a runtime supports a requested right (e.g.
+    ``write``) before selecting it. ``available`` is ``False`` whenever the
+    adapter is unhealthy or its roster is empty; ``reason`` carries the
+    adapter-supplied explanation, falling back to ``"roster empty"`` when the
+    adapter reports itself healthy but the roster still came back empty.
+    """
+
+    models: tuple[ModelInfo, ...]
+    capabilities: tuple[str, ...]
+    available: bool
+    reason: str | None
+
+
 class AgentService:
     """Validate once, persist once, and expose stable transport-neutral views."""
 
@@ -502,8 +522,8 @@ class AgentService:
             "orchestrator", None, orchestrator, page.items, page.total, page.complete
         )
 
-    def models(self) -> Mapping[str, tuple[ModelInfo, ...]]:
-        result: dict[str, tuple[ModelInfo, ...]] = {}
+    def models(self) -> Mapping[str, RuntimeModels]:
+        result: dict[str, RuntimeModels] = {}
         for name in sorted(self._config.runtimes):
             runtime = self._config.runtimes[name]
             if not runtime.enabled:
@@ -511,11 +531,20 @@ class AgentService:
             adapter = self._registry.load(name, (Capability.MODEL_ROSTER,))
             adapter.validate(runtime)
             allowed = set(runtime.models)
-            result[name] = tuple(
+            roster = tuple(
                 model
                 for model in adapter.models(runtime, runtime.home)
                 if model.id in allowed
             )
+            capabilities = tuple(
+                sorted(capability.value for capability in adapter.describe().capabilities)
+            )
+            health = adapter.probe(runtime, runtime.home)
+            available = health.available and bool(roster)
+            reason = health.reason
+            if not roster and reason is None:
+                reason = "roster empty"
+            result[name] = RuntimeModels(roster, capabilities, available, reason)
         return MappingProxyType(result)
 
     def limits(self) -> CapacityReport:
