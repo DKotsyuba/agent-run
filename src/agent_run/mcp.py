@@ -11,6 +11,7 @@ from typing import IO, Mapping
 
 from .domain import OrchestratorRef, StartRequest
 from .errors import AgentRunError, ValidationError
+from .launch_evidence import bootstrap_error_fields
 from .service import AgentQuery, AgentService
 
 
@@ -244,7 +245,9 @@ def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
         try:
             result = _tool_result(_call_tool(service, name, arguments))
         except AgentRunError as error:
-            result = _tool_error(type(error).__name__, str(error))
+            result = _tool_error(
+                type(error).__name__, str(error), extra=bootstrap_error_fields(error)
+            )
         except Exception as error:
             result = _tool_error("internal_error", f"internal error: {type(error).__name__}")
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -409,8 +412,8 @@ def _tool_result(value: object) -> dict:
     }
 
 
-def _tool_error(code: str, message: str) -> dict:
-    data = {"error": {"code": code, "message": _bounded(message)}}
+def _tool_error(code: str, message: str, *, extra: Mapping[str, object] | None = None) -> dict:
+    data = {"error": {"code": code, "message": _bounded(message), **(extra or {})}}
     return {
         "content": [{"type": "text", "text": json.dumps(data, separators=(",", ":"))}],
         "structuredContent": data,

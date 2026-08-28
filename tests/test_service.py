@@ -25,6 +25,7 @@ from agent_run.domain import (
     StartRequest,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.store import StateStore
@@ -348,6 +349,55 @@ class AgentServiceTests(unittest.TestCase):
         self.assertFalse(retry.created)
         self.assertIs(retry.agent.status, AgentStatus.FAILED)
         self.assertEqual(len(calls), 1)
+
+    def test_bootstrap_failure_keeps_the_agent_id_stage_and_evidence_on_the_error(
+        self,
+    ) -> None:
+        def fail_launch(*args) -> None:
+            raise SupervisorBootstrapError(
+                "detached supervisor died before session proof at stage "
+                "'import': ModuleNotFoundError: no module named agent_run.adapters "
+                "(exit code 1)",
+                failure_kind=FAILURE_KIND_BOOTSTRAP,
+                failure_stage="import",
+                bootstrap_error_type="ModuleNotFoundError",
+                bootstrap_traceback="Traceback (most recent call last):\n...\n",
+                provisional_pid=999999,
+                proven=False,
+            )
+
+        service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=fail_launch,
+            now=lambda: 100.0,
+        )
+        request = self.request(request_id="bootstrap-failure")
+        with self.assertRaises(SupervisorBootstrapError) as caught:
+            service.start(request)
+
+        error = caught.exception
+        row = self.store.list_agents()[0]
+        agent_id = row["id"]
+        # The caller keeps the agent_id even though start() raised: this is
+        # what lets CLI/MCP surface {agent_id, failure_kind, failure_stage,
+        # failure_text} instead of a bare error message.
+        self.assertEqual(str(error.agent_id), str(agent_id))
+        self.assertEqual(error.failure_kind, FAILURE_KIND_BOOTSTRAP)
+        self.assertEqual(error.failure_stage, "import")
+        self.assertIn("no module named agent_run.adapters", error.failure_text)
+
+        self.assertEqual(row["failure_kind"], FAILURE_KIND_BOOTSTRAP)
+        event = self.store.connection.execute(
+            """SELECT kind, data_json FROM events
+               WHERE agent_id = ? ORDER BY seq DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+        self.assertIn('"stage":"import"', event["data_json"])
+        self.assertIn('"type":"ModuleNotFoundError"', event["data_json"])
+        self.assertIn('"provisional_pid":999999', event["data_json"])
+        self.assertIn('"proven":false', event["data_json"])
 
     def test_list_has_exact_total_and_explicit_offset_completeness(self) -> None:
         for index in range(3):

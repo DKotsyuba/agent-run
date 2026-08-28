@@ -23,6 +23,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--payload-fd", type=int, required=True)
     parser.add_argument("--ready-fd", type=int, required=True)
     parser.add_argument("--identity-fd", type=int, required=True)
+    parser.add_argument("--error-fd", type=int, required=True)
     return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
 
@@ -88,12 +89,23 @@ def main(argv: list[str] | None = None) -> int:
     args = _arguments(argv)
     ready = ReadyChannel.from_write_fd(args.ready_fd)
     payload = _read_payload(args.payload_fd)
+    # Simulates a child that dies before it can prove its identity at all
+    # (e.g. a kill -9): no identity write, no error-pipe write, just gone.
+    if payload.get("die_silent_before_identity"):
+        os._exit(137)
+    # Simulates a child that manages to record a bootstrap failure record
+    # (import/config/etc) before dying, but never proves its identity.
+    record = payload.get("die_with_evidence_before_identity")
+    if record is not None:
+        os.write(args.error_fd, (json.dumps(record) + "\n").encode("utf-8"))
+        os._exit(1)
     reported = payload.get("report_pid")
     os.write(
         args.identity_fd,
         f"{os.getpid() if reported is None else int(reported)}\n".encode("ascii"),
     )
     os.close(args.identity_fd)
+    os.close(args.error_fd)
 
     exit_code = 0
     try:

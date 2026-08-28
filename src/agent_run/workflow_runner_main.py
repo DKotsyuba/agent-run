@@ -201,6 +201,11 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--payload-fd", type=int, required=True)
     parser.add_argument("--ready-fd", type=int, required=True)
     parser.add_argument("--identity-fd", type=int, required=True)
+    # launch_detached() always passes an error-fd now (see launch_evidence.py);
+    # the workflow runner does not yet instrument its own early bootstrap, but
+    # still has to accept and close the fd to keep its exec contract with the
+    # parent intact.
+    parser.add_argument("--error-fd", type=int, required=True)
     return parser.parse_args(sys.argv[1:] if argv is None else argv)
 
 
@@ -280,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
         ready.failed(_failure_reason(error))
         ready.close_write()
         return 1
+    finally:
+        with suppress(OSError):
+            os.close(args.error_fd)
 
     exit_code = 0
     try:

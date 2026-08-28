@@ -27,6 +27,7 @@ from .domain import (
     validate_agent_id,
 )
 from .errors import AuthError, ValidationError
+from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from .profiles import assign_role, load_profile
 from .state.store import StateStore
@@ -318,9 +319,17 @@ class AgentService:
         try:
             self._launch(creation.agent_id, request, adapter, plan, candidate_dir)
         except Exception as error:
-            self._fail_created_start(
+            kind, stage, text = self._fail_created_start(
                 creation.agent_id, error, "supervisor_start_failed"
             )
+            # The durable agent row already exists: attach it to the raised
+            # error so CLI/MCP can surface {agent_id, failure_kind,
+            # failure_stage, failure_text} instead of a bare error message
+            # that hides which agent this was.
+            error.agent_id = creation.agent_id
+            error.failure_kind = kind
+            error.failure_stage = stage
+            error.failure_text = text
             raise
         return StartResult(
             creation.agent_id, True, self.get(creation.agent_id)
@@ -328,24 +337,26 @@ class AgentService:
 
     def _fail_created_start(
         self, agent_id: AgentId, error: Exception, kind: str
-    ) -> None:
+    ) -> tuple[str, str | None, str]:
         # A missing or unrenewable credential is its own diagnosis, not a
         # generic prepare/launch fault: name it so the row says what to fix.
+        stage: str | None = None
         if isinstance(error, AuthError):
             kind = "auth_failed"
+        elif isinstance(error, SupervisorBootstrapError):
+            kind, stage = error.failure_kind, error.failure_stage
         outcome = Outcome(
-            AgentStatus.FAILED,
-            failure_kind=kind,
-            failure_text=_failure_text(error),
+            AgentStatus.FAILED, failure_kind=kind, failure_text=_failure_text(error)
         )
         self._store.transition(
             agent_id,
             AgentStatus.FAILED,
             outcome=outcome,
             kind=kind,
-            data={"agent_id": str(agent_id)},
+            data=bootstrap_event_data(agent_id, error),
             at=self._now(),
         )
+        return kind, stage, outcome.failure_text
 
     def bind(
         self, agent_id: str | AgentId, orchestrator: OrchestratorRef

@@ -11,6 +11,11 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 
 from .errors import ValidationError
+from .launch_evidence import (
+    diagnose_bootstrap_failure,
+    preflight_executable,
+    write_exec_failure,
+)
 from .lifecycle import (
     ReadyChannel,
     SystemProcessOps,
@@ -66,12 +71,18 @@ def launch_detached(
     reap_timeout = _positive("post_reap_timeout_seconds", post_reap_timeout_seconds)
     grace = _positive("cleanup_grace_seconds", cleanup_grace_seconds)
     kill_grace = _positive("cleanup_kill_seconds", cleanup_kill_seconds)
+    # Refuses instantly (no fork, no evidence to lose) when this session's
+    # own interpreter is already gone -- e.g. its release directory was
+    # deleted while this MCP server kept running.
+    preflight_executable(executable)
 
     ready = ReadyChannel.open()
     payload_read, payload_write = os.pipe()
     identity_read, identity_write = os.pipe()
+    error_read, error_write = os.pipe()
     os.set_inheritable(payload_read, True)
     os.set_inheritable(identity_write, True)
+    os.set_inheritable(error_write, True)
     argv = [
         executable,
         "-m",
@@ -82,6 +93,8 @@ def launch_detached(
         str(ready.write_fd),
         "--identity-fd",
         str(identity_write),
+        "--error-fd",
+        str(error_write),
     ]
     try:
         # The child derives its own identity from `ps -o command=` on its own
@@ -96,7 +109,10 @@ def launch_detached(
             }
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        for descriptor in (payload_read, payload_write, identity_read, identity_write):
+        for descriptor in (
+            payload_read, payload_write, identity_read, identity_write,
+            error_read, error_write,
+        ):
             _close(descriptor)
         ready.close_read()
         ready.close_write()
@@ -105,29 +121,36 @@ def launch_detached(
     try:
         pid = os.fork()
     except OSError as error:
-        for descriptor in (payload_read, payload_write, identity_read, identity_write):
+        for descriptor in (
+            payload_read, payload_write, identity_read, identity_write,
+            error_read, error_write,
+        ):
             _close(descriptor)
         ready.close_read()
         ready.close_write()
         raise ValidationError("cannot fork detached supervisor") from error
 
     if pid == 0:
-        # Nothing but setsid and execv may run here: any inherited library state
-        # touched before the exec is exactly what crashes the child.
+        # Nothing but setsid, execv, and -- on failure only -- one bounded
+        # os.write of the failure evidence may run here: any other inherited
+        # library state touched before the exec is exactly what crashes the
+        # child.
         try:
             os.setsid()
             os.execv(executable, argv)
-        except BaseException:
+        except BaseException as error:
+            write_exec_failure(error_write, error)
             os._exit(1)
 
     ready.close_write()
     _close(identity_write)
     _close(payload_read)
+    _close(error_write)
     deadline = time.monotonic() + ready_timeout
     group: VerifiedProcessGroup | None = None
     try:
         _write_payload(payload_write, blob)
-        reported_pid = _read_identity(identity_read, deadline)
+        reported_pid = _read_identity(identity_read, deadline, pid=pid, error_fd=error_read)
         if reported_pid != pid:
             raise ValidationError("detached supervisor reported the wrong process identity")
         group = verify_process_group(SystemProcessOps(), pid)
@@ -135,13 +158,14 @@ def launch_detached(
     except ValidationError as error:
         ready.close_read()
         if time.monotonic() < deadline and _wait_child(pid, dispatch_timeout + 0.25):
-            raise ValidationError(str(error)) from error
+            raise error
         if group is None:
             group = verify_process_group(SystemProcessOps(), pid)
         _cleanup(pid, group, grace, kill_grace)
-        raise ValidationError(str(error)) from error
+        raise error
     finally:
         _close(identity_read)
+        _close(error_read)
 
     ready.close_read()
     threading.Thread(
@@ -163,7 +187,7 @@ def _write_payload(fd: int, blob: bytes) -> None:
         _close(fd)
 
 
-def _read_identity(fd: int, deadline: float) -> int:
+def _read_identity(fd: int, deadline: float, *, pid: int, error_fd: int) -> int:
     buffer = b""
     while b"\n" not in buffer:
         readable, _, _ = select.select([fd], [], [], _remaining(deadline))
@@ -171,7 +195,7 @@ def _read_identity(fd: int, deadline: float) -> int:
             continue
         chunk = os.read(fd, 64)
         if not chunk:
-            raise ValidationError("detached supervisor exited before session proof")
+            raise diagnose_bootstrap_failure(pid, error_fd)
         buffer += chunk
     raw = buffer.split(b"\n", 1)[0]
     try:

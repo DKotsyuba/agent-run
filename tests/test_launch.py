@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -11,6 +12,12 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from agent_run.errors import ValidationError
 from agent_run.launch import launch_detached
+from agent_run.launch_evidence import (
+    FAILURE_KIND_BOOTSTRAP,
+    FAILURE_KIND_EXECUTABLE_MISSING,
+    SupervisorBootstrapError,
+    write_exec_failure,
+)
 
 
 CHILD_MODULE = "tests.detached_child"
@@ -199,6 +206,68 @@ class DetachedLaunchTests(unittest.TestCase):
             launch_detached({}, executable="")
         with self.assertRaisesRegex(ValidationError, "payload is not JSON"):
             self.launch({"plan": object()})
+
+    def test_missing_executable_is_refused_before_any_fork(self) -> None:
+        missing = str(Path(self.root) / "gone" / "python3")
+        with mock.patch("agent_run.launch.os.fork") as forked:
+            with self.assertRaisesRegex(
+                ValidationError, "reconnect/restart this MCP session"
+            ) as caught:
+                launch_detached({}, executable=missing)
+        forked.assert_not_called()
+        error = caught.exception
+        self.assertIsInstance(error, SupervisorBootstrapError)
+        self.assertEqual(error.failure_kind, FAILURE_KIND_EXECUTABLE_MISSING)
+        self.assertIn(missing, str(error))
+
+    def test_child_dies_pre_identity_with_evidence_is_diagnosed(self) -> None:
+        record = {
+            "stage": "import",
+            "type": "ModuleNotFoundError",
+            "message": "no module named agent_run.adapters",
+            "traceback": "Traceback (most recent call last):\n...\n",
+        }
+        with self.assertRaises(SupervisorBootstrapError) as caught:
+            self.launch({"die_with_evidence_before_identity": record})
+        error = caught.exception
+        self.assertEqual(error.failure_kind, FAILURE_KIND_BOOTSTRAP)
+        self.assertEqual(error.failure_stage, "import")
+        self.assertEqual(error.bootstrap_error_type, "ModuleNotFoundError")
+        self.assertIn("no module named agent_run.adapters", str(error))
+        self.assertFalse(error.proven)
+        self.assertIsNotNone(error.provisional_pid)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(error.provisional_pid, os.WNOHANG)
+
+    def test_child_dies_pre_identity_without_evidence_is_diagnosed(self) -> None:
+        with self.assertRaises(SupervisorBootstrapError) as caught:
+            self.launch({"die_silent_before_identity": True})
+        error = caught.exception
+        self.assertEqual(error.failure_kind, FAILURE_KIND_BOOTSTRAP)
+        self.assertIsNone(error.failure_stage)
+        self.assertFalse(error.proven)
+        self.assertIsNotNone(error.provisional_pid)
+        self.assertIn("no bootstrap evidence", str(error))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(error.provisional_pid, os.WNOHANG)
+
+    def test_write_exec_failure_writes_a_bounded_stage_and_errno_record(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            write_exec_failure(
+                write_fd, FileNotFoundError(2, "No such file or directory")
+            )
+            os.close(write_fd)
+            write_fd = -1
+            blob = os.read(read_fd, 4096)
+        finally:
+            if write_fd != -1:
+                os.close(write_fd)
+            os.close(read_fd)
+        record = json.loads(blob.splitlines()[0])
+        self.assertEqual(record["stage"], "exec")
+        self.assertEqual(record["type"], "FileNotFoundError")
+        self.assertEqual(record["errno"], 2)
 
     @staticmethod
     def alive(pid: int) -> bool:
