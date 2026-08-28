@@ -14,7 +14,25 @@ falls back to stderr instead.
 
 `agent-run doctor` is the first move for almost any reported problem. It
 separates errors (must fix) from warnings (should look at), including
-`state_migration_pending` — see `migrations`.
+`state_migration_pending` — see `migrations`. The command exits nonzero
+whenever any finding is error-severity.
+
+Two checks matter most for a supervisor that cannot even start:
+
+- **Canary handshake** (`component: canary`): exercises the real fork ->
+  exec -> identity-proof -> READY path with no provider/runtime, via a
+  throwaway home. `supervisor_canary_ok` means the path works; a
+  `supervisor_executable_missing` or `supervisor_start_failed` finding
+  carries the same bootstrap evidence (stage, error type, pid) a failed
+  `start` would, and means every `start` in this home is currently doomed
+  the same way.
+- **MCP process inventory** (`component: mcp:*`): lists every running
+  `agent-run mcp` process it can see, with pid, start time, and the release
+  path from its own `ps` argv (macOS has no way to read a running process's
+  resolved executable back from the OS). `mcp_process_older_release` fires
+  when a process started before the `standalone/current` symlink's last
+  switch — it may still be running old code; reconnect MCP in that session
+  before pruning releases.
 
 ## failure_kind vocabulary
 
