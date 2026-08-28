@@ -40,6 +40,10 @@ class FakeAdapter:
         self.materialize_calls = 0
         self.skills_roots = []
         self.models_calls = 0
+        self.models_result: tuple[ModelInfo, ...] = (
+            ModelInfo("model", "fake model", ("high",)),
+        )
+        self.probe_health = RuntimeHealth(True, "1", True, None)
         self.limits_calls = 0
         self.prepare_calls = 0
         self.prepare_dirs = []
@@ -58,11 +62,11 @@ class FakeAdapter:
         return "cfg-1"
 
     def probe(self, config, home):
-        return RuntimeHealth(True, "1", True, None)
+        return self.probe_health
 
     def models(self, config, home):
         self.models_calls += 1
-        return (ModelInfo("model", "fake model", ("high",)),)
+        return self.models_result
 
     def limits(self, config, home):
         self.limits_calls += 1
@@ -479,7 +483,13 @@ class AgentServiceTests(unittest.TestCase):
             self.service.summary(agent_id=agent_id, orchestrator=ref)
 
         self.assertEqual(tuple(self.service.models()), ("fake",))
-        self.assertEqual(self.service.models()["fake"][0].id, "model")
+        fake_roster = self.service.models()["fake"]
+        self.assertEqual(fake_roster.models[0].id, "model")
+        self.assertEqual(
+            fake_roster.capabilities, tuple(sorted(c.value for c in Capability))
+        )
+        self.assertTrue(fake_roster.available)
+        self.assertIsNone(fake_roster.reason)
         self.store.insert_capacity_sample(
             runtime="fake",
             lane="main",
@@ -495,6 +505,25 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(len(limits.items), 1)
         self.assertEqual(limits.items[0].key.runtime, "fake")
         self.assertEqual(ADAPTER.limits_calls, 0)
+
+    def test_empty_roster_still_lists_the_runtime_with_a_reason(self) -> None:
+        ADAPTER.models_result = ()
+
+        roster = self.service.models()["fake"]
+
+        self.assertEqual(roster.models, ())
+        self.assertFalse(roster.available)
+        self.assertEqual(roster.reason, "roster empty")
+
+    def test_empty_roster_prefers_the_adapters_own_unavailable_reason(self) -> None:
+        ADAPTER.models_result = ()
+        ADAPTER.probe_health = RuntimeHealth(False, None, None, "no network route")
+
+        roster = self.service.models()["fake"]
+
+        self.assertEqual(roster.models, ())
+        self.assertFalse(roster.available)
+        self.assertEqual(roster.reason, "no network route")
 
     def test_codex_models_bootstrap_from_config_without_isolated_cache(self) -> None:
         from agent_run.config import RuntimeAuthConfig
@@ -527,11 +556,21 @@ class AgentServiceTests(unittest.TestCase):
         roster = service.models()["codex"]
 
         self.assertEqual(
-            [(model.id, model.description, model.efforts) for model in roster],
+            [(model.id, model.description, model.efforts) for model in roster.models],
             [
                 ("gpt-5.6-sol", "", ()),
                 ("gpt-5.6-terra", "", ()),
             ],
+        )
+        from agent_run.adapters.codex.adapter import ADAPTER as codex_adapter
+
+        self.assertEqual(
+            roster.capabilities,
+            tuple(sorted(c.value for c in codex_adapter.describe().capabilities)),
+        )
+        self.assertFalse(roster.available)
+        self.assertEqual(
+            roster.reason, "codex binary, generated home, or auth bridge is missing"
         )
         self.assertFalse((codex_home / "cache" / "models.json").exists())
 
