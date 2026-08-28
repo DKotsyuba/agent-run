@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -22,6 +23,7 @@ from agent_run.adapters.base import (
 )
 from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.home import content_hash, write_managed_file
+from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
 from agent_run.adapters.qwen.auth import DEFAULT_BASE_URL, keychain_omniroute_api_key
 from agent_run.adapters.qwen.skills import materialize_skills, skills_context_note
@@ -39,6 +41,7 @@ _CAPABILITIES = frozenset(
         Capability.WRITE,
         Capability.TRANSCRIPT,
         Capability.MODEL_ROSTER,
+        Capability.LIVE_LIMITS,
         Capability.MCP,
         Capability.SKILLS,
         Capability.HOOKS,
@@ -194,9 +197,14 @@ class QwenAdapter:
         return tuple(ModelInfo(model, f"configured qwen model: {model}") for model in config.models)
 
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
-        """Return no live quota samples because Qwen exposes no local quota API."""
+        """Report the OmniRoute account pool this runtime is served from.
+
+        Every qwen model here routes through OmniRoute out of the same
+        ``opencode-go`` account pool opencode uses, so the pool's quota is
+        this runtime's quota. See :mod:`agent_run.adapters.omniroute`.
+        """
         del config, home
-        return ()
+        return pool_samples(time.time())
 
     def prepare(
         self,

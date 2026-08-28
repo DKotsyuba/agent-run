@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -172,6 +173,34 @@ class QwenAdapterTests(unittest.TestCase):
         """Qwen has no Skill tool, but the capability still advertises delivery."""
         self.assertIn(Capability.SKILLS, self.adapter.describe().capabilities)
         self.assertIn(Capability.HOOKS, self.adapter.describe().capabilities)
+
+    def test_live_limits_capability_and_pool_samples_are_shared(self) -> None:
+        """qwen's quota IS the OmniRoute opencode-go pool's quota."""
+        self.assertIn(Capability.LIVE_LIMITS, self.adapter.describe().capabilities)
+        rows = [
+            {"window_key": "session", "remaining_percentage": 90.0,
+             "next_reset_at": "2026-08-28T17:26:35.920Z",
+             "created_at": "2026-08-28T14:06:01.922Z"},
+        ]
+        now = datetime.fromisoformat("2026-08-28T14:06:01.922Z").timestamp() + 60.0
+        with patch(
+            "agent_run.adapters.omniroute._docker_rows", lambda: rows
+        ), patch(
+            "agent_run.adapters.qwen.adapter.time.time", lambda: now
+        ):
+            samples = self.adapter.limits(self.config(), self.home)
+        (sample,) = samples
+        self.assertEqual(sample.window, "session_5h")
+        self.assertEqual(sample.source, "omniroute_quota_pool")
+        self.assertEqual(sample.target, "opencode-go:pool")
+        self.assertEqual(sample.remaining_percent, 90.0)
+
+    def test_a_failing_row_source_reports_no_samples(self) -> None:
+        """A docker failure is no evidence, never an exception."""
+        with patch(
+            "agent_run.adapters.omniroute._docker_rows", return_value=None
+        ):
+            self.assertEqual(self.adapter.limits(self.config(), self.home), ())
 
     def test_skills_are_materialized_and_context_notes_the_absolute_path(self) -> None:
         """Configured skills land under home/skills, and the context file points at them."""
