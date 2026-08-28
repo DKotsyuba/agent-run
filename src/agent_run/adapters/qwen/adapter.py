@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from types import MappingProxyType
@@ -21,7 +22,10 @@ from agent_run.adapters.base import (
 )
 from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.home import content_hash, write_managed_file
-from agent_run.config import McpConfig, RuntimeConfig
+from agent_run.adapters.qwen import plugins as plugin_install
+from agent_run.adapters.qwen.auth import DEFAULT_BASE_URL, keychain_omniroute_api_key
+from agent_run.adapters.qwen.skills import materialize_skills, skills_context_note
+from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
@@ -30,8 +34,20 @@ __all__ = ["ADAPTER", "QwenAdapter"]
 
 _AUTH_NAMES = frozenset({"OPENAI_API_KEY", "OPENAI_BASE_URL"})
 _CAPABILITIES = frozenset(
-    {Capability.READ_ROOTS, Capability.WRITE, Capability.TRANSCRIPT, Capability.MODEL_ROSTER, Capability.MCP}
+    {
+        Capability.READ_ROOTS,
+        Capability.WRITE,
+        Capability.TRANSCRIPT,
+        Capability.MODEL_ROSTER,
+        Capability.MCP,
+        Capability.SKILLS,
+        Capability.HOOKS,
+    }
 )
+#: Qwen's only supported provider protocol; without this, headless (`-p`)
+#: runs fail closed with "No auth type is selected" even when OPENAI_API_KEY
+#: and OPENAI_BASE_URL are both set (verified live against 0.22.2).
+_SELECTED_AUTH_TYPE = "openai"
 
 
 def _mcp_document(names: tuple[str, ...], servers: Mapping[str, McpConfig]) -> dict[str, object]:
@@ -39,6 +55,13 @@ def _mcp_document(names: tuple[str, ...], servers: Mapping[str, McpConfig]) -> d
 
     Raises ``ValidationError`` when a selected server is absent or is not a
     stdio command, because silently dropping it would weaken the child role.
+    Every entry is marked ``trust: true``: a headless (``-p``) run has no
+    prompt to confirm a tool call, so an untrusted MCP server's tools are
+    silently denied (verified live against 0.22.2 -- see
+    ``mcpServers.<NAME>.trust`` in the Qwen settings reference). The set of
+    servers themselves is still bounded to the caller-resolved, operator
+    configured ``config.mcp`` names, so trust extends only as far as that
+    configured selection already does.
     """
 
     rendered: dict[str, object] = {}
@@ -48,8 +71,48 @@ def _mcp_document(names: tuple[str, ...], servers: Mapping[str, McpConfig]) -> d
             raise ValidationError(f"no resolved MCP definition for runtimes.qwen.mcp entry: {name}")
         if server.transport != "stdio" or server.command is None:
             raise ValidationError(f"qwen MCP {name!r} must use stdio with a command")
-        rendered[name] = {"command": str(server.command), "args": list(server.args)}
+        rendered[name] = {"command": str(server.command), "args": list(server.args), "trust": True}
     return rendered
+
+
+def _auth_value(name: str) -> str | None:
+    """Resolve one provider auth env name: process env first, then fallback.
+
+    The process environment always wins. ``OPENAI_API_KEY`` falls back to the
+    managed OmniRoute keychain item; ``OPENAI_BASE_URL`` falls back to the
+    local OmniRoute router default. Any other name has no fallback.
+    """
+
+    value = os.environ.get(name)
+    if value:
+        return value
+    if name == "OPENAI_API_KEY":
+        return keychain_omniroute_api_key()
+    if name == "OPENAI_BASE_URL":
+        return DEFAULT_BASE_URL
+    return None
+
+
+def _hooks_document(
+    hooks: tuple[RuntimeHookConfig, ...], plugin_roots: Mapping[str, Path]
+) -> dict[str, list[dict[str, object]]]:
+    """Render configured hooks as Qwen's ``settings.json`` ``hooks`` table.
+
+    Verified live against qwen-code 0.22.2: a ``PreToolUse`` command hook
+    configured this way fires with no separate trust step, unlike codex's
+    ``[hooks.state]`` digest requirement. Each hook's command is expanded for
+    ``{plugin:NAME}`` tokens against ``plugin_roots`` and joined into the one
+    shell-command string Qwen's ``command`` hook field expects.
+    """
+
+    by_event: dict[str, list[dict[str, object]]] = {}
+    for hook in hooks:
+        command = shlex.join(plugin_install.expand(hook.command, plugin_roots))
+        entry: dict[str, object] = {"hooks": [{"type": "command", "command": command}]}
+        if hook.matcher is not None:
+            entry["matcher"] = hook.matcher
+        by_event.setdefault(hook.event, []).append(entry)
+    return by_event
 
 
 class QwenAdapter:
@@ -77,23 +140,51 @@ class QwenAdapter:
         mcp_servers: Mapping[str, McpConfig],
         skills_root: Path | None = None,
     ) -> str:
-        """Create an isolated Qwen home with strict MCP and context settings."""
-        del skills_root
+        """Create an isolated Qwen home with strict MCP, skill, and hook settings.
+
+        :param skills_root: Absolute directory this runtime's unowned skill
+            copies live under. Defaults to ``<agent_run_home>/skills/qwen``,
+            mirroring :func:`agent_run.paths.runtime_skills_dir`, when the
+            caller (unit tests calling this directly, or :meth:`prepare`'s
+            own internal re-materialize) does not supply one.
+        :returns: A content hash covering the rendered settings document,
+            every delivered skill's content, and every installed plugin
+            file, so a changed skill or plugin selection is reflected in the
+            revision.
+        """
+
+        if skills_root is None:
+            skills_root = Path(home).parents[2] / "skills" / "qwen"
+        if not isinstance(skills_root, Path) or not skills_root.is_absolute():
+            raise ValidationError("qwen skills_root must be absolute")
         context_path = Path(home) / "agent-run-context.md"
-        document = {
+        skill_hashes = materialize_skills(Path(home), config.plugins, skills_root, config.skills)
+        plugin_roots, plugin_digest = plugin_install.install(Path(home), config.plugins)
+        document: dict[str, object] = {
             "context": {"fileName": str(context_path)},
             "mcpServers": _mcp_document(config.mcp, mcp_servers),
             "tools": {"sandbox": True},
+            "security": {"auth": {"selectedType": _SELECTED_AUTH_TYPE}},
         }
+        hooks_document = _hooks_document(config.hooks, plugin_roots)
+        if hooks_document:
+            document["hooks"] = hooks_document
         text = json.dumps(document, indent=2, sort_keys=True) + "\n"
         write_managed_file(Path(home), ".qwen/settings.json", text)
-        return content_hash(text)
+        fingerprint = "\n".join(
+            [
+                text,
+                *(f"{name}:{digest}" for name, digest in sorted(skill_hashes.items())),
+                plugin_digest,
+            ]
+        )
+        return content_hash(fingerprint)
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         """Report local binary and declared authentication availability only."""
         del home
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
-        authenticated = bool(config.auth and all(os.environ.get(name) for name in config.auth.names))
+        authenticated = bool(config.auth and all(_auth_value(name) for name in config.auth.names))
         reason = None if available else f"qwen binary not executable: {config.binary}"
         return RuntimeHealth(available, "0.22.2" if available else None, authenticated, reason)
 
@@ -129,6 +220,7 @@ class QwenAdapter:
         role_text = profile.body
         if request.output_schema is not None:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
+        role_text += skills_context_note(Path(home), config.skills)
         write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
         self.materialize(config, Path(home), mcp_servers=mcp_servers)
 
@@ -138,7 +230,7 @@ class QwenAdapter:
         secret_names: list[str] = []
         assert config.auth is not None
         for name in config.auth.names:
-            value = os.environ.get(name)
+            value = _auth_value(name)
             if not value:
                 raise ValidationError(f"qwen requires environment variable {name}, which is not set")
             environment[name] = value
