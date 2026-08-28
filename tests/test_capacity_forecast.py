@@ -100,6 +100,40 @@ class CapacityForecastTests(unittest.TestCase):
         self.assertIsNone(forecast.burn_percent_per_hour)
         self.assertEqual(forecast.remaining_percent, 90.0)
 
+
+    def test_latest_sample_with_past_reset_at_is_unknown(self) -> None:
+        now = 1_000_000.0
+        sample = NormalizedSample(
+            remaining_percent=50.0, reset_at=now - 1, observed_at=now, valid_until=None
+        )
+        series = CapacitySeries(KEY, (sample,))
+        (forecast,) = build_forecasts([series], now=now)
+        self.assertFalse(forecast.known)
+        self.assertIsNone(forecast.remaining_percent)
+        self.assertIsNone(forecast.reset_at)
+        self.assertEqual(forecast.risk, RISK_UNKNOWN)
+
+    def test_latest_sample_with_future_reset_at_is_known(self) -> None:
+        now = 1_000_000.0
+        sample = NormalizedSample(
+            remaining_percent=50.0, reset_at=now + 1, observed_at=now, valid_until=None
+        )
+        series = CapacitySeries(KEY, (sample,))
+        (forecast,) = build_forecasts([series], now=now)
+        self.assertTrue(forecast.known)
+        self.assertEqual(forecast.remaining_percent, 50.0)
+        self.assertEqual(forecast.reset_at, now + 1)
+
+    def test_latest_sample_without_reset_at_is_unaffected(self) -> None:
+        now = 1_000_000.0
+        sample = NormalizedSample(
+            remaining_percent=50.0, reset_at=None, observed_at=now, valid_until=None
+        )
+        series = CapacitySeries(KEY, (sample,))
+        (forecast,) = build_forecasts([series], now=now)
+        self.assertTrue(forecast.known)
+        self.assertIsNone(forecast.reset_at)
+
     def test_exhausted_zero_is_high_risk_even_with_zero_burn_and_pace(self) -> None:
         now = 1_000_000.0
         reset_at = now + 3600

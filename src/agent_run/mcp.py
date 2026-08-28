@@ -121,7 +121,10 @@ _TOOLS = (
     },
     {
         "name": "models",
-        "description": "List enabled runtime model rosters.",
+        "description": (
+            "List enabled runtime model rosters with each runtime's declared "
+            "capabilities and available/reason health."
+        ),
         "inputSchema": _schema({}),
     },
     {
