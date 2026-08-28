@@ -8,6 +8,7 @@ responses are stored: only the structured :class:`LimitSample` fields.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from ..adapters.registry import load_adapter
 from ..config import Config, RuntimeConfig
 from ..state import StateStore
 
+_logger = logging.getLogger("agent_run.capacity")
 
 AdapterLoader = Callable[[str, RuntimeConfig], RuntimeAdapter]
 
@@ -90,6 +92,7 @@ def _collect_runtime(
         adapter = load(name, runtime_config)
         info = adapter.describe()
         if Capability.LIVE_LIMITS not in info.capabilities:
+            _logger.debug("collect runtime=%s status=%s", name, STATUS_UNSUPPORTED)
             return CollectResult(name, STATUS_UNSUPPORTED, 0)
         for sample in adapter.limits(runtime_config, runtime_config.home):
             if not isinstance(sample, LimitSample):
@@ -100,7 +103,12 @@ def _collect_runtime(
             _store_sample(store, name, sample, observed_epoch)
             count += 1
     except Exception as error:  # isolate provider, generator, and sample failures
+        _logger.warning(
+            "collect runtime=%s status=%s samples=%d error=%s",
+            name, STATUS_FAILED, count, type(error).__name__,
+        )
         return CollectResult(name, STATUS_FAILED, count, type(error).__name__)
+    _logger.debug("collect runtime=%s status=%s samples=%d", name, STATUS_COLLECTED, count)
     return CollectResult(name, STATUS_COLLECTED, count)
 
 
@@ -122,4 +130,10 @@ def collect_once(
     )
     store.prune_capacity_samples(config.capacity.sample_retention)
     finished = time.time() if at is None else at
+    _logger.info(
+        "collect_once runtimes=%d failed=%d duration_ms=%.1f",
+        len(results),
+        sum(1 for result in results if result.status == STATUS_FAILED),
+        (finished - started) * 1000,
+    )
     return CollectionReport(started, finished, results)

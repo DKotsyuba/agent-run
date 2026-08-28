@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Iterable
+
+_logger = logging.getLogger("agent_run.state")
 
 from agent_run.domain import (
     ACTIVE,
@@ -69,6 +72,7 @@ class StateStore:
         from .reconciliation import reconcile_workflow_runs
 
         store = cls(open_database(database))
+        _logger.debug("db=%s open", database)
         try:
             reconcile_workflow_runs(store)
         except BaseException:

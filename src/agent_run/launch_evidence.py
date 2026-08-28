@@ -14,12 +14,15 @@ error.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import time
 import traceback as _traceback
 
 from .errors import ValidationError
+
+_logger = logging.getLogger("agent_run.launch")
 
 #: The child's executable no longer exists or is not runnable (e.g. its
 #: release directory was deleted while the process was still alive).
@@ -76,7 +79,9 @@ def preflight_executable(executable: str) -> None:
     """
 
     if os.path.exists(executable) and os.access(executable, os.X_OK):
+        _logger.debug("preflight ok executable=%s", executable)
         return
+    _logger.warning("preflight failed executable=%s stage=preflight", executable)
     raise SupervisorBootstrapError(
         f"supervisor executable is gone (release deleted?): {executable}; "
         "reconnect/restart this MCP session",
@@ -177,6 +182,10 @@ def diagnose_bootstrap_failure(
             f"detached supervisor died before session proof at stage "
             f"{stage!r}: {error_type}: {message} ({status_text})"
         )
+        _logger.warning(
+            "bootstrap_failure pid=%d stage=%s error_type=%s (%s)",
+            pid, stage, error_type, status_text,
+        )
         return SupervisorBootstrapError(
             summary,
             failure_kind=FAILURE_KIND_BOOTSTRAP,
@@ -190,6 +199,7 @@ def diagnose_bootstrap_failure(
         "detached supervisor exited before session proof with no bootstrap "
         f"evidence ({status_text}); provisional pid {pid} was never proven"
     )
+    _logger.warning("bootstrap_failure pid=%d stage=unknown no_evidence (%s)", pid, status_text)
     return SupervisorBootstrapError(
         summary,
         failure_kind=FAILURE_KIND_BOOTSTRAP,

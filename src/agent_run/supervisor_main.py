@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import signal
 import sys
 import traceback
 from contextlib import suppress
 from pathlib import Path
+
+_logger = logging.getLogger("agent_run.supervisor_main")
 
 
 def _bootstrap_error_fd(argv: list[str]) -> int | None:
@@ -63,6 +66,7 @@ try:
     from .config import load_config
     from .errors import ValidationError
     from .lifecycle import ReadyChannel
+    from .logging_setup import configure_logging
     from .paths import config_path, state_db_path
     from .state.store import StateStore
     from .supervisor import Supervisor, SupervisorSettings
@@ -126,10 +130,14 @@ def _number(payload: Mapping[str, object], key: str) -> float:
 
 
 def _supervise(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None:
+    agent_id = _text(payload, "agent_id")
     config = load_config(config_path(home))
+    _logger.debug("agent_id=%s stage=config", agent_id)
     adapter = AdapterRegistry(config).load(_text(payload, "runtime"))
+    _logger.debug("agent_id=%s stage=adapter_load runtime=%s", agent_id, payload.get("runtime"))
     plan = LaunchPlan.from_payload(payload.get("plan"))
     store = StateStore.open(state_db_path(home))
+    _logger.debug("agent_id=%s stage=store_open", agent_id)
     try:
         Supervisor(
             store,
@@ -159,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _arguments(argv)
     ready = ReadyChannel.from_write_fd(args.ready_fd)
     error_fd = args.error_fd
+    child_pid = os.getpid()
     try:
         _report_identity(args.identity_fd)
     except BaseException as error:  # identity was never proven: the error pipe
@@ -174,6 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         payload = _read_payload(args.payload_fd)
         home = Path(_text(payload, "home"))
         dispatch_timeout = _number(payload, "post_terminal_timeout_seconds")
+        configure_logging(home, "supervisor")
+        _logger.info(
+            "agent_id=%s stage=payload_read pid=%d",
+            payload.get("agent_id"), child_pid,
+        )
     except BaseException as error:  # identity is already proven: the ready
         # pipe alone carries this reason back to the parent.
         ready.failed(_failure_reason(error))
@@ -185,6 +199,10 @@ def main(argv: list[str] | None = None) -> int:
         _redirect_standard_streams()
         _supervise(payload, home, ready)
     except BaseException as error:
+        _logger.warning(
+            "agent_id=%s stage=supervise failed error_kind=%s",
+            payload.get("agent_id"), type(error).__name__,
+        )
         ready.failed(_failure_reason(error))
         exit_code = 1
     finally:
@@ -193,6 +211,10 @@ def main(argv: list[str] | None = None) -> int:
             _bounded(lambda: _dispatch(home), dispatch_timeout)
         except BaseException:
             exit_code = 1
+    _logger.info(
+        "agent_id=%s stage=exit pid=%d exit_code=%d",
+        payload.get("agent_id"), child_pid, exit_code,
+    )
     return exit_code
 
 

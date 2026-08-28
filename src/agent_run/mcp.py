@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
+import time
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -15,10 +17,15 @@ from .launch_evidence import bootstrap_error_fields
 from .service import AgentQuery, AgentService
 
 
+_logger = logging.getLogger("agent_run.mcp")
+
 MAX_LINE_BYTES = 1024 * 1024
 _MAX_ERROR_CHARS = 512
 _PROTOCOL_VERSION = "2025-06-18"
 _MISSING = object()
+#: Never log a full task; a truncated preview is still useful for a timeline
+#: and never long enough to be the sensitive payload itself.
+_TASK_LOG_CHARS = 120
 
 
 def _schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
@@ -242,18 +249,43 @@ def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
         return _error(request_id, -32602, "tools/call requires name and object arguments")
     # Tolerate standard extra fields (e.g. _meta) per JSON-RPC/MCP robustness;
     # only name/arguments carry tool-call semantics and stay strictly checked.
+    agent_id = arguments.get("agent_id")
+    if not isinstance(agent_id, str):
+        agent_id = None
+    task = arguments.get("task")
+    _logger.info(
+        "tool_call in name=%s request_id=%s agent_id=%s%s",
+        name, request_id, agent_id,
+        "" if not isinstance(task, str) else f" task={task[:_TASK_LOG_CHARS]!r}",
+    )
+    started = time.monotonic()
     if name not in _TOOL_NAMES:
         result = _tool_error("unknown_tool", f"unknown tool: {name}")
+        outcome = "unknown_tool"
     else:
         try:
-            result = _tool_result(_call_tool(service, name, arguments))
+            value = _call_tool(service, name, arguments)
+            result = _tool_result(value)
+            outcome = "ok"
+            if agent_id is None:
+                found = getattr(value, "agent_id", None)
+                agent_id = found if isinstance(found, str) else agent_id
         except AgentRunError as error:
             result = _tool_error(
                 type(error).__name__, str(error), extra=bootstrap_error_fields(error)
             )
+            outcome = type(error).__name__
         except Exception as error:
             result = _tool_error("internal_error", f"internal error: {type(error).__name__}")
+            outcome = "internal_error"
+    duration_ms = (time.monotonic() - started) * 1000
+    log = _logger.info if outcome == "ok" else _logger.warning
+    log(
+        "tool_call out name=%s request_id=%s agent_id=%s outcome=%s duration_ms=%.1f",
+        name, request_id, agent_id, outcome, duration_ms,
+    )
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
 
 
 def _call_tool(service: AgentService, name: str, raw: dict) -> object:
