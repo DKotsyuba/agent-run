@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -28,9 +30,12 @@ from .hooks.bind import ref_from_payload, run_hook
 from .hooks.context import build_context
 from .launch import launch_detached
 from .launch_evidence import bootstrap_error_fields
+from .logging_setup import configure_logging
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
+
+_logger = logging.getLogger("agent_run.cli")
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
@@ -818,8 +823,11 @@ def main(
         _emit(_error_payload(error), stderr)
         return _EXPECTED_ERROR_EXIT
     owned: _Runtime | None = None
+    started = time.monotonic()
     try:
         home = agent_run_home(args.home)
+        configure_logging(home, "mcp" if args.command == "mcp" else "cli")
+        _logger.info("cli command=%s", args.command)
         if service is None and args.command == "init":
             result = _initialize(home)
         elif service is None and args.command == "doctor":
@@ -848,12 +856,24 @@ def main(
                     stdin=stdin,
                     stdout=stdout,
                 )
+                _logger.info(
+                    "cli command=mcp outcome=ok duration_ms=%.1f",
+                    (time.monotonic() - started) * 1000,
+                )
                 return returned if isinstance(returned, int) else 0
             result = _execute(args, target, stdin)
         _emit(result, stdout)
+        _logger.info(
+            "cli command=%s outcome=ok duration_ms=%.1f",
+            args.command, (time.monotonic() - started) * 1000,
+        )
         return 0
     except AgentRunError as error:
         _emit(_error_payload(error), stderr)
+        _logger.warning(
+            "cli command=%s outcome=%s duration_ms=%.1f",
+            args.command, type(error).__name__, (time.monotonic() - started) * 1000,
+        )
         return _EXPECTED_ERROR_EXIT
     finally:
         if owned is not None:

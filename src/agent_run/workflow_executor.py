@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from agent_run.errors import ValidationError
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
+_logger = logging.getLogger("agent_run.workflow_runner")
 
 POLL_SECONDS = 0.05
 _RAW_ANSWER_LIMIT = 4096
@@ -225,6 +227,7 @@ class WorkflowStepExecutor:
         if cached is not None:
             return cached  # type: ignore[return-value]
         self._store_for_caller().record_step_start(self._run_id, step_key, spec)
+        _logger.debug("run_id=%s step_key=%s start", self._run_id, step_key)
         try:
             request = validate_agent_spec(spec)
         except ValidationError as error:
@@ -284,6 +287,7 @@ class WorkflowStepExecutor:
             self._store_for_caller().finish_step(
                 self._run_id, step_key, "succeeded", result=result
             )
+            _logger.debug("run_id=%s step_key=%s finish status=succeeded", self._run_id, step_key)
             return result
         kind = getattr(agent, "failure_kind", None) or "agent_failed"
         params = getattr(agent, "failure_params", None) or {"agent_id": agent_id, "status": status}
@@ -302,6 +306,10 @@ class WorkflowStepExecutor:
         output["failure_params"] = params
         self._store_for_caller().finish_step(
             self._run_id, step_key, "failed", failure_kind=kind, failure_params=params
+        )
+        _logger.warning(
+            "run_id=%s step_key=%s finish status=failed failure_kind=%s",
+            self._run_id, step_key, kind,
         )
         return output
 

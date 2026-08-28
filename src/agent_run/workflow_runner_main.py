@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import signal
 import sys
@@ -26,6 +27,7 @@ from pathlib import Path
 
 from .errors import StateTransitionError, ValidationError
 from .lifecycle import ReadyChannel, install_signal_handlers, restore_signal_handlers
+from .logging_setup import configure_logging
 from .paths import state_db_path
 from .state import step_key, workflow_owner_identity
 from .state.db import nonblank
@@ -40,6 +42,7 @@ from .supervisor_main import (
 )
 from .workflow_run import validate_plan
 
+_logger = logging.getLogger("agent_run.workflow_runner")
 
 CANCELLED_FAILURE_KIND = "runner_cancelled"
 POLL_SECONDS = 0.05
@@ -148,6 +151,7 @@ def execute_plan(
         store.resume_workflow_run(run_id, identity)
     else:
         store.claim_workflow_run(run_id, identity)
+    _logger.info("run_id=%s claimed resume=%s steps=%d", run_id, resume, len(steps))
     if ready is not None:
         ready.ready()
     stop = _StopRequest()
@@ -161,6 +165,7 @@ def execute_plan(
                 continue  # already succeeded in an earlier pass -- replay, don't re-run
             seconds = float(step["seconds"])
             store.record_step_start(run_id, key, step)
+            _logger.debug("run_id=%s step_key=%s start", run_id, key)
             if _sleep(seconds, stop, poll_seconds):
                 store.finish_step(
                     run_id,
@@ -169,14 +174,21 @@ def execute_plan(
                     failure_kind=CANCELLED_FAILURE_KIND,
                     failure_params={"signal": stop.signal_name},
                 )
+                _logger.warning(
+                    "run_id=%s step_key=%s finish status=failed failure_kind=%s",
+                    run_id, key, CANCELLED_FAILURE_KIND,
+                )
                 break
             store.finish_step(
                 run_id, key, "succeeded", result={"slept_seconds": seconds}
             )
+            _logger.debug("run_id=%s step_key=%s finish status=succeeded", run_id, key)
         status = "cancelled" if stop.requested else "succeeded"
         store.finish_workflow_run(run_id, status)
+        _logger.info("run_id=%s finish status=%s", run_id, status)
         return status
-    except BaseException:
+    except BaseException as error:
+        _logger.warning("run_id=%s finish status=failed error_kind=%s", run_id, type(error).__name__)
         with suppress(ValidationError, StateTransitionError):
             store.finish_workflow_run(run_id, "failed")
         raise
@@ -225,6 +237,7 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
                 store.resume_workflow_run(run_id, runner_identity())
             else:
                 store.claim_workflow_run(run_id, runner_identity())
+            _logger.info("run_id=%s claimed resume=%s stage=script", run_id, resume)
             ready.ready()
             stop = _StopRequest()
             previous = install_signal_handlers(stop.request)
@@ -247,17 +260,23 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
                     lambda text: _append_runner_log(log_path, "log", text),
                     4,
                 )
-                store.finish_workflow_run(
-                    run_id,
+                final_status = (
                     "cancelled"
                     if stop.requested
                     else "failed"
                     if executor.failed
                     or (isinstance(outcome, Mapping) and "failure_kind" in outcome)
-                    else "succeeded",
-                    result=_stored_result(home, run_id, outcome),
+                    else "succeeded"
                 )
+                store.finish_workflow_run(
+                    run_id, final_status, result=_stored_result(home, run_id, outcome)
+                )
+                _logger.info("run_id=%s finish status=%s stage=script", run_id, final_status)
             except BaseException as error:
+                _logger.warning(
+                    "run_id=%s finish status=failed stage=script error_kind=%s",
+                    run_id, type(error).__name__,
+                )
                 _append_runner_log(log_path, "runner_error", repr(error))
                 raise
             finally:
@@ -281,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
         _report_identity(args.identity_fd)
         payload = _read_payload(args.payload_fd)
         home = Path(_text(payload, "home"))
+        configure_logging(home, "workflow-runner")
+        _logger.info("run_id=%s pid=%d stage=payload_read", payload.get("run_id"), os.getpid())
     except BaseException as error:  # fail closed: the parent surfaces the reason
         ready.failed(_failure_reason(error))
         ready.close_write()
@@ -294,6 +315,9 @@ def main(argv: list[str] | None = None) -> int:
         _redirect_standard_streams()
         _run(payload, home, ready)
     except BaseException as error:
+        _logger.warning(
+            "run_id=%s stage=exit error_kind=%s", payload.get("run_id"), type(error).__name__
+        )
         with suppress(Exception):
             run_id = _text(payload, "run_id")
             _append_runner_log(

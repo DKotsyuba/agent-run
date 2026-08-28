@@ -1,5 +1,15 @@
 # troubleshoot
 
+## Central log
+
+Every entrypoint (`mcp`, other CLI verbs, the detached supervisor, the
+workflow runner) writes dense, rotating logs to `<home>/logs/<component>.log`
+(`mcp.log`, `cli.log`, `supervisor.log`, `workflow-runner.log`). Logging
+defaults to `DEBUG` so a postmortem has everything; set `AGENT_RUN_LOG_LEVEL`
+(e.g. `INFO`) in the environment to quiet it down once a system is stable.
+A log directory that cannot be created never blocks a command — the process
+falls back to stderr instead.
+
 ## Start with doctor
 
 `agent-run doctor` is the first move for almost any reported problem. It

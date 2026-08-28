@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import threading
@@ -16,6 +17,8 @@ from .launch_evidence import (
     preflight_executable,
     write_exec_failure,
 )
+
+_logger = logging.getLogger("agent_run.launch")
 from .lifecycle import (
     ReadyChannel,
     SystemProcessOps,
@@ -129,6 +132,8 @@ def launch_detached(
         ready.close_read()
         ready.close_write()
         raise ValidationError("cannot fork detached supervisor") from error
+    if pid != 0:
+        _logger.info("launch forked pid=%d module=%s", pid, module)
 
     if pid == 0:
         # Nothing but setsid, execv, and -- on failure only -- one bounded
@@ -147,15 +152,21 @@ def launch_detached(
     _close(payload_read)
     _close(error_write)
     deadline = time.monotonic() + ready_timeout
+    fork_started = time.monotonic()
     group: VerifiedProcessGroup | None = None
     try:
         _write_payload(payload_write, blob)
         reported_pid = _read_identity(identity_read, deadline, pid=pid, error_fd=error_read)
         if reported_pid != pid:
             raise ValidationError("detached supervisor reported the wrong process identity")
+        _logger.debug(
+            "launch identity_proven pid=%d duration_ms=%.1f",
+            pid, (time.monotonic() - fork_started) * 1000,
+        )
         group = verify_process_group(SystemProcessOps(), pid)
         token = ready.wait(_remaining(deadline))
     except ValidationError as error:
+        _logger.warning("launch failed pid=%d error_kind=%s", pid, type(error).__name__)
         ready.close_read()
         if time.monotonic() < deadline and _wait_child(pid, dispatch_timeout + 0.25):
             raise error
@@ -168,6 +179,10 @@ def launch_detached(
         _close(error_read)
 
     ready.close_read()
+    _logger.info(
+        "launch ready pid=%d duration_ms=%.1f",
+        pid, (time.monotonic() - fork_started) * 1000,
+    )
     threading.Thread(
         target=_reap_child, args=(pid, post_reap, reap_timeout), daemon=True
     ).start()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import uuid
 from contextlib import contextmanager
@@ -21,6 +22,8 @@ from .base import (
     CompletionNotice,
     DeliveryError,
 )
+
+_logger = logging.getLogger("agent_run.delivery")
 
 
 LOCK_NAME = "delivery-dispatcher.lock"
@@ -173,6 +176,11 @@ class DeliveryDispatcher:
                 break
             else:
                 failed += 1
+        if claimed:
+            _logger.info(
+                "drain claimed=%d delivered=%d retried=%d failed=%d ambiguous=%d claim_lost=%d",
+                claimed, delivered, retried, failed, ambiguous, claim_lost,
+            )
         return DispatchResult(
             claimed=claimed,
             delivered=delivered,
@@ -184,6 +192,10 @@ class DeliveryDispatcher:
 
     def _dispatch(self, row: Mapping[str, object], at: float | None) -> _Verdict:
         delivery_id = str(row["id"])
+        _logger.debug(
+            "dispatch attempt delivery_id=%s agent_id=%s transport=%s",
+            delivery_id, row.get("agent_id"), row["transport"],
+        )
         transport = self._transports.get(str(row["transport"]))
         if transport is None:
             if self._fail(delivery_id, "delivery transport is not configured", False, at):
@@ -211,6 +223,9 @@ class DeliveryDispatcher:
             )
         except ValidationError:
             return _Verdict("claim_lost", True)
+        _logger.info(
+            "dispatch delivered delivery_id=%s ambiguous=%s", delivery_id, receipt.ambiguous
+        )
         return _Verdict("delivered", receipt.ambiguous)
 
     def _give_up_or_retry(
@@ -224,6 +239,10 @@ class DeliveryDispatcher:
         limit = self._config.max_attempts
         # `max_attempts = 0` means unlimited: retries are durable by default.
         if limit > 0 and int(row["attempts"]) >= limit:
+            _logger.warning(
+                "dispatch give_up delivery_id=%s attempts=%s reason=%s",
+                delivery_id, row["attempts"], error,
+            )
             if self._fail(delivery_id, error, ambiguous, at):
                 return _Verdict("failed", ambiguous)
             return _Verdict("claim_lost", True)
@@ -239,6 +258,7 @@ class DeliveryDispatcher:
             )
         except ValidationError:
             return _Verdict("claim_lost", True)
+        _logger.warning("dispatch retry delivery_id=%s reason=%s", delivery_id, error)
         return _Verdict("retry_wait", ambiguous)
 
     def _fail(

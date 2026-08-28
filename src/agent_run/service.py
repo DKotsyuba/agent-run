@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,6 +33,8 @@ from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir,
 from .profiles import assign_role, load_profile
 from .state.store import StateStore
 
+
+_logger = logging.getLogger("agent_run.service")
 
 _SUMMARY_LIMIT = 50
 _TASK_SUMMARY_CHARS = 160
@@ -268,6 +271,11 @@ class AgentService:
     def start(self, request: StartRequest) -> StartResult:
         if not isinstance(request, StartRequest):
             raise ValidationError("request must be a StartRequest")
+        _logger.info(
+            "start runtime=%s model=%s profile=%s write=%s request_id=%s",
+            request.runtime, request.model, request.profile, request.write,
+            request.request_id,
+        )
         if request.timeout_seconds is None:
             request = replace(
                 request,
@@ -278,15 +286,25 @@ class AgentService:
             request.runtime, self._required_capabilities(request, runtime)
         )
         adapter.validate(runtime)
+        _logger.debug("start gate=capabilities ok runtime=%s", request.runtime)
         if request.model not in runtime.models:
+            _logger.warning(
+                "start gate=model_configured failed runtime=%s model=%s",
+                request.runtime, request.model,
+            )
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
         roster = adapter.models(runtime, runtime.home)
         if request.model not in {model.id for model in roster}:
+            _logger.warning(
+                "start gate=model_available failed runtime=%s model=%s",
+                request.runtime, request.model,
+            )
             raise ValidationError(
                 f"model is not available for runtime {request.runtime}: {request.model}"
             )
+        _logger.debug("start gate=model ok runtime=%s model=%s", request.runtime, request.model)
         # The profile is agent-run's runtime adapter for the shared role
         # contracts: it names the role, and this is where the child is told to
         # load it. One place, so every runtime's preamble carries the same
@@ -309,6 +327,7 @@ class AgentService:
             mcp_servers=mcp_servers,
             skills_root=skills_root,
         )
+        _logger.info("start materialized runtime=%s revision=%s", request.runtime, revision)
         candidate = new_agent_id()
         creation = self._store.create_agent_limited(
             request,
@@ -320,9 +339,11 @@ class AgentService:
             at=self._now(),
         )
         if not creation.created:
+            _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)
             return StartResult(
                 creation.agent_id, False, self.get(creation.agent_id)
             )
+        _logger.info("start agent_id=%s created=True", creation.agent_id)
         try:
             candidate_dir = create_agent_dir(creation.agent_id, self._home)
             plan = adapter.prepare(
@@ -334,11 +355,19 @@ class AgentService:
                 mcp_servers=mcp_servers,
             )
         except Exception as error:
+            _logger.warning(
+                "start agent_id=%s failed stage=prepare error_kind=%s",
+                creation.agent_id, type(error).__name__,
+            )
             self._fail_created_start(creation.agent_id, error, "prepare_failed")
             raise
         try:
             self._launch(creation.agent_id, request, adapter, plan, candidate_dir)
         except Exception as error:
+            _logger.warning(
+                "start agent_id=%s failed stage=launch error_kind=%s",
+                creation.agent_id, type(error).__name__,
+            )
             kind, stage, text = self._fail_created_start(
                 creation.agent_id, error, "supervisor_start_failed"
             )
@@ -351,9 +380,11 @@ class AgentService:
             error.failure_stage = stage
             error.failure_text = text
             raise
+        _logger.info("start agent_id=%s done", creation.agent_id)
         return StartResult(
             creation.agent_id, True, self.get(creation.agent_id)
         )
+
 
     def _fail_created_start(
         self, agent_id: AgentId, error: Exception, kind: str
@@ -386,10 +417,12 @@ class AgentService:
         session_id = self._store.bind_orchestrator(
             agent_id, orchestrator, at=self._now()
         )
+        _logger.info("bind agent_id=%s transport=%s", agent_id, orchestrator.transport)
         return self._delivery_view(validate_agent_id(agent_id), session_id)
 
     def cancel(self, agent_id: str | AgentId) -> AgentView:
         self._store.enqueue_command(agent_id, "cancel", {}, at=self._now())
+        _logger.info("cancel agent_id=%s", agent_id)
         return self.get(agent_id)
 
     def steer(self, agent_id: str | AgentId, text: str) -> CommandView:
@@ -401,9 +434,11 @@ class AgentService:
         command_id = self._store.enqueue_command(
             checked, "steer", {"text": text}, at=self._now()
         )
+        _logger.info("steer agent_id=%s command_id=%s", checked, command_id)
         return CommandView(command_id, checked, "steer")
 
     def get(self, agent_id: str | AgentId) -> AgentView:
+        _logger.debug("status agent_id=%s", agent_id)
         return self._agent_view(self._store.get_agent(agent_id), self._now())
 
     def list(self, query: AgentQuery = AgentQuery()) -> AgentPage:
@@ -469,6 +504,7 @@ class AgentService:
         row = self._store.get_agent(checked)
         status = AgentStatus(str(row["status"]))
         if row["answer_path"] is None:
+            _logger.debug("answer agent_id=%s available=False", checked)
             return AnswerView(checked, status, False, None, None, None, None, True)
         if row["answer_bytes"] is None or row["answer_sha256"] is None:
             raise ValidationError("stored answer proof is incomplete")
@@ -502,6 +538,7 @@ class AgentService:
             text = None if content is None else bytes(content).decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValidationError("stored answer is not valid UTF-8") from error
+        _logger.debug("answer agent_id=%s available=True bytes=%d", checked, size)
         return AnswerView(
             checked,
             status,
@@ -555,7 +592,12 @@ class AgentService:
             reason = health.reason
             if not roster and reason is None:
                 reason = "roster empty"
+            _logger.debug(
+                "models runtime=%s available=%s count=%d reason=%s",
+                name, available, len(roster), reason,
+            )
             result[name] = RuntimeModels(roster, capabilities, available, reason)
+        _logger.info("models runtimes=%d", len(result))
         return MappingProxyType(result)
 
     def limits(self) -> CapacityReport:
