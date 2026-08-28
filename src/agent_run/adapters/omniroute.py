@@ -1,7 +1,8 @@
 """The OmniRoute account pool's quota, read from OmniRoute's own store.
 
-Every model this runtime can reach is served by OmniRoute out of one
-``opencode-go`` account pool, so the pool's quota *is* this runtime's quota.
+Every model the OmniRoute-served runtimes (opencode, qwen) can reach is
+served by OmniRoute out of one ``opencode-go`` account pool, so the pool's
+quota *is* each such runtime's quota.
 
 That store is the only real source there is. Probed live against the local
 server (2026-08-27):
@@ -25,20 +26,29 @@ What the server does keep is sqlite: ``quota_snapshots`` holds
 refreshed by OmniRoute's own provider sync (roughly every 70 minutes, so a
 sample is routinely older than the M009 freshness bound and is then reported
 as unknown -- which is the honest answer, not a missing feature).
+
+OmniRoute now runs inside a docker container (OrbStack) whose volume is not
+readable from the host, so the store is queried in place: the query runs
+inside the container against ``/app/data/storage.sqlite`` via the sqlite
+driver OmniRoute itself ships with (verified live 2026-08-28: the old host
+copy ``~/.omniroute/storage.sqlite`` is a stale pre-docker snapshot).
 """
 
 from __future__ import annotations
 
+import json
 import math
-import sqlite3
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
+from typing import Callable, Iterable, Mapping
 
-from ..base import LimitSample
+from .base import LimitSample
 
 
-OMNIROUTE_STORAGE = Path.home() / ".omniroute" / "storage.sqlite"
+DOCKER = Path("/Users/pluto/.orbstack/bin/docker")
+CONTAINER = "omniroute"
 PROVIDER = "opencode-go"
 LIMITS_STALE_SECONDS = 900
 #: OmniRoute's window keys in this runtime's vocabulary. A key absent here is
@@ -62,6 +72,15 @@ WHERE s.provider = ?
       WHERE provider = ? GROUP BY connection_id, window_key)
 LIMIT 64
 """
+#: Runs the same SQL the old host-side sqlite reader ran, but inside the
+#: container where the live database actually is, using the driver OmniRoute
+#: already bundles. Rows arrive on stdout as one JSON array.
+_DOCKER_SCRIPT = (
+    'const Database = require("/app/node_modules/better-sqlite3");'
+    'const db = new Database("/app/data/storage.sqlite", {readonly: true});'
+    f"const rows = db.prepare({json.dumps(_QUERY)}).all({json.dumps(PROVIDER)}, {json.dumps(PROVIDER)});"
+    "console.log(JSON.stringify(rows));"
+)
 
 
 def _timestamp(value: object) -> datetime | None:
@@ -76,36 +95,62 @@ def _timestamp(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def pool_samples(now: float, database: Path | None = None) -> tuple[LimitSample, ...]:
+def _docker_rows() -> list | None:
+    """Read the snapshot rows from the container; any failure is no evidence."""
+
+    try:
+        result = subprocess.run(
+            [str(DOCKER), "exec", CONTAINER, "node", "-e", _DOCKER_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        rows = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def pool_samples(
+    now: float,
+    fetch_rows: Callable[[], Iterable[Mapping[str, object]]] | None = None,
+) -> tuple[LimitSample, ...]:
     """Report the OmniRoute account pool's quota under the M009 contract.
 
     Equal pool accounts are averaged into one 0-100 figure and the *soonest*
     reset in the pool is the one reported, because that is the one that bites
     first. A window whose newest observation is older than
     ``LIMITS_STALE_SECONDS`` keeps its reset and its timestamp but reports
-    ``source="unknown"`` with no percentage: never a fabricated zero. An
-    unreadable, missing, or schema-drifted store is simply no evidence.
+    ``source="unknown"`` with no percentage: never a fabricated zero. A
+    failing or unparsable row source is simply no evidence.
 
-    Read-only and local: this opens a file, so the collector's cadence is the
-    only cost and no agent start ever reaches the network for it.
+    ``fetch_rows`` overrides the row source (tests); by default the newest
+    snapshots are read out of the OmniRoute container. Local and read-only:
+    one docker exec, so the collector's cadence is the only cost and no agent
+    start ever reaches the network for it.
     """
 
-    path = OMNIROUTE_STORAGE if database is None else Path(database)
+    fetch = _docker_rows if fetch_rows is None else fetch_rows
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+        rows = fetch()
+    except Exception:
         return ()
-    try:
-        rows = connection.execute(_QUERY, (PROVIDER, PROVIDER)).fetchall()
-    except sqlite3.Error:  # a drifted or quarantined store is no evidence
+    if not isinstance(rows, (list, tuple)):
         return ()
-    finally:
-        connection.close()
 
     pooled: dict[str, list[tuple[float, datetime | None, datetime]]] = {}
-    for window_key, remaining, reset_raw, observed_raw in rows:
-        window = WINDOWS.get(window_key)
-        observed_at = _timestamp(observed_raw)
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        window = WINDOWS.get(row.get("window_key"))
+        remaining = row.get("remaining_percentage")
+        observed_at = _timestamp(row.get("created_at"))
         if (
             window is None
             or observed_at is None
@@ -115,7 +160,7 @@ def pool_samples(now: float, database: Path | None = None) -> tuple[LimitSample,
         ):
             continue
         pooled.setdefault(window, []).append(
-            (float(remaining), _timestamp(reset_raw), observed_at)
+            (float(remaining), _timestamp(row.get("next_reset_at")), observed_at)
         )
 
     samples = []
