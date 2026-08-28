@@ -671,59 +671,24 @@ class _Runtime:
 
     def workflow_start(self, name: str, script: str, args: dict | None = None,
                        orchestrator: OrchestratorRef | None = None) -> dict[str, str]:
-        """Launch a script workflow, optionally binding its lifecycle notice."""
+        """Launch a script workflow. Delegates to `AgentService.workflow_start`."""
 
-        from .workflow_run import start_workflow
-
-        source = script if args is None else f"args = {args!r}\n{script}"
-        return {"run_id": start_workflow(
-            self.home, name, {"script": source}, orchestrator=orchestrator
-        )}
+        return self.core.workflow_start(name, script, args, orchestrator)
 
     def workflow_status(self, run_id: str) -> dict[str, object]:
-        """Return the durable journal summary for one workflow run."""
+        """Return one workflow run's journal summary. Delegates to `AgentService.workflow_status`."""
 
-        _config, store = self._inputs()
-        try:
-            return store.workflow_run_status(run_id)
-        finally:
-            store.close()
+        return self.core.workflow_status(run_id)
 
     def workflow_cancel(self, run_id: str) -> dict[str, object]:
-        """Request SIGTERM from a live workflow runner, refusing terminal runs."""
+        """Request cancellation of a live workflow run. Delegates to `AgentService.workflow_cancel`."""
 
-        import signal
-
-        _config, store = self._inputs()
-        try:
-            run = store.workflow_run_status(run_id)["run"]
-            if run["status"] in {"succeeded", "failed", "cancelled", "lost"}:
-                raise ValidationError("terminal workflow run cannot be cancelled")
-            identity = run["owner_pid_identity"]
-            if not isinstance(identity, str) or not identity.split(" ", 1)[0].isdigit():
-                raise ValidationError("workflow runner identity is not recorded")
-            os.kill(int(identity.split(" ", 1)[0]), signal.SIGTERM)
-            return {"run_id": run_id, "cancel_requested": True}
-        finally:
-            store.close()
+        return self.core.workflow_cancel(run_id)
 
     def workflow_answer(self, run_id: str) -> object:
-        """Return a terminal workflow's last persisted step result, if any."""
+        """Return a terminal workflow run's last result. Delegates to `AgentService.workflow_answer`."""
 
-        _config, store = self._inputs()
-        try:
-            run = store.workflow_run_status(run_id)["run"]
-            if run["status"] not in {"succeeded", "failed", "cancelled", "lost"}:
-                raise ValidationError("workflow run has not finished")
-            row = store.connection.execute(
-                """SELECT result_json FROM workflow_steps
-                   WHERE run_id = ? AND result_json IS NOT NULL ORDER BY rowid DESC LIMIT 1""",
-                (run_id,),
-            ).fetchone()
-            return {"run_id": run_id, "status": run["status"],
-                    "result": None if row is None else json.loads(row["result_json"])}
-        finally:
-            store.close()
+        return self.core.workflow_answer(run_id)
 
     def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
         config, store = self._inputs()
