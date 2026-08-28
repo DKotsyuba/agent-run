@@ -867,6 +867,10 @@ def main(
             "cli command=%s outcome=ok duration_ms=%.1f",
             args.command, (time.monotonic() - started) * 1000,
         )
+        # A doctor report with any error-severity finding is a failed check,
+        # not a successful command -- surface that as a nonzero exit.
+        if args.command == "doctor" and getattr(result, "ok", True) is False:
+            return _EXPECTED_ERROR_EXIT
         return 0
     except AgentRunError as error:
         _emit(_error_payload(error), stderr)

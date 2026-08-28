@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,8 @@ from typing import Callable
 
 from .config import Config, RuntimeConfig, load_config
 from .errors import AgentRunError, SchemaMigrationRequired
+from .launch import launch_detached
+from .launch_evidence import SupervisorBootstrapError
 from .paths import config_path, state_db_path
 from .state import diagnostic_snapshot
 
@@ -46,6 +50,12 @@ class DoctorReport:
 
 
 ProcessProbe = Callable[[int, int | None], tuple[bool, str | None, bool]]
+#: Runs the provider-free canary handshake and returns its duration in
+#: milliseconds, or raises (typically :class:`SupervisorBootstrapError`).
+CanaryRunner = Callable[[], float]
+#: Lists ``(pid, ps "lstart" text, ps "command" text)`` for every process on
+#: the machine; swappable so inventory parsing is testable without a live ps.
+McpProcessLister = Callable[[], list[tuple[int, str, str]]]
 
 
 def run_doctor(
@@ -53,6 +63,9 @@ def run_doctor(
     *,
     at: float | None = None,
     process_probe: ProcessProbe | None = None,
+    canary_executable: str | None = None,
+    canary_runner: CanaryRunner | None = None,
+    mcp_process_lister: McpProcessLister | None = None,
 ) -> DoctorReport:
     root = Path(home).expanduser().resolve()
     checked_at = time.time() if at is None else float(at)
@@ -83,6 +96,10 @@ def run_doctor(
         return DoctorReport(root, checked_at, tuple(findings))
     _capacity(config, snapshot.capacity, checked_at, findings)
     _supervisors(snapshot.agents, process_probe or _probe_process, findings)
+    _canary_handshake(
+        findings, canary_runner or _bound_canary_runner(canary_executable)
+    )
+    _mcp_inventory(findings, root, mcp_process_lister or _list_mcp_processes)
     return DoctorReport(root, checked_at, tuple(findings[:_LIMIT]))
 
 
@@ -247,3 +264,192 @@ def _under(path: Path, root: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+_CANARY_PS_ARGS_COMMAND = ["/bin/ps", "-A", "-o", "pid=,command="]
+_CANARY_PS_ARGS_LSTART = ["/bin/ps", "-A", "-o", "pid=,lstart="]
+_PS_ENV = {"PATH": "/usr/bin:/bin"}
+_PS_TIMEOUT_SECONDS = 2
+_LSTART_FORMAT = "%a %b %d %H:%M:%S %Y"
+_LSTART_WHITESPACE = re.compile(r"\s+")
+
+
+def _bound_canary_runner(executable: str | None) -> CanaryRunner:
+    """Bind ``_run_canary`` to one executable so ``run_doctor`` can pass it around."""
+
+    return lambda: _run_canary(executable or sys.executable)
+
+
+def _run_canary(executable: str) -> float:
+    """Run the real fork -> exec -> identity-proof -> READY handshake, provider-free.
+
+    Targets a scratch temporary home and the real ``agent_run.supervisor_main``
+    module via :func:`launch_detached`, exactly as ``start`` does, but with
+    ``canary: True`` in the payload so the exec'd process proves identity,
+    signals READY, and exits without ever touching an adapter or a session.
+    Returns the handshake duration in milliseconds; raises
+    :class:`SupervisorBootstrapError` (or another :class:`AgentRunError`) on
+    any failure in that path, carrying the same bootstrap evidence a real
+    failed ``start`` would.
+    """
+
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="agent-run-doctor-canary-") as home:
+        launch_detached({"home": home, "canary": True}, executable=executable)
+    return (time.monotonic() - started) * 1000
+
+
+def _canary_handshake(findings: list[DoctorFinding], runner: CanaryRunner) -> None:
+    try:
+        duration_ms = runner()
+    except SupervisorBootstrapError as error:
+        _add(findings, error.failure_kind, "error", "canary", _canary_detail(error))
+    except AgentRunError as error:
+        _add(findings, "supervisor_canary_failed", "error", "canary", type(error).__name__)
+    else:
+        _add(
+            findings,
+            "supervisor_canary_ok",
+            "info",
+            "canary",
+            f"handshake completed in {duration_ms:.1f}ms",
+        )
+
+
+def _canary_detail(error: SupervisorBootstrapError) -> str:
+    parts = [str(error)]
+    if error.failure_stage:
+        parts.append(f"stage={error.failure_stage}")
+    if error.bootstrap_error_type:
+        parts.append(f"type={error.bootstrap_error_type}")
+    if error.provisional_pid is not None:
+        parts.append(f"pid={error.provisional_pid}")
+    return "; ".join(parts)
+
+
+def _list_mcp_processes() -> list[tuple[int, str, str]]:
+    """Pair every process's ``ps`` command with its start time.
+
+    Two separate ``ps`` calls (rather than one combined format) because
+    ``lstart`` embeds internal spaces that would make a single whitespace
+    split ambiguous; each call instead needs only one split on the pid.
+    """
+
+    commands = _ps_by_pid(_CANARY_PS_ARGS_COMMAND)
+    if not commands:
+        return []
+    starts = _ps_by_pid(_CANARY_PS_ARGS_LSTART)
+    return [
+        (pid, starts[pid], command)
+        for pid, command in commands.items()
+        if pid in starts
+    ]
+
+
+def _ps_by_pid(args: list[str]) -> dict[int, str]:
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_PS_TIMEOUT_SECONDS, env=_PS_ENV
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    rows: dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        rows[pid] = parts[1]
+    return rows
+
+
+def _looks_like_mcp_process(tokens: list[str]) -> bool:
+    if "mcp" not in tokens:
+        return False
+    return any(
+        token == "agent_run.cli" or Path(token).name == "agent-run" for token in tokens
+    )
+
+
+def _parse_lstart(raw: str) -> float | None:
+    normalized = _LSTART_WHITESPACE.sub(" ", raw.strip())
+    try:
+        return time.mktime(time.strptime(normalized, _LSTART_FORMAT))
+    except ValueError:
+        return None
+
+
+def _mcp_inventory(
+    findings: list[DoctorFinding], root: Path, lister: McpProcessLister
+) -> None:
+    """List every ``agent-run mcp`` process visible on the machine for this home.
+
+    macOS has no ``/proc/<pid>/exe`` equivalent, so a running process's
+    resolved release can never be read back from the OS once it has exec'd --
+    only the argv path it was launched with (via ``ps``, e.g. through the
+    ``standalone/current`` symlink), which may no longer match what that
+    symlink points to today. This reports the honest available signal
+    instead of a false-precision resolution: this process's own resolved
+    release, the ``current`` symlink's target and last-switched time, and
+    for every other mcp process, its pid, start time, and launch-path
+    release hint -- flagged as a warning when the process started before
+    the symlink's last switch, since it may still be running the code that
+    was current at that time.
+    """
+
+    current_link = root / "standalone" / "current"
+    try:
+        switch_epoch = current_link.lstat().st_mtime
+    except OSError:
+        switch_epoch = None
+    try:
+        current_target = os.readlink(current_link)
+    except OSError:
+        current_target = None
+    _add(
+        findings,
+        "mcp_inventory_self",
+        "info",
+        "mcp:self",
+        f"release={os.path.realpath(sys.executable)} current_target={current_target or 'unknown'}",
+    )
+    self_pid = os.getpid()
+    for pid, lstart_raw, command in lister()[:_LIMIT]:
+        if pid == self_pid:
+            continue
+        tokens = command.split()
+        if not _looks_like_mcp_process(tokens):
+            continue
+        release_hint = tokens[0]
+        start_epoch = _parse_lstart(lstart_raw)
+        started = (
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start_epoch))
+            if start_epoch is not None
+            else lstart_raw.strip()
+        )
+        if (
+            switch_epoch is not None
+            and start_epoch is not None
+            and start_epoch < switch_epoch
+        ):
+            _add(
+                findings,
+                "mcp_process_older_release",
+                "warning",
+                f"mcp:{pid}",
+                f"started={started} release={release_hint}; started before the "
+                "current release switch and may run older code -- reconnect "
+                "MCP in this session before pruning releases",
+            )
+        else:
+            _add(
+                findings,
+                "mcp_process",
+                "info",
+                f"mcp:{pid}",
+                f"started={started} release={release_hint}",
+            )
+

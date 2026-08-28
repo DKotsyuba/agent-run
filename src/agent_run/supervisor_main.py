@@ -162,7 +162,14 @@ def _dispatch(home: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run one supervisor, then its bounded post-terminal delivery dispatch."""
+    """Run one supervisor, then its bounded post-terminal delivery dispatch.
+
+    ``payload["canary"] == True`` selects the doctor handshake probe: identity
+    proof and READY happen exactly as in a real launch, but no adapter, plan,
+    or session ever runs, and no post-terminal dispatch fires. It exists so
+    `agent-run doctor` can exercise the real fork -> exec -> identity-proof ->
+    READY path with no provider/runtime involved.
+    """
 
     args = _arguments(argv)
     ready = ReadyChannel.from_write_fd(args.ready_fd)
@@ -193,6 +200,11 @@ def main(argv: list[str] | None = None) -> int:
         ready.failed(_failure_reason(error))
         ready.close_write()
         return 1
+
+    if payload.get("canary") is True:
+        _logger.info("stage=canary_ready pid=%d", child_pid)
+        ready.ready()
+        return 0
 
     exit_code = 0
     try:
