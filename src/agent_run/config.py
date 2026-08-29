@@ -32,6 +32,7 @@ class CapacityConfig:
     collect_interval_seconds: int = 300
     sample_retention: int = 1000
     context_max_chars: int = 2500
+    codexbar_binary: Path = Path("/opt/homebrew/bin/codexbar")
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class RuntimeConfig:
     hooks: tuple[RuntimeHookConfig, ...] = ()
     service_mode: str | None = None
     plugins: tuple[Path, ...] = ()
+    limits_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,7 +238,12 @@ def _parse_capacity(value: object) -> CapacityConfig:
     table = _table(value, "capacity")
     _reject_unknown(
         table,
-        {"collect_interval_seconds", "sample_retention", "context_max_chars"},
+        {
+            "collect_interval_seconds",
+            "sample_retention",
+            "context_max_chars",
+            "codexbar_binary",
+        },
         "capacity",
     )
     interval = _int(
@@ -251,10 +258,14 @@ def _parse_capacity(value: object) -> CapacityConfig:
     )
     if context_max_chars > 2500:
         raise ValidationError("capacity.context_max_chars must be <= 2500")
+    codexbar_binary = table.get("codexbar_binary")
     return CapacityConfig(
         interval,
         _int(table.get("sample_retention", 1000), "capacity.sample_retention", minimum=1),
         context_max_chars,
+        Path("/opt/homebrew/bin/codexbar")
+        if codexbar_binary is None
+        else _path(codexbar_binary, "capacity.codexbar_binary"),
     )
 
 
@@ -369,6 +380,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "hooks",
         "service_mode",
         "plugins",
+        "limits_source",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -382,6 +394,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         maximum = table.get("max_active_agents")
         auth = table.get("auth")
         service_mode = table.get("service_mode")
+        limits_source = table.get("limits_source")
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -395,9 +408,14 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             _parse_hooks(table.get("hooks", []), f"{path}.hooks"),
             None if service_mode is None else _string(service_mode, f"{path}.service_mode"),
             _plugin_dirs(table.get("plugins", []), f"{path}.plugins"),
+            None if limits_source is None else _string(limits_source, f"{path}.limits_source"),
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")
+        if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "none"}:
+            raise ValidationError(
+                f"{path}.limits_source must be one of 'native', 'omniroute', 'codexbar', 'none'"
+            )
     return MappingProxyType(result)
 
 

@@ -14,10 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
-from ..adapters.base import Capability, LimitSample, RuntimeAdapter
+from ..adapters.base import LimitSample, RuntimeAdapter
 from ..adapters.registry import load_adapter
-from ..config import Config, RuntimeConfig
+from ..config import CapacityConfig, Config, RuntimeConfig
 from ..state import StateStore
+from . import sources
 
 _logger = logging.getLogger("agent_run.capacity")
 
@@ -85,16 +86,20 @@ def _store_sample(
 
 
 def _collect_runtime(
-    store: StateStore, name: str, runtime_config: RuntimeConfig, load: AdapterLoader, started: float
+    store: StateStore,
+    name: str,
+    runtime_config: RuntimeConfig,
+    capacity_config: CapacityConfig,
+    load: AdapterLoader,
+    started: float,
 ) -> CollectResult:
     count = 0
     try:
-        adapter = load(name, runtime_config)
-        info = adapter.describe()
-        if Capability.LIVE_LIMITS not in info.capabilities:
+        samples = sources.collect_samples(name, runtime_config, capacity_config, load)
+        if samples is None:
             _logger.debug("collect runtime=%s status=%s", name, STATUS_UNSUPPORTED)
             return CollectResult(name, STATUS_UNSUPPORTED, 0)
-        for sample in adapter.limits(runtime_config, runtime_config.home):
+        for sample in samples:
             if not isinstance(sample, LimitSample):
                 raise TypeError("limit sample must be a LimitSample")
             observed_epoch = _epoch(sample.observed_at)
@@ -124,7 +129,7 @@ def collect_once(
     load = loader or _default_loader
     started = time.time() if at is None else at
     results = tuple(
-        _collect_runtime(store, name, runtime_config, load, started)
+        _collect_runtime(store, name, runtime_config, config.capacity, load, started)
         for name, runtime_config in config.runtimes.items()
         if runtime_config.enabled
     )

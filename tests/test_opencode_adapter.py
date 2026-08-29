@@ -1599,6 +1599,7 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
             self.assertEqual(
                 sample.observed_at, datetime.fromisoformat(_NEWEST_OBSERVATION)
             )
+            self.assertEqual(sample.valid_for_seconds, LIMITS_STALE_SECONDS)
         # The soonest reset in the pool is the one that bites first.
         self.assertEqual(
             samples["session_5h"].reset_at,

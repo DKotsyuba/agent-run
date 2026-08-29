@@ -179,6 +179,7 @@ def pool_samples(
                 observed_at=observed_at,
                 source="unknown" if stale else "omniroute_quota_pool",
                 target=f"{PROVIDER}:pool",
+                valid_for_seconds=LIMITS_STALE_SECONDS,
             )
         )
     return tuple(samples)
