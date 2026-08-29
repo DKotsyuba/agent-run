@@ -93,10 +93,10 @@ class QwenAdapterTests(unittest.TestCase):
             )
 
     def test_read_only_and_write_modes_are_explicit_and_sandboxed(self) -> None:
-        """Map read-only to plan and writes to auto-edit without dropping sandbox."""
+        """Map read-only to plan and writes to yolo (live shell) without dropping sandbox."""
         readonly = self.prepare()
         writable = self.prepare(write=True)
-        for plan, expected in ((readonly, "plan"), (writable, "auto-edit")):
+        for plan, expected in ((readonly, "plan"), (writable, "yolo")):
             self.assertEqual(plan.argv[plan.argv.index("--approval-mode") + 1], expected)
             self.assertIn("--sandbox", plan.argv)
             self.assertEqual(plan.cwd, self.workdir)

@@ -224,7 +224,11 @@ class QwenAdapter:
         if request.write and not profile.write:
             raise ValidationError("qwen profile does not allow requested write access")
         allow_write = request.write and profile.write
-        approval_mode = "auto-edit" if allow_write else "plan"
+        # yolo auto-approves the shell tool that auto-edit leaves dead in a
+        # one-shot run; the seatbelt sandbox and the worktree stay the fence.
+        # Probed live on qwen-code 0.22.2 (2026-08-29): plan/auto-edit deny
+        # run_shell_command, yolo executes it inside the sandbox.
+        approval_mode = "yolo" if allow_write else "plan"
         role_text = profile.body
         if request.output_schema is not None:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
