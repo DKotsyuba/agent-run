@@ -77,8 +77,10 @@ stable specs give stable keys, which is what makes the journal replayable.
 - **qwen**: the cheap-OSS lane (Chinese models through the local OmniRoute
   router; combo aliases keep the historical `opencode/` prefix). Check the
   LIVE roster with the `models` tool. `opencode/MiniMaxM3` answers one-liners
-  in seconds — the default smoke and verify model. Write children have no
-  shell (qwen sandbox): acceptance runs their tests and commits for them.
+  in seconds — the default smoke and verify model. Since 29.08.2026 write
+  children have a sandboxed shell and run their own tests (name the exact
+  commands in the step brief); read-only children have none, and git commits
+  stay with acceptance.
 - **claude**: watch the capacity advisory before fanning out; sonnet steps
   are the cheap option.
 
