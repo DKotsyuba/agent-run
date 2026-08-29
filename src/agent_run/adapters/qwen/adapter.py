@@ -52,6 +52,37 @@ _CAPABILITIES = frozenset(
 #: and OPENAI_BASE_URL are both set (verified live against 0.22.2).
 _SELECTED_AUTH_TYPE = "openai"
 
+#: Marker Qwen emits as its entire final result text on an upstream provider
+#: failure while exiting cleanly (verified live against 0.22.2: the run then
+#: used to be sealed ``succeeded`` with the raw error as its "answer").
+_API_ERROR_PREFIX = "[API Error:"
+
+#: Upper bound on the failure line kept from an error-only result; the first
+#: line of Qwen's ``[API Error: ...]`` payload carries no secrets, and the
+#: cap keeps pathological provider payloads out of the durable store.
+_MAX_FAILURE_LINE = 500
+
+
+def qwen_error_only_result_line(result_text: str) -> str | None:
+    """Bounded first line when a Qwen result is nothing but a provider error.
+
+    Only a result whose stripped text *starts* with the ``[API Error:``
+    marker counts as error-only; a real answer that merely mentions an API
+    error somewhere inside its content stays a success.
+    """
+
+    stripped = result_text.strip()
+    if not stripped.startswith(_API_ERROR_PREFIX):
+        return None
+    return stripped.splitlines()[0].strip()[:_MAX_FAILURE_LINE]
+
+
+class QwenSession(ClaudeSession):
+    """Claude-style session whose clean-exit result can still be a failure."""
+
+    def _error_only_result_line(self, result_text: str) -> str | None:
+        return qwen_error_only_result_line(result_text)
+
 
 def _mcp_document(names: tuple[str, ...], servers: Mapping[str, McpConfig]) -> dict[str, object]:
     """Return strict Qwen stdio MCP settings for resolved configured names.
@@ -280,14 +311,14 @@ class QwenAdapter:
             answer_path=agent_dir / "answer.md",
         )
 
-    def launch(self, plan: LaunchPlan, sink: EventSink) -> ClaudeSession:
+    def launch(self, plan: LaunchPlan, sink: EventSink) -> QwenSession:
         """Launch Qwen in its own process group and decode its JSONL stream."""
         process = subprocess.Popen(
             list(plan.argv), cwd=str(plan.cwd), env=dict(plan.environment), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             start_new_session=True,
         )
-        return ClaudeSession(process, plan, sink)
+        return QwenSession(process, plan, sink)
 
 
 ADAPTER = QwenAdapter()

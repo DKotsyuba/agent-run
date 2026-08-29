@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
+from agent_run.adapters.claude import adapter as claude_adapter
 from agent_run.adapters.qwen import auth as qwen_auth
 from agent_run.adapters.qwen.adapter import ADAPTER, QwenAdapter
-from agent_run.adapters.base import Capability
+from agent_run.adapters.base import Capability, LaunchPlan
 from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
-from agent_run.domain import StartRequest
+from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
 
@@ -247,6 +250,107 @@ class QwenAdapterTests(unittest.TestCase):
         installed = self.home / "plugins" / "lsp-guard-plugin" / "hooks" / "lsp_guard.py"
         self.assertIn(str(installed), rendered_command)
         self.assertTrue(installed.is_file())
+
+
+class FakeSink:
+    """Minimal EventSink stand-in for launched stub sessions."""
+
+    def __init__(self) -> None:
+        self.messages: list = []
+        self.sessions: list = []
+        self.events: list = []
+
+    def message(self, message) -> None:
+        self.messages.append(message)
+
+    def session(self, runtime_session_id: str) -> None:
+        self.sessions.append(runtime_session_id)
+
+    def event(self, kind: str, data) -> None:
+        self.events.append((kind, dict(data)))
+
+
+class QwenErrorOnlyResultTests(unittest.TestCase):
+    """An upstream ``[API Error: ...]`` result is a failure, never an answer.
+
+    Regression for T35B (verified live in the durable store, agents
+    ag-20260828-162223-6d45036f11 / ag-20260829-185940-2bff9b5b25): Qwen's
+    CLI emits a raw provider error as its final result message and exits 0,
+    which used to be sealed as a ``succeeded`` answer.
+    """
+
+    API_ERROR_400 = (
+        "[API Error: 400 opencode-go/deepseek-v4-pro-high: model - [400]: "
+        "Error from provider (Console Go): Upstream request failed: "
+        "[invalid_request_error] No tool output found for tool call call_01_a2b3c4d5e6f7]"
+    )
+    API_ERROR_500 = (
+        "[API Error: 500 opencode-go/mimo-v2.5-max: provider - [500]: "
+        "Error from provider: Internal server error (HTTP 500)]"
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.workdir = self.root / "work"
+        self.workdir.mkdir()
+        self.agent_dir = self.root / "agents" / "ag-1"
+        self.agent_dir.mkdir(parents=True)
+
+    def plan(self, result_text: str) -> LaunchPlan:
+        script = (
+            "import json\n"
+            f"print(json.dumps({{'type': 'result', 'session_id': 'sess-1', 'subtype': 'success', "
+            f"'is_error': False, 'result': {result_text!r}}}))\n"
+        )
+        return LaunchPlan(
+            argv=(sys.executable, "-u", "-c", script),
+            cwd=self.workdir,
+            environment=MappingProxyType({}),
+            initial_input="",
+            runtime_stream_path=self.agent_dir / "runtime.jsonl",
+            adapter_state=MappingProxyType({}),
+            answer_path=self.agent_dir / "answer.md",
+        )
+
+    def test_error_only_400_result_fails_with_provider_error(self) -> None:
+        outcome = ADAPTER.launch(self.plan(self.API_ERROR_400), FakeSink()).wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertEqual(outcome.failure_kind, "provider_error")
+        self.assertEqual(outcome.failure_text, self.API_ERROR_400)
+        self.assertIsNone(outcome.answer_path)
+        self.assertFalse((self.agent_dir / "answer.md").exists())
+
+    def test_error_only_500_result_fails_with_provider_error(self) -> None:
+        outcome = ADAPTER.launch(self.plan(self.API_ERROR_500), FakeSink()).wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "provider_error")
+        self.assertEqual(outcome.failure_text, self.API_ERROR_500)
+
+    def test_error_mention_inside_real_content_stays_succeeded(self) -> None:
+        result = (
+            "The first attempt hit " + self.API_ERROR_400 +
+            " so I retried the request.\nFinal answer: the task is done."
+        )
+        outcome = ADAPTER.launch(self.plan(result), FakeSink()).wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertIsNone(outcome.failure_kind)
+        answer = (self.agent_dir / "answer.md").read_text(encoding="utf-8")
+        self.assertIn("Final answer: the task is done.", answer)
+
+    def test_claude_session_semantics_are_unchanged(self) -> None:
+        """The shared base session must not classify text prefixes."""
+        outcome = claude_adapter.ADAPTER.launch(
+            self.plan(self.API_ERROR_400), FakeSink()
+        ).wait(timeout_seconds=5)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertIsNone(outcome.failure_kind)
 
 
 if __name__ == "__main__":
