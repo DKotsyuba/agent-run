@@ -207,6 +207,7 @@ def _rollout_limits(
                         observed_at=observed_at,
                         source="unknown" if stale else "isolated_rollout_evidence",
                         target=target,
+                        valid_for_seconds=_LIMITS_STALE_SECONDS,
                     )
                 )
             if samples:

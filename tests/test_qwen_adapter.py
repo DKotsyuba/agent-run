@@ -194,6 +194,7 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertEqual(sample.source, "omniroute_quota_pool")
         self.assertEqual(sample.target, "opencode-go:pool")
         self.assertEqual(sample.remaining_percent, 90.0)
+        self.assertEqual(sample.valid_for_seconds, 900)
 
     def test_a_failing_row_source_reports_no_samples(self) -> None:
         """A docker failure is no evidence, never an exception."""

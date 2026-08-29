@@ -131,6 +131,7 @@ def agent_rate_limit_samples(home: Path, now: float) -> tuple[LimitSample, ...]:
                         reset_at=_timestamp(window.get("resetsAt")),
                         observed_at=observed_at,
                         source="unknown" if stale else "runtime_stream_evidence",
+                        valid_for_seconds=_LIMITS_STALE_SECONDS,
                     )
                 )
             if samples:

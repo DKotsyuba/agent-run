@@ -77,6 +77,43 @@ command = ["echo", "done"]
                 'schema_version = 1\n[delivery]\ncodex_queue_bin = "relative"\n'
             )
 
+    def runtime_with_limits_source(self, source_line: str = ""):
+        return self.load(
+            f"""schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/runtime-home"
+models = ["test"]
+{source_line}
+"""
+        )
+
+    def test_limits_source_defaults_to_native_and_is_validated(self) -> None:
+        self.assertIsNone(self.runtime_with_limits_source().runtimes["fake"].limits_source)
+        for source in ("native", "omniroute", "codexbar", "none"):
+            with self.subTest(source=source):
+                configured = self.runtime_with_limits_source(f'limits_source = "{source}"')
+                self.assertEqual(
+                    configured.runtimes["fake"].limits_source, source
+                )
+        for bad in ("codex", "native,evil", "Codexbar"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(
+                ValidationError, r"runtimes\.fake\.limits_source"
+            ):
+                self.runtime_with_limits_source(f'limits_source = "{bad}"')
+
+    def test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute(self) -> None:
+        self.assertEqual(
+            self.load("schema_version = 1\n").capacity.codexbar_binary,
+            Path("/opt/homebrew/bin/codexbar"),
+        )
+        configured = self.load('schema_version = 1\n[capacity]\ncodexbar_binary = "/bin/echo"\n')
+        self.assertEqual(configured.capacity.codexbar_binary, Path("/bin/echo"))
+        with self.assertRaisesRegex(ValidationError, "capacity.codexbar_binary"):
+            self.load('schema_version = 1\n[capacity]\ncodexbar_binary = "relative"\n')
+
     def runtime_with_plugins(self, value: str, directory: Path):
         return self.load(
             f"""schema_version = 1
