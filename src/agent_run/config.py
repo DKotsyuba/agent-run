@@ -25,6 +25,7 @@ class CoreConfig:
     default_timeout_seconds: float = 480
     max_active_agents: int = 6
     warning_fraction: float = 0.90
+    stalled_after_seconds: float = 900
 
 
 @dataclass(frozen=True)
@@ -217,7 +218,12 @@ def _parse_core(value: object) -> CoreConfig:
     table = _table(value, "core")
     _reject_unknown(
         table,
-        {"default_timeout_seconds", "max_active_agents", "warning_fraction"},
+        {
+            "default_timeout_seconds",
+            "max_active_agents",
+            "warning_fraction",
+            "stalled_after_seconds",
+        },
         "core",
     )
     warning = _number(table.get("warning_fraction", 0.90), "core.warning_fraction", minimum=0)
@@ -231,6 +237,11 @@ def _parse_core(value: object) -> CoreConfig:
         ),
         _int(table.get("max_active_agents", 6), "core.max_active_agents", minimum=1),
         warning,
+        _number(
+            table.get("stalled_after_seconds", 900),
+            "core.stalled_after_seconds",
+            minimum=0,
+        ),
     )
 
 

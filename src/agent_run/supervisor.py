@@ -44,7 +44,10 @@ CANCEL_COMMAND = "cancel"
 STEER_COMMAND = "steer"
 _MINIMUM_POLL = 0.001
 DEFAULT_WARNING_TEXT = (
-    "Time budget is nearly exhausted. Stop exploring, write your final answer now."
+    "Time budget is nearly exhausted. Stop starting new work NOW. Write your final "
+    "answer immediately: (1) what is COMPLETE, with evidence (files, tests, commands "
+    "run); (2) what is NOT done and the exact continuation point for a successor. Then "
+    "end with your completion sentinel."
 )
 
 
@@ -85,6 +88,7 @@ class SupervisorSettings:
     warning_fraction: float = 0.90
     warning_text: str = DEFAULT_WARNING_TEXT
     silence_threshold_seconds: float = 60.0
+    stalled_after_seconds: float = 900.0
     sentinel: str | None = DEFAULT_SENTINEL
 
     def __post_init__(self) -> None:
@@ -102,7 +106,11 @@ class SupervisorSettings:
                 or value <= 0
             ):
                 raise ValidationError(f"{name} must be positive and finite")
-        for name in ("natural_grace_seconds", "silence_threshold_seconds"):
+        for name in (
+            "natural_grace_seconds",
+            "silence_threshold_seconds",
+            "stalled_after_seconds",
+        ):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
@@ -222,6 +230,7 @@ class Supervisor:
         self._signalled = False
         self._warned = False
         self._last_heartbeat: float | None = None
+        self._run_started_at: float | None = None
 
     def run(self) -> Outcome:
         """Report ready only after handlers are armed and `starting` is durable."""
@@ -319,6 +328,10 @@ class Supervisor:
             process_group_id=self._recorded_group_id,
         )
         self._last_heartbeat = started_at
+        # Baseline for the stalled watchdog only. Seeding the sink itself
+        # would erase the "no stream progress ever" evidence that timeout
+        # outcomes report as silence=no_progress.
+        self._run_started_at = started_at
         self._store.transition(self._agent_id, AgentStatus.RUNNING, kind="running")
         deadline = Deadline(
             started_at, self._timeout_seconds, self._settings.warning_fraction
@@ -392,12 +405,39 @@ class Supervisor:
                         self._warn(session, steerable, deadline, now)
                     elif phase is Phase.EXPIRED:
                         self._stop_reason = STOP_TIMEOUT
+                    elif self._is_stalled(now):
+                        silence = now - self._stall_baseline()
+                        self._store.append_event(
+                            self._agent_id, "stalled", data={"silence_seconds": silence}
+                        )
+                        self._stop_reason = "stalled"
             if self._stop_reason is not None:
                 return self._stop(session)
             outcome = session.wait(self._wait_timeout(deadline, now))
             if outcome is not None:
                 return outcome
             self._heartbeat(self._ops.monotonic())
+
+    def _stall_baseline(self) -> float:
+        """Return the moment stream silence is measured from.
+
+        The last stream event when one ever arrived, otherwise the run start:
+        a child that never emitted anything must still stall, while the sink's
+        own ``last_progress_at`` stays untouched so timeout outcomes keep
+        reporting ``silence=no_progress`` honestly.
+        """
+
+        last_event = self._sink.last_progress_at
+        if last_event is not None:
+            return last_event
+        return self._run_started_at if self._run_started_at is not None else 0.0
+
+    def _is_stalled(self, now: float) -> bool:
+        """Return whether the running engine has exceeded its stream-silence budget."""
+
+        if self._settings.stalled_after_seconds <= 0:
+            return False
+        return now - self._stall_baseline() > self._settings.stalled_after_seconds
 
     def _wait_timeout(self, deadline: Deadline, now: float) -> float:
         """Never sleep past the warning point, so a coarse poll cannot skip it."""
@@ -548,15 +588,26 @@ class Supervisor:
         self._record_termination(termination, best_effort=True)
         self._reap_session(session)
         proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
-        outcome = verify_completion(
-            session_outcome=session_outcome,
-            stop_reason=self._stop_reason,
-            answer=proof,
-            group_gone=termination.group_gone,
-            last_progress_at=self._sink.last_progress_at,
-            now=self._ops.monotonic(),
-            silence_threshold_seconds=self._settings.silence_threshold_seconds,
-        )
+        if self._stop_reason == "stalled":
+            # verify_completion knows only timeout/cancel stop reasons, and a
+            # stalled child by definition produced no fresh answer to verify.
+            silence = self._ops.monotonic() - self._stall_baseline()
+            outcome = Outcome(
+                AgentStatus.FAILED,
+                failure_kind="stalled",
+                failure_text=f"no stream events for {silence:.0f}s",
+                runtime_session_id=self._sink.runtime_session_id,
+            )
+        else:
+            outcome = verify_completion(
+                session_outcome=session_outcome,
+                stop_reason=self._stop_reason,
+                answer=proof,
+                group_gone=termination.group_gone,
+                last_progress_at=self._sink.last_progress_at,
+                now=self._ops.monotonic(),
+                silence_threshold_seconds=self._settings.silence_threshold_seconds,
+            )
         committed = self._commit(outcome)
         self._drain_terminal_commands()
         return committed
