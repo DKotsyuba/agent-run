@@ -103,9 +103,11 @@ The CLI positional is the SCRIPT SOURCE TEXT, not a path — always pass
 `"$(cat file)"`. Passing a path makes the runner compile the path string and
 fail with a SyntaxError.
 
-Do not block your turn on a run: watch it with a background poll loop on
-`workflow status <run_id>` (terminal statuses: succeeded / failed /
-cancelled / lost), and keep doing other work.
+Do not block your turn on a run: put `agent-run workflow wait <run_id>`
+in the background (it blocks until terminal — succeeded / failed /
+cancelled / lost — and prints the status report with class-mapped exit
+codes), and keep doing other work. Single agents have the same watchdog:
+`agent-run wait <agent_id>`. Never hand-roll status/sleep poll loops.
 
 ## Reading the result — verification duty
 
@@ -127,7 +129,8 @@ cancelled / lost), and keep doing other work.
   of already-open sessions are stale: every call fails version-checked.
   Reconnect MCP, or use the CLI of the current release until then.
 - Chat delivery of the terminal notice only happens for runs started with a
-  bound session (MCP path). CLI-started runs deliver nothing — poll them.
+  bound session (MCP path). CLI-started runs deliver nothing and create no
+  delivery row — `wait` on them, that IS the delivery.
 - Resume exists at engine level (journal replay by step_key) but is NOT
   exposed via CLI/MCP yet — a lost run is restarted, cached steps replay.
 - Cancel is safe and proven: run → cancelled, in-flight step journaled
