@@ -37,6 +37,13 @@ _AUTH_NAMES = frozenset({"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"})
 _TOKEN_ENV_NAME = "ANTHROPIC_AUTH_TOKEN"
 _BASE_URL_ENV_NAME = "ANTHROPIC_BASE_URL"
 _MODEL_ENV_NAME = "ANTHROPIC_MODEL"
+#: Models whose real window is 1M (1_048_576, per Z.ai's registry). Claude
+#: Code clamps unknown models to 200k unless the id carries the ``[1m]``
+#: suffix, so the adapter appends it for these — verified live 2026-08-30:
+#: without the suffix the CLI announces a 200k auto-compact ceiling, with it
+#: the warning disappears and z.ai still answers.
+_MILLION_CONTEXT_MODELS = frozenset({"glm-5.3", "glm-5.3-flash", "glm-5.2"})
+_MILLION_SUFFIX = "[1m]"
 
 
 def _glm_environment() -> dict[str, str]:
@@ -128,11 +135,20 @@ class GlmAdapter(ClaudeAdapter):
         plan = super().prepare(
             request, profile, config, home, agent_dir, mcp_servers=mcp_servers
         )
+        cli_model = request.model
+        argv = plan.argv
+        if request.model in _MILLION_CONTEXT_MODELS:
+            cli_model = request.model + _MILLION_SUFFIX
+            rebuilt = list(argv)
+            for index, value in enumerate(rebuilt[:-1]):
+                if value == "--model":
+                    rebuilt[index + 1] = cli_model
+            argv = tuple(rebuilt)
         environment = dict(plan.environment)
         # The coding-helper convention: aliases like glm-5.3 resolve through
         # ANTHROPIC_MODEL, belt and suspenders alongside the --model flag.
-        environment[_MODEL_ENV_NAME] = request.model
-        return replace(plan, environment=MappingProxyType(environment))
+        environment[_MODEL_ENV_NAME] = cli_model
+        return replace(plan, argv=argv, environment=MappingProxyType(environment))
 
 
 ADAPTER = GlmAdapter()

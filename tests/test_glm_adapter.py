@@ -141,11 +141,34 @@ class GlmAdapterTests(unittest.TestCase):
             plan = self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
         self.assertEqual(plan.environment["ANTHROPIC_AUTH_TOKEN"], "sk-plan-key")
         self.assertEqual(plan.environment["ANTHROPIC_BASE_URL"], DEFAULT_BASE_URL)
-        self.assertEqual(plan.environment["ANTHROPIC_MODEL"], "glm-5.3")
+        self.assertEqual(plan.environment["ANTHROPIC_MODEL"], "glm-5.3[1m]")
         argv = list(plan.argv)
-        self.assertEqual(argv[argv.index("--model") + 1], "glm-5.3")
+        self.assertEqual(argv[argv.index("--model") + 1], "glm-5.3[1m]")
         self.assertNotIn("sk-plan-key", " ".join(argv))
         self.assertIn("ANTHROPIC_AUTH_TOKEN", plan.adapter_state["secret_env_names"])
+
+    def test_million_context_models_carry_the_1m_suffix(self) -> None:
+        """Claude Code clamps unknown models to 200k without the [1m] marker.
+
+        Verified live 2026-08-30: bare glm-5.3 makes the CLI announce a 200k
+        auto-compact ceiling; glm-5.3[1m] silences it and z.ai still answers.
+        glm-5-turbo's real window is ~205k, so it must stay bare.
+        """
+        config = self.runtime_config(models=("glm-5.3", "glm-5.3-flash", "glm-5-turbo"))
+        with patch.object(glm_adapter, "keychain_glm_key", return_value="sk-plan-key"):
+            for model, expected in (
+                ("glm-5.3", "glm-5.3[1m]"),
+                ("glm-5.3-flash", "glm-5.3-flash[1m]"),
+                ("glm-5-turbo", "glm-5-turbo"),
+            ):
+                with self.subTest(model=model):
+                    plan = self.prepare(
+                        self.request(model=model), self.profile(), config,
+                        self.home, self.agent_dir,
+                    )
+                    argv = list(plan.argv)
+                    self.assertEqual(argv[argv.index("--model") + 1], expected)
+                    self.assertEqual(plan.environment["ANTHROPIC_MODEL"], expected)
 
     def test_prepare_falls_back_to_default_base_url(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_AUTH_TOKEN": "sk-test-token"}, clear=False):
