@@ -72,8 +72,10 @@ stable specs give stable keys, which is what makes the journal replayable.
 
 - **codex**: a read-only profile with no `read_roots` and no `write` is
   refused ("no-filesystem"). Give it `read_roots: [workdir]` at minimum.
-  Known open bug: codex + external read_roots on an implement/write step is
-  refused ("roots mismatch") — copy the material into the workdir instead.
+  Engine limitation (permanent, codex 0.151.0 schema has no extra-roots
+  fields on write threads): codex + external read_roots on a write step
+  refuses EARLY with guidance — copy the material into the workdir and omit
+  read_roots. Read-only root grants keep working.
 - **qwen**: the cheap-OSS lane (Chinese models through the local OmniRoute
   router; combo aliases keep the historical `opencode/` prefix). Check the
   LIVE roster with the `models` tool. `opencode/MiniMaxM3` answers one-liners
