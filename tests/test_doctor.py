@@ -1,14 +1,18 @@
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from agent_run import doctor
+from agent_run.config import RuntimeAuthConfig, RuntimeConfig
 from agent_run.doctor import run_doctor
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.launch_evidence import FAILURE_KIND_EXECUTABLE_MISSING
@@ -221,4 +225,72 @@ models = ["model"]
         fresh = by_component[f"mcp:{fresh_pid}"]
         self.assertEqual(fresh.code, "mcp_process")
         self.assertEqual(fresh.severity, "info")
+
+
+class KeychainFallbackAuthTests(unittest.TestCase):
+    """Environment auth is satisfied by a keychain item, not only by env."""
+
+    def _runtime(self) -> RuntimeConfig:
+        return RuntimeConfig(
+            enabled=True,
+            adapter="example:ADAPTER",
+            binary=Path("/usr/bin/true"),
+            home=Path("/tmp"),
+            models=("model",),
+            auth=RuntimeAuthConfig(kind="environment", names=("GLM_CODING_KEY",)),
+        )
+
+    def _auth_findings(self, name: str, runtime: RuntimeConfig) -> list:
+        findings: list = []
+        with mock.patch.dict(os.environ, {}, clear=True):
+            doctor._auth(name, runtime, f"runtime:{name}", findings)
+        return findings
+
+    def test_a_present_keychain_item_suppresses_the_warning(self) -> None:
+        # security prints the secret on stdout; it must be discarded unread.
+        present = subprocess.CompletedProcess([], 0, stdout="super-secret-value\n", stderr="")
+        with mock.patch.object(doctor.subprocess, "run", return_value=present) as probe:
+            findings = self._auth_findings("glm", self._runtime())
+
+        self.assertEqual([item.code for item in findings], [])
+        self.assertEqual(probe.call_count, 1)
+        argv = probe.call_args[0][0]
+        self.assertEqual(
+            argv,
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "com.pluto.agent-run.glm",
+                "-a",
+                "GLM_CODING_KEY",
+                "-w",
+            ],
+        )
+        self.assertTrue(
+            all("super-secret-value" not in (item.detail or "") for item in findings)
+        )
+
+    def test_an_absent_keychain_item_keeps_the_warning(self) -> None:
+        absent = subprocess.CompletedProcess([], 44, stdout="", stderr="could not be found")
+        with mock.patch.object(doctor.subprocess, "run", return_value=absent):
+            findings = self._auth_findings("qwen", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+        self.assertEqual(findings[0].severity, "warning")
+
+    def test_a_runtime_without_a_fallback_is_never_probed(self) -> None:
+        with mock.patch.object(doctor.subprocess, "run") as probe:
+            findings = self._auth_findings("codex", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+        probe.assert_not_called()
+
+    def test_a_failing_probe_counts_as_absent(self) -> None:
+        with mock.patch.object(
+            doctor.subprocess, "run", side_effect=OSError("security missing")
+        ):
+            findings = self._auth_findings("glm", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
 
