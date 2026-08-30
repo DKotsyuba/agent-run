@@ -440,6 +440,97 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.agent()["status"], "timed_out")
         self.assertEqual(ops.alive_members(), set())
 
+    def test_stalled_watchdog_kills_a_stream_silent_engine(self) -> None:
+        """No stream events past the budget fails the run as stalled.
+
+        The fake session never reports progress, so the baseline is the run
+        start and the watchdog must fire long before the generous deadline.
+        """
+
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+        settings = SupervisorSettings(
+            poll_seconds=0.4,
+            grace_seconds=1.0,
+            heartbeat_seconds=1000.0,
+            stalled_after_seconds=3.0,
+        )
+        outcome = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=1000.0, settings=settings
+        ).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, "stalled")
+        self.assertIn("no stream events", outcome.failure_text)
+        self.assertEqual(len(self.events("stalled")), 1)
+        self.assertEqual(self.agent()["status"], "failed")
+        self.assertEqual(ops.alive_members(), set())
+
+    def test_stream_progress_defers_the_stall_until_the_deadline(self) -> None:
+        """A live engine that keeps streaming is never killed as stalled."""
+
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+        settings = SupervisorSettings(
+            poll_seconds=0.4,
+            grace_seconds=1.0,
+            heartbeat_seconds=1000.0,
+            stalled_after_seconds=3.0,
+        )
+        supervisor = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
+        )
+        session._on_wait = lambda polls: setattr(
+            supervisor._sink, "last_progress_at", ops.monotonic()
+        )
+        outcome = supervisor.run()
+
+        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
+        self.assertEqual(self.events("stalled"), [])
+
+    def test_stalled_watchdog_disabled_at_zero(self) -> None:
+        """stalled_after_seconds=0 disables the watchdog entirely."""
+
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+        settings = SupervisorSettings(
+            poll_seconds=0.4,
+            grace_seconds=1.0,
+            heartbeat_seconds=1000.0,
+            stalled_after_seconds=0.0,
+        )
+        outcome = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
+        ).run()
+
+        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
+        self.assertEqual(self.events("stalled"), [])
+
+    def test_deadline_expiry_wins_over_a_simultaneous_stall(self) -> None:
+        """When both budgets elapse in one tick, the timeout outcome wins."""
+
+        ops = FakeOps()
+        session = FakeSession(ops, native_cancel=False)
+        settings = SupervisorSettings(
+            poll_seconds=0.4,
+            grace_seconds=1.0,
+            heartbeat_seconds=1000.0,
+            stalled_after_seconds=10.0,
+        )
+        outcome = self.supervisor(
+            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
+        ).run()
+
+        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
+        self.assertEqual(self.events("stalled"), [])
+
+    def test_warning_text_demands_the_done_and_not_done_summary(self) -> None:
+        """The 90% nudge must require the completion summary contract."""
+
+        self.assertIn("COMPLETE", DEFAULT_WARNING_TEXT)
+        self.assertIn("NOT done", DEFAULT_WARNING_TEXT)
+        self.assertIn("continuation point", DEFAULT_WARNING_TEXT)
+
     def test_a_failing_stopping_bookkeeping_write_does_not_mask_the_timeout(self) -> None:
         """A durable-write hiccup on the "stopping" event must stay best-effort.
 

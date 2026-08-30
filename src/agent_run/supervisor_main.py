@@ -147,7 +147,14 @@ def _supervise(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -
             answer_path=Path(_text(payload, "answer_path")),
             timeout_seconds=_number(payload, "timeout_seconds"),
             settings=SupervisorSettings(
-                warning_fraction=_number(payload, "warning_fraction")
+                warning_fraction=_number(payload, "warning_fraction"),
+                # Optional for payloads written by an older launcher: a mixed
+                # release window must not fail bootstrap over the new knob.
+                stalled_after_seconds=(
+                    _number(payload, "stalled_after_seconds")
+                    if "stalled_after_seconds" in payload
+                    else 900.0
+                ),
             ),
             ready=ready,
         ).run()

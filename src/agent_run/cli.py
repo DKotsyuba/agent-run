@@ -654,6 +654,7 @@ def _launch_callback(home: Path):
 
         # The exec'd supervisor reloads config and adapter itself; only the plan
         # travels, because its environment carries live secrets.
+        core = load_config(config_path(home)).core
         launch_detached(
             {
                 "agent_id": str(agent_id),
@@ -662,7 +663,8 @@ def _launch_callback(home: Path):
                 "timeout_seconds": request.timeout_seconds,
                 "answer_path": str(candidate_dir / "answer.md"),
                 "agent_dir": str(candidate_dir),
-                "warning_fraction": load_config(config_path(home)).core.warning_fraction,
+                "warning_fraction": core.warning_fraction,
+                "stalled_after_seconds": core.stalled_after_seconds,
                 "plan": plan.to_payload(),
             },
             executable=sys.executable,

@@ -1148,7 +1148,7 @@ class CliTests(unittest.TestCase):
                 return 123
 
             with patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
-                cli, "load_config", return_value=SimpleNamespace(core=SimpleNamespace(warning_fraction=0.9))
+                cli, "load_config", return_value=SimpleNamespace(core=SimpleNamespace(warning_fraction=0.9, stalled_after_seconds=900.0))
             ), patch.object(
                 cli, "launch_detached", side_effect=detached
             ), patch.object(
@@ -1174,6 +1174,7 @@ class CliTests(unittest.TestCase):
                 "answer_path": str(home / "agents" / AGENT_ID / "answer.md"),
                 "agent_dir": str(home / "agents" / AGENT_ID),
                 "warning_fraction": 0.9,
+                "stalled_after_seconds": 900.0,
                 "plan": {"argv": ["engine"], "environment": {"T": "s"}},
             },
         )

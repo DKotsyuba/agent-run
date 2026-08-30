@@ -157,6 +157,8 @@ plugins = {value}
             ("core", "warning_fraction", '"0.5"'),
             ("core", "warning_fraction", "0"),
             ("core", "warning_fraction", "1"),
+            ("core", "stalled_after_seconds", "true"),
+            ("core", "stalled_after_seconds", "-1"),
             ("capacity", "collect_interval_seconds", "true"),
             ("capacity", "collect_interval_seconds", "0.5"),
             ("capacity", "collect_interval_seconds", "0"),
@@ -177,10 +179,15 @@ plugins = {value}
             """schema_version = 1
 [core]
 warning_fraction = 0.1
+stalled_after_seconds = 0
 [capacity]
 collect_interval_seconds = 1
 context_max_chars = 1
 """
+        )
+        self.assertEqual(lower.core.stalled_after_seconds, 0)
+        self.assertEqual(
+            self.load("schema_version = 1\n").core.stalled_after_seconds, 900
         )
         upper = self.load(
             """schema_version = 1
