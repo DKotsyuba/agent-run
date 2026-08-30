@@ -136,6 +136,9 @@ class DispatchTests(unittest.TestCase):
 
 
 class CodexbarMappingTests(unittest.TestCase):
+    def test_glm_maps_to_the_zai_provider(self) -> None:
+        self.assertEqual(sources._CODEXBAR_PROVIDERS["glm"], "zai")
+
     def collect(self, payload):
         def run(argv):
             return Completed(

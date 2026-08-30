@@ -163,6 +163,10 @@ class ClaudeAdapter:
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
         return agent_rate_limit_samples(Path(home), time.time())
 
+    def _auth_environment(self, binary: Path, names: tuple[str, ...]) -> Mapping[str, str]:
+        """Resolve the auth env for a child; subclasses may supply their own."""
+        return auth_environment(binary, names)
+
     def prepare(
         self,
         request: StartRequest,
@@ -274,7 +278,7 @@ class ClaudeAdapter:
         auth_names: tuple[str, ...] = ()
         if config.auth is not None:
             auth_names = config.auth.names
-            environment.update(auth_environment(config.binary, auth_names))
+            environment.update(self._auth_environment(config.binary, auth_names))
 
         mcp_env_names: list[str] = []
         for name in config.mcp:
