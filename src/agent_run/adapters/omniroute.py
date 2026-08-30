@@ -52,7 +52,13 @@ from .base import LimitSample
 DOCKER = Path("/Users/pluto/.orbstack/bin/docker")
 CONTAINER = "omniroute"
 PROVIDER = "opencode-go"
-LIMITS_STALE_SECONDS = 900
+#: OmniRoute's own provider sync refreshes quota_snapshots roughly every 70
+#: minutes, so a 15-minute freshness bound reported the pool as unknown for
+#: most of every hour (owner order 30.08.2026: limits must run like
+#: clockwork, nothing hidden). 90 minutes covers the sync cadence with
+#: margin; pool quota moves slowly enough that an hour-old percentage is
+#: still an honest answer, and a died sync still decays to unknown.
+LIMITS_STALE_SECONDS = 5400
 #: How long to wait before retrying a first failed quota read.
 _DOCKER_RETRY_DELAY_SECONDS = 2.0
 #: Bound on the stderr fragment carried into a failure log line.

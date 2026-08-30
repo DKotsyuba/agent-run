@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
+from agent_run.adapters import omniroute
 from agent_run.adapters.claude import adapter as claude_adapter
 from agent_run.adapters.qwen import auth as qwen_auth
 from agent_run.adapters.qwen.adapter import ADAPTER, QwenAdapter
@@ -197,7 +198,7 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertEqual(sample.source, "omniroute_quota_pool")
         self.assertEqual(sample.target, "opencode-go:pool")
         self.assertEqual(sample.remaining_percent, 90.0)
-        self.assertEqual(sample.valid_for_seconds, 900)
+        self.assertEqual(sample.valid_for_seconds, omniroute.LIMITS_STALE_SECONDS)
 
     def test_a_failing_row_source_reports_no_samples(self) -> None:
         """A docker failure is no evidence, never an exception."""
