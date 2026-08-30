@@ -521,8 +521,10 @@ class CodexAdapter:
 
         Validates ``request`` against ``profile`` and ``config``. Network
         profiles receive app-server's tagged sandbox request form; other
-        profiles retain the legacy string sandbox mode. Raises
-        ``ValidationError`` when an authorization or runtime constraint fails.
+        profiles retain the legacy string sandbox mode. Workspace-write
+        threads cannot grant external read roots in the pinned app-server
+        contract. Raises ``ValidationError`` when an authorization or runtime
+        constraint fails.
         """
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
@@ -568,6 +570,11 @@ class CodexAdapter:
         # The writable grant never widens beyond the workdir, even when a read
         # root above it swallowed the workdir in the normalized antichain.
         writable_roots = (str(workdir),) if effective_write else ()
+        if effective_write and roots != writable_roots:
+            raise ValidationError(
+                "codex workspace-write threads cannot grant external read roots; "
+                "copy the material into the workdir and omit --read-root"
+            )
         sandbox_mode = "workspace-write" if effective_write else "read-only"
 
         # ``HOME`` is part of the isolation, not a convenience: the engine

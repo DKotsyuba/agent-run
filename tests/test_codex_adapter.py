@@ -818,7 +818,7 @@ env_from = ["PATH"]
         """Write-capable network profiles use the tagged workspace-write form."""
 
         config = self.materialized()
-        profile = AgentProfile("research", "body", True, (self.auth_source_dir,), True)
+        profile = AgentProfile("research", "body", True, (), True)
         plan = self.prepare(self.start_request(write=True), profile, config)
         self.assertEqual(
             plan.adapter_state["sandbox"], {"workspace-write": {"networkAccess": True}}
@@ -851,22 +851,23 @@ env_from = ["PATH"]
         bare = self.prepare(self.start_request(write=False), profile, self.materialized())
         self.assertNotIn("TOKENPIPE_POST_REPLACE", bare.environment)
 
-    def test_prepare_never_widens_the_writable_root_to_a_containing_read_root(self) -> None:
+    def test_prepare_refuses_external_read_roots_with_write(self) -> None:
         config = self.materialized()
         base = Path(self._mkdtemp()).resolve()
         work = base / "work"
         work.mkdir()
         profile = AgentProfile("implement", "body", True, (base,))
-        plan = ADAPTER.prepare(
-            self.start_request(workdir=work, write=True),
-            profile,
-            config,
-            self.home,
-            self.workdir,
-            mcp_servers={},
-        )
-        self.assertEqual(plan.adapter_state["roots"], (str(base),))
-        self.assertEqual(plan.adapter_state["writable_roots"], (str(work),))
+        with self.assertRaisesRegex(
+            ValidationError, "cannot grant external read roots"
+        ):
+            ADAPTER.prepare(
+                self.start_request(workdir=work, write=True),
+                profile,
+                config,
+                self.home,
+                self.workdir,
+                mcp_servers={},
+            )
 
     def test_prepare_refuses_unknown_model(self) -> None:
         config = self.materialized()
