@@ -82,8 +82,9 @@ stable specs give stable keys, which is what makes the journal replayable.
   commands in the step brief); read-only children have none, and git commits
   stay with acceptance.
 - **glm**: the claude engine on the Z.ai GLM Coding Plan (subscription
-  quota — watch the glm lane in limits). glm-5.3 is the workhorse,
-  glm-5.3-flash the cheap step; write children have a sandboxed shell.
+  quota — watch the glm lane in limits). glm-5.3-flash is the normal step
+  for easy-to-medium coding; glm-5.3 is the escalation for complex steps,
+  review, and architecture. Write children have a sandboxed shell.
 - **claude**: watch the capacity advisory before fanning out; sonnet steps
   are the cheap option.
 
