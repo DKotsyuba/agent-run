@@ -442,6 +442,11 @@ class AgentService:
 
         return workflow_facade.workflow_status(self._store, run_id)
 
+    def workflow_resume(self, run_id: str) -> dict[str, str]:
+        """Resume a failed or lost run. See `workflow_facade.workflow_resume`."""
+
+        return workflow_facade.workflow_resume(self._home, self._store, run_id)
+
     def workflow_cancel(self, run_id: str) -> dict[str, object]:
         """Request cancellation of a live workflow run. See `workflow_facade.workflow_cancel`."""
 

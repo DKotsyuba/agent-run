@@ -176,6 +176,11 @@ class _UnknownService:
 
         raise ValidationError("workflow start is not part of this test")
 
+    def workflow_resume(self, run_id: str) -> dict[str, Any]:
+        """Refuse to resume; only the status verb's error path reaches here."""
+
+        raise ValidationError("workflow resume is not part of this test")
+
     def workflow_cancel(self, run_id: str) -> dict[str, Any]:
         """Refuse to cancel; only the status verb's error path reaches here."""
 
