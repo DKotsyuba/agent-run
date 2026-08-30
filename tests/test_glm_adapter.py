@@ -125,19 +125,26 @@ class GlmAdapterTests(unittest.TestCase):
 
     # -- prepare --------------------------------------------------------
 
-    def test_prepare_with_full_environment(self) -> None:
+    def test_prepare_ignores_inherited_environment(self) -> None:
+        """The orchestrator's own ANTHROPIC_* env must never leak into the child.
+
+        Claude Code exports ANTHROPIC_BASE_URL into every shell it runs, and
+        an inherited ANTHROPIC_AUTH_TOKEN would be the orchestrator's own
+        credential — proven live 2026-08-30: env-wins sent the plan key to
+        api.anthropic.com (401). Keychain wins; the base URL is the plan's.
+        """
         with patch.dict(
             "os.environ",
-            {"ANTHROPIC_AUTH_TOKEN": "sk-test-token", "ANTHROPIC_BASE_URL": "https://example.test/api"},
+            {"ANTHROPIC_AUTH_TOKEN": "sk-orchestrator", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
             clear=False,
-        ):
+        ), patch.object(glm_adapter, "keychain_glm_key", return_value="sk-plan-key"):
             plan = self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
-        self.assertEqual(plan.environment["ANTHROPIC_AUTH_TOKEN"], "sk-test-token")
-        self.assertEqual(plan.environment["ANTHROPIC_BASE_URL"], "https://example.test/api")
+        self.assertEqual(plan.environment["ANTHROPIC_AUTH_TOKEN"], "sk-plan-key")
+        self.assertEqual(plan.environment["ANTHROPIC_BASE_URL"], DEFAULT_BASE_URL)
         self.assertEqual(plan.environment["ANTHROPIC_MODEL"], "glm-5.3")
         argv = list(plan.argv)
         self.assertEqual(argv[argv.index("--model") + 1], "glm-5.3")
-        self.assertNotIn("sk-test-token", " ".join(argv))
+        self.assertNotIn("sk-plan-key", " ".join(argv))
         self.assertIn("ANTHROPIC_AUTH_TOKEN", plan.adapter_state["secret_env_names"])
 
     def test_prepare_falls_back_to_default_base_url(self) -> None:
@@ -153,16 +160,25 @@ class GlmAdapterTests(unittest.TestCase):
         self.assertEqual(plan.environment["ANTHROPIC_BASE_URL"], DEFAULT_BASE_URL)
 
     def test_prepare_without_token_anywhere_is_a_validation_error(self) -> None:
-        with patch.object(glm_adapter, "keychain_glm_key", return_value=None):
-            with self.assertRaisesRegex(ValidationError, "glm requires ANTHROPIC_AUTH_TOKEN"):
-                self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
+        env_without_token = {
+            k: v for k, v in os.environ.items() if k != "ANTHROPIC_AUTH_TOKEN"
+        }
+        with patch.dict("os.environ", env_without_token, clear=True):
+            with patch.object(glm_adapter, "keychain_glm_key", return_value=None):
+                with self.assertRaisesRegex(ValidationError, "glm requires the macOS Keychain"):
+                    self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
 
-    def test_process_environment_wins_over_keychain(self) -> None:
-        def keychain_must_not_run():
-            raise AssertionError("keychain consulted despite exported token")
-
+    def test_keychain_wins_over_process_environment(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_AUTH_TOKEN": "sk-exported"}, clear=False):
-            with patch.object(glm_adapter, "keychain_glm_key", side_effect=keychain_must_not_run):
+            with patch.object(glm_adapter, "keychain_glm_key", return_value="sk-keychain"):
+                plan = self.prepare(
+                    self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir
+                )
+        self.assertEqual(plan.environment["ANTHROPIC_AUTH_TOKEN"], "sk-keychain")
+
+    def test_environment_token_is_the_fallback_when_keychain_is_empty(self) -> None:
+        with patch.dict("os.environ", {"ANTHROPIC_AUTH_TOKEN": "sk-exported"}, clear=False):
+            with patch.object(glm_adapter, "keychain_glm_key", return_value=None):
                 plan = self.prepare(
                     self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir
                 )
