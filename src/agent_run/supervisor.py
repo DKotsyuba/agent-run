@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import subprocess
@@ -36,6 +37,8 @@ from .verify import (
     verify_completion,
 )
 
+
+_logger = logging.getLogger("agent_run.supervisor")
 
 CANCEL_COMMAND = "cancel"
 STEER_COMMAND = "steer"
@@ -168,6 +171,9 @@ class StoreEventSink:
 
     def session(self, runtime_session_id: str) -> None:
         self.runtime_session_id = runtime_session_id
+        _logger.info(
+            "agent_id=%s stage=session runtime_session_id=%s", self._agent_id, runtime_session_id
+        )
         self._store_for_caller().append_event(
             self._agent_id, "runtime_session", data={"id": runtime_session_id}
         )
@@ -242,7 +248,11 @@ class Supervisor:
             )
             if self._ready is not None:
                 self._ready.ready()
+            _logger.info("agent_id=%s stage=READY pid=%d", self._agent_id, self._pid)
         except Exception as error:
+            _logger.warning(
+                "agent_id=%s stage=READY failed error_kind=%s", self._agent_id, type(error).__name__
+            )
             if self._ready is not None:
                 self._ready.failed(_error_text(error))
             raise
@@ -254,6 +264,10 @@ class Supervisor:
         try:
             steerable = Capability.STEER in self._adapter.describe().capabilities
             session = self._adapter.launch(self._plan, self._sink)
+            _logger.info(
+                "agent_id=%s stage=session_start pid=%s steerable=%s",
+                self._agent_id, session.pid, steerable,
+            )
         except Exception as error:  # adapter faults must stay durable, not crash
             return self._commit(
                 Outcome(
@@ -614,6 +628,10 @@ class Supervisor:
         try:
             self._store.transition(
                 self._agent_id, outcome.status, outcome=outcome, kind="terminal"
+            )
+            _logger.info(
+                "agent_id=%s stage=terminal status=%s failure_kind=%s",
+                self._agent_id, outcome.status.value, outcome.failure_kind,
             )
         except AgentRunError:
             durable = self._store.get_agent(self._agent_id)

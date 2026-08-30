@@ -26,6 +26,16 @@ CONTEXT_HARD_LIMIT_CHARS = 2500
 ACTIVE_BLOCK_MAX_CHARS = 600
 _MAX_LISTED_AGENTS = 5
 _SILENCE_THRESHOLD_SECONDS = 60.0
+#: Presentation order for capacity lines. Every lane is rendered -- filtering
+#: healthy rows got a healthy lane read as "no data" twice -- but the worst
+#: known risk leads, so the char budget can only ever clip the tail.
+_RISK_ORDER = {
+    forecast_module.RISK_HIGH: 0,
+    forecast_module.RISK_MEDIUM: 1,
+    forecast_module.RISK_UNKNOWN: 2,
+    forecast_module.RISK_LOW: 3,
+}
+_NOT_KNOWN_ORDER = 4
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,25 @@ def build_context(
     return ContextResult(session_id, context_key, text if changed else "", changed)
 
 
+def _advice_order(item: advice_module.CapacityAdvice) -> tuple[int, str, str, str, str, str]:
+    """Sort key putting the worst-known lanes first and no-data lanes last.
+
+    Known lanes order by risk severity -- high, then medium, then any known
+    lane carrying an unrecognized risk -- followed by low. Lanes with no data
+    sort after every known lane. Ties break on the stable identity tuple, so
+    the same advice always renders in the same order regardless of how the
+    samples were collected.
+    """
+
+    rank = (
+        _RISK_ORDER.get(item.risk, _RISK_ORDER[forecast_module.RISK_UNKNOWN])
+        if item.known
+        else _NOT_KNOWN_ORDER
+    )
+    key = item.key
+    return (rank, key.runtime, key.lane, key.window, key.target or "", key.source)
+
+
 def _capacity_block(
     store: StateStore, at: float, retention: int
 ) -> tuple[str, str]:
@@ -81,19 +110,9 @@ def _capacity_block(
             f"{'unknown' if item.remaining_percent is None else f'{item.remaining_percent:.0f}%'} "
             f"remaining, risk={item.risk}"
         )
-        for item in sorted(
-            items,
-            key=lambda item: (
-                item.key.runtime,
-                item.key.lane,
-                item.key.window,
-                item.key.target or "",
-                item.key.source,
-            ),
-        )
-        if item.risk != forecast_module.RISK_LOW
+        for item in sorted(items, key=_advice_order)
     ]
-    summary = "unknown" if not items else ("; ".join(lines) if lines else "nominal")
+    summary = "unknown" if not items else "; ".join(lines)
     text = f"Capacity: {summary}."
     return text, key
 

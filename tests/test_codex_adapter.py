@@ -519,6 +519,7 @@ env_from = ["PATH"]
         self.assertEqual(sample.remaining_percent, 43.0)
         self.assertEqual(sample.source, "isolated_rollout_evidence")
         self.assertEqual(sample.observed_at, observed)
+        self.assertEqual(sample.valid_for_seconds, 900)
         self.assertEqual(
             sample.reset_at, datetime.fromtimestamp(1788272105, tz=timezone.utc)
         )

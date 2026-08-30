@@ -25,6 +25,7 @@ from agent_run.domain import (
     StartRequest,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.store import StateStore
@@ -40,6 +41,10 @@ class FakeAdapter:
         self.materialize_calls = 0
         self.skills_roots = []
         self.models_calls = 0
+        self.models_result: tuple[ModelInfo, ...] = (
+            ModelInfo("model", "fake model", ("high",)),
+        )
+        self.probe_health = RuntimeHealth(True, "1", True, None)
         self.limits_calls = 0
         self.prepare_calls = 0
         self.prepare_dirs = []
@@ -58,11 +63,11 @@ class FakeAdapter:
         return "cfg-1"
 
     def probe(self, config, home):
-        return RuntimeHealth(True, "1", True, None)
+        return self.probe_health
 
     def models(self, config, home):
         self.models_calls += 1
-        return (ModelInfo("model", "fake model", ("high",)),)
+        return self.models_result
 
     def limits(self, config, home):
         self.limits_calls += 1
@@ -349,6 +354,55 @@ class AgentServiceTests(unittest.TestCase):
         self.assertIs(retry.agent.status, AgentStatus.FAILED)
         self.assertEqual(len(calls), 1)
 
+    def test_bootstrap_failure_keeps_the_agent_id_stage_and_evidence_on_the_error(
+        self,
+    ) -> None:
+        def fail_launch(*args) -> None:
+            raise SupervisorBootstrapError(
+                "detached supervisor died before session proof at stage "
+                "'import': ModuleNotFoundError: no module named agent_run.adapters "
+                "(exit code 1)",
+                failure_kind=FAILURE_KIND_BOOTSTRAP,
+                failure_stage="import",
+                bootstrap_error_type="ModuleNotFoundError",
+                bootstrap_traceback="Traceback (most recent call last):\n...\n",
+                provisional_pid=999999,
+                proven=False,
+            )
+
+        service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=fail_launch,
+            now=lambda: 100.0,
+        )
+        request = self.request(request_id="bootstrap-failure")
+        with self.assertRaises(SupervisorBootstrapError) as caught:
+            service.start(request)
+
+        error = caught.exception
+        row = self.store.list_agents()[0]
+        agent_id = row["id"]
+        # The caller keeps the agent_id even though start() raised: this is
+        # what lets CLI/MCP surface {agent_id, failure_kind, failure_stage,
+        # failure_text} instead of a bare error message.
+        self.assertEqual(str(error.agent_id), str(agent_id))
+        self.assertEqual(error.failure_kind, FAILURE_KIND_BOOTSTRAP)
+        self.assertEqual(error.failure_stage, "import")
+        self.assertIn("no module named agent_run.adapters", error.failure_text)
+
+        self.assertEqual(row["failure_kind"], FAILURE_KIND_BOOTSTRAP)
+        event = self.store.connection.execute(
+            """SELECT kind, data_json FROM events
+               WHERE agent_id = ? ORDER BY seq DESC LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+        self.assertIn('"stage":"import"', event["data_json"])
+        self.assertIn('"type":"ModuleNotFoundError"', event["data_json"])
+        self.assertIn('"provisional_pid":999999', event["data_json"])
+        self.assertIn('"proven":false', event["data_json"])
+
     def test_list_has_exact_total_and_explicit_offset_completeness(self) -> None:
         for index in range(3):
             self.start(f"request-{index}", task=f"task {index}")
@@ -479,7 +533,13 @@ class AgentServiceTests(unittest.TestCase):
             self.service.summary(agent_id=agent_id, orchestrator=ref)
 
         self.assertEqual(tuple(self.service.models()), ("fake",))
-        self.assertEqual(self.service.models()["fake"][0].id, "model")
+        fake_roster = self.service.models()["fake"]
+        self.assertEqual(fake_roster.models[0].id, "model")
+        self.assertEqual(
+            fake_roster.capabilities, tuple(sorted(c.value for c in Capability))
+        )
+        self.assertTrue(fake_roster.available)
+        self.assertIsNone(fake_roster.reason)
         self.store.insert_capacity_sample(
             runtime="fake",
             lane="main",
@@ -495,6 +555,25 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(len(limits.items), 1)
         self.assertEqual(limits.items[0].key.runtime, "fake")
         self.assertEqual(ADAPTER.limits_calls, 0)
+
+    def test_empty_roster_still_lists_the_runtime_with_a_reason(self) -> None:
+        ADAPTER.models_result = ()
+
+        roster = self.service.models()["fake"]
+
+        self.assertEqual(roster.models, ())
+        self.assertFalse(roster.available)
+        self.assertEqual(roster.reason, "roster empty")
+
+    def test_empty_roster_prefers_the_adapters_own_unavailable_reason(self) -> None:
+        ADAPTER.models_result = ()
+        ADAPTER.probe_health = RuntimeHealth(False, None, None, "no network route")
+
+        roster = self.service.models()["fake"]
+
+        self.assertEqual(roster.models, ())
+        self.assertFalse(roster.available)
+        self.assertEqual(roster.reason, "no network route")
 
     def test_codex_models_bootstrap_from_config_without_isolated_cache(self) -> None:
         from agent_run.config import RuntimeAuthConfig
@@ -527,11 +606,21 @@ class AgentServiceTests(unittest.TestCase):
         roster = service.models()["codex"]
 
         self.assertEqual(
-            [(model.id, model.description, model.efforts) for model in roster],
+            [(model.id, model.description, model.efforts) for model in roster.models],
             [
                 ("gpt-5.6-sol", "", ()),
                 ("gpt-5.6-terra", "", ()),
             ],
+        )
+        from agent_run.adapters.codex.adapter import ADAPTER as codex_adapter
+
+        self.assertEqual(
+            roster.capabilities,
+            tuple(sorted(c.value for c in codex_adapter.describe().capabilities)),
+        )
+        self.assertFalse(roster.available)
+        self.assertEqual(
+            roster.reason, "codex binary, generated home, or auth bridge is missing"
         )
         self.assertFalse((codex_home / "cache" / "models.json").exists())
 

@@ -322,6 +322,27 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "bug"):
             self.run_cli(["status", AGENT_ID], service=unexpected)
 
+    def test_bootstrap_failure_error_envelope_carries_the_agent_id(self):
+        bootstrapped = FakeService()
+        failure = ValidationError(
+            "detached supervisor died before session proof at stage 'import': "
+            "ModuleNotFoundError: no module named agent_run.adapters"
+        )
+        failure.agent_id = AGENT_ID
+        failure.failure_kind = "supervisor_start_failed"
+        failure.failure_stage = "import"
+        failure.failure_text = "ModuleNotFoundError: no module named agent_run.adapters"
+        bootstrapped.error = failure
+
+        code, output, error = self.run_cli(["status", AGENT_ID], service=bootstrapped)
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
+        payload = json.loads(error)["error"]
+        self.assertEqual(payload["agent_id"], AGENT_ID)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["failure_kind"], "supervisor_start_failed")
+        self.assertEqual(payload["failure_stage"], "import")
+
     def test_producer_shims_and_all_top_level_commands_parse(self):
         service = FakeService()
         cases = (

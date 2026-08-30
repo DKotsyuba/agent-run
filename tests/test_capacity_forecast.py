@@ -90,6 +90,30 @@ class CapacityForecastTests(unittest.TestCase):
         )
         self.assertEqual(high.risk, RISK_HIGH)
 
+    def test_young_lane_with_a_scary_short_span_burn_stays_low(self) -> None:
+        # Ten minutes of history is not enough evidence to call a burn rate
+        # alarming, even when extrapolating it looks catastrophic.
+        now = 1_000_000.0
+        reset_at = now + 48 * 3600
+        newest = NormalizedSample(99.0, reset_at, now, None)
+        oldest = NormalizedSample(100.0, reset_at, now - 600, None)
+        (forecast,) = build_forecasts([CapacitySeries(KEY, (newest, oldest))], now=now)
+        self.assertFalse(forecast.warmup)
+        self.assertAlmostEqual(forecast.burn_percent_per_hour, 6.0)
+        self.assertAlmostEqual(forecast.sustainable_percent_per_hour, 99.0 / 48)
+        self.assertEqual(forecast.risk, RISK_LOW)
+
+    def test_mature_lane_with_the_same_burn_still_escalates(self) -> None:
+        # Two hours of history supporting the same 6%/hour is trusted.
+        now = 1_000_000.0
+        reset_at = now + 48 * 3600
+        newest = NormalizedSample(88.0, reset_at, now, None)
+        oldest = NormalizedSample(100.0, reset_at, now - 2 * 3600, None)
+        (forecast,) = build_forecasts([CapacitySeries(KEY, (newest, oldest))], now=now)
+        self.assertAlmostEqual(forecast.burn_percent_per_hour, 6.0)
+        self.assertAlmostEqual(forecast.sustainable_percent_per_hour, 88.0 / 48)
+        self.assertEqual(forecast.risk, RISK_HIGH)
+
     def test_window_reset_starts_a_new_warmup(self) -> None:
         now = 1_000_000.0
         post_reset = NormalizedSample(90.0, now + 3600, now, None)
@@ -99,6 +123,40 @@ class CapacityForecastTests(unittest.TestCase):
         self.assertTrue(forecast.warmup)
         self.assertIsNone(forecast.burn_percent_per_hour)
         self.assertEqual(forecast.remaining_percent, 90.0)
+
+
+    def test_latest_sample_with_past_reset_at_is_unknown(self) -> None:
+        now = 1_000_000.0
+        sample = NormalizedSample(
+            remaining_percent=50.0, reset_at=now - 1, observed_at=now, valid_until=None
+        )
+        series = CapacitySeries(KEY, (sample,))
+        (forecast,) = build_forecasts([series], now=now)
+        self.assertFalse(forecast.known)
+        self.assertIsNone(forecast.remaining_percent)
+        self.assertIsNone(forecast.reset_at)
+        self.assertEqual(forecast.risk, RISK_UNKNOWN)
+
+    def test_latest_sample_with_future_reset_at_is_known(self) -> None:
+        now = 1_000_000.0
+        sample = NormalizedSample(
+            remaining_percent=50.0, reset_at=now + 1, observed_at=now, valid_until=None
+        )
+        series = CapacitySeries(KEY, (sample,))
+        (forecast,) = build_forecasts([series], now=now)
+        self.assertTrue(forecast.known)
+        self.assertEqual(forecast.remaining_percent, 50.0)
+        self.assertEqual(forecast.reset_at, now + 1)
+
+    def test_latest_sample_without_reset_at_is_unaffected(self) -> None:
+        now = 1_000_000.0
+        sample = NormalizedSample(
+            remaining_percent=50.0, reset_at=None, observed_at=now, valid_until=None
+        )
+        series = CapacitySeries(KEY, (sample,))
+        (forecast,) = build_forecasts([series], now=now)
+        self.assertTrue(forecast.known)
+        self.assertIsNone(forecast.reset_at)
 
     def test_exhausted_zero_is_high_risk_even_with_zero_burn_and_pace(self) -> None:
         now = 1_000_000.0

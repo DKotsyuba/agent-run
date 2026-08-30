@@ -1,8 +1,10 @@
+import json
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -12,6 +14,7 @@ from agent_run.adapters.base import (
     LimitSample,
     RuntimeInfo,
 )
+from agent_run.capacity import sources
 from agent_run.capacity.collect import (
     STATUS_COLLECTED,
     STATUS_FAILED,
@@ -200,6 +203,49 @@ class CapacityCollectTests(unittest.TestCase):
         payload = stored[0]["payload_json"]
         self.assertNotIn("auth", payload)
         self.assertNotIn("token", payload.lower())
+
+    def test_codexbar_source_stores_samples_with_shelf_life(self) -> None:
+        observed = "2026-08-29T12:12:53Z"
+        payload = json.dumps(
+            [
+                {
+                    "usage": {
+                        "updatedAt": observed,
+                        "secondary": {
+                            "usedPercent": 46,
+                            "windowMinutes": 10080,
+                            "resetsAt": "2026-09-03T16:26:47Z",
+                        },
+                    }
+                }
+            ]
+        )
+
+        def fake_run(argv):
+            return type("Completed", (), {"stdout": payload, "returncode": 0})()
+
+        def load(name, runtime_config):
+            raise AssertionError("codexbar must not touch the adapter")
+
+        config = Config(
+            schema_version=1,
+            runtimes={"codex": _runtime_config(limits_source="codexbar")},
+        )
+        with mock.patch.object(sources, "_run_codexbar", side_effect=fake_run):
+            report = collect_once(self.store, config, at=1_704_110_400.0, loader=load)
+
+        result = report.results[0]
+        self.assertEqual(result.status, STATUS_COLLECTED)
+        self.assertEqual(result.sample_count, 1)
+
+        stored = self.store.recent_capacity_samples(at=0.0, limit=10)
+        self.assertEqual(len(stored), 1)
+        row = stored[0]
+        expected = datetime(2026, 8, 29, 12, 12, 53, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(row["source"], "codexbar")
+        self.assertEqual(row["remaining_percent"], 54.0)
+        self.assertEqual(row["observed_at"], expected)
+        self.assertEqual(row["valid_until"], expected + 900)
 
     def test_partial_failure_still_prunes_to_global_retention(self) -> None:
         for observed_at in (1, 2):

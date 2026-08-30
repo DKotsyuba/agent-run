@@ -19,6 +19,7 @@ sidecar.  The snapshot is removed only once the transaction commits.
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import re
 import sqlite3
@@ -29,6 +30,7 @@ from typing import Iterator
 
 from agent_run.errors import SchemaMigrationRequired, ValidationError
 
+_logger = logging.getLogger("agent_run.state")
 
 SCHEMA_VERSION = 6
 
@@ -206,10 +208,12 @@ def _apply_one(
             connection.execute(f"PRAGMA legacy_alter_table={legacy_alter_table}")
             connection.execute(f"PRAGMA foreign_keys={foreign_keys}")
     except BaseException as error:
+        _logger.warning("db=%s migration_failed target=%d error_kind=%s", path, target, type(error).__name__)
         raise ValidationError(
             f"state schema migration to v{target} failed and was rolled back: {error}. "
             f"The pre-migration backup of {path} is intact at {backup}"
         ) from error
+    _logger.info("db=%s migration_applied target=%d source=%s", path, target, source.name)
     backup.unlink(missing_ok=True)
 
 
@@ -241,6 +245,7 @@ def migrate(store_path: str | Path) -> int:
     connection = _connect(path)
     try:
         version = version_of(connection)
+        _logger.debug("db=%s user_version=%d target=%d", path, version, SCHEMA_VERSION)
         if version == 0:
             return 0
         _refuse_newer(path, version)
@@ -256,7 +261,12 @@ def migrate(store_path: str | Path) -> int:
     finally:
         connection.close()
     with schema_lock(path):
-        return _apply_pending(path)
+        applied = _apply_pending(path)
+        _logger.info(
+            "db=%s migrated user_version_before=%d user_version_after=%d",
+            path, version, applied,
+        )
+        return applied
 
 
 def require_current(version: int) -> None:

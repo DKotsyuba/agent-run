@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -27,9 +29,13 @@ from .errors import AgentRunError, ValidationError
 from .hooks.bind import ref_from_payload, run_hook
 from .hooks.context import build_context
 from .launch import launch_detached
+from .launch_evidence import bootstrap_error_fields
+from .logging_setup import configure_logging
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
+
+_logger = logging.getLogger("agent_run.cli")
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
@@ -464,6 +470,18 @@ def _emit(value, stream: TextIO) -> None:
     stream.write("\n")
 
 
+def _error_payload(error: AgentRunError) -> dict:
+    """The standard error envelope, extended with a bootstrap failure's evidence."""
+
+    return {
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            **bootstrap_error_fields(error),
+        }
+    }
+
+
 def _capacity_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
     config = load_config(config_path(home))
     job = build_configured_job(
@@ -653,59 +671,24 @@ class _Runtime:
 
     def workflow_start(self, name: str, script: str, args: dict | None = None,
                        orchestrator: OrchestratorRef | None = None) -> dict[str, str]:
-        """Launch a script workflow, optionally binding its lifecycle notice."""
+        """Launch a script workflow. Delegates to `AgentService.workflow_start`."""
 
-        from .workflow_run import start_workflow
-
-        source = script if args is None else f"args = {args!r}\n{script}"
-        return {"run_id": start_workflow(
-            self.home, name, {"script": source}, orchestrator=orchestrator
-        )}
+        return self.core.workflow_start(name, script, args, orchestrator)
 
     def workflow_status(self, run_id: str) -> dict[str, object]:
-        """Return the durable journal summary for one workflow run."""
+        """Return one workflow run's journal summary. Delegates to `AgentService.workflow_status`."""
 
-        _config, store = self._inputs()
-        try:
-            return store.workflow_run_status(run_id)
-        finally:
-            store.close()
+        return self.core.workflow_status(run_id)
 
     def workflow_cancel(self, run_id: str) -> dict[str, object]:
-        """Request SIGTERM from a live workflow runner, refusing terminal runs."""
+        """Request cancellation of a live workflow run. Delegates to `AgentService.workflow_cancel`."""
 
-        import signal
-
-        _config, store = self._inputs()
-        try:
-            run = store.workflow_run_status(run_id)["run"]
-            if run["status"] in {"succeeded", "failed", "cancelled", "lost"}:
-                raise ValidationError("terminal workflow run cannot be cancelled")
-            identity = run["owner_pid_identity"]
-            if not isinstance(identity, str) or not identity.split(" ", 1)[0].isdigit():
-                raise ValidationError("workflow runner identity is not recorded")
-            os.kill(int(identity.split(" ", 1)[0]), signal.SIGTERM)
-            return {"run_id": run_id, "cancel_requested": True}
-        finally:
-            store.close()
+        return self.core.workflow_cancel(run_id)
 
     def workflow_answer(self, run_id: str) -> object:
-        """Return a terminal workflow's last persisted step result, if any."""
+        """Return a terminal workflow run's last result. Delegates to `AgentService.workflow_answer`."""
 
-        _config, store = self._inputs()
-        try:
-            run = store.workflow_run_status(run_id)["run"]
-            if run["status"] not in {"succeeded", "failed", "cancelled", "lost"}:
-                raise ValidationError("workflow run has not finished")
-            row = store.connection.execute(
-                """SELECT result_json FROM workflow_steps
-                   WHERE run_id = ? AND result_json IS NOT NULL ORDER BY rowid DESC LIMIT 1""",
-                (run_id,),
-            ).fetchone()
-            return {"run_id": run_id, "status": run["status"],
-                    "result": None if row is None else json.loads(row["result_json"])}
-        finally:
-            store.close()
+        return self.core.workflow_answer(run_id)
 
     def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
         config, store = self._inputs()
@@ -802,11 +785,14 @@ def main(
     except SystemExit as error:
         return int(error.code)
     except AgentRunError as error:
-        _emit({"error": {"type": type(error).__name__, "message": str(error)}}, stderr)
+        _emit(_error_payload(error), stderr)
         return _EXPECTED_ERROR_EXIT
     owned: _Runtime | None = None
+    started = time.monotonic()
     try:
         home = agent_run_home(args.home)
+        configure_logging(home, "mcp" if args.command == "mcp" else "cli")
+        _logger.info("cli command=%s", args.command)
         if service is None and args.command == "init":
             result = _initialize(home)
         elif service is None and args.command == "doctor":
@@ -835,12 +821,28 @@ def main(
                     stdin=stdin,
                     stdout=stdout,
                 )
+                _logger.info(
+                    "cli command=mcp outcome=ok duration_ms=%.1f",
+                    (time.monotonic() - started) * 1000,
+                )
                 return returned if isinstance(returned, int) else 0
             result = _execute(args, target, stdin)
         _emit(result, stdout)
+        _logger.info(
+            "cli command=%s outcome=ok duration_ms=%.1f",
+            args.command, (time.monotonic() - started) * 1000,
+        )
+        # A doctor report with any error-severity finding is a failed check,
+        # not a successful command -- surface that as a nonzero exit.
+        if args.command == "doctor" and getattr(result, "ok", True) is False:
+            return _EXPECTED_ERROR_EXIT
         return 0
     except AgentRunError as error:
-        _emit({"error": {"type": type(error).__name__, "message": str(error)}}, stderr)
+        _emit(_error_payload(error), stderr)
+        _logger.warning(
+            "cli command=%s outcome=%s duration_ms=%.1f",
+            args.command, type(error).__name__, (time.monotonic() - started) * 1000,
+        )
         return _EXPECTED_ERROR_EXIT
     finally:
         if owned is not None:

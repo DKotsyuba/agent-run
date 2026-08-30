@@ -163,6 +163,10 @@ class ClaudeAdapter:
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
         return agent_rate_limit_samples(Path(home), time.time())
 
+    def _auth_environment(self, binary: Path, names: tuple[str, ...]) -> Mapping[str, str]:
+        """Resolve the auth env for a child; subclasses may supply their own."""
+        return auth_environment(binary, names)
+
     def prepare(
         self,
         request: StartRequest,
@@ -274,7 +278,7 @@ class ClaudeAdapter:
         auth_names: tuple[str, ...] = ()
         if config.auth is not None:
             auth_names = config.auth.names
-            environment.update(auth_environment(config.binary, auth_names))
+            environment.update(self._auth_environment(config.binary, auth_names))
 
         mcp_env_names: list[str] = []
         for name in config.mcp:
@@ -433,6 +437,19 @@ class ClaudeSession:
     def owns_process_group(self) -> bool:
         return True
 
+    def _error_only_result_line(self, result_text: str) -> str | None:
+        """Bounded first line when the final result is an error-only payload.
+
+        The claude CLI signals engine/provider failures structurally
+        (``is_error``/subtype), so the base session never treats clean-exit
+        result text as a failure; the Qwen session overrides this because
+        its CLI can emit an upstream ``[API Error: ...]`` line as the whole
+        result while exiting 0.
+        """
+
+        del result_text
+        return None
+
     def _read_stdout(self) -> None:
         try:
             stdout = self._process.stdout
@@ -561,11 +578,15 @@ class ClaudeSession:
         # agent-run ended an already-answered child, not whether the engine
         # itself succeeded; only a naturally-exited child must report 0.
         exit_ok = exit_code == 0 or self._force_stopped
+        error_only_line = (
+            self._error_only_result_line(metadata.result_text) if metadata.result_text else None
+        )
         succeeded = (
             exit_ok
             and not metadata.is_error
             and metadata.subtype != "no_answer"
             and bool(metadata.result_text)
+            and error_only_line is None
         )
         if self._cancelled:
             status = AgentStatus.CANCELLED
@@ -577,14 +598,18 @@ class ClaudeSession:
             failure_kind = None
             failure_text = None
         else:
-            empty_result = (
-                exit_ok
-                and not metadata.is_error
-                and metadata.subtype != "no_answer"
-                and not metadata.result_text
-            )
-            failure_kind = "empty_result" if empty_result else classify_failure(metadata)
-            failure_text = metadata.result_text
+            if error_only_line is not None:
+                failure_kind = "provider_error"
+                failure_text = error_only_line
+            else:
+                empty_result = (
+                    exit_ok
+                    and not metadata.is_error
+                    and metadata.subtype != "no_answer"
+                    and not metadata.result_text
+                )
+                failure_kind = "empty_result" if empty_result else classify_failure(metadata)
+                failure_text = metadata.result_text
         answer_path = None
         answer_bytes = None
         answer_sha256 = None

@@ -1,10 +1,24 @@
+import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT))
+
+from agent_run import doctor
+from agent_run.config import RuntimeAuthConfig, RuntimeConfig
 from agent_run.doctor import run_doctor
 from agent_run.domain import AgentStatus, StartRequest
+from agent_run.launch_evidence import FAILURE_KIND_EXECUTABLE_MISSING
 from agent_run.state import StateStore
+
+from tests.test_launch import child_pythonpath
 
 
 class DoctorTests(unittest.TestCase):
@@ -111,3 +125,172 @@ models = ["model"]
             report = run_doctor(home, at=1)
             self.assertIn("plaintext_secret_config", {item.code for item in report.findings})
             self.assertNotIn("must-not-leak", repr(report))
+
+    def _minimal_home(self, directory: str) -> Path:
+        home = Path(directory).resolve()
+        (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+        StateStore.initialize(home / "state.db").close()
+        # Truncate the WAL sidecar so the snapshot's read-only URI open works
+        # under every interpreter's bundled sqlite (3.12 refuses a ro open of
+        # a WAL database whose -wal has not been checkpointed).
+        import sqlite3 as _sqlite3
+
+        checkpoint = _sqlite3.connect(home / "state.db")
+        try:
+            checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            checkpoint.close()
+        return home
+
+    @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX only")
+    def test_canary_handshake_ok_reports_a_completed_real_handshake(self) -> None:
+        previous = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = child_pythonpath()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                home = self._minimal_home(directory)
+                report = run_doctor(home, mcp_process_lister=lambda: [])
+        finally:
+            if previous is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = previous
+
+        canary = [item for item in report.findings if item.component == "canary"]
+        self.assertEqual([item.code for item in canary], ["supervisor_canary_ok"])
+        self.assertEqual(canary[0].severity, "info")
+
+    def test_canary_handshake_fail_reports_the_bootstrap_failure_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._minimal_home(directory)
+            report = run_doctor(
+                home,
+                canary_executable=str(Path(directory) / "no-such-python"),
+                mcp_process_lister=lambda: [],
+            )
+
+        canary = [item for item in report.findings if item.component == "canary"]
+        self.assertEqual([item.code for item in canary], [FAILURE_KIND_EXECUTABLE_MISSING])
+        self.assertEqual(canary[0].severity, "error")
+        self.assertFalse(report.ok)
+
+    def test_mcp_inventory_flags_processes_older_than_the_release_switch_and_excludes_self(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._minimal_home(directory)
+            (home / "standalone").mkdir()
+            current = home / "standalone" / "current"
+            current.symlink_to(home / "standalone" / "releases" / "sha-new")
+            switch_epoch = 2_000_000.0
+            os.utime(current, (switch_epoch, switch_epoch), follow_symlinks=False)
+
+            self_pid = os.getpid()
+            stale_pid = self_pid + 10_000
+            fresh_pid = self_pid + 10_001
+
+            def lstart(epoch: float) -> str:
+                return time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(epoch))
+
+            def fake_ps() -> list[tuple[int, str, str]]:
+                return [
+                    (self_pid, lstart(switch_epoch - 500), "python3 -m agent_run.cli mcp"),
+                    (
+                        stale_pid,
+                        lstart(switch_epoch - 3600),
+                        "/old/release/venv/bin/python3 /old/release/venv/bin/agent-run mcp",
+                    ),
+                    (
+                        fresh_pid,
+                        lstart(switch_epoch + 3600),
+                        "/new/release/venv/bin/python3 /new/release/venv/bin/agent-run mcp",
+                    ),
+                ]
+
+            report = run_doctor(
+                home,
+                canary_runner=lambda: 0.0,
+                mcp_process_lister=fake_ps,
+            )
+
+        by_component = {item.component: item for item in report.findings}
+        self.assertNotIn(f"mcp:{self_pid}", by_component)
+        self.assertIn("mcp:self", by_component)
+
+        stale = by_component[f"mcp:{stale_pid}"]
+        self.assertEqual(stale.code, "mcp_process_older_release")
+        self.assertEqual(stale.severity, "warning")
+        self.assertIn("/old/release", stale.detail)
+
+        fresh = by_component[f"mcp:{fresh_pid}"]
+        self.assertEqual(fresh.code, "mcp_process")
+        self.assertEqual(fresh.severity, "info")
+
+
+class KeychainFallbackAuthTests(unittest.TestCase):
+    """Environment auth is satisfied by a keychain item, not only by env."""
+
+    def _runtime(self) -> RuntimeConfig:
+        return RuntimeConfig(
+            enabled=True,
+            adapter="example:ADAPTER",
+            binary=Path("/usr/bin/true"),
+            home=Path("/tmp"),
+            models=("model",),
+            auth=RuntimeAuthConfig(kind="environment", names=("GLM_CODING_KEY",)),
+        )
+
+    def _auth_findings(self, name: str, runtime: RuntimeConfig) -> list:
+        findings: list = []
+        with mock.patch.dict(os.environ, {}, clear=True):
+            doctor._auth(name, runtime, f"runtime:{name}", findings)
+        return findings
+
+    def test_a_present_keychain_item_suppresses_the_warning(self) -> None:
+        # security prints the secret on stdout; it must be discarded unread.
+        present = subprocess.CompletedProcess([], 0, stdout="super-secret-value\n", stderr="")
+        with mock.patch.object(doctor.subprocess, "run", return_value=present) as probe:
+            findings = self._auth_findings("glm", self._runtime())
+
+        self.assertEqual([item.code for item in findings], [])
+        self.assertEqual(probe.call_count, 1)
+        argv = probe.call_args[0][0]
+        self.assertEqual(
+            argv,
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "com.pluto.agent-run.glm",
+                "-a",
+                "GLM_CODING_KEY",
+                "-w",
+            ],
+        )
+        self.assertTrue(
+            all("super-secret-value" not in (item.detail or "") for item in findings)
+        )
+
+    def test_an_absent_keychain_item_keeps_the_warning(self) -> None:
+        absent = subprocess.CompletedProcess([], 44, stdout="", stderr="could not be found")
+        with mock.patch.object(doctor.subprocess, "run", return_value=absent):
+            findings = self._auth_findings("qwen", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+        self.assertEqual(findings[0].severity, "warning")
+
+    def test_a_runtime_without_a_fallback_is_never_probed(self) -> None:
+        with mock.patch.object(doctor.subprocess, "run") as probe:
+            findings = self._auth_findings("codex", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+        probe.assert_not_called()
+
+    def test_a_failing_probe_counts_as_absent(self) -> None:
+        with mock.patch.object(
+            doctor.subprocess, "run", side_effect=OSError("security missing")
+        ):
+            findings = self._auth_findings("glm", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+

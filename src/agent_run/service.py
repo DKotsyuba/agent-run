@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,10 +28,14 @@ from .domain import (
     validate_agent_id,
 )
 from .errors import AuthError, ValidationError
+from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
+from . import workflow_facade
 from .profiles import assign_role, load_profile
 from .state.store import StateStore
 
+
+_logger = logging.getLogger("agent_run.service")
 
 _SUMMARY_LIMIT = 50
 _TASK_SUMMARY_CHARS = 160
@@ -187,6 +192,26 @@ class CapacityReport:
     items: tuple[CapacityAdvice, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeModels:
+    """One runtime's model discovery snapshot: roster plus capability/health context.
+
+    ``models`` keeps the pre-existing :class:`ModelInfo` shape unchanged so
+    current consumers of individual model entries do not break. ``capabilities``
+    is the adapter's declared :class:`Capability` set (sorted string values), so
+    a router can check whether a runtime supports a requested right (e.g.
+    ``write``) before selecting it. ``available`` is ``False`` whenever the
+    adapter is unhealthy or its roster is empty; ``reason`` carries the
+    adapter-supplied explanation, falling back to ``"roster empty"`` when the
+    adapter reports itself healthy but the roster still came back empty.
+    """
+
+    models: tuple[ModelInfo, ...]
+    capabilities: tuple[str, ...]
+    available: bool
+    reason: str | None
+
+
 class AgentService:
     """Validate once, persist once, and expose stable transport-neutral views."""
 
@@ -247,6 +272,11 @@ class AgentService:
     def start(self, request: StartRequest) -> StartResult:
         if not isinstance(request, StartRequest):
             raise ValidationError("request must be a StartRequest")
+        _logger.info(
+            "start runtime=%s model=%s profile=%s write=%s request_id=%s",
+            request.runtime, request.model, request.profile, request.write,
+            request.request_id,
+        )
         if request.timeout_seconds is None:
             request = replace(
                 request,
@@ -257,15 +287,25 @@ class AgentService:
             request.runtime, self._required_capabilities(request, runtime)
         )
         adapter.validate(runtime)
+        _logger.debug("start gate=capabilities ok runtime=%s", request.runtime)
         if request.model not in runtime.models:
+            _logger.warning(
+                "start gate=model_configured failed runtime=%s model=%s",
+                request.runtime, request.model,
+            )
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
         roster = adapter.models(runtime, runtime.home)
         if request.model not in {model.id for model in roster}:
+            _logger.warning(
+                "start gate=model_available failed runtime=%s model=%s",
+                request.runtime, request.model,
+            )
             raise ValidationError(
                 f"model is not available for runtime {request.runtime}: {request.model}"
             )
+        _logger.debug("start gate=model ok runtime=%s model=%s", request.runtime, request.model)
         # The profile is agent-run's runtime adapter for the shared role
         # contracts: it names the role, and this is where the child is told to
         # load it. One place, so every runtime's preamble carries the same
@@ -288,6 +328,7 @@ class AgentService:
             mcp_servers=mcp_servers,
             skills_root=skills_root,
         )
+        _logger.info("start materialized runtime=%s revision=%s", request.runtime, revision)
         candidate = new_agent_id()
         creation = self._store.create_agent_limited(
             request,
@@ -299,9 +340,11 @@ class AgentService:
             at=self._now(),
         )
         if not creation.created:
+            _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)
             return StartResult(
                 creation.agent_id, False, self.get(creation.agent_id)
             )
+        _logger.info("start agent_id=%s created=True", creation.agent_id)
         try:
             candidate_dir = create_agent_dir(creation.agent_id, self._home)
             plan = adapter.prepare(
@@ -313,39 +356,59 @@ class AgentService:
                 mcp_servers=mcp_servers,
             )
         except Exception as error:
+            _logger.warning(
+                "start agent_id=%s failed stage=prepare error_kind=%s",
+                creation.agent_id, type(error).__name__,
+            )
             self._fail_created_start(creation.agent_id, error, "prepare_failed")
             raise
         try:
             self._launch(creation.agent_id, request, adapter, plan, candidate_dir)
         except Exception as error:
-            self._fail_created_start(
+            _logger.warning(
+                "start agent_id=%s failed stage=launch error_kind=%s",
+                creation.agent_id, type(error).__name__,
+            )
+            kind, stage, text = self._fail_created_start(
                 creation.agent_id, error, "supervisor_start_failed"
             )
+            # The durable agent row already exists: attach it to the raised
+            # error so CLI/MCP can surface {agent_id, failure_kind,
+            # failure_stage, failure_text} instead of a bare error message
+            # that hides which agent this was.
+            error.agent_id = creation.agent_id
+            error.failure_kind = kind
+            error.failure_stage = stage
+            error.failure_text = text
             raise
+        _logger.info("start agent_id=%s done", creation.agent_id)
         return StartResult(
             creation.agent_id, True, self.get(creation.agent_id)
         )
 
+
     def _fail_created_start(
         self, agent_id: AgentId, error: Exception, kind: str
-    ) -> None:
+    ) -> tuple[str, str | None, str]:
         # A missing or unrenewable credential is its own diagnosis, not a
         # generic prepare/launch fault: name it so the row says what to fix.
+        stage: str | None = None
         if isinstance(error, AuthError):
             kind = "auth_failed"
+        elif isinstance(error, SupervisorBootstrapError):
+            kind, stage = error.failure_kind, error.failure_stage
         outcome = Outcome(
-            AgentStatus.FAILED,
-            failure_kind=kind,
-            failure_text=_failure_text(error),
+            AgentStatus.FAILED, failure_kind=kind, failure_text=_failure_text(error)
         )
         self._store.transition(
             agent_id,
             AgentStatus.FAILED,
             outcome=outcome,
             kind=kind,
-            data={"agent_id": str(agent_id)},
+            data=bootstrap_event_data(agent_id, error),
             at=self._now(),
         )
+        return kind, stage, outcome.failure_text
 
     def bind(
         self, agent_id: str | AgentId, orchestrator: OrchestratorRef
@@ -355,11 +418,40 @@ class AgentService:
         session_id = self._store.bind_orchestrator(
             agent_id, orchestrator, at=self._now()
         )
+        _logger.info("bind agent_id=%s transport=%s", agent_id, orchestrator.transport)
         return self._delivery_view(validate_agent_id(agent_id), session_id)
 
     def cancel(self, agent_id: str | AgentId) -> AgentView:
         self._store.enqueue_command(agent_id, "cancel", {}, at=self._now())
+        _logger.info("cancel agent_id=%s", agent_id)
         return self.get(agent_id)
+
+    def workflow_start(
+        self,
+        name: str,
+        script: str,
+        args: dict | None = None,
+        orchestrator: OrchestratorRef | None = None,
+    ) -> dict[str, str]:
+        """Launch a script workflow. See `workflow_facade.workflow_start`."""
+
+        return workflow_facade.workflow_start(self._home, name, script, args, orchestrator)
+
+    def workflow_status(self, run_id: str) -> dict[str, object]:
+        """Return one workflow run's journal summary. See `workflow_facade.workflow_status`."""
+
+        return workflow_facade.workflow_status(self._store, run_id)
+
+    def workflow_cancel(self, run_id: str) -> dict[str, object]:
+        """Request cancellation of a live workflow run. See `workflow_facade.workflow_cancel`."""
+
+        return workflow_facade.workflow_cancel(self._store, run_id)
+
+    def workflow_answer(self, run_id: str) -> dict[str, object]:
+        """Return a terminal workflow run's last result. See `workflow_facade.workflow_answer`."""
+
+        return workflow_facade.workflow_answer(self._store, run_id)
+
 
     def steer(self, agent_id: str | AgentId, text: str) -> CommandView:
         if not isinstance(text, str) or not text.strip():
@@ -370,9 +462,11 @@ class AgentService:
         command_id = self._store.enqueue_command(
             checked, "steer", {"text": text}, at=self._now()
         )
+        _logger.info("steer agent_id=%s command_id=%s", checked, command_id)
         return CommandView(command_id, checked, "steer")
 
     def get(self, agent_id: str | AgentId) -> AgentView:
+        _logger.debug("status agent_id=%s", agent_id)
         return self._agent_view(self._store.get_agent(agent_id), self._now())
 
     def list(self, query: AgentQuery = AgentQuery()) -> AgentPage:
@@ -438,6 +532,7 @@ class AgentService:
         row = self._store.get_agent(checked)
         status = AgentStatus(str(row["status"]))
         if row["answer_path"] is None:
+            _logger.debug("answer agent_id=%s available=False", checked)
             return AnswerView(checked, status, False, None, None, None, None, True)
         if row["answer_bytes"] is None or row["answer_sha256"] is None:
             raise ValidationError("stored answer proof is incomplete")
@@ -471,6 +566,7 @@ class AgentService:
             text = None if content is None else bytes(content).decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValidationError("stored answer is not valid UTF-8") from error
+        _logger.debug("answer agent_id=%s available=True bytes=%d", checked, size)
         return AnswerView(
             checked,
             status,
@@ -502,8 +598,8 @@ class AgentService:
             "orchestrator", None, orchestrator, page.items, page.total, page.complete
         )
 
-    def models(self) -> Mapping[str, tuple[ModelInfo, ...]]:
-        result: dict[str, tuple[ModelInfo, ...]] = {}
+    def models(self) -> Mapping[str, RuntimeModels]:
+        result: dict[str, RuntimeModels] = {}
         for name in sorted(self._config.runtimes):
             runtime = self._config.runtimes[name]
             if not runtime.enabled:
@@ -511,11 +607,25 @@ class AgentService:
             adapter = self._registry.load(name, (Capability.MODEL_ROSTER,))
             adapter.validate(runtime)
             allowed = set(runtime.models)
-            result[name] = tuple(
+            roster = tuple(
                 model
                 for model in adapter.models(runtime, runtime.home)
                 if model.id in allowed
             )
+            capabilities = tuple(
+                sorted(capability.value for capability in adapter.describe().capabilities)
+            )
+            health = adapter.probe(runtime, runtime.home)
+            available = health.available and bool(roster)
+            reason = health.reason
+            if not roster and reason is None:
+                reason = "roster empty"
+            _logger.debug(
+                "models runtime=%s available=%s count=%d reason=%s",
+                name, available, len(roster), reason,
+            )
+            result[name] = RuntimeModels(roster, capabilities, available, reason)
+        _logger.info("models runtimes=%d", len(result))
         return MappingProxyType(result)
 
     def limits(self) -> CapacityReport:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from agent_run.domain import ACTIVE, AgentId
@@ -12,6 +13,8 @@ from .workflow import finish_workflow_run
 
 if TYPE_CHECKING:
     from .store import StateStore
+
+_logger = logging.getLogger("agent_run.state")
 
 
 def reconcile_reaped_agent(
@@ -81,6 +84,10 @@ def reconcile_reaped_supervisor(
             continue  # one stale or concurrently changed row never aborts the sweep
         if committed:
             changed.append(AgentId(str(row["id"])))
+    _logger.debug(
+        "reconcile_reaped_supervisor pid=%d candidates=%d changed=%d",
+        supervisor_pid, len(rows), len(changed),
+    )
     return tuple(changed)
 
 
@@ -124,6 +131,10 @@ def reconcile_active_agents(store, *, at: float | None = None, limit: int = 100)
             continue  # one stale or concurrently changed row never aborts the sweep
         if committed:
             changed.append(AgentId(str(row["id"])))
+    if changed:
+        _logger.info("reconcile_active_agents candidates=%d changed=%d", len(rows), len(changed))
+    else:
+        _logger.debug("reconcile_active_agents candidates=%d changed=%d", len(rows), len(changed))
     return tuple(changed)
 
 
@@ -189,5 +200,9 @@ def reconcile_workflow_runs(store, *, at: float | None = None, limit: int = 100)
         except (ValidationError, StateTransitionError):
             continue  # one stale or concurrently changed row never aborts the sweep
         changed.append(str(row["id"]))
+    if changed:
+        _logger.info("reconcile_workflow_runs candidates=%d changed_to_lost=%d", len(rows), len(changed))
+    else:
+        _logger.debug("reconcile_workflow_runs candidates=%d changed_to_lost=%d", len(rows), len(changed))
     return tuple(changed)
 

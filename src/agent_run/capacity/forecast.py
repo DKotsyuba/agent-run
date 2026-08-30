@@ -2,8 +2,10 @@
 
 Freshness comes from each sample's ``valid_until`` (per the architecture
 contract); missing or stale data becomes ``unknown`` and never blocks a
-caller. Identity (runtime/lane/window/target/source) is preserved end to end
-from :mod:`agent_run.capacity.history`.
+caller. A sample whose ``reset_at`` has already passed is treated the same
+way: the window it describes has already reset, so it can no longer speak
+for the current window. Identity (runtime/lane/window/target/source) is
+preserved end to end from :mod:`agent_run.capacity.history`.
 """
 
 from __future__ import annotations
@@ -23,6 +25,12 @@ _LOW_REMAINING_THRESHOLD = 30.0
 _HIGH_REMAINING_THRESHOLD = 10.0
 _BURN_MEDIUM_MULTIPLIER = 1.0
 _BURN_HIGH_MULTIPLIER = 1.5
+#: Burn evidence must span at least this many seconds before it may escalate
+#: risk. A lane only minutes old has a remaining percentage that moves in
+#: whole-number jumps, so a couple of early samples extrapolate to a burn rate
+#: that looks catastrophic while the lane still holds ~99% -- the remaining
+#: thresholds cover that case until the evidence is an hour deep.
+_BURN_MIN_SPAN_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -45,7 +53,9 @@ def build_forecasts(
 
 
 def _is_fresh(sample: NormalizedSample, now: float) -> bool:
-    return sample.valid_until is None or sample.valid_until >= now
+    valid = sample.valid_until is None or sample.valid_until >= now
+    not_yet_reset = sample.reset_at is None or sample.reset_at >= now
+    return valid and not_yet_reset
 
 
 def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
@@ -72,7 +82,7 @@ def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
     burn = _burn_rate(window_samples)
     warmup = burn is None
     sustainable = _sustainable_pace(remaining, reset_at, now)
-    risk = _risk(remaining, burn, sustainable, warmup)
+    risk = _risk(remaining, burn, sustainable, warmup, _burn_span_seconds(window_samples))
     return CapacityForecast(
         key=series.key,
         known=True,
@@ -105,6 +115,25 @@ def _burn_rate(window_samples: list[NormalizedSample]) -> float | None:
     return max(consumed, 0.0) / elapsed_hours
 
 
+def _burn_span_seconds(window_samples: list[NormalizedSample]) -> float | None:
+    """Seconds of history between the newest and oldest burn samples.
+
+    Mirrors the endpoints ``_burn_rate`` uses, so the two always agree about
+    which samples constitute the evidence. Returns ``None`` when there are
+    fewer than two samples or either endpoint lacks an ``observed_at``, which
+    is exactly when ``_burn_rate`` returns ``None`` and burn cannot escalate
+    anyway.
+    """
+
+    if len(window_samples) < 2:
+        return None
+    newest = window_samples[0]
+    oldest = window_samples[-1]
+    if newest.observed_at is None or oldest.observed_at is None:
+        return None
+    return newest.observed_at - oldest.observed_at
+
+
 def _sustainable_pace(
     remaining: float, reset_at: float | None, now: float
 ) -> float | None:
@@ -121,12 +150,34 @@ def _risk(
     burn: float | None,
     sustainable: float | None,
     warmup: bool,
+    burn_span_seconds: float | None,
 ) -> str:
+    """Risk tier for one lane.
+
+    ``remaining`` is the lane's remaining percentage (0-100). ``burn`` and
+    ``sustainable`` are percent-per-hour rates, either possibly ``None`` when
+    they could not be derived. ``warmup`` marks a lane with too few samples to
+    state a burn rate at all. ``burn_span_seconds`` is how much time the burn
+    evidence actually covers, or ``None`` when unknown.
+
+    The remaining-percent thresholds always apply. Burn-based escalation is
+    additionally gated on the evidence spanning at least
+    ``_BURN_MIN_SPAN_SECONDS``; below that span the burn rate is reported
+    unchanged but is too thin to escalate on, so the remaining thresholds
+    alone decide.
+    """
+
     if remaining <= _HIGH_REMAINING_THRESHOLD:
         return RISK_HIGH
     if remaining <= _LOW_REMAINING_THRESHOLD:
         return RISK_MEDIUM
-    if not warmup and burn is not None and sustainable is not None:
+    if (
+        not warmup
+        and burn is not None
+        and sustainable is not None
+        and burn_span_seconds is not None
+        and burn_span_seconds >= _BURN_MIN_SPAN_SECONDS
+    ):
         if burn > sustainable * _BURN_HIGH_MULTIPLIER:
             return RISK_HIGH
         if burn > sustainable * _BURN_MEDIUM_MULTIPLIER:

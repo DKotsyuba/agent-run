@@ -196,6 +196,51 @@ class ContextHookTests(unittest.TestCase):
         self.assertTrue(truncated.injected)
         self.assertLessEqual(len(truncated.text), 120)
 
+    def test_capacity_block_renders_every_lane_worst_first(self) -> None:
+        # A healthy lane and a lane with no fresh data are both rendered --
+        # hiding them got a healthy lane read as "no data" twice -- with the
+        # lane actually in trouble leading.
+        self.store.insert_capacity_sample(
+            runtime="glm",
+            lane="requests",
+            window="5h",
+            source="provider",
+            payload={},
+            remaining_percent=95,
+            reset_at=2000,
+            observed_at=1000,
+            valid_until=1100,
+        )
+        self.store.insert_capacity_sample(
+            runtime="codex",
+            lane="requests",
+            window="5h",
+            source="provider",
+            payload={},
+            remaining_percent=0,
+            reset_at=2000,
+            observed_at=1000,
+            valid_until=1100,
+        )
+        self.store.insert_capacity_sample(
+            runtime="qwen",
+            lane="requests",
+            window="5h",
+            source="provider",
+            payload={},
+            remaining_percent=50,
+            reset_at=2000,
+            observed_at=1000,
+            valid_until=999,
+        )
+        result = build_context(self.store, self.ref, config=self.config, now=1000)
+        capacity_line = result.text.splitlines()[0]
+        self.assertIn("risk=high", capacity_line)
+        self.assertIn("risk=low", capacity_line)
+        self.assertIn("risk=unknown", capacity_line)
+        self.assertLess(capacity_line.index("risk=high"), capacity_line.index("risk=low"))
+        self.assertLess(capacity_line.index("risk=low"), capacity_line.index("risk=unknown"))
+
 
 if __name__ == "__main__":
     unittest.main()

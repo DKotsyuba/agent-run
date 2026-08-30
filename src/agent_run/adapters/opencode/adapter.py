@@ -33,7 +33,7 @@ from ..base import (
 )
 from ..home import content_hash, seal_answer, write_managed_file
 from ..plugin_skills import skill_dirs
-from .capacity import pool_samples
+from ..omniroute import pool_samples
 from .http import POLL_INTERVAL_SECONDS, HttpError, OpenCodeHttpClient
 from .normalize import (
     PRIMARY_AGENT,
@@ -363,7 +363,7 @@ class OpenCodeAdapter:
 
         Pool-wide, not per model: OmniRoute meters the ``opencode-go`` accounts,
         not the individual models routed over them, so one set of window samples
-        covers every configured model. See :mod:`.capacity` for what was probed
+        covers every configured model. See :mod:`..omniroute` for what was probed
         and why OmniRoute's own sqlite store is the only real source.
         """
 
