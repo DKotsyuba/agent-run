@@ -27,6 +27,8 @@ _MARKERS = {
     "codex": "config.toml",
     "claude": "settings.json",
     "opencode": "xdg/config/opencode/opencode.json",
+    "qwen": ".qwen/settings.json",
+    "glm": "settings.json",
 }
 
 
