@@ -93,7 +93,7 @@ stable specs give stable keys, which is what makes the journal replayable.
 ## Launching and watching
 
 Prefer the MCP tools: `workflow_start(script, args?)`, `workflow_status`,
-`workflow_cancel`, `workflow_answer`. CLI fallback (server not connected or
+`workflow_cancel`, `workflow_answer`, `workflow_resume`. CLI fallback (server not connected or
 stale — see cautions):
 
 ```bash
@@ -133,8 +133,11 @@ codes), and keep doing other work. Single agents have the same watchdog:
 - Chat delivery of the terminal notice only happens for runs started with a
   bound session (MCP path). CLI-started runs deliver nothing and create no
   delivery row — `wait` on them, that IS the delivery.
-- Resume exists at engine level (journal replay by step_key) but is NOT
-  exposed via CLI/MCP yet — a lost run is restarted, cached steps replay.
+- Resume is first-class since 31.08.2026: `workflow resume <run_id>` (CLI)
+  or the `workflow_resume` MCP tool replays a failed/lost run in place
+  under the same run_id — completed steps return from the journal cache
+  (proven live: zero new agents on resume), only the broken tail re-runs.
+  succeeded/cancelled/running runs refuse.
 - Cancel is safe and proven: run → cancelled, in-flight step journaled
   `runner_cancelled`, the child agent is cancelled with it, no orphans.
 - A workflow burns quota on every step: intersect the plan with the capacity
