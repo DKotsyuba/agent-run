@@ -34,6 +34,7 @@ from .logging_setup import configure_logging
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
+from .state.run_stats import backfill_run_stats
 from .wait import DEFAULT_POLL_SECONDS, wait_for_agent, wait_for_workflow
 
 _logger = logging.getLogger("agent_run.cli")
@@ -130,6 +131,11 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("models")
     commands.add_parser("limits")
+
+    stats = commands.add_parser("stats").add_subparsers(
+        dest="stats_command", required=True
+    )
+    stats.add_parser("backfill")
 
     context = commands.add_parser("context")
     _session(context, required=True)
@@ -810,6 +816,16 @@ def _doctor(home: Path):
     return run_doctor(home)
 
 
+def _stats(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    if args.stats_command == "backfill":
+        store = StateStore.open(state_db_path(home))
+        try:
+            return backfill_run_stats(store)
+        finally:
+            store.close()
+    raise AgentRunError(f"unsupported stats command: {args.stats_command}")
+
+
 def _doc(args: argparse.Namespace) -> dict[str, object]:
     from .doc import topic_text
 
@@ -848,6 +864,8 @@ def main(
             result = _doctor(home)
         elif service is None and args.command == "doc":
             result = _doc(args)
+        elif service is None and args.command == "stats":
+            result = _stats(home, args)
         elif args.command == "capacity" and args.capacity_command == "launchd":
             result = _capacity_launchd(home, args)
         elif args.command == "delivery" and args.delivery_command == "launchd":

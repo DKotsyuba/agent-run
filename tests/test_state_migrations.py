@@ -124,6 +124,10 @@ def _build_poisoned_v5_store(path: Path, run_id: str) -> None:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA legacy_alter_table=OFF")
         connection.executescript(migration_five.read_text(encoding="utf-8"))
+        # Downgrade the stamp and the post-v5 tables afterwards: replaying 005
+        # is what proves 006's repair, and the store must look exactly like a
+        # genuine v5 one so migrations 006..end can re-run over it.
+        connection.execute("DROP TABLE run_stats")
         connection.execute("PRAGMA user_version=5")
         connection.commit()
     finally:
