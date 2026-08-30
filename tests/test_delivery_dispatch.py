@@ -63,13 +63,15 @@ class DeliveryDispatchTests(unittest.TestCase):
         agent_id = self.store.create_agent(
             request, task_summary="summary", config_revision="cfg-1", at=1
         ).agent_id
-        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
-        self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
-        self.store.transition(
-            agent_id, AgentStatus.SUCCEEDED, outcome=Outcome(AgentStatus.SUCCEEDED), at=4
-        )
+        # An orchestrator-backed start binds its session before the agent runs,
+        # so the completion notice is created pending rather than waiting.
         self.store.bind_orchestrator(
-            agent_id, OrchestratorRef("codex_queue", "session-1", "turn-1"), at=5
+            agent_id, OrchestratorRef("codex_queue", "session-1", "turn-1"), at=2
+        )
+        self.store.transition(agent_id, AgentStatus.STARTING, at=3)
+        self.store.transition(agent_id, AgentStatus.RUNNING, at=4)
+        self.store.transition(
+            agent_id, AgentStatus.SUCCEEDED, outcome=Outcome(AgentStatus.SUCCEEDED), at=5
         )
         return agent_id
 
@@ -263,7 +265,124 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.assertEqual(self.delivery_row()["state"], "cancelled")
         agent = self.store.get_agent(self.agent_id)
         self.assertEqual(agent["status"], "succeeded")
-        self.assertEqual(agent["finished_at"], 4)
+        self.assertEqual(agent["finished_at"], 5)
+
+    def unbound_row(self, delivery_id: str = "ntf_unbound") -> dict:
+        return dict(
+            self.store.connection.execute(
+                "SELECT * FROM deliveries WHERE id = ?", (delivery_id,)
+            ).fetchone()
+        )
+
+    def plant_waiting_binding(self) -> str:
+        """Create a start with no orchestrator ref and plant the never-bound
+        notice a pre-T36B binary would have created for it."""
+
+        request = StartRequest(
+            "codex", "model", "profile", "task", self.root, timeout_seconds=480
+        )
+        agent_id = self.store.create_agent(
+            request, task_summary="summary", config_revision="cfg-1", at=1
+        ).agent_id
+        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
+        self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
+        self.store.transition(
+            agent_id, AgentStatus.SUCCEEDED, outcome=Outcome(AgentStatus.SUCCEEDED), at=4
+        )
+        seq = self.store.connection.execute(
+            "SELECT MAX(seq) FROM events WHERE agent_id = ?", (agent_id,)
+        ).fetchone()[0]
+        self.store.connection.execute(
+            """INSERT INTO deliveries
+               (id, agent_id, orchestrator_session_id, terminal_event_seq, state)
+               VALUES ('ntf_unbound', ?, NULL, ?, 'waiting_binding')""",
+            (agent_id, seq),
+        )
+        self.store.connection.commit()
+        return "ntf_unbound"
+
+    def test_never_bound_notice_for_a_terminal_agent_expires_after_the_window(self) -> None:
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+        dispatcher = self.dispatcher(transport)
+        delivery_id = self.plant_waiting_binding()
+
+        with self.assertLogs("agent_run.delivery", level="INFO") as logged:
+            first = dispatcher.drain(at=4 + 3600)
+        self.assertEqual(
+            [
+                record.getMessage()
+                for record in logged.records
+                if "expired" in record.getMessage()
+            ],
+            [
+                "dispatch expired delivery_id=%s reason=binding_window_elapsed"
+                % delivery_id
+            ],
+        )
+        self.assertEqual(self.unbound_row()["state"], "expired")
+        # Only the bound notice from setUp was dispatched; the expired one is
+        # never claimed again, sent, or logged on any later rescan.
+        self.assertEqual(first.claimed, 1)
+        with self.assertNoLogs("agent_run.delivery", level="INFO"):
+            second = dispatcher.drain(at=4 + 7200)
+        self.assertEqual(
+            (second.claimed, len(transport.calls)),
+            (0, 1),
+        )
+
+    def test_never_bound_notice_inside_the_window_is_left_to_bind(self) -> None:
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+        dispatcher = self.dispatcher(transport)
+        self.plant_waiting_binding()
+
+        dispatcher.drain(at=4 + 3599)
+
+        self.assertEqual(self.unbound_row()["state"], "waiting_binding")
+
+    def test_never_bound_notice_for_a_running_agent_never_expires(self) -> None:
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+        dispatcher = self.dispatcher(transport)
+        request = StartRequest(
+            "codex", "model", "profile", "task", self.root, timeout_seconds=480
+        )
+        agent_id = self.store.create_agent(
+            request, task_summary="summary", config_revision="cfg-1", at=1
+        ).agent_id
+        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
+        self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
+        self.store.connection.execute(
+            """INSERT INTO deliveries
+               (id, agent_id, orchestrator_session_id, terminal_event_seq, state)
+               VALUES ('ntf_unbound', ?, NULL,
+                       (SELECT MAX(seq) FROM events WHERE agent_id = ?),
+                       'waiting_binding')""",
+            (agent_id, agent_id),
+        )
+        self.store.connection.commit()
+
+        dispatcher.drain(at=3 + 100000)
+
+        row = dict(
+            self.store.connection.execute(
+                "SELECT * FROM deliveries WHERE id = 'ntf_unbound'"
+            ).fetchone()
+        )
+        self.assertEqual(row["state"], "waiting_binding")
+
+    def test_bound_deliveries_are_never_expired_by_the_sweep(self) -> None:
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+        dispatcher = self.dispatcher(transport)
+        self.plant_waiting_binding()
+        self.assertEqual(self.delivery_row()["state"], "pending")
+
+        # Far past the window: the bound notice still dispatches normally and
+        # the sweep leaves it alone.
+        result = dispatcher.drain(at=5 + 100000)
+
+        self.assertEqual((result.claimed, result.delivered), (1, 1))
+        self.assertEqual(self.delivery_row()["state"], "delivered")
+        self.assertEqual(self.unbound_row()["state"], "expired")
+        self.assertEqual(len(transport.calls), 1)
 
 
 if __name__ == "__main__":

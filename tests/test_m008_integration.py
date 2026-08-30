@@ -110,6 +110,14 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertTrue(directory.is_dir())
         answer_path = directory / "answer.md"
         answer_path.write_text(f"done\n{DEFAULT_SENTINEL}\n", encoding="utf-8")
+        # The orchestrator binds before the agent finishes, so the terminal
+        # transition creates a pending notice rather than one that can never bind.
+        bind(
+            self.store,
+            agent_id,
+            OrchestratorRef("codex_queue", "root-session", "turn-1"),
+            at=100,
+        )
         ops = FakeOps()
         session = FakeSession(
             ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
@@ -130,11 +138,11 @@ class M008IntegrationTests(unittest.TestCase):
             ops=ops,
         ).run()
         self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
-        self.assertEqual(self.service.get(agent_id).delivery.state, "waiting_binding")
+        self.assertEqual(self.service.get(agent_id).delivery.state, "pending")
 
         ref = OrchestratorRef("codex_queue", "root-session", "turn-1")
+        # A repeat of the same bind is idempotent; a different session is refused.
         bind(self.store, agent_id, ref, at=200)
-        self.assertEqual(self.service.get(agent_id).delivery.state, "pending")
         with self.assertRaises(BindHookError):
             bind(
                 self.store,
@@ -147,8 +155,10 @@ class M008IntegrationTests(unittest.TestCase):
         dispatcher = DeliveryDispatcher(
             self.store, {transport.name: transport}, owner="integration-dispatcher"
         )
-        first = dispatcher.drain(at=200)
-        second = dispatcher.drain(at=200)
+        # The notice was created pending at the agent's own terminal timestamp,
+        # so the dispatcher is run well past it.
+        first = dispatcher.drain(at=10_000_000_000)
+        second = dispatcher.drain(at=10_000_000_000)
         self.assertEqual((first.claimed, first.delivered), (1, 1))
         self.assertEqual(second.claimed, 0)
         self.assertEqual(len(transport.sent), 1)

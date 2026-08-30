@@ -99,7 +99,7 @@ CREATE TABLE deliveries (
   state TEXT NOT NULL CHECK (
     state IN (
       'waiting_binding', 'pending', 'sending', 'delivered', 'retry_wait',
-      'failed', 'cancelled'
+      'failed', 'cancelled', 'expired'
     )
   ),
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -203,4 +203,4 @@ CREATE INDEX idx_workflow_steps_agent
   ON workflow_steps(agent_id)
   WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
