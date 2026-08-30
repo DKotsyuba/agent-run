@@ -177,6 +177,8 @@ class ClaudeAdapter:
         *,
         mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan:
+        if request.fast:
+            raise ValidationError(f"{request.runtime} runtime does not support fast mode")
         if request.model not in config.models:
             raise ValidationError(f"model is not in the configured roster: {request.model}")
         if request.effort is not None and request.effort not in _SUPPORTED_EFFORTS:

@@ -163,10 +163,13 @@ class StartRequest:
     output_schema: dict | None = None
     orchestrator: OrchestratorRef | None = None
     request_id: str | None = None
+    fast: bool = False
 
     def __post_init__(self) -> None:
         for name in ("runtime", "model", "profile", "task"):
             _nonblank(name, getattr(self, name))
+        if not isinstance(self.fast, bool):
+            raise ValidationError("fast must be a boolean")
         if self.timeout_seconds is not None:
             if isinstance(self.timeout_seconds, bool) or not isinstance(
                 self.timeout_seconds, (int, float)

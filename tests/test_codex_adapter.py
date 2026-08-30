@@ -742,6 +742,15 @@ env_from = ["PATH"]
             sorted((str(self.workdir), str(self.auth_source_dir))),
         )
 
+    def test_prepare_adds_fast_overrides_only_for_fast_requests(self) -> None:
+        config = self.materialized()
+        profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
+        plan = self.prepare(self.start_request(fast=True), profile, config)
+        self.assertEqual(
+            plan.argv,
+            (str(config.binary), "-c", "service_tier=fast", "-c", "features.fast_mode=true", "app-server"),
+        )
+
     def test_prepare_prefixes_the_task_with_the_profile_preamble(self) -> None:
         """codex takes no system prompt, so the preamble rides the first turn.
 

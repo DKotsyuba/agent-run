@@ -88,6 +88,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--task", required=True)
     start.add_argument("--workdir", default=os.getcwd())
     start.add_argument("--write", action="store_true")
+    start.add_argument("--fast", action="store_true")
     start.add_argument("--effort")
     start.add_argument("--timeout", type=float)
     start.add_argument("--read-root", action="append", default=[])
@@ -343,6 +344,7 @@ def _request(args: argparse.Namespace, stream: TextIO) -> StartRequest:
         output_schema=schema,
         orchestrator=_ref(args),
         request_id=args.request_id,
+        fast=args.fast,
     )
 
 
