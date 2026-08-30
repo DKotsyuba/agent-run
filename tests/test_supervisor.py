@@ -1026,5 +1026,90 @@ class StoreEventSinkThreadingTests(unittest.TestCase):
         self.assertEqual(len(self.events("concurrent_event_1")), 1)
 
 
+class RunStatsSupervisorTests(unittest.TestCase):
+    """The supervisor's terminal path snapshots one run_stats row, best-effort."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = CountingStore(StateStore.initialize(self.root / "state.db").connection)
+        self.addCleanup(self.store.close)
+        self.answer = self.root / "answer.md"
+        self.agent_id = self.store.create_agent(
+            StartRequest(
+                "fake", "model", "profile", "task", self.root, timeout_seconds=480
+            ),
+            task_summary="task",
+            config_revision="rev-1",
+        ).agent_id
+
+    def write_answer(self, text: str) -> None:
+        self.answer.write_text(text, encoding="utf-8")
+
+    def plan(self) -> LaunchPlan:
+        return LaunchPlan((), self.root, {}, None, self.root / "runtime.jsonl", {})
+
+    def supervisor(self, adapter, ops) -> Supervisor:
+        return Supervisor(
+            self.store,
+            self.agent_id,
+            adapter,
+            self.plan(),
+            answer_path=self.answer,
+            timeout_seconds=60.0,
+            settings=SupervisorSettings(poll_seconds=0.5, grace_seconds=2.0),
+            ops=ops,
+        )
+
+    def stats_row(self) -> dict | None:
+        row = self.store.connection.execute(
+            "SELECT * FROM run_stats WHERE agent_id = ?", (self.agent_id,)
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def test_a_terminal_commit_writes_the_run_stats_row(self) -> None:
+        self.write_answer(f"done {DEFAULT_SENTINEL}")
+        ops = FakeOps()
+        session = FakeSession(
+            ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        row = self.stats_row()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "succeeded")
+        self.assertEqual(row["runtime"], "fake")
+        self.assertEqual(row["usage_source"], "none")
+        self.assertIsNotNone(row["started_at"])
+        self.assertIsNotNone(row["finished_at"])
+        self.assertIsNotNone(row["recorded_at"])
+
+    def test_a_stats_failure_still_returns_the_committed_outcome(self) -> None:
+        import agent_run.supervisor as supervisor_module
+
+        self.write_answer(f"done {DEFAULT_SENTINEL}")
+        ops = FakeOps()
+        session = FakeSession(
+            ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
+        )
+        original = supervisor_module.record_run_stats_best_effort
+
+        def boom(store, agent_id, *, at=None):
+            raise RuntimeError("stats broke")
+
+        supervisor_module.record_run_stats_best_effort = boom
+        try:
+            outcome = self.supervisor(FakeAdapter(session), ops).run()
+        finally:
+            supervisor_module.record_run_stats_best_effort = original
+
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(str(self.store.get_agent(self.agent_id)["status"]), "succeeded")
+        self.assertIsNone(self.stats_row())
+
+
 if __name__ == "__main__":
     unittest.main()

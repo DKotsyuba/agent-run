@@ -28,6 +28,7 @@ from .lifecycle import (
     terminate_process_group,
     verify_process_group,
 )
+from .state.run_stats import record_run_stats_best_effort
 from .state.store import StateStore
 from .verify import (
     DEFAULT_SENTINEL,
@@ -684,6 +685,9 @@ class Supervisor:
                 "agent_id=%s stage=terminal status=%s failure_kind=%s",
                 self._agent_id, outcome.status.value, outcome.failure_kind,
             )
+            # Best-effort: the terminal row above is the durable outcome, so a
+            # stats snapshot failure must never rewrite it.
+            record_run_stats_best_effort(self._store, self._agent_id)
         except AgentRunError:
             durable = self._store.get_agent(self._agent_id)
             status = AgentStatus(str(durable["status"]))

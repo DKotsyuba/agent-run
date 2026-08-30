@@ -12,6 +12,7 @@ from .reconciliation import (
     workflow_owner_identity,
 )
 from .store import AgentCreation, StateStore
+from .run_stats import backfill_run_stats, record_run_stats
 from .workflow import step_key
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "DiagnosticSnapshot",
     "SCHEMA_VERSION",
     "StateStore",
+    "backfill_run_stats",
     "backup_path",
     "context_agents",
     "diagnostic_snapshot",
@@ -28,6 +30,7 @@ __all__ = [
     "reconcile_reaped_agent",
     "reconcile_reaped_supervisor",
     "reconcile_workflow_runs",
+    "record_run_stats",
     "step_key",
     "workflow_owner_identity",
 ]
