@@ -205,6 +205,7 @@ class CliTests(unittest.TestCase):
         self.assertIsInstance(request, StartRequest)
         self.assertEqual(request.task, "do work")
         self.assertTrue(request.write)
+        self.assertFalse(request.fast)
         self.assertEqual(request.effort, "high")
         self.assertEqual(request.timeout_seconds, 42)
         self.assertEqual(request.read_roots, (read_root.resolve(),))
@@ -226,6 +227,12 @@ class CliTests(unittest.TestCase):
             )
         self.assertIsNone(omitted.request.timeout_seconds)
         self.assertEqual(explicit.request.timeout_seconds, 480)
+
+    def test_start_fast_flag_reaches_the_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = FakeService()
+            self.assertEqual(self.run_cli(["start", "--runtime", "codex", "--model", "model", "--profile", "p", "--task", "t", "--workdir", directory, "--fast"], service=service)[0], 0)
+        self.assertTrue(service.request.fast)
 
     def test_json_supports_dataclasses_enums_paths_and_mappingproxy(self):
         code, output, error = self.run_cli(["status", AGENT_ID])
@@ -935,7 +942,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
-                "start", "cancel", "steer", "status", "list_agents",
+                "start", "fast", "cancel", "steer", "status", "list_agents",
                 "summary", "transcript", "answer", "models", "limits", "doc",
                 "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
             ],

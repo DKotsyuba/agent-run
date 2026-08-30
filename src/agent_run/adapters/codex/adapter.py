@@ -617,8 +617,12 @@ class CodexAdapter:
                     "networkAccess": True,
                 }
             }
+        argv = [str(config.binary)]
+        if request.fast:
+            argv.extend(("-c", "service_tier=fast", "-c", "features.fast_mode=true"))
+        argv.append("app-server")
         return LaunchPlan(
-            argv=(str(config.binary), "app-server"),
+            argv=tuple(argv),
             cwd=workdir,
             environment=MappingProxyType(environment),
             # The profile preamble reaches this engine only here: codex

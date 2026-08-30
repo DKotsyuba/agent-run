@@ -248,6 +248,8 @@ class QwenAdapter:
         mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan:
         """Build a sandboxed one-shot invocation and isolated environment."""
+        if request.fast:
+            raise ValidationError("qwen runtime does not support fast mode")
         if profile.network:
             raise ValidationError("qwen runtime does not support network profiles")
         if request.model not in config.models:

@@ -115,7 +115,7 @@ class McpTests(unittest.TestCase):
         self.assertEqual(
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
-                "start", "cancel", "steer", "status", "list_agents",
+                "start", "fast", "cancel", "steer", "status", "list_agents",
                 "summary", "transcript", "answer", "models", "limits", "doc",
                 "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
             ],
@@ -130,7 +130,7 @@ class McpTests(unittest.TestCase):
             ]
         )
         expected = [
-            "start", "cancel", "steer", "status", "list_agents",
+            "start", "fast", "cancel", "steer", "status", "list_agents",
             "summary", "transcript", "answer", "models", "limits", "doc",
             "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
         ]
@@ -216,6 +216,23 @@ class McpTests(unittest.TestCase):
         starts = [value for name, value in service.calls if name == "start"]
         self.assertIsNone(starts[0].timeout_seconds)
         self.assertEqual(starts[1].timeout_seconds, 480)
+
+    def test_fast_toggle_is_ephemeral_and_applies_to_codex_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            start = {"runtime": "codex", "model": "model", "profile": "p", "task": "t", "workdir": directory}
+            service, responses = self.run_server([
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "fast", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "fast", "arguments": {"runtime": "codex", "enabled": True}}},
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "start", "arguments": start}},
+                {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "fast", "arguments": {"runtime": "codex", "enabled": False}}},
+                {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "start", "arguments": {**start, "fast": False}}},
+                {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "fast", "arguments": {"runtime": "claude", "enabled": True}}},
+            ])
+        starts = [value for name, value in service.calls if name == "start"]
+        self.assertEqual(responses[0]["result"]["structuredContent"], {"codex": False})
+        self.assertTrue(starts[0].fast)
+        self.assertFalse(starts[1].fast)
+        self.assertTrue(responses[-1]["result"]["isError"])
 
     def test_protocol_and_tool_errors_are_bounded_and_loop_continues(self) -> None:
         service, responses = self.run_server(

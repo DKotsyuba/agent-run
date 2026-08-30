@@ -60,6 +60,7 @@ _TOOLS = (
                 "task": {"type": "string"},
                 "workdir": {"type": "string"},
                 "write": {"type": "boolean"},
+                "fast": {"type": "boolean"},
                 "effort": {"type": ["string", "null"]},
                 "timeout_seconds": {"type": "number"},
                 "read_roots": {"type": "array", "items": {"type": "string"}},
@@ -68,6 +69,13 @@ _TOOLS = (
                 "request_id": {"type": ["string", "null"]},
             },
             ("runtime", "model", "profile", "task", "workdir"),
+        ),
+    },
+    {
+        "name": "fast",
+        "description": "Get or set the ephemeral Codex fast-mode toggle.",
+        "inputSchema": _schema(
+            {"runtime": {"type": "string"}, "enabled": {"type": "boolean"}}
         ),
     },
     {
@@ -173,6 +181,7 @@ def serve(
     stdout: IO[str] = sys.stdout,
 ) -> int:
     """Serve newline-delimited JSON-RPC until EOF; stdout carries JSON only."""
+    fast_modes = {"codex": False}
 
     while True:
         line = stdin.readline(MAX_LINE_BYTES + 1)
@@ -196,12 +205,12 @@ def serve(
         except (json.JSONDecodeError, UnicodeDecodeError):
             _emit(stdout, _error(None, -32700, "parse error"))
             continue
-        response = _handle(service, request)
+        response = _handle(service, request, fast_modes)
         if response is not None:
             _emit(stdout, response)
 
 
-def _handle(service: AgentService, request: object) -> dict | None:
+def _handle(service: AgentService, request: object, fast_modes: dict[str, bool]) -> dict | None:
     if not isinstance(request, dict):
         return _error(None, -32600, "invalid request")
     request_id = request.get("id", _MISSING)
@@ -234,7 +243,7 @@ def _handle(service: AgentService, request: object) -> dict | None:
             # always serve the single, complete page.
             result = {"tools": list(_TOOLS)}
         elif method == "tools/call":
-            return _tool_call(service, request_id, params)
+            return _tool_call(service, request_id, params, fast_modes)
         else:
             return _error(request_id, -32601, "method not found")
     except Exception as error:
@@ -242,7 +251,9 @@ def _handle(service: AgentService, request: object) -> dict | None:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
+def _tool_call(
+    service: AgentService, request_id: object, params: dict, fast_modes: dict[str, bool]
+) -> dict:
     name = params.get("name")
     arguments = params.get("arguments", {})
     if not isinstance(name, str) or not isinstance(arguments, dict):
@@ -264,7 +275,7 @@ def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
         outcome = "unknown_tool"
     else:
         try:
-            value = _call_tool(service, name, arguments)
+            value = _call_tool(service, name, arguments, fast_modes)
             result = _tool_result(value)
             outcome = "ok"
             if agent_id is None:
@@ -288,9 +299,21 @@ def _tool_call(service: AgentService, request_id: object, params: dict) -> dict:
 
 
 
-def _call_tool(service: AgentService, name: str, raw: dict) -> object:
+def _call_tool(service: AgentService, name: str, raw: dict, fast_modes: dict[str, bool]) -> object:
     """Validate one MCP tool request and dispatch it to the service."""
 
+    if name == "fast":
+        args = _arguments(raw, {"runtime", "enabled"})
+        if not args:
+            return dict(fast_modes)
+        runtime = _string(args, "runtime")
+        if runtime != "codex":
+            raise ValidationError(f"{runtime} runtime does not support fast mode")
+        enabled = args.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValidationError("enabled must be a boolean")
+        fast_modes[runtime] = enabled
+        return dict(fast_modes)
     if name == "workflow_start":
         args = _arguments(raw, {"name", "script", "args", "orchestrator"},
                           {"name", "script"})
@@ -314,13 +337,16 @@ def _call_tool(service: AgentService, name: str, raw: dict) -> object:
             {
                 "runtime", "model", "profile", "task", "workdir", "write",
                 "effort", "timeout_seconds", "read_roots", "output_schema",
-                "orchestrator", "request_id",
+                "orchestrator", "request_id", "fast",
             },
             {"runtime", "model", "profile", "task", "workdir"},
         )
         write = args.get("write", False)
         if not isinstance(write, bool):
             raise ValidationError("write must be a boolean")
+        fast = args.get("fast", fast_modes.get(_string(args, "runtime"), False))
+        if not isinstance(fast, bool):
+            raise ValidationError("fast must be a boolean")
         roots = args.get("read_roots", [])
         if not isinstance(roots, list) or not all(isinstance(item, str) for item in roots):
             raise ValidationError("read_roots must be an array of strings")
@@ -339,6 +365,7 @@ def _call_tool(service: AgentService, name: str, raw: dict) -> object:
                 _string(args, "profile"),
                 _string(args, "task"),
                 Path(_string(args, "workdir")),
+                fast=fast,
                 write=write,
                 effort=_optional_string(args, "effort"),
                 **timeout,

@@ -80,15 +80,15 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_mcp_has_fifteen_schema_backed_tools_and_dispatches_all_workflow_verbs(self) -> None:
         """Expose exactly fifteen tools and decode each workflow request."""
 
-        self.assertEqual(len(_TOOLS), 15)
+        self.assertEqual(len(_TOOLS), 16)
         self.assertTrue(all(tool.get("inputSchema", {}).get("type") == "object" for tool in _TOOLS))
         service = _WorkflowService()
-        self.assertEqual(_call_tool(service, "workflow_start", {"name": "n", "script": "result = 7"}),
+        self.assertEqual(_call_tool(service, "workflow_start", {"name": "n", "script": "result = 7"}, {}),
                          {"run_id": "wf_test"})
         for name in ("workflow_status", "workflow_cancel", "workflow_answer"):
-            _call_tool(service, name, {"run_id": "wf_test"})
+            _call_tool(service, name, {"run_id": "wf_test"}, {})
         with self.assertRaises(ValidationError):
-            _call_tool(service, "workflow_status", {"run_id": "wf_test", "extra": True})
+            _call_tool(service, "workflow_status", {"run_id": "wf_test", "extra": True}, {})
 
     def test_cli_parses_and_dispatches_the_four_workflow_verbs(self) -> None:
         """Mirror workflow start, status, cancel, and answer in the CLI."""
@@ -210,7 +210,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
                     "agent_run.workflow_run.start_workflow", return_value="wf_live"
                 ) as start:
                     result = _call_tool(
-                        service, "workflow_start", {"name": "n", "script": "result = 1"}
+                        service, "workflow_start", {"name": "n", "script": "result = 1"}, {}
                     )
                 self.assertEqual(result, {"run_id": "wf_live"})
                 start.assert_called_once_with(
