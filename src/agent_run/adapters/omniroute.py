@@ -37,8 +37,10 @@ copy ``~/.omniroute/storage.sqlite`` is a stale pre-docker snapshot).
 from __future__ import annotations
 
 import json
+import logging
 import math
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -51,6 +53,31 @@ DOCKER = Path("/Users/pluto/.orbstack/bin/docker")
 CONTAINER = "omniroute"
 PROVIDER = "opencode-go"
 LIMITS_STALE_SECONDS = 900
+#: How long to wait before retrying a first failed quota read.
+_DOCKER_RETRY_DELAY_SECONDS = 2.0
+#: Bound on the stderr fragment carried into a failure log line.
+_DOCKER_ERROR_TAIL_CHARS = 200
+
+#: Warnings about unreadable quota sources surface on the capacity logger, so
+#: a flaky collection tick is diagnosable next to the collect log lines.
+_logger = logging.getLogger("agent_run.capacity")
+
+
+def _bounded_error_tail(stderr: object) -> str:
+    """Collapse a child's stderr into one bounded line for failure logs.
+
+    Accepts the ``stderr`` of a ``subprocess.CompletedProcess`` or of a
+    ``subprocess.TimeoutExpired``, or ``None`` when the child never ran or
+    produced nothing. Returns at most ``_DOCKER_ERROR_TAIL_CHARS`` characters
+    with all whitespace flattened to single spaces, so the result never
+    contains a newline; returns ``""`` when there is nothing to report.
+    """
+
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if not isinstance(stderr, str) or not stderr:
+        return ""
+    return " ".join(stderr.split())[:_DOCKER_ERROR_TAIL_CHARS]
 #: OmniRoute's window keys in this runtime's vocabulary. A key absent here is
 #: one we have never seen and cannot name, so it is not reported.
 WINDOWS = MappingProxyType(
@@ -96,7 +123,44 @@ def _timestamp(value: object) -> datetime | None:
 
 
 def _docker_rows() -> list | None:
-    """Read the snapshot rows from the container; any failure is no evidence."""
+    """Read the snapshot rows from the container; any failure is no evidence.
+
+    The in-container read is flaky in place -- one tick returns three samples,
+    the next returns none -- so a first failure is retried once after a short
+    delay. A second failure still yields ``None``, which callers read as "no
+    evidence" rather than "empty pool", but it is logged as a warning naming
+    the failure kind: a lane that silently reports zero samples is
+    indistinguishable from a healthy one from the outside.
+
+    Returns the parsed row list on success (possibly empty), or ``None`` when
+    the source could not be read. The success path stays silent.
+    """
+
+    kind, stderr = "", None
+    for attempt in (0, 1):
+        kind, stderr, rows = _docker_rows_once()
+        if rows is not None:
+            return rows
+        if attempt == 0:
+            time.sleep(_DOCKER_RETRY_DELAY_SECONDS)
+    _logger.warning(
+        "omniroute quota rows unavailable kind=%s stderr=%s",
+        kind,
+        _bounded_error_tail(stderr),
+    )
+    return None
+
+
+def _docker_rows_once() -> tuple[str, object, list | None]:
+    """One docker exec attempt against the container's quota store.
+
+    Returns a ``(kind, stderr, rows)`` triple. On failure ``rows`` is ``None``
+    and ``kind`` names what went wrong -- ``"timeout"``, ``"os_error"``,
+    ``"exit_code"``, ``"unparseable"`` or ``"not_a_list"`` -- with ``stderr``
+    carrying the child's raw stderr for the caller to log. On success ``kind``
+    is ``""`` and ``rows`` is the parsed list, which may legitimately be
+    empty.
+    """
 
     try:
         result = subprocess.run(
@@ -106,15 +170,19 @@ def _docker_rows() -> list | None:
             timeout=10.0,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    except subprocess.TimeoutExpired as error:
+        return "timeout", getattr(error, "stderr", None), None
+    except OSError:
+        return "os_error", None, None
     if result.returncode != 0:
-        return None
+        return "exit_code", result.stderr, None
     try:
         rows = json.loads(result.stdout)
     except ValueError:
-        return None
-    return rows if isinstance(rows, list) else None
+        return "unparseable", result.stderr, None
+    if not isinstance(rows, list):
+        return "not_a_list", result.stderr, None
+    return "", result.stderr, rows
 
 
 def pool_samples(

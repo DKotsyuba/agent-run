@@ -28,8 +28,31 @@ Loader = Callable[[str, RuntimeConfig], RuntimeAdapter]
 
 _CODEXBAR_PROVIDERS = {"codex": "codex", "claude": "claude", "glm": "zai"}
 _CODEXBAR_VALID_FOR_SECONDS = 900
-_CODEXBAR_TIMEOUT_SECONDS = 60
+#: 60s was not enough for the claude provider, which timed out on every tick
+#: for hours while codex/glm answered in time -- the lane went blind on one
+#: slow child. 120s keeps the tick well under the 900s validity window.
+_CODEXBAR_TIMEOUT_SECONDS = 120
+#: Bound on the stderr fragment carried into a failure log line, so a chatty
+#: child cannot flood the log during a burst of failed ticks.
+_ERROR_TAIL_CHARS = 200
 _CODEXBAR_LANES = ("primary", "secondary", "tertiary")
+
+
+def _bounded_error_tail(stderr: object) -> str:
+    """Collapse a child's stderr into one bounded line for failure logs.
+
+    Accepts the ``stderr`` of a ``subprocess.CompletedProcess`` or of a
+    ``subprocess.TimeoutExpired``, or ``None`` when the child never ran or
+    produced nothing. Returns at most ``_ERROR_TAIL_CHARS`` characters with
+    all whitespace flattened to single spaces, so the result never contains a
+    newline; returns ``""`` when there is nothing to report.
+    """
+
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if not isinstance(stderr, str) or not stderr:
+        return ""
+    return " ".join(stderr.split())[:_ERROR_TAIL_CHARS]
 
 
 def _timestamp(value: object) -> datetime | None:
@@ -65,15 +88,29 @@ def _codexbar_samples(name: str, capacity: CapacityConfig) -> tuple[LimitSample,
     try:
         result = _run_codexbar(argv)
     except (OSError, subprocess.TimeoutExpired) as error:
-        _logger.warning("codexbar runtime=%s failed: %s", name, type(error).__name__)
+        _logger.warning(
+            "codexbar runtime=%s failed: %s stderr=%s",
+            name,
+            type(error).__name__,
+            _bounded_error_tail(getattr(error, "stderr", None)),
+        )
         return ()
     if result.returncode != 0:
-        _logger.warning("codexbar runtime=%s rc=%d", name, result.returncode)
+        _logger.warning(
+            "codexbar runtime=%s rc=%d stderr=%s",
+            name,
+            result.returncode,
+            _bounded_error_tail(result.stderr),
+        )
         return ()
     try:
         payload = json.loads(result.stdout)
     except ValueError:
-        _logger.warning("codexbar runtime=%s unparseable stdout", name)
+        _logger.warning(
+            "codexbar runtime=%s unparseable stdout stderr=%s",
+            name,
+            _bounded_error_tail(result.stderr),
+        )
         return ()
     if not isinstance(payload, list) or not payload:
         _logger.warning("codexbar runtime=%s returned no account entries", name)

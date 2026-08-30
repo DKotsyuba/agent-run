@@ -30,6 +30,17 @@ _MARKERS = {
     "qwen": ".qwen/settings.json",
     "glm": "settings.json",
 }
+#: Runtimes whose environment auth also has a macOS keychain item the adapter
+#: falls back to when the variable is unset. Maps the config runtime name to
+#: the ``(service, account)`` pair the item is stored under. Without this
+#: probe, doctor checks only ``os.environ`` and reports a keychain-backed
+#: runtime as unauthenticated.
+KEYCHAIN_FALLBACKS = {
+    "qwen": ("com.pluto.agent-run.opencode.omniroute", "OMNIROUTE_API_KEY"),
+    "glm": ("com.pluto.agent-run.glm", "GLM_CODING_KEY"),
+}
+#: Bound on the keychain probe so a hung ``security`` call cannot stall doctor.
+_KEYCHAIN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +161,7 @@ def _configuration(
                 _add(findings, "runtime_home_stale", "warning", component, str(marker))
         _skills(root, name, runtime, findings)
         _hooks(runtime, component, trusted, findings)
-        _auth(runtime, component, findings)
+        _auth(name, runtime, component, findings)
 
 
 def _skills(root: Path, name: str, runtime: RuntimeConfig, findings) -> None:
@@ -170,12 +181,21 @@ def _hooks(runtime: RuntimeConfig, component: str, trusted, findings) -> None:
             _add(findings, "hook_untrusted", "warning", item, str(command))
 
 
-def _auth(runtime: RuntimeConfig, component: str, findings) -> None:
+def _auth(name: str, runtime: RuntimeConfig, component: str, findings) -> None:
+    """Check one runtime's auth wiring and record what is missing.
+
+    ``name`` is the config runtime key (e.g. ``"qwen"``), used to look up a
+    keychain fallback. Environment auth is satisfied by any of ``auth.names``
+    being set, or by the runtime's fallback keychain item resolving; bridge
+    auth is checked as a source file plus a symlink into the runtime home.
+    Emits no finding when auth is configured and present.
+    """
+
     auth = runtime.auth
     if auth is None:
         return
     if auth.kind == "environment":
-        if not any(name in os.environ for name in auth.names):
+        if not any(n in os.environ for n in auth.names) and not _keychain_present(name):
             _add(findings, "auth_environment_missing", "warning", component, ",".join(auth.names))
         return
     if auth.source is None or auth.target is None:
@@ -188,6 +208,42 @@ def _auth(runtime: RuntimeConfig, component: str, findings) -> None:
         _add(findings, "auth_bridge_missing", "error", component, str(bridge))
     elif bridge.resolve(strict=False) != auth.source.resolve(strict=False):
         _add(findings, "auth_bridge_mismatch", "error", component, str(bridge))
+
+
+def _keychain_present(name: str) -> bool:
+    """Whether the runtime's fallback keychain item exists and is readable.
+
+    Probes ``security find-generic-password -s SERVICE -a ACCOUNT -w`` for the
+    ``(service, account)`` pair registered in ``KEYCHAIN_FALLBACKS``. The
+    secret is read only so that a resolvable item exits zero; the value is
+    discarded immediately and never logged, returned, or stored. Any failure
+    -- nonzero exit, missing binary, timeout, or ``OSError`` -- counts as
+    "not present", so a broken probe never suppresses a real warning. Returns
+    ``False`` for runtimes with no fallback entry.
+    """
+
+    fallback = KEYCHAIN_FALLBACKS.get(name)
+    if fallback is None:
+        return False
+    service, account = fallback
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                service,
+                "-a",
+                account,
+                "-w",
+            ],
+            capture_output=True,
+            timeout=_KEYCHAIN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _capacity(config: Config, rows, at: float, findings) -> None:

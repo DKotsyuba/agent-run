@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1646,6 +1647,51 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
         self.assertEqual(pool_samples(self.fresh, fetch_rows=lambda: None), ())
         self.assertEqual(pool_samples(self.fresh, fetch_rows=lambda: "oops"), ())
         self.assertEqual(pool_samples(self.fresh, fetch_rows=lambda: []), ())
+
+    def test_a_first_failed_quota_read_is_retried_once_and_stays_silent(self):
+        # The docker exec is flaky in place; a single failure must not log,
+        # because a warning per flake would drown the real outages.
+        failing = subprocess.CompletedProcess([], 1, stdout="", stderr="transient")
+        recovered = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        with mock.patch.object(
+            omniroute.subprocess, "run", side_effect=[failing, recovered]
+        ), mock.patch.object(omniroute.time, "sleep") as slept, self.assertNoLogs(
+            "agent_run.capacity", level="WARNING"
+        ):
+            self.assertEqual(omniroute._docker_rows(), [])
+        self.assertEqual(slept.call_count, 1)
+        slept.assert_called_once_with(omniroute._DOCKER_RETRY_DELAY_SECONDS)
+
+    def test_a_successful_quota_read_is_silent_and_runs_once(self):
+        good = subprocess.CompletedProcess([], 0, stdout="[]", stderr="")
+        with mock.patch.object(
+            omniroute.subprocess, "run", return_value=good
+        ) as run, mock.patch.object(
+            omniroute.time, "sleep"
+        ) as slept, self.assertNoLogs(
+            "agent_run.capacity", level="WARNING"
+        ):
+            self.assertEqual(omniroute._docker_rows(), [])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(slept.call_count, 0)
+
+    def test_a_repeatedly_failing_quota_read_warns_with_kind_and_tail(self):
+        failing = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="docker: no such container\nfurther noise"
+        )
+        with mock.patch.object(
+            omniroute.subprocess, "run", return_value=failing
+        ), mock.patch.object(
+            omniroute.time, "sleep"
+        ), self.assertLogs(
+            "agent_run.capacity", level="WARNING"
+        ) as logs:
+            self.assertIsNone(omniroute._docker_rows())
+        self.assertEqual(len(logs.output), 1)
+        message = logs.output[0]
+        self.assertIn("kind=exit_code", message)
+        self.assertIn("stderr=docker: no such container further noise", message)
+        self.assertNotIn("\n", message)
 
     def test_limits_reads_the_omniroute_store_and_never_the_runtime_home(self):
         with mock.patch.object(omniroute, "_docker_rows", lambda: list(_REAL_ROWS)):

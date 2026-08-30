@@ -45,9 +45,10 @@ class FakeAdapter:
 
 
 class Completed:
-    def __init__(self, stdout, returncode=0):
+    def __init__(self, stdout, returncode=0, stderr=""):
         self.stdout = stdout
         self.returncode = returncode
+        self.stderr = stderr
 
 
 _CODEXBAR_PAYLOAD = [
@@ -217,6 +218,37 @@ class CodexbarMappingTests(unittest.TestCase):
             ):
                 result = self.collect(stdout)
                 self.assertEqual(result, ())
+
+    def test_codexbar_timeout_allows_two_minutes(self) -> None:
+        # 60s timed the claude provider out on every tick for hours; 120s
+        # clears it while staying far under the 900s validity window.
+        self.assertEqual(sources._CODEXBAR_TIMEOUT_SECONDS, 120)
+
+    def test_bounded_error_tail_collapses_to_one_bounded_line(self) -> None:
+        noisy = "first line\nsecond line " + "x" * 400
+        tail = sources._bounded_error_tail(noisy)
+        self.assertEqual(tail, " ".join(noisy.split())[:200])
+        self.assertEqual(len(tail), 200)
+        self.assertNotIn("\n", tail)
+        self.assertEqual(sources._bounded_error_tail(None), "")
+        self.assertEqual(sources._bounded_error_tail(b"raw bytes\n"), "raw bytes")
+
+    def test_failure_warning_carries_the_bounded_stderr_tail(self) -> None:
+        noisy = "provider exploded\n" + "x" * 400
+        failed = Completed("[]", returncode=1, stderr=noisy)
+        with mock.patch.object(
+            sources, "_run_codexbar", return_value=failed
+        ), self.assertLogs("agent_run.capacity", level="WARNING") as logs:
+            result = sources.collect_samples(
+                "claude", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
+            )
+        self.assertEqual(result, ())
+        self.assertEqual(len(logs.output), 1)
+        message = logs.output[0]
+        self.assertIn("runtime=claude", message)
+        self.assertIn("rc=1", message)
+        self.assertIn("stderr=provider exploded", message)
+        self.assertNotIn("\n", message)
 
 
 if __name__ == "__main__":
