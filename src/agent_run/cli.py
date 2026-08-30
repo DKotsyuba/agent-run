@@ -34,6 +34,7 @@ from .logging_setup import configure_logging
 from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
+from .wait import DEFAULT_POLL_SECONDS, wait_for_agent, wait_for_workflow
 
 _logger = logging.getLogger("agent_run.cli")
 
@@ -59,6 +60,19 @@ def _session(parser: argparse.ArgumentParser, *, required: bool = False) -> None
     parser.add_argument("--session-transport", required=required)
     parser.add_argument("--session-id", required=required)
     parser.add_argument("--session-turn-id")
+
+
+def _wait_options(parser: argparse.ArgumentParser) -> None:
+    """Add the shared ``wait`` polling options to a subcommand parser.
+
+    ``--timeout`` is the watcher budget in seconds, where ``0`` (the default)
+    waits forever because the run's own ``timeout_seconds`` bounds it;
+    ``--poll`` is the seconds between polls, defaulting to the wait module's
+    ``DEFAULT_POLL_SECONDS``.
+    """
+
+    parser.add_argument("--timeout", type=float, default=0.0)
+    parser.add_argument("--poll", type=float, default=DEFAULT_POLL_SECONDS)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -87,6 +101,10 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("cancel", "status", "answer"):
         command = commands.add_parser(name)
         command.add_argument("agent_id")
+
+    agent_wait = commands.add_parser("wait")
+    agent_wait.add_argument("agent_id")
+    _wait_options(agent_wait)
 
     steer = commands.add_parser("steer")
     steer.add_argument("agent_id")
@@ -180,6 +198,9 @@ def _parser() -> argparse.ArgumentParser:
 
     for workflow_name in ("status", "cancel", "answer"):
         workflow.add_parser(workflow_name).add_argument("run_id")
+    workflow_wait = workflow.add_parser("wait")
+    workflow_wait.add_argument("run_id")
+    _wait_options(workflow_wait)
     return parser
 
 
@@ -445,6 +466,32 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     if command == "doctor":
         return service.doctor()
     raise AgentRunError(f"unsupported command: {command}")
+
+
+def _wait_command(
+    args: argparse.Namespace, service, stdout: TextIO, stderr: TextIO
+) -> int:
+    """Run a blocking ``wait`` verb and return its status-coded exit.
+
+    The polling loop lives in :mod:`agent_run.wait`; this only hands it the
+    parsed arguments and owns the process-visible side effects: the terminal
+    payload goes to stdout, and when the watcher gives up the current status
+    payload is joined by a one-line note on stderr.
+    """
+
+    outcome = (
+        wait_for_workflow(
+            service, args.run_id, timeout=args.timeout, poll=args.poll
+        )
+        if args.command == "workflow"
+        else wait_for_agent(
+            service, args.agent_id, timeout=args.timeout, poll=args.poll
+        )
+    )
+    _emit(outcome.payload, stdout)
+    if outcome.note is not None:
+        stderr.write(f"{outcome.note}\n")
+    return outcome.exit_code
 
 
 def _jsonable(value):
@@ -826,6 +873,17 @@ def main(
                     (time.monotonic() - started) * 1000,
                 )
                 return returned if isinstance(returned, int) else 0
+            if args.command == "wait" or (
+                args.command == "workflow" and args.workflow_command == "wait"
+            ):
+                # A wait verb exits with the run's own terminal code, so it
+                # returns here instead of through the always-successful emit.
+                code = _wait_command(args, target, stdout, stderr)
+                _logger.info(
+                    "cli command=%s outcome=ok duration_ms=%.1f",
+                    args.command, (time.monotonic() - started) * 1000,
+                )
+                return code
             result = _execute(args, target, stdin)
         _emit(result, stdout)
         _logger.info(
