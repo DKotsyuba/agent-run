@@ -40,23 +40,28 @@ _MODEL_ENV_NAME = "ANTHROPIC_MODEL"
 
 
 def _glm_environment() -> dict[str, str]:
-    """Resolve the GLM auth pair: process env wins, then keychain/default.
+    """Resolve the GLM auth pair: keychain first, the plan endpoint always.
 
-    The token falls back to the managed Keychain entry; the base URL falls
-    back to the plan's Anthropic endpoint. A missing token from both is a
-    hard validation failure, never a silent unauthenticated launch.
+    The orchestrator's own process environment is NOT a source here: Claude
+    Code exports ANTHROPIC_BASE_URL (api.anthropic.com) into every shell it
+    runs, and an inherited ANTHROPIC_AUTH_TOKEN would be the orchestrator's
+    Anthropic credential — either inherited value silently points the GLM
+    child at the wrong provider (proven live 2026-08-30: the plan key was
+    sent to api.anthropic.com → 401). The keychain entry is the identity of
+    this runtime; env is only a last-resort fallback when the keychain has
+    nothing. The base URL is the plan endpoint, full stop.
     """
 
-    token = os.environ.get(_TOKEN_ENV_NAME) or keychain_glm_key()
+    token = keychain_glm_key() or os.environ.get(_TOKEN_ENV_NAME)
     if not token:
         raise ValidationError(
-            "glm requires ANTHROPIC_AUTH_TOKEN in the process environment or "
-            "the macOS Keychain entry 'com.pluto.agent-run.glm' (account "
-            "GLM_CODING_KEY)"
+            "glm requires the macOS Keychain entry 'com.pluto.agent-run.glm' "
+            "(account GLM_CODING_KEY) or ANTHROPIC_AUTH_TOKEN in the process "
+            "environment"
         )
     return {
         _TOKEN_ENV_NAME: token,
-        _BASE_URL_ENV_NAME: os.environ.get(_BASE_URL_ENV_NAME) or DEFAULT_BASE_URL,
+        _BASE_URL_ENV_NAME: DEFAULT_BASE_URL,
     }
 
 
