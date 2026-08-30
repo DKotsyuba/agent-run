@@ -27,6 +27,13 @@ _logger = logging.getLogger("agent_run.capacity")
 Loader = Callable[[str, RuntimeConfig], RuntimeAdapter]
 
 _CODEXBAR_PROVIDERS = {"codex": "codex", "claude": "claude", "glm": "zai"}
+#: Extra codexbar arguments per RUNTIME. The claude provider's default "auto"
+#: source reads browser cookies, which hangs past any timeout in the launchd
+#: collector context (measured 30.08: 6 successful ticks out of 163 at 120s,
+#: empty stderr) while the same call from an interactive shell finishes in
+#: 11-54s. "--source cli" reads the local Claude CLI credentials instead:
+#: deterministic, no cookie access, ~11s from any context.
+_CODEXBAR_EXTRA_ARGS = {"claude": ("--source", "cli")}
 _CODEXBAR_VALID_FOR_SECONDS = 900
 #: 60s was not enough for the claude provider, which timed out on every tick
 #: for hours while codex/glm answered in time -- the lane went blind on one
@@ -85,6 +92,7 @@ def _codexbar_samples(name: str, capacity: CapacityConfig) -> tuple[LimitSample,
         _logger.warning("codexbar source has no provider for runtime=%s", name)
         return ()
     argv = [str(capacity.codexbar_binary), "usage", "--provider", provider, "--json"]
+    argv += _CODEXBAR_EXTRA_ARGS.get(name, ())
     try:
         result = _run_codexbar(argv)
     except (OSError, subprocess.TimeoutExpired) as error:
