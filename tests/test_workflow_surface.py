@@ -61,6 +61,12 @@ class _WorkflowService:
         self.calls.append(("status", run_id))
         return {"status": "running"}
 
+    def workflow_resume(self, run_id: str) -> dict[str, str]:
+        """Record a replay request and return the stable run identifier."""
+
+        self.calls.append(("resume", run_id))
+        return {"run_id": run_id}
+
     def workflow_cancel(self, run_id: str) -> dict[str, object]:
         """Record a cancellation request and report it accepted."""
 
@@ -77,30 +83,30 @@ class _WorkflowService:
 class WorkflowSurfaceTests(unittest.TestCase):
     """Exercise workflow visibility and its independent delivery channel."""
 
-    def test_mcp_has_fifteen_schema_backed_tools_and_dispatches_all_workflow_verbs(self) -> None:
-        """Expose exactly fifteen tools and decode each workflow request."""
+    def test_mcp_has_resume_schema_and_dispatches_all_workflow_verbs(self) -> None:
+        """Expose exactly seventeen tools and decode each workflow request."""
 
-        self.assertEqual(len(_TOOLS), 16)
+        self.assertEqual(len(_TOOLS), 17)
         self.assertTrue(all(tool.get("inputSchema", {}).get("type") == "object" for tool in _TOOLS))
         service = _WorkflowService()
         self.assertEqual(_call_tool(service, "workflow_start", {"name": "n", "script": "result = 7"}, {}),
                          {"run_id": "wf_test"})
-        for name in ("workflow_status", "workflow_cancel", "workflow_answer"):
+        for name in ("workflow_status", "workflow_resume", "workflow_cancel", "workflow_answer"):
             _call_tool(service, name, {"run_id": "wf_test"}, {})
         with self.assertRaises(ValidationError):
             _call_tool(service, "workflow_status", {"run_id": "wf_test", "extra": True}, {})
 
-    def test_cli_parses_and_dispatches_the_four_workflow_verbs(self) -> None:
-        """Mirror workflow start, status, cancel, and answer in the CLI."""
+    def test_cli_parses_and_dispatches_the_five_workflow_verbs(self) -> None:
+        """Mirror workflow start, status, resume, cancel, and answer in the CLI."""
 
         service = _WorkflowService()
         start = _parser().parse_args(["workflow", "start", "name", "result = args['x']",
                                       "--args", json.dumps({"x": 7})])
         self.assertEqual(_execute(start, service, StringIO()), {"run_id": "wf_test"})
-        for verb in ("status", "cancel", "answer"):
+        for verb in ("status", "resume", "cancel", "answer"):
             args = _parser().parse_args(["workflow", verb, "wf_test"])
             _execute(args, service, StringIO())
-        self.assertEqual([call[0] for call in service.calls], ["start", "status", "cancel", "answer"])
+        self.assertEqual([call[0] for call in service.calls], ["start", "status", "resume", "cancel", "answer"])
 
     def test_cli_batch_generates_flat_parallel_workflow(self) -> None:
         """Validate batch shape, embed each task, and reuse workflow start."""
@@ -216,6 +222,45 @@ class WorkflowSurfaceTests(unittest.TestCase):
                 start.assert_called_once_with(
                     service._home, "n", {"script": "result = 1"}, orchestrator=None
                 )
+            finally:
+                store.close()
+
+    def test_facade_resume_only_relaunches_failed_and_lost_runs(self) -> None:
+        """Resume failed and lost journals, refusing every other known state."""
+
+        from agent_run import workflow_facade
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                for status in ("failed", "lost"):
+                    run_id = store.create_workflow_run(status, "sha", plan=[])
+                    store.start_workflow_run(run_id)
+                    store.finish_workflow_run(run_id, status)
+                    with patch("agent_run.workflow_run.resume_workflow", return_value=run_id) as resume:
+                        self.assertEqual(
+                            workflow_facade.workflow_resume(directory, store, run_id),
+                            {"run_id": run_id},
+                        )
+                    resume.assert_called_once_with(directory, run_id)
+
+                for status in ("succeeded", "cancelled"):
+                    run_id = store.create_workflow_run(status, "sha", plan=[])
+                    store.start_workflow_run(run_id)
+                    store.finish_workflow_run(run_id, status)
+                    with self.assertRaisesRegex(ValidationError, status):
+                        workflow_facade.workflow_resume(directory, store, run_id)
+
+                running = store.create_workflow_run("running", "sha", plan=[])
+                store.start_workflow_run(running)
+                with self.assertRaisesRegex(ValidationError, "running"):
+                    workflow_facade.workflow_resume(directory, store, running)
+
+                with self.assertRaises(Exception) as status_error:
+                    workflow_facade.workflow_status(store, "wf_unknown")
+                with self.assertRaises(type(status_error.exception)) as resume_error:
+                    workflow_facade.workflow_resume(directory, store, "wf_unknown")
+                self.assertEqual(str(resume_error.exception), str(status_error.exception))
             finally:
                 store.close()
 

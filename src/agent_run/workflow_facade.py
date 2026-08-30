@@ -48,6 +48,29 @@ def workflow_start(
     }
 
 
+def workflow_resume(
+    home: str | Path, store: StateStore, run_id: str
+) -> dict[str, str]:
+    """Relaunch a failed or lost workflow from its durable journal.
+
+    ``home`` identifies the agent-run installation used by the detached runner
+    and ``store`` is its already-open journal store. ``run_id`` must name a
+    run in ``failed`` or ``lost`` state; unknown ids raise exactly as
+    :func:`workflow_status` does, while all other states are refused. Returns
+    the original run id once the replay runner is ready, preserving cached
+    successful steps under that id.
+    """
+
+    from .errors import ValidationError
+    from .workflow_run import resume_workflow
+
+    run = workflow_status(store, run_id)["run"]
+    status = run["status"]
+    if status not in {"failed", "lost"}:
+        raise ValidationError(f"workflow run cannot be resumed from status: {status}")
+    return {"run_id": resume_workflow(home, run_id)}
+
+
 def workflow_status(store: StateStore, run_id: str) -> dict[str, object]:
     """Return the durable journal summary for one workflow run.
 

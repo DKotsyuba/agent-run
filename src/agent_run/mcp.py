@@ -170,6 +170,8 @@ _TOOLS += (
      "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
     {"name": "workflow_answer", "description": "Read one terminal workflow result.",
      "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
+    {"name": "workflow_resume", "description": "Resume one failed or lost workflow.",
+     "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
 )
 
 _TOOL_NAMES = frozenset(tool["name"] for tool in _TOOLS)
@@ -324,6 +326,9 @@ def _call_tool(service: AgentService, name: str, raw: dict, fast_modes: dict[str
             _string(args, "name"), _string(args, "script"), values,
             _optional_orchestrator(args.get("orchestrator")),
         )
+    if name == "workflow_resume":
+        args = _arguments(raw, {"run_id"}, {"run_id"})
+        return service.workflow_resume(_string(args, "run_id"))
     if name in {"workflow_status", "workflow_cancel", "workflow_answer"}:
         args = _arguments(raw, {"run_id"}, {"run_id"})
         return {

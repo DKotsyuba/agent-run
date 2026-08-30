@@ -203,7 +203,7 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--file", required=True)
     batch.add_argument("--name", default="batch")
 
-    for workflow_name in ("status", "cancel", "answer"):
+    for workflow_name in ("status", "resume", "cancel", "answer"):
         workflow.add_parser(workflow_name).add_argument("run_id")
     workflow_wait = workflow.add_parser("wait")
     workflow_wait.add_argument("run_id")
@@ -415,6 +415,7 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
             )
         return {
             "status": service.workflow_status,
+            "resume": service.workflow_resume,
             "cancel": service.workflow_cancel,
             "answer": service.workflow_answer,
         }[args.workflow_command](args.run_id)
@@ -736,6 +737,11 @@ class _Runtime:
         """Return one workflow run's journal summary. Delegates to `AgentService.workflow_status`."""
 
         return self.core.workflow_status(run_id)
+
+    def workflow_resume(self, run_id: str) -> dict[str, str]:
+        """Resume one failed or lost workflow. Delegates to `AgentService.workflow_resume`."""
+
+        return self.core.workflow_resume(run_id)
 
     def workflow_cancel(self, run_id: str) -> dict[str, object]:
         """Request cancellation of a live workflow run. Delegates to `AgentService.workflow_cancel`."""
