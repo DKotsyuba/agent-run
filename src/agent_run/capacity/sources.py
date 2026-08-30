@@ -26,7 +26,7 @@ _logger = logging.getLogger("agent_run.capacity")
 
 Loader = Callable[[str, RuntimeConfig], RuntimeAdapter]
 
-_CODEXBAR_PROVIDERS = {"codex": "codex", "claude": "claude"}
+_CODEXBAR_PROVIDERS = {"codex": "codex", "claude": "claude", "glm": "zai"}
 _CODEXBAR_VALID_FOR_SECONDS = 900
 _CODEXBAR_TIMEOUT_SECONDS = 60
 _CODEXBAR_LANES = ("primary", "secondary", "tertiary")
