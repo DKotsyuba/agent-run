@@ -340,7 +340,14 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(row["failure_kind"], "supervisor_start_failed")
         self.assertEqual(row["failure_text"], "ready failed")
         view = service.get(agent_id)
-        self.assertEqual(view.delivery.state, "waiting_binding")
+        # The start carried no orchestrator session reference, so no notice was
+        # created: nothing could ever bind to deliver it.
+        self.assertEqual(view.delivery.state, "not_created")
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT id FROM deliveries WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+        )
         event = self.store.connection.execute(
             """SELECT kind, data_json FROM events
                WHERE agent_id = ? ORDER BY seq DESC LIMIT 1""",

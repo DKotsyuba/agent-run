@@ -74,16 +74,16 @@ class BindHookTests(unittest.TestCase):
             self.store.get_agent(agent_id)["orchestrator_session_id"], first.session_id
         )
 
-    def test_terminal_before_binding_activates_the_waiting_delivery_exactly_once(self) -> None:
+    def test_bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it(self) -> None:
         agent_id = self.create()
+        # An orchestrator-backed start binds before the agent finishes, so the
+        # notice is created pending rather than waiting for a binding.
+        result = bind(self.store, agent_id, OrchestratorRef(**PAYLOAD), at=1)
         self.finish(agent_id)
-        self.assertEqual(self.deliveries(agent_id)[0]["state"], "waiting_binding")
-
-        result = bind(self.store, agent_id, OrchestratorRef(**PAYLOAD), at=5)
         activated = self.deliveries(agent_id)
         self.assertEqual(len(activated), 1)
         self.assertEqual(activated[0]["state"], "pending")
-        self.assertEqual(activated[0]["next_attempt_at"], 5)
+        self.assertEqual(activated[0]["next_attempt_at"], 4)
 
         # A repeated bind must not resurrect or duplicate an already sent notice.
         claimed = self.store.claim_delivery("worker", at=5)
@@ -93,6 +93,11 @@ class BindHookTests(unittest.TestCase):
         rows = self.deliveries(agent_id)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "delivered")
+
+    def test_unbound_terminal_agent_never_gets_a_notice_row(self) -> None:
+        agent_id = self.create()
+        self.finish(agent_id)
+        self.assertEqual(self.deliveries(agent_id), [])
 
     def test_unbound_running_agent_keeps_running_without_a_delivery(self) -> None:
         agent_id = self.create()

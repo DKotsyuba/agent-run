@@ -410,7 +410,9 @@ class StateStoreTests(unittest.TestCase):
             self.store.list_agents(orchestrator_session_id=" ")
 
     def test_guarded_transitions_attempts_and_atomic_terminal_outbox(self) -> None:
-        agent_id = self.create()
+        agent_id = self.create(
+            self.request(orchestrator=OrchestratorRef("codex_queue", "session", "turn"))
+        )
         attempt_id = self.store.create_attempt(
             agent_id, state="starting", adapter_state={"pid": 7}, at=2
         )
@@ -433,7 +435,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(agent["status"], "succeeded")
         self.assertEqual(agent["finished_at"], 7)
         self.assertEqual(delivery["terminal_event_seq"], event_seq)
-        self.assertEqual(delivery["state"], "waiting_binding")
+        self.assertEqual(delivery["state"], "pending")
         with self.assertRaises(StateTransitionError):
             self.store.transition(agent_id, AgentStatus.RUNNING, at=8)
 

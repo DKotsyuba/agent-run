@@ -434,6 +434,22 @@ class StateStore:
                 data=data,
             )
 
+    def expire_unbound_deliveries(
+        self, *, at: float | None = None,
+        max_age_seconds: float = delivery.BINDING_WINDOW_SECONDS,
+    ) -> list[str]:
+        """Expire never-bound completion deliveries for terminal agents.
+
+        Delegates to :func:`agent_run.state.delivery.expire_unbound_deliveries`
+        and returns the ids it expired, oldest first.  The counterpart of the
+        delivery insert in :meth:`_transition`: it retires the rows that insert
+        can no longer produce and that no bind hook will ever attach to.
+        """
+
+        return delivery.expire_unbound_deliveries(
+            self.connection, at=at, max_age_seconds=max_age_seconds
+        )
+
     def _transition(
         self,
         agent_id: AgentId,
@@ -489,22 +505,19 @@ class StateStore:
             data=data,
         )
         if target in TERMINAL:
+            # A completion notice can only reach a chat through the orchestrator
+            # session that asked for it.  A start with no session reference never
+            # fires a bind hook, so a waiting_binding row here would be rescanned
+            # forever; such an agent is reported with delivery state not_created.
             session_id = agent["orchestrator_session_id"]
-            state = "pending" if session_id is not None else "waiting_binding"
-            self.connection.execute(
-                """INSERT INTO deliveries
-                   (id, agent_id, orchestrator_session_id, terminal_event_seq,
-                    state, next_attempt_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    f"ntf_{uuid.uuid4().hex}",
-                    agent_id,
-                    session_id,
-                    event_seq,
-                    state,
-                    at if session_id is not None else None,
-                ),
-            )
+            if session_id is not None:
+                self.connection.execute(
+                    """INSERT INTO deliveries
+                       (id, agent_id, orchestrator_session_id, terminal_event_seq,
+                        state, next_attempt_at)
+                       VALUES (?, ?, ?, ?, 'pending', ?)""",
+                    (f"ntf_{uuid.uuid4().hex}", agent_id, session_id, event_seq, at),
+                )
         return event_seq
 
     def reconcile(

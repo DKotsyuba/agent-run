@@ -156,6 +156,13 @@ class DeliveryDispatcher:
 
         if max_batch < 1:
             raise ValidationError("max_batch must be at least 1")
+        # Retire the notices that can never be dispatched before claiming
+        # anything, so a backlog of them cannot crowd out live work.
+        for delivery_id in self._store.expire_unbound_deliveries(at=at):
+            _logger.info(
+                "dispatch expired delivery_id=%s reason=binding_window_elapsed",
+                delivery_id,
+            )
         claimed = delivered = retried = failed = ambiguous = claim_lost = 0
         while claimed < max_batch:
             row = self._store.claim_delivery(

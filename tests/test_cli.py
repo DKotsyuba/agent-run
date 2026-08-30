@@ -685,12 +685,6 @@ class CliTests(unittest.TestCase):
             )
             store.transition(agent_id, AgentStatus.STARTING, at=2)
             store.transition(agent_id, AgentStatus.RUNNING, at=3)
-            store.transition(
-                agent_id,
-                AgentStatus.SUCCEEDED,
-                outcome=Outcome(AgentStatus.SUCCEEDED),
-                at=4,
-            )
             store.close()
             runtime = object.__new__(cli._Runtime)
             runtime.home = home
@@ -738,6 +732,8 @@ class CliTests(unittest.TestCase):
                     "structuredContent": {"agent_id": agent_id},
                 },
             }
+            # The bind hook fires while the agent is still running, so the
+            # terminal transition below creates a deliverable pending notice.
             with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
                 code, output, error = self.run_cli(
                     ["--home", str(home), "hook", "bind"],
@@ -766,6 +762,16 @@ class CliTests(unittest.TestCase):
             self.assertIn(agent_id, bind_output["additionalContext"])
             self.assertIn("completion will be delivered", bind_output["additionalContext"])
 
+            store = cli.StateStore.open(home / "state.db")
+            try:
+                store.transition(
+                    agent_id,
+                    AgentStatus.SUCCEEDED,
+                    outcome=Outcome(AgentStatus.SUCCEEDED),
+                    at=4,
+                )
+            finally:
+                store.close()
             check_store = cli.StateStore.open(home / "state.db")
             try:
                 session = check_store.connection.execute(
@@ -1047,15 +1053,11 @@ class CliTests(unittest.TestCase):
             )
             store.transition(agent_id, AgentStatus.STARTING, at=2)
             store.transition(agent_id, AgentStatus.RUNNING, at=3)
-            store.transition(
-                agent_id,
-                AgentStatus.SUCCEEDED,
-                outcome=Outcome(AgentStatus.SUCCEEDED),
-                at=4,
-            )
             store.close()
             runtime = object.__new__(cli._Runtime)
             runtime.home = home
+            # The bind hook fires while the agent is still running, so the
+            # terminal transition below creates a deliverable pending notice.
             code, _output, error = self.run_cli(
                 [
                     "--home", str(home), "hook", "bind",
@@ -1073,6 +1075,16 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual((code, error), (0, ""))
 
+            store = cli.StateStore.open(home / "state.db")
+            try:
+                store.transition(
+                    agent_id,
+                    AgentStatus.SUCCEEDED,
+                    outcome=Outcome(AgentStatus.SUCCEEDED),
+                    at=4,
+                )
+            finally:
+                store.close()
             check_store = cli.StateStore.open(home / "state.db")
             try:
                 session = check_store.connection.execute(

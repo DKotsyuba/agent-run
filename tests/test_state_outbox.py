@@ -69,6 +69,11 @@ class StateOutboxTests(unittest.TestCase):
         return mock.patch.multiple("os", kill=refuse, killpg=refuse)
 
     def finish(self, agent_id) -> None:
+        # An orchestrator-backed start has its session bound before the agent
+        # finishes, so the terminal transition creates a pending notice.
+        self.store.bind_orchestrator(
+            agent_id, OrchestratorRef("codex_queue", "session", "turn"), at=1
+        )
         self.store.transition(agent_id, AgentStatus.STARTING, at=2)
         self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
         self.store.transition(
@@ -84,7 +89,7 @@ class StateOutboxTests(unittest.TestCase):
         delivery = self.store.connection.execute(
             "SELECT * FROM deliveries WHERE agent_id = ?", (agent_id,)
         ).fetchone()
-        self.assertEqual(delivery["state"], "waiting_binding")
+        self.assertEqual(delivery["state"], "pending")
         self.store.bind_orchestrator(
             agent_id, OrchestratorRef("codex_queue", "session", "turn"), at=5
         )
@@ -282,11 +287,12 @@ class StateOutboxTests(unittest.TestCase):
             )
         )
         self.assertEqual(self.store.get_agent(agent_id)["status"], "lost")
-        self.assertEqual(
+        # The agent was started with no orchestrator session reference, so its
+        # terminal transition creates no notice that could never bind.
+        self.assertIsNone(
             self.store.connection.execute(
                 "SELECT state FROM deliveries WHERE agent_id = ?", (agent_id,)
-            ).fetchone()[0],
-            "waiting_binding",
+            ).fetchone()
         )
 
         dead_agent = self.create()
@@ -364,11 +370,12 @@ class StateOutboxTests(unittest.TestCase):
 
         self.assertTrue(reconcile_reaped_agent(self.store, agent_id, 321, at=3))
         self.assertEqual(self.store.get_agent(agent_id)["status"], "lost")
-        self.assertEqual(
+        # Reaped before any orchestrator session was bound: no notice is created,
+        # because nothing could ever bind to deliver it.
+        self.assertIsNone(
             self.store.connection.execute(
                 "SELECT state FROM deliveries WHERE agent_id = ?", (agent_id,)
-            ).fetchone()[0],
-            "waiting_binding",
+            ).fetchone()
         )
         self.assertFalse(reconcile_reaped_agent(self.store, agent_id, 321, at=4))
 
