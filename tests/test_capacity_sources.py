@@ -1,5 +1,7 @@
+import base64
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agent_run.accounts import account_email, account_store_dir
 from agent_run.adapters import omniroute
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
@@ -15,7 +18,7 @@ from agent_run.adapters.base import (
     RuntimeInfo,
 )
 from agent_run.capacity import sources
-from agent_run.config import CapacityConfig, RuntimeConfig
+from agent_run.config import CapacityConfig, RuntimeAuthConfig, RuntimeConfig
 
 
 def _runtime_config(**overrides) -> RuntimeConfig:
@@ -74,6 +77,30 @@ _CODEXBAR_PAYLOAD = [
         "openaiDashboard": "ignored",
     }
 ]
+
+
+def _jwt(email: str | None) -> str:
+    claims = {} if email is None else {"email": email}
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+    return f"header.{payload}.signature"
+
+
+def _auth_file(path: Path, email: str | None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"tokens": {"id_token": _jwt(email)}}))
+
+
+class AccountEmailTests(unittest.TestCase):
+    def test_decodes_email_and_collapses_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth.json"
+            _auth_file(path, "a @b")
+            self.assertEqual(account_email(path), "a @b")
+            self.assertIsNone(account_email(path.with_name("missing.json")))
+            path.write_text("garbage")
+            self.assertIsNone(account_email(path))
+            _auth_file(path, None)
+            self.assertIsNone(account_email(path))
 
 
 class DispatchTests(unittest.TestCase):
@@ -185,6 +212,43 @@ class CodexbarMappingTests(unittest.TestCase):
         self.assertEqual(sample.remaining_percent, 65.0)
         self.assertIsNone(sample.observed_at)
 
+    def test_declared_accounts_map_targets_and_add_all_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            default_auth = home / "default-auth.json"
+            _auth_file(default_auth, "default@example.com")
+            _auth_file(
+                account_store_dir(home, "codex", "personal1") / "auth.json",
+                "personal1@example.com",
+            )
+            _auth_file(
+                account_store_dir(home, "codex", "personal2") / "auth.json",
+                "personal2@example.com",
+            )
+            payload = [
+                {"usage": {"accountEmail": "default@example.com", "primary": {"usedPercent": 3, "windowMinutes": 300}}},
+                {"usage": {"identity": {"accountEmail": "personal2@example.com"}, "primary": {"usedPercent": 4, "windowMinutes": 300}}},
+                {"usage": {"identity": {"accountEmail": "stranger@example.com"}, "primary": {"usedPercent": 5, "windowMinutes": 300}}},
+            ]
+            captured = []
+
+            def run(argv):
+                captured.append(argv)
+                return Completed(json.dumps(payload))
+
+            runtime = _runtime_config(
+                limits_source="codexbar",
+                accounts=("personal1", "personal2"),
+                auth=RuntimeAuthConfig("file_link", source=default_auth, target="auth.json"),
+            )
+            with mock.patch.object(sources, "_run_codexbar", side_effect=run):
+                samples = sources.collect_samples(
+                    "codex", runtime, CapacityConfig(), None, home
+                )
+
+        self.assertEqual([sample.target for sample in samples], [None, "personal2", "stranger@example.com"])
+        self.assertIn("--all-accounts", captured[0])
+
     def test_unknown_window_minutes_names_itself(self) -> None:
         payload = [{"usage": {"primary": {"usedPercent": 80.0, "windowMinutes": 30}}}]
         (sample,) = self.collect(payload)
@@ -218,6 +282,12 @@ class CodexbarMappingTests(unittest.TestCase):
             ):
                 result = self.collect(stdout)
                 self.assertEqual(result, ())
+
+    def test_single_object_payload_still_maps_one_account_without_accounts(self) -> None:
+        payload = {"usage": {"primary": {"usedPercent": 20, "windowMinutes": 300}}}
+        (sample,) = self.collect(payload)
+        self.assertEqual(sample.target, None)
+        self.assertEqual(sample.remaining_percent, 80.0)
 
     def test_codexbar_timeout_allows_two_minutes(self) -> None:
         # 60s timed the claude provider out on every tick for hours; 120s

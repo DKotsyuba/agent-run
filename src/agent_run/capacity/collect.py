@@ -12,6 +12,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 from ..adapters.base import LimitSample, RuntimeAdapter
@@ -92,10 +93,13 @@ def _collect_runtime(
     capacity_config: CapacityConfig,
     load: AdapterLoader,
     started: float,
+    agent_run_home: Path | None,
 ) -> CollectResult:
     count = 0
     try:
-        samples = sources.collect_samples(name, runtime_config, capacity_config, load)
+        samples = sources.collect_samples(
+            name, runtime_config, capacity_config, load, agent_run_home
+        )
         if samples is None:
             _logger.debug("collect runtime=%s status=%s", name, STATUS_UNSUPPORTED)
             return CollectResult(name, STATUS_UNSUPPORTED, 0)
@@ -123,13 +127,16 @@ def collect_once(
     *,
     at: float | None = None,
     loader: AdapterLoader | None = None,
+    agent_run_home: Path | None = None,
 ) -> CollectionReport:
     """Collect one bounded round of samples for every enabled runtime."""
 
     load = loader or _default_loader
     started = time.time() if at is None else at
     results = tuple(
-        _collect_runtime(store, name, runtime_config, config.capacity, load, started)
+        _collect_runtime(
+            store, name, runtime_config, config.capacity, load, started, agent_run_home
+        )
         for name, runtime_config in config.runtimes.items()
         if runtime_config.enabled
     )
