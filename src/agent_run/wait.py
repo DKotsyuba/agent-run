@@ -117,13 +117,17 @@ def _wait_until_terminal(
         code = exit_codes.get(status)
         if code is not None:
             return WaitOutcome(code, payload)
-        if deadline is not None and clock() >= deadline:
-            return WaitOutcome(
-                WATCHER_TIMEOUT_EXIT,
-                payload,
-                f"wait gave up after {timeout:g}s; status is still {status}",
-            )
-        sleep(interval)
+        if deadline is not None:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return WaitOutcome(
+                    WATCHER_TIMEOUT_EXIT,
+                    payload,
+                    f"wait gave up after {timeout:g}s; status is still {status}",
+                )
+            sleep(min(interval, remaining))
+        else:
+            sleep(interval)
 
 
 def wait_for_agent(
