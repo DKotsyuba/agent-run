@@ -723,7 +723,7 @@ class _Runtime:
     def capacity_collect(self):
         config, store = self._inputs()
         try:
-            return collect_once(store, config)
+            return collect_once(store, config, agent_run_home=self.home)
         finally:
             store.close()
 

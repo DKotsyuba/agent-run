@@ -1,6 +1,21 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
+
+
+def account_email(auth_file: Path) -> str | None:
+    try:
+        payload = json.loads(auth_file.read_text())
+        token = payload["tokens"]["id_token"]
+        encoded = token.split(".")[1]
+        encoded += "=" * (-len(encoded) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        email = claims["email"]
+        return email if isinstance(email, str) else None
+    except Exception:
+        return None
 
 
 def account_store_dir(agent_run_home: str | Path, runtime_name: str, label: str) -> Path:

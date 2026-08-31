@@ -16,8 +16,10 @@ import math
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Mapping
 
+from ..accounts import account_auth_source, account_email
 from ..adapters import omniroute
 from ..adapters.base import Capability, LimitSample, RuntimeAdapter
 from ..config import CapacityConfig, RuntimeConfig
@@ -86,12 +88,19 @@ def _run_codexbar(argv: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def _codexbar_samples(name: str, capacity: CapacityConfig) -> tuple[LimitSample, ...]:
+def _codexbar_samples(
+    name: str,
+    capacity: CapacityConfig,
+    runtime_config: RuntimeConfig,
+    agent_run_home: Path | None,
+) -> tuple[LimitSample, ...]:
     provider = _CODEXBAR_PROVIDERS.get(name)
     if provider is None:
         _logger.warning("codexbar source has no provider for runtime=%s", name)
         return ()
     argv = [str(capacity.codexbar_binary), "usage", "--provider", provider, "--json"]
+    if runtime_config.accounts:
+        argv.append("--all-accounts")
     argv += _CODEXBAR_EXTRA_ARGS.get(name, ())
     try:
         result = _run_codexbar(argv)
@@ -120,48 +129,88 @@ def _codexbar_samples(name: str, capacity: CapacityConfig) -> tuple[LimitSample,
             _bounded_error_tail(result.stderr),
         )
         return ()
-    if not isinstance(payload, list) or not payload:
+    if isinstance(payload, Mapping):
+        accounts = [payload]
+    elif isinstance(payload, list):
+        accounts = payload if runtime_config.accounts else payload[:1]
+    else:
+        accounts = []
+    if not accounts:
         _logger.warning("codexbar runtime=%s returned no account entries", name)
         return ()
-    account = payload[0]
-    usage = account.get("usage") if isinstance(account, Mapping) else None
-    if not isinstance(usage, Mapping):
-        _logger.warning("codexbar runtime=%s missing usage object", name)
-        return ()
 
-    observed_at = _timestamp(usage.get("updatedAt"))
+    declared_emails = {}
+    if runtime_config.accounts and agent_run_home is not None:
+        declared_emails = {
+            label: account_email(account_auth_source(agent_run_home, name, label))
+            for label in runtime_config.accounts
+        }
+    default_email = None
+    if (
+        runtime_config.auth is not None
+        and runtime_config.auth.kind == "file_link"
+        and runtime_config.auth.source is not None
+    ):
+        default_email = account_email(runtime_config.auth.source)
+
     samples = []
-    for lane in _CODEXBAR_LANES:
-        window = usage.get(lane)
-        if not isinstance(window, Mapping):
+    for account in accounts:
+        usage = account.get("usage") if isinstance(account, Mapping) else None
+        if not isinstance(usage, Mapping):
+            _logger.warning("codexbar runtime=%s missing usage object", name)
             continue
-        used = window.get("usedPercent")
-        if (
-            isinstance(used, bool)
-            or not isinstance(used, (int, float))
-            or not math.isfinite(used)
-        ):
-            continue
-        minutes = window.get("windowMinutes")
-        label = (
-            "five_hour"
-            if minutes == 300
-            else "seven_day"
-            if minutes == 10080
-            else f"min{minutes}"
-        )
-        samples.append(
-            LimitSample(
-                lane=lane,
-                window=label,
-                remaining_percent=max(0.0, min(100.0, 100.0 - float(used))),
-                reset_at=_timestamp(window.get("resetsAt")),
-                observed_at=observed_at,
-                source="codexbar",
-                target=None,
-                valid_for_seconds=_CODEXBAR_VALID_FOR_SECONDS,
+        identity = usage.get("identity")
+        email = identity.get("accountEmail") if isinstance(identity, Mapping) else None
+        if not isinstance(email, str) or not email:
+            email = usage.get("accountEmail")
+        if not isinstance(email, str) or not email:
+            email = None
+        if not runtime_config.accounts:
+            target = None
+        elif email is None:
+            target = "unknown"
+        elif email == default_email:
+            target = None
+        else:
+            target = next(
+                (label for label, declared_email in declared_emails.items() if declared_email == email),
+                email,
             )
-        )
+
+        observed_at = _timestamp(usage.get("updatedAt"))
+        for lane in _CODEXBAR_LANES:
+            window = usage.get(lane)
+            if not isinstance(window, Mapping):
+                continue
+            used = window.get("usedPercent")
+            if (
+                isinstance(used, bool)
+                or not isinstance(used, (int, float))
+                or not math.isfinite(used)
+            ):
+                continue
+            minutes = window.get("windowMinutes")
+            label = (
+                "five_hour"
+                if minutes == 300
+                else "seven_day"
+                if minutes == 10080
+                else f"min{minutes}"
+            )
+            samples.append(
+                LimitSample(
+                    lane=lane,
+                    window=label,
+                    remaining_percent=max(0.0, min(100.0, 100.0 - float(used))),
+                    reset_at=_timestamp(window.get("resetsAt")),
+                    observed_at=observed_at,
+                    source="codexbar",
+                    target=target,
+                    valid_for_seconds=_CODEXBAR_VALID_FOR_SECONDS,
+                )
+            )
+    if not samples:
+        _logger.warning("codexbar runtime=%s returned no usable windows", name)
     return tuple(samples)
 
 
@@ -170,6 +219,7 @@ def collect_samples(
     runtime_config: RuntimeConfig,
     capacity_config: CapacityConfig,
     load: Loader,
+    agent_run_home: Path | None = None,
 ) -> tuple[LimitSample, ...] | None:
     """Resolve the runtime's configured source; ``None`` is unsupported."""
 
@@ -179,7 +229,7 @@ def collect_samples(
     if source == "omniroute":
         return omniroute.pool_samples(time.time())
     if source == "codexbar":
-        return _codexbar_samples(name, capacity_config)
+        return _codexbar_samples(name, capacity_config, runtime_config, agent_run_home)
 
     adapter = load(name, runtime_config)
     info = adapter.describe()
