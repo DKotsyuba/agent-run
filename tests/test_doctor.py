@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from agent_run import doctor
-from agent_run.config import RuntimeAuthConfig, RuntimeConfig
+from agent_run.config import Config, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.doctor import run_doctor
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.launch_evidence import FAILURE_KIND_EXECUTABLE_MISSING
@@ -293,4 +293,135 @@ class KeychainFallbackAuthTests(unittest.TestCase):
             findings = self._auth_findings("glm", self._runtime())
 
         self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+
+    def test_an_item_without_a_fixed_account_is_probed_by_service_alone(self) -> None:
+        # claude stores its credential with no fixed account, so the probe
+        # must omit -a: an -a lookup of any account name would not resolve it.
+        present = subprocess.CompletedProcess([], 0, stdout="super-secret-value\n", stderr="")
+        with mock.patch.object(doctor.subprocess, "run", return_value=present) as probe:
+            findings = self._auth_findings("claude", self._runtime())
+
+        self.assertEqual([item.code for item in findings], [])
+        self.assertEqual(
+            probe.call_args[0][0],
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
+        )
+        self.assertTrue(
+            all("super-secret-value" not in (item.detail or "") for item in findings)
+        )
+
+    def test_an_item_without_a_fixed_account_keeps_the_warning_when_absent(self) -> None:
+        absent = subprocess.CompletedProcess([], 44, stdout="", stderr="could not be found")
+        with mock.patch.object(doctor.subprocess, "run", return_value=absent):
+            findings = self._auth_findings("claude", self._runtime())
+
+        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
+        self.assertEqual(findings[0].severity, "warning")
+
+
+class HookTrustTests(unittest.TestCase):
+    """A trusted script behind a system interpreter is a trusted hook.
+
+    Rendered hooks run [interpreter, script, ...]; the interpreter is a system
+    path outside the trusted roots by design, so trust is judged from the
+    script argument instead.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name).resolve()
+        self.root = self.home / "install"
+        (self.root / "hooks").mkdir(parents=True)
+
+    def _findings(self, command: tuple[str, ...]) -> list:
+        runtime = RuntimeConfig(
+            enabled=True,
+            adapter="example:ADAPTER",
+            binary=Path("/usr/bin/true"),
+            home=self.home,
+            models=("model",),
+            hooks=(RuntimeHookConfig(event="PostToolUse", command=command),),
+        )
+        findings: list = []
+        trusted = (self.root, (self.root / "standalone" / "current").resolve())
+        doctor._hooks(runtime, "runtime:claude", trusted, findings)
+        return findings
+
+    def _codes(self, command: tuple[str, ...]) -> list:
+        return [item.code for item in self._findings(command)]
+
+    def test_a_script_inside_the_trusted_roots_is_trusted(self) -> None:
+        script = self.root / "hooks" / "context.py"
+        script.write_text("pass\n", encoding="utf-8")
+
+        self.assertEqual(
+            self._codes(("/usr/bin/python3", str(script), "--event", "PostToolUse")),
+            [],
+        )
+
+    def test_a_script_outside_the_trusted_roots_is_untrusted(self) -> None:
+        script = self.home / "outside" / "context.py"
+
+        findings = self._findings(("/usr/bin/python3", str(script)))
+
+        self.assertEqual([item.code for item in findings], ["hook_untrusted"])
+        self.assertEqual(findings[0].severity, "warning")
+        self.assertEqual(findings[0].detail, str(script))
+
+    def test_an_interpreter_without_a_script_stays_untrusted(self) -> None:
+        # No non-flag argument at all.
+        self.assertEqual(
+            self._codes(("/usr/bin/python3",)),
+            ["hook_untrusted"],
+        )
+        # Flags only: the first non-flag word is a shell string, not a path.
+        self.assertEqual(
+            self._codes(("/bin/sh", "-c", "echo hi")),
+            ["hook_untrusted"],
+        )
+        self.assertEqual(
+            [item.detail for item in self._findings(("/bin/sh", "-c", "echo hi"))],
+            ["echo hi"],
+        )
+
+
+class CapacityStalenessTests(unittest.TestCase):
+    """``valid_until`` decides staleness; age is only the fallback bound."""
+
+    @staticmethod
+    def _row(lane: str, observed_at: float, valid_until: float | None) -> dict:
+        return {
+            "runtime": "qwen",
+            "lane": lane,
+            "window": "5h",
+            "target": None,
+            "source": "omniroute",
+            "observed_at": observed_at,
+            "valid_until": valid_until,
+        }
+
+    def _lanes(self, rows: list[dict], at: float = 1_000) -> list[str]:
+        findings: list = []
+        doctor._capacity(Config(schema_version=1), rows, at, findings)
+        return [item.detail.split("/")[0] for item in findings]
+
+    def test_a_sample_still_within_its_validity_is_never_stale(self) -> None:
+        # Older than twice the collection interval, so only valid_until
+        # justifies calling it fresh.
+        self.assertEqual(self._lanes([self._row("fresh", 100, 2_000)]), [])
+
+    def test_an_expired_sample_is_stale_even_when_recently_observed(self) -> None:
+        self.assertEqual(self._lanes([self._row("expired", 999, 500)]), ["expired"])
+
+    def test_a_sample_without_validity_keeps_the_age_bound(self) -> None:
+        rows = [self._row("aged", 100, None), self._row("recent", 900, None)]
+
+        self.assertEqual(self._lanes(rows), ["aged"])
 
