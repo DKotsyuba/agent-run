@@ -14,7 +14,7 @@ from agent_run.delivery.base import DeliveryReceipt
 from agent_run.delivery.workflow_dispatch import WorkflowDeliveryDispatcher
 from agent_run.domain import OrchestratorRef
 from agent_run.errors import ValidationError
-from agent_run.mcp import _TOOLS, _call_tool
+from agent_run.dispatch import TOOLS, Session, call_tool
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
@@ -86,15 +86,16 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_mcp_has_resume_schema_and_dispatches_all_workflow_verbs(self) -> None:
         """Expose exactly seventeen tools and decode each workflow request."""
 
-        self.assertEqual(len(_TOOLS), 17)
-        self.assertTrue(all(tool.get("inputSchema", {}).get("type") == "object" for tool in _TOOLS))
+        self.assertEqual(len(TOOLS), 17)
+        self.assertTrue(all(tool.get("inputSchema", {}).get("type") == "object" for tool in TOOLS))
         service = _WorkflowService()
-        self.assertEqual(_call_tool(service, "workflow_start", {"name": "n", "script": "result = 7"}, {}),
+        session = Session()
+        self.assertEqual(call_tool(service, "workflow_start", {"name": "n", "script": "result = 7"}, session),
                          {"run_id": "wf_test"})
         for name in ("workflow_status", "workflow_resume", "workflow_cancel", "workflow_answer"):
-            _call_tool(service, name, {"run_id": "wf_test"}, {})
+            call_tool(service, name, {"run_id": "wf_test"}, session)
         with self.assertRaises(ValidationError):
-            _call_tool(service, "workflow_status", {"run_id": "wf_test", "extra": True}, {})
+            call_tool(service, "workflow_status", {"run_id": "wf_test", "extra": True}, session)
 
     def test_cli_parses_and_dispatches_the_five_workflow_verbs(self) -> None:
         """Mirror workflow start, status, resume, cancel, and answer in the CLI."""
@@ -181,9 +182,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
         import ast
         import inspect
 
-        from agent_run.mcp import _call_tool
+        from agent_run.dispatch import call_tool
 
-        tree = ast.parse(inspect.getsource(_call_tool))
+        tree = ast.parse(inspect.getsource(call_tool))
         names = sorted({
             node.attr
             for node in ast.walk(tree)
@@ -215,8 +216,8 @@ class WorkflowSurfaceTests(unittest.TestCase):
                 with patch(
                     "agent_run.workflow_run.start_workflow", return_value="wf_live"
                 ) as start:
-                    result = _call_tool(
-                        service, "workflow_start", {"name": "n", "script": "result = 1"}, {}
+                    result = call_tool(
+                        service, "workflow_start", {"name": "n", "script": "result = 1"}, Session()
                     )
                 self.assertEqual(result, {"run_id": "wf_live"})
                 start.assert_called_once_with(
