@@ -29,6 +29,7 @@ _SPEC_KEYS = frozenset(
         "read_roots",
         "timeout_seconds",
         "output_schema",
+        "account",
     }
 )
 _REQUIRED_SPEC_KEYS = frozenset({"runtime", "model", "profile", "task", "workdir"})
@@ -75,6 +76,7 @@ def validate_agent_spec(spec: object) -> StartRequest:
         read_roots=tuple(Path(path) for path in read_roots),
         timeout_seconds=spec.get("timeout_seconds"),  # type: ignore[arg-type]
         output_schema=spec.get("output_schema"),  # type: ignore[arg-type]
+        account=spec.get("account"),  # type: ignore[arg-type]
     )
 
 

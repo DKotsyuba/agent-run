@@ -101,12 +101,14 @@ class WorkflowExecutorTests(unittest.TestCase):
                 read_roots=[str(self.root)],
                 timeout_seconds=2.5,
                 output_schema={"type": "object", "properties": {}},
+                account="personal2",
             )
         )
         self.assertTrue(request.write)
         self.assertEqual(request.read_roots, (self.root.resolve(),))
         self.assertEqual(request.timeout_seconds, 2.5)
         self.assertEqual(request.output_schema, {"type": "object", "properties": {}})
+        self.assertEqual(request.account, "personal2")
         with self.assertRaisesRegex(ValidationError, "unknown keys: extra"):
             validate_agent_spec(self.spec(extra=True))
 
