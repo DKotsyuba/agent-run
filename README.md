@@ -48,13 +48,35 @@ you / your agent / your app
 
 ## Install
 
-Requirements: Python ≥ 3.11, macOS or Linux (keychain-based auth helpers
-are macOS; env-var auth works everywhere), plus the engine CLIs you intend
+Requirements: Python ≥ 3.11, macOS or Linux, plus the engine CLIs you intend
 to drive (`codex`, `claude`, `qwen`, `opencode` — any subset).
 
+| Feature | macOS | Linux |
+|---|---:|---:|
+| Core CLI, MCP, socket API, workflows | yes | yes |
+| Environment/file-based runtime auth | yes | yes |
+| Keychain auth fallback and launchd helpers | yes | no |
+| Optional codexbar / local OmniRoute capacity sources | when installed | when installed |
+
 ```bash
-pip install git+https://github.com/DKotsyuba/agent-run.git
-# or: pipx install / uv tool install, same URL; or clone and `pip install .`
+pipx install \
+  https://github.com/DKotsyuba/agent-run/releases/download/v0.1.0/agent_run-0.1.0-py3-none-any.whl
+# or use the same wheel URL with `python -m pip install` / `uv tool install`
+```
+
+Versioned wheel and source archives are attached to each
+[GitHub Release](https://github.com/DKotsyuba/agent-run/releases). After
+installing, confirm the selected version:
+
+```bash
+python -c 'from importlib.metadata import version; print(version("agent-run"))'
+```
+
+To install a tagged source tree instead of a release artifact:
+
+```bash
+python -m pip install \
+  git+https://github.com/DKotsyuba/agent-run.git@v0.1.0
 ```
 
 Then bootstrap the home directory (default `~/.agent-run`, override with
@@ -204,6 +226,10 @@ Anthropic-compatible endpoint), **qwen** (Qwen Code headless),
 - [docs/architecture.md](docs/architecture.md) — how the pieces fit
 - [docs/api.md](docs/api.md) — socket API integration guide
 - [docs/workflows.md](docs/workflows.md) — workflow script contract
+- [docs/releasing.md](docs/releasing.md) — version, CI, and GitHub Release procedure
+- [CHANGELOG.md](CHANGELOG.md) — user-visible changes by version
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development and pull-request checks
+- [SECURITY.md](SECURITY.md) — supported versions and private reporting
 - `agent-run doc` — operator guide (config, models, releases, …)
 - [AGENTS.md](AGENTS.md) — rules for working on this codebase
 

@@ -1,6 +1,6 @@
 # models
 
-## claude and codex
+## claude, codex, glm, and qwen
 
 Static rosters: whatever model ids are listed in each runtime's `models =
 [...]` in config.toml. There is nothing to sync — editing the list and

@@ -7,9 +7,6 @@ Declare plugins per runtime with absolute paths:
 plugins = ["/abs/path/to/tokenpipe-compressor", "/abs/path/to/agent-lsp-plugin"]
 ```
 
-Live examples in this deployment: the tokenpipe compressor and
-agent-lsp-plugin.
-
 ## Per-runtime load mechanics
 
 - **claude** loads plugins via `--plugin-dir`. A plugin's hooks auto-load

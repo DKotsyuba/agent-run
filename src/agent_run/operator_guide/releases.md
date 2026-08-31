@@ -1,6 +1,15 @@
 # releases
 
-Sealed releases live under `~/.agent-run/standalone/releases/<sha>`, one
+Public versions are built from an annotated `vX.Y.Z` tag by GitHub Actions.
+The workflow verifies that the tag matches `pyproject.toml`, runs the full
+suite, builds and checks wheel/sdist, performs a clean install smoke, records
+`SHA256SUMS`, creates provenance attestations, and publishes the files in a
+GitHub Release. Maintainer procedure: `docs/releasing.md` in the source tree.
+
+The sealed layout below is an optional local deployment strategy. It is not
+created by pip/pipx and is separate from the public distribution channel.
+
+Sealed local releases live under `~/.agent-run/standalone/releases/<sha>`, one
 immutable directory per shipped commit.
 
 ## Build steps

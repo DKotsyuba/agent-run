@@ -97,7 +97,7 @@ Prefer the MCP tools: `workflow_start(script, args?)`, `workflow_status`,
 stale — see cautions):
 
 ```bash
-~/.agent-run/standalone/current/venv/bin/agent-run --home ~/.agent-run \
+agent-run --home ~/.agent-run \
   workflow start <name> "$(cat script.wf)"
 ```
 

@@ -4,13 +4,14 @@ Only opencode has a managed, long-running service; no other runtime does.
 
 ## Starting it
 
-Start via `~/.agent-run/bin/agent-run-keychain`, which exports the service
-password from the system Keychain before invoking `agent-run service
-start`. A bare `agent-run` binary invocation — skipping the keychain
-wrapper — starts a service that comes up but silently yields an EMPTY model
-roster. This is a known trap: if `agent-run models` shows nothing for
-opencode right after a start, check which binary actually launched it
-before debugging anything else.
+Start with `agent-run service start --runtime opencode`. Configure the service
+password through the runtime's declared environment/file auth. A deployment
+may wrap this command with its own credential helper; such wrappers are not
+part of agent-run.
+
+If `agent-run models` shows nothing for opencode after startup, verify that the
+configured credential reached the service process before debugging the model
+roster.
 
 The running service's descriptor lives at
 `<home>/runtimes/opencode/home/service.json`.

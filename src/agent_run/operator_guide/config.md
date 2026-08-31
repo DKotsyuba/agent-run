@@ -32,7 +32,8 @@ Each `[runtimes.<name>]` table may declare:
 
 - `enabled` — bool; a disabled runtime is invisible everywhere (models,
   doc, service).
-- `adapter` — which adapter drives this runtime (claude, codex, opencode).
+- `adapter` — which adapter drives this runtime (claude, codex, glm, qwen,
+  opencode).
 - `binary` — absolute path to the runtime's executable.
 - `home` — the runtime's private home directory; materialized config,
   skills, and plugins live under here.

@@ -13,10 +13,9 @@ stops being read — the plugin's copy wins. Two declared plugins shipping the
 same skill name is a conflict and fails closed rather than picking one
 silently.
 
-Symlinked skill directories are allowed and expected: the `role-*` skills
-are symlinks into the agent-workflows checkout, not physical copies, so
-editing the checkout updates every runtime that uses them without
-rematerializing skill content itself.
+Symlinked skill directories are supported. Their targets must remain readable
+for every runtime that uses them; editing a symlink target changes the content
+seen at the next materialization.
 
 ## After changing skills
 

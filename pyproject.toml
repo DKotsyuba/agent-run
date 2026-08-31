@@ -1,15 +1,44 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-run"
 version = "0.1.0"
+description = "Local supervisor for durable, isolated coding-agent runs"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Denis Kotsyuba" }]
+keywords = ["agents", "codex", "llm", "mcp", "orchestration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
 dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+release = ["build>=1.2", "twine>=5.0"]
 
 [project.scripts]
 agent-run = "agent_run.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/DKotsyuba/agent-run"
+Documentation = "https://github.com/DKotsyuba/agent-run#documentation"
+Repository = "https://github.com/DKotsyuba/agent-run.git"
+Issues = "https://github.com/DKotsyuba/agent-run/issues"
+Changelog = "https://github.com/DKotsyuba/agent-run/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

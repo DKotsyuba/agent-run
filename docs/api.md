@@ -12,7 +12,7 @@ Everything needed to connect is on this page.
 ## Starting the server
 
 ```bash
-~/.agent-run/standalone/current/venv/bin/agent-run --home ~/.agent-run api serve
+agent-run --home ~/.agent-run api serve
 ```
 
 - Foreground process; run it under your own supervisor (launchd, tmux, a
@@ -146,6 +146,7 @@ id); `-32603` as a bug to report.
 - The tool surface is pinned to the MCP surface by a parity test; new
   tools appear in both transports simultaneously. Re-read `tools` after
   an agent-run upgrade instead of caching schemas across versions.
-- The server binary comes from the sealed release under
-  `~/.agent-run/standalone/current`; upgrading agent-run swaps that
-  symlink. Restart `api serve` after an upgrade.
+- Restart `api serve` after upgrading the installed package. Operators using
+  the optional sealed-release layout restart it after switching
+  `~/.agent-run/standalone/current`; ordinary pip/pipx installs use the
+  `agent-run` executable on `PATH`.
