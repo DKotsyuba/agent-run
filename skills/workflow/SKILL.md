@@ -72,6 +72,10 @@ stable specs give stable keys, which is what makes the journal replayable.
 
 - **codex**: a read-only profile with no `read_roots` and no `write` is
   refused ("no-filesystem"). Give it `read_roots: [workdir]` at minimum.
+  HARD RULE (owner directive, 01.09.2026): codex steps set
+  `"account": "personal2"` until that account's lanes in `limits` are
+  exhausted; only then omit the field to use the default account. Never
+  split codex steps across both accounts to balance load.
   Engine limitation (permanent, codex 0.151.0 schema has no extra-roots
   fields on write threads): codex + external read_roots on a write step
   refuses EARLY with guidance — copy the material into the workdir and omit
