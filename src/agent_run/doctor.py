@@ -209,14 +209,23 @@ def _hooks(runtime: RuntimeConfig, component: str, trusted, findings) -> None:
     -- while the trust check targets :func:`_hook_script`, so a hook that runs
     a trusted script through a system interpreter is not flagged merely
     because the interpreter lives outside the roots.
+
+    A ``{plugin:NAME}`` script token is trusted when NAME is a plugin declared
+    for the runtime: adapters expand the token under the runtime home (itself a
+    trusted root), each with its own layout beneath it, so the token is the
+    trust evidence and no per-adapter path reconstruction is attempted.
     """
 
+    declared_plugins = {path.name for path in runtime.plugins}
     for index, hook in enumerate(runtime.hooks):
         interpreter = Path(hook.command[0]).expanduser()
         item = f"{component}:hook:{index}"
         if not _executable(interpreter):
             _add(findings, "hook_executable_missing", "error", item, str(interpreter))
         script = _hook_script(hook.command)
+        token = re.match(r"\{plugin:([^}]+)\}/.", str(script))
+        if token and token.group(1) in declared_plugins:
+            continue
         if not script.is_absolute() or not any(_under(script, root) for root in trusted):
             _add(findings, "hook_untrusted", "warning", item, str(script))
 

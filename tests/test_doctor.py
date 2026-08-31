@@ -340,7 +340,9 @@ class HookTrustTests(unittest.TestCase):
         self.root = self.home / "install"
         (self.root / "hooks").mkdir(parents=True)
 
-    def _findings(self, command: tuple[str, ...]) -> list:
+    def _findings(
+        self, command: tuple[str, ...], plugins: tuple[Path, ...] = ()
+    ) -> list:
         runtime = RuntimeConfig(
             enabled=True,
             adapter="example:ADAPTER",
@@ -348,6 +350,7 @@ class HookTrustTests(unittest.TestCase):
             home=self.home,
             models=("model",),
             hooks=(RuntimeHookConfig(event="PostToolUse", command=command),),
+            plugins=plugins,
         )
         findings: list = []
         trusted = (self.root, (self.root / "standalone" / "current").resolve())
@@ -390,6 +393,31 @@ class HookTrustTests(unittest.TestCase):
             [item.detail for item in self._findings(("/bin/sh", "-c", "echo hi"))],
             ["echo hi"],
         )
+
+    def test_a_declared_plugin_token_is_trusted(self) -> None:
+        # Adapters expand {plugin:NAME} under the runtime home, each with its
+        # own layout; the token plus the declaration is the trust evidence.
+        self.assertEqual(
+            self._codes_with_plugins(
+                ("/usr/bin/python3", "{plugin:agent-lsp-plugin}/hooks/guard.py"),
+                (Path("/anywhere/agent-lsp-plugin"),),
+            ),
+            [],
+        )
+
+    def test_an_undeclared_plugin_token_stays_untrusted(self) -> None:
+        self.assertEqual(
+            self._codes_with_plugins(
+                ("/usr/bin/python3", "{plugin:agent-lsp-plugin}/hooks/guard.py"),
+                (),
+            ),
+            ["hook_untrusted"],
+        )
+
+    def _codes_with_plugins(
+        self, command: tuple[str, ...], plugins: tuple[Path, ...]
+    ) -> list:
+        return [item.code for item in self._findings(command, plugins)]
 
 
 class CapacityStalenessTests(unittest.TestCase):
