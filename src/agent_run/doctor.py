@@ -32,12 +32,14 @@ _MARKERS = {
 }
 #: Runtimes whose environment auth also has a macOS keychain item the adapter
 #: falls back to when the variable is unset. Maps the config runtime name to
-#: the ``(service, account)`` pair the item is stored under. Without this
-#: probe, doctor checks only ``os.environ`` and reports a keychain-backed
-#: runtime as unauthenticated.
+#: the ``(service, account)`` pair the item is stored under; an ``account`` of
+#: ``None`` means the item has no fixed account, so it is probed by service
+#: alone. Without this probe, doctor checks only ``os.environ`` and reports a
+#: keychain-backed runtime as unauthenticated.
 KEYCHAIN_FALLBACKS = {
     "qwen": ("com.pluto.agent-run.opencode.omniroute", "OMNIROUTE_API_KEY"),
     "glm": ("com.pluto.agent-run.glm", "GLM_CODING_KEY"),
+    "claude": ("Claude Code-credentials", None),
 }
 #: Bound on the keychain probe so a hung ``security`` call cannot stall doctor.
 _KEYCHAIN_TIMEOUT_SECONDS = 5.0
@@ -171,14 +173,52 @@ def _skills(root: Path, name: str, runtime: RuntimeConfig, findings) -> None:
             _add(findings, "runtime_skill_missing", "error", f"runtime:{name}", skill)
 
 
+#: System interpreters our rendered hooks launch scripts with. Their own
+#: absolute paths sit outside the trusted roots by design, so the trust check
+#: for such a hook applies to the script argument instead.
+_HOOK_INTERPRETERS = frozenset({"/usr/bin/python3", "/bin/sh", "/bin/zsh", "/usr/bin/env"})
+
+
+def _hook_script(command: tuple[str, ...]) -> Path:
+    """Return the path the hook trust check should evaluate.
+
+    For a plain hook command that is ``command[0]``. When the hook launches a
+    script through a known system interpreter (see :data:`_HOOK_INTERPRETERS`),
+    the interpreter itself is not the artifact whose location matters, so the
+    first non-flag argument -- the script path -- is returned. A hook that
+    carries an interpreter but no such argument has nothing to trust, so the
+    interpreter path is returned and the hook stays untrusted.
+
+    ``command`` is the hook's argv; config parsing guarantees it is non-empty.
+    """
+
+    interpreter = Path(command[0]).expanduser()
+    if str(interpreter) not in _HOOK_INTERPRETERS:
+        return interpreter
+    for word in command[1:]:
+        if not word.startswith("-"):
+            return Path(word).expanduser()
+    return interpreter
+
+
 def _hooks(runtime: RuntimeConfig, component: str, trusted, findings) -> None:
+    """Check every runtime hook's presence and trust, recording violations.
+
+    ``trusted`` are the roots a hook command must live under. The executable
+    check always targets ``command[0]`` -- the interpreter, when there is one
+    -- while the trust check targets :func:`_hook_script`, so a hook that runs
+    a trusted script through a system interpreter is not flagged merely
+    because the interpreter lives outside the roots.
+    """
+
     for index, hook in enumerate(runtime.hooks):
-        command = Path(hook.command[0]).expanduser()
+        interpreter = Path(hook.command[0]).expanduser()
         item = f"{component}:hook:{index}"
-        if not _executable(command):
-            _add(findings, "hook_executable_missing", "error", item, str(command))
-        if not command.is_absolute() or not any(_under(command, root) for root in trusted):
-            _add(findings, "hook_untrusted", "warning", item, str(command))
+        if not _executable(interpreter):
+            _add(findings, "hook_executable_missing", "error", item, str(interpreter))
+        script = _hook_script(hook.command)
+        if not script.is_absolute() or not any(_under(script, root) for root in trusted):
+            _add(findings, "hook_untrusted", "warning", item, str(script))
 
 
 def _auth(name: str, runtime: RuntimeConfig, component: str, findings) -> None:
@@ -214,29 +254,27 @@ def _keychain_present(name: str) -> bool:
     """Whether the runtime's fallback keychain item exists and is readable.
 
     Probes ``security find-generic-password -s SERVICE -a ACCOUNT -w`` for the
-    ``(service, account)`` pair registered in ``KEYCHAIN_FALLBACKS``. The
-    secret is read only so that a resolvable item exits zero; the value is
-    discarded immediately and never logged, returned, or stored. Any failure
-    -- nonzero exit, missing binary, timeout, or ``OSError`` -- counts as
-    "not present", so a broken probe never suppresses a real warning. Returns
-    ``False`` for runtimes with no fallback entry.
+    ``(service, account)`` pair registered in ``KEYCHAIN_FALLBACKS``; an entry
+    registered with ``account=None`` is probed without ``-a``, because that
+    item is stored with no fixed account. The secret is read only so that a
+    resolvable item exits zero; the value is discarded immediately and never
+    logged, returned, or stored. Any failure -- nonzero exit, missing binary,
+    timeout, or ``OSError`` -- counts as "not present", so a broken probe never
+    suppresses a real warning. Returns ``False`` for runtimes with no fallback
+    entry.
     """
 
     fallback = KEYCHAIN_FALLBACKS.get(name)
     if fallback is None:
         return False
     service, account = fallback
+    argv = ["security", "find-generic-password", "-s", service]
+    if account is not None:
+        argv += ["-a", account]
+    argv.append("-w")
     try:
         result = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-s",
-                service,
-                "-a",
-                account,
-                "-w",
-            ],
+            argv,
             capture_output=True,
             timeout=_KEYCHAIN_TIMEOUT_SECONDS,
             check=False,
@@ -247,6 +285,17 @@ def _keychain_present(name: str) -> bool:
 
 
 def _capacity(config: Config, rows, at: float, findings) -> None:
+    """Flag capacity identities whose newest sample no longer describes now.
+
+    A sample that carries its own ``valid_until`` is judged only by it: a
+    still-future ``valid_until`` is never stale (sources stamp their own
+    validity window, which can be far longer than the collection interval),
+    and a past one is always stale. Only a sample without ``valid_until``
+    falls back to the age bound of twice the configured collection interval.
+    ``rows`` are the snapshot's capacity samples; ``at`` is the check time in
+    epoch seconds.
+    """
+
     latest = {}
     for row in rows:
         key = tuple(row[name] for name in ("runtime", "lane", "window", "target", "source"))
@@ -254,10 +303,10 @@ def _capacity(config: Config, rows, at: float, findings) -> None:
     stale_after = max(1, config.capacity.collect_interval_seconds) * 2
     for key, row in latest.items():
         valid_until = row["valid_until"]
-        stale = (
-            (valid_until is not None and float(valid_until) < at)
-            or at - float(row["observed_at"]) > stale_after
-        )
+        if valid_until is not None:
+            stale = float(valid_until) < at
+        else:
+            stale = at - float(row["observed_at"]) > stale_after
         if stale:
             _add(findings, "capacity_stale", "warning", f"capacity:{key[0]}", "/".join(str(x or "-") for x in key[1:]))
 
