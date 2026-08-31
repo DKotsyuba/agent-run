@@ -109,6 +109,19 @@ names or file links — never secret values in config), allowed skills,
 declared MCP servers, lifecycle hooks, plugins, and the limits source
 (`native` / `codexbar` / `omniroute` / `none`).
 
+**Multiple accounts** (codex): declare labels on the runtime —
+`accounts = ["personal1", "personal2"]` (optionally `default_account`) —
+then log each one in via the engine's own OAuth flow:
+
+```bash
+agent-run auth personal2 codex     # opens the browser login once
+agent-run start --runtime codex --account personal2 ...
+```
+
+Credentials live in `<home>/accounts/codex/<label>/`, each account gets
+its own child-home lineage, and `--account` works identically over MCP
+and the socket API. With no accounts declared, nothing changes.
+
 The built-in operator guide documents every section:
 
 ```bash
