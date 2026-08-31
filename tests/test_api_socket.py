@@ -3,10 +3,13 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent_run.api_socket import ApiServer, MAX_LINE_BYTES, METHOD_NAMES
+from agent_run.domain import AgentStatus
 from agent_run.dispatch import TOOL_NAMES, TOOLS
 
 
@@ -20,6 +23,40 @@ class StubService:
         self.calls.append("limits")
         self.call_threads.append(threading.get_ident())
         return {"ok": True}
+
+
+@dataclass(frozen=True)
+class _AgentView:
+    status: AgentStatus
+
+
+class _WaitService:
+    def __init__(self, statuses, *, started=None):
+        self.statuses = iter(statuses)
+        self.last_status = None
+        self.started = started
+
+    def get(self, agent_id):
+        if self.started is not None:
+            self.started.set()
+        self.last_status = next(self.statuses, self.last_status)
+        return _AgentView(self.last_status)
+
+    def answer(self, agent_id):
+        return {
+            "agent_id": agent_id,
+            "status": self.last_status,
+            "available": True,
+            "content": "done",
+        }
+
+
+class _Factory:
+    def __init__(self, dispatcher_service, wait_service):
+        self.services = [dispatcher_service, wait_service]
+
+    def __call__(self):
+        return self.services.pop(0)
 
 
 class ApiSocketTests(unittest.TestCase):
@@ -38,6 +75,15 @@ class ApiSocketTests(unittest.TestCase):
         self.server.server_close()
         self.path.unlink(missing_ok=True)
         self.tempdir.cleanup()
+
+    def replace_server(self, factory):
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+        self.path.unlink(missing_ok=True)
+        self.server = ApiServer(self.path, factory)
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.start()
 
     def request(self, request):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -107,7 +153,56 @@ class ApiSocketTests(unittest.TestCase):
         stale.unlink(missing_ok=True)
 
     def test_surface_is_dispatch_tools_plus_control_methods(self):
-        self.assertEqual(METHOD_NAMES, TOOL_NAMES | {"tools", "ping"})
+        self.assertEqual(
+            METHOD_NAMES, TOOL_NAMES | {"tools", "ping", "wait", "workflow_wait"}
+        )
+
+    def test_wait_returns_the_answer_envelope_when_agent_finishes(self):
+        wait_service = _WaitService([AgentStatus.RUNNING, AgentStatus.SUCCEEDED])
+        self.replace_server(_Factory(StubService(), wait_service))
+        response = self.request({
+            "jsonrpc": "2.0", "id": 1, "method": "wait",
+            "params": {"agent_id": "ag-20260826-120000-0123456789", "timeout_seconds": 2},
+        })
+        self.assertEqual(response["result"]["content"], "done")
+        self.assertEqual(response["result"]["status"], "succeeded")
+
+    def test_wait_timeout_is_a_normal_timed_out_result(self):
+        wait_service = _WaitService([AgentStatus.RUNNING])
+        self.replace_server(_Factory(StubService(), wait_service))
+        response = self.request({
+            "jsonrpc": "2.0", "id": 1, "method": "wait",
+            "params": {"agent_id": "ag-20260826-120000-0123456789", "timeout_seconds": 0.05},
+        })
+        self.assertEqual(response["result"]["timed_out"], True)
+        self.assertEqual(response["result"]["status"], "running")
+
+    def test_wait_timeout_validation(self):
+        for value in (0, -1, True, "1", float("inf")):
+            with self.subTest(value=value):
+                response = self.request({
+                    "jsonrpc": "2.0", "id": 1, "method": "wait",
+                    "params": {"agent_id": "ag-20260826-120000-0123456789", "timeout_seconds": value},
+                })
+                self.assertEqual(response["error"]["code"], -32602)
+
+    def test_wait_does_not_block_other_connections(self):
+        started = threading.Event()
+        wait_service = _WaitService([AgentStatus.RUNNING], started=started)
+        self.replace_server(_Factory(StubService(), wait_service))
+        pending = {}
+        waiter = threading.Thread(target=lambda: pending.setdefault("response", self.request({
+            "jsonrpc": "2.0", "id": 1, "method": "wait",
+            "params": {"agent_id": "ag-20260826-120000-0123456789", "timeout_seconds": 0.2},
+        })))
+        waiter.start()
+        self.assertTrue(started.wait(1))
+        began = time.monotonic()
+        self.assertEqual(self.request({"jsonrpc": "2.0", "id": 2, "method": "ping"})["result"], {"ok": True})
+        self.assertEqual(self.request({"jsonrpc": "2.0", "id": 3, "method": "limits", "params": {}})["result"], {"ok": True})
+        self.assertLess(time.monotonic() - began, 0.5)
+        waiter.join(timeout=2)
+        self.assertTrue(pending["response"]["result"]["timed_out"])
 
     def test_all_dispatch_runs_on_the_service_owning_thread(self):
         # SQLite connections are thread-affine: every tool call must execute

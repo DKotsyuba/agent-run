@@ -10,6 +10,7 @@ wait on a future. That also serializes dispatch, so no extra lock exists.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import signal
@@ -25,20 +26,28 @@ from .dispatch import (
     TOOL_NAMES,
     TOOLS,
     Session,
+    _arguments,
     _bounded,
     _emit,
     _error,
     _jsonable,
+    _string,
     _valid_id,
     call_tool,
 )
 from .errors import AgentRunError, ValidationError
 from .launch_evidence import bootstrap_error_fields
+from .wait import (
+    WATCHER_TIMEOUT_EXIT,
+    _workflow_status,
+    wait_for_agent,
+    wait_for_workflow,
+)
 
 MAX_LINE_BYTES = 1024 * 1024
 _MISSING = object()
 _DEFAULT_SOCKET = ".agent-run/api.sock"
-METHOD_NAMES = TOOL_NAMES | {"tools", "ping"}
+METHOD_NAMES = TOOL_NAMES | {"tools", "ping", "wait", "workflow_wait"}
 
 
 def default_socket_path() -> Path:
@@ -104,7 +113,59 @@ def _agent_run_error(request_id: object, error: AgentRunError) -> dict:
     return _rpc_error(request_id, -32000, error, data)
 
 
-def _handle(dispatcher: _Dispatcher, request: object, session: Session) -> dict | None:
+def _wait_timeout(params: dict) -> float:
+    if "timeout_seconds" not in params:
+        return 0.0
+    value = params["timeout_seconds"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError("timeout_seconds must be a positive finite number")
+    if value <= 0 or not math.isfinite(value):
+        raise ValidationError("timeout_seconds must be a positive finite number")
+    return float(value)
+
+
+def _wait_result(method: str, outcome) -> object:
+    result = _jsonable(outcome.payload)
+    if outcome.exit_code != WATCHER_TIMEOUT_EXIT:
+        return result
+    if not isinstance(result, dict):
+        result = {"payload": result}
+    result["timed_out"] = True
+    if "status" not in result:
+        result["status"] = _jsonable(
+            _workflow_status(outcome.payload)
+            if method == "workflow_wait"
+            else getattr(outcome.payload, "status", "unknown")
+        )
+    return result
+
+
+def _run_wait(method: str, params: dict, service_factory: Callable[[], object]) -> object:
+    if method == "wait":
+        agent_id = _string(_arguments(params, {"agent_id", "timeout_seconds"}, {"agent_id"}), "agent_id")
+    else:
+        run_id = _string(_arguments(params, {"run_id", "timeout_seconds"}, {"run_id"}), "run_id")
+    timeout = _wait_timeout(params)
+    service = service_factory()
+    try:
+        outcome = (
+            wait_for_agent(service, agent_id, timeout=timeout)
+            if method == "wait"
+            else wait_for_workflow(service, run_id, timeout=timeout)
+        )
+        return _wait_result(method, outcome)
+    finally:
+        close = getattr(service, "close", None)
+        if callable(close):
+            close()
+
+
+def _handle(
+    dispatcher: _Dispatcher,
+    request: object,
+    session: Session,
+    service_factory: Callable[[], object],
+) -> dict | None:
     if isinstance(request, list):
         return _rpc_error(None, -32600, "batch requests are not supported")
     if not isinstance(request, dict):
@@ -127,6 +188,8 @@ def _handle(dispatcher: _Dispatcher, request: object, session: Session) -> dict 
             result = {"ok": True}
         elif method == "tools":
             result = _jsonable(TOOLS)
+        elif method in {"wait", "workflow_wait"}:
+            result = _run_wait(method, params, service_factory)
         elif method not in TOOL_NAMES:
             response = _rpc_error(response_id, -32601, "method not found")
             return None if request_id is _MISSING else response
@@ -177,7 +240,9 @@ class _Handler(socketserver.StreamRequestHandler):
             except (UnicodeDecodeError, json.JSONDecodeError):
                 _emit(writer, _rpc_error(None, -32700, "parse error"))
                 continue
-            response = _handle(self.server.dispatcher, request, session)
+            response = _handle(
+                self.server.dispatcher, request, session, self.server.service_factory
+            )
             if response is not None:
                 _emit(writer, response)
 
@@ -208,6 +273,7 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
             finally:
                 probe.close()
         self.socket_path = path
+        self.service_factory = service_factory
         self.dispatcher = _Dispatcher(service_factory)
         super().__init__(str(path), _Handler, bind_and_activate=True)
         os.chmod(path, 0o600)
