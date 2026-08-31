@@ -12,6 +12,7 @@ from typing import Callable, Mapping, TypeAlias
 
 from .adapters.base import Capability, LaunchPlan, ModelInfo, RuntimeAdapter
 from .adapters.registry import AdapterRegistry
+from .accounts import account_auth_source, account_runtime_home
 from .capacity.advice import CapacityAdvice, build_advice
 from .capacity.forecast import build_forecasts
 from .capacity.history import load_series
@@ -283,10 +284,38 @@ class AgentService:
                 timeout_seconds=self._config.core.default_timeout_seconds,
             )
         runtime = self._runtime_config(request.runtime)
+        label = request.account or runtime.default_account
+        if request.account is not None and not runtime.accounts:
+            raise ValidationError(f"runtime {request.runtime} declares no accounts")
+        if label is not None and label not in runtime.accounts:
+            known = ", ".join(runtime.accounts) or "none"
+            raise ValidationError(
+                f"account {label!r} is not declared for runtime {request.runtime}; known accounts: {known}"
+            )
+        effective_runtime = runtime
+        effective_home = runtime.home
+        if label is not None:
+            if runtime.auth is None or runtime.auth.target is None:
+                raise ValidationError(f"runtime {request.runtime} account auth is not configured")
+            effective_source = account_auth_source(
+                self._home, request.runtime, label, runtime.auth.target
+            )
+            if not effective_source.is_file():
+                raise ValidationError(
+                    f"account {label!r} is not authenticated; run agent-run auth {label} {request.runtime}"
+                )
+            effective_home = account_runtime_home(runtime.home, label)
+            effective_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+            effective_home.chmod(0o700)
+            effective_runtime = replace(
+                runtime,
+                home=effective_home,
+                auth=replace(runtime.auth, source=effective_source),
+            )
         adapter = self._registry.load(
-            request.runtime, self._required_capabilities(request, runtime)
+            request.runtime, self._required_capabilities(request, effective_runtime)
         )
-        adapter.validate(runtime)
+        adapter.validate(effective_runtime)
         _logger.debug("start gate=capabilities ok runtime=%s", request.runtime)
         if request.model not in runtime.models:
             _logger.warning(
@@ -296,7 +325,7 @@ class AgentService:
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
-        roster = adapter.models(runtime, runtime.home)
+        roster = adapter.models(effective_runtime, effective_home)
         if request.model not in {model.id for model in roster}:
             _logger.warning(
                 "start gate=model_available failed runtime=%s model=%s",
@@ -318,13 +347,13 @@ class AgentService:
                 read_roots=request.read_roots,
             ),
             request.runtime,
-            runtime.skills,
+            effective_runtime.skills,
         )
-        mcp_servers = self._mcp_servers(runtime)
+        mcp_servers = self._mcp_servers(effective_runtime)
         skills_root = runtime_skills_dir(request.runtime, self._home)
         revision = adapter.materialize(
-            runtime,
-            runtime.home,
+            effective_runtime,
+            effective_home,
             mcp_servers=mcp_servers,
             skills_root=skills_root,
         )
@@ -350,8 +379,8 @@ class AgentService:
             plan = adapter.prepare(
                 request,
                 profile,
-                runtime,
-                runtime.home,
+                effective_runtime,
+                effective_home,
                 candidate_dir,
                 mcp_servers=mcp_servers,
             )

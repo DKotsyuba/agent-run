@@ -18,6 +18,7 @@ _ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _IMPORT_REF = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*\Z"
 )
+_ACCOUNT_LABEL = re.compile(r"[a-z0-9_-]{1,32}\Z")
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,8 @@ class RuntimeConfig:
     service_mode: str | None = None
     plugins: tuple[Path, ...] = ()
     limits_source: str | None = None
+    accounts: tuple[str, ...] = ()
+    default_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -392,6 +395,8 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "service_mode",
         "plugins",
         "limits_source",
+        "accounts",
+        "default_account",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -406,6 +411,23 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         auth = table.get("auth")
         service_mode = table.get("service_mode")
         limits_source = table.get("limits_source")
+        accounts = table.get("accounts", [])
+        account_names = _strings(accounts, f"{path}.accounts")
+        for index, label in enumerate(account_names):
+            if not _ACCOUNT_LABEL.fullmatch(label):
+                raise ValidationError(f"{path}.accounts[{index}] must be lowercase path-safe label")
+        if len(set(account_names)) != len(account_names):
+            raise ValidationError(f"{path}.accounts must not contain duplicates")
+        default_account = table.get("default_account")
+        if default_account is not None:
+            default_account = _string(default_account, f"{path}.default_account")
+            if not _ACCOUNT_LABEL.fullmatch(default_account):
+                raise ValidationError(f"{path}.default_account must be lowercase path-safe label")
+            if default_account not in account_names:
+                raise ValidationError(f"{path}.default_account must be declared in accounts")
+        parsed_auth = None if auth is None else _parse_auth(auth, f"{path}.auth")
+        if account_names and (parsed_auth is None or parsed_auth.kind != "file_link"):
+            raise ValidationError(f"{path}.accounts requires file_link auth")
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -415,11 +437,13 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             _names(table.get("skills", []), f"{path}.skills"),
             _names(table.get("mcp", []), f"{path}.mcp"),
             None if maximum is None else _int(maximum, f"{path}.max_active_agents", minimum=1),
-            None if auth is None else _parse_auth(auth, f"{path}.auth"),
+            parsed_auth,
             _parse_hooks(table.get("hooks", []), f"{path}.hooks"),
             None if service_mode is None else _string(service_mode, f"{path}.service_mode"),
             _plugin_dirs(table.get("plugins", []), f"{path}.plugins"),
             None if limits_source is None else _string(limits_source, f"{path}.limits_source"),
+            account_names,
+            default_account,
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")

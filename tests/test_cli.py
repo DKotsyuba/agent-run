@@ -213,6 +213,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(request.request_id, "request-1")
         self.assertEqual(request.orchestrator.external_turn_id, "turn-1")
 
+    def test_auth_runs_codex_login_in_account_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text('''schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/codex"
+home = "/tmp/codex"
+models = ["model"]
+accounts = ["personal2"]
+[runtimes.codex.auth]
+kind = "file_link"
+source = "/tmp/auth"
+target = "auth.json"
+''', encoding="utf-8")
+            calls = []
+            def run(argv, **kwargs):
+                calls.append((argv, kwargs))
+                return type("Result", (), {"returncode": 0, "stdout": ""})()
+            with patch("agent_run.cli.subprocess.run", side_effect=run):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                code = cli.main(
+                    ["--home", str(home), "auth", "personal2", "codex"],
+                    service=None,
+                    stdin=io.StringIO(),
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                output, error = stdout.getvalue(), stderr.getvalue()
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output), {"account": "personal2", "runtime": "codex", "status": "ok"})
+        self.assertEqual(calls[0][0], ["/bin/codex", "login"])
+        self.assertEqual(calls[1][0], ["/bin/codex", "login", "status"])
+        self.assertEqual(Path(calls[0][1]["env"]["CODEX_HOME"]).resolve(), home.resolve() / "accounts" / "codex" / "personal2")
+
+    def test_start_account_flag_reaches_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = FakeService()
+            code, _output, _error = self.run_cli(
+                ["start", "--runtime", "codex", "--model", "model", "--profile", "p", "--task", "t", "--workdir", directory, "--account", "personal2"],
+                service=service,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(service.request.account, "personal2")
+
     def test_start_preserves_omitted_and_explicit_timeout(self):
         with tempfile.TemporaryDirectory() as directory:
             base = [
