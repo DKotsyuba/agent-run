@@ -156,6 +156,7 @@ def request_json(request: StartRequest) -> str:
                 "external_turn_id": orchestrator.external_turn_id,
             },
             "request_id": request.request_id,
+            "account": request.account,
         }
     )
 

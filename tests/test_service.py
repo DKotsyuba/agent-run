@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_run.accounts import account_auth_source, account_runtime_home
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -15,7 +16,7 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from agent_run.config import Config, ProfilesConfig, RuntimeConfig
+from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import (
     AgentStatus,
     Message,
@@ -39,6 +40,8 @@ class FakeAdapter:
         self.capabilities = frozenset(Capability)
         self.validate_calls = 0
         self.materialize_calls = 0
+        self.materialize_configs = []
+        self.materialize_homes = []
         self.skills_roots = []
         self.models_calls = 0
         self.models_result: tuple[ModelInfo, ...] = (
@@ -59,6 +62,8 @@ class FakeAdapter:
 
     def materialize(self, config, home, *, mcp_servers, skills_root):
         self.materialize_calls += 1
+        self.materialize_configs.append(config)
+        self.materialize_homes.append(home)
         self.skills_roots.append(skills_root)
         return "cfg-1"
 
@@ -154,6 +159,25 @@ class AgentServiceTests(unittest.TestCase):
 
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
+
+    def test_account_resolution_uses_sibling_home_and_store_auth(self) -> None:
+        runtime = self.config.runtimes["fake"]
+        auth_source = self.root / "accounts" / "fake" / "personal2" / "auth.json"
+        auth_source.parent.mkdir(parents=True)
+        auth_source.write_text("{}", encoding="utf-8")
+        self.service = AgentService(
+            replace(self.config, runtimes={"fake": replace(
+                runtime,
+                accounts=("personal2",),
+                default_account="personal2",
+                auth=RuntimeAuthConfig("file_link", self.root / "auth", "auth.json"),
+            )}),
+            self.store, self.root, launch=lambda *args: self.launched.append(args), now=lambda: 100.0,
+        )
+        self.service.start(self.request(request_id="account"))
+        self.assertEqual(ADAPTER.materialize_homes[-1], self.runtime_home.with_name("runtime@personal2"))
+        self.assertEqual(ADAPTER.materialize_configs[-1].auth.source, auth_source)
+        self.assertEqual((self.runtime_home.with_name("runtime@personal2")).is_dir(), True)
 
     def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
         """The profile is where agent-run assigns the shared role contract.

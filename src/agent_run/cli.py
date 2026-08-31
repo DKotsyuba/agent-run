@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -15,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TextIO
 
+from .accounts import account_store_dir
 from .capacity.collect import collect_once
 from .capacity.launchd import argv as launchd_argv
 from .capacity.launchd import build_configured_job, render_plist
@@ -94,7 +96,12 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--read-root", action="append", default=[])
     start.add_argument("--output-schema")
     start.add_argument("--request-id")
+    start.add_argument("--account")
     _session(start)
+
+    auth = commands.add_parser("auth")
+    auth.add_argument("label")
+    auth.add_argument("runtime")
 
     bind = commands.add_parser("bind")
     bind.add_argument("agent_id")
@@ -350,6 +357,7 @@ def _request(args: argparse.Namespace, stream: TextIO) -> StartRequest:
         orchestrator=_ref(args),
         request_id=args.request_id,
         fast=args.fast,
+        account=args.account,
     )
 
 
@@ -825,6 +833,38 @@ def _initialize(home: Path):
     return {"home": home, "config": path, "state": state_db_path(home)}
 
 
+def _auth(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, object] | int:
+    config = load_config(config_path(home))
+    runtime = config.runtimes.get(args.runtime)
+    if runtime is None or not runtime.enabled:
+        raise ValidationError(f"runtime is not configured or not enabled: {args.runtime}")
+    if args.label not in runtime.accounts:
+        raise ValidationError(
+            f"account {args.label!r} is not declared for runtime {args.runtime}"
+        )
+    if "adapters.codex" not in runtime.adapter:
+        raise ValidationError(f"auth login not supported for runtime {args.runtime} yet")
+    store = account_store_dir(home, args.runtime, args.label)
+    store.mkdir(mode=0o700, parents=True, exist_ok=True)
+    store.chmod(0o700)
+    environment = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
+    environment["CODEX_HOME"] = str(store)
+    login = subprocess.run([str(runtime.binary), "login"], env=environment)
+    if login.returncode:
+        stderr.write(f"auth login failed for {args.label} {args.runtime} (exit {login.returncode})\n")
+        return login.returncode
+    status = subprocess.run(
+        [str(runtime.binary), "login", "status"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode:
+        stderr.write(f"auth login status failed for {args.label} {args.runtime} (exit {status.returncode})\n")
+        return status.returncode
+    return {"account": args.label, "runtime": args.runtime, "status": "ok"}
+
+
 def _doctor(home: Path):
     return run_doctor(home)
 
@@ -873,6 +913,10 @@ def main(
         _logger.info("cli command=%s", args.command)
         if service is None and args.command == "init":
             result = _initialize(home)
+        elif service is None and args.command == "auth":
+            result = _auth(home, args, stderr)
+            if isinstance(result, int):
+                return result
         elif service is None and args.command == "doctor":
             result = _doctor(home)
         elif service is None and args.command == "doc":

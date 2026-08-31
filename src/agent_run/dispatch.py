@@ -55,6 +55,7 @@ TOOLS = (
                 "output_schema": {"type": ["object", "null"]},
                 "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
                 "request_id": {"type": ["string", "null"]},
+                "account": {"type": ["string", "null"]},
             },
             ("runtime", "model", "profile", "task", "workdir"),
         ),
@@ -212,7 +213,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
             {
                 "runtime", "model", "profile", "task", "workdir", "write",
                 "effort", "timeout_seconds", "read_roots", "output_schema",
-                "orchestrator", "request_id", "fast",
+                "orchestrator", "request_id", "fast", "account",
             },
             {"runtime", "model", "profile", "task", "workdir"},
         )
@@ -248,6 +249,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 output_schema=schema,
                 orchestrator=_optional_orchestrator(args.get("orchestrator")),
                 request_id=_optional_string(args, "request_id"),
+                account=_optional_string(args, "account"),
             )
         )
     if name in {"cancel", "status", "answer"}:

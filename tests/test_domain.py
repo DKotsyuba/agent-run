@@ -1,3 +1,4 @@
+import json
 import math
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from agent_run.domain import (
     validate_transition,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.state.db import request_json
 
 
 class DomainTests(unittest.TestCase):
@@ -99,6 +101,10 @@ class DomainTests(unittest.TestCase):
                 )
             with self.assertRaises(ValidationError):
                 StartRequest("codex", "model", "profile", "task", root, timeout_seconds=math.inf)
+            first = StartRequest("codex", "model", "profile", "task", root, account="personal2")
+            second = StartRequest("codex", "model", "profile", "task", root, account="work")
+            self.assertEqual(json.loads(request_json(first))["account"], "personal2")
+            self.assertNotEqual(request_json(first), request_json(second))
 
     def test_message_and_outcome_validation(self) -> None:
         self.assertEqual(Message(0, MessageRole.USER, "hello").content, "hello")

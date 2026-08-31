@@ -90,6 +90,63 @@ models = ["test"]
 """
         )
 
+    def test_accounts_parse_and_validate(self) -> None:
+        config = self.load(
+            '''schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/codex"
+home = "/tmp/codex"
+models = ["test"]
+accounts = ["personal2", "work_1"]
+default_account = "personal2"
+[runtimes.codex.auth]
+kind = "file_link"
+source = "/tmp/auth.json"
+target = "auth.json"
+'''
+        )
+        runtime = config.runtimes["codex"]
+        self.assertEqual(runtime.accounts, ("personal2", "work_1"))
+        self.assertEqual(runtime.default_account, "personal2")
+        for bad in ("Upper", "has space", "a" * 33, "../escape"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValidationError, "accounts"):
+                self.load(
+                    f'''schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/codex"
+home = "/tmp/codex"
+models = ["test"]
+accounts = ["{bad}"]
+[runtimes.codex.auth]
+kind = "file_link"
+source = "/tmp/auth.json"
+target = "auth.json"
+'''
+                )
+
+    def test_accounts_require_file_link_and_default_must_be_declared(self) -> None:
+        base = '''schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/runtime-home"
+models = ["test"]
+accounts = ["personal"]
+'''
+        with self.assertRaisesRegex(ValidationError, "requires file_link"):
+            self.load(base)
+        with self.assertRaisesRegex(ValidationError, "default_account"):
+            self.load(
+                base
+                + 'default_account = "missing"\n'
+                + '[runtimes.fake.auth]\nkind = "file_link"\nsource = "/tmp/auth"\ntarget = "auth.json"\n'
+            )
+
     def test_limits_source_defaults_to_native_and_is_validated(self) -> None:
         self.assertIsNone(self.runtime_with_limits_source().runtimes["fake"].limits_source)
         for source in ("native", "omniroute", "codexbar", "none"):
