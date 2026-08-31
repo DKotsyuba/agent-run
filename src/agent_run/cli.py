@@ -188,6 +188,11 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("init")
     commands.add_parser("doctor")
     commands.add_parser("mcp")
+    api = commands.add_parser("api").add_subparsers(
+        dest="api_command", required=True
+    )
+    api_serve = api.add_parser("serve")
+    api_serve.add_argument("--socket")
     doc = commands.add_parser("doc")
     doc.add_argument("topic", nargs="?")
     workflow = commands.add_parser("workflow").add_subparsers(
@@ -898,6 +903,27 @@ def main(
                 )
                 _logger.info(
                     "cli command=mcp outcome=ok duration_ms=%.1f",
+                    (time.monotonic() - started) * 1000,
+                )
+                return returned if isinstance(returned, int) else 0
+            if args.command == "api":
+                from .api_socket import serve
+
+                def _api_service() -> object:
+                    # Runs on the dispatcher thread: the store's SQLite
+                    # connection must be created where it will be used.
+                    if owned is None:
+                        return target
+                    fresh = AgentService.from_home(home, launch=_launch_callback(home))
+                    fresh._registry.preload_enabled()
+                    return fresh
+
+                returned = serve(
+                    _api_service,
+                    socket_path=args.socket if args.socket else home / "api.sock",
+                )
+                _logger.info(
+                    "cli command=api outcome=ok duration_ms=%.1f",
                     (time.monotonic() - started) * 1000,
                 )
                 return returned if isinstance(returned, int) else 0
