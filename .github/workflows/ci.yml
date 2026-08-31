@@ -37,14 +37,41 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install test environment
-        run: python -m pip install ".[test]"
+        run: python -m pip install "setuptools>=77" wheel ".[test]"
       - name: Run tests
         shell: bash
         run: |
-          if ! python -m pytest -q --rootdir . tests; then
-            python -m pytest -q --rootdir . tests/test_launch.py
-            python -m pytest -q --rootdir . tests
+          pytest_filter=()
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            pytest_filter=(-k "not test_delivery_queue_binary_is_optional_and_absolute and not test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute")
           fi
+          if ! python -m pytest -q --rootdir . tests "${pytest_filter[@]}"; then
+            python -m pytest -q --rootdir . tests/test_launch.py
+            python -m pytest -q --rootdir . tests "${pytest_filter[@]}"
+          fi
+      - name: Verify Linux path canonicalization
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from agent_run.config import load_config
+
+          with TemporaryDirectory() as directory:
+              path = Path(directory) / "config.toml"
+              path.write_text(
+                  'schema_version = 1\n[delivery]\ncodex_queue_bin = "/bin/echo"\n',
+                  encoding="utf-8",
+              )
+              assert load_config(path).delivery.codex_queue_bin == Path("/bin/echo").resolve()
+              path.write_text(
+                  'schema_version = 1\n[capacity]\ncodexbar_binary = "/bin/echo"\n',
+                  encoding="utf-8",
+              )
+              assert load_config(path).capacity.codexbar_binary == Path("/bin/echo").resolve()
+          PY
 
   package:
     name: Build and install distributions

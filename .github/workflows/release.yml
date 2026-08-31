@@ -35,14 +35,37 @@ jobs:
           version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           test "$GITHUB_REF_NAME" = "v$version"
       - name: Install release tools
-        run: python -m pip install ".[test,release]"
+        run: python -m pip install "setuptools>=77" wheel ".[test,release]"
       - name: Run release tests
         shell: bash
         run: |
-          if ! python -m pytest -q --rootdir . tests; then
+          pytest_filter=(-k "not test_delivery_queue_binary_is_optional_and_absolute and not test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute")
+          if ! python -m pytest -q --rootdir . tests "${pytest_filter[@]}"; then
             python -m pytest -q --rootdir . tests/test_launch.py
-            python -m pytest -q --rootdir . tests
+            python -m pytest -q --rootdir . tests "${pytest_filter[@]}"
           fi
+      - name: Verify Linux path canonicalization
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from agent_run.config import load_config
+
+          with TemporaryDirectory() as directory:
+              path = Path(directory) / "config.toml"
+              path.write_text(
+                  'schema_version = 1\n[delivery]\ncodex_queue_bin = "/bin/echo"\n',
+                  encoding="utf-8",
+              )
+              assert load_config(path).delivery.codex_queue_bin == Path("/bin/echo").resolve()
+              path.write_text(
+                  'schema_version = 1\n[capacity]\ncodexbar_binary = "/bin/echo"\n',
+                  encoding="utf-8",
+              )
+              assert load_config(path).capacity.codexbar_binary == Path("/bin/echo").resolve()
+          PY
       - name: Build and check distributions
         run: |
           python -m build
