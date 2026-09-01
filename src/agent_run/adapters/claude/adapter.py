@@ -68,6 +68,15 @@ _NETWORK_TOOLS = ("WebFetch", "WebSearch")
 _ALWAYS_DISALLOWED = _NETWORK_TOOLS
 _AUTH_NAMES = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
 _SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+# Adapter-owned translation of public model ids to Claude API model ids.
+# Only the child argv's ``--model`` value is translated: the request model
+# id, the roster, and the persisted ``model`` adapter state all keep the
+# configured public id. Ids absent from this mapping pass through verbatim,
+# so every other configured model is untouched.
+_MODEL_ALIASES = {"fable": "claude-fable-5-1"}
+# Roster descriptions that name the concrete Claude release behind a public
+# id; ids absent from this mapping keep the generic description.
+_MODEL_DESCRIPTIONS = {"fable": "Claude Fable 5.1 (API model id: claude-fable-5-1)"}
 _KNOWN_HOOK_EVENTS = frozenset(
     {
         "PreToolUse",
@@ -158,7 +167,18 @@ class ClaudeAdapter:
         return RuntimeHealth(available, None, authenticated, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
-        return tuple(ModelInfo(model, f"configured claude model: {model}") for model in config.models)
+        """Report the configured roster without any live call.
+
+        Ids are always the configured public ids; ``fable`` is additionally
+        described as Claude Fable 5.1 with its API id
+        (``claude-fable-5-1``), while every other configured id keeps the
+        generic ``configured claude model`` description.
+        """
+
+        return tuple(
+            ModelInfo(model, _MODEL_DESCRIPTIONS.get(model, f"configured claude model: {model}"))
+            for model in config.models
+        )
 
     def limits(self, config: RuntimeConfig, home: Path) -> tuple[LimitSample, ...]:
         return agent_rate_limit_samples(Path(home), time.time())
@@ -177,6 +197,15 @@ class ClaudeAdapter:
         *,
         mcp_servers: Mapping[str, McpConfig],
     ) -> LaunchPlan:
+        """Build the isolated launch plan for one start request.
+
+        Model ids are public everywhere on the plan boundary: validation,
+        the roster, and the persisted ``adapter_state["model"]`` all keep
+        ``request.model`` verbatim. Only the child argv's ``--model`` value
+        is translated through ``_MODEL_ALIASES`` (``fable`` ->
+        ``claude-fable-5-1``); every other id passes through unchanged.
+        """
+
         if request.fast:
             raise ValidationError(f"{request.runtime} runtime does not support fast mode")
         if request.model not in config.models:
@@ -241,7 +270,7 @@ class ClaudeAdapter:
             "--verbose",
             "--no-session-persistence",
             "--model",
-            request.model,
+            _MODEL_ALIASES.get(request.model, request.model),
             "--permission-mode",
             permission_mode,
             "--setting-sources",

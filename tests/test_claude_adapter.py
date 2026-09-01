@@ -125,6 +125,21 @@ class ClaudeAdapterTests(unittest.TestCase):
         models = self.adapter.models(self.runtime_config(), self.home)
         self.assertEqual(tuple(model.id for model in models), ("sonnet", "opus"))
 
+    def test_models_describe_fable_as_claude_fable_5_1_and_leave_other_ids_generic(self) -> None:
+        models = {
+            model.id: model.description
+            for model in self.adapter.models(
+                self.runtime_config(models=("sonnet", "fable", "opus")), self.home
+            )
+        }
+        self.assertEqual(
+            tuple(models), ("sonnet", "fable", "opus")
+        )
+        self.assertIn("Claude Fable 5.1", models["fable"])
+        self.assertIn("claude-fable-5-1", models["fable"])
+        self.assertEqual(models["sonnet"], "configured claude model: sonnet")
+        self.assertEqual(models["opus"], "configured claude model: opus")
+
     def write_agent_runtime(self, agent_id: str, text: str, *, mtime: float | None = None) -> Path:
         """Write one agent's runtime.jsonl, matching the real on-disk layout.
 
@@ -392,6 +407,36 @@ class ClaudeAdapterTests(unittest.TestCase):
     def test_prepare_fails_closed_when_no_declared_auth_env_is_set(self) -> None:
         with self.assertRaisesRegex(ValidationError, "auth requires one of"):
             self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
+
+    def test_prepare_resolves_only_the_fable_alias_in_the_child_argv(self) -> None:
+        config = self.runtime_config(models=("sonnet", "fable", "opus"))
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            fable = self.prepare(
+                self.request(model="fable"), self.profile(), config, self.home, self.agent_dir
+            )
+            sonnet = self.prepare(
+                self.request(model="sonnet"), self.profile(), config, self.home, self.agent_dir
+            )
+            opus = self.prepare(
+                self.request(model="opus"), self.profile(), config, self.home, self.agent_dir
+            )
+            custom = self.prepare(
+                self.request(model="custom-model"),
+                self.profile(),
+                self.runtime_config(models=("custom-model",)),
+                self.home,
+                self.agent_dir,
+            )
+        for plan, requested, argv_model in (
+            (fable, "fable", "claude-fable-5-1"),
+            (sonnet, "sonnet", "sonnet"),
+            (opus, "opus", "opus"),
+            (custom, "custom-model", "custom-model"),
+        ):
+            with self.subTest(argv_model=argv_model):
+                self.assertEqual(plan.argv[plan.argv.index("--model") + 1], argv_model)
+                # The persisted public model id never changes.
+                self.assertEqual(plan.adapter_state["model"], requested)
 
     def test_prepare_builds_an_isolated_launch_plan_for_a_read_only_profile(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
