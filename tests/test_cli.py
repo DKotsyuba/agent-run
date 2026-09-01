@@ -214,6 +214,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(request.orchestrator.external_turn_id, "turn-1")
 
     def test_auth_runs_codex_login_in_account_home(self):
+        """Run account login with the configured binary's canonical path."""
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / "config.toml").write_text('''schema_version = 1
@@ -246,8 +247,9 @@ target = "auth.json"
                 output, error = stdout.getvalue(), stderr.getvalue()
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output), {"account": "personal2", "runtime": "codex", "status": "ok"})
-        self.assertEqual(calls[0][0], ["/bin/codex", "login"])
-        self.assertEqual(calls[1][0], ["/bin/codex", "login", "status"])
+        binary = str(Path("/bin/codex").resolve())
+        self.assertEqual(calls[0][0], [binary, "login"])
+        self.assertEqual(calls[1][0], [binary, "login", "status"])
         self.assertEqual(Path(calls[0][1]["env"]["CODEX_HOME"]).resolve(), home.resolve() / "accounts" / "codex" / "personal2")
 
     def test_start_account_flag_reaches_request(self):
