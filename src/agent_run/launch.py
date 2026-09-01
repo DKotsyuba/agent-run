@@ -28,7 +28,10 @@ from .lifecycle import (
 )
 
 
-DEFAULT_READY_TIMEOUT_SECONDS = 5.0
+# One budget covers exec, module imports, identity proof, config/store setup,
+# and READY. Production launchd starts have needed 13.9s just for identity
+# under routine collector load; 30s keeps failure bounded with useful headroom.
+DEFAULT_READY_TIMEOUT_SECONDS = 30.0
 DEFAULT_DISPATCH_TIMEOUT_SECONDS = 5.0
 DEFAULT_REAP_TIMEOUT_SECONDS = 5.0
 DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
@@ -131,17 +134,16 @@ def launch_detached(
     cleanup_kill_seconds: float = DEFAULT_CLEANUP_KILL_SECONDS,
     child_reaper: ChildReaper | None = None,
 ) -> int:
-    """Fork one session leader, exec `module`, and return its pid after READY.
+    """Spawn one session-leading supervisor and return its PID after READY.
 
-    The child execs a fresh interpreter before touching anything: on macOS a
-    forked child of a process that has used SQLite segfaults inside
-    ``sqlite3.connect`` roughly half the time, and the CLI always has
-    ``state.db`` open here. ``payload`` carries live secrets, so it crosses only
-    the private pipe -- never argv, never a file. The durable agent row must
-    already exist; the child performs its own post-terminal dispatch. When
-    ``child_reaper`` is supplied, that long-lived owner receives the exact PID
-    instead of creating a short-lived per-child waiter thread. The callback and
-    wait-status contract is identical in both modes.
+    On supported systems, ``posix_spawn(..., setsid=True)`` creates the session
+    and execs without running Python in the child, avoiding the unsafe
+    post-fork window in the multithreaded API daemon.  ``payload`` carries live
+    secrets only through a private pipe -- never argv or a file. The durable
+    agent row must already exist; the child performs its own post-terminal
+    dispatch. When ``child_reaper`` is supplied, that long-lived owner receives
+    the exact PID instead of creating a short-lived waiter thread. The callback
+    and wait-status contract is identical in both spawn modes.
     """
 
     if not isinstance(payload, Mapping):
@@ -207,7 +209,7 @@ def launch_detached(
         raise ValidationError(f"detached supervisor payload is not JSON: {error}") from error
 
     try:
-        pid = os.fork()
+        pid = _spawn_session_leader(executable, argv, error_write)
     except OSError as error:
         for descriptor in (
             payload_read, payload_write, identity_read, identity_write,
@@ -216,21 +218,8 @@ def launch_detached(
             _close(descriptor)
         ready.close_read()
         ready.close_write()
-        raise ValidationError("cannot fork detached supervisor") from error
-    if pid != 0:
-        _logger.info("launch forked pid=%d module=%s", pid, module)
-
-    if pid == 0:
-        # Nothing but setsid, execv, and -- on failure only -- one bounded
-        # os.write of the failure evidence may run here: any other inherited
-        # library state touched before the exec is exactly what crashes the
-        # child.
-        try:
-            os.setsid()
-            os.execv(executable, argv)
-        except BaseException as error:
-            write_exec_failure(error_write, error)
-            os._exit(1)
+        raise ValidationError("cannot spawn detached supervisor") from error
+    _logger.info("launch spawned pid=%d module=%s", pid, module)
 
     ready.close_write()
     _close(identity_write)
@@ -275,6 +264,51 @@ def launch_detached(
     else:
         child_reaper.register(pid, post_reap, reap_timeout)
     return pid
+
+
+def _spawn_session_leader(executable: str, argv: list[str], error_fd: int) -> int:
+    """Spawn ``argv`` as a session leader without Python child execution when supported.
+
+    The preferred ``posix_spawn`` path atomically creates a new session and
+    execs the supervisor, avoiding the unsafe post-fork window in a
+    multithreaded daemon.  Old Python/platform combinations that explicitly
+    report ``setsid`` unsupported use the narrowly retained fork fallback;
+    all other spawn errors propagate so an ambiguous creation is never retried.
+    ``executable`` and ``argv`` were validated by :func:`launch_detached`;
+    ``error_fd`` is its already-inherited bootstrap-evidence pipe.
+    """
+
+    spawn = getattr(os, "posix_spawn", None)
+    if spawn is not None:
+        try:
+            return spawn(executable, argv, os.environ, setsid=True)
+        except NotImplementedError:
+            pass
+        except TypeError as error:
+            if "setsid" not in str(error):
+                raise
+    return _fork_session_leader(executable, argv, error_fd)
+
+
+def _fork_session_leader(executable: str, argv: list[str], error_fd: int) -> int:
+    """Use the legacy fork path only when ``posix_spawn(..., setsid=True)`` is unavailable.
+
+    The child invokes only ``setsid``, ``execv``, bounded bootstrap-evidence
+    writing to the already-known ``error_fd``, and immediate exit. Callers use
+    this compatibility path only after :func:`_spawn_session_leader` has
+    established that ``setsid`` spawn support is absent, never after a failed
+    or ambiguous spawn attempt.
+    """
+
+    pid = os.fork()
+    if pid != 0:
+        return pid
+    try:
+        os.setsid()
+        os.execv(executable, argv)
+    except BaseException as error:
+        write_exec_failure(error_fd, error)
+        os._exit(1)
 
 
 def _write_payload(fd: int, blob: bytes) -> None:

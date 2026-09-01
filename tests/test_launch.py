@@ -11,7 +11,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from agent_run.errors import ValidationError
-from agent_run.launch import ChildReaper, launch_detached
+from agent_run.launch import (
+    DEFAULT_READY_TIMEOUT_SECONDS,
+    ChildReaper,
+    _spawn_session_leader,
+    launch_detached,
+)
 from agent_run.launch_evidence import (
     FAILURE_KIND_BOOTSTRAP,
     FAILURE_KIND_EXECUTABLE_MISSING,
@@ -35,6 +40,9 @@ def child_pythonpath() -> str:
 
 @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX only")
 class DetachedLaunchTests(unittest.TestCase):
+    def test_default_ready_budget_covers_observed_launchd_startup(self) -> None:
+        self.assertGreaterEqual(DEFAULT_READY_TIMEOUT_SECONDS, 30.0)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -235,6 +243,35 @@ class DetachedLaunchTests(unittest.TestCase):
         self.assertIsInstance(error, SupervisorBootstrapError)
         self.assertEqual(error.failure_kind, FAILURE_KIND_EXECUTABLE_MISSING)
         self.assertIn(missing, str(error))
+
+    def test_posix_spawn_requests_setsid_without_fork_fallback(self) -> None:
+        """Supported spawn failures propagate without entering the unsafe fork path."""
+
+        with (
+            mock.patch(
+                "agent_run.launch.os.posix_spawn",
+                side_effect=OSError("spawn failed"),
+            ) as spawned,
+            mock.patch("agent_run.launch.os.fork") as forked,
+        ):
+            with self.assertRaisesRegex(ValidationError, "cannot spawn"):
+                self.launch({})
+        self.assertTrue(spawned.call_args.kwargs["setsid"])
+        forked.assert_not_called()
+
+    def test_explicitly_unsupported_setsid_uses_legacy_fork_path(self) -> None:
+        """Only an explicit unsupported capability result permits the fork fallback."""
+
+        with (
+            mock.patch(
+                "agent_run.launch.os.posix_spawn", side_effect=NotImplementedError
+            ),
+            mock.patch("agent_run.launch.os.fork", return_value=1234) as forked,
+        ):
+            self.assertEqual(
+                _spawn_session_leader(sys.executable, [sys.executable], 91), 1234
+            )
+        forked.assert_called_once_with()
 
     def test_child_dies_pre_identity_with_evidence_is_diagnosed(self) -> None:
         record = {
