@@ -6,6 +6,15 @@ from agent_run.domain import StartRequest
 from agent_run.mcp import serve
 
 
+class _Broker:
+    def __init__(self, service):
+        self.service = service
+        self.session = Session()
+
+    def call(self, method, params=None, timeout=600):
+        return call_tool(self.service, method, params or {}, self.session)
+
+
 class _Service:
     def start(self, request):
         self.request = request
@@ -30,7 +39,7 @@ def test_tools_table_and_mcp_tools_list_are_exactly_pinned() -> None:
 
     output = StringIO()
     assert serve(
-        _Service(),
+        _Broker(_Service()),
         StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"),
         output,
     ) == 0

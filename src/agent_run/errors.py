@@ -5,6 +5,10 @@ class AgentRunError(Exception):
     """Base class for expected agent-run failures."""
 
 
+class BrokerUnavailable(AgentRunError):
+    """The resident agent-run broker cannot be reached."""
+
+
 class ValidationError(AgentRunError, ValueError):
     """Input violates a public contract."""
 

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TextIO
 
 from .accounts import account_store_dir
+from .broker_client import BrokerClient
 from .capacity.collect import collect_once
 from .capacity.launchd import argv as launchd_argv
 from .capacity.launchd import build_configured_job, render_plist
@@ -930,26 +931,24 @@ def main(
         elif args.command == "service":
             result = _service_start(home, args)
         else:
-            if service is None:
-                owned = _Runtime(home)
-                target = owned
-            else:
-                target = service
             if args.command == "mcp":
                 from .mcp import serve
 
-                if owned is not None:
-                    owned.core._registry.preload_enabled()
-                returned = serve(
-                    owned.core if owned is not None else target,
-                    stdin=stdin,
-                    stdout=stdout,
-                )
+                broker = service if service is not None else BrokerClient(home / "api.sock")
+                returned = serve(broker, stdin=stdin, stdout=stdout)
+                close = getattr(broker, "close", None)
+                if callable(close):
+                    close()
                 _logger.info(
                     "cli command=mcp outcome=ok duration_ms=%.1f",
                     (time.monotonic() - started) * 1000,
                 )
                 return returned if isinstance(returned, int) else 0
+            if service is None:
+                owned = _Runtime(home)
+                target = owned
+            else:
+                target = service
             if args.command == "api":
                 from .api_socket import serve
 

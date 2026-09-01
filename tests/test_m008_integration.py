@@ -11,6 +11,7 @@ from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.delivery.base import DeliveryReceipt
 from agent_run.delivery.dispatch import DeliveryDispatcher
 from agent_run.domain import AgentStatus, Message, MessageRole, OrchestratorRef, Outcome, StartRequest
+from agent_run.dispatch import Session, call_tool
 from agent_run.errors import ValidationError
 from agent_run.hooks.bind import BindHookError, bind
 from agent_run.mcp import serve
@@ -85,6 +86,14 @@ class M008IntegrationTests(unittest.TestCase):
         )
 
     def mcp_call(self, service, request_id, name, arguments):
+        class Broker:
+            def __init__(self, target):
+                self.target = target
+                self.session = Session()
+
+            def call(self, method, params=None, timeout=600):
+                return call_tool(self.target, method, params or {}, self.session)
+
         source = StringIO(
             json.dumps(
                 {
@@ -97,7 +106,7 @@ class M008IntegrationTests(unittest.TestCase):
             + "\n"
         )
         output = StringIO()
-        self.assertEqual(serve(service, source, output), 0)
+        self.assertEqual(serve(Broker(service), source, output), 0)
         return json.loads(output.getvalue())["result"]
 
     def test_async_start_supervisor_late_bind_and_one_trusted_dispatch(self) -> None:

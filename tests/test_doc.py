@@ -9,7 +9,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run import cli
 from agent_run.doc import TOPICS, topic_text
 from agent_run.errors import ValidationError
+from agent_run.dispatch import Session, call_tool
 from agent_run.mcp import serve
+
+
+class _Broker:
+    def __init__(self, service):
+        self.service = service
+        self.session = Session()
+
+    def call(self, method, params=None, timeout=600):
+        return call_tool(self.service, method, params or {}, self.session)
 
 
 _MAX_BYTES = 8192
@@ -73,7 +83,7 @@ class DocMcpTests(unittest.TestCase):
         class _NoService:
             pass
 
-        self.assertEqual(serve(_NoService(), source, output), 0)
+        self.assertEqual(serve(_Broker(_NoService()), source, output), 0)
         return [json.loads(line) for line in output.getvalue().splitlines()]
 
     def test_doc_tool_is_listed(self):
