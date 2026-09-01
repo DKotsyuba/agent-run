@@ -557,6 +557,32 @@ target = "auth.json"
             self.assertIs(parsed["RunAtLoad"], False)
             self.assertNotIn("KeepAlive", parsed)
 
+    def test_api_launchd_renders_a_keep_alive_resident_daemon(self):
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            binary = home / "agent-run"
+            code, output, error = self.run_cli(
+                [
+                    "--home", str(home), "api", "launchd", "--binary", str(binary)
+                ]
+            )
+
+            self.assertEqual((code, error), (0, ""))
+            rendered = json.loads(output)
+            self.assertEqual(rendered["label"], "com.agent-run.api")
+            self.assertEqual(
+                rendered["argv"],
+                [str(binary), "--home", str(home), "api", "serve"],
+            )
+            parsed = plistlib.loads(rendered["plist"].encode("utf-8"))
+            self.assertEqual(parsed["ProgramArguments"], rendered["argv"])
+            self.assertIs(parsed["RunAtLoad"], True)
+            self.assertIs(parsed["KeepAlive"], True)
+            self.assertEqual(parsed["StandardOutPath"], str(home / "logs" / "api.log"))
+            self.assertEqual(parsed["StandardErrorPath"], str(home / "logs" / "api.err.log"))
+
     def test_init_bootstraps_private_minimal_home_without_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve() / "fresh"

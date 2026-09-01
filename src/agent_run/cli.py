@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import TextIO
 
 from .accounts import account_store_dir
+from .api_launchd import argv as api_launchd_argv
+from .api_launchd import build_job as build_api_launchd_job
+from .api_launchd import render_plist as render_api_launchd_plist
 from .broker_client import BrokerClient
 from .capacity.collect import collect_once
 from .capacity.launchd import argv as launchd_argv
@@ -46,6 +49,7 @@ _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
 _QUEUE_TIMEOUT_SECONDS = 30.0
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
+_API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
 #: The only runtime that owns a managed service; there is no generic daemon.
 _SERVICE_RUNTIME = "opencode"
@@ -201,6 +205,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     api_serve = api.add_parser("serve")
     api_serve.add_argument("--socket")
+    api_launchd = api.add_parser("launchd")
+    api_launchd.add_argument("--binary", required=True)
+    api_launchd.add_argument("--label", default=_API_LAUNCHD_LABEL)
+    api_launchd.add_argument("--stdout-log", default=None)
+    api_launchd.add_argument("--stderr-log", default=None)
     doc = commands.add_parser("doc")
     doc.add_argument("topic", nargs="?")
     workflow = commands.add_parser("workflow").add_subparsers(
@@ -597,6 +606,29 @@ def _delivery_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]
     }
 
 
+def _api_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    job = build_api_launchd_job(
+        args.label,
+        Path(args.binary),
+        home,
+        stdout_log=(
+            home / "logs" / "api.log"
+            if args.stdout_log is None
+            else Path(args.stdout_log)
+        ),
+        stderr_log=(
+            home / "logs" / "api.err.log"
+            if args.stderr_log is None
+            else Path(args.stderr_log)
+        ),
+    )
+    return {
+        "label": job.label,
+        "argv": api_launchd_argv(job),
+        "plist": render_api_launchd_plist(job),
+    }
+
+
 def _service_start(home: Path, args: argparse.Namespace) -> dict[str, object]:
     """Start (or reuse) the one managed service of a runtime that owns one."""
 
@@ -928,6 +960,8 @@ def main(
             result = _capacity_launchd(home, args)
         elif args.command == "delivery" and args.delivery_command == "launchd":
             result = _delivery_launchd(home, args)
+        elif args.command == "api" and args.api_command == "launchd":
+            result = _api_launchd(home, args)
         elif args.command == "service":
             result = _service_start(home, args)
         else:
