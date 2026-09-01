@@ -242,7 +242,8 @@ parallel group without writing a script.
 
 Engine adapters included: **codex** (app-server JSON-RPC),
 **claude** (Claude Code CLI), **glm** (Claude Code CLI pointed at Z.ai's
-Anthropic-compatible endpoint), **qwen** (Qwen Code headless), 
+Anthropic-compatible endpoint), **qwen** (Qwen Code headless with sandbox-safe
+macOS Git bootstrap),
 **opencode** (managed HTTP service).
 
 ## Documentation

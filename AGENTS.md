@@ -39,6 +39,11 @@ reliability of *this* code is set by everything that will run on top of it.
   so another thread can open its own). The socket API routes all dispatch
   through one owning thread — copy that pattern, don't share stores across
   threads.
+- **Detached launch is `posix_spawn`-first.** The resident API daemon is
+  multithreaded, so never reintroduce Python work between `fork` and `exec`.
+  The legacy fork path is allowed only when session-creating `posix_spawn` is
+  explicitly unavailable; PID/PGID, readiness, cleanup, and reap evidence must
+  stay exact.
 - **Schema changes go through migrations.** `state/schema.sql` is the
   current shape; every change also needs a numbered file in
   `state/migrations/` and a schema-version bump. Old MCP servers
