@@ -641,3 +641,55 @@ class ProcessTransport:
                     pipe.close()
                 except OSError:
                     pass
+
+
+def fetch_models(plan, *, timeout_seconds: float = 20.0) -> tuple[Mapping[str, object], ...]:
+    """Fetch the app-server model catalog without starting a thread or turn."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 < timeout_seconds < float("inf")
+    ):
+        raise ValidationError("timeout_seconds must be positive and finite")
+    transport = ProcessTransport(plan)
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("codex app-server model refresh timed out")
+        return value
+
+    try:
+        transport.request(
+            "initialize",
+            {"clientInfo": {"name": "agent-run", "version": "1"}},
+            timeout_seconds=remaining(),
+        )
+        models: list[Mapping[str, object]] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, object] = {"includeHidden": True, "limit": 1000}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = transport.request(
+                "model/list", params, timeout_seconds=remaining()
+            )
+            data = response.get("data")
+            if not isinstance(data, list) or not all(isinstance(item, Mapping) for item in data):
+                raise ValidationError("codex app-server model/list returned malformed data")
+            models.extend(data)
+            next_cursor = response.get("nextCursor")
+            if next_cursor is None:
+                next_cursor = response.get("next_cursor")
+            if next_cursor is None:
+                return tuple(models)
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise ValidationError("codex app-server model/list returned malformed cursor")
+            cursor = next_cursor
+    finally:
+        try:
+            transport.terminate(1.0)
+        except Exception:
+            transport.close()
