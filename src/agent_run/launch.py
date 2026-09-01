@@ -37,6 +37,65 @@ SUPERVISOR_MODULE = "agent_run.supervisor_main"
 _POLL_SECONDS = 0.01
 
 
+class ChildReaper:
+    """Reap registered direct children without disturbing unrelated waits."""
+
+    def __init__(self) -> None:
+        self._children: dict[int, tuple[Callable[[int, int], object] | None, float]] = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def register(
+        self,
+        pid: int,
+        callback: Callable[[int, int], object] | None = None,
+        timeout_seconds: float = DEFAULT_REAP_TIMEOUT_SECONDS,
+    ) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("child reaper is closed")
+            self._children[pid] = (callback, timeout_seconds)
+        self._wake.set()
+
+    def close(self, timeout_seconds: float = 1.0) -> None:
+        with self._lock:
+            self._closed = True
+        self._wake.set()
+        self._thread.join(timeout_seconds)
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                children = tuple(self._children.items())
+                closed = self._closed
+            if not children and closed:
+                return
+            for pid, (callback, timeout_seconds) in children:
+                try:
+                    waited, status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    with self._lock:
+                        self._children.pop(pid, None)
+                    continue
+                except OSError:
+                    continue
+                if waited != pid:
+                    continue
+                with self._lock:
+                    self._children.pop(pid, None)
+                if callback is not None:
+                    threading.Thread(
+                        target=_invoke_reap_callback,
+                        args=(callback, pid, status, timeout_seconds),
+                        daemon=True,
+                    ).start()
+            self._wake.wait(_POLL_SECONDS)
+            self._wake.clear()
+
+
 def launch_detached(
     payload: Mapping[str, object],
     *,
@@ -48,6 +107,7 @@ def launch_detached(
     post_reap_timeout_seconds: float = DEFAULT_REAP_TIMEOUT_SECONDS,
     cleanup_grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
     cleanup_kill_seconds: float = DEFAULT_CLEANUP_KILL_SECONDS,
+    child_reaper: ChildReaper | None = None,
 ) -> int:
     """Fork one session leader, exec `module`, and return its pid after READY.
 
@@ -183,9 +243,12 @@ def launch_detached(
         "launch ready pid=%d duration_ms=%.1f",
         pid, (time.monotonic() - fork_started) * 1000,
     )
-    threading.Thread(
-        target=_reap_child, args=(pid, post_reap, reap_timeout), daemon=True
-    ).start()
+    if child_reaper is None:
+        threading.Thread(
+            target=_reap_child, args=(pid, post_reap, reap_timeout), daemon=True
+        ).start()
+    else:
+        child_reaper.register(pid, post_reap, reap_timeout)
     return pid
 
 
@@ -271,7 +334,15 @@ def _reap_child(
         return
     if callback is None:
         return
+    _invoke_reap_callback(callback, pid, status, timeout_seconds)
 
+
+def _invoke_reap_callback(
+    callback: Callable[[int, int], object],
+    pid: int,
+    status: int,
+    timeout_seconds: float,
+) -> None:
     def invoke() -> None:
         with suppress(Exception):
             callback(pid, status)
