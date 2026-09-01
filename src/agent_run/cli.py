@@ -34,7 +34,7 @@ from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import AgentRunError, ValidationError
 from .hooks.bind import ref_from_payload, run_hook
 from .hooks.context import build_context
-from .launch import launch_detached
+from .launch import ChildReaper, launch_detached
 from .launch_evidence import bootstrap_error_fields
 from .logging_setup import configure_logging
 from .paths import agent_run_home, config_path, state_db_path
@@ -692,7 +692,7 @@ def _dispatch_once(home: Path):
         store.close()
 
 
-def _launch_callback(home: Path):
+def _launch_callback(home: Path, *, child_reaper: ChildReaper | None = None):
     def launch(
         agent_id: AgentId,
         request: StartRequest,
@@ -710,30 +710,43 @@ def _launch_callback(home: Path):
         # The exec'd supervisor reloads config and adapter itself; only the plan
         # travels, because its environment carries live secrets.
         core = load_config(config_path(home)).core
-        launch_detached(
-            {
-                "agent_id": str(agent_id),
-                "home": str(home),
-                "runtime": request.runtime,
-                "timeout_seconds": request.timeout_seconds,
-                "answer_path": str(candidate_dir / "answer.md"),
-                "agent_dir": str(candidate_dir),
-                "warning_fraction": core.warning_fraction,
-                "stalled_after_seconds": core.stalled_after_seconds,
-                "plan": plan.to_payload(),
-            },
-            executable=sys.executable,
-            post_terminal_timeout_seconds=_POST_TERMINAL_TIMEOUT_SECONDS,
-            post_reap=post_reap,
-        )
+        payload = {
+            "agent_id": str(agent_id),
+            "home": str(home),
+            "runtime": request.runtime,
+            "timeout_seconds": request.timeout_seconds,
+            "answer_path": str(candidate_dir / "answer.md"),
+            "agent_dir": str(candidate_dir),
+            "warning_fraction": core.warning_fraction,
+            "stalled_after_seconds": core.stalled_after_seconds,
+            "plan": plan.to_payload(),
+        }
+        if child_reaper is None:
+            launch_detached(
+                payload,
+                executable=sys.executable,
+                post_terminal_timeout_seconds=_POST_TERMINAL_TIMEOUT_SECONDS,
+                post_reap=post_reap,
+            )
+        else:
+            launch_detached(
+                payload,
+                executable=sys.executable,
+                post_terminal_timeout_seconds=_POST_TERMINAL_TIMEOUT_SECONDS,
+                post_reap=post_reap,
+                child_reaper=child_reaper,
+            )
 
     return launch
 
 
 class _Runtime:
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, *, child_reaper: ChildReaper | None = None) -> None:
         self.home = home
-        self.core = AgentService.from_home(home, launch=_launch_callback(home))
+        self.child_reaper = child_reaper
+        self.core = AgentService.from_home(
+            home, launch=_launch_callback(home, child_reaper=child_reaper)
+        )
 
     def __getattr__(self, name: str):
         return getattr(self.core, name)
@@ -939,6 +952,7 @@ def main(
         _emit(_error_payload(error), stderr)
         return _EXPECTED_ERROR_EXIT
     owned: _Runtime | None = None
+    child_reaper: ChildReaper | None = None
     started = time.monotonic()
     try:
         home = agent_run_home(args.home)
@@ -979,7 +993,9 @@ def main(
                 )
                 return returned if isinstance(returned, int) else 0
             if service is None:
-                owned = _Runtime(home)
+                if args.command == "api":
+                    child_reaper = ChildReaper()
+                owned = _Runtime(home, child_reaper=child_reaper)
                 target = owned
             else:
                 target = service
@@ -991,7 +1007,9 @@ def main(
                     # connection must be created where it will be used.
                     if owned is None:
                         return target
-                    fresh = AgentService.from_home(home, launch=_launch_callback(home))
+                    fresh = AgentService.from_home(
+                        home, launch=_launch_callback(home, child_reaper=child_reaper)
+                    )
                     fresh._registry.preload_enabled()
                     return fresh
 
@@ -1036,6 +1054,8 @@ def main(
     finally:
         if owned is not None:
             owned.close()
+        if child_reaper is not None:
+            child_reaper.close()
 
 
 if __name__ == "__main__":

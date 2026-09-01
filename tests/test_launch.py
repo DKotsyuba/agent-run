@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from agent_run.errors import ValidationError
-from agent_run.launch import launch_detached
+from agent_run.launch import ChildReaper, launch_detached
 from agent_run.launch_evidence import (
     FAILURE_KIND_BOOTSTRAP,
     FAILURE_KIND_EXECUTABLE_MISSING,
@@ -182,6 +182,22 @@ class DetachedLaunchTests(unittest.TestCase):
         self.wait_for(lambda: not self.alive(pid))
         self.assertEqual(events.read_text(), "before-ready\nterminal\n")
         self.assertEqual(dispatched.read_text(), "once\n")
+
+    def test_targeted_reaper_preserves_launch_evidence(self) -> None:
+        report = self.root / "reaped"
+        reaper = ChildReaper()
+        self.addCleanup(reaper.close)
+
+        def reaped(pid, status):
+            report.write_text(f"{pid}:{status}", encoding="utf-8")
+
+        pid = self.launch({}, post_reap=reaped, child_reaper=reaper)
+        self.wait_for(lambda: report.exists())
+        reported_pid, status = map(int, report.read_text().split(":"))
+        self.assertEqual(reported_pid, pid)
+        self.assertTrue(os.WIFEXITED(status))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
 
     def test_post_reap_receives_exact_pid_and_wait_status(self) -> None:
         report = self.root / "reaped"
