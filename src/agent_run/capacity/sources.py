@@ -15,13 +15,15 @@ import logging
 import math
 import subprocess
 import time
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
 
 from ..accounts import account_auth_source, account_email
 from ..adapters import omniroute
 from ..adapters.base import Capability, LimitSample, RuntimeAdapter
+from ..adapters.claude.auth import keychain_token
 from ..config import CapacityConfig, RuntimeConfig
 
 _logger = logging.getLogger("agent_run.capacity")
@@ -45,6 +47,9 @@ _CODEXBAR_TIMEOUT_SECONDS = 120
 #: child cannot flood the log during a burst of failed ticks.
 _ERROR_TAIL_CHARS = 200
 _CODEXBAR_LANES = ("primary", "secondary", "tertiary")
+_CLAUDE_NATIVE_URL = "https://api.anthropic.com/api/oauth/usage"
+_CLAUDE_NATIVE_TIMEOUT_SECONDS = 20
+_CLAUDE_NATIVE_VALID_FOR_SECONDS = 900
 
 
 def _bounded_error_tail(stderr: object) -> str:
@@ -214,6 +219,71 @@ def _codexbar_samples(
     return tuple(samples)
 
 
+def _claude_native_samples() -> tuple[LimitSample, ...]:
+    observed_at = time.time()
+    token = keychain_token(observed_at)
+    if token is None:
+        _logger.warning("claude native limits have no usable OAuth token")
+        return ()
+    request = urllib.request.Request(
+        _CLAUDE_NATIVE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_CLAUDE_NATIVE_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read())
+    except (OSError, TimeoutError, ValueError) as error:
+        _logger.warning(
+            "claude native limits request failed: %s", type(error).__name__
+        )
+        return ()
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("limits"), list):
+        _logger.warning("claude native limits response has no limits array")
+        return ()
+
+    observed = datetime.fromtimestamp(observed_at, tz=timezone.utc)
+    samples = []
+    for entry in payload["limits"]:
+        if not isinstance(entry, Mapping):
+            continue
+        percent = entry.get("percent")
+        if (
+            isinstance(percent, bool)
+            or not isinstance(percent, (int, float))
+            or not math.isfinite(percent)
+        ):
+            continue
+        kind = entry.get("kind")
+        if kind == "session":
+            lane, window, target = "primary", "five_hour", None
+        elif kind == "weekly_all":
+            lane, window, target = "secondary", "seven_day", None
+        elif kind == "weekly_scoped":
+            lane, window = "secondary", "seven_day"
+            scope = entry.get("scope")
+            model = scope.get("model") if isinstance(scope, Mapping) else None
+            display_name = model.get("display_name") if isinstance(model, Mapping) else None
+            target = display_name.lower() if isinstance(display_name, str) else str(kind)
+        else:
+            lane, window, target = "secondary", "seven_day", str(kind)
+        samples.append(
+            LimitSample(
+                lane=lane,
+                window=window,
+                remaining_percent=max(0.0, min(100.0, 100.0 - float(percent))),
+                reset_at=_timestamp(entry.get("resets_at")),
+                observed_at=observed,
+                source="native",
+                target=target,
+                valid_for_seconds=_CLAUDE_NATIVE_VALID_FOR_SECONDS,
+            )
+        )
+    return tuple(samples)
+
+
 def collect_samples(
     name: str,
     runtime_config: RuntimeConfig,
@@ -230,6 +300,8 @@ def collect_samples(
         return omniroute.pool_samples(time.time())
     if source == "codexbar":
         return _codexbar_samples(name, capacity_config, runtime_config, agent_run_home)
+    if source == "native" and name == "claude":
+        return _claude_native_samples()
 
     adapter = load(name, runtime_config)
     info = adapter.describe()
