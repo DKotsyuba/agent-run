@@ -1,4 +1,4 @@
-"""Minimal bounded JSON-RPC 2.0 stdio transport for :class:`AgentService`."""
+"""Minimal bounded JSON-RPC 2.0 stdio transport over the resident broker."""
 
 from __future__ import annotations
 
@@ -8,20 +8,10 @@ import sys
 import time
 from typing import IO, Mapping
 
-from .dispatch import (
-    TOOL_NAMES,
-    TOOLS,
-    Session,
-    _bounded,
-    _emit,
-    _error,
-    _jsonable,
-    _valid_id,
-    call_tool,
-)
+from .broker_client import BrokerClient
+from .dispatch import TOOL_NAMES, TOOLS, _bounded, _emit, _error, _jsonable, _valid_id
 from .errors import AgentRunError
 from .launch_evidence import bootstrap_error_fields
-from .service import AgentService
 
 
 _logger = logging.getLogger("agent_run.mcp")
@@ -35,13 +25,11 @@ _TASK_LOG_CHARS = 120
 
 
 def serve(
-    service: AgentService,
+    broker: BrokerClient,
     stdin: IO[str] = sys.stdin,
     stdout: IO[str] = sys.stdout,
 ) -> int:
     """Serve newline-delimited JSON-RPC until EOF; stdout carries JSON only."""
-    session = Session()
-
     while True:
         line = stdin.readline(MAX_LINE_BYTES + 1)
         if line == "":
@@ -64,12 +52,12 @@ def serve(
         except (json.JSONDecodeError, UnicodeDecodeError):
             _emit(stdout, _error(None, -32700, "parse error"))
             continue
-        response = _handle(service, request, session)
+        response = _handle(broker, request)
         if response is not None:
             _emit(stdout, response)
 
 
-def _handle(service: AgentService, request: object, session: Session) -> dict | None:
+def _handle(broker: BrokerClient, request: object) -> dict | None:
     if not isinstance(request, dict):
         return _error(None, -32600, "invalid request")
     request_id = request.get("id", _MISSING)
@@ -102,7 +90,7 @@ def _handle(service: AgentService, request: object, session: Session) -> dict | 
             # always serve the single, complete page.
             result = {"tools": list(TOOLS)}
         elif method == "tools/call":
-            return _tool_call(service, request_id, params, session)
+            return _tool_call(broker, request_id, params)
         else:
             return _error(request_id, -32601, "method not found")
     except Exception as error:
@@ -110,9 +98,7 @@ def _handle(service: AgentService, request: object, session: Session) -> dict | 
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _tool_call(
-    service: AgentService, request_id: object, params: dict, session: Session
-) -> dict:
+def _tool_call(broker: BrokerClient, request_id: object, params: dict) -> dict:
     name = params.get("name")
     arguments = params.get("arguments", {})
     if not isinstance(name, str) or not isinstance(arguments, dict):
@@ -134,15 +120,14 @@ def _tool_call(
         outcome = "unknown_tool"
     else:
         try:
-            value = call_tool(service, name, arguments, session)
+            value = broker.call(name, arguments)
             result = _tool_result(value)
             outcome = "ok"
-            if agent_id is None:
-                found = getattr(value, "agent_id", None)
-                agent_id = found if isinstance(found, str) else agent_id
         except AgentRunError as error:
             result = _tool_error(
-                type(error).__name__, str(error), extra=bootstrap_error_fields(error)
+                str(getattr(error, "broker_error_code", type(error).__name__)),
+                str(error),
+                extra=bootstrap_error_fields(error),
             )
             outcome = type(error).__name__
         except Exception as error:
