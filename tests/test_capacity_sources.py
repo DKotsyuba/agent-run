@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -161,6 +162,117 @@ class DispatchTests(unittest.TestCase):
                 "opencode", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
             )
         self.assertEqual(result, ())
+
+
+class NativeClaudeMappingTests(unittest.TestCase):
+    _PAYLOAD = {
+        "limits": [
+            {
+                "kind": "session",
+                "percent": 25,
+                "severity": "warning",
+                "resets_at": "2026-09-01T15:00:00-04:00",
+                "scope": None,
+                "is_active": True,
+            },
+            {
+                "kind": "weekly_all",
+                "percent": 40,
+                "severity": "warning",
+                "resets_at": "2026-09-07T12:00:00Z",
+                "scope": None,
+                "is_active": True,
+            },
+            {
+                "kind": "weekly_scoped",
+                "percent": 60,
+                "severity": "warning",
+                "resets_at": "2026-09-07T12:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}},
+                "is_active": True,
+            },
+            {
+                "kind": "mystery_limit",
+                "percent": 10,
+                "severity": "warning",
+                "resets_at": None,
+                "scope": None,
+                "is_active": True,
+            },
+            {"kind": "weekly_all", "resets_at": None},
+        ]
+    }
+
+    class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode()
+
+    def collect(self, payload=None, *, urlopen=None):
+        payload = self._PAYLOAD if payload is None else payload
+        opener = urlopen or (lambda request, timeout: self.Response(payload))
+        with mock.patch.object(sources, "keychain_token", return_value="access-token"), mock.patch.object(
+            sources.urllib.request, "urlopen", side_effect=opener
+        ), mock.patch.object(sources.time, "time", return_value=1788278400.0):
+            return sources.collect_samples(
+                "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
+            )
+
+    def test_live_payload_maps_lanes_targets_and_remaining(self) -> None:
+        samples = self.collect()
+        self.assertEqual(
+            [(sample.lane, sample.window, sample.target, sample.remaining_percent) for sample in samples],
+            [
+                ("primary", "five_hour", None, 75.0),
+                ("secondary", "seven_day", None, 60.0),
+                ("secondary", "seven_day", "fable", 40.0),
+                ("secondary", "seven_day", "mystery_limit", 90.0),
+            ],
+        )
+        self.assertEqual(samples[0].source, "native")
+        self.assertEqual(samples[0].valid_for_seconds, 900)
+        self.assertEqual(
+            samples[0].reset_at,
+            datetime(2026, 9, 1, 19, 0, tzinfo=timezone.utc),
+        )
+
+    def test_request_uses_oauth_headers_and_timeout(self) -> None:
+        captured = {}
+
+        def opener(request, timeout):
+            captured.update(url=request.full_url, headers=dict(request.headers), timeout=timeout)
+            return self.Response({"limits": []})
+
+        self.assertEqual(self.collect(urlopen=opener), ())
+        self.assertEqual(captured["url"], "https://api.anthropic.com/api/oauth/usage")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer access-token")
+        self.assertEqual(captured["headers"]["Anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(captured["timeout"], 20)
+
+    def test_missing_token_http_error_and_timeout_are_no_samples(self) -> None:
+        with mock.patch.object(sources, "keychain_token", return_value=None), self.assertLogs(
+            "agent_run.capacity", level="WARNING"
+        ):
+            self.assertEqual(
+                sources.collect_samples(
+                    "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
+                ),
+                (),
+            )
+
+        for error in (urllib.error.HTTPError("https://example.com", 401, "unauthorized", {}, None), TimeoutError()):
+            with self.subTest(error=type(error).__name__), self.assertLogs(
+                "agent_run.capacity", level="WARNING"
+            ):
+                self.assertEqual(self.collect(urlopen=mock.Mock(side_effect=error)), ())
 
 
 class CodexbarMappingTests(unittest.TestCase):

@@ -100,18 +100,21 @@ class CapacityCollectTests(unittest.TestCase):
             schema_version=1,
             runtimes={
                 "codex": _runtime_config(),
-                "claude": _runtime_config(),
+                "claude": _runtime_config(limits_source="native"),
                 "opencode": _runtime_config(),
                 "disabled_rt": _runtime_config(enabled=False),
             },
         )
 
-        report = collect_once(
-            self.store,
-            config,
-            at=1_704_110_400.0,
-            loader=lambda name, runtime_config: adapters[name],
-        )
+        with mock.patch.object(sources, "keychain_token", return_value="token"), mock.patch.object(
+            sources.urllib.request, "urlopen", side_effect=RuntimeError("provider unreachable")
+        ):
+            report = collect_once(
+                self.store,
+                config,
+                at=1_704_110_400.0,
+                loader=lambda name, runtime_config: adapters[name],
+            )
 
         by_runtime = {result.runtime: result for result in report.results}
         self.assertEqual(set(by_runtime), {"codex", "claude", "opencode"})
