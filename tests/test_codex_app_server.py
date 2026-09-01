@@ -313,6 +313,7 @@ class StartSessionTests(unittest.TestCase):
                 "approval_policy": "never",
                 "roots": (str(cwd),),
                 "writable_roots": (),
+                "request_timeout_seconds": 180.0,
             },
         )
         transport = FakeTransport(
@@ -329,7 +330,7 @@ class StartSessionTests(unittest.TestCase):
         methods = [method for method, _ in transport.requests]
         self.assertEqual(methods, ["initialize", "thread/start", "turn/start"])
         self.assertEqual(len(transport.timeouts), 3)
-        self.assertTrue(all(0 < value <= 30 for value in transport.timeouts))
+        self.assertTrue(all(100 < value <= 120 for value in transport.timeouts))
         self.assertEqual(
             transport.requests[-1][1]["input"],
             [{"type": "text", "text": "do the thing"}],

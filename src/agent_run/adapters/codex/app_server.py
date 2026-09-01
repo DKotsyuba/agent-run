@@ -25,6 +25,13 @@ from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
 
 
+# App-server initialization is outside the agent execution deadline. Keep a
+# bounded default for synthetic/legacy plans, but honor configured production
+# requests up to the observed slow-start ceiling instead of truncating at 30s.
+_DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
+_MAX_STARTUP_TIMEOUT_SECONDS = 120.0
+
+
 class VerificationError(ValidationError):
     """Effective app-server parameters do not match the requested launch plan."""
 
@@ -424,11 +431,11 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     state = plan.adapter_state
     configured = state.get("request_timeout_seconds")
     timeout = (
-        min(float(configured), 30.0)
+        min(float(configured), _MAX_STARTUP_TIMEOUT_SECONDS)
         if isinstance(configured, (int, float))
         and not isinstance(configured, bool)
         and configured > 0
-        else 30.0
+        else _DEFAULT_STARTUP_TIMEOUT_SECONDS
     )
     deadline = time.monotonic() + timeout
 
