@@ -1,0 +1,9 @@
+{
+  "include": [
+    "src/agent_run"
+  ],
+  "pythonVersion": "3.11",
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "typeCheckingMode": "basic"
+}

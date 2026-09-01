@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import ssl
 import subprocess
 import time
 import urllib.request
@@ -219,6 +220,22 @@ def _codexbar_samples(
     return tuple(samples)
 
 
+_SYSTEM_CA_BUNDLE = Path("/etc/ssl/cert.pem")
+
+
+def _claude_native_context() -> ssl.SSLContext:
+    """TLS context that verifies inside the sealed venv.
+
+    The standalone venv's Python carries no CA bundle of its own, so the
+    default context fails certificate verification on macOS; the system
+    bundle at /etc/ssl/cert.pem is used when present.
+    """
+
+    if _SYSTEM_CA_BUNDLE.is_file():
+        return ssl.create_default_context(cafile=str(_SYSTEM_CA_BUNDLE))
+    return ssl.create_default_context()
+
+
 def _claude_native_samples() -> tuple[LimitSample, ...]:
     observed_at = time.time()
     token = keychain_token(observed_at)
@@ -233,7 +250,11 @@ def _claude_native_samples() -> tuple[LimitSample, ...]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=_CLAUDE_NATIVE_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=_CLAUDE_NATIVE_TIMEOUT_SECONDS,
+            context=_claude_native_context(),
+        ) as response:
             payload = json.loads(response.read())
     except (OSError, TimeoutError, ValueError) as error:
         _logger.warning(

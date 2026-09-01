@@ -218,7 +218,7 @@ class NativeClaudeMappingTests(unittest.TestCase):
 
     def collect(self, payload=None, *, urlopen=None):
         payload = self._PAYLOAD if payload is None else payload
-        opener = urlopen or (lambda request, timeout: self.Response(payload))
+        opener = urlopen or (lambda request, timeout, **kwargs: self.Response(payload))
         with mock.patch.object(sources, "keychain_token", return_value="access-token"), mock.patch.object(
             sources.urllib.request, "urlopen", side_effect=opener
         ), mock.patch.object(sources.time, "time", return_value=1788278400.0):
@@ -247,8 +247,13 @@ class NativeClaudeMappingTests(unittest.TestCase):
     def test_request_uses_oauth_headers_and_timeout(self) -> None:
         captured = {}
 
-        def opener(request, timeout):
-            captured.update(url=request.full_url, headers=dict(request.headers), timeout=timeout)
+        def opener(request, timeout, context=None):
+            captured.update(
+                url=request.full_url,
+                headers=dict(request.headers),
+                timeout=timeout,
+                context=context,
+            )
             return self.Response({"limits": []})
 
         self.assertEqual(self.collect(urlopen=opener), ())
