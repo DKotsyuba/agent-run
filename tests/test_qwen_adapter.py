@@ -83,13 +83,16 @@ class QwenAdapterTests(unittest.TestCase):
         values.update(overrides)
         return StartRequest(**values)
 
-    def prepare(self, *, write: bool = False, mcp: bool = False, config: RuntimeConfig | None = None):
-        """Prepare one plan with deterministic fake provider credentials."""
+    def prepare(
+        self, *, write: bool = False, mcp: bool = False,
+        config: RuntimeConfig | None = None, path: str = "/usr/bin",
+    ):
+        """Prepare one plan with deterministic credentials and child PATH."""
         servers = {"agent_lsp": McpConfig("stdio", Path("/bin/lsp"), ("--stdio",), ())}
         if config is None:
             config = self.config(mcp=("agent_lsp",)) if mcp else self.config()
         with patch.dict(os.environ, {
-            "PATH": "/usr/bin", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
+            "PATH": path, "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }):
             return self.adapter.prepare(
                 self.request(write=write), self.profile(write=write), config, self.home,
@@ -106,6 +109,17 @@ class QwenAdapterTests(unittest.TestCase):
             self.assertEqual(plan.cwd, self.workdir)
             self.assertEqual(plan.adapter_state["approval_mode"], expected)
             self.assertTrue(plan.adapter_state["sandbox"])
+
+    def test_child_path_bypasses_the_macos_xcode_git_shim_when_available(self) -> None:
+        """Prefer Xcode's real Git binary without changing non-macOS PATHs."""
+        plan = self.prepare(path="/usr/bin:/bin")
+        xcode = Path("/Applications/Xcode.app/Contents/Developer/usr/bin")
+        expected = (
+            f"{xcode}{os.pathsep}/usr/bin:/bin"
+            if (xcode / "git").is_file()
+            else "/usr/bin:/bin"
+        )
+        self.assertEqual(plan.environment["PATH"], expected)
 
     def test_provider_model_mcp_and_role_are_isolated(self) -> None:
         """Carry provider values in env and materialize MCP plus the role under HOME."""

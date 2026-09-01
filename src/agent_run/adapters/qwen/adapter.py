@@ -61,6 +61,8 @@ _API_ERROR_PREFIX = "[API Error:"
 #: line of Qwen's ``[API Error: ...]`` payload carries no secrets, and the
 #: cap keeps pathological provider payloads out of the durable store.
 _MAX_FAILURE_LINE = 500
+# Bypass macOS' /usr/bin/git Xcode shim inside Qwen's seatbelt sandbox.
+_XCODE_GIT_DIRECTORY = Path("/Applications/Xcode.app/Contents/Developer/usr/bin")
 
 
 def qwen_error_only_result_line(result_text: str) -> str | None:
@@ -270,8 +272,11 @@ class QwenAdapter:
         self.materialize(config, Path(home), mcp_servers=mcp_servers)
 
         environment = {"HOME": str(home), "OPENAI_MODEL": request.model}
-        if os.environ.get("PATH"):
-            environment["PATH"] = os.environ["PATH"]
+        parent_path = os.environ.get("PATH")
+        if parent_path:
+            if (_XCODE_GIT_DIRECTORY / "git").is_file():
+                parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
+            environment["PATH"] = parent_path
         secret_names: list[str] = []
         assert config.auth is not None
         for name in config.auth.names:
