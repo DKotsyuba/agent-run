@@ -693,6 +693,13 @@ def _dispatch_once(home: Path):
 
 
 def _launch_callback(home: Path, *, child_reaper: ChildReaper | None = None):
+    """Build the service launch callback for one home and reaping policy.
+
+    CLI callers omit ``child_reaper`` and retain the per-child waiter. The
+    resident socket daemon passes its shared reaper so completed supervisors do
+    not become zombies while preserving exact post-reap reconciliation.
+    """
+
     def launch(
         agent_id: AgentId,
         request: StartRequest,
@@ -741,7 +748,11 @@ def _launch_callback(home: Path, *, child_reaper: ChildReaper | None = None):
 
 
 class _Runtime:
+    """Own one transport-facing service and its optional daemon child reaper."""
+
     def __init__(self, home: Path, *, child_reaper: ChildReaper | None = None) -> None:
+        """Compose the service for ``home`` using the selected reaping policy."""
+
         self.home = home
         self.child_reaper = child_reaper
         self.core = AgentService.from_home(
@@ -940,6 +951,13 @@ def main(
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
+    """Parse and execute one CLI, MCP-proxy, or resident API invocation.
+
+    A resident ``api serve`` invocation owns one shared ``ChildReaper`` for its
+    full lifetime; every other command retains the existing launch behavior.
+    Returns the process exit code and closes every service/reaper it created.
+    """
+
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
