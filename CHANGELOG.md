@@ -2,6 +2,11 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.2.1] - 2026-09-01
+
+- Prevented an exiting resident API daemon from unlinking the replacement
+  daemon's Unix socket during launchd restarts.
+
 ## [0.2.0] - 2026-09-01
 
 - Added isolated multi-account Codex authentication, account-aware workflows,
@@ -27,5 +32,6 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[0.2.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.1
 [0.2.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.0
 [0.1.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.1.0
