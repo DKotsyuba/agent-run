@@ -129,7 +129,18 @@ class SystemProcessOps:
         return True
 
     def group_alive(self, pgid: int) -> bool:
-        return self.signal_group(pgid, 0)
+        try:
+            os.killpg(checked_pgid(pgid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # POSIX: signal 0 answering EPERM means the group exists but is
+            # not ours to signal (e.g. the pid was reused by a foreign
+            # process). For a liveness probe that is "exists"; raising here
+            # let one stale agent row abort unrelated starts in the resident
+            # daemon.
+            return True
+        return True
 
     def reap(self, pid: int) -> int | None:
         try:

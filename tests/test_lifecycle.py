@@ -239,3 +239,30 @@ class ReadyChannelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SystemGroupAliveTests(unittest.TestCase):
+    """POSIX semantics of the real liveness probe."""
+
+    def test_eperm_on_signal_zero_means_the_group_exists(self) -> None:
+        # A foreign process that reused the pid answers EPERM to signal 0;
+        # the probe must report "alive", not raise (a stale agent row must
+        # never abort unrelated starts in the resident daemon).
+        from unittest import mock
+
+        from agent_run import lifecycle as lifecycle_module
+        from agent_run.lifecycle import SystemProcessOps
+
+        ops = SystemProcessOps()
+        with mock.patch.object(lifecycle_module.os, "killpg", side_effect=PermissionError):
+            self.assertTrue(ops.group_alive(4242))
+
+    def test_esrch_on_signal_zero_means_gone(self) -> None:
+        from unittest import mock
+
+        from agent_run import lifecycle as lifecycle_module
+        from agent_run.lifecycle import SystemProcessOps
+
+        ops = SystemProcessOps()
+        with mock.patch.object(lifecycle_module.os, "killpg", side_effect=ProcessLookupError):
+            self.assertFalse(ops.group_alive(4242))
