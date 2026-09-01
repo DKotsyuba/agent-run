@@ -32,6 +32,9 @@ touch the store or an engine directly.
 
 `start` validates the request, writes the agent row (status `created`),
 and launches a **detached supervisor process** that owns the child engine.
+On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
+the legacy fork path is only a compatibility fallback when session-creating
+spawn is explicitly unavailable.
 From that point the orchestrating process is optional: state transitions
 (`starting → running → succeeded/failed/timed_out/cancelled/lost`) are
 recorded as events; transcripts are journaled as messages with large
@@ -64,7 +67,7 @@ child. What the adapters drive:
 | `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots supported on read-only runs |
 | `claude` | `claude` CLI headless | `--setting-sources ""`, per-run plugin dirs |
 | `glm` | `claude` CLI pointed at Z.ai's Anthropic-compatible endpoint | subclass of the claude adapter; auth via env/keychain, base URL pinned in the adapter |
-| `qwen` | `qwen -p … --output-format stream-json --sandbox` | headless one-shot; approval mode maps to write/read-only |
+| `qwen` | `qwen -p … --output-format stream-json --sandbox` | headless one-shot; approval mode maps to write/read-only; macOS uses Xcode's real Git binary instead of the sandbox-hostile `/usr/bin` shim |
 | `opencode` | managed long-lived `opencode serve` HTTP service | the only runtime with a managed service (`agent-run service start`) |
 
 Auth is declared per runtime as env-var **names** or file links — secret
