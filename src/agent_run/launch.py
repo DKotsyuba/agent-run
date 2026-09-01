@@ -38,9 +38,16 @@ _POLL_SECONDS = 0.01
 
 
 class ChildReaper:
-    """Reap registered direct children without disturbing unrelated waits."""
+    """Reap only registered direct children for a long-lived launch owner.
+
+    One daemon-owned instance may accept registrations from several threads.
+    It polls exact child PIDs, preserving unrelated wait statuses and forwarding
+    the raw wait status to each optional bounded callback.
+    """
 
     def __init__(self) -> None:
+        """Start the daemon reaper thread with no registered children."""
+
         self._children: dict[int, tuple[Callable[[int, int], object] | None, float]] = {}
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -54,6 +61,13 @@ class ChildReaper:
         callback: Callable[[int, int], object] | None = None,
         timeout_seconds: float = DEFAULT_REAP_TIMEOUT_SECONDS,
     ) -> None:
+        """Register one direct child PID and its optional post-reap callback.
+
+        ``pid`` must still be a direct child of this process. ``timeout_seconds``
+        bounds only the callback; reaping itself continues until the child exits.
+        Registration after :meth:`close` raises ``RuntimeError``.
+        """
+
         with self._lock:
             if self._closed:
                 raise RuntimeError("child reaper is closed")
@@ -61,12 +75,20 @@ class ChildReaper:
         self._wake.set()
 
     def close(self, timeout_seconds: float = 1.0) -> None:
+        """Stop accepting children and wait briefly for the reaper to quiesce.
+
+        Existing live children remain registered. The daemon thread may outlive
+        this bounded join and will exit after those children are reaped.
+        """
+
         with self._lock:
             self._closed = True
         self._wake.set()
         self._thread.join(timeout_seconds)
 
     def _run(self) -> None:
+        """Poll registered PIDs until closure and the child set are both empty."""
+
         while True:
             with self._lock:
                 children = tuple(self._children.items())
@@ -92,7 +114,7 @@ class ChildReaper:
                         args=(callback, pid, status, timeout_seconds),
                         daemon=True,
                     ).start()
-            self._wake.wait(_POLL_SECONDS)
+            self._wake.wait(_POLL_SECONDS if children else None)
             self._wake.clear()
 
 
@@ -116,7 +138,10 @@ def launch_detached(
     ``sqlite3.connect`` roughly half the time, and the CLI always has
     ``state.db`` open here. ``payload`` carries live secrets, so it crosses only
     the private pipe -- never argv, never a file. The durable agent row must
-    already exist; the child performs its own post-terminal dispatch.
+    already exist; the child performs its own post-terminal dispatch. When
+    ``child_reaper`` is supplied, that long-lived owner receives the exact PID
+    instead of creating a short-lived per-child waiter thread. The callback and
+    wait-status contract is identical in both modes.
     """
 
     if not isinstance(payload, Mapping):
@@ -343,6 +368,13 @@ def _invoke_reap_callback(
     status: int,
     timeout_seconds: float,
 ) -> None:
+    """Run one post-reap callback in a bounded helper thread.
+
+    Callback exceptions and callback timeouts are deliberately best-effort:
+    the child is already reaped and its exact PID/status evidence must not be
+    converted into a second lifecycle failure.
+    """
+
     def invoke() -> None:
         with suppress(Exception):
             callback(pid, status)
