@@ -152,6 +152,21 @@ class ApiSocketTests(unittest.TestCase):
         replacement.server_close()
         stale.unlink(missing_ok=True)
 
+    def test_old_server_release_does_not_unlink_replacement_socket(self):
+        path = Path(self.tempdir.name) / "ownership.sock"
+        old = ApiServer(path, lambda: StubService())
+        replacement = None
+        try:
+            self.assertTrue(old.release_socket_path())
+            replacement = ApiServer(path, lambda: StubService())
+            self.assertFalse(old.release_socket_path())
+            self.assertTrue(path.exists())
+        finally:
+            old.server_close()
+            if replacement is not None:
+                replacement.server_close()
+                replacement.release_socket_path()
+
     def test_surface_is_dispatch_tools_plus_control_methods(self):
         self.assertEqual(
             METHOD_NAMES, TOOL_NAMES | {"tools", "ping", "wait", "workflow_wait"}

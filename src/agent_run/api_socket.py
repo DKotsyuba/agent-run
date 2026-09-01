@@ -277,6 +277,19 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
         self.dispatcher = _Dispatcher(service_factory)
         super().__init__(str(path), _Handler, bind_and_activate=True)
         os.chmod(path, 0o600)
+        bound = path.stat()
+        self._socket_identity = (bound.st_dev, bound.st_ino)
+
+    def release_socket_path(self) -> bool:
+        """Unlink this server's socket path without deleting a replacement."""
+        try:
+            current = self.socket_path.stat()
+        except FileNotFoundError:
+            return False
+        if (current.st_dev, current.st_ino) != self._socket_identity:
+            return False
+        self.socket_path.unlink()
+        return True
 
     def server_close(self) -> None:
         super().server_close()
@@ -289,6 +302,7 @@ def serve(service_factory: Callable[[], object], socket_path: str | Path | None 
     previous: dict[int, object] = {}
 
     def stop(signum: int, _frame: object) -> None:
+        server.release_socket_path()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     try:
@@ -299,5 +313,5 @@ def serve(service_factory: Callable[[], object], socket_path: str | Path | None 
         for signum, handler in previous.items():
             signal.signal(signum, handler)
         server.server_close()
-        server.socket_path.unlink(missing_ok=True)
+        server.release_socket_path()
     return 0
