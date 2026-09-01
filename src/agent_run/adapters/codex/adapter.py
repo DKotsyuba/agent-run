@@ -37,7 +37,7 @@ from ..base import (
 )
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
-from . import app_server, plugins as plugin_install
+from . import app_server, model_cache, plugins as plugin_install
 
 
 _CONFIG_REL = "config.toml"
@@ -425,7 +425,11 @@ class CodexAdapter:
         return RuntimeHealth(available, version if isinstance(version, str) else None, auth_ok, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
-        cache = _read_json(Path(home) / _MODEL_CACHE_REL)
+        cache_path = Path(home) / _MODEL_CACHE_REL
+        cache = _read_json(cache_path)
+        if not model_cache.is_fresh(cache_path, time.time()):
+            model_cache.refresh_models(config, Path(home))
+            cache = _read_json(cache_path)
         entries = cache.get("models") if isinstance(cache, dict) else None
         if not isinstance(entries, list):
             return tuple(ModelInfo(model_id, "", ()) for model_id in config.models)
@@ -436,6 +440,8 @@ class CodexAdapter:
             model_id = item.get("slug")
             if not isinstance(model_id, str):
                 model_id = item.get("id")
+            if not isinstance(model_id, str):
+                model_id = item.get("model")
             if isinstance(model_id, str):
                 by_id[model_id] = item
         result = []
@@ -444,15 +450,22 @@ class CodexAdapter:
             if item is None:
                 continue
             description = item.get("description")
-            efforts_raw = item.get("supported_reasoning_levels")
+            efforts_raw = item.get("supportedReasoningEfforts")
+            if not isinstance(efforts_raw, list):
+                efforts_raw = item.get("supported_reasoning_levels")
             if not isinstance(efforts_raw, list):
                 efforts_raw = item.get("efforts")
             efforts: list[str] = []
             if isinstance(efforts_raw, list):
                 for level in efforts_raw:
-                    effort = level if isinstance(level, str) else (
-                        level.get("effort") if isinstance(level, Mapping) else None
-                    )
+                    if isinstance(level, str):
+                        effort = level
+                    elif isinstance(level, Mapping):
+                        effort = level.get("reasoningEffort")
+                        if not isinstance(effort, str):
+                            effort = level.get("effort")
+                    else:
+                        effort = None
                     if isinstance(effort, str) and effort not in efforts:
                         efforts.append(effort)
             result.append(

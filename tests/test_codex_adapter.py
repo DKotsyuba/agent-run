@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
+from agent_run.adapters.codex import app_server
 from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
@@ -407,6 +408,20 @@ env_from = ["PATH"]
         self.assertEqual(sol.description, "fast")
         self.assertEqual(sol.efforts, ("low", "high"))
 
+    def test_models_parses_current_model_list_shape(self) -> None:
+        config = self.runtime_config()
+        self.write_model_cache(
+            """{"models": [
+                {"model": "gpt-5.6-sol", "description": "current", "supportedReasoningEfforts": [
+                    {"reasoningEffort": "minimal", "description": "Minimal"},
+                    {"reasoningEffort": "high", "description": "High"}
+                ]}
+            ]}"""
+        )
+        models = ADAPTER.models(config, self.home)
+        self.assertEqual(models[0].description, "current")
+        self.assertEqual(models[0].efforts, ("minimal", "high"))
+
     def test_models_normalizes_real_cache_and_keeps_present_cache_strict(self) -> None:
         config = self.runtime_config()
         self.write_model_cache(
@@ -422,6 +437,45 @@ env_from = ["PATH"]
         self.assertEqual(models[0].description, "real cache")
         self.assertEqual(models[0].efforts, ("low", "high"))
 
+    def test_models_missing_cache_refreshes_live_roster_and_writes_cache(self) -> None:
+        (self.cache_dir / "models.json").unlink()
+        live = (
+            {
+                "id": "gpt-5.6-sol",
+                "description": "live description",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "Low"},
+                    {"reasoningEffort": "high", "description": "High"},
+                ],
+            },
+        )
+        with patch.object(app_server, "fetch_models", return_value=live) as refresh:
+            models = ADAPTER.models(self.runtime_config(), self.home)
+        refresh.assert_called_once()
+        self.assertEqual(models[0].description, "live description")
+        self.assertEqual(models[0].efforts, ("low", "high"))
+        cached = json.loads((self.cache_dir / "models.json").read_text(encoding="utf-8"))
+        self.assertEqual(cached["models"], list(live))
+
+    def test_models_refresh_failure_falls_back_without_raising(self) -> None:
+        (self.cache_dir / "models.json").unlink()
+        with patch.object(app_server, "fetch_models", side_effect=OSError("offline")):
+            models = ADAPTER.models(self.runtime_config(), self.home)
+        self.assertEqual(
+            [(model.id, model.description, model.efforts) for model in models],
+            [("gpt-5.6-sol", "", ()), ("gpt-5.6-terra", "", ())],
+        )
+
+    def test_models_stale_cache_refreshes_and_fresh_cache_does_not(self) -> None:
+        path = self.cache_dir / "models.json"
+        os.utime(path, (time.time() - 25 * 60 * 60,) * 2)
+        live = ({"id": "gpt-5.6-sol", "description": "refreshed", "efforts": ["max"]},)
+        with patch.object(app_server, "fetch_models", return_value=live) as refresh:
+            self.assertEqual(ADAPTER.models(self.runtime_config(), self.home)[0].description, "refreshed")
+            refresh.assert_called_once()
+        with patch.object(app_server, "fetch_models", side_effect=AssertionError("unexpected")):
+            self.assertEqual(ADAPTER.models(self.runtime_config(), self.home)[0].description, "refreshed")
+
     def test_models_without_cache_falls_back_to_config_only(self) -> None:
         (self.cache_dir / "models.json").unlink()
         ambient = self.agent_run_root / "cache" / "models.json"
@@ -429,7 +483,8 @@ env_from = ["PATH"]
         ambient.write_text(
             '{"models": [{"slug": "ambient-only"}]}', encoding="utf-8"
         )
-        models = ADAPTER.models(self.runtime_config(), self.home)
+        with patch.object(app_server, "fetch_models", side_effect=OSError("offline")):
+            models = ADAPTER.models(self.runtime_config(), self.home)
         self.assertEqual(
             [(model.id, model.description, model.efforts) for model in models],
             [
