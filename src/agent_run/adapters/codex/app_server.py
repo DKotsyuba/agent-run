@@ -25,9 +25,7 @@ from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
 
 
-# App-server initialization is outside the agent execution deadline. Keep a
-# bounded default for synthetic/legacy plans, but honor configured production
-# requests up to the observed slow-start ceiling instead of truncating at 30s.
+# Startup is outside the agent deadline: default to 30s, cap production at 120s.
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 _MAX_STARTUP_TIMEOUT_SECONDS = 120.0
 
