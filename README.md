@@ -158,11 +158,22 @@ Useful verbs beyond that: `status`, `transcript --follow`, `steer`,
 
 ## Use as an MCP server
 
-`agent-run mcp` speaks Model Context Protocol over stdio, exposing 17
-tools: `start`, `status`, `answer`, `wait`-free async flow, `cancel`,
-`steer`, `summary`, `transcript`, `list_agents`, `models`, `limits`,
-`fast`, `doc`, and `workflow_start` / `workflow_status` /
-`workflow_answer` / `workflow_cancel` / `workflow_resume`.
+`agent-run mcp` is a thin stdio proxy over the resident Unix-socket daemon.
+Start the daemon in the foreground with `agent-run api serve`; MCP requires it
+to be running and reports `BrokerUnavailable` when it is down.
+
+For a long-lived macOS setup, generate and install a launchd job:
+
+```bash
+agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgents/com.agent-run.api.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
+```
+
+The proxy exposes the same tool surface as the resident daemon: `start`,
+`status`, `answer`, `wait`-free async flow, `cancel`, `steer`, `summary`,
+`transcript`, `list_agents`, `models`, `limits`, `fast`, `doc`, and
+`workflow_start` / `workflow_status` / `workflow_answer` /
+`workflow_cancel` / `workflow_resume`.
 
 **Claude Code:**
 

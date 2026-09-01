@@ -16,6 +16,26 @@ roster.
 The running service's descriptor lives at
 `<home>/runtimes/opencode/home/service.json`.
 
+## agent-run api daemon
+
+The resident `agent-run api` daemon is the single launch host and exposes the
+JSON-RPC Unix socket at `<home>/api.sock`. Install it with the new launchd
+verb:
+
+```bash
+agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgents/com.agent-run.api.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
+```
+
+After a release switch, restart it with:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.agent-run.api
+```
+
+MCP is a thin stdio proxy over the socket daemon and fails with
+`BrokerUnavailable` when the daemon is down.
+
 ## Config-change restart order (exact order matters)
 
 1. Rematerialize: run the adapter's `materialize` step (either through a
@@ -34,5 +54,5 @@ nothing new to serve when restarted.
 ## Never touch a foreign listener
 
 Before killing anything on the service's port, confirm the pid in
-`service.json` is actually agent-run's — never send a signal to a listener
-you have not confirmed by descriptor first.
+`service.json` is actually agent-run's — never send a signal to a listener you
+have not confirmed by descriptor first.

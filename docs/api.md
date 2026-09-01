@@ -11,12 +11,23 @@ Everything needed to connect is on this page.
 
 ## Starting the server
 
+Foreground:
+
 ```bash
 agent-run --home ~/.agent-run api serve
 ```
 
-- Foreground process; run it under your own supervisor (launchd, tmux, a
-  service manager) if you need it long-lived.
+For the recommended long-lived macOS setup, generate a keep-alive launchd
+plist, then bootstrap it for the current user:
+
+```bash
+agent-run --home ~/.agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgents/com.agent-run.api.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
+```
+
+The generated service runs `BINARY --home HOME api serve` with `RunAtLoad` and
+`KeepAlive` enabled. A foreground process can still be run under another
+supervisor when launchd is unavailable.
 - Socket path defaults to `<home>/api.sock` (with `--home ~/.agent-run`
   that is `~/.agent-run/api.sock`). Override with `--socket PATH`.
   macOS caps `AF_UNIX` paths at ~104 bytes — keep the path short.

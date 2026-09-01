@@ -57,7 +57,8 @@ reliability of *this* code is set by everything that will run on top of it.
 |---|---|
 | `src/agent_run/cli.py` | argument parsing + command wiring (entry point `agent-run`) |
 | `src/agent_run/dispatch.py` | transport-neutral tool table and dispatcher |
-| `src/agent_run/mcp.py` | stdio MCP transport |
+| `src/agent_run/broker_client.py` | client for the resident Unix-socket daemon |
+| `src/agent_run/mcp.py` | stdio MCP transport (thin proxy over the socket daemon) |
 | `src/agent_run/api_socket.py` | Unix-socket JSON-RPC transport (`docs/api.md`) |
 | `src/agent_run/service.py` | AgentService — the domain facade every transport calls |
 | `src/agent_run/adapters/` | one package per engine (codex, claude, glm, qwen, …) |

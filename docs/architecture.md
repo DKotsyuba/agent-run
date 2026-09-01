@@ -19,6 +19,10 @@ engine drivers          adapters/  ──  supervisor  ──  detached children
                      codex · claude · glm · qwen · opencode
 ```
 
+MCP is a thin stdio proxy forwarding `tools/call` to the resident Unix-socket
+daemon. The daemon is the single launch host, closing the nested-sandbox
+failure mode; a proxy without store access survives release switches.
+
 Three transports expose one dispatcher. A tool added to
 `dispatch.TOOLS` appears in all of them; parity tests fail otherwise.
 `AgentService` is the only door to state and adapters — transports never
