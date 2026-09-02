@@ -6,6 +6,8 @@ import math
 import os
 import re
 import subprocess
+from dataclasses import replace
+import time
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -16,6 +18,7 @@ from .base import (
     AmbiguousDeliveryError,
     ChatTransportConfig,
     CompletionNotice,
+    DeliveryAttemptEvidence,
     DeliveryError,
     DeliveryReceipt,
 )
@@ -44,6 +47,8 @@ class CodexQueueSender:
     _SESSION_LIMIT = 512
     _MESSAGE_LIMIT = 4096
     _MESSAGE_ID_LIMIT = 512
+    _TAIL_BYTES = 4096
+    _SENSITIVE_ENV = re.compile(r"(?:AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)", re.I)
 
     def __init__(
         self,
@@ -88,7 +93,13 @@ class CodexQueueSender:
         self._environment = {
             key: value for key, value in inherited.items() if key not in self._CLAUDE_AUTH
         }
+        self._redactions = tuple(
+            value.encode("utf-8")
+            for key, value in inherited.items()
+            if value and self._SENSITIVE_ENV.search(key)
+        )
         self._runner = runner
+        self.last_evidence: DeliveryAttemptEvidence | None = None
 
     def __call__(self, external_session_id: str, text: str) -> str | None:
         session = self._bounded_text(
@@ -103,6 +114,8 @@ class CodexQueueSender:
             "--message",
             message,
         ]
+        self.last_evidence = None
+        started = time.monotonic()
         try:
             completed = self._runner(
                 argv,
@@ -114,22 +127,50 @@ class CodexQueueSender:
                 shell=False,
             )
         except subprocess.TimeoutExpired as error:
+            self.last_evidence = self._evidence(
+                "timeout", started, message, session,
+                error_class=type(error).__name__,
+                stdout=error.stdout,
+                stderr=error.stderr,
+            )
             raise TimeoutError("codex queue acceptance is unknown") from error
-        except OSError:
+        except OSError as error:
+            self.last_evidence = self._evidence("spawn", started, message, session,
+                                                spawn_errno=error.errno, error_class=type(error).__name__)
             raise
         except subprocess.SubprocessError as error:
+            self.last_evidence = self._evidence(
+                "subprocess", started, message, session,
+                error_class=type(error).__name__,
+            )
             raise OSError("codex queue subprocess failed") from error
 
         returncode = getattr(completed, "returncode", None)
         if type(returncode) is not int:
-            raise DeliveryError("codex queue returned an invalid process result")
-        output = getattr(completed, "stdout", None) or getattr(completed, "stderr", None) or ""
+            self.last_evidence = self._evidence(
+                "invalid_process_result", started, message, session,
+                error_class="invalid_process_result",
+            )
+            raise DeliveryError(
+                "codex queue returned an invalid process result",
+                evidence=self.last_evidence,
+            )
+        stdout, stderr = getattr(completed, "stdout", None), getattr(completed, "stderr", None)
+        self.last_evidence = self._evidence("success" if returncode == 0 else "exit", started,
+                                            message, session, returncode=returncode if type(returncode) is int else None,
+                                            error_class=None if type(returncode) is int else "invalid_process_result",
+                                            stdout=stdout, stderr=stderr)
+        output = stdout or stderr or ""
         if isinstance(output, bytes):
             output = output.decode("utf-8", "replace")
         if not isinstance(output, str):
-            raise DeliveryError("codex queue returned invalid output")
+            raise DeliveryError(
+                "codex queue returned invalid output", evidence=self.last_evidence
+            )
         if len(output.encode("utf-8")) > self._max_output:
-            raise DeliveryError("codex queue output exceeded its limit")
+            raise DeliveryError(
+                "codex queue output exceeded its limit", evidence=self.last_evidence
+            )
         output = output.strip()
 
         if returncode == 0:
@@ -138,11 +179,54 @@ class CodexQueueSender:
                 return None
             message_id = hit.group(1).rstrip(".")
             if not message_id or len(message_id) > self._MESSAGE_ID_LIMIT:
-                raise DeliveryError("codex queue returned an invalid message id")
+                raise DeliveryError(
+                    "codex queue returned an invalid message id",
+                    evidence=self.last_evidence,
+                )
+            assert self.last_evidence is not None
+            self.last_evidence = replace(
+                self.last_evidence, message_id_present=True
+            )
             return message_id
         if self._session_is_gone(output, session):
             raise SessionGoneError("codex queue session is gone")
-        raise DeliveryError(f"codex queue exited with status {returncode}")
+        raise DeliveryError(
+            f"codex queue exited with status {returncode}",
+            evidence=self.last_evidence,
+        )
+
+    def _evidence(self, classifier: str, started: float, message: str, session: str, *,
+                  returncode: int | None = None, spawn_errno: int | None = None,
+                  error_class: str | None = None, stdout: object = "", stderr: object = "") -> DeliveryAttemptEvidence:
+        """Build bounded evidence after replacing known private command values."""
+        def tail(value: object) -> tuple[str, int, bool]:
+            """Return one redacted UTF-8 tail, original byte count, and cut flag."""
+
+            if value is None:
+                raw = b""
+            elif isinstance(value, bytes):
+                raw = value
+            elif isinstance(value, str):
+                raw = value.encode("utf-8", "replace")
+            else:
+                return "", 0, False
+            safe = raw.replace(message.encode(), b"[redacted]").replace(
+                session.encode(), b"[redacted]"
+            )
+            for secret in self._redactions:
+                safe = safe.replace(secret, b"[redacted]")
+            bounded = safe[-self._TAIL_BYTES:]
+            return (
+                bounded.decode("utf-8", "ignore"),
+                len(raw),
+                len(raw) > self._TAIL_BYTES or len(safe) > len(bounded),
+            )
+        out, out_size, out_cut = tail(stdout)
+        err, err_size, err_cut = tail(stderr)
+        return DeliveryAttemptEvidence(classifier, self._executable,
+            ("executable", "queue", "option", "value", "option", "value"),
+            int((time.monotonic() - started) * 1000), returncode, spawn_errno, error_class,
+            out, err, out_size, err_size, out_cut, err_cut, False)
 
     @staticmethod
     def _bounded_text(
@@ -215,16 +299,24 @@ class CodexQueueTransport:
             # The queue may have accepted the message. At-least-once: report
             # ambiguity so the dispatcher records it and retries.
             raise AmbiguousDeliveryError(
-                f"codex queue acceptance is unknown for {notice.notification_id}"
+                f"codex queue acceptance is unknown for {notice.notification_id}",
+                evidence=getattr(self._sender, "last_evidence", None),
             ) from error
         except SessionGoneError as error:
             raise DeliveryError(
-                "codex queue session is gone; agent-run never opens a replacement"
+                "codex queue session is gone; agent-run never opens a replacement",
+                evidence=getattr(self._sender, "last_evidence", None),
             ) from error
         except OSError as error:
             raise DeliveryError(
-                f"codex queue is unreachable ({type(error).__name__})"
+                f"codex queue is unreachable ({type(error).__name__})",
+                evidence=getattr(self._sender, "last_evidence", None),
             ) from error
         if remote_message_id is not None and not isinstance(remote_message_id, str):
             raise DeliveryError("codex queue returned a non-string message id")
-        return DeliveryReceipt(remote_message_id=remote_message_id, ambiguous=False)
+        evidence = getattr(self._sender, "last_evidence", None)
+        return DeliveryReceipt(
+            remote_message_id=remote_message_id,
+            ambiguous=False,
+            evidence=evidence if isinstance(evidence, DeliveryAttemptEvidence) else None,
+        )

@@ -30,6 +30,7 @@ from .domain import (
     validate_agent_id,
 )
 from .errors import AuthError, StateTransitionError, ValidationError
+from .delivery.base import DeliveryAttemptEvidence
 from .launch import launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
@@ -68,6 +69,8 @@ def _failure_text(error: BaseException) -> str:
 
 @dataclass(frozen=True, slots=True)
 class DeliveryView:
+    """Current delivery state plus the latest bounded subprocess evidence."""
+
     agent_id: AgentId
     bound: bool
     orchestrator_session_id: str | None
@@ -76,6 +79,7 @@ class DeliveryView:
     attempts: int
     ambiguous: bool
     last_error: str | None
+    last_attempt: DeliveryAttemptEvidence | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -937,8 +941,10 @@ class AgentService:
         ).fetchone()
         if row is None:
             return DeliveryView(
-                agent_id, session_id is not None, session_id, None, "not_created", 0, False, None
+                agent_id, session_id is not None, session_id, None,
+                "not_created", 0, False, None, None,
             )
+        last_attempt = self._store.latest_delivery_attempt(str(row["id"]))
         return DeliveryView(
             agent_id,
             session_id is not None,
@@ -948,4 +954,5 @@ class AgentService:
             int(row["attempts"]),
             bool(row["ambiguous_result"]),
             None if row["last_error"] is None else str(row["last_error"]),
+            last_attempt,
         )

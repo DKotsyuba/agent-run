@@ -28,6 +28,7 @@ from agent_run.domain import (
     StartRequest,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
@@ -678,6 +679,25 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(len(limits.items), 1)
         self.assertEqual(limits.items[0].key.runtime, "fake")
         self.assertEqual(ADAPTER.limits_calls, 0)
+
+    def test_delivery_view_exposes_only_the_latest_typed_attempt_evidence(self) -> None:
+        """Expose latest safe evidence additively after a completed delivery."""
+
+        agent_id = self.start("delivery-evidence").agent_id
+        self.service.bind(
+            agent_id, OrchestratorRef("codex_queue", "session-1", "turn-1")
+        )
+        self.terminal(agent_id)
+        claimed = self.store.claim_delivery("worker", at=102, lease_seconds=10)
+        evidence = DeliveryAttemptEvidence(
+            "success", "/bin/codex", ("executable", "queue"), 2,
+            returncode=0, message_id_present=True,
+        )
+        self.store.complete_delivery(
+            claimed["id"], "worker", at=103, evidence=evidence
+        )
+
+        self.assertEqual(self.service.get(agent_id).delivery.last_attempt, evidence)
 
     def test_empty_roster_still_lists_the_runtime_with_a_reason(self) -> None:
         ADAPTER.models_result = ()

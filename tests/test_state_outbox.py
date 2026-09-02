@@ -8,6 +8,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
+from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.errors import ValidationError
 from agent_run.state import (
     StateStore,
@@ -136,6 +137,35 @@ class StateOutboxTests(unittest.TestCase):
             1,
         )
         self.assertIsNone(self.store.claim_delivery("other", at=1000))
+
+    def test_delivery_attempt_evidence_is_immutable_and_latest_is_validated(self) -> None:
+        """Persist one evidence row per owned attempt and return the latest."""
+
+        agent_id = self.create()
+        self.finish(agent_id)
+        delivery = self.store.claim_delivery("worker", at=5, lease_seconds=10)
+        first = DeliveryAttemptEvidence(
+            "exit", "/bin/codex", ("executable", "queue"), 4, returncode=127
+        )
+        self.store.retry_delivery(
+            delivery["id"], "worker", "exit 127", at=6, evidence=first
+        )
+        retried = self.store.claim_delivery("worker", at=7, lease_seconds=10)
+        second = DeliveryAttemptEvidence(
+            "success", "/bin/codex", ("executable", "queue"), 2,
+            returncode=0, message_id_present=True,
+        )
+        self.store.complete_delivery(
+            retried["id"], "worker", at=8, evidence=second
+        )
+
+        rows = list(self.store.connection.execute(
+            """SELECT attempt, recorded_at FROM delivery_attempt_evidence
+               WHERE delivery_id = ? ORDER BY attempt""",
+            (delivery["id"],),
+        ))
+        self.assertEqual([tuple(row) for row in rows], [(1, 6.0), (2, 8.0)])
+        self.assertEqual(self.store.latest_delivery_attempt(delivery["id"]), second)
 
     def test_failed_delivery_requires_live_owned_lease(self) -> None:
         agent_id = self.create()

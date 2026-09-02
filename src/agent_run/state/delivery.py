@@ -17,6 +17,33 @@ from .db import (
     timestamp,
 )
 
+_MAX_EVIDENCE_JSON_BYTES = 16384
+
+
+def _owned_attempt(
+    connection: sqlite3.Connection,
+    delivery_id: str,
+    owner: str,
+    now: float,
+    evidence_json: str | None,
+) -> int:
+    """Verify one live claim and optionally persist its immutable evidence."""
+
+    attempts = owned_delivery_attempts(connection, delivery_id, owner, now)
+    if attempts is None:
+        raise ValidationError("delivery lease is not owned by caller")
+    if evidence_json is not None:
+        nonblank("delivery attempt evidence", evidence_json)
+        if len(evidence_json.encode("utf-8")) > _MAX_EVIDENCE_JSON_BYTES:
+            raise ValidationError("delivery attempt evidence exceeds 16384 bytes")
+        connection.execute(
+            """INSERT INTO delivery_attempt_evidence
+               (delivery_id, attempt, recorded_at, evidence_json)
+               VALUES (?, ?, ?, ?)""",
+            (delivery_id, attempts, now, evidence_json),
+        )
+    return attempts
+
 
 def claim_delivery(
     connection: sqlite3.Connection,
@@ -40,12 +67,14 @@ def complete_delivery(
     *,
     remote_message_id: str | None = None,
     ambiguous_result: bool = False,
+    evidence_json: str | None = None,
     at: float | None = None,
 ) -> None:
     nonblank("delivery_id", delivery_id)
     nonblank("lease owner", owner)
     now = timestamp(at)
     with immediate(connection):
+        _owned_attempt(connection, delivery_id, owner, now, evidence_json)
         if not finish_delivery_claim(
             connection,
             delivery_id,
@@ -66,12 +95,14 @@ def fail_delivery(
     *,
     at: float | None = None,
     ambiguous_result: bool = False,
+    evidence_json: str | None = None,
 ) -> None:
     nonblank("delivery_id", delivery_id)
     nonblank("lease owner", owner)
     nonblank("delivery error", error)
     now = timestamp(at)
     with immediate(connection):
+        _owned_attempt(connection, delivery_id, owner, now, evidence_json)
         if not finish_delivery_claim(
             connection,
             delivery_id,
@@ -92,6 +123,7 @@ def retry_delivery(
     *,
     at: float | None = None,
     ambiguous_result: bool = False,
+    evidence_json: str | None = None,
     base_delay: float = 1,
     max_delay: float = 300,
 ) -> float:
@@ -102,9 +134,9 @@ def retry_delivery(
     max_delay = positive_number("max_delay", max_delay)
     now = timestamp(at)
     with immediate(connection):
-        attempts = owned_delivery_attempts(connection, delivery_id, owner, now)
-        if attempts is None:
-            raise ValidationError("delivery lease is not owned by caller")
+        attempts = _owned_attempt(
+            connection, delivery_id, owner, now, evidence_json
+        )
         delay = min(max_delay, base_delay * (2 ** min(attempts - 1, 20)))
         next_attempt_at = now + delay
         finish_delivery_claim(
@@ -186,4 +218,3 @@ def expire_unbound_deliveries(
                 (delivery_id,),
             )
     return expired
-

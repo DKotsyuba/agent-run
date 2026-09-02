@@ -55,6 +55,14 @@ tool's arguments.
 {"jsonrpc": "2.0", "id": 1, "result": {"agent_id": "ag-...", "status": "running", ...}}
 ```
 
+Terminal agent responses include `delivery.last_attempt` when Codex queue made
+at least one delivery attempt. The additive nullable object records a safe
+classifier, executable provenance, argv shape without values, duration, exact
+return code or spawn errno, error class, original output byte counts,
+truncation flags, bounded redacted stdout/stderr tails, and whether a remote
+message id was observed. Each tail is at most 4096 UTF-8 bytes. Messages,
+session ids, argv/environment values, and credentials are never persisted.
+
 One connection may send many requests; on a single connection they are
 answered in order. Open several connections for parallelism — dispatch is
 serialized server-side, so calls are cheap-interleaved, not truly parallel
@@ -164,3 +172,5 @@ id); `-32603` as a bug to report.
   the optional sealed-release layout restart it after switching
   `~/.agent-run/standalone/current`; ordinary pip/pipx installs use the
   `agent-run` executable on `PATH`.
+- Schema version 9 adds immutable per-attempt delivery evidence. Older resident
+  processes refuse the migrated database and must be restarted after upgrade.

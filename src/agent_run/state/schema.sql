@@ -113,6 +113,15 @@ CREATE TABLE deliveries (
   UNIQUE (agent_id, terminal_event_seq)
 );
 
+CREATE TABLE delivery_attempt_evidence (
+  delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+  attempt INTEGER NOT NULL CHECK (attempt > 0),
+  recorded_at REAL NOT NULL,
+  evidence_json TEXT NOT NULL
+    CHECK (length(CAST(evidence_json AS BLOB)) <= 16384),
+  PRIMARY KEY (delivery_id, attempt)
+);
+
 CREATE TABLE capacity_samples (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   runtime TEXT NOT NULL,
@@ -229,4 +238,4 @@ CREATE INDEX idx_workflow_steps_agent
   ON workflow_steps(agent_id)
   WHERE agent_id IS NOT NULL;
 
-PRAGMA user_version = 8;
+PRAGMA user_version = 9;

@@ -128,6 +128,7 @@ def _build_poisoned_v5_store(path: Path, run_id: str) -> None:
         # is what proves 006's repair, and the store must look exactly like a
         # genuine v5 one so migrations 006..end can re-run over it.
         connection.execute("DROP TABLE run_stats")
+        connection.execute("DROP TABLE delivery_attempt_evidence")
         connection.execute("PRAGMA user_version=5")
         connection.commit()
     finally:

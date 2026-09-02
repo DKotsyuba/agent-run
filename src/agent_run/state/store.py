@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 _logger = logging.getLogger("agent_run.state")
 
@@ -24,6 +25,9 @@ from agent_run.domain import (
     validate_transition,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+
+if TYPE_CHECKING:
+    from agent_run.delivery.base import DeliveryAttemptEvidence
 
 from . import capacity, delivery, workflow
 from .db import (
@@ -48,6 +52,25 @@ from .db import (
     session_for_ref,
     timestamp,
 )
+
+_MAX_DELIVERY_EVIDENCE_JSON_BYTES = 16384
+
+
+def _delivery_evidence_json(
+    evidence: DeliveryAttemptEvidence | None,
+) -> str | None:
+    """Return bounded canonical JSON for typed evidence, or ``None``."""
+
+    if evidence is None:
+        return None
+    from agent_run.delivery.base import DeliveryAttemptEvidence
+
+    if not isinstance(evidence, DeliveryAttemptEvidence):
+        raise ValidationError("evidence must be DeliveryAttemptEvidence or None")
+    encoded = json_text(evidence.payload())
+    if len(encoded.encode("utf-8")) > _MAX_DELIVERY_EVIDENCE_JSON_BYTES:
+        raise ValidationError("delivery attempt evidence exceeds 16384 bytes")
+    return encoded
 from .start import AgentCreation, create_agent as create_agent_record
 
 
@@ -791,33 +814,66 @@ class StateStore:
         self, delivery_id: str, owner: str, *,
         remote_message_id: str | None = None,
         ambiguous_result: bool = False,
+        evidence: DeliveryAttemptEvidence | None = None,
         at: float | None = None,
     ) -> None:
+        """Complete an owned claim and atomically record optional evidence."""
+
         delivery.complete_delivery(
             self.connection, delivery_id, owner,
             remote_message_id=remote_message_id,
-            ambiguous_result=ambiguous_result, at=at,
+            ambiguous_result=ambiguous_result,
+            evidence_json=_delivery_evidence_json(evidence), at=at,
         )
 
     def fail_delivery(
         self, delivery_id: str, owner: str, error: str, *,
         at: float | None = None, ambiguous_result: bool = False,
+        evidence: DeliveryAttemptEvidence | None = None,
     ) -> None:
+        """Fail an owned claim and atomically record optional evidence."""
+
         delivery.fail_delivery(
             self.connection, delivery_id, owner, error,
             at=at, ambiguous_result=ambiguous_result,
+            evidence_json=_delivery_evidence_json(evidence),
         )
 
     def retry_delivery(
         self, delivery_id: str, owner: str, error: str, *,
         at: float | None = None, ambiguous_result: bool = False,
+        evidence: DeliveryAttemptEvidence | None = None,
         base_delay: float = 1, max_delay: float = 300,
     ) -> float:
+        """Schedule an owned retry and atomically record optional evidence."""
+
         return delivery.retry_delivery(
             self.connection, delivery_id, owner, error,
             at=at, ambiguous_result=ambiguous_result,
+            evidence_json=_delivery_evidence_json(evidence),
             base_delay=base_delay, max_delay=max_delay,
         )
+
+    def latest_delivery_attempt(
+        self, delivery_id: str
+    ) -> DeliveryAttemptEvidence | None:
+        """Return the latest validated evidence for ``delivery_id``, if any."""
+
+        nonblank("delivery_id", delivery_id)
+        row = self.connection.execute(
+            """SELECT evidence_json FROM delivery_attempt_evidence
+               WHERE delivery_id = ? ORDER BY attempt DESC LIMIT 1""",
+            (delivery_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["evidence_json"]))
+        except (TypeError, ValueError) as error:
+            raise ValidationError("invalid stored delivery attempt evidence") from error
+        from agent_run.delivery.base import DeliveryAttemptEvidence
+
+        return DeliveryAttemptEvidence.from_payload(payload)
 
     def cancel_delivery(self, delivery_id: str) -> bool:
         return delivery.cancel_delivery(self.connection, delivery_id)

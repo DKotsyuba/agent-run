@@ -215,6 +215,52 @@ class CodexQueueSenderTests(unittest.TestCase):
             self.sender(RecordingRunner(error=io_error))("session-1", "trusted message")
         self.assertIs(caught_io.exception, io_error)
 
+    def test_attempt_evidence_is_bounded_redacted_and_exactly_classified(self) -> None:
+        """Preserve exit, timeout, and success facts without private values."""
+
+        self.environment["SERVICE_TOKEN"] = "token-secret"
+        private = "trusted message"
+        stderr = f"session-1 {private} token-secret " + ("é" * 3000)
+        sender = self.sender(
+            RecordingRunner(returncode=127, stdout="stdout-safe", stderr=stderr)
+        )
+        with self.assertRaises(DeliveryError) as caught:
+            sender("session-1", private)
+        evidence = caught.exception.evidence
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual((evidence.classifier, evidence.returncode), ("exit", 127))
+        self.assertEqual(evidence.stdout_tail, "stdout-safe")
+        self.assertEqual(evidence.stderr_bytes, len(stderr.encode("utf-8")))
+        self.assertTrue(evidence.stderr_truncated)
+        self.assertLessEqual(len(evidence.stderr_tail.encode("utf-8")), 4096)
+        for secret in ("session-1", private, "token-secret"):
+            self.assertNotIn(secret, evidence.stderr_tail)
+
+        accepted = self.sender(
+            RecordingRunner(stdout="Queued message remote-1 for thread session-1.\n")
+        )
+        self.assertEqual(accepted("session-1", private), "remote-1")
+        assert accepted.last_evidence is not None
+        self.assertTrue(accepted.last_evidence.message_id_present)
+
+        timed_out = self.sender(
+            RecordingRunner(error=subprocess.TimeoutExpired(["codex"], 1))
+        )
+        with self.assertRaises(TimeoutError):
+            timed_out("session-1", private)
+        assert timed_out.last_evidence is not None
+        self.assertEqual(timed_out.last_evidence.classifier, "timeout")
+
+        spawned = self.sender(RecordingRunner(error=OSError(2, "missing")))
+        with self.assertRaises(OSError):
+            spawned("session-1", private)
+        assert spawned.last_evidence is not None
+        self.assertEqual(
+            (spawned.last_evidence.classifier, spawned.last_evidence.spawn_errno),
+            ("spawn", 2),
+        )
+
     def test_constructor_inputs_and_outputs_are_bounded_without_replacement_paths(self) -> None:
         with self.assertRaises(ValidationError):
             CodexQueueSender("codex")

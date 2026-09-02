@@ -59,6 +59,10 @@ reliability of *this* code is set by everything that will run on top of it.
   sha256/size/path and completion sentinels; anything that reports
   "succeeded" must be derivable from recorded state, not from an
   adapter's optimism.
+- **Delivery diagnostics are bounded and secret-safe.** Persist one immutable
+  evidence row per owned Codex queue attempt in the same transaction as its
+  delivery verdict. Never store the message, session id, argv/environment
+  values, or credentials; tails stay redacted and at most 4096 UTF-8 bytes.
 
 ## Layout
 

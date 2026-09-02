@@ -30,8 +30,10 @@ touch the store or an engine directly.
 
 ## Durable agents
 
-`start` validates the request, writes the agent row (status `created`),
-and launches a **detached supervisor process** that owns the child engine.
+`start` validates and durably admits the request as `starting`, then returns its
+agent id before authentication, materialization, adapter preparation, spawn, or
+READY. A bounded worker with its own thread-affine store performs those slow
+steps and launches a **detached supervisor process** that owns the child engine.
 On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
 the legacy fork path is only a compatibility fallback when session-creating
 spawn is explicitly unavailable.
@@ -76,11 +78,12 @@ lookups where configured.
 
 ## State
 
-Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 8`.
+Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 9`.
 Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
 `commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
-`deliveries`, `capacity_samples`, `workflow_runs` / `workflow_steps` /
-`workflow_deliveries`, `run_stats`, `context_receipts`.
+`deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
+`workflow_runs` / `workflow_steps` / `workflow_deliveries`, `run_stats`,
+`context_receipts`.
 
 Schema changes ship as numbered migrations (`state/migrations/`) with a
 pre-migration backup; components version-check and refuse to run against a
@@ -98,6 +101,11 @@ row is created and a dispatcher pushes the completion notice back to the
 orchestrator's chat (codex queue and Claude UDS transports exist).
 Unbound runs create no delivery row — `wait` on them is the delivery.
 Deliveries retry with backoff and expire instead of retrying forever.
+Each Codex queue attempt records an immutable bounded evidence row in the same
+transaction that completes, retries, or fails its owned delivery claim. The
+record distinguishes exit status (including 127), spawn errno, timeout, session
+loss, and success while storing no message, session id, argv/environment value,
+or credential. Status exposes only the latest validated safe summary.
 
 ## Workflows
 

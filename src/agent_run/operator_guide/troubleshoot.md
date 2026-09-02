@@ -66,6 +66,16 @@ The `PostToolUse` hook on `mcp__agent[-_]run__start` binds a session using
 `claude_uds`. A missing or wrong `--transport` on that hook is the usual
 cause of "the agent ran but never delivered a result back."
 
+## Delivery attempt evidence
+
+When Codex queue delivery retries or fails, inspect `status.delivery.last_attempt`.
+`classifier`, `returncode`, `spawn_errno`, `error_class`, and `duration_ms`
+separate an executable failure, exit 127, timeout, lost session, malformed
+result, and success. Output tails are redacted and capped at 4096 UTF-8 bytes;
+byte counts and truncation flags show when the original output was larger.
+`null` means no Codex queue attempt has been recorded. Raw messages, session
+ids, argument/environment values, and credentials are intentionally unavailable.
+
 ## Orphan check
 
 To find agents whose supervisor process died without cleanup: `ps` for

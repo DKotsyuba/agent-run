@@ -20,6 +20,7 @@ from .base import (
     AmbiguousDeliveryError,
     ChatTransport,
     CompletionNotice,
+    DeliveryAttemptEvidence,
     DeliveryError,
 )
 
@@ -205,7 +206,9 @@ class DeliveryDispatcher:
         )
         transport = self._transports.get(str(row["transport"]))
         if transport is None:
-            if self._fail(delivery_id, "delivery transport is not configured", False, at):
+            if self._fail(
+                delivery_id, "delivery transport is not configured", False, at, None
+            ):
                 return _Verdict("failed", False)
             return _Verdict("claim_lost", True)
         try:
@@ -213,12 +216,12 @@ class DeliveryDispatcher:
         except AmbiguousDeliveryError as error:
             # At-least-once: the message may have arrived, so record the
             # ambiguity and try again. A duplicate wake names the same agent.
-            return self._give_up_or_retry(row, str(error), True, at)
+            return self._give_up_or_retry(row, str(error), True, at, error.evidence)
         except DeliveryError as error:
-            return self._give_up_or_retry(row, str(error), False, at)
+            return self._give_up_or_retry(row, str(error), False, at, error.evidence)
         except Exception as error:
             return self._give_up_or_retry(
-                row, f"transport send raised {type(error).__name__}", True, at
+                row, f"transport send raised {type(error).__name__}", True, at, None
             )
         try:
             self._store.complete_delivery(
@@ -226,6 +229,7 @@ class DeliveryDispatcher:
                 self._owner,
                 remote_message_id=receipt.remote_message_id,
                 ambiguous_result=receipt.ambiguous,
+                evidence=receipt.evidence,
                 at=at,
             )
         except ValidationError:
@@ -241,6 +245,7 @@ class DeliveryDispatcher:
         error: str,
         ambiguous: bool,
         at: float | None,
+        evidence: DeliveryAttemptEvidence | None,
     ) -> _Verdict:
         delivery_id = str(row["id"])
         limit = self._config.max_attempts
@@ -250,7 +255,7 @@ class DeliveryDispatcher:
                 "dispatch give_up delivery_id=%s attempts=%s reason=%s",
                 delivery_id, row["attempts"], error,
             )
-            if self._fail(delivery_id, error, ambiguous, at):
+            if self._fail(delivery_id, error, ambiguous, at, evidence):
                 return _Verdict("failed", ambiguous)
             return _Verdict("claim_lost", True)
         try:
@@ -260,6 +265,7 @@ class DeliveryDispatcher:
                 error,
                 at=at,
                 ambiguous_result=ambiguous,
+                evidence=evidence,
                 base_delay=self._config.retry_base_seconds,
                 max_delay=self._config.retry_cap_seconds,
             )
@@ -269,7 +275,12 @@ class DeliveryDispatcher:
         return _Verdict("retry_wait", ambiguous)
 
     def _fail(
-        self, delivery_id: str, error: str, ambiguous: bool, at: float | None
+        self,
+        delivery_id: str,
+        error: str,
+        ambiguous: bool,
+        at: float | None,
+        evidence: DeliveryAttemptEvidence | None,
     ) -> bool:
         try:
             self._store.fail_delivery(
@@ -278,6 +289,7 @@ class DeliveryDispatcher:
                 error,
                 at=at,
                 ambiguous_result=ambiguous,
+                evidence=evidence,
             )
         except ValidationError:
             return False

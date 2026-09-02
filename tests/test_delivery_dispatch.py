@@ -10,6 +10,7 @@ from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.state import StateStore
 from agent_run.delivery.base import (
     AmbiguousDeliveryError,
+    DeliveryAttemptEvidence,
     DeliveryError,
     DeliveryReceipt,
 )
@@ -148,6 +149,33 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.assertEqual(self.delivery_row()["next_attempt_at"], 18)
         self.assertEqual(self.delivery_row()["state"], "retry_wait")
         self.assertEqual(self.delivery_row()["attempts"], 3)
+
+    def test_attempt_evidence_follows_retry_and_success_transactions(self) -> None:
+        """Persist failed and successful transport evidence with their claims."""
+
+        failed = DeliveryAttemptEvidence(
+            "exit", "/bin/codex", ("executable", "queue"), 5, returncode=127
+        )
+        succeeded = DeliveryAttemptEvidence(
+            "success", "/bin/codex", ("executable", "queue"), 3,
+            returncode=0, message_id_present=True,
+        )
+        transport = FakeTransport(
+            AmbiguousDeliveryError("unknown acceptance", evidence=failed),
+            DeliveryReceipt("remote-1", evidence=succeeded),
+        )
+        dispatcher = self.dispatcher(transport)
+
+        self.assertEqual(dispatcher.run(lock_path=self.lock_path, at=10).retried, 1)
+        self.assertEqual(dispatcher.run(lock_path=self.lock_path, at=12).delivered, 1)
+        delivery_id = str(self.delivery_row()["id"])
+        self.assertEqual(self.store.latest_delivery_attempt(delivery_id), succeeded)
+        attempts = self.store.connection.execute(
+            """SELECT COUNT(*) FROM delivery_attempt_evidence
+               WHERE delivery_id = ?""",
+            (delivery_id,),
+        ).fetchone()[0]
+        self.assertEqual(attempts, 2)
 
     def test_exhausted_attempt_budget_fails_the_delivery(self) -> None:
         transport = FakeTransport(DeliveryError("queue refused"))

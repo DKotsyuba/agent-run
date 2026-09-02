@@ -161,6 +161,12 @@ Useful verbs beyond that: `status`, `transcript --follow`, `steer`,
 `cancel`, `agents` (list), `models`, `limits`, `summary`,
 `stats backfill`. All output is line-delimited JSON — pipe it into `jq`.
 
+For Codex queue delivery, `status.delivery.last_attempt` exposes the latest
+bounded diagnostic summary: classifier, duration, exact exit status or spawn
+errno, output byte counts/truncation, and redacted stdout/stderr tails. It never
+contains the delivered message, session id, argv values, environment values,
+or credentials; non-queue deliveries report `null`.
+
 ## Use as an MCP server
 
 `agent-run mcp` is a thin stdio proxy over the resident Unix-socket daemon.
