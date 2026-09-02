@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -34,6 +35,23 @@ class StateDatabaseTests(unittest.TestCase):
             for candidate in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
                 self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
             reopened.close()
+
+    def test_reopen_tolerates_chmod_denied_but_creation_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            initialize_database(database).close()
+
+            denied = mock.patch.object(
+                Path, "chmod", side_effect=PermissionError(1, "Operation not permitted")
+            )
+            with denied:
+                reopened = open_database(database)
+                self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+                reopened.close()
+
+                with self.assertRaises(PermissionError):
+                    initialize_database(Path(directory) / "fresh.db")
+            self.assertFalse((Path(directory) / "fresh.db").exists())
 
     def test_invalid_and_newer_versions_refuse_without_schema_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

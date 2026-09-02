@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -32,6 +33,7 @@ from .migrations import (
 MAX_INLINE_MESSAGE_BYTES = 32 * 1024
 INLINE_STUB_HEAD_CHARS = 4096
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+_logger = logging.getLogger("agent_run.state")
 
 
 def timestamp(value: float | None = None) -> float:
@@ -616,7 +618,19 @@ def _configure(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA busy_timeout=5000")
 
 
-def _private_path(path: Path, *, parent_created: bool) -> None:
+def _private_path(path: Path, *, parent_created: bool, strict: bool) -> None:
+    """Tighten the store file, its WAL/SHM siblings and (if just made) its
+    parent directory to owner-only modes.
+
+    ``strict`` is True when this process created the database: a chmod failure
+    then propagates, because a store left world-readable at creation is a
+    defect. It is False for a pre-existing database: the chmod is best effort,
+    so a sandboxed reader (read-only filesystem, ``PermissionError`` on chmod)
+    can still open a store someone else created. A missing sibling is never an
+    error in either mode. Failures skipped in best-effort mode are logged at
+    debug on ``agent_run.state``.
+    """
+
     if parent_created:
         path.parent.chmod(0o700)
     for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
@@ -624,6 +638,10 @@ def _private_path(path: Path, *, parent_created: bool) -> None:
             candidate.chmod(0o600)
         except FileNotFoundError:
             pass
+        except OSError as error:
+            if strict:
+                raise
+            _logger.debug("db=%s chmod skipped: %s", candidate, error)
 
 
 def initialize_database(database: str | Path) -> sqlite3.Connection:
@@ -639,7 +657,7 @@ def initialize_database(database: str | Path) -> sqlite3.Connection:
         migrate(path)
     connection = _raw_connect(path)
     try:
-        _private_path(path, parent_created=parent_created)
+        _private_path(path, parent_created=parent_created, strict=not existed)
         version = _version(connection)
         tables = _tables(connection)
         if version != 0 or tables:
@@ -647,7 +665,7 @@ def initialize_database(database: str | Path) -> sqlite3.Connection:
         with _initialization_lock(path):
             _initialize_schema(connection)
             _configure(connection)
-        _private_path(path, parent_created=parent_created)
+        _private_path(path, parent_created=parent_created, strict=not existed)
         return connection
     except BaseException:
         connection.close()
@@ -661,18 +679,22 @@ def open_database(database: str | Path) -> sqlite3.Connection:
 
     An older home therefore needs no manual step; a newer one is refused by
     :func:`migrate` rather than silently opened.
+
+    Re-tightening the file modes is best effort here: the database already
+    exists, so a caller that may not chmod it (sandboxed read-only child) still
+    gets a connection instead of a ``PermissionError``.
     """
 
     path = Path(database).expanduser().resolve()
     if not path.is_file():
         raise ValidationError(f"state database does not exist: {path}")
-    _private_path(path, parent_created=False)
+    _private_path(path, parent_created=False, strict=False)
     migrate(path)
     connection = _raw_connect(path, existing=True)
     try:
         _validate_schema(connection)
         _configure(connection)
-        _private_path(path, parent_created=False)
+        _private_path(path, parent_created=False, strict=False)
         return connection
     except BaseException:
         connection.close()
