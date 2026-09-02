@@ -13,6 +13,7 @@ from .topology import (
     CapacityRouteDescriptor,
     CapacityTopology,
     PhysicalPoolDescriptor,
+    account_token,
     validate_topology,
 )
 
@@ -54,14 +55,16 @@ def normalize_rate_limits(
     fixtures. Multi-bucket rateLimitsByLimitId is preferred, while legacy
     rateLimits is wrapped as one bucket. Only finite 0--100 percentages with
     positive finite window durations are emitted. Missing reset timestamps
-    remain None; malformed timestamps skip only their window.
+    remain None. Malformed present windows disable their whole bucket route;
+    valid samples still remain available as advisory evidence.
 
     Each bucket becomes one account-namespaced physical pool and route. Stable
     provider limitId values identify samples and pools; limitName is display-only
     quota_lane metadata. Evidence remains fresh for the bounded source interval,
     never until the provider reset. The returned backend account id is ephemeral
     deduplication data and callers must neither persist nor log it. Malformed
-    envelopes raise ValidationError; malformed buckets or windows are ignored.
+    envelopes raise ValidationError; absent/null windows represent no quota,
+    whereas malformed present windows are never treated as missing constraints.
     """
 
     wrapped = response.get("result")
@@ -90,15 +93,19 @@ def normalize_rate_limits(
     samples: list[LimitSample] = []
     pools: list[PhysicalPoolDescriptor] = []
     routes: list[CapacityRouteDescriptor] = []
-    scope = target if target is not None else "base"
+    scope = account_token(target, absent_token="base")
     for limit_id, bucket in buckets_obj.items():
         if not isinstance(limit_id, str) or not limit_id or not isinstance(bucket, Mapping):
             continue
         display_name = bucket.get("limitName")
         quota_lane = display_name if isinstance(display_name, str) and display_name else limit_id
         keys: set[CapacityKey] = set()
+        complete = True
         for window in (bucket.get("primary"), bucket.get("secondary")):
+            if window is None:
+                continue
             if not isinstance(window, Mapping):
+                complete = False
                 continue
             used = _number(window.get("usedPercent"))
             minutes = _number(window.get("windowDurationMins"))
@@ -111,12 +118,14 @@ def normalize_rate_limits(
                 or minutes <= 0
                 or (reset_value is not None and (reset is None or reset < 0))
             ):
+                complete = False
                 continue
             reset_datetime = None
             if reset is not None:
                 try:
                     reset_datetime = datetime.fromtimestamp(reset, timezone.utc)
                 except (OverflowError, OSError, ValueError):
+                    complete = False
                     continue
             window_name = _window_name(minutes)
             samples.append(
@@ -132,7 +141,7 @@ def normalize_rate_limits(
                 )
             )
             keys.add(CapacityKey(runtime, limit_id, window_name, target, _SOURCE))
-        if not keys:
+        if not keys or not complete:
             continue
         pool_id = f"{runtime}:{scope}:{limit_id}"
         pools.append(PhysicalPoolDescriptor(pool_id, frozenset(keys)))

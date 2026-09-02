@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+from urllib.parse import quote
 
 from ..adapters.base import LimitSample
 from ..errors import ValidationError
@@ -246,6 +247,23 @@ def validate_slice(
     )
 
 
+def account_token(account: str | None, *, absent_token: str) -> str:
+    """Encode an opaque nullable account without colliding with literal labels.
+
+    ``absent_token`` is a non-empty source-defined token without an ``@``
+    prefix. ``None`` keeps that token; every non-empty string label gets an
+    ``@`` prefix and URL-escaped separators. Invalid inputs raise
+    ``ValidationError``. This changes identifiers only, never sample keys.
+    """
+
+    absent = _required_text("absent_token", absent_token)
+    if absent.startswith("@"):
+        raise ValidationError("absent_token must not start with @")
+    return absent if account is None else "@" + quote(
+        _required_text("account", account), safe=""
+    )
+
+
 def pools_from_samples(
     runtime: str, samples: Iterable[LimitSample]
 ) -> tuple[PhysicalPoolDescriptor, ...]:
@@ -253,7 +271,8 @@ def pools_from_samples(
 
     Pooling is by whole sample identity (lane, window, target, source): each
     distinct identity becomes one pool whose id is built from those fields,
-    with ``shared`` marking a ``None`` target. Samples sharing an identity
+    with a typed token distinguishing ``None`` from every literal target.
+    Samples sharing an identity
     share one reservoir — the shared-target case — while any difference in
     identity keeps pools distinct. ``runtime`` names the engine for the ids
     and each pool's keys; it is not inspected beyond being
@@ -270,7 +289,7 @@ def pools_from_samples(
         identity = (
             sample.lane,
             sample.window,
-            "shared" if sample.target is None else sample.target,
+            account_token(sample.target, absent_token="shared"),
             sample.source,
         )
         grouped.setdefault(identity, set()).add(

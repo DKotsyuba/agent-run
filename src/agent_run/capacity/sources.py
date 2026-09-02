@@ -31,6 +31,7 @@ from .topology import (
     CapacityRouteDescriptor,
     CapacityTopology,
     PhysicalPoolDescriptor,
+    account_token,
     pools_from_samples,
     validate_slice,
     validate_topology,
@@ -370,7 +371,7 @@ def collect_codex_appserver_slices(
                 default=_CODEX_APPSERVER_VALID_FOR_SECONDS,
             )
             valid_until = observed_at + valid_for
-            scope_id = f"codex:{target if target is not None else 'base'}"
+            scope_id = f"codex:{account_token(target, absent_token='base')}"
             slices.append(validate_slice(
                 name, scope_id, samples, topology, observed_at, valid_until
             ))
@@ -465,7 +466,7 @@ def _account_routes(
         grouped.setdefault(target, set()).add(pool_id)
     routes = tuple(
         CapacityRouteDescriptor(
-            route_id=f"{name}:{account if account is not None else 'default'}:default",
+            route_id=f"{name}:{account_token(account, absent_token='default')}:default",
             runtime=name,
             account=account,
             quota_lane="default",

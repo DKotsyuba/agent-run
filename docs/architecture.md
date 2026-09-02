@@ -149,6 +149,13 @@ snapshot expires instead of deleting healthy sibling scopes. Samples carry
 validity windows; `limits` serves projections with burn-rate–based exhaustion
 risk per lane, worst first, hiding nothing.
 
+Account labels are opaque: a labelled account cannot collide with the absent
+account even when its label is `base`, `default`, or `shared`. Provider-scoped
+identifiers encode that distinction without changing the original sample keys.
+For Codex, a malformed present quota window disables that bucket's route;
+valid sibling samples remain advisory evidence, never proof that the unknown
+governing limit does not exist.
+
 Capacity route ranking is a pure read of those snapshots. Every governing
 window must be fresh and known; a zero window is omitted before scoring.
 Evidence spanning at least one hour projects remaining capacity to reset,

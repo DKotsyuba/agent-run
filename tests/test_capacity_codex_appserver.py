@@ -157,9 +157,9 @@ class NormalizeRateLimitsTests(unittest.TestCase):
         )
         self.assertEqual({s.target for s in samples}, {"plus"})
         (pool,) = topology.pools
-        self.assertEqual(pool.pool_id, f"{_RUNTIME}:plus:codex_plus")
+        self.assertEqual(pool.pool_id, f"{_RUNTIME}:@plus:codex_plus")
         (route,) = topology.routes
-        self.assertEqual(route.route_id, f"{_RUNTIME}:plus:codex_plus")
+        self.assertEqual(route.route_id, f"{_RUNTIME}:@plus:codex_plus")
         self.assertEqual(route.account, "plus")
         # No display limitName: quota_lane falls back to the stable limitId.
         self.assertEqual(route.quota_lane, "codex_plus")
@@ -263,7 +263,7 @@ class CollectCodexAppserverSlicesTests(unittest.TestCase):
         }
         with self._patch_reads(responses):
             slices = sources.collect_codex_appserver_slices(_RUNTIME, runtime, _OBSERVED)
-        self.assertEqual([s.scope_id for s in slices], ["codex:base", "codex:plus"])
+        self.assertEqual([s.scope_id for s in slices], ["codex:base", "codex:@plus"])
         for slice_ in slices:
             self.assertIsInstance(slice_, CapacityCollectionSlice)
             self.assertEqual(slice_.runtime, _RUNTIME)
@@ -316,7 +316,7 @@ class CollectCodexAppserverSlicesTests(unittest.TestCase):
         with self.assertLogs("agent_run.capacity", level="WARNING") as captured:
             with self._patch_reads(responses):
                 slices = sources.collect_codex_appserver_slices(_RUNTIME, runtime, _OBSERVED)
-        self.assertEqual([s.scope_id for s in slices], ["codex:base", "codex:spark-team"])
+        self.assertEqual([s.scope_id for s in slices], ["codex:base", "codex:@spark-team"])
         joined = "\n".join(captured.output)
         self.assertIn("failed=ConnectionError", joined)
         # Neither the failure detail nor any backend account id is logged.
@@ -360,7 +360,7 @@ class CollectCodexAppserverSlicesTests(unittest.TestCase):
                 store.close()
         # Multi-scope persistence: both scopes stored once, then left untouched.
         self.assertEqual(len(snapshots), 2)
-        self.assertEqual({s["scope_id"] for s in snapshots}, {"codex:base", "codex:plus"})
+        self.assertEqual({s["scope_id"] for s in snapshots}, {"codex:base", "codex:@plus"})
         self.assertEqual({row["target"] for row in rows}, {None, "plus"})
 
 
