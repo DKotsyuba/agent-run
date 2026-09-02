@@ -2,6 +2,11 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.3.1] - 2026-09-02
+
+- Accepted the LSP plugin's `PostToolUseFailure` hook in Codex plugin trust
+  materialization, restoring Codex launches after the plugin event expansion.
+
 ## [0.3.0] - 2026-09-02
 
 - Made `start` durably asynchronous: runtime authentication, materialization,
@@ -45,6 +50,7 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[0.3.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.1
 [0.3.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.0
 [0.2.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.1
 [0.2.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.0

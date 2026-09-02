@@ -60,7 +60,7 @@ to drive (`codex`, `claude`, `qwen`, `opencode` — any subset).
 
 ```bash
 pipx install \
-  https://github.com/DKotsyuba/agent-run/releases/download/v0.3.0/agent_run-0.3.0-py3-none-any.whl
+  https://github.com/DKotsyuba/agent-run/releases/download/v0.3.1/agent_run-0.3.1-py3-none-any.whl
 # or use the same wheel URL with `python -m pip install` / `uv tool install`
 ```
 
@@ -76,7 +76,7 @@ To install a tagged source tree instead of a release artifact:
 
 ```bash
 python -m pip install \
-  git+https://github.com/DKotsyuba/agent-run.git@v0.3.0
+  git+https://github.com/DKotsyuba/agent-run.git@v0.3.1
 ```
 
 Then bootstrap the home directory (default `~/.agent-run`, override with
