@@ -93,6 +93,11 @@ task. `insufficient_diversity` is true when fewer than two working physical
 choices remain; the routes list is still authoritative and may contain one or
 zero entries.
 
+The equivalent human-facing command is `agent-run capacity order`. Its first
+route is the highest capacity priority; it only reports a read-only order and
+never launches work. The orchestrator still selects a compatible role and model
+alias from that route's aliases.
+
 Two extra methods exist only on this transport:
 
 - `wait` — params `{"agent_id": "...", "timeout_seconds": 240}` (timeout

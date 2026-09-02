@@ -53,3 +53,9 @@ Each `[runtimes.<name>]` table may declare:
 
 Declaring a key with an unsupported value fails closed at load time
 (`ValidationError`), not silently at first use.
+
+Use `agent-run capacity order` to inspect the resulting role-independent
+priority order. The first route is highest priority, but this is not an
+automatic launch: the orchestrator must still choose a compatible role/model
+alias. The output includes working routes, deferred evidence, exhausted
+omissions, unavailable runtimes, and `insufficient_diversity`.

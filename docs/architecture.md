@@ -147,6 +147,11 @@ while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
 at 50%. The worst window defines a nonnegative route score, then a positive
 runtime multiplier scales its priority. Concrete account/model aliases sharing
 the same runtime and physical pool set remain one capacity choice.
+`agent-run capacity order` exposes that same read-only, role-independent order:
+its first route is highest priority, while the orchestrator still chooses a
+compatible role/model alias and decides whether to launch. The output retains
+deferred evidence, exhausted omissions, unavailable runtimes, and the
+`insufficient_diversity` signal alongside the working routes.
 Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
 terminal, with an idempotent `stats backfill`.
 

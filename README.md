@@ -32,7 +32,7 @@ you / your agent / your app
   (completion sentinels, answer hashes, classified failure kinds) — not
   from an engine's exit code. Error-only replies, stalls, and timeouts are
   classified, not celebrated.
-- **One tool table, three transports.** The same 17 verbs are exposed via
+- **One tool table, three transports.** The same 18 verbs are exposed via
   CLI, MCP, and the socket API, generated from a single dispatcher; a
   parity test keeps them from drifting.
 - **Isolated children.** Each run gets a generated home: no ambient
@@ -253,11 +253,12 @@ parallel group without writing a script.
 | Surface | Command | Notes |
 |---|---|---|
 | CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
-| MCP server | `agent-run mcp` | stdio, 17 tools |
+| MCP server | `agent-run mcp` | stdio, 18 tools |
 | JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
 | Operator guide | `agent-run doc` | built into the package |
 | Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
 | Capacity collector | `agent-run capacity collect` | + launchd plist generator |
+| Capacity priority | `agent-run capacity order` | read-only, role-independent route order |
 | State | `~/.agent-run/state.db` | SQLite, versioned schema + migrations |
 
 Engine adapters included: **codex** (app-server JSON-RPC),

@@ -1036,7 +1036,7 @@ target = "auth.json"
         self.assertEqual(
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
-                "start", "fast", "cancel", "steer", "status", "list_agents",
+                "capacity_order", "start", "fast", "cancel", "steer", "status", "list_agents",
                 "summary", "transcript", "answer", "models", "limits", "doc",
                 "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
                 "workflow_resume",

@@ -158,6 +158,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     collect = capacity.add_parser("collect")
     collect.add_argument("--once", action="store_true", required=True)
+    capacity.add_parser(
+        "order",
+        help=(
+            "List capacity priority (first route is highest); the orchestrator "
+            "still chooses a compatible role/model alias and does not launch work."
+        ),
+    )
     launchd = capacity.add_parser("launchd")
     launchd.add_argument("--binary", required=True)
     launchd.add_argument("--label", default=_CAPACITY_LAUNCHD_LABEL)
@@ -479,7 +486,11 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     if command == "context":
         return service.context(_ref(args, required=True))
     if command == "capacity":
-        return service.capacity_collect()
+        return (
+            service.capacity_collect()
+            if args.capacity_command == "collect"
+            else service.capacity_order()
+        )
     if command == "delivery":
         if args.delivery_command == "status":
             return service.delivery_status(args.agent_id)
