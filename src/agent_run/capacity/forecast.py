@@ -35,6 +35,14 @@ _BURN_MIN_SPAN_SECONDS = 3600.0
 
 @dataclass(frozen=True)
 class CapacityForecast:
+    """Forecast and risk evidence for one exact capacity identity.
+
+    ``burn_span_seconds`` is the elapsed observation span used by the burn
+    calculation, or ``None`` when the forecast is unknown or has fewer than
+    two usable reset-matched samples.  All existing risk and rate fields keep
+    their prior meanings and are not altered by exposing this evidence.
+    """
+
     key: CapacityKey
     known: bool
     remaining_percent: float | None
@@ -44,6 +52,7 @@ class CapacityForecast:
     burn_percent_per_hour: float | None
     sustainable_percent_per_hour: float | None
     risk: str
+    burn_span_seconds: float | None = None
 
 
 def build_forecasts(
@@ -74,9 +83,11 @@ def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
             burn_percent_per_hour=None,
             sustainable_percent_per_hour=None,
             risk=RISK_UNKNOWN,
+            burn_span_seconds=None,
         )
     latest = series.samples[0]
     remaining = latest.remaining_percent
+    assert remaining is not None  # guarded by the unknown-forecast branch above
     reset_at = latest.reset_at
     window_samples = [sample for sample in series.samples if sample.reset_at == reset_at]
     burn = _burn_rate(window_samples)
@@ -93,6 +104,7 @@ def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
         burn_percent_per_hour=burn,
         sustainable_percent_per_hour=sustainable,
         risk=risk,
+        burn_span_seconds=_burn_span_seconds(window_samples),
     )
 
 

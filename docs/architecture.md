@@ -139,6 +139,14 @@ independently, so a failed account keeps its previous topology only until that
 snapshot expires instead of deleting healthy sibling scopes. Samples carry
 validity windows; `limits` serves projections with burn-rate–based exhaustion
 risk per lane, worst first, hiding nothing.
+
+Capacity route ranking is a pure read of those snapshots. Every governing
+window must be fresh and known; a zero window is omitted before scoring.
+Evidence spanning at least one hour projects remaining capacity to reset,
+while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
+at 50%. The worst window defines a nonnegative route score, then a positive
+runtime multiplier scales its priority. Concrete account/model aliases sharing
+the same runtime and physical pool set remain one capacity choice.
 Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
 terminal, with an idempotent `stats backfill`.
 
