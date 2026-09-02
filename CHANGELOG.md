@@ -2,6 +2,19 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.3.0] - 2026-09-02
+
+- Made `start` durably asynchronous: runtime authentication, materialization,
+  preparation, spawn, and READY no longer block neighboring requests, while
+  cancellation and unowned-start reconciliation remain exact.
+- Routed one-shot CLI starts through the resident broker so accepted workers
+  outlive the CLI process and unavailable brokers fail explicitly.
+- Added schema v9 immutable, bounded, redacted Codex queue attempt evidence and
+  exposed the latest safe summary through `status.delivery.last_attempt`.
+- Resolved the public Claude `fable` alias to Claude Fable 5.1 while preserving
+  the stable configured and persisted model id.
+- Stopped read-only state inspection from attempting to change database modes.
+
 ## [0.2.1] - 2026-09-01
 
 - Prevented an exiting resident API daemon from unlinking the replacement
@@ -32,6 +45,7 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[0.3.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.0
 [0.2.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.1
 [0.2.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.0
 [0.1.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.1.0
