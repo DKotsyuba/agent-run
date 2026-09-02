@@ -1086,12 +1086,24 @@ def main(
             result = _execute(args, target, stdin)
         _emit(result, stdout)
         _logger.info(
-            "cli command=%s outcome=ok duration_ms=%.1f",
-            args.command, (time.monotonic() - started) * 1000,
+            "cli command=%s outcome=%s duration_ms=%.1f",
+            args.command,
+            "degraded" if getattr(result, "ok", True) is False else "ok",
+            (time.monotonic() - started) * 1000,
         )
         # A doctor report with any error-severity finding is a failed check,
         # not a successful command -- surface that as a nonzero exit.
         if args.command == "doctor" and getattr(result, "ok", True) is False:
+            return _EXPECTED_ERROR_EXIT
+        # A collection report with any failed, partial, or data-less runtime
+        # is a degraded round: the capacity view is incomplete or stale, so
+        # the one-shot command (and the launchd loop driving it) must not
+        # report success while the JSON payload stays intact on stdout.
+        if (
+            args.command == "capacity"
+            and args.capacity_command == "collect"
+            and getattr(result, "ok", True) is False
+        ):
             return _EXPECTED_ERROR_EXIT
         return 0
     except AgentRunError as error:

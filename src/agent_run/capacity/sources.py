@@ -2,10 +2,12 @@
 
 The collector used to ask every adapter for live limits; a runtime now names
 its source explicitly (``native``, ``omniroute``, ``codexbar``, ``none``) so a
-stale or never-refreshed native channel stops being the only answer. Every
-source failure is no evidence, never an exception: ``None`` means the source
-concept does not apply to this runtime, ``()`` means it applies and produced
-no samples.
+stale or never-refreshed native channel stops being the only answer.
+``None`` means the source concept does not apply to this runtime and ``()``
+means it applied and legitimately observed no data; an operational failure
+raises :class:`CapacitySourceError` with a fixed reason code instead of
+masquerading as collected empty evidence. Failure logs carry static reason
+codes, statuses, and exception class names only -- never provider output.
 """
 
 from __future__ import annotations
@@ -13,10 +15,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import ssl
 import subprocess
 import time
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -24,8 +28,9 @@ from typing import Callable, Mapping
 from ..accounts import account_auth_source, account_email
 from ..adapters import omniroute
 from ..adapters.base import Capability, LimitSample, RuntimeAdapter
-from ..adapters.claude.auth import keychain_token
+from ..adapters.claude.auth import TOKEN_ENV_NAME, keychain_token, refresh_keychain
 from ..config import CapacityConfig, RuntimeConfig
+from ..errors import AuthError, CapacitySourceError
 from .topology import (
     CapacityCollectionSlice,
     CapacityRouteDescriptor,
@@ -54,10 +59,23 @@ _CODEXBAR_VALID_FOR_SECONDS = 900
 #: for hours while codex/glm answered in time -- the lane went blind on one
 #: slow child. 120s keeps the tick well under the 900s validity window.
 _CODEXBAR_TIMEOUT_SECONDS = 120
-#: Bound on the stderr fragment carried into a failure log line, so a chatty
-#: child cannot flood the log during a burst of failed ticks.
-_ERROR_TAIL_CHARS = 200
 _CODEXBAR_LANES = ("primary", "secondary", "tertiary")
+# Fixed failure reason codes. They are the only failure-dependent text that
+# may reach a log line or a CollectResult: never raw provider output.
+_CODEXBAR_SPAWN = "codexbar_spawn_failed"
+_CODEXBAR_TIMEOUT = "codexbar_timeout"
+_CODEXBAR_EXIT = "codexbar_nonzero_exit"
+_CODEXBAR_MALFORMED = "codexbar_malformed_response"
+_CODEXBAR_OBSERVED = "codexbar_invalid_observed_at"
+_CODEXBAR_WINDOW = "codexbar_invalid_window"
+_CODEXBAR_MISSING = "codexbar_missing_data"
+_CLAUDE_TOKEN = "claude_token_missing"
+_CLAUDE_REQUEST = "claude_usage_unreachable"
+_CLAUDE_MALFORMED = "claude_malformed_response"
+# Fixed codex app-server per-scope issue codes.
+HOME_MISSING = "home_missing"
+PROBE_FAILED = "probe_failed"
+SCOPE_EMPTY = "scope_empty"
 _CLAUDE_NATIVE_URL = "https://api.anthropic.com/api/oauth/usage"
 _CLAUDE_NATIVE_TIMEOUT_SECONDS = 20
 _CLAUDE_NATIVE_VALID_FOR_SECONDS = 900
@@ -67,25 +85,28 @@ _CLAUDE_NATIVE_VALID_FOR_SECONDS = 900
 _CODEX_APPSERVER_VALID_FOR_SECONDS = 900
 
 
-def _bounded_error_tail(stderr: object) -> str:
-    """Collapse a child's stderr into one bounded line for failure logs.
+def _finite_number(value: object) -> float | None:
+    """Return ``value`` as a finite float, or ``None`` for anything else.
 
-    Accepts the ``stderr`` of a ``subprocess.CompletedProcess`` or of a
-    ``subprocess.TimeoutExpired``, or ``None`` when the child never ran or
-    produced nothing. Returns at most ``_ERROR_TAIL_CHARS`` characters with
-    all whitespace flattened to single spaces, so the result never contains a
-    newline; returns ``""`` when there is nothing to report.
+    Booleans are numbers in Python but never a provider quantity, so they
+    are rejected like text, ``None``, and non-finite floats. Sources use
+    this for ``usedPercent``/``windowMinutes``/``percent`` fields whose
+    malformed presence must fail a round rather than silently disappear.
     """
 
-    if isinstance(stderr, bytes):
-        stderr = stderr.decode("utf-8", "replace")
-    if not isinstance(stderr, str) or not stderr:
-        return ""
-    return " ".join(stderr.split())[:_ERROR_TAIL_CHARS]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _timestamp(value: object) -> datetime | None:
-    """Parse one ISO-8601 stamp ('Z' suffix included); anything else is unknown."""
+    """Parse one timezone-aware ISO-8601 stamp; anything else is unknown.
+
+    A naive stamp carries no usable timezone: interpreting it as UTC (or as
+    local time) would invent freshness for evidence whose zone is unknown,
+    so it is rejected exactly like an unparsable value.
+    """
 
     if not isinstance(value, str) or len(value) > 64:
         return None
@@ -93,11 +114,11 @@ def _timestamp(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _run_codexbar(argv: list[str]) -> subprocess.CompletedProcess:
-    """One argv run with no shell; failures surface as no evidence upstream."""
+    """One argv run with no shell; the caller classifies any failure."""
 
     return subprocess.run(
         argv,
@@ -113,42 +134,61 @@ def _codexbar_samples(
     capacity: CapacityConfig,
     runtime_config: RuntimeConfig,
     agent_run_home: Path | None,
-) -> tuple[LimitSample, ...]:
+) -> tuple[LimitSample, ...] | None:
+    """Collect one codexbar round; operational failures raise.
+
+    ``name`` is the configured runtime, ``capacity`` supplies the codexbar
+    binary, ``runtime_config`` names the configured account labels and the
+    default auth link, and ``agent_run_home`` locates per-account auth
+    files. A runtime with no codexbar provider is unsupported (``None``).
+    Spawn, timeout, nonzero-exit, malformed-response, and missing-data
+    failures raise :class:`CapacitySourceError` with a fixed reason code so
+    no failed round can masquerade as collected empty evidence. A lane
+    window that is present but unusable (non-numeric, boolean, or
+    non-finite ``usedPercent``/``windowMinutes``, or a missing/naive
+    ``updatedAt``) fails the whole round: silently dropping a governing
+    window would make the route look unconstrained, and inventing a
+    collector-now timestamp would revive stale evidence. Failure logs
+    carry the static reason, exception type, and exit status only --
+    never child output.
+    """
+
     provider = _CODEXBAR_PROVIDERS.get(name)
     if provider is None:
         _logger.warning("codexbar source has no provider for runtime=%s", name)
-        return ()
+        return None
     argv = [str(capacity.codexbar_binary), "usage", "--provider", provider, "--json"]
     if runtime_config.accounts:
         argv.append("--all-accounts")
     argv += _CODEXBAR_EXTRA_ARGS.get(name, ())
     try:
         result = _run_codexbar(argv)
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
         _logger.warning(
-            "codexbar runtime=%s failed: %s stderr=%s",
-            name,
-            type(error).__name__,
-            _bounded_error_tail(getattr(error, "stderr", None)),
+            "codexbar runtime=%s reason=%s error=%s",
+            name, _CODEXBAR_TIMEOUT, type(error).__name__,
         )
-        return ()
+        raise CapacitySourceError(_CODEXBAR_TIMEOUT) from error
+    except OSError as error:
+        _logger.warning(
+            "codexbar runtime=%s reason=%s error=%s",
+            name, _CODEXBAR_SPAWN, type(error).__name__,
+        )
+        raise CapacitySourceError(_CODEXBAR_SPAWN) from error
     if result.returncode != 0:
         _logger.warning(
-            "codexbar runtime=%s rc=%d stderr=%s",
-            name,
-            result.returncode,
-            _bounded_error_tail(result.stderr),
+            "codexbar runtime=%s reason=%s rc=%d",
+            name, _CODEXBAR_EXIT, result.returncode,
         )
-        return ()
+        raise CapacitySourceError(_CODEXBAR_EXIT)
     try:
         payload = json.loads(result.stdout)
-    except ValueError:
+    except ValueError as error:
         _logger.warning(
-            "codexbar runtime=%s unparseable stdout stderr=%s",
-            name,
-            _bounded_error_tail(result.stderr),
+            "codexbar runtime=%s reason=%s error=%s",
+            name, _CODEXBAR_MALFORMED, type(error).__name__,
         )
-        return ()
+        raise CapacitySourceError(_CODEXBAR_MALFORMED) from error
     if isinstance(payload, Mapping):
         accounts = [payload]
     elif isinstance(payload, list):
@@ -156,8 +196,8 @@ def _codexbar_samples(
     else:
         accounts = []
     if not accounts:
-        _logger.warning("codexbar runtime=%s returned no account entries", name)
-        return ()
+        _logger.warning("codexbar runtime=%s reason=%s", name, _CODEXBAR_MISSING)
+        raise CapacitySourceError(_CODEXBAR_MISSING)
 
     declared_emails = {}
     if runtime_config.accounts and agent_run_home is not None:
@@ -177,8 +217,8 @@ def _codexbar_samples(
     for account in accounts:
         usage = account.get("usage") if isinstance(account, Mapping) else None
         if not isinstance(usage, Mapping):
-            _logger.warning("codexbar runtime=%s missing usage object", name)
-            continue
+            _logger.warning("codexbar runtime=%s reason=%s", name, _CODEXBAR_MALFORMED)
+            raise CapacitySourceError(_CODEXBAR_MALFORMED)
         identity = usage.get("identity")
         email = identity.get("accountEmail") if isinstance(identity, Mapping) else None
         if not isinstance(email, str) or not email:
@@ -198,30 +238,33 @@ def _codexbar_samples(
             )
 
         observed_at = _timestamp(usage.get("updatedAt"))
+        if observed_at is None:
+            _logger.warning("codexbar runtime=%s reason=%s", name, _CODEXBAR_OBSERVED)
+            raise CapacitySourceError(_CODEXBAR_OBSERVED)
         for lane in _CODEXBAR_LANES:
             window = usage.get(lane)
             if not isinstance(window, Mapping):
                 continue
-            used = window.get("usedPercent")
-            if (
-                isinstance(used, bool)
-                or not isinstance(used, (int, float))
-                or not math.isfinite(used)
-            ):
-                continue
-            minutes = window.get("windowMinutes")
+            used = _finite_number(window.get("usedPercent"))
+            minutes = _finite_number(window.get("windowMinutes"))
+            if used is None or minutes is None or minutes <= 0:
+                _logger.warning(
+                    "codexbar runtime=%s reason=%s lane=%s",
+                    name, _CODEXBAR_WINDOW, lane,
+                )
+                raise CapacitySourceError(_CODEXBAR_WINDOW)
             label = (
                 "five_hour"
                 if minutes == 300
                 else "seven_day"
                 if minutes == 10080
-                else f"min{minutes}"
+                else f"min{window.get('windowMinutes')}"
             )
             samples.append(
                 LimitSample(
                     lane=lane,
                     window=label,
-                    remaining_percent=max(0.0, min(100.0, 100.0 - float(used))),
+                    remaining_percent=max(0.0, min(100.0, 100.0 - used)),
                     reset_at=_timestamp(window.get("resetsAt")),
                     observed_at=observed_at,
                     source="codexbar",
@@ -230,7 +273,8 @@ def _codexbar_samples(
                 )
             )
     if not samples:
-        _logger.warning("codexbar runtime=%s returned no usable windows", name)
+        _logger.warning("codexbar runtime=%s reason=%s", name, _CODEXBAR_MISSING)
+        raise CapacitySourceError(_CODEXBAR_MISSING)
     return tuple(samples)
 
 
@@ -250,12 +294,57 @@ def _claude_native_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def _claude_native_samples() -> tuple[LimitSample, ...]:
+def _claude_oauth_token(runtime_config: RuntimeConfig, now: float) -> str | None:
+    """Return the OAuth token for one native Claude collection round.
+
+    An explicitly exported ``CLAUDE_CODE_OAUTH_TOKEN`` wins, but only when
+    the runtime's auth configuration declares that variable: honouring an
+    undeclared export would silently widen the configured auth bridge.
+    ``ANTHROPIC_API_KEY`` is an API key and is never used as an OAuth
+    token. Otherwise a usable Keychain token is returned directly. A missing
+    or expired entry triggers the adapter-owned, 60-second-bounded Keychain
+    refresh once, then this function rereads the Keychain. Refresh failures
+    and still-unusable entries return ``None`` without exposing credential or
+    child-process details. The caller maps that result to its fixed safe
+    capacity-source outcome.
+    """
+
+    auth = runtime_config.auth
+    if auth is not None and TOKEN_ENV_NAME in auth.names:
+        exported = os.environ.get(TOKEN_ENV_NAME)
+        if exported:
+            return exported
+    token = keychain_token(now)
+    if token is not None:
+        return token
+    try:
+        refresh_keychain(runtime_config.binary)
+    except AuthError:
+        return None
+    return keychain_token(now)
+
+
+def _claude_native_samples(
+    runtime_config: RuntimeConfig,
+) -> tuple[LimitSample, ...]:
+    """Collect Claude's native usage round; operational failures raise.
+
+    ``runtime_config`` supplies the auth declaration that gates an
+    exported OAuth token. A missing OAuth token, an unreachable usage
+    endpoint, and a malformed response each raise
+    :class:`CapacitySourceError` with a fixed reason code -- none of them
+    is collected empty evidence. A present ``limits`` entry whose
+    ``percent`` is not a finite non-boolean number is also a failure:
+    silently dropping it would make the model look unconstrained. A
+    healthy empty ``limits`` array returns ``()``. Failure logs carry the
+    static reason and exception type only.
+    """
+
     observed_at = time.time()
-    token = keychain_token(observed_at)
+    token = _claude_oauth_token(runtime_config, observed_at)
     if token is None:
-        _logger.warning("claude native limits have no usable OAuth token")
-        return ()
+        _logger.warning("claude native limits reason=%s", _CLAUDE_TOKEN)
+        raise CapacitySourceError(_CLAUDE_TOKEN)
     request = urllib.request.Request(
         _CLAUDE_NATIVE_URL,
         headers={
@@ -269,28 +358,34 @@ def _claude_native_samples() -> tuple[LimitSample, ...]:
             timeout=_CLAUDE_NATIVE_TIMEOUT_SECONDS,
             context=_claude_native_context(),
         ) as response:
-            payload = json.loads(response.read())
-    except (OSError, TimeoutError, ValueError) as error:
+            body = response.read()
+    except (OSError, TimeoutError) as error:
         _logger.warning(
-            "claude native limits request failed: %s", type(error).__name__
+            "claude native limits reason=%s error=%s",
+            _CLAUDE_REQUEST, type(error).__name__,
         )
-        return ()
+        raise CapacitySourceError(_CLAUDE_REQUEST) from error
+    try:
+        payload = json.loads(body)
+    except ValueError as error:
+        _logger.warning(
+            "claude native limits reason=%s error=%s",
+            _CLAUDE_MALFORMED, type(error).__name__,
+        )
+        raise CapacitySourceError(_CLAUDE_MALFORMED) from error
     if not isinstance(payload, Mapping) or not isinstance(payload.get("limits"), list):
-        _logger.warning("claude native limits response has no limits array")
-        return ()
+        _logger.warning("claude native limits reason=%s", _CLAUDE_MALFORMED)
+        raise CapacitySourceError(_CLAUDE_MALFORMED)
 
     observed = datetime.fromtimestamp(observed_at, tz=timezone.utc)
     samples = []
     for entry in payload["limits"]:
-        if not isinstance(entry, Mapping):
-            continue
-        percent = entry.get("percent")
-        if (
-            isinstance(percent, bool)
-            or not isinstance(percent, (int, float))
-            or not math.isfinite(percent)
-        ):
-            continue
+        percent = _finite_number(
+            entry.get("percent") if isinstance(entry, Mapping) else None
+        )
+        if percent is None:
+            _logger.warning("claude native limits reason=%s", _CLAUDE_MALFORMED)
+            raise CapacitySourceError(_CLAUDE_MALFORMED)
         kind = entry.get("kind")
         if kind == "session":
             lane, window, target = "primary", "five_hour", None
@@ -308,7 +403,7 @@ def _claude_native_samples() -> tuple[LimitSample, ...]:
             LimitSample(
                 lane=lane,
                 window=window,
-                remaining_percent=max(0.0, min(100.0, 100.0 - float(percent))),
+                remaining_percent=max(0.0, min(100.0, 100.0 - percent)),
                 reset_at=_timestamp(entry.get("resets_at")),
                 observed_at=observed,
                 source="native",
@@ -319,22 +414,40 @@ def _claude_native_samples() -> tuple[LimitSample, ...]:
     return tuple(samples)
 
 
-def collect_codex_appserver_slices(
+@dataclass(frozen=True)
+class CodexAppserverCollection:
+    """One codex app-server collection round: healthy slices plus issues.
+
+    ``slices`` holds every independently validated slice that may persist;
+    ``issues`` holds fixed per-scope reason codes (:data:`HOME_MISSING`,
+    :data:`PROBE_FAILED`, :data:`SCOPE_EMPTY`) for configured scopes that
+    produced no slice this round. A duplicate backend account is a
+    deliberate skip, never an issue. No backend account id ever appears
+    in either field.
+    """
+
+    slices: tuple[CapacityCollectionSlice, ...]
+    issues: tuple[str, ...] = ()
+
+
+def collect_codex_appserver(
     name: str,
     runtime_config: RuntimeConfig,
     observed_at: float,
-) -> tuple[CapacityCollectionSlice, ...]:
+) -> CodexAppserverCollection:
     """Probe Codex base and configured account homes into independent slices.
 
     ``name`` is the configured runtime name, ``runtime_config`` supplies the
     Codex binary, base home, and ordered account labels, and ``observed_at`` is
     the collection epoch seconds shared by this round.  Each successful home
     is normalized and validated before it is returned as an opaque collection
-    slice.  One account failure is logged without response details and does
-    not affect other homes; failed or zero-valid-sample scopes yield no slice,
-    preserving any previously stored snapshot for natural aging.  Backend
-    account ids are retained only while de-duplicating this invocation and are
-    never included in a slice or log.
+    slice.  Every configured account is independent: a missing home, a failed
+    probe, or an empty response records one fixed issue code and never
+    removes another scope's slice, and subsequent accounts are still probed.
+    A duplicate backend-account scope is a deliberate skip, not an issue.
+    Backend account ids are retained only while de-duplicating this
+    invocation and never appear in a slice, issue, or log; failure logs
+    carry the issue code and exception class name only.
     """
 
     from ..accounts import account_runtime_home
@@ -346,16 +459,29 @@ def collect_codex_appserver_slices(
         for label in runtime_config.accounts
     ]
     slices: list[CapacityCollectionSlice] = []
+    issues: list[str] = []
     seen_account_ids: set[str] = set()
     for target, home in homes:
+        scope = target if target is not None else "base"
         try:
             response = read_rate_limits(runtime_config, home)
             samples, topology, account_id = normalize_rate_limits(
                 name, target, response, observed_at
             )
             if not samples or not getattr(topology, "routes", ()):
+                issues.append(SCOPE_EMPTY)
+                _logger.warning(
+                    "codex_appserver runtime=%s target=%s issue=%s",
+                    name, scope, SCOPE_EMPTY,
+                )
                 continue
             if account_id is not None and account_id in seen_account_ids:
+                # Two configured labels resolving to one backend account is
+                # deliberate de-duplication, not a collection issue.
+                _logger.debug(
+                    "codex_appserver runtime=%s target=%s duplicate_scope_skipped",
+                    name, scope,
+                )
                 continue
             if account_id is not None:
                 seen_account_ids.add(account_id)
@@ -375,12 +501,35 @@ def collect_codex_appserver_slices(
             slices.append(validate_slice(
                 name, scope_id, samples, topology, observed_at, valid_until
             ))
-        except Exception as error:
+        except FileNotFoundError as error:
+            issue = HOME_MISSING if not home.is_dir() else PROBE_FAILED
+            issues.append(issue)
             _logger.warning(
-                "codex_appserver runtime=%s target=%s failed=%s",
-                name, target if target is not None else "base", type(error).__name__,
+                "codex_appserver runtime=%s target=%s issue=%s error=%s",
+                name, scope, issue, type(error).__name__,
             )
-    return tuple(slices)
+        except Exception as error:
+            issues.append(PROBE_FAILED)
+            _logger.warning(
+                "codex_appserver runtime=%s target=%s issue=%s error=%s",
+                name, scope, PROBE_FAILED, type(error).__name__,
+            )
+    return CodexAppserverCollection(tuple(slices), tuple(issues))
+
+
+def collect_codex_appserver_slices(
+    name: str,
+    runtime_config: RuntimeConfig,
+    observed_at: float,
+) -> tuple[CapacityCollectionSlice, ...]:
+    """Slice-only view of :func:`collect_codex_appserver` for legacy callers.
+
+    Discards the per-scope issue diagnostics; new callers consume
+    :func:`collect_codex_appserver` directly so a partially failed round is
+    never mistaken for a fully collected one.
+    """
+
+    return collect_codex_appserver(name, runtime_config, observed_at).slices
 
 
 def collect_samples(
@@ -390,17 +539,26 @@ def collect_samples(
     load: Loader,
     agent_run_home: Path | None = None,
 ) -> tuple[LimitSample, ...] | None:
-    """Resolve the runtime's configured source; ``None`` is unsupported."""
+    """Resolve the runtime's configured source.
+
+    ``None`` means the source concept does not apply to this runtime --
+    including an explicit ``limits_source="none"`` and an adapter without
+    live limits -- and ``()`` means the source applied and legitimately
+    observed no data. Operational failures raise
+    :class:`CapacitySourceError` with a fixed reason code rather than
+    masquerading as empty evidence; adapter failures propagate unchanged
+    for the collector to isolate per runtime.
+    """
 
     source = runtime_config.limits_source or "native"
     if source == "none":
-        return ()
+        return None
     if source == "omniroute":
         return omniroute.pool_samples(time.time())
     if source == "codexbar":
         return _codexbar_samples(name, capacity_config, runtime_config, agent_run_home)
     if source == "native" and name == "claude":
-        return _claude_native_samples()
+        return _claude_native_samples(runtime_config)
 
     adapter = load(name, runtime_config)
     info = adapter.describe()

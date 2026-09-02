@@ -16,6 +16,78 @@ class ConfigTests(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
             return load_config(path)
 
+    def test_runtime_binary_symlink_is_kept_while_other_paths_resolve(self) -> None:
+        """The configured launcher keeps its symlink; homes and auth still canonicalize."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "lib" / "node_modules" / "@openai" / "codex" / "bin"
+            package.mkdir(parents=True)
+            target = package / "codex.js"
+            target.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            linked = root / "bin" / "codex"
+            linked.parent.mkdir()
+            linked.symlink_to(target)
+            home = root / "runtime-home"
+            home.mkdir()
+            source = root / "auth.json"
+            source.write_text("{}", encoding="utf-8")
+            config = self.load(
+                f"""
+schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "{linked}"
+home = "{home}"
+models = ["test"]
+[runtimes.codex.auth]
+kind = "file_link"
+source = "{source}"
+target = "auth.json"
+"""
+            )
+            runtime = config.runtimes["codex"]
+            self.assertEqual(runtime.binary, linked)
+            self.assertTrue(runtime.binary.is_symlink())
+            self.assertEqual(runtime.binary.parent, linked.parent)
+            self.assertEqual(runtime.home, home.resolve())
+            self.assertEqual(runtime.auth.source, source.resolve())
+
+    def test_relative_runtime_binary_is_rejected(self) -> None:
+        """A relative launcher is still rejected instead of falling back to PATH."""
+
+        with self.assertRaisesRegex(ValidationError, r"runtimes\.codex\.binary"):
+            self.load(
+                """
+schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "codex"
+home = "/tmp/runtime-home"
+models = ["test"]
+"""
+            )
+
+    def test_runtime_binary_expands_the_user_prefix_without_resolving(self) -> None:
+        """``~`` in a launcher expands, but the result stays unresolved."""
+
+        config = self.load(
+            """
+schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "~/tools/bin/codex"
+home = "/tmp/runtime-home"
+models = ["test"]
+"""
+        )
+        self.assertEqual(
+            config.runtimes["codex"].binary, Path("~/tools/bin/codex").expanduser()
+        )
+
     def test_minimal_and_consumed_configuration_load(self) -> None:
         minimal = self.load("schema_version = 1\n")
         self.assertEqual(minimal.core.default_timeout_seconds, 480)

@@ -149,6 +149,34 @@ snapshot expires instead of deleting healthy sibling scopes. Samples carry
 validity windows; `limits` serves projections with burn-rate–based exhaustion
 risk per lane, worst first, hiding nothing.
 
+Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
+and `unsupported`. A source failure is not a successful collection of zero
+samples. Successful account slices remain independently committed when a
+sibling probe or write fails; reported sample counts reflect those commits.
+`capacity collect --once` still prints its JSON report, but exits with status
+2 for partial, failed, or empty supported-source collection. Logs carry safe
+reason codes and counts, never provider response bodies or raw child stderr.
+Sources retain their bounded call deadlines; a round exceeding the configured
+collection interval is explicitly warned about.
+
+Freshness uses source observations, not the time an old payload was fetched
+again. Future observations and windows whose reset has arrived are unknown.
+Diagnostic snapshots select the newest row per quota identity before applying
+their result cap, so a busy account cannot hide a stale sibling through repeated
+samples. Stored sample history retains its separate, global retention bound.
+OmniRoute pool freshness is limited by its oldest included member; future
+observations and expired resets invalidate the whole window, never just remove
+the inconvenient member from the mean. Its quota query detects overflow of the
+64-row bound rather than silently returning a truncated, apparently healthy
+pool. Upstream snapshot timestamps and the source's shelf life remain intact.
+
+For Claude's native usage source, a usable Keychain token is read without a
+refresh. Missing or expired credentials trigger the adapter's existing Claude
+CLI renewal once, bounded to 60 seconds, followed by a validated Keychain
+reread. Failure stays an explicit collection failure. A declared, explicitly
+exported OAuth token remains authoritative and is never replaced by this
+renewal path; API keys are not treated as OAuth credentials.
+
 Account labels are opaque: a labelled account cannot collide with the absent
 account even when its label is `base`, `default`, or `shared`. Provider-scoped
 identifiers encode that distinction without changing the original sample keys.

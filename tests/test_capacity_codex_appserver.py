@@ -318,7 +318,7 @@ class CollectCodexAppserverSlicesTests(unittest.TestCase):
                 slices = sources.collect_codex_appserver_slices(_RUNTIME, runtime, _OBSERVED)
         self.assertEqual([s.scope_id for s in slices], ["codex:base", "codex:@spark-team"])
         joined = "\n".join(captured.output)
-        self.assertIn("failed=ConnectionError", joined)
+        self.assertIn("issue=probe_failed", joined)
         # Neither the failure detail nor any backend account id is logged.
         self.assertNotIn("boom token", joined)
         self.assertNotIn("acct-pro-1", joined)

@@ -21,6 +21,13 @@ class DiagnosticSnapshot:
 def diagnostic_snapshot(
     database: str | Path, *, at: float, limit: int = 256
 ) -> DiagnosticSnapshot:
+    """Read bounded active agents and the newest row per capacity identity.
+
+    ``limit`` caps agents and distinct capacity identities independently.
+    Repeated healthy samples must not hide an older, stale sibling identity.
+    The database is opened read-only; invalid paths, schema or bounds raise
+    ``ValidationError`` or the existing schema error without modifying state.
+    """
     path = Path(database).expanduser().resolve()
     if not path.is_file():
         raise ValidationError(f"state database does not exist: {path}")
@@ -45,7 +52,13 @@ def diagnostic_snapshot(
         capacity = connection.execute(
             """SELECT id, runtime, lane, window, target, source,
                       observed_at, valid_until
-               FROM capacity_samples
+               FROM (
+                   SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY runtime, lane, window, target, source
+                       ORDER BY observed_at DESC, id DESC
+                   ) AS position
+                   FROM capacity_samples
+               ) WHERE position = 1
                ORDER BY observed_at DESC, id DESC LIMIT ?""",
             (limit,),
         )

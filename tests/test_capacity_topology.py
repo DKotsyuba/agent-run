@@ -216,16 +216,15 @@ class SourceTopologyTests(unittest.TestCase):
 
     def test_legacy_samples_and_collect_samples_are_unchanged(self) -> None:
         # The neutral grouping never rewrites the samples it is given, and the
-        # legacy collect_samples contract still returns plain tuples.
+        # collect_samples reports an explicit none source as unsupported.
         samples = (_SHARED, _SCOPED_A)
         topology = sources.sample_topology("clara-runtime", _runtime_config(), samples)
         self.assertEqual(samples, (_SHARED, _SCOPED_A))
         self.assertIsInstance(topology, CapacityTopology)
-        self.assertEqual(
+        self.assertIsNone(
             sources.collect_samples(
                 "clara-runtime", _runtime_config(limits_source="none"), CapacityConfig(), None
-            ),
-            (),
+            )
         )
 
 

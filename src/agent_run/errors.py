@@ -39,3 +39,16 @@ class SchemaMigrationRequired(ValidationError):
 
 class AuthError(AgentRunError):
     """A runtime could not obtain a usable credential."""
+
+
+class CapacitySourceError(AgentRunError):
+    """A capacity evidence source failed its own collection contract.
+
+    ``reason`` is a fixed, provider-independent reason code (for example
+    ``codexbar_nonzero_exit``) safe for logs and reports: it never carries
+    raw provider output, tokens, or exception text.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason

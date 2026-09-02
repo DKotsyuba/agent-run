@@ -1598,7 +1598,12 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
             self.assertEqual(sample.source, "omniroute_quota_pool")
             self.assertEqual((sample.lane, sample.target), ("pool", "opencode-go:pool"))
             self.assertEqual(
-                sample.observed_at, datetime.fromisoformat(_NEWEST_OBSERVATION)
+                sample.observed_at,
+                min(
+                    datetime.fromisoformat(row["created_at"])
+                    for row in _REAL_ROWS
+                    if omniroute.WINDOWS.get(row["window_key"]) == sample.window
+                ),
             )
             self.assertEqual(sample.valid_for_seconds, LIMITS_STALE_SECONDS)
         # The soonest reset in the pool is the one that bites first.
@@ -1624,29 +1629,55 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
         rows = (
             {"window_key": "some_new_window", "remaining_percentage": 50.0,
              "next_reset_at": None, "created_at": _NEWEST_OBSERVATION},
-            {"window_key": "weekly", "remaining_percentage": None,
-             "next_reset_at": None, "created_at": _NEWEST_OBSERVATION},
-            {"window_key": "weekly", "remaining_percentage": True,
-             "next_reset_at": None, "created_at": _NEWEST_OBSERVATION},
-            {"window_key": "session", "remaining_percentage": 90.0,
-             "next_reset_at": None, "created_at": "not-a-timestamp"},
             {"window_key": "session", "remaining_percentage": 100.0,
              "next_reset_at": None, "created_at": _NEWEST_OBSERVATION},
-            "not a row at all",
         )
         samples = self.samples_by_window(self.fresh, rows)
         self.assertEqual(sorted(samples), ["session_5h"])
         self.assertEqual(samples["session_5h"].remaining_percent, 100.0)
         self.assertIsNone(samples["session_5h"].reset_at)
 
+        malformed = dict(rows[1])
+        malformed["remaining_percentage"] = None
+        with self.assertRaises(omniroute.CapacitySourceError):
+            pool_samples(self.fresh, fetch_rows=lambda: [malformed])
+
     def test_a_failing_or_garbage_row_source_is_no_evidence(self):
         def broken():
             raise OSError("docker is gone")
 
-        self.assertEqual(pool_samples(self.fresh, fetch_rows=broken), ())
-        self.assertEqual(pool_samples(self.fresh, fetch_rows=lambda: None), ())
-        self.assertEqual(pool_samples(self.fresh, fetch_rows=lambda: "oops"), ())
+        with self.assertRaises(omniroute.CapacitySourceError):
+            pool_samples(self.fresh, fetch_rows=broken)
+        with self.assertRaises(omniroute.CapacitySourceError):
+            pool_samples(self.fresh, fetch_rows=lambda: None)
+        with self.assertRaises(omniroute.CapacitySourceError):
+            pool_samples(self.fresh, fetch_rows=lambda: "oops")
         self.assertEqual(pool_samples(self.fresh, fetch_rows=lambda: []), ())
+
+    def test_invalid_window_state_does_not_inflate_pool_remaining(self):
+        rows = [
+            {"window_key": "session", "remaining_percentage": 90.0,
+             "next_reset_at": "2026-08-25T00:00:00Z", "created_at": _NEWEST_OBSERVATION},
+            {"window_key": "session", "remaining_percentage": 10.0,
+             "next_reset_at": "2026-08-25T00:00:00Z", "created_at": "2026-08-24T17:17:02.437Z"},
+        ]
+        sample = self.samples_by_window(self.fresh, rows)["session_5h"]
+        self.assertIsNone(sample.remaining_percent)
+        self.assertEqual(sample.observed_at, datetime.fromisoformat(rows[1]["created_at"]))
+
+    def test_future_and_reset_boundary_make_window_unknown(self):
+        future = [{"window_key": "weekly", "remaining_percentage": 99.0,
+                   "next_reset_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z"}]
+        self.assertIsNone(self.samples_by_window(self.fresh, future)["weekly"].remaining_percent)
+        boundary = [{"window_key": "weekly", "remaining_percentage": 99.0,
+                     "next_reset_at": _NEWEST_OBSERVATION, "created_at": _NEWEST_OBSERVATION}]
+        self.assertIsNone(self.samples_by_window(self.fresh, boundary)["weekly"].remaining_percent)
+
+    def test_row_cap_overflow_is_a_source_failure(self):
+        row = {"window_key": "weekly", "remaining_percentage": 99.0,
+               "next_reset_at": None, "created_at": _NEWEST_OBSERVATION}
+        with self.assertRaises(omniroute.CapacitySourceError):
+            pool_samples(self.fresh, fetch_rows=lambda: [row] * 65)
 
     def test_a_first_failed_quota_read_is_retried_once_and_stays_silent(self):
         # The docker exec is flaky in place; a single failure must not log,
@@ -1686,11 +1717,13 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
         ), self.assertLogs(
             "agent_run.capacity", level="WARNING"
         ) as logs:
-            self.assertIsNone(omniroute._docker_rows())
+            with self.assertRaises(omniroute.CapacitySourceError):
+                omniroute._docker_rows()
         self.assertEqual(len(logs.output), 1)
         message = logs.output[0]
         self.assertIn("kind=exit_code", message)
-        self.assertIn("stderr=docker: no such container further noise", message)
+        self.assertIn("rc=1", message)
+        self.assertNotIn("no such container", message)
         self.assertNotIn("\n", message)
 
     def test_limits_reads_the_omniroute_store_and_never_the_runtime_home(self):

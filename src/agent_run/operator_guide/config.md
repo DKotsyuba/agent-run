@@ -34,7 +34,10 @@ Each `[runtimes.<name>]` table may declare:
   doc, service).
 - `adapter` — which adapter drives this runtime (claude, codex, glm, qwen,
   opencode).
-- `binary` — absolute path to the runtime's executable.
+- `binary` — absolute path to the runtime's executable; the configured launcher
+  path is preserved rather than replaced with its symlink target. This keeps
+  interpreter lookup relative to the launcher directory reliable for packaged
+  executables. Runtime homes and credential paths still resolve normally.
 - `home` — the runtime's private home directory; materialized config,
   skills, and plugins live under here.
 - `models` — the declared model roster for this runtime.

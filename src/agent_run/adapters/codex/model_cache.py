@@ -10,7 +10,7 @@ from typing import Mapping
 
 from ...config import RuntimeConfig
 from ..base import LaunchPlan
-from . import app_server
+from . import app_server, environment
 
 
 _MODEL_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -44,14 +44,20 @@ def _cache_is_fresh(path: Path, now: float) -> bool:
 
 
 def refresh_models(config: RuntimeConfig, home: Path) -> None:
+    """Refresh ``home``'s isolated model roster cache from the real app-server.
+
+    ``config`` supplies the Codex binary and ``home`` the runtime home whose
+    ``cache/models.json`` is rewritten.  The child is launched with the shared
+    :func:`environment.build_environment` mapping, so the packaged interpreter
+    resolves even under the collector's minimal PATH.  Any failure -- spawn,
+    handshake, or cache write -- is swallowed and leaves any existing cache in
+    place, so a refresh problem never turns into an agent-start failure.
+    """
+
     plan = LaunchPlan(
         argv=(str(config.binary), "app-server"),
         cwd=Path(home),
-        environment={
-            "CODEX_HOME": str(home),
-            "HOME": str(home),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        },
+        environment=environment.build_environment(config.binary, home),
         initial_input=None,
         runtime_stream_path=Path(home) / ".model-refresh.jsonl",
         adapter_state={},

@@ -20,6 +20,20 @@ KEY = CapacityKey("codex", "requests", "5h", "gpt-5.6-sol", "app_server")
 
 
 class CapacityForecastTests(unittest.TestCase):
+    """Verify exact-window freshness, evidence span, and burn-risk decisions."""
+
+    def test_future_observation_and_reset_boundary_are_unknown(self) -> None:
+        """Future evidence and a window ending exactly now must not be usable."""
+
+        now = 1_000.0
+        for sample in (
+            NormalizedSample(80.0, now + 3_600.0, now + 60.0, now + 900.0),
+            NormalizedSample(80.0, now, now - 60.0, now + 900.0),
+        ):
+            with self.subTest(sample=sample):
+                forecast = build_forecasts((CapacitySeries(KEY, (sample,)),), now=now)[0]
+                self.assertFalse(forecast.known)
+
     def test_no_samples_is_unknown_and_never_blocks(self) -> None:
         series = CapacitySeries(KEY, ())
         (forecast,) = build_forecasts([series], now=1_000_000.0)

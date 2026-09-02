@@ -168,7 +168,20 @@ def _number(value: object, path: str, *, minimum: float) -> float:
     return float(value)
 
 
-def _path(value: object, path: str) -> Path:
+def _path(value: object, path: str, *, resolve: bool = True) -> Path:
+    """Validate one configured path field and return it as an absolute ``Path``.
+
+    ``value`` is the raw TOML field and ``path`` is the dotted configuration
+    location reported in error messages.  A leading ``~`` is expanded; a
+    relative result, or an ``~`` that cannot be expanded, raises
+    ``ValidationError``.  ``resolve`` selects canonicalization: the default
+    ``True`` resolves symlinks and ``..`` segments, which homes, auth sources,
+    plugin directories, MCP commands, and other filesystem anchors want;
+    ``False`` keeps the configured path verbatim, which only the runtime
+    binary uses so a version-managed launcher symlink (nvm, Homebrew) stays
+    intact and its own directory still anchors child ``PATH`` resolution.
+    """
+
     text = _string(value, path)
     try:
         expanded = Path(text).expanduser()
@@ -176,7 +189,7 @@ def _path(value: object, path: str) -> Path:
         raise ValidationError(f"{path} must be an absolute path") from error
     if not expanded.is_absolute():
         raise ValidationError(f"{path} must be an absolute path")
-    return expanded.resolve()
+    return expanded.resolve() if resolve else expanded
 
 
 def _relative_target(value: object, path: str) -> str:
@@ -390,7 +403,10 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
     """Parse arbitrary runtime tables into an immutable validated mapping.
 
     Every runtime must declare its adapter, binary, home, models, and enabled
-    state. Optional account/auth, hook, plugin, capacity-source, and concurrency
+    state. The binary keeps its configured absolute path verbatim (``~``
+    expanded, symlinks unresolved) so a version-managed launcher symlink keeps
+    anchoring its own interpreter directory; every other path field resolves.
+    Optional account/auth, hook, plugin, capacity-source, and concurrency
     fields retain their existing validation. ``priority_multiplier`` defaults
     to ``1.0`` and rejects booleans, non-numeric or non-finite values, and
     numbers less than or equal to zero. Unknown fields raise ``ValidationError``.
@@ -456,7 +472,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
-            _path(table.get("binary"), f"{path}.binary"),
+            _path(table.get("binary"), f"{path}.binary", resolve=False),
             _path(table.get("home"), f"{path}.home"),
             models,
             _names(table.get("skills", []), f"{path}.skills"),

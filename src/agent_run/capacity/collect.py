@@ -18,6 +18,7 @@ from typing import Callable
 from ..adapters.base import LimitSample, RuntimeAdapter
 from ..adapters.registry import load_adapter
 from ..config import CapacityConfig, Config, RuntimeConfig
+from ..errors import CapacitySourceError
 from ..state import StateStore
 from . import sources
 from .topology import CapacityCollectionSlice, validate_slice
@@ -29,21 +30,60 @@ AdapterLoader = Callable[[str, RuntimeConfig], RuntimeAdapter]
 STATUS_COLLECTED = "collected"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_FAILED = "failed"
+STATUS_PARTIAL = "partial"
+STATUS_NO_DATA = "no_data"
+
+#: Fixed per-slice issue code for a slice that validated but could not be
+#: committed; later slices still persist.
+ISSUE_PERSIST_FAILED = "persist_failed"
 
 
 @dataclass(frozen=True)
 class CollectResult:
+    """One runtime's collection outcome for one round.
+
+    ``status`` is one of ``collected``, ``partial``, ``failed``,
+    ``no_data``, or ``unsupported``. ``sample_count`` counts only samples
+    actually committed to the store this round. ``error`` keeps the
+    historical single-failure summary -- a :class:`CapacitySourceError`
+    reason code or an exception type name -- and ``issues`` carries every
+    fixed reason code for scopes that failed or stayed empty, including
+    per-slice persistence failures. Neither field ever holds raw provider
+    output or exception text.
+    """
+
     runtime: str
     status: str
     sample_count: int
     error: str | None = None
+    issues: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class CollectionReport:
+    """All enabled runtimes' outcomes for one bounded collection round.
+
+    ``started_at``/``finished_at`` are epoch seconds bounding the round and
+    ``results`` holds one :class:`CollectResult` per enabled runtime.
+    """
+
     started_at: float
     finished_at: float
     results: tuple[CollectResult, ...]
+
+    @property
+    def ok(self) -> bool:
+        """True only when every runtime fully collected or is unsupported.
+
+        ``partial``, ``failed``, and ``no_data`` outcomes are degraded
+        rounds: the capacity view is incomplete or stale, so the command
+        must not report success.
+        """
+
+        return all(
+            result.status in (STATUS_COLLECTED, STATUS_UNSUPPORTED)
+            for result in self.results
+        )
 
 
 def _default_loader(name: str, runtime_config: RuntimeConfig) -> RuntimeAdapter:
@@ -117,44 +157,97 @@ def _collect_runtime(
 ) -> CollectResult:
     """Collect and atomically persist one runtime while isolating its failures.
 
-    Ordinary sources retain the historical single-slice collection path.
-    ``codex_appserver`` may return one independently validated slice per
-    configured account scope; every successful scope persists independently so
-    a broken account cannot erase healthy or prior scope evidence.  Returns a
-    status/count result and logs only the exception class on source failure.
+    Ordinary sources keep the single-slice path: ``None`` is unsupported, a
+    healthy empty tuple is ``no_data``, and operational failures arrive as
+    :class:`CapacitySourceError` (or adapter exceptions) and become
+    ``failed`` with a safe reason. ``codex_appserver`` returns one
+    independently validated slice per configured account scope plus
+    per-scope issue codes; every slice validates and persists on its own,
+    so a broken account or a single slice's persistence failure can not
+    erase healthy or prior scope evidence, and ``sample_count`` counts
+    only samples actually committed. Logs carry fixed reasons, statuses,
+    and exception class names only -- never provider output.
     """
 
     try:
         if runtime_config.limits_source == "codex_appserver":
             from .topology import CapacityCollectionSlice
 
-            slices = sources.collect_codex_appserver_slices(name, runtime_config, started)
-            count = 0
-            for slice_ in slices:
-                if not isinstance(slice_, CapacityCollectionSlice):
-                    raise TypeError("codex app-server collector returned an invalid slice")
-                persist_slice(store, slice_)
-                count += len(slice_.samples)
-            _logger.debug("collect runtime=%s status=%s samples=%d", name, STATUS_COLLECTED, count)
-            return CollectResult(name, STATUS_COLLECTED, count)
-        samples = sources.collect_samples(
-            name, runtime_config, capacity_config, load, agent_run_home
+            collected = sources.collect_codex_appserver(name, runtime_config, started)
+            issues = list(collected.issues)
+            committed = 0
+            for slice_ in collected.slices:
+                scope = (
+                    slice_.scope_id
+                    if isinstance(slice_, CapacityCollectionSlice)
+                    else "invalid"
+                )
+                try:
+                    if not isinstance(slice_, CapacityCollectionSlice):
+                        raise TypeError(
+                            "codex app-server collector returned an invalid slice"
+                        )
+                    persist_slice(store, slice_)
+                except Exception as error:
+                    # One scope's persistence failure must not prevent
+                    # later healthy slices from committing.
+                    issues.append(ISSUE_PERSIST_FAILED)
+                    _logger.warning(
+                        "persist runtime=%s scope=%s issue=%s error=%s",
+                        name, scope, ISSUE_PERSIST_FAILED,
+                        type(error).__name__,
+                    )
+                    continue
+                committed += len(slice_.samples)
+            if committed and not issues:
+                status, count = STATUS_COLLECTED, committed
+            elif committed:
+                status, count = STATUS_PARTIAL, committed
+            elif issues:
+                return _result(name, STATUS_FAILED, 0, issues=issues)
+            else:
+                status, count = STATUS_NO_DATA, 0
+        else:
+            samples = sources.collect_samples(
+                name, runtime_config, capacity_config, load, agent_run_home
+            )
+            if samples is None:
+                status, count = STATUS_UNSUPPORTED, 0
+            elif not samples:
+                status, count = STATUS_NO_DATA, 0
+            else:
+                persist_slice(
+                    store, _slice_from_samples(name, runtime_config, samples, started)
+                )
+                status, count = STATUS_COLLECTED, len(samples)
+    except CapacitySourceError as error:
+        _logger.warning(
+            "collect runtime=%s status=%s reason=%s",
+            name, STATUS_FAILED, error.reason,
         )
-        if samples is None:
-            _logger.debug("collect runtime=%s status=%s", name, STATUS_UNSUPPORTED)
-            return CollectResult(name, STATUS_UNSUPPORTED, 0)
-        if not samples:
-            return CollectResult(name, STATUS_COLLECTED, 0)
-        persist_slice(store, _slice_from_samples(name, runtime_config, samples, started))
-        count = len(samples)
+        return CollectResult(name, STATUS_FAILED, 0, error.reason)
     except Exception as error:  # isolate provider, generator, and sample failures
         _logger.warning(
             "collect runtime=%s status=%s samples=%d error=%s",
             name, STATUS_FAILED, 0, type(error).__name__,
         )
         return CollectResult(name, STATUS_FAILED, 0, type(error).__name__)
-    _logger.debug("collect runtime=%s status=%s samples=%d", name, STATUS_COLLECTED, count)
-    return CollectResult(name, STATUS_COLLECTED, count)
+    return _result(name, status, count, issues=issues if status == STATUS_PARTIAL else ())
+
+
+def _result(
+    name: str,
+    status: str,
+    count: int,
+    *,
+    issues: tuple[str, ...] | list[str] = (),
+) -> CollectResult:
+    """Log one runtime's outcome at INFO and build its result."""
+
+    _logger.info(
+        "collect runtime=%s status=%s samples=%d", name, status, count
+    )
+    return CollectResult(name, status, count, None, tuple(issues))
 
 
 def collect_once(
@@ -179,11 +272,23 @@ def collect_once(
     store.prune_capacity_samples(config.capacity.sample_retention)
     finished = time.time() if at is None else at
     _logger.info(
-        "collect_once runtimes=%d failed=%d duration_ms=%.1f",
+        "collect_once runtimes=%d samples=%d failed=%d partial=%d no_data=%d"
+        " duration_ms=%.1f",
         len(results),
+        sum(result.sample_count for result in results),
         sum(1 for result in results if result.status == STATUS_FAILED),
+        sum(1 for result in results if result.status == STATUS_PARTIAL),
+        sum(1 for result in results if result.status == STATUS_NO_DATA),
         (finished - started) * 1000,
     )
+    if finished - started >= config.capacity.collect_interval_seconds:
+        # Each source keeps its own bounded deadline; this only makes a round
+        # slow enough to skip its next scheduled tick visible to the operator.
+        _logger.warning(
+            "collect_once duration_seconds=%.1f >= interval_seconds=%s;"
+            " the next scheduled tick may be skipped",
+            finished - started, config.capacity.collect_interval_seconds,
+        )
     return CollectionReport(started, finished, results)
 
 

@@ -62,9 +62,11 @@ def build_forecasts(
 
 
 def _is_fresh(sample: NormalizedSample, now: float) -> bool:
+    """Accept observations from now or earlier only while their window is open."""
     valid = sample.valid_until is None or sample.valid_until >= now
-    not_yet_reset = sample.reset_at is None or sample.reset_at >= now
-    return valid and not_yet_reset
+    observed = sample.observed_at is None or sample.observed_at <= now
+    not_yet_reset = sample.reset_at is None or sample.reset_at > now
+    return valid and observed and not_yet_reset
 
 
 def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:

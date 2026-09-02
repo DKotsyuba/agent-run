@@ -36,6 +36,8 @@ copy ``~/.omniroute/storage.sqlite`` is a stale pre-docker snapshot).
 
 from __future__ import annotations
 
+from ..errors import CapacitySourceError
+
 import json
 import logging
 import math
@@ -61,29 +63,12 @@ PROVIDER = "opencode-go"
 LIMITS_STALE_SECONDS = 5400
 #: How long to wait before retrying a first failed quota read.
 _DOCKER_RETRY_DELAY_SECONDS = 2.0
-#: Bound on the stderr fragment carried into a failure log line.
-_DOCKER_ERROR_TAIL_CHARS = 200
 
 #: Warnings about unreadable quota sources surface on the capacity logger, so
 #: a flaky collection tick is diagnosable next to the collect log lines.
 _logger = logging.getLogger("agent_run.capacity")
 
 
-def _bounded_error_tail(stderr: object) -> str:
-    """Collapse a child's stderr into one bounded line for failure logs.
-
-    Accepts the ``stderr`` of a ``subprocess.CompletedProcess`` or of a
-    ``subprocess.TimeoutExpired``, or ``None`` when the child never ran or
-    produced nothing. Returns at most ``_DOCKER_ERROR_TAIL_CHARS`` characters
-    with all whitespace flattened to single spaces, so the result never
-    contains a newline; returns ``""`` when there is nothing to report.
-    """
-
-    if isinstance(stderr, bytes):
-        stderr = stderr.decode("utf-8", "replace")
-    if not isinstance(stderr, str) or not stderr:
-        return ""
-    return " ".join(stderr.split())[:_DOCKER_ERROR_TAIL_CHARS]
 #: OmniRoute's window keys in this runtime's vocabulary. A key absent here is
 #: one we have never seen and cannot name, so it is not reported.
 WINDOWS = MappingProxyType(
@@ -103,7 +88,7 @@ WHERE s.provider = ?
   AND s.id IN (
       SELECT MAX(id) FROM quota_snapshots
       WHERE provider = ? GROUP BY connection_id, window_key)
-LIMIT 64
+LIMIT 65
 """
 #: Runs the same SQL the old host-side sqlite reader ran, but inside the
 #: container where the live database actually is, using the driver OmniRoute
@@ -128,44 +113,34 @@ def _timestamp(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _docker_rows() -> list | None:
-    """Read the snapshot rows from the container; any failure is no evidence.
+def _docker_rows() -> list:
+    """Read quota rows with one retry and fail safely after two failures.
 
-    The in-container read is flaky in place -- one tick returns three samples,
-    the next returns none -- so a first failure is retried once after a short
-    delay. A second failure still yields ``None``, which callers read as "no
-    evidence" rather than "empty pool", but it is logged as a warning naming
-    the failure kind: a lane that silently reports zero samples is
-    indistinguishable from a healthy one from the outside.
-
-    Returns the parsed row list on success (possibly empty), or ``None`` when
-    the source could not be read. The success path stays silent.
+    Each attempt has a ten-second timeout and the attempts are separated by
+    ``_DOCKER_RETRY_DELAY_SECONDS``. An empty list is successful empty data;
+    exhausted reads raise ``CapacitySourceError``. The warning contains only a
+    safe kind and optional integer return code, never stderr.
     """
 
-    kind, stderr = "", None
+    kind, returncode = "", None
     for attempt in (0, 1):
-        kind, stderr, rows = _docker_rows_once()
+        kind, returncode, rows = _docker_rows_once()
         if rows is not None:
             return rows
         if attempt == 0:
             time.sleep(_DOCKER_RETRY_DELAY_SECONDS)
-    _logger.warning(
-        "omniroute quota rows unavailable kind=%s stderr=%s",
-        kind,
-        _bounded_error_tail(stderr),
-    )
-    return None
+    _logger.warning("omniroute quota rows unavailable kind=%s rc=%s", kind, returncode)
+    raise CapacitySourceError("omniroute_unavailable")
 
 
-def _docker_rows_once() -> tuple[str, object, list | None]:
+def _docker_rows_once() -> tuple[str, int | None, list | None]:
     """One docker exec attempt against the container's quota store.
 
-    Returns a ``(kind, stderr, rows)`` triple. On failure ``rows`` is ``None``
+    Returns a ``(kind, returncode, rows)`` triple. On failure ``rows`` is ``None``
     and ``kind`` names what went wrong -- ``"timeout"``, ``"os_error"``,
-    ``"exit_code"``, ``"unparseable"`` or ``"not_a_list"`` -- with ``stderr``
-    carrying the child's raw stderr for the caller to log. On success ``kind``
-    is ``""`` and ``rows`` is the parsed list, which may legitimately be
-    empty.
+    ``"exit_code"``, ``"unparseable"`` or ``"not_a_list"`` -- with only an
+    integer process status when available. Raw stderr is never returned.
+    On success ``kind`` is ``""`` and ``rows`` may legitimately be empty.
     """
 
     try:
@@ -176,19 +151,19 @@ def _docker_rows_once() -> tuple[str, object, list | None]:
             timeout=10.0,
             check=False,
         )
-    except subprocess.TimeoutExpired as error:
-        return "timeout", getattr(error, "stderr", None), None
+    except subprocess.TimeoutExpired:
+        return "timeout", None, None
     except OSError:
         return "os_error", None, None
     if result.returncode != 0:
-        return "exit_code", result.stderr, None
+        return "exit_code", result.returncode, None
     try:
         rows = json.loads(result.stdout)
     except ValueError:
-        return "unparseable", result.stderr, None
+        return "unparseable", result.returncode, None
     if not isinstance(rows, list):
-        return "not_a_list", result.stderr, None
-    return "", result.stderr, rows
+        return "not_a_list", result.returncode, None
+    return "", result.returncode, rows
 
 
 def pool_samples(
@@ -199,10 +174,12 @@ def pool_samples(
 
     Equal pool accounts are averaged into one 0-100 figure and the *soonest*
     reset in the pool is the one reported, because that is the one that bites
-    first. A window whose newest observation is older than
+    first. A window whose oldest included observation is older than
     ``LIMITS_STALE_SECONDS`` keeps its reset and its timestamp but reports
     ``source="unknown"`` with no percentage: never a fabricated zero. A
-    failing or unparsable row source is simply no evidence.
+    future observation or an expired reset also makes the whole window
+    unknown. Failed or malformed sources raise ``CapacitySourceError``;
+    a successfully read empty pool returns an empty tuple.
 
     ``fetch_rows`` overrides the row source (tests); by default the newest
     snapshots are read out of the OmniRoute container. Local and read-only:
@@ -213,45 +190,57 @@ def pool_samples(
     fetch = _docker_rows if fetch_rows is None else fetch_rows
     try:
         rows = fetch()
+    except CapacitySourceError:
+        raise
     except Exception:
-        return ()
+        raise CapacitySourceError("omniroute_unavailable") from None
     if not isinstance(rows, (list, tuple)):
-        return ()
+        raise CapacitySourceError("omniroute_unavailable")
+    if len(rows) > 64:
+        raise CapacitySourceError("omniroute_result_overflow")
 
     pooled: dict[str, list[tuple[float, datetime | None, datetime]]] = {}
     for row in rows:
         if not isinstance(row, Mapping):
+            raise CapacitySourceError("omniroute_malformed_data")
+        window_key = row.get("window_key")
+        window = WINDOWS.get(window_key) if isinstance(window_key, str) else None
+        if window is None:
             continue
-        window = WINDOWS.get(row.get("window_key"))
         remaining = row.get("remaining_percentage")
         observed_at = _timestamp(row.get("created_at"))
+        reset_value = row.get("next_reset_at")
+        reset_at = _timestamp(reset_value) if reset_value is not None else None
         if (
-            window is None
-            or observed_at is None
+            observed_at is None
             or isinstance(remaining, bool)
             or not isinstance(remaining, (int, float))
             or not math.isfinite(remaining)
+            or (reset_value is not None and reset_at is None)
         ):
-            continue
+            raise CapacitySourceError("omniroute_malformed_data")
         pooled.setdefault(window, []).append(
-            (float(remaining), _timestamp(row.get("next_reset_at")), observed_at)
+            (float(remaining), reset_at, observed_at)
         )
 
     samples = []
     for window in sorted(pooled):
         members = pooled[window]
-        observed_at = max(observed for _r, _reset, observed in members)
+        observed_at = min(observed for _r, _reset, observed in members)
         resets = [reset for _r, reset, _o in members if reset is not None]
+        future = any(observed.timestamp() > now for _r, _reset, observed in members)
+        expired = any(reset.timestamp() <= now for reset in resets)
         stale = now - observed_at.timestamp() > LIMITS_STALE_SECONDS
         mean = sum(remaining for remaining, _reset, _o in members) / len(members)
+        unknown = future or expired or stale
         samples.append(
             LimitSample(
                 lane="pool",
                 window=window,
-                remaining_percent=None if stale else max(0.0, min(100.0, mean)),
+                remaining_percent=None if unknown else max(0.0, min(100.0, mean)),
                 reset_at=min(resets) if resets else None,
                 observed_at=observed_at,
-                source="unknown" if stale else "omniroute_quota_pool",
+                source="unknown" if unknown else "omniroute_quota_pool",
                 target=f"{PROVIDER}:pool",
                 valid_for_seconds=LIMITS_STALE_SECONDS,
             )
