@@ -108,15 +108,21 @@ record distinguishes exit status (including 127), spawn errno, timeout, session
 loss, and success while storing no message, session id, argv/environment value,
 or credential. Status exposes only the latest validated safe summary.
 
-On Codex, when the MCP process is handed `CODEX_APP_TOOLS_PIPE_PATH`, it serves
-a volatile, mode-0600 Unix socket under the agent-run home that the queue
-transport probes first. A live relay calls the Desktop host's
-`send_message_to_thread` tool (the same semantic as the UI "Correct" action)
-and, on acceptance, completes the lease without queueing; an explicit rejection
-falls back to the queue sender, and any ambiguity after a request byte is
-written is recorded and retried instead of being double-sent. The relay carries
-only structured lifecycle fields, renders the fixed trusted notice itself, and
-never accepts arbitrary prompt text.
+Codex Desktop delivery first tries a volatile local relay. With both
+`CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` supplied by the host, the
+MCP CLI replaces itself with the host's signed Node executable. That wrapper
+owns a private Unix socket and a thin Python MCP child; the child receives
+neither host capability, preventing recursive wrappers. The wrapper calls only
+`send_message_to_thread` and renders the same fixed completion notice from
+validated lifecycle fields. Host tool inventories have an 8 MiB frame limit;
+local delivery requests remain bounded to 8 KiB. No socket path, host response,
+or message text enters delivery evidence.
+
+Missing relays and explicit pre-call rejection use the existing `codex queue`
+sender. Unknown acceptance after transmission remains ambiguous and retryable,
+never a blind queue fallback. Relay discovery has a two-second total budget;
+the queue subprocess has 25 seconds, fitting the existing 30-second lease.
+The Node wrapper preserves MCP stdio and removes its socket on child exit.
 
 ## Workflows
 

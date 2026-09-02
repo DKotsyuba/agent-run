@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from importlib import resources
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ _logger = logging.getLogger("agent_run.cli")
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
-_QUEUE_TIMEOUT_SECONDS = 30.0
+_QUEUE_TIMEOUT_SECONDS = 25.0
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
@@ -950,6 +951,25 @@ def _stats(home: Path, args: argparse.Namespace) -> dict[str, object]:
     raise AgentRunError(f"unsupported stats command: {args.stats_command}")
 
 
+def _exec_desktop_relay(home: Path) -> None:
+    """Replace a real MCP process with the signed Node relay when configured."""
+
+    node = os.environ.get("CODEX_MCP_NODE_PATH")
+    pipe = os.environ.get("CODEX_APP_TOOLS_PIPE_PATH")
+    if (
+        not node or not pipe or "\x00" in node or "\x00" in pipe
+        or len(node) > 4096 or len(pipe) > 4096
+        or not Path(node).is_absolute() or not Path(pipe).is_absolute()
+        or not Path(node).is_file() or not os.access(node, os.X_OK)
+    ):
+        return
+    wrapper = resources.files("agent_run.delivery").joinpath("codex_desktop_host.cjs")
+    try:
+        os.execv(node, [node, str(wrapper), sys.executable, str(home), "-m", "agent_run.cli", "--home", str(home), "mcp"])
+    except OSError:
+        _logger.warning("Desktop Node wrapper unavailable; using queue-only MCP")
+
+
 def _doc(args: argparse.Namespace) -> dict[str, object]:
     from .doc import topic_text
 
@@ -991,6 +1011,8 @@ def main(
     started = time.monotonic()
     try:
         home = agent_run_home(args.home)
+        if service is None and args.command == "mcp":
+            _exec_desktop_relay(home)
         configure_logging(home, "mcp" if args.command == "mcp" else "cli")
         _logger.info("cli command=%s", args.command)
         if service is None and args.command == "init":
@@ -1018,7 +1040,7 @@ def main(
                 from .mcp import serve
 
                 mcp_broker = service if service is not None else BrokerClient(home / "api.sock")
-                returned = serve(mcp_broker, stdin=stdin, stdout=stdout, home=home)
+                returned = serve(mcp_broker, stdin=stdin, stdout=stdout)
                 close = getattr(mcp_broker, "close", None)
                 if callable(close):
                     close()

@@ -1080,7 +1080,7 @@ target = "auth.json"
                 self.assertIs(cli._dispatch_once(home), result)
 
             opened.assert_called_once_with(home / "state.db")
-            sender_type.assert_called_once_with(str(executable), timeout_seconds=30.0)
+            sender_type.assert_called_once_with(str(executable), timeout_seconds=25.0)
             relay_type.assert_called_once_with(home)
             transport_type.assert_called_once_with(sender, relay)
             uds_sender_type.assert_called_once_with()
@@ -1122,7 +1122,7 @@ target = "auth.json"
                 cli, "CodexQueueTransport", return_value=Mock()
             ), patch.object(cli, "DeliveryDispatcher", return_value=dispatcher):
                 cli._dispatch_once(home)
-            sender.assert_called_once_with(str(override), timeout_seconds=30.0)
+            sender.assert_called_once_with(str(override), timeout_seconds=25.0)
 
     def test_hook_transport_is_per_runtime_and_dispatch_routes_by_the_recorded_name(self):
         from agent_run.delivery.base import DeliveryReceipt

@@ -105,32 +105,7 @@ class McpTests(unittest.TestCase):
         self.assertEqual([response["error"]["code"] for response in responses], [-32700, -32700, -32602])
         self.assertEqual(broker.calls, [])
 
-    def test_serve_starts_a_relay_only_when_the_host_pipe_env_is_set(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            relay = mock.Mock()
-            with mock.patch(
-                "agent_run.delivery.codex_desktop_relay.CodexDesktopRelayServer.start_from_environment",
-                return_value=relay,
-            ) as start, mock.patch("atexit.register") as register:
-                self.assertEqual(
-                    serve(FakeBroker(), StringIO(""), StringIO(), home=home), 0
-                )
-                start.assert_called_once_with(home)
-                register.assert_called_once_with(relay.close)
 
-    def test_serve_does_not_start_a_relay_without_the_host_pipe_env(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            with mock.patch(
-                "agent_run.delivery.codex_desktop_relay.CodexDesktopRelayServer.start_from_environment",
-                return_value=None,
-            ) as start, mock.patch("atexit.register") as register:
-                self.assertEqual(
-                    serve(FakeBroker(), StringIO(""), StringIO(), home=home), 0
-                )
-                start.assert_called_once_with(home)
-                register.assert_not_called()
 
 
 if __name__ == "__main__":

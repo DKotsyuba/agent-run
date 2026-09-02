@@ -1,278 +1,166 @@
-"""Focused protocol tests for the volatile Codex Desktop relay."""
-
+"""Exercise the real Node wrapper and Python client without contacting Desktop."""
+import json
 import os
+from pathlib import Path
+import shutil
 import socket
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
-from pathlib import Path
-from unittest import mock
+from unittest.mock import MagicMock, patch
 
-from agent_run.delivery.base import AmbiguousDeliveryError, CompletionNotice
-from agent_run.delivery.codex_desktop_relay import (
-    CodexDesktopRelayClient,
-    CodexDesktopRelayServer,
-    _frame,
-    _read_frame,
-)
-from agent_run.domain import AgentStatus, OrchestratorRef
+from agent_run import cli
+from agent_run.delivery.base import CompletionNotice, AmbiguousDeliveryError
+from agent_run.delivery.codex_desktop_relay import CodexDesktopRelayClient, _frame, _read_frame
+from agent_run.domain import AgentId, AgentStatus, OrchestratorRef
 from agent_run.errors import ValidationError
 
-AGENT_ID = "ag-20260825-120000-0123456789"
-
-def _bind_host(path: str) -> socket.socket:
-    """Bind a listening Unix socket that acts as the Desktop host pipe."""
-
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(path)
-    listener.listen(1)
-    return listener
-
-def _serve_host(listener: socket.socket, success: bool) -> None:
-    """Answer one host tools/list then tools/call over the framed protocol."""
-
-    connection, _ = listener.accept()
-    with connection:
-        listed = _read_frame(connection)
-        connection.sendall(_frame({
-            "jsonrpc": "2.0",
-            "id": listed["id"],
-            "result": {
-                "tools": [{"name": "send_message_to_thread", "namespace": "codex"}]
-            },
-        }))
-        called = _read_frame(connection)
-        connection.sendall(_frame({
-            "jsonrpc": "2.0",
-            "id": called["id"],
-            "result": {"success": success, "contentItems": []},
-        }))
-    listener.close()
-
-def _scripted_relay(path: Path, script) -> threading.Thread:
-    """Serve one scripted relay connection from a listening Unix socket."""
-
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(path))
-    listener.listen(1)
-
-    def run() -> None:
-        connection, _ = listener.accept()
-        with connection:
-            script(connection)
-        listener.close()
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    return thread
-
-class CodexDesktopRelayProtocolTests(unittest.TestCase):
-    """Check the bounded frame and tool discovery contracts without a live host."""
-
-    def test_frame_round_trip_uses_little_endian_json(self) -> None:
-        """A relay frame preserves one JSON object across a local socket pair."""
-
-        reader, writer = socket.socketpair()
-        try:
-            writer.sendall(_frame({"outcome": "accepted"}))
-            self.assertEqual(_read_frame(reader), {"outcome": "accepted"})
-        finally:
-            reader.close()
-            writer.close()
-
-    def test_namespace_requires_the_exact_host_tool(self) -> None:
-        """Discovery accepts only the advertised completion tool namespace, echoing the expected id."""
-
-        expected_id = "list-1"
-        self.assertEqual(
-            CodexDesktopRelayServer._namespace(
-                {
-                    "jsonrpc": "2.0",
-                    "id": expected_id,
-                    "result": {"tools": [{"name": "send_message_to_thread", "namespace": "codex"}]},
-                },
-                expected_id,
-            ),
-            "codex",
-        )
-        self.assertIsNone(
-            CodexDesktopRelayServer._namespace(
-                {"jsonrpc": "2.0", "id": expected_id, "result": {"tools": []}},
-                expected_id,
-            )
-        )
-        self.assertIsNone(
-            CodexDesktopRelayServer._namespace(
-                {
-                    "jsonrpc": "2.0",
-                    "id": "mismatched-id",
-                    "result": {"tools": [{"name": "send_message_to_thread", "namespace": "codex"}]},
-                },
-                expected_id,
-            )
-        )
-        self.assertIsNone(CodexDesktopRelayServer._namespace("not a dict", expected_id))
-        self.assertIsNone(
-            CodexDesktopRelayServer._namespace(
-                {"jsonrpc": "2.0", "id": expected_id, "result": "not a dict"},
-                expected_id,
-            )
-        )
+NODE = shutil.which("node")
+WRAPPER = Path(__file__).parents[1] / "src/agent_run/delivery/codex_desktop_host.cjs"
+AGENT = AgentId("ag-20260825-120000-0123456789")
+NOTICE = CompletionNotice("ntf_test", AGENT, AgentStatus.SUCCEEDED)
+TARGET = OrchestratorRef("codex_queue", "thread-test")
 
 
-class CodexDesktopRelayServerTests(unittest.TestCase):
-    """The relay server starts only when the host pipe path is injected."""
+class RelayClientTests(unittest.TestCase):
+    """Local failure classifications preserve the existing at-least-once contract."""
 
-    def test_start_from_environment_gates_on_the_pipe_path(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            pipe = str(home / "host.sock")
-            with mock.patch.dict(os.environ, {}, clear=True):
-                self.assertIsNone(CodexDesktopRelayServer.start_from_environment(home))
-            with mock.patch.dict(
-                os.environ, {"CODEX_APP_TOOLS_PIPE_PATH": pipe}, clear=True
-            ), mock.patch.object(
-                CodexDesktopRelayServer, "start"
-            ) as start, mock.patch.object(CodexDesktopRelayServer, "close"):
-                server = CodexDesktopRelayServer.start_from_environment(home)
-                self.assertIsInstance(server, CodexDesktopRelayServer)
-                self.assertEqual(server._host_pipe_path, pipe)
-                start.assert_called_once_with()
+    def test_missing_relay_is_safe_fallback(self):
+        """An empty endpoint directory cannot have accepted a notice."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            self.assertFalse(CodexDesktopRelayClient(Path(directory)).send(TARGET, NOTICE))
 
-class CodexDesktopRelayDeliverTests(unittest.TestCase):
-    """The relay validates its own request and rebuilds the trusted notice."""
-
-    def setUp(self) -> None:
-        self.server = CodexDesktopRelayServer(
-            Path(tempfile.gettempdir()), "/nonexistent/host.sock"
-        )
-
-    def tearDown(self) -> None:
-        self.server._socket.close()
-
-    def request(self, **overrides) -> dict:
-        base = {
-            "version": 1,
-            "op": "completion",
-            "thread_id": "session-1",
-            "notification_id": "ntf_relay",
-            "agent_id": AGENT_ID,
-            "status": "succeeded",
-        }
-        base.update(overrides)
-        return base
-
-    def test_deliver_rejects_a_non_terminal_status(self) -> None:
-        """A valid but active status never reaches the host pipe."""
-
-        with self.assertRaises(ValidationError):
-            self.server._deliver(self.request(status="running"))
-
-    def test_deliver_rejects_an_unknown_status(self) -> None:
-        """An unrecognised status is rejected as a bad request."""
-
-        with self.assertRaises(ValidationError):
-            self.server._deliver(self.request(status="bogus"))
-
-    def test_deliver_rejects_an_unknown_agent_id(self) -> None:
-        """A malformed agent id fails the trusted notice before any host call."""
-
-        with self.assertRaises(ValidationError):
-            self.server._deliver(self.request(agent_id="not-an-agent"))
-
-class CodexDesktopRelayClientTests(unittest.TestCase):
-    """The client classifies each relay attempt and never crosses the fallback."""
-
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.home = Path(self.temporary.name)
-        self.notice = CompletionNotice("ntf_relay", AGENT_ID, AgentStatus.SUCCEEDED)
-        self.target = OrchestratorRef("codex_queue", "session-1", "turn-1")
-
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
-    def test_acceptance_returns_true_with_static_evidence(self) -> None:
-        path = self.home / "ar-cdx-accept.sock"
-        thread = _scripted_relay(path, lambda conn: (
-            _read_frame(conn),
-            conn.sendall(_frame({"outcome": "accepted"})),
-        ))
-        try:
-            client = CodexDesktopRelayClient(self.home)
-            self.assertTrue(client.send(self.target, self.notice))
-            self.assertIsNotNone(client.last_evidence)
-            self.assertEqual(client.last_evidence.classifier, "relay_accepted")
-            self.assertEqual(client.last_evidence.executable, "codex_desktop_relay")
-            self.assertEqual(client.last_evidence.argv_shape, ("relay",))
-        finally:
-            thread.join(timeout=2.0)
-
-    def test_explicit_rejection_falls_through_to_the_queue(self) -> None:
-        path = self.home / "ar-cdx-reject.sock"
-        thread = _scripted_relay(path, lambda conn: (
-            _read_frame(conn),
-            conn.sendall(_frame({"outcome": "rejected"})),
-        ))
-        try:
-            client = CodexDesktopRelayClient(self.home)
-            self.assertFalse(client.send(self.target, self.notice))
-        finally:
-            thread.join(timeout=2.0)
-
-    def test_post_write_eof_is_ambiguous_and_never_falls_back(self) -> None:
-        path = self.home / "ar-cdx-eof.sock"
-        thread = _scripted_relay(path, lambda conn: _read_frame(conn))
-        try:
-            client = CodexDesktopRelayClient(self.home)
+    def test_partial_send_is_ambiguous_and_stops_discovery(self):
+        """Even BrokenPipe during sendall cannot permit another relay or queue."""
+        client = CodexDesktopRelayClient(Path("/tmp"))
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.sendall.side_effect = BrokenPipeError("partial")
+        with patch.object(client, "_paths", return_value=(Path("/tmp/a"), Path("/tmp/b"))), patch(
+            "agent_run.delivery.codex_desktop_relay.socket.socket", return_value=connection
+        ):
             with self.assertRaises(AmbiguousDeliveryError):
-                client.send(self.target, self.notice)
-            self.assertIsNotNone(client.last_evidence)
-            self.assertEqual(client.last_evidence.classifier, "relay_ambiguous")
-        finally:
-            thread.join(timeout=2.0)
+                client.send(TARGET, NOTICE)
+        connection.connect.assert_called_once()
+        assert client.last_evidence is not None
+        self.assertEqual(client.last_evidence.classifier, "relay_ambiguous")
+        self.assertNotIn("thread-test", json.dumps(client.last_evidence.payload()))
 
-    def test_unreachable_socket_is_skipped_and_cleaned_up(self) -> None:
-        stale = self.home / "ar-cdx-stale.sock"
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(stale))
-        listener.close()
-        client = CodexDesktopRelayClient(self.home)
-        self.assertFalse(client.send(self.target, self.notice))
-        self.assertFalse(stale.exists())
+    def test_frame_bound_is_enforced(self):
+        """Oversized local requests fail before any socket transmission."""
+        with self.assertRaises(ValidationError):
+            _frame({"text": "x" * 8192})
 
-class CodexDesktopRelayEndToEndTests(unittest.TestCase):
-    """One real relay server backed by a scripted host, driven by the client."""
 
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.home = Path(self.temporary.name)
-        self.notice = CompletionNotice("ntf_relay", AGENT_ID, AgentStatus.SUCCEEDED)
-        self.target = OrchestratorRef("codex_queue", "session-1", "turn-1")
+@unittest.skipUnless(NODE, "optional Desktop Node host is unavailable")
+class NodeWrapperTests(unittest.TestCase):
+    """Real Node UDS roundtrips preserve exact notice text, stdio, and cleanup."""
 
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
+    def run_delivery(self, mode):
+        """Run one fake host exchange; return acceptance and assert child cleanup."""
+        assert NODE is not None
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            home = Path(directory)
+            host = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            host.bind(str(home / "host.sock")); host.listen(1); host.settimeout(5)
+            errors = []
 
-    def _run(self, success: bool) -> bool:
-        host_path = str(self.home / "host.sock")
-        listener = _bind_host(host_path)
-        host_thread = threading.Thread(
-            target=_serve_host, args=(listener, success), daemon=True
-        )
-        host_thread.start()
-        relay = CodexDesktopRelayServer(self.home, host_path)
-        relay.start()
-        try:
-            return CodexDesktopRelayClient(self.home).send(self.target, self.notice)
-        finally:
-            relay.close()
-            host_thread.join(timeout=2.0)
+            def reply(connection, value):
+                """Write host-sized JSON, deliberately independent of local 8192 cap."""
+                body = json.dumps(value).encode()
+                connection.sendall(struct.pack("<I", len(body)) + body)
 
-    def test_live_relay_accepts_and_suppresses_the_queue(self) -> None:
-        self.assertTrue(self._run(True))
+            def serve_host():
+                """Answer one tools/list then tools/call and capture assertion failures."""
+                try:
+                    connection, _ = host.accept()
+                    with connection:
+                        connection.settimeout(3)
+                        listed = _read_frame(connection)
+                        self.assertEqual(listed["id"], 1)
+                        if mode == "precall":
+                            reply(connection, {"jsonrpc": "2.0", "id": 999, "result": {}})
+                            return
+                        reply(connection, {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+                            {"name": "send_message_to_thread", "namespace": "codex_app", "description": "x" * 42000}
+                        ]}})
+                        called = _read_frame(connection)
+                        self.assertEqual(called["id"], 2)
+                        self.assertEqual(called["params"]["arguments"], {"threadId": TARGET.external_session_id, "prompt": NOTICE.render()})
+                        self.assertEqual(called["params"]["callId"], NOTICE.notification_id)
+                        if mode == "drop":
+                            return
+                        value = {"jsonrpc": "2.0", "id": 2, "result": {"success": mode != "false", "contentItems": []}}
+                        if mode == "badid": value["id"] = 999
+                        if mode == "error": value = {"jsonrpc": "2.0", "id": 2, "error": {"code": -1}}
+                        reply(connection, value)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    host.close()
 
-    def test_host_failure_is_an_explicit_rejection_for_queue_fallback(self) -> None:
-        self.assertFalse(self._run(False))
+            thread = threading.Thread(target=serve_host, daemon=True)
+            thread.start()
+            child_code = "import os,sys,json;sys.stdin.buffer.read();print(json.dumps([os.getenv('CODEX_APP_TOOLS_PIPE_PATH'),os.getenv('CODEX_MCP_NODE_PATH')]))"
+            env = dict(os.environ, CODEX_APP_TOOLS_PIPE_PATH=str(home / "host.sock"), CODEX_MCP_NODE_PATH=NODE)
+            process = subprocess.Popen([NODE, str(WRAPPER), sys.executable, str(home), "-c", child_code],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            try:
+                deadline = time.monotonic() + 5
+                while not list(home.glob("ar-cdx-*.sock")):
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        self.fail("Node wrapper did not bind relay")
+                    time.sleep(0.01)
+                endpoint = next(home.glob("ar-cdx-*.sock"))
+                self.assertEqual(endpoint.stat().st_mode & 0o777, 0o600)
+                client = CodexDesktopRelayClient(home)
+                if mode in {"drop", "badid", "error"}:
+                    with self.assertRaises(AmbiguousDeliveryError): client.send(TARGET, NOTICE)
+                    accepted = None
+                else:
+                    accepted = client.send(TARGET, NOTICE)
+            finally:
+                out, err = process.communicate(b"", timeout=5)
+                thread.join(timeout=5)
+            self.assertEqual(process.returncode, 0, err.decode())
+            self.assertEqual(json.loads(out), [None, None])
+            self.assertFalse(list(home.glob("ar-cdx-*.sock")))
+            if errors: raise errors[0]
+            return accepted
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_large_inventory_and_exact_notice_are_accepted(self):
+        """A real >8KiB host inventory passes the separate host frame ceiling."""
+        self.assertTrue(self.run_delivery("true"))
+
+    def test_explicit_rejection_and_precall_failure_allow_fallback(self):
+        """Only known non-delivery outcomes return False to the queue transport."""
+        for mode in ("false", "precall"):
+            with self.subTest(mode=mode): self.assertFalse(self.run_delivery(mode))
+
+    def test_postcall_uncertainty_never_allows_fallback(self):
+        """EOF, id mismatch, and error after dispatch all remain ambiguous."""
+        for mode in ("drop", "badid", "error"):
+            with self.subTest(mode=mode): self.run_delivery(mode)
+
+
+class ExecWrapperTests(unittest.TestCase):
+    """Only a real configured MCP CLI replaces itself with the host Node wrapper."""
+
+    def test_missing_capability_does_not_exec(self):
+        """Ordinary CLI/MCP operation remains dependency-free without host env."""
+        with patch.dict(os.environ, {}, clear=True), patch.object(os, "execv") as execute:
+            cli._exec_desktop_relay(Path("/tmp"))
+        execute.assert_not_called()
+
+    def test_exec_uses_exact_node_and_python_child(self):
+        """No shell or inherited arbitrary argv is used for the wrapper process."""
+        with patch.dict(os.environ, {"CODEX_MCP_NODE_PATH": sys.executable, "CODEX_APP_TOOLS_PIPE_PATH": "/tmp/host.sock"}, clear=True), patch.object(os, "execv") as execute:
+            cli._exec_desktop_relay(Path("/tmp/home"))
+        node, args = execute.call_args.args
+        self.assertEqual(node, sys.executable)
+        self.assertTrue(args[1].endswith("codex_desktop_host.cjs"))
+        self.assertEqual(args[2:], [sys.executable, "/tmp/home", "-m", "agent_run.cli", "--home", "/tmp/home", "mcp"])
