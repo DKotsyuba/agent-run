@@ -3,6 +3,7 @@
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -37,8 +38,14 @@ def _append_scope(
     *,
     remaining: float,
     observed_at: float,
+    reset_at: float = 2_000.0,
+    valid_until: float = 1_100.0,
 ) -> None:
-    """Append one sample and refresh its explicit topology at ``observed_at``."""
+    """Append one sample and refresh its explicit topology at ``observed_at``.
+
+    ``reset_at`` and ``valid_until`` default to the fixed epochs the injected
+    ``now`` fixtures use; tests that run the real clock pass fresh ones.
+    """
 
     lane = f"lane-{runtime}"
     pool_id = f"pool-{runtime}"
@@ -50,16 +57,16 @@ def _append_scope(
                 "source": "source",
                 "target": None,
                 "remaining_percent": remaining,
-                "reset_at": 2_000.0,
+                "reset_at": reset_at,
                 "observed_at": observed_at,
-                "valid_until": 1_100.0,
+                "valid_until": valid_until,
                 "payload": None,
             }
         ],
         runtime=runtime,
         scope_id="scope",
         observed_at=observed_at,
-        valid_until=1_100.0,
+        valid_until=valid_until,
         payload={
             "pools": [
                 {
@@ -86,6 +93,45 @@ def _append_scope(
             ],
         },
     )
+
+
+def _config_text(home: Path) -> str:
+    """Render a temporary config declaring the capacity-order fixture runtimes.
+
+    ``home`` is the temporary agent-run home, so no binary or runtime home ever
+    points at real user state. ``disabled`` proves the default facade drops
+    disabled runtimes exactly like the injected-service path does.
+    """
+
+    runtimes = ""
+    for name, enabled in (
+        ("alpha", True),
+        ("beta", True),
+        ("empty", True),
+        ("missing", True),
+        ("disabled", False),
+    ):
+        runtimes += (
+            f"\n[runtimes.{name}]\n"
+            f"enabled = {str(enabled).lower()}\n"
+            'adapter = "agent_run.adapters.codex.adapter:ADAPTER"\n'
+            f'binary = "{home / name}"\n'
+            f'home = "{home / name}-home"\n'
+            'models = ["model"]\n'
+        )
+    return f"schema_version = 1\n{runtimes}"
+
+
+def _durable_row_counts(store: StateStore) -> dict[str, int]:
+    """Count the rows a read-only capacity order must leave untouched."""
+
+    tables = ("capacity_samples", "capacity_route_snapshots", "agents", "deliveries")
+    return {
+        table: int(
+            store.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        )
+        for table in tables
+    }
 
 
 class _CapacityService:
@@ -184,3 +230,51 @@ class CapacityOrderCliTests(unittest.TestCase):
                 self.assertEqual(payload["unavailable_runtimes"], ["missing"])
             finally:
                 store.close()
+
+    def test_default_facade_serves_capacity_order_without_injection(self) -> None:
+        """Run the real non-injected command end to end against a temp home.
+
+        Every other test here injects ``service``, so none reaches the
+        ``_Runtime`` facade ``main`` builds by default. This one drives
+        ``cli.main`` with ``--home`` only, a real config file, and a real
+        ``StateStore``, then checks the order, the fresh clock epoch, and that
+        no durable row was touched.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text(_config_text(home), encoding="utf-8")
+            store = StateStore.initialize(home / "state.db")
+            try:
+                now = time.time()
+                fresh = {
+                    "reset_at": now + 3_600.0,
+                    "valid_until": now + 900.0,
+                }
+                _append_scope(store, "alpha", remaining=80.0, observed_at=now, **fresh)
+                _append_scope(store, "beta", remaining=20.0, observed_at=now, **fresh)
+                _append_scope(store, "empty", remaining=0.0, observed_at=now, **fresh)
+                durable = _durable_row_counts(store)
+            finally:
+                store.close()
+
+            started = time.time()
+            stdout = io.StringIO()
+            code = main(["--home", str(home), "capacity", "order"], stdout=stdout)
+            finished = time.time()
+            payload = json.loads(stdout.getvalue())
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                [route["runtime"] for route in payload["routes"]], ["alpha", "beta"]
+            )
+            self.assertEqual(payload["omitted"][0]["runtime"], "empty")
+            self.assertEqual(payload["unavailable_runtimes"], ["missing"])
+            self.assertNotIn("disabled", stdout.getvalue())
+            self.assertTrue(started <= payload["observed_at"] <= finished)
+            store = StateStore.open(home / "state.db")
+            try:
+                self.assertEqual(_durable_row_counts(store), durable)
+            finally:
+                store.close()
+            self.assertFalse((home / "agents").exists())

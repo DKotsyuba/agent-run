@@ -378,7 +378,7 @@ class ReadRateLimitsTests(unittest.TestCase):
             captured["timeout"] = timeout_seconds
             return {"accountId": "acct-x"}
 
-        with mock.patch.object(app_server, "fetch_rate_limits", fake_fetch):
+        with mock.patch.object(codex_rate_limits, "fetch_rate_limits", fake_fetch):
             result = codex_rate_limits.read_rate_limits(runtime, home)
         self.assertEqual(result, {"accountId": "acct-x"})
         plan = captured["plan"]
@@ -453,7 +453,7 @@ class FetchRateLimitsTests(unittest.TestCase):
 
         with mock.patch.object(app_server, "ProcessTransport", fake_transport):
             try:
-                state["result"] = app_server.fetch_rate_limits(
+                state["result"] = codex_rate_limits.fetch_rate_limits(
                     _plan(directory.name), timeout_seconds=5.0
                 )
             except BaseException as error:  # surfaced via state for the assertions
@@ -514,7 +514,7 @@ class FetchRateLimitsTests(unittest.TestCase):
             for bad in (0, -1, float("inf"), True, "20"):
                 with self.subTest(bad=bad):
                     with self.assertRaises(ValidationError):
-                        app_server.fetch_rate_limits(
+                        codex_rate_limits.fetch_rate_limits(
                             _plan("."), timeout_seconds=cast(float, bad)
                         )
         self.assertEqual(spawned, [])
@@ -528,7 +528,7 @@ class FetchRateLimitsTests(unittest.TestCase):
         )
         started = time.monotonic()
         with self.assertRaises(TimeoutError):
-            app_server.fetch_rate_limits(sleeping, timeout_seconds=1.0)
+            codex_rate_limits.fetch_rate_limits(sleeping, timeout_seconds=1.0)
         self.assertLess(time.monotonic() - started, 20)
 
 
