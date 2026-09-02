@@ -43,6 +43,13 @@ Each `[runtimes.<name>]` table may declare:
 - `plugins` — absolute plugin directory paths.
 - `max_active_agents` — concurrency ceiling for this runtime.
 - `hooks` — codex only; hook trust digests and commands.
+- `limits_source` — `native`, `codex_appserver`, `codexbar`, `omniroute`,
+  or `none`; controls how quota evidence is collected.
+- `accounts` / `default_account` — path-safe labels for configured account
+  homes when the runtime supports multi-account launches.
+- `priority_multiplier` — positive finite number, default `1.0`; multiplies
+  this runtime's nonnegative capacity-order score. It cannot make an exhausted
+  route usable and does not affect role/model suitability.
 
 Declaring a key with an unsupported value fails closed at load time
 (`ValidationError`), not silently at first use.

@@ -122,6 +122,7 @@ class CapacityRankingTests(unittest.TestCase):
         self.assertAlmostEqual(first.priority, 3.2)
         self.assertEqual(first.windows[0].projected_percent, 60.0)
         self.assertEqual(first.windows[0].marker, "projected")
+        self.assertFalse(order.insufficient_diversity)
 
     def test_fallback_markers_use_centered_remaining_percent(self) -> None:
         """Warmup, thin, and reset-less windows never extrapolate thin burn."""
@@ -225,6 +226,9 @@ class CapacityRankingTests(unittest.TestCase):
                 ("route-a", "account-a", "lane-a"),
                 ("route-b", "account-b", "lane-b"),
             ],
+        )
+        self.assertTrue(
+            rank_capacity_routes(_snapshot(*routes), {}, now=_NOW).insufficient_diversity
         )
 
     def test_tie_break_is_total_and_input_order_independent(self) -> None:

@@ -356,6 +356,25 @@ names = ["{secret}"]
             with self.subTest(field=field), self.assertRaisesRegex(ValidationError, field):
                 self.load(text)
 
+    def test_runtime_priority_multiplier_is_positive_and_finite(self) -> None:
+        """Accept a positive weight and reject invalid routing weights."""
+
+        self.assertEqual(
+            self.runtime_with_limits_source("priority_multiplier = 2.5").runtimes[
+                "fake"
+            ].priority_multiplier,
+            2.5,
+        )
+        self.assertEqual(
+            self.runtime_with_limits_source().runtimes["fake"].priority_multiplier,
+            1.0,
+        )
+        for value in ("0", "-1", "true", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValidationError, "priority_multiplier"
+            ):
+                self.runtime_with_limits_source(f"priority_multiplier = {value}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,7 @@ class CapacityOrder:
     deferred: tuple[CapacityOrderEvidence, ...]
     omitted: tuple[OmittedCapacityRoute, ...]
     unavailable_runtimes: tuple[str, ...]
+    insufficient_diversity: bool
 
 
 def _finite(value: object, name: str) -> float:
@@ -376,5 +377,10 @@ def rank_capacity_routes(
     deferred = sorted(set(deferred), key=_evidence_order)
     unavailable = tuple(sorted(seen_runtimes - available_runtimes))
     return CapacityOrder(
-        ranked_at, tuple(ranked), tuple(deferred), tuple(omitted), unavailable
+        ranked_at,
+        tuple(ranked),
+        tuple(deferred),
+        tuple(omitted),
+        unavailable,
+        len(ranked) < 2,
     )

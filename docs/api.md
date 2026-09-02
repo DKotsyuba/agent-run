@@ -77,11 +77,21 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-The tool set (17 at the time of writing, same names as the MCP server):
+The tool set (18 at the time of writing, same names as the MCP server):
 `start`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
-`list_agents`, `models`, `limits`, `fast`, `doc`, and the workflow verbs
+`list_agents`, `models`, `limits`, `capacity_order`, `fast`, `doc`, and the workflow verbs
 `workflow_start`, `workflow_status`, `workflow_answer`, `workflow_cancel`,
 `workflow_resume`.
+
+`capacity_order` takes no parameters. It returns fresh non-exhausted physical
+quota routes in descending priority, plus deferred evidence, exhausted
+`omitted` routes, and `unavailable_runtimes`. Each working route includes its
+concrete runtime/account/quota-lane aliases, governing windows, raw score,
+configured multiplier, final priority, and limiting exact key/reset. The list
+is role-independent: callers still choose the first alias whose models fit the
+task. `insufficient_diversity` is true when fewer than two working physical
+choices remain; the routes list is still authoritative and may contain one or
+zero entries.
 
 Two extra methods exist only on this transport:
 

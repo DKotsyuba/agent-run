@@ -108,6 +108,9 @@ Add more `[runtimes.<name>]` blocks for other engines (`codex`, `qwen`,
 names or file links — never secret values in config), allowed skills,
 declared MCP servers, lifecycle hooks, plugins, and the limits source
 (`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
+`priority_multiplier = 1.0` is the optional positive finite weight used by
+capacity ordering; it scales only viable routes and never revives an exhausted
+window.
 
 For Codex, `codex_appserver` reads each configured account through a
 short-lived local app-server process. Standard and model-specific buckets
@@ -188,7 +191,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 
 The proxy exposes the same tool surface as the resident daemon: `start`,
 `status`, `answer`, `wait`-free async flow, `cancel`, `steer`, `summary`,
-`transcript`, `list_agents`, `models`, `limits`, `fast`, `doc`, and
+`transcript`, `list_agents`, `models`, `limits`, `capacity_order`, `fast`, `doc`, and
 `workflow_start` / `workflow_status` / `workflow_answer` /
 `workflow_cancel` / `workflow_resume`.
 

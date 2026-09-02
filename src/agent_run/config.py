@@ -75,6 +75,12 @@ class RuntimeHookConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """Static configuration for one arbitrary runtime name.
+
+    ``priority_multiplier`` is a positive finite routing weight. It is applied
+    only to that runtime's capacity priority and defaults to ``1.0``.
+    """
+
     enabled: bool
     adapter: str
     binary: Path
@@ -90,6 +96,7 @@ class RuntimeConfig:
     limits_source: str | None = None
     accounts: tuple[str, ...] = ()
     default_account: str | None = None
+    priority_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -380,6 +387,15 @@ def _parse_hooks(value: object, path: str) -> tuple[RuntimeHookConfig, ...]:
 
 
 def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
+    """Parse arbitrary runtime tables into an immutable validated mapping.
+
+    Every runtime must declare its adapter, binary, home, models, and enabled
+    state. Optional account/auth, hook, plugin, capacity-source, and concurrency
+    fields retain their existing validation. ``priority_multiplier`` defaults
+    to ``1.0`` and rejects booleans, non-numeric or non-finite values, and
+    numbers less than or equal to zero. Unknown fields raise ``ValidationError``.
+    """
+
     result: dict[str, RuntimeConfig] = {}
     allowed = {
         "enabled",
@@ -397,6 +413,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "limits_source",
         "accounts",
         "default_account",
+        "priority_multiplier",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -428,6 +445,14 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         parsed_auth = None if auth is None else _parse_auth(auth, f"{path}.auth")
         if account_names and (parsed_auth is None or parsed_auth.kind != "file_link"):
             raise ValidationError(f"{path}.accounts requires file_link auth")
+        priority_multiplier = table.get("priority_multiplier", 1.0)
+        if (
+            isinstance(priority_multiplier, bool)
+            or not isinstance(priority_multiplier, (int, float))
+            or not math.isfinite(priority_multiplier)
+            or priority_multiplier <= 0
+        ):
+            raise ValidationError(f"{path}.priority_multiplier must be a finite number > 0")
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -444,6 +469,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             None if limits_source is None else _string(limits_source, f"{path}.limits_source"),
             account_names,
             default_account,
+            float(priority_multiplier),
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")
