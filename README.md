@@ -139,6 +139,11 @@ agent-run doctor
 
 ## Quick start (CLI)
 
+The one-shot `start` command submits to the resident Unix-socket daemon so an
+accepted asynchronous launch survives the CLI process. Start `agent-run api
+serve` first, or install the launchd job below; if the daemon is unavailable,
+`start` returns an actionable `BrokerUnavailable` error.
+
 ```bash
 # start one read-only agent; returns immediately with a durable id
 agent-run start --runtime claude --model sonnet --profile review \
@@ -160,7 +165,8 @@ Useful verbs beyond that: `status`, `transcript --follow`, `steer`,
 
 `agent-run mcp` is a thin stdio proxy over the resident Unix-socket daemon.
 Start the daemon in the foreground with `agent-run api serve`; MCP requires it
-to be running and reports `BrokerUnavailable` when it is down.
+to be running and reports `BrokerUnavailable` when it is down. The one-shot
+CLI `start` command uses the same resident path for lifecycle safety.
 
 For a long-lived macOS setup, generate and install a launchd job:
 

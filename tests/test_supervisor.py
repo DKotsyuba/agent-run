@@ -854,6 +854,26 @@ class SupervisorTests(unittest.TestCase):
             channel.wait(1.0)
         self.assertEqual(adapter.launches, 0)
 
+    def test_ready_accepts_prestarted_and_cancelling_rows(self) -> None:
+        """Async admission must not trigger a STARTING-to-STARTING failure."""
+
+        ops = FakeOps()
+        supervisor = self.supervisor(FakeAdapter(FakeSession(ops)), ops)
+        self.store.transition(self.agent_id, AgentStatus.STARTING)
+
+        supervisor._report_ready()
+        started = self.store.get_agent(self.agent_id)
+        self.assertEqual(started["status"], AgentStatus.STARTING.value)
+        self.assertIsNotNone(started["supervisor_pid"])
+        self.assertIsNotNone(started["supervisor_identity"])
+
+        self.store.transition(self.agent_id, AgentStatus.RUNNING)
+        self.store.transition(self.agent_id, AgentStatus.CANCELLING)
+        supervisor._report_ready()
+        cancelling = self.store.get_agent(self.agent_id)
+        self.assertEqual(cancelling["status"], AgentStatus.CANCELLING.value)
+        self.assertIsNotNone(cancelling["process_group_id"])
+
     def test_blank_startup_error_uses_exception_type_in_ready_failure(self) -> None:
         self.store.starting_error = RuntimeError()
         channel = ReadyChannel.open()

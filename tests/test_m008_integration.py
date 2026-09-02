@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -77,7 +78,7 @@ class M008IntegrationTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.store.close()
+        self.service.close()
         self.temporary.cleanup()
 
     def request(self, request_id: str, task: str = "safe task") -> StartRequest:
@@ -86,6 +87,8 @@ class M008IntegrationTests(unittest.TestCase):
         )
 
     def mcp_call(self, service, request_id, name, arguments):
+        """Invoke one shared MCP dispatch call and decode its result envelope."""
+
         class Broker:
             def __init__(self, target):
                 self.target = target
@@ -109,10 +112,21 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertEqual(serve(Broker(service), source, output), 0)
         return json.loads(output.getvalue())["result"]
 
+    def wait_until(self, predicate, *, timeout: float = 2.0) -> None:
+        """Wait boundedly for an asynchronous integration condition."""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("asynchronous integration condition did not become true")
+
     def test_async_start_supervisor_late_bind_and_one_trusted_dispatch(self) -> None:
         started = self.service.start(self.request("async-completion"))
         self.assertTrue(started.created)
-        self.assertIs(started.agent.status, AgentStatus.CREATED)
+        self.assertIs(started.agent.status, AgentStatus.STARTING)
+        self.wait_until(lambda: len(self.launches) == 1)
         self.assertEqual(len(self.launches), 1, "start returns after the launch decision")
 
         agent_id, _request, _adapter, plan, directory = self.launches[0]
@@ -264,13 +278,20 @@ class M008IntegrationTests(unittest.TestCase):
             "request_id": "mcp-launch-failure",
         }
         failed = self.mcp_call(service, 1, "start", arguments)
-        self.assertTrue(failed["isError"])
+        self.assertFalse(failed["isError"])
+        self.assertTrue(failed["structuredContent"]["created"])
+        agent_id = failed["structuredContent"]["agent_id"]
+        self.wait_until(
+            lambda: self.store.get_agent(agent_id)["status"]
+            == AgentStatus.FAILED.value
+        )
         row = self.store.list_agents()[0]
         self.assertEqual((row["status"], row["failure_kind"]), ("failed", "supervisor_start_failed"))
         retried = self.mcp_call(service, 2, "start", arguments)
         self.assertFalse(retried["isError"])
         self.assertFalse(retried["structuredContent"]["created"])
         self.assertEqual(len(calls), 1)
+        service.close()
 
 
 if __name__ == "__main__":

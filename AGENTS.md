@@ -44,6 +44,10 @@ reliability of *this* code is set by everything that will run on top of it.
   The legacy fork path is allowed only when session-creating `posix_spawn` is
   explicitly unavailable; PID/PGID, readiness, cleanup, and reap evidence must
   stay exact.
+- **One-shot CLI start is broker-owned.** `agent-run start` must submit through
+  the resident Unix-socket daemon. Never create an asynchronous start worker
+  owned by the short-lived CLI process, and never silently fall back locally
+  when the broker is unavailable.
 - **Schema changes go through migrations.** `state/schema.sql` is the
   current shape; every change also needs a numbered file in
   `state/migrations/` and a schema-version bump. Old MCP servers

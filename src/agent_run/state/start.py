@@ -22,11 +22,15 @@ from .db import (
 
 @dataclass(frozen=True, slots=True)
 class AgentCreation:
+    """Result of one atomic creation or idempotent replay."""
+
     agent_id: AgentId
     created: bool
 
 
 def _limit(name: str, value: int | None) -> int | None:
+    """Validate an optional positive active-agent limit and return it."""
+
     if value is not None and (type(value) is not int or value < 1):
         raise ValidationError(f"{name} must be a positive integer")
     return value
@@ -43,6 +47,13 @@ def create_agent(
     global_limit: int | None = None,
     runtime_limit: int | None = None,
 ) -> AgentCreation:
+    """Atomically admit one agent or replay its immutable request.
+
+    ``config_revision`` may be replaced after asynchronous materialization, so
+    replay equality deliberately uses only the serialized request and task
+    summary. Capacity is checked after replay lookup.
+    """
+
     if not isinstance(request, StartRequest):
         raise ValidationError("request must be a StartRequest")
     nonblank("task_summary", task_summary)
@@ -61,7 +72,6 @@ def create_agent(
                 if (
                     existing["request_json"] != serialized
                     or existing["task_summary"] != task_summary
-                    or existing["config_revision"] != config_revision
                 ):
                     raise ValidationError("request_id was reused for a different request")
                 return AgentCreation(AgentId(str(existing["id"])), False)

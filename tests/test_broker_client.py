@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from agent_run.broker_client import BrokerClient
+from agent_run.domain import StartRequest
 from agent_run.errors import AgentRunError, BrokerUnavailable, ValidationError
 
 
@@ -72,6 +73,35 @@ class BrokerClientTests(unittest.TestCase):
         self.assertEqual(client.call("limits", {"x": 1}), {"value": {"x": 1}})
         self.assertEqual(client.call("status", {"x": 2}), {"value": {"x": 2}})
         self.assertEqual([item["id"] for item in seen], [1, 2])
+
+    def test_start_serializes_request_and_rejects_malformed_results(self):
+        """Serialize starts and reject invalid requests or broker results."""
+
+        seen = []
+
+        def respond(request):
+            """Return one valid start result, then one malformed result."""
+
+            seen.append(request)
+            result = {"agent_id": "ag-test", "created": True} if len(seen) == 1 else {}
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+
+        server = FakeSocketApi(self.path, respond)
+        server.start()
+        self.addCleanup(server.close)
+        client = BrokerClient(self.path)
+        self.addCleanup(client.close)
+        request = StartRequest("codex", "model", "review", "task", Path(self.tempdir.name))
+
+        result = client.start(request)
+
+        self.assertEqual((result.agent_id, result.created), ("ag-test", True))
+        self.assertEqual(seen[0]["method"], "start")
+        self.assertEqual(seen[0]["params"]["workdir"], str(request.workdir))
+        with self.assertRaisesRegex(AgentRunError, "invalid start result"):
+            client.start(request)
+        with self.assertRaisesRegex(ValidationError, "request must be a StartRequest"):
+            client.start(object())  # type: ignore[arg-type]
 
     def test_reconnects_once_after_server_restart(self):
         first = FakeSocketApi(self.path)

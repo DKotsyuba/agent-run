@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -28,11 +29,13 @@ from .domain import (
     new_agent_id,
     validate_agent_id,
 )
-from .errors import AuthError, ValidationError
+from .errors import AuthError, StateTransitionError, ValidationError
+from .launch import launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from . import workflow_facade
 from .profiles import assign_role, load_profile
+from .start_coordinator import StartCoordinator
 from .state.store import StateStore
 
 
@@ -44,6 +47,7 @@ _DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
 _MAX_PAGE_SIZE = 1000
 _FAILURE_TEXT_CHARS = 512
 _CHUNK = 65536
+_PENDING_CONFIG_REVISION = "pending:materialization"
 
 LaunchAgent: TypeAlias = Callable[
     [AgentId, StartRequest, RuntimeAdapter, LaunchPlan, Path], None
@@ -226,6 +230,12 @@ class AgentService:
         now: Callable[[], float] = time.time,
         max_inline_answer_bytes: int = _DEFAULT_INLINE_ANSWER_BYTES,
     ) -> None:
+        """Create the service and its thread-isolated start coordinator.
+
+        The supplied store remains on the service thread. Start workers retain
+        only its database path and open their own thread-affine connections.
+        """
+
         if not isinstance(config, Config):
             raise ValidationError("config must be a Config")
         if not isinstance(store, StateStore):
@@ -245,6 +255,9 @@ class AgentService:
         self._launch = launch
         self._now = now
         self._max_inline_answer_bytes = max_inline_answer_bytes
+        self._starts = StartCoordinator(
+            store.path(), max_workers=config.core.max_active_agents
+        )
 
     @classmethod
     def from_home(
@@ -268,9 +281,19 @@ class AgentService:
         )
 
     def close(self) -> None:
+        """Signal pre-ownership starts before closing the service store."""
+
+        self._starts.close()
         self._store.close()
 
     def start(self, request: StartRequest) -> StartResult:
+        """Durably accept one start and return before slow runtime bootstrap.
+
+        Validation, replay, capacity admission, row creation, and ``STARTING``
+        transition are synchronous. Materialization, authentication, prepare,
+        detached spawn, and READY run on a thread-isolated coordinator worker.
+        """
+
         if not isinstance(request, StartRequest):
             raise ValidationError("request must be a StartRequest")
         _logger.info(
@@ -292,30 +315,13 @@ class AgentService:
             raise ValidationError(
                 f"account {label!r} is not declared for runtime {request.runtime}; known accounts: {known}"
             )
-        effective_runtime = runtime
-        effective_home = runtime.home
         if label is not None:
             if runtime.auth is None or runtime.auth.target is None:
                 raise ValidationError(f"runtime {request.runtime} account auth is not configured")
-            effective_source = account_auth_source(
-                self._home, request.runtime, label, runtime.auth.target
-            )
-            if not effective_source.is_file():
-                raise ValidationError(
-                    f"account {label!r} is not authenticated; run agent-run auth {label} {request.runtime}"
-                )
-            effective_home = account_runtime_home(runtime.home, label)
-            effective_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-            effective_home.chmod(0o700)
-            effective_runtime = replace(
-                runtime,
-                home=effective_home,
-                auth=replace(runtime.auth, source=effective_source),
-            )
         adapter = self._registry.load(
-            request.runtime, self._required_capabilities(request, effective_runtime)
+            request.runtime, self._required_capabilities(request, runtime)
         )
-        adapter.validate(effective_runtime)
+        adapter.validate(runtime)
         _logger.debug("start gate=capabilities ok runtime=%s", request.runtime)
         if request.model not in runtime.models:
             _logger.warning(
@@ -325,48 +331,16 @@ class AgentService:
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
-        roster = adapter.models(effective_runtime, effective_home)
-        if request.model not in {model.id for model in roster}:
-            _logger.warning(
-                "start gate=model_available failed runtime=%s model=%s",
-                request.runtime, request.model,
-            )
-            raise ValidationError(
-                f"model is not available for runtime {request.runtime}: {request.model}"
-            )
-        _logger.debug("start gate=model ok runtime=%s model=%s", request.runtime, request.model)
-        # The profile is agent-run's runtime adapter for the shared role
-        # contracts: it names the role, and this is where the child is told to
-        # load it. One place, so every runtime's preamble carries the same
-        # assignment and one runtime cannot quietly skip a denied role.
-        profile = assign_role(
-            load_profile(
-                self._config.profiles,
-                request.profile,
-                requested_write=request.write,
-                read_roots=request.read_roots,
-            ),
-            request.runtime,
-            effective_runtime.skills,
-        )
-        mcp_servers = self._mcp_servers(effective_runtime)
-        skills_root = runtime_skills_dir(request.runtime, self._home)
-        revision = adapter.materialize(
-            effective_runtime,
-            effective_home,
-            mcp_servers=mcp_servers,
-            skills_root=skills_root,
-        )
-        _logger.info("start materialized runtime=%s revision=%s", request.runtime, revision)
         candidate = new_agent_id()
+        accepted_at = self._now()
         creation = self._store.create_agent_limited(
             request,
             task_summary=self._task_summary(request.task),
-            config_revision=revision,
+            config_revision=_PENDING_CONFIG_REVISION,
             global_limit=self._config.core.max_active_agents,
             runtime_limit=runtime.max_active_agents,
             agent_id=candidate,
-            at=self._now(),
+            at=accepted_at,
         )
         if not creation.created:
             _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)
@@ -374,8 +348,122 @@ class AgentService:
                 creation.agent_id, False, self.get(creation.agent_id)
             )
         _logger.info("start agent_id=%s created=True", creation.agent_id)
+        self._store.transition(
+            creation.agent_id,
+            AgentStatus.STARTING,
+            kind="start_accepted",
+            at=accepted_at,
+        )
         try:
-            candidate_dir = create_agent_dir(creation.agent_id, self._home)
+            self._starts.submit(
+                creation.agent_id,
+                lambda worker_store, cancelled: self._continue_start(
+                    worker_store,
+                    cancelled,
+                    creation.agent_id,
+                    request,
+                    runtime,
+                    label,
+                ),
+            )
+        except Exception as error:
+            _logger.warning(
+                "start agent_id=%s failed stage=submit error_kind=%s",
+                creation.agent_id, type(error).__name__,
+            )
+            self._fail_created_start(
+                creation.agent_id, error, "start_submit_failed", store=self._store
+            )
+        return StartResult(
+            creation.agent_id, True, self.get(creation.agent_id)
+        )
+
+
+    def _continue_start(
+        self,
+        store: StateStore,
+        cancelled: threading.Event,
+        agent_id: AgentId,
+        request: StartRequest,
+        runtime: RuntimeConfig,
+        account_label: str | None,
+    ) -> None:
+        """Materialize and launch one already accepted start.
+
+        ``store`` belongs to this worker thread. Cancellation is checked before
+        work, after authentication/materialization/prepare, and before spawn.
+        Post-accept failures are always converted to durable outcomes.
+        """
+
+        failure_kind = "prepare_failed"
+        try:
+            if self._cancel_accepted_start(store, cancelled, agent_id):
+                return
+            effective_runtime = runtime
+            effective_home = runtime.home
+            if account_label is not None:
+                if runtime.auth is None or runtime.auth.target is None:
+                    raise ValidationError(
+                        f"runtime {request.runtime} account auth is not configured"
+                    )
+                effective_source = account_auth_source(
+                    self._home, request.runtime, account_label, runtime.auth.target
+                )
+                if not effective_source.is_file():
+                    raise ValidationError(
+                        f"account {account_label!r} is not authenticated; "
+                        f"run agent-run auth {account_label} {request.runtime}"
+                    )
+                effective_home = account_runtime_home(runtime.home, account_label)
+                effective_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+                effective_home.chmod(0o700)
+                effective_runtime = replace(
+                    runtime,
+                    home=effective_home,
+                    auth=replace(runtime.auth, source=effective_source),
+                )
+            if self._cancel_accepted_start(store, cancelled, agent_id):
+                return
+
+            adapter = AdapterRegistry(self._config).load(
+                request.runtime,
+                self._required_capabilities(request, effective_runtime),
+            )
+            adapter.validate(effective_runtime)
+            roster = adapter.models(effective_runtime, effective_home)
+            if request.model not in {model.id for model in roster}:
+                raise ValidationError(
+                    f"model is not available for runtime {request.runtime}: {request.model}"
+                )
+            profile = assign_role(
+                load_profile(
+                    self._config.profiles,
+                    request.profile,
+                    requested_write=request.write,
+                    read_roots=request.read_roots,
+                ),
+                request.runtime,
+                effective_runtime.skills,
+            )
+            mcp_servers = self._mcp_servers(effective_runtime)
+            revision = adapter.materialize(
+                effective_runtime,
+                effective_home,
+                mcp_servers=mcp_servers,
+                skills_root=runtime_skills_dir(request.runtime, self._home),
+            )
+            store.replace_config_revision(
+                agent_id, _PENDING_CONFIG_REVISION, revision
+            )
+            _logger.info(
+                "start materialized runtime=%s revision=%s",
+                request.runtime,
+                revision,
+            )
+            if self._cancel_accepted_start(store, cancelled, agent_id):
+                return
+
+            candidate_dir = create_agent_dir(agent_id, self._home)
             plan = adapter.prepare(
                 request,
                 profile,
@@ -384,41 +472,70 @@ class AgentService:
                 candidate_dir,
                 mcp_servers=mcp_servers,
             )
-        except Exception as error:
+            if self._cancel_accepted_start(store, cancelled, agent_id):
+                return
+            with launch_cancellation(
+                lambda: cancelled.is_set() or store.has_pending_cancel(agent_id)
+            ):
+                if self._cancel_accepted_start(store, cancelled, agent_id):
+                    return
+                failure_kind = "supervisor_start_failed"
+                self._launch(agent_id, request, adapter, plan, candidate_dir)
+            _logger.info("start agent_id=%s done", agent_id)
+        except BaseException as error:
+            if self._cancel_accepted_start(store, cancelled, agent_id):
+                return
             _logger.warning(
-                "start agent_id=%s failed stage=prepare error_kind=%s",
-                creation.agent_id, type(error).__name__,
+                "start agent_id=%s failed asynchronous error_kind=%s",
+                agent_id,
+                type(error).__name__,
             )
-            self._fail_created_start(creation.agent_id, error, "prepare_failed")
-            raise
-        try:
-            self._launch(creation.agent_id, request, adapter, plan, candidate_dir)
-        except Exception as error:
-            _logger.warning(
-                "start agent_id=%s failed stage=launch error_kind=%s",
-                creation.agent_id, type(error).__name__,
+            self._fail_created_start(
+                agent_id, error, failure_kind, store=store
             )
-            kind, stage, text = self._fail_created_start(
-                creation.agent_id, error, "supervisor_start_failed"
-            )
-            # The durable agent row already exists: attach it to the raised
-            # error so CLI/MCP can surface {agent_id, failure_kind,
-            # failure_stage, failure_text} instead of a bare error message
-            # that hides which agent this was.
-            error.agent_id = creation.agent_id
-            error.failure_kind = kind
-            error.failure_stage = stage
-            error.failure_text = text
-            raise
-        _logger.info("start agent_id=%s done", creation.agent_id)
-        return StartResult(
-            creation.agent_id, True, self.get(creation.agent_id)
-        )
 
+    def _cancel_accepted_start(
+        self,
+        store: StateStore,
+        cancelled: threading.Event,
+        agent_id: AgentId,
+    ) -> bool:
+        """Commit pre-ownership cancellation when either signal is durable."""
+
+        if not cancelled.is_set() and not store.has_pending_cancel(agent_id):
+            return False
+        status = AgentStatus(str(store.get_agent(agent_id)["status"]))
+        if status in TERMINAL:
+            return True
+        if status not in {
+            AgentStatus.CREATED,
+            AgentStatus.STARTING,
+            AgentStatus.CANCELLING,
+        }:
+            return True
+        try:
+            store.transition(
+                agent_id,
+                AgentStatus.CANCELLED,
+                outcome=Outcome(AgentStatus.CANCELLED),
+                kind="start_cancelled",
+                at=self._now(),
+            )
+        except StateTransitionError:
+            if AgentStatus(str(store.get_agent(agent_id)["status"])) not in TERMINAL:
+                raise
+        return True
 
     def _fail_created_start(
-        self, agent_id: AgentId, error: Exception, kind: str
+        self,
+        agent_id: AgentId,
+        error: BaseException,
+        kind: str,
+        *,
+        store: StateStore | None = None,
     ) -> tuple[str, str | None, str]:
+        """Persist an accepted-start failure through the caller-owned store."""
+
         # A missing or unrenewable credential is its own diagnosis, not a
         # generic prepare/launch fault: name it so the row says what to fix.
         stage: str | None = None
@@ -429,7 +546,8 @@ class AgentService:
         outcome = Outcome(
             AgentStatus.FAILED, failure_kind=kind, failure_text=_failure_text(error)
         )
-        self._store.transition(
+        target_store = self._store if store is None else store
+        target_store.transition(
             agent_id,
             AgentStatus.FAILED,
             outcome=outcome,
@@ -451,7 +569,10 @@ class AgentService:
         return self._delivery_view(validate_agent_id(agent_id), session_id)
 
     def cancel(self, agent_id: str | AgentId) -> AgentView:
+        """Persist cancellation before signalling a pre-ownership worker."""
+
         self._store.enqueue_command(agent_id, "cancel", {}, at=self._now())
+        self._starts.cancel(agent_id)
         _logger.info("cancel agent_id=%s", agent_id)
         return self.get(agent_id)
 

@@ -8,8 +8,8 @@ import os
 import select
 import threading
 import time
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 
 from .errors import ValidationError
 from .launch_evidence import (
@@ -38,6 +38,29 @@ DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
 DEFAULT_CLEANUP_KILL_SECONDS = 1.0
 SUPERVISOR_MODULE = "agent_run.supervisor_main"
 _POLL_SECONDS = 0.01
+_launch_context = threading.local()
+
+
+@contextmanager
+def launch_cancellation(cancel_requested: Callable[[], bool]) -> Iterator[None]:
+    """Expose one worker's cancellation predicate to its nested launch call.
+
+    Existing service launch callbacks keep their contract. The predicate is
+    thread-local, applies only inside this context, and is restored afterward.
+    """
+
+    if not callable(cancel_requested):
+        raise ValidationError("launch cancellation predicate must be callable")
+    previous = getattr(_launch_context, "cancel_requested", None)
+    _launch_context.cancel_requested = cancel_requested
+    try:
+        yield
+    finally:
+        if previous is None:
+            with suppress(AttributeError):
+                del _launch_context.cancel_requested
+        else:
+            _launch_context.cancel_requested = previous
 
 
 class ChildReaper:
@@ -133,6 +156,7 @@ def launch_detached(
     cleanup_grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
     cleanup_kill_seconds: float = DEFAULT_CLEANUP_KILL_SECONDS,
     child_reaper: ChildReaper | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> int:
     """Spawn one session-leading supervisor and return its PID after READY.
 
@@ -154,6 +178,10 @@ def launch_detached(
         raise ValidationError("detached supervisor module must be a nonblank string")
     if post_reap is not None and not callable(post_reap):
         raise ValidationError("post-reap callback must be callable")
+    if cancel_requested is None:
+        cancel_requested = getattr(_launch_context, "cancel_requested", None)
+    if cancel_requested is not None and not callable(cancel_requested):
+        raise ValidationError("launch cancellation predicate must be callable")
     ready_timeout = _positive("readiness_timeout_seconds", readiness_timeout_seconds)
     dispatch_timeout = _positive(
         "post_terminal_timeout_seconds", post_terminal_timeout_seconds
@@ -238,7 +266,7 @@ def launch_detached(
             pid, (time.monotonic() - fork_started) * 1000,
         )
         group = verify_process_group(SystemProcessOps(), pid)
-        token = ready.wait(_remaining(deadline))
+        token = _wait_ready(ready, deadline, cancel_requested)
     except ValidationError as error:
         _logger.warning("launch failed pid=%d error_kind=%s", pid, type(error).__name__)
         ready.close_read()
@@ -264,6 +292,33 @@ def launch_detached(
     else:
         child_reaper.register(pid, post_reap, reap_timeout)
     return pid
+
+
+def _wait_ready(
+    ready: ReadyChannel,
+    deadline: float,
+    cancel_requested: Callable[[], bool] | None,
+) -> str:
+    """Wait for READY while polling cooperative cancellation.
+
+    Predicate failures and cancellation use the launcher's existing verified
+    cleanup path, so a detached process group cannot be leaked.
+    """
+
+    while True:
+        if cancel_requested is not None:
+            try:
+                cancelled = bool(cancel_requested())
+            except Exception as error:
+                raise ValidationError("launch cancellation predicate failed") from error
+            if cancelled:
+                raise ValidationError("detached launch cancelled before supervisor READY")
+        remaining = _remaining(deadline)
+        readable, _, _ = select.select(
+            [ready.read_fd], [], [], min(remaining, _POLL_SECONDS)
+        )
+        if readable:
+            return ready.wait(remaining)
 
 
 def _spawn_session_leader(executable: str, argv: list[str], error_fd: int) -> int:

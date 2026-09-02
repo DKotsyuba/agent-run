@@ -131,6 +131,9 @@ Notes for the loop:
 
 - `start` returns immediately with a durable `agent_id`; the agent runs
   detached and survives your process.
+- The one-shot CLI `agent-run start` submits through this resident socket too;
+  it never owns an in-process start worker that would die with the CLI. A down
+  daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - Model rosters and health come from `models`; remaining quota and risk
   from `limits`. Check them before fanning out work.
 - `answer` re-fetches a finished agent's result any time later by id —

@@ -136,6 +136,52 @@ class StateStore:
             at=at,
         )
 
+    def replace_config_revision(
+        self,
+        agent_id: str | AgentId,
+        expected_revision: str,
+        replacement_revision: str,
+    ) -> bool:
+        """Atomically replace one pending configuration revision.
+
+        Returning ``True`` means this call replaced ``expected_revision``;
+        ``False`` means the requested replacement was already durable. Any
+        other current revision is rejected.
+        """
+
+        checked = validate_agent_id(agent_id)
+        nonblank("expected config revision", expected_revision)
+        nonblank("replacement config revision", replacement_revision)
+        with immediate(self.connection):
+            row = agent_row(self.connection, checked)
+            current = str(row["config_revision"])
+            if current == replacement_revision:
+                return False
+            if current != expected_revision:
+                raise ValidationError("config revision changed concurrently")
+            updated = self.connection.execute(
+                """UPDATE agents SET config_revision = ?
+                   WHERE id = ? AND config_revision = ?""",
+                (replacement_revision, checked, expected_revision),
+            ).rowcount
+            if updated != 1:
+                raise ValidationError("config revision changed concurrently")
+        return True
+
+    def has_pending_cancel(self, agent_id: str | AgentId) -> bool:
+        """Return whether a pending or claimed durable cancel command exists."""
+
+        checked = validate_agent_id(agent_id)
+        agent_row(self.connection, checked)
+        row = self.connection.execute(
+            """SELECT 1 FROM commands
+               WHERE agent_id = ? AND kind = 'cancel'
+                 AND state IN ('pending', 'claimed')
+               ORDER BY id LIMIT 1""",
+            (checked,),
+        ).fetchone()
+        return row is not None
+
     def bind_orchestrator(
         self,
         agent_id: str | AgentId,

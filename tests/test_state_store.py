@@ -145,10 +145,11 @@ class StateStoreTests(unittest.TestCase):
             self.store.create_agent(
                 request, task_summary="different", config_revision="cfg-1"
             )
-        with self.assertRaises(ValidationError):
-            self.store.create_agent(
-                request, task_summary="summary", config_revision="cfg-2"
-            )
+        revised = self.store.create_agent(
+            request, task_summary="summary", config_revision="cfg-2"
+        )
+        self.assertFalse(revised.created)
+        self.assertEqual(revised.agent_id, results[0].agent_id)
 
         first = self.store.create_agent(
             self.request(task="non-idempotent-1"),

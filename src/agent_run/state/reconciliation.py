@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
-from agent_run.domain import ACTIVE, AgentId
+from agent_run.domain import ACTIVE, AgentId, AgentStatus, Outcome
 from agent_run.errors import StateTransitionError, ValidationError
 
-from .db import integer, nonblank, timestamp
+from .db import immediate, integer, nonblank, timestamp
 from .workflow import finish_workflow_run
 
 if TYPE_CHECKING:
     from .store import StateStore
 
 _logger = logging.getLogger("agent_run.state")
+DEFAULT_UNOWNED_STARTING_GRACE_SECONDS = 30.0
 
 
 def reconcile_reaped_agent(
@@ -91,9 +93,81 @@ def reconcile_reaped_supervisor(
     return tuple(changed)
 
 
-def reconcile_active_agents(store, *, at: float | None = None, limit: int = 100) -> tuple[AgentId, ...]:
-    """Boundedly close dead detached supervisors during an independent sweep."""
+def reconcile_unowned_starting(
+    store: StateStore,
+    *,
+    at: float | None = None,
+    grace_seconds: float = DEFAULT_UNOWNED_STARTING_GRACE_SECONDS,
+    limit: int = 100,
+) -> tuple[AgentId, ...]:
+    """Converge only stale, wholly unowned ``STARTING`` rows to ``LOST``.
+
+    Selection and terminal transition share one immediate transaction. Recent,
+    owned, and non-``STARTING`` rows are untouched.
+    """
+
+    from .store import StateStore
+
+    if not isinstance(store, StateStore):
+        raise ValidationError("store must be a StateStore")
+    if (
+        isinstance(grace_seconds, bool)
+        or not isinstance(grace_seconds, (int, float))
+        or not math.isfinite(grace_seconds)
+        or grace_seconds < 0
+    ):
+        raise ValidationError("grace_seconds must be nonnegative and finite")
+    integer("limit", limit, minimum=1)
+    if limit > 1_000:
+        raise ValidationError("limit must not exceed 1000")
+    checked_at = timestamp(at)
+    cutoff = checked_at - float(grace_seconds)
+    changed: list[AgentId] = []
+    with immediate(store.connection):
+        rows = list(
+            store.connection.execute(
+                """SELECT id FROM agents
+                   WHERE status = ? AND created_at <= ?
+                     AND supervisor_pid IS NULL
+                     AND process_group_id IS NULL
+                     AND supervisor_identity IS NULL
+                   ORDER BY created_at, id LIMIT ?""",
+                (AgentStatus.STARTING.value, cutoff, limit),
+            )
+        )
+        for row in rows:
+            agent_id = AgentId(str(row["id"]))
+            store._transition(
+                agent_id,
+                AgentStatus.LOST,
+                checked_at,
+                outcome=Outcome(
+                    AgentStatus.LOST,
+                    failure_kind="unowned_starting",
+                    failure_text="accepted start remained unowned beyond its grace period",
+                ),
+                attempt_id=None,
+                kind="reconciled_lost",
+                data={"verdict": "unowned_starting"},
+            )
+            changed.append(agent_id)
+    return tuple(changed)
+
+
+def reconcile_active_agents(
+    store,
+    *,
+    at: float | None = None,
+    limit: int = 100,
+) -> tuple[AgentId, ...]:
+    """Boundedly converge unowned starts and dead detached supervisors."""
+
     from ..doctor import _probe_process
+
+    changed = list(reconcile_unowned_starting(store, at=at, limit=limit))
+    remaining = limit - len(changed)
+    if remaining <= 0:
+        return tuple(changed)
 
     statuses = tuple(sorted(status.value for status in ACTIVE))
     placeholders = ",".join("?" for _ in statuses)
@@ -101,10 +175,9 @@ def reconcile_active_agents(store, *, at: float | None = None, limit: int = 100)
         store.connection.execute(
             f"SELECT id, supervisor_pid, process_group_id, supervisor_identity FROM agents "
             f"WHERE status IN ({placeholders}) ORDER BY created_at, id LIMIT ?",
-            (*statuses, limit),
+            (*statuses, remaining),
         )
     )
-    changed = []
     for row in rows:
         pid, pgid, expected = row["supervisor_pid"], row["process_group_id"], row["supervisor_identity"]
         if not isinstance(pid, int) or not isinstance(pgid, int) or not isinstance(expected, str):
@@ -205,4 +278,3 @@ def reconcile_workflow_runs(store, *, at: float | None = None, limit: int = 100)
     else:
         _logger.debug("reconcile_workflow_runs candidates=%d changed_to_lost=%d", len(rows), len(changed))
     return tuple(changed)
-

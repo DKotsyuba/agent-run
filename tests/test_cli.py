@@ -213,6 +213,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(request.request_id, "request-1")
         self.assertEqual(request.orchestrator.external_turn_id, "turn-1")
 
+    def test_one_shot_start_uses_resident_broker_without_ephemeral_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker = Mock()
+            broker.start.return_value = FakeStart()
+            output, error = io.StringIO(), io.StringIO()
+            with patch.object(cli, "BrokerClient", return_value=broker) as factory:
+                with patch.object(cli, "_Runtime") as runtime:
+                    code = cli.main(
+                        ["--home", directory, "start", "--runtime", "codex",
+                         "--model", "model", "--profile", "review", "--task", "task",
+                         "--workdir", directory],
+                        stdin=io.StringIO(), stdout=output, stderr=error,
+                    )
+            self.assertEqual(code, 0)
+            factory.assert_called_once_with(Path(directory).resolve() / "api.sock")
+            runtime.assert_not_called()
+            broker.close.assert_called_once_with()
+            self.assertIn(AGENT_ID, output.getvalue())
+
     def test_auth_runs_codex_login_in_account_home(self):
         """Run account login with the configured binary's canonical path."""
         with tempfile.TemporaryDirectory() as directory:

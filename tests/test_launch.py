@@ -174,6 +174,43 @@ class DetachedLaunchTests(unittest.TestCase):
         with self.assertRaises(ChildProcessError):
             os.waitpid(wrapper, os.WNOHANG)
 
+    def test_ready_wait_cancellation_kills_and_reaps_verified_group(self) -> None:
+        """Cancellation during READY must reuse verified group cleanup."""
+
+        evidence = self.root / "cancel-pids"
+        try:
+            self.launch(
+                {
+                    "evidence": str(evidence),
+                    "grandchild": True,
+                    "ready": False,
+                    "fail_safe_seconds": 12.0,
+                },
+                readiness_timeout_seconds=10.0,
+                post_terminal_timeout_seconds=0.05,
+                cleanup_grace_seconds=0.05,
+                cleanup_kill_seconds=0.05,
+                cancel_requested=evidence.exists,
+            )
+        except ValidationError as error:
+            caught = error
+        else:
+            self.fail("cancelled readiness wait unexpectedly succeeded")
+
+        self.wait_for(evidence.exists)
+        wrapper, grandchild = map(int, evidence.read_text().split())
+        if str(caught).startswith("cannot signal process group "):
+            os.waitpid(wrapper, 0)
+            self.wait_for(lambda: not self.alive(grandchild))
+            self.skipTest(
+                "macOS/Codex sandbox returned EPERM for killpg on the verified child group"
+            )
+        self.assertRegex(str(caught), "cancelled before supervisor READY")
+        self.wait_for(lambda: not self.alive(wrapper))
+        self.wait_for(lambda: not self.alive(grandchild))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(wrapper, os.WNOHANG)
+
     def test_post_terminal_dispatch_is_bounded_and_never_reruns_the_child(self) -> None:
         events = self.root / "events"
         dispatched = self.root / "dispatched"

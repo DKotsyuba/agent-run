@@ -954,8 +954,10 @@ def main(
     """Parse and execute one CLI, MCP-proxy, or resident API invocation.
 
     A resident ``api serve`` invocation owns one shared ``ChildReaper`` for its
-    full lifetime; every other command retains the existing launch behavior.
-    Returns the process exit code and closes every service/reaper it created.
+    full lifetime. A one-shot ``start`` without an injected service submits to
+    that resident daemon so accepted asynchronous work outlives this process;
+    other commands retain their local service behavior. Returns the process
+    exit code and closes every client, service, or reaper it created.
     """
 
     stdin = sys.stdin if stdin is None else stdin
@@ -970,6 +972,7 @@ def main(
         _emit(_error_payload(error), stderr)
         return _EXPECTED_ERROR_EXIT
     owned: _Runtime | None = None
+    start_broker: BrokerClient | None = None
     child_reaper: ChildReaper | None = None
     started = time.monotonic()
     try:
@@ -1000,9 +1003,9 @@ def main(
             if args.command == "mcp":
                 from .mcp import serve
 
-                broker = service if service is not None else BrokerClient(home / "api.sock")
-                returned = serve(broker, stdin=stdin, stdout=stdout)
-                close = getattr(broker, "close", None)
+                mcp_broker = service if service is not None else BrokerClient(home / "api.sock")
+                returned = serve(mcp_broker, stdin=stdin, stdout=stdout)
+                close = getattr(mcp_broker, "close", None)
                 if callable(close):
                     close()
                 _logger.info(
@@ -1013,8 +1016,12 @@ def main(
             if service is None:
                 if args.command == "api":
                     child_reaper = ChildReaper()
-                owned = _Runtime(home, child_reaper=child_reaper)
-                target = owned
+                if args.command == "start":
+                    start_broker = BrokerClient(home / "api.sock")
+                    target = start_broker
+                else:
+                    owned = _Runtime(home, child_reaper=child_reaper)
+                    target = owned
             else:
                 target = service
             if args.command == "api":
@@ -1072,6 +1079,8 @@ def main(
     finally:
         if owned is not None:
             owned.close()
+        if start_broker is not None:
+            start_broker.close()
         if child_reaper is not None:
             child_reaper.close()
 

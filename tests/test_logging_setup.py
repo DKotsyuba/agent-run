@@ -5,6 +5,7 @@ import logging.handlers
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -153,18 +154,31 @@ class ServiceLoggingTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        self.store.close()
+        self.service.close()
         self.temporary.cleanup()
         logging_setup._reset_for_tests()
 
     def request(self, *, request_id: str, task: str = "do work") -> StartRequest:
+        """Build one valid fake-runtime request for logging assertions."""
+
         return StartRequest(
             "fake", "model", "profile", task, self.workdir, request_id=request_id
         )
 
+    def wait_materialized(self, agent_id, *, timeout: float = 2.0) -> None:
+        """Wait until the async worker replaces its pending config revision."""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.store.get_agent(agent_id)["config_revision"] == "cfg-1":
+                return
+            time.sleep(0.01)
+        self.fail("start did not materialize before the logging deadline")
+
     def test_service_start_logs_a_reconstructable_lifecycle(self) -> None:
         with self.assertLogs("agent_run.service", level="DEBUG") as captured:
-            self.service.start(self.request(request_id="log-test"))
+            started = self.service.start(self.request(request_id="log-test"))
+            self.wait_materialized(started.agent_id)
         joined = "\n".join(captured.output)
         self.assertIn("start runtime=fake model=model", joined)
         self.assertIn("gate=capabilities ok", joined)

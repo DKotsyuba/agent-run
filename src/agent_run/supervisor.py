@@ -244,10 +244,23 @@ class Supervisor:
             restore_signal_handlers(previous)
 
     def _report_ready(self) -> None:
+        """Persist ownership and report READY without invalid same-state writes.
+
+        Legacy ``CREATED`` rows transition to ``STARTING``. Asynchronously
+        accepted ``STARTING`` rows and already-cancelling rows keep their status
+        while receiving supervisor ownership before READY.
+        """
+
         try:
-            self._store.transition(
-                self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
-            )
+            status = AgentStatus(str(self._store.get_agent(self._agent_id)["status"]))
+            if status is AgentStatus.CREATED:
+                self._store.transition(
+                    self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
+                )
+            elif status not in {AgentStatus.STARTING, AgentStatus.CANCELLING}:
+                self._store.transition(
+                    self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
+                )
             # Persist pid and identity before ready so every ready row can later
             # be converged by reconciliation, even if launch never returns.
             self._store.record_supervisor(
