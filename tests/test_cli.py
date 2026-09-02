@@ -1043,20 +1043,17 @@ target = "auth.json"
             ],
         )
 
-    def test_dispatch_composes_sender_transport_and_fresh_store_once(self):
+    def test_dispatch_composes_relay_transport_and_fresh_store_once(self):
+        """Construct relay-only Codex delivery without consulting a queue binary."""
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
-            executable = home / "codex"
-            executable.write_text("#!/bin/sh\n", encoding="utf-8")
-            executable.chmod(0o700)
             store = Mock()
-            sender = Mock()
             transport = Mock()
             dispatcher = Mock()
             result = object()
             dispatcher.run.return_value = result
             config = SimpleNamespace(
-                delivery=SimpleNamespace(codex_queue_bin=executable)
+                delivery=SimpleNamespace()
             )
             uds_sender = Mock()
             uds_transport = Mock()
@@ -1064,8 +1061,6 @@ target = "auth.json"
             with patch.dict(os.environ, {}, clear=True), patch.object(
                 cli, "load_config", return_value=config
             ), patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
-                cli, "CodexQueueSender", return_value=sender
-            ) as sender_type, patch.object(
                 cli, "CodexQueueTransport", return_value=transport
             ) as transport_type, patch(
                 "agent_run.delivery.codex_desktop_relay.CodexDesktopRelayClient",
@@ -1080,9 +1075,8 @@ target = "auth.json"
                 self.assertIs(cli._dispatch_once(home), result)
 
             opened.assert_called_once_with(home / "state.db")
-            sender_type.assert_called_once_with(str(executable), timeout_seconds=25.0)
             relay_type.assert_called_once_with(home)
-            transport_type.assert_called_once_with(sender, relay)
+            transport_type.assert_called_once_with(relay)
             uds_sender_type.assert_called_once_with()
             uds_transport_type.assert_called_once_with(uds_sender)
             dispatcher_type.assert_called_once_with(
@@ -1102,7 +1096,8 @@ target = "auth.json"
                 self.assertIs(runtime.delivery_dispatch(), result)
             dispatch.assert_called_once_with(home)
 
-    def test_dispatch_environment_binary_explicitly_overrides_owner_config(self):
+    def test_dispatch_ignores_legacy_queue_binary_settings(self):
+        """Neither legacy configuration nor environment can activate UI queue."""
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
             configured = home / "configured"
@@ -1118,11 +1113,11 @@ target = "auth.json"
                 os.environ, {"CODEX_QUEUE_BIN": str(override)}, clear=True
             ), patch.object(cli, "load_config", return_value=config), patch.object(
                 cli.StateStore, "open", return_value=Mock()
-            ), patch.object(cli, "CodexQueueSender", return_value=Mock()) as sender, patch.object(
+            ), patch("agent_run.delivery.codex_queue.CodexQueueSender") as sender, patch.object(
                 cli, "CodexQueueTransport", return_value=Mock()
             ), patch.object(cli, "DeliveryDispatcher", return_value=dispatcher):
                 cli._dispatch_once(home)
-            sender.assert_called_once_with(str(override), timeout_seconds=25.0)
+            sender.assert_not_called()
 
     def test_hook_transport_is_per_runtime_and_dispatch_routes_by_the_recorded_name(self):
         from agent_run.delivery.base import DeliveryReceipt
@@ -1224,20 +1219,18 @@ target = "auth.json"
                 cli.CLAUDE_UDS_TRANSPORT_NAME,
             )
 
-    def test_dispatch_requires_an_absolute_codex_queue_binary(self):
-        config = SimpleNamespace(
-            delivery=SimpleNamespace(codex_queue_bin=None)
-        )
-        with patch.object(cli, "load_config", return_value=config), patch.dict(
-            os.environ, {}, clear=True
-        ):
-            with self.assertRaisesRegex(ValidationError, "CODEX_QUEUE_BIN"):
-                cli._dispatch_once(Path("/tmp/home"))
-        with patch.object(cli, "load_config", return_value=config), patch.dict(
-            os.environ, {"CODEX_QUEUE_BIN": "codex"}, clear=True
-        ):
-            with self.assertRaisesRegex(ValidationError, "absolute executable"):
-                cli._dispatch_once(Path("/tmp/home"))
+    def test_dispatch_needs_no_codex_queue_binary(self):
+        """An empty real outbox drains with missing or invalid legacy queue env."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            cli.StateStore.initialize(home / "state.db").close()
+            for environment in ({}, {"CODEX_QUEUE_BIN": "codex"}):
+                with self.subTest(environment=environment), patch.dict(
+                    os.environ, environment, clear=True
+                ), patch("agent_run.delivery.codex_queue.CodexQueueSender.__call__") as queue:
+                    self.assertEqual(cli._dispatch_once(home).claimed, 0)
+                    queue.assert_not_called()
 
     def test_launch_hands_over_one_exec_payload_and_reconciles_on_reap(self):
         with tempfile.TemporaryDirectory() as directory:

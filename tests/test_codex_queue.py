@@ -26,6 +26,9 @@ AGENT_ID = "ag-20260825-120000-0123456789"
 from agent_run.delivery.codex_queue import SessionGoneError
 
 
+from agent_run.delivery.codex_desktop_relay import CodexDesktopRelayClient
+
+
 class RecordingQueue:
     """A queue that records sends and can only reach existing sessions."""
 
@@ -43,33 +46,55 @@ class RecordingQueue:
         return f"remote-{len(self.sent)}"
 
 
+class FakeRelay(CodexDesktopRelayClient):
+    """A relay-only test double that records sends without a queue capability."""
+
+    def __init__(self, outcome: object = True) -> None:
+        """Set the next outcome; exceptions model relay delivery failures."""
+        self.outcome = outcome
+        self.calls: list[tuple[OrchestratorRef, CompletionNotice]] = []
+        self.last_evidence: DeliveryAttemptEvidence | None = None
+
+    def send(self, target: OrchestratorRef, notice: CompletionNotice) -> bool:
+        """Record one relay send, returning acceptance or raising its outcome."""
+        self.calls.append((target, notice))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        self.last_evidence = DeliveryAttemptEvidence(
+            classifier="relay_accepted", executable="codex_desktop_relay",
+            argv_shape=("relay",), duration_ms=1,
+        )
+        return bool(self.outcome)
 class CodexQueueTransportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.notice = CompletionNotice("ntf_abc", AGENT_ID, AgentStatus.SUCCEEDED)
         self.target = OrchestratorRef("codex_queue", "session-1", "turn-1")
 
-    def test_send_queues_the_fixed_trusted_message_and_returns_the_remote_id(self) -> None:
-        queue = RecordingQueue()
-        receipt = CodexQueueTransport(queue).send(self.target, self.notice)
-        self.assertEqual(queue.sent, [("session-1", self.notice.render())])
-        self.assertEqual(receipt.remote_message_id, "remote-1")
+    def test_send_uses_the_relay_without_a_queue_message_id(self) -> None:
+        """Return relay acceptance for the exact trusted target and notice."""
+        relay = FakeRelay()
+        receipt = CodexQueueTransport(relay).send(self.target, self.notice)
+        self.assertEqual(relay.calls, [(self.target, self.notice)])
+        self.assertIsNone(receipt.remote_message_id)
         self.assertFalse(receipt.ambiguous)
 
     def test_ambiguous_timeout_is_at_least_once_not_a_failure(self) -> None:
-        queue = RecordingQueue(outcome=TimeoutError("no ack"))
+        """Propagate uncertain acceptance without invoking another transport."""
+        relay = FakeRelay(AmbiguousDeliveryError("relay acceptance is unknown"))
         with self.assertRaises(AmbiguousDeliveryError) as caught:
-            CodexQueueTransport(queue).send(self.target, self.notice)
-        self.assertIn("ntf_abc", str(caught.exception))
+            CodexQueueTransport(relay).send(self.target, self.notice)
+        self.assertIn("relay", str(caught.exception))
         self.assertIsInstance(caught.exception, DeliveryError)
-        self.assertEqual(len(queue.sent), 1)
+        self.assertEqual(len(relay.calls), 1)
 
     def test_missing_session_fails_and_no_replacement_is_started(self) -> None:
-        queue = RecordingQueue(sessions=())
-        transport = CodexQueueTransport(queue)
+        """A relay refusal cannot create a replacement session or agent."""
+        relay = FakeRelay(DeliveryError("relay rejected"))
+        transport = CodexQueueTransport(relay)
         with self.assertRaises(DeliveryError) as caught:
             transport.send(OrchestratorRef("codex_queue", "gone"), self.notice)
         self.assertNotIsInstance(caught.exception, AmbiguousDeliveryError)
-        self.assertIn("never opens a replacement", str(caught.exception))
+        self.assertIn("relay", str(caught.exception))
         # The transport exposes no way to open a session or start an agent.
         for forbidden in ("start", "open", "create", "spawn", "launch"):
             self.assertFalse(
@@ -77,25 +102,28 @@ class CodexQueueTransportTests(unittest.TestCase):
                 f"transport must not expose a {forbidden} path",
             )
 
-    def test_unreachable_queue_and_foreign_target_are_delivery_errors(self) -> None:
+    def test_unavailable_relay_and_foreign_target_are_delivery_errors(self) -> None:
+        """Reject unavailable relays and bindings for another transport."""
         with self.assertRaises(DeliveryError):
-            CodexQueueTransport(RecordingQueue(outcome=OSError("socket"))).send(
+            CodexQueueTransport(FakeRelay(DeliveryError("relay unavailable"))).send(
                 self.target, self.notice
             )
         with self.assertRaises(DeliveryError):
-            CodexQueueTransport(RecordingQueue()).send(
+            CodexQueueTransport(FakeRelay()).send(
                 OrchestratorRef("slack", "session-1"), self.notice
             )
 
-    def test_only_explicit_session_gone_is_classified_as_missing(self) -> None:
+    def test_unexpected_relay_exceptions_are_not_reclassified(self) -> None:
+        """Unexpected client bugs remain distinguishable from known refusal."""
         for error in (KeyError("sender bug"), IndexError("sender bug")):
             with self.assertRaises(type(error)):
-                CodexQueueTransport(RecordingQueue(outcome=error)).send(
+                CodexQueueTransport(FakeRelay(error)).send(
                     self.target, self.notice
                 )
 
     def test_validate_and_arguments_are_checked(self) -> None:
-        transport = CodexQueueTransport(RecordingQueue())
+        """Reject malformed transport configuration, clients and notices."""
+        transport = CodexQueueTransport(FakeRelay())
         transport.validate(DeliveryConfig())
         with self.assertRaises(ValidationError):
             transport.validate(object())  # type: ignore[arg-type]
@@ -112,6 +140,7 @@ class CodexQueueTransportTests(unittest.TestCase):
 
 
     def test_relay_acceptance_bypasses_the_queue_without_a_remote_id(self) -> None:
+        """Preserve static relay evidence and never call the UI queue."""
         queue = RecordingQueue()
         relay = mock.Mock()
         relay.send.return_value = True
@@ -121,28 +150,30 @@ class CodexQueueTransportTests(unittest.TestCase):
             argv_shape=("relay",),
             duration_ms=1,
         )
-        receipt = CodexQueueTransport(queue, relay).send(self.target, self.notice)
+        receipt = CodexQueueTransport(relay).send(self.target, self.notice)
         relay.send.assert_called_once_with(self.target, self.notice)
         self.assertEqual(queue.sent, [])
         self.assertIsNone(receipt.remote_message_id)
         self.assertFalse(receipt.ambiguous)
         self.assertEqual(receipt.evidence.classifier, "relay_accepted")
 
-    def test_relay_rejection_falls_back_to_the_queue(self) -> None:
+    def test_relay_rejection_never_falls_back_to_the_queue(self) -> None:
+        """A false acceptance result raises rather than being marked delivered."""
         queue = RecordingQueue()
         relay = mock.Mock()
         relay.send.return_value = False
-        receipt = CodexQueueTransport(queue, relay).send(self.target, self.notice)
+        with self.assertRaises(DeliveryError):
+            CodexQueueTransport(relay).send(self.target, self.notice)
         relay.send.assert_called_once_with(self.target, self.notice)
-        self.assertEqual(queue.sent, [("session-1", self.notice.render())])
-        self.assertEqual(receipt.remote_message_id, "remote-1")
+        self.assertEqual(queue.sent, [])
 
     def test_relay_ambiguity_never_falls_back_to_the_queue(self) -> None:
+        """Post-write uncertainty propagates without a second delivery path."""
         queue = RecordingQueue()
         relay = mock.Mock()
         relay.send.side_effect = AmbiguousDeliveryError("relay acceptance is unknown")
         with self.assertRaises(AmbiguousDeliveryError):
-            CodexQueueTransport(queue, relay).send(self.target, self.notice)
+            CodexQueueTransport(relay).send(self.target, self.notice)
         self.assertEqual(queue.sent, [])
 
 class RecordingRunner:
@@ -222,7 +253,9 @@ class CodexQueueSenderTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             sender("session-1", "trusted message")
 
-        transport = CodexQueueTransport(sender)
+        transport = CodexQueueTransport(
+            FakeRelay(AmbiguousDeliveryError("relay acceptance is unknown"))
+        )
         notice = CompletionNotice("ntf_sender", AGENT_ID, AgentStatus.SUCCEEDED)
         with self.assertRaises(AmbiguousDeliveryError):
             transport.send(OrchestratorRef("codex_queue", "session-1"), notice)

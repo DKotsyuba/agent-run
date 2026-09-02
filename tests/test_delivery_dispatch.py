@@ -112,6 +112,35 @@ class DeliveryDispatchTests(unittest.TestCase):
         again = dispatcher.run(lock_path=self.lock_path, at=11)
         self.assertEqual((again.claimed, len(transport.calls)), (0, 1))
 
+    def test_missing_codex_relay_retries_then_recovers_without_queue(self) -> None:
+        """A real missing relay leaves durable work that later succeeds without UI queue."""
+        from unittest.mock import patch as patch_queue
+        from agent_run.delivery.base import DeliveryAttemptEvidence
+        from agent_run.delivery.codex_desktop_relay import CodexDesktopRelayClient
+        from agent_run.delivery.codex_queue import CodexQueueTransport
+
+        relay = CodexDesktopRelayClient(self.root)
+        dispatcher = self.dispatcher(CodexQueueTransport(relay), lease_seconds=30)
+        with patch_queue("agent_run.delivery.codex_queue.CodexQueueSender.__call__") as queue:
+            result = dispatcher.run(lock_path=self.lock_path, at=10)
+            self.assertEqual((result.delivered, result.retried), (0, 1))
+            row = self.delivery_row()
+            self.assertEqual(row["state"], "retry_wait")
+            self.assertIsNone(row["remote_message_id"])
+            self.assertFalse(row["ambiguous_result"])
+            assert relay.last_evidence is not None
+            self.assertEqual(relay.last_evidence.classifier, "relay_unavailable")
+            relay.last_evidence = DeliveryAttemptEvidence(
+                classifier="relay_accepted", executable="codex_desktop_relay",
+                argv_shape=("relay",), duration_ms=1,
+            )
+            with patch_queue.object(relay, "send", return_value=True):
+                recovered = dispatcher.run(lock_path=self.lock_path, at=row["next_attempt_at"])
+            self.assertEqual(recovered.delivered, 1)
+            self.assertEqual(self.delivery_row()["state"], "delivered")
+            self.assertIsNone(self.delivery_row()["remote_message_id"])
+            queue.assert_not_called()
+
     def test_trigger_drains_bounded_backlog_and_overflow_is_recoverable(self) -> None:
         self.finished_agent()
         self.finished_agent()

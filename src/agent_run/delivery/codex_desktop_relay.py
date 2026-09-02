@@ -7,12 +7,12 @@ from pathlib import Path
 
 from ..domain import OrchestratorRef
 from ..errors import ValidationError
-from .base import AmbiguousDeliveryError, CompletionNotice, DeliveryAttemptEvidence
+from .base import AmbiguousDeliveryError, CompletionNotice, DeliveryAttemptEvidence, DeliveryError
 
 #: Local notices stay small; Node separately bounds the larger host inventory.
 _MAX_FRAME = 8192
-#: One total discovery budget reserves time for queue fallback inside the lease.
-_TIMEOUT = 2.0
+#: Total discovery budget in seconds, below the thirty-second delivery lease.
+_TIMEOUT = 10.0
 _MAX_RELAYS = 16
 
 
@@ -68,11 +68,22 @@ class CodexDesktopRelayClient:
         self.last_evidence: DeliveryAttemptEvidence | None = None
 
     def send(self, target: OrchestratorRef, notice: CompletionNotice) -> bool:
-        """Return True on acceptance, False for safe queue fallback, or raise ambiguity.
+        """Return True on acceptance or raise a retryable/ambiguous delivery error.
 
-        Discovery takes at most two seconds total. Any error once sendall is
-        attempted is ambiguous; only rejection or a pre-write failure permits
-        another relay or queue send. No state/database access occurs here.
+        Discovery takes at most ten seconds total across candidates. Any error
+        once sendall is attempted is ambiguous; only rejection or a pre-write
+        failure permits another relay. No queue or state/database access occurs.
+
+        Args:
+            target (OrchestratorRef): Existing session receiving the notice.
+            notice (CompletionNotice): Validated terminal lifecycle facts.
+
+        Returns:
+            bool: True only for confirmed host acceptance.
+
+        Raises:
+            DeliveryError: No relay accepted; durable dispatch may retry.
+            AmbiguousDeliveryError: Acceptance is unknown after a write attempt.
         """
         self.last_evidence = None
         started = time.monotonic()
@@ -82,6 +93,7 @@ class CodexDesktopRelayClient:
             "notification_id": notice.notification_id, "agent_id": str(notice.agent_id),
             "status": notice.status.value,
         })
+        rejected = False
         for path in self._paths():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -98,6 +110,7 @@ class CodexDesktopRelayClient:
                     self.last_evidence = _evidence("relay_accepted", started)
                     return True
                 if response == {"outcome": "rejected"}:
+                    rejected = True
                     continue
                 raise ValueError("unknown relay acceptance")
             except (EOFError, OSError, ValueError) as error:
@@ -111,7 +124,11 @@ class CodexDesktopRelayClient:
                         path.unlink()
                     except OSError:
                         pass
-        return False
+        classifier = "relay_rejected" if rejected else "relay_unavailable"
+        self.last_evidence = _evidence(classifier, started)
+        raise DeliveryError(
+            "codex desktop relay did not accept completion", evidence=self.last_evidence
+        )
 
     def _paths(self) -> tuple[Path, ...]:
         """Return at most sixteen local endpoints in sorted order; unreadable is empty."""

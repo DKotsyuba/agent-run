@@ -26,13 +26,21 @@ NOTICE = CompletionNotice("ntf_test", AGENT, AgentStatus.SUCCEEDED)
 TARGET = OrchestratorRef("codex_queue", "thread-test")
 
 
+from agent_run.delivery.base import DeliveryError
+
+
 class RelayClientTests(unittest.TestCase):
     """Local failure classifications preserve the existing at-least-once contract."""
 
-    def test_missing_relay_is_safe_fallback(self):
-        """An empty endpoint directory cannot have accepted a notice."""
+    def test_missing_relay_is_retryable(self):
+        """An empty endpoint directory records unavailability, not success."""
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            self.assertFalse(CodexDesktopRelayClient(Path(directory)).send(TARGET, NOTICE))
+            client = CodexDesktopRelayClient(Path(directory))
+            with self.assertRaises(DeliveryError) as caught:
+                client.send(TARGET, NOTICE)
+            self.assertNotIsInstance(caught.exception, AmbiguousDeliveryError)
+            assert caught.exception.evidence is not None
+            self.assertEqual(caught.exception.evidence.classifier, "relay_unavailable")
 
     def test_partial_send_is_ambiguous_and_stops_discovery(self):
         """Even BrokenPipe during sendall cannot permit another relay or queue."""
@@ -60,8 +68,13 @@ class RelayClientTests(unittest.TestCase):
 class NodeWrapperTests(unittest.TestCase):
     """Real Node UDS roundtrips preserve exact notice text, stdio, and cleanup."""
 
-    def run_delivery(self, mode):
-        """Run one fake host exchange; return acceptance and assert child cleanup."""
+    def run_delivery(self, mode: str) -> bool | None:
+        """Run a fake host exchange for str mode and verify child/socket cleanup.
+
+        Returns bool True on acceptance or None after asserting the expected
+        typed error. Slow mode delays tools/list by two seconds. Unexpected
+        exchange errors raise rather than masking a failed regression.
+        """
         assert NODE is not None
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             home = Path(directory)
@@ -85,6 +98,8 @@ class NodeWrapperTests(unittest.TestCase):
                         if mode == "precall":
                             reply(connection, {"jsonrpc": "2.0", "id": 999, "result": {}})
                             return
+                        if mode == "slow":
+                            time.sleep(2)
                         reply(connection, {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
                             {"name": "send_message_to_thread", "namespace": "codex_app", "description": "x" * 42000}
                         ]}})
@@ -118,7 +133,14 @@ class NodeWrapperTests(unittest.TestCase):
                 endpoint = next(home.glob("ar-cdx-*.sock"))
                 self.assertEqual(endpoint.stat().st_mode & 0o777, 0o600)
                 client = CodexDesktopRelayClient(home)
-                if mode in {"drop", "badid", "error"}:
+                if mode in {"false", "precall"}:
+                    with self.assertRaises(DeliveryError) as caught:
+                        client.send(TARGET, NOTICE)
+                    self.assertNotIsInstance(caught.exception, AmbiguousDeliveryError)
+                    assert caught.exception.evidence is not None
+                    self.assertEqual(caught.exception.evidence.classifier, "relay_rejected")
+                    accepted = None
+                elif mode in {"drop", "badid", "error"}:
                     with self.assertRaises(AmbiguousDeliveryError): client.send(TARGET, NOTICE)
                     accepted = None
                 else:
@@ -136,10 +158,14 @@ class NodeWrapperTests(unittest.TestCase):
         """A real >8KiB host inventory passes the separate host frame ceiling."""
         self.assertTrue(self.run_delivery("true"))
 
-    def test_explicit_rejection_and_precall_failure_allow_fallback(self):
-        """Only known non-delivery outcomes return False to the queue transport."""
+    def test_slow_discovery_exceeds_the_former_deadline_and_succeeds(self):
+        """A two-second tools/list response must not lose the completion."""
+        self.assertTrue(self.run_delivery("slow"))
+
+    def test_explicit_rejection_and_precall_failure_are_retryable(self):
+        """Known non-delivery raises with evidence instead of using the UI queue."""
         for mode in ("false", "precall"):
-            with self.subTest(mode=mode): self.assertFalse(self.run_delivery(mode))
+            with self.subTest(mode=mode): self.run_delivery(mode)
 
     def test_postcall_uncertainty_never_allows_fallback(self):
         """EOF, id mismatch, and error after dispatch all remain ambiguous."""

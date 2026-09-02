@@ -99,16 +99,17 @@ dedicated dispatch thread for exactly this reason).
 An agent started by an MCP session (or with explicit `--session-*` flags)
 is **bound** to that orchestrator session. On terminal state, a delivery
 row is created and a dispatcher pushes the completion notice back to the
-orchestrator's chat (codex queue and Claude UDS transports exist).
+orchestrator's chat (the relay-backed `codex_queue` compatibility identifier
+and Claude UDS transports exist).
 Unbound runs create no delivery row — `wait` on them is the delivery.
 Deliveries retry with backoff and expire instead of retrying forever.
-Each Codex queue attempt records an immutable bounded evidence row in the same
+Each Codex delivery attempt records an immutable bounded evidence row in the same
 transaction that completes, retries, or fails its owned delivery claim. The
 record distinguishes exit status (including 127), spawn errno, timeout, session
 loss, and success while storing no message, session id, argv/environment value,
 or credential. Status exposes only the latest validated safe summary.
 
-Codex Desktop delivery first tries a volatile local relay. With both
+Codex Desktop delivery uses a volatile local relay. With both
 `CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` supplied by the host, the
 MCP CLI replaces itself with the host's signed Node executable. That wrapper
 owns a private Unix socket and a thin Python MCP child; the child receives
@@ -118,10 +119,12 @@ validated lifecycle fields. Host tool inventories have an 8 MiB frame limit;
 local delivery requests remain bounded to 8 KiB. No socket path, host response,
 or message text enters delivery evidence.
 
-Missing relays and explicit pre-call rejection use the existing `codex queue`
-sender. Unknown acceptance after transmission remains ambiguous and retryable,
-never a blind queue fallback. Relay discovery has a two-second total budget;
-the queue subprocess has 25 seconds, fitting the existing 30-second lease.
+Codex completion delivery uses only the signed Desktop relay. The persisted
+`codex_queue` name is a compatibility identifier; it never invokes the Codex
+UI queue or requires a queue executable. Missing or rejected relays are
+retryable; unknown acceptance after transmission remains ambiguous and
+retryable. Relay discovery has a ten-second total budget and the host call
+has an eight-second budget, within the existing thirty-second lease.
 The Node wrapper preserves MCP stdio and removes its socket on child exit.
 
 ## Workflows

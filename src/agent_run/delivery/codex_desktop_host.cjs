@@ -5,7 +5,8 @@ const net = require("node:net");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 /** Host inventory is larger than the small local delivery request. */
-const LOCAL_LIMIT = 8192, HOST_LIMIT = 8 * 1024 * 1024, HOST_MS = 1500;
+/** Frame limits in bytes and host deadline in ms, below the client's 10 s budget. */
+const LOCAL_LIMIT = 8192, HOST_LIMIT = 8 * 1024 * 1024, HOST_MS = 8000;
 const [python, home, ...pythonArgs] = process.argv.slice(2);
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
 const relayPath = path.join(home, `ar-cdx-${process.pid}.sock`);

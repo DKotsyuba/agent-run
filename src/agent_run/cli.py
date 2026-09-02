@@ -28,7 +28,7 @@ from .capacity.launchd import build_configured_job, render_plist
 from .config import load_config
 from .delivery.claude_uds import TRANSPORT_NAME as CLAUDE_UDS_TRANSPORT_NAME
 from .delivery.claude_uds import ClaudeSessionSender, ClaudeUdsTransport
-from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueSender, CodexQueueTransport
+from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueTransport
 from .delivery.dispatch import DeliveryDispatcher
 from .doctor import run_doctor
 from .domain import AgentId, OrchestratorRef, StartRequest
@@ -48,7 +48,6 @@ _logger = logging.getLogger("agent_run.cli")
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
-_QUEUE_TIMEOUT_SECONDS = 25.0
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
@@ -665,27 +664,17 @@ def _dispatch_once(home: Path):
     """Drain both agent and workflow lifecycle outboxes once."""
 
     config = load_config(config_path(home))
-    executable = (
-        os.environ["CODEX_QUEUE_BIN"]
-        if "CODEX_QUEUE_BIN" in os.environ
-        else config.delivery.codex_queue_bin
-    )
-    if executable is None or not str(executable) or not Path(executable).is_absolute():
-        raise ValidationError(
-            "delivery.codex_queue_bin or CODEX_QUEUE_BIN must name an absolute executable"
-        )
     store = StateStore.open(state_db_path(home))
     try:
         if isinstance(store, StateStore):
             reconcile_active_agents(store)
-        sender = CodexQueueSender(str(executable), timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
         from .delivery.codex_desktop_relay import CodexDesktopRelayClient
 
         relay = CodexDesktopRelayClient(home)
         dispatcher = DeliveryDispatcher(
             store,
             {
-                TRANSPORT_NAME: CodexQueueTransport(sender, relay),
+                TRANSPORT_NAME: CodexQueueTransport(relay),
                 CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
             },
             config.delivery,
@@ -697,7 +686,7 @@ def _dispatch_once(home: Path):
             WorkflowDeliveryDispatcher(
                 store,
                 {
-                    TRANSPORT_NAME: CodexQueueTransport(sender, relay),
+                    TRANSPORT_NAME: CodexQueueTransport(relay),
                     CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
                 },
                 config.delivery,
