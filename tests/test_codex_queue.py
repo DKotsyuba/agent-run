@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -13,6 +14,7 @@ from agent_run.errors import ValidationError
 from agent_run.delivery.base import (
     AmbiguousDeliveryError,
     CompletionNotice,
+    DeliveryAttemptEvidence,
     DeliveryError,
 )
 from agent_run.delivery.codex_queue import CodexQueueSender, CodexQueueTransport
@@ -108,6 +110,40 @@ class CodexQueueTransportTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             transport.send(self.target, "done")  # type: ignore[arg-type]
 
+
+    def test_relay_acceptance_bypasses_the_queue_without_a_remote_id(self) -> None:
+        queue = RecordingQueue()
+        relay = mock.Mock()
+        relay.send.return_value = True
+        relay.last_evidence = DeliveryAttemptEvidence(
+            classifier="relay_accepted",
+            executable="codex_desktop_relay",
+            argv_shape=("relay",),
+            duration_ms=1,
+        )
+        receipt = CodexQueueTransport(queue, relay).send(self.target, self.notice)
+        relay.send.assert_called_once_with(self.target, self.notice)
+        self.assertEqual(queue.sent, [])
+        self.assertIsNone(receipt.remote_message_id)
+        self.assertFalse(receipt.ambiguous)
+        self.assertEqual(receipt.evidence.classifier, "relay_accepted")
+
+    def test_relay_rejection_falls_back_to_the_queue(self) -> None:
+        queue = RecordingQueue()
+        relay = mock.Mock()
+        relay.send.return_value = False
+        receipt = CodexQueueTransport(queue, relay).send(self.target, self.notice)
+        relay.send.assert_called_once_with(self.target, self.notice)
+        self.assertEqual(queue.sent, [("session-1", self.notice.render())])
+        self.assertEqual(receipt.remote_message_id, "remote-1")
+
+    def test_relay_ambiguity_never_falls_back_to_the_queue(self) -> None:
+        queue = RecordingQueue()
+        relay = mock.Mock()
+        relay.send.side_effect = AmbiguousDeliveryError("relay acceptance is unknown")
+        with self.assertRaises(AmbiguousDeliveryError):
+            CodexQueueTransport(queue, relay).send(self.target, self.notice)
+        self.assertEqual(queue.sent, [])
 
 class RecordingRunner:
     def __init__(self, *, returncode=0, stdout="", stderr="", error=None):

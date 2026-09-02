@@ -1060,13 +1060,17 @@ target = "auth.json"
             )
             uds_sender = Mock()
             uds_transport = Mock()
+            relay = Mock()
             with patch.dict(os.environ, {}, clear=True), patch.object(
                 cli, "load_config", return_value=config
             ), patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
                 cli, "CodexQueueSender", return_value=sender
             ) as sender_type, patch.object(
                 cli, "CodexQueueTransport", return_value=transport
-            ) as transport_type, patch.object(
+            ) as transport_type, patch(
+                "agent_run.delivery.codex_desktop_relay.CodexDesktopRelayClient",
+                return_value=relay,
+            ) as relay_type, patch.object(
                 cli, "ClaudeSessionSender", return_value=uds_sender
             ) as uds_sender_type, patch.object(
                 cli, "ClaudeUdsTransport", return_value=uds_transport
@@ -1077,7 +1081,8 @@ target = "auth.json"
 
             opened.assert_called_once_with(home / "state.db")
             sender_type.assert_called_once_with(str(executable), timeout_seconds=30.0)
-            transport_type.assert_called_once_with(sender)
+            relay_type.assert_called_once_with(home)
+            transport_type.assert_called_once_with(sender, relay)
             uds_sender_type.assert_called_once_with()
             uds_transport_type.assert_called_once_with(uds_sender)
             dispatcher_type.assert_called_once_with(

@@ -22,6 +22,7 @@ from .base import (
     DeliveryError,
     DeliveryReceipt,
 )
+from .codex_desktop_relay import CodexDesktopRelayClient
 
 
 TRANSPORT_NAME = "codex_queue"
@@ -265,10 +266,17 @@ class CodexQueueTransport:
     name = TRANSPORT_NAME
     api_version = TRANSPORT_API_VERSION
 
-    def __init__(self, sender: QueueSender) -> None:
+    def __init__(
+        self, sender: QueueSender, relay: CodexDesktopRelayClient | None = None
+    ) -> None:
+        """Create a queue transport with an optional volatile Desktop relay."""
+
         if not callable(sender):
             raise ValidationError("codex queue sender must be callable")
+        if relay is not None and not callable(getattr(relay, "send", None)):
+            raise ValidationError("codex desktop relay must provide send")
         self._sender = sender
+        self._relay = relay
 
     def validate(self, config: ChatTransportConfig) -> None:
         if not isinstance(config, ChatTransportConfig):
@@ -290,6 +298,15 @@ class CodexQueueTransport:
         if target.transport != self.name:
             raise DeliveryError(
                 f"{self.name} cannot deliver to transport {target.transport!r}"
+            )
+        if self._relay is not None and self._relay.send(target, notice):
+            evidence = self._relay.last_evidence
+            return DeliveryReceipt(
+                remote_message_id=None,
+                ambiguous=False,
+                evidence=(
+                    evidence if isinstance(evidence, DeliveryAttemptEvidence) else None
+                ),
             )
         try:
             remote_message_id = self._sender(

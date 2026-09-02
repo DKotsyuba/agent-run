@@ -667,10 +667,13 @@ def _dispatch_once(home: Path):
         if isinstance(store, StateStore):
             reconcile_active_agents(store)
         sender = CodexQueueSender(str(executable), timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
+        from .delivery.codex_desktop_relay import CodexDesktopRelayClient
+
+        relay = CodexDesktopRelayClient(home)
         dispatcher = DeliveryDispatcher(
             store,
             {
-                TRANSPORT_NAME: CodexQueueTransport(sender),
+                TRANSPORT_NAME: CodexQueueTransport(sender, relay),
                 CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
             },
             config.delivery,
@@ -682,7 +685,7 @@ def _dispatch_once(home: Path):
             WorkflowDeliveryDispatcher(
                 store,
                 {
-                    TRANSPORT_NAME: CodexQueueTransport(sender),
+                    TRANSPORT_NAME: CodexQueueTransport(sender, relay),
                     CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
                 },
                 config.delivery,
@@ -1004,7 +1007,7 @@ def main(
                 from .mcp import serve
 
                 mcp_broker = service if service is not None else BrokerClient(home / "api.sock")
-                returned = serve(mcp_broker, stdin=stdin, stdout=stdout)
+                returned = serve(mcp_broker, stdin=stdin, stdout=stdout, home=home)
                 close = getattr(mcp_broker, "close", None)
                 if callable(close):
                     close()

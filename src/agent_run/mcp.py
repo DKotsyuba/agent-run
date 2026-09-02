@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 import time
+from pathlib import Path
 from typing import IO, Mapping
 
 from .broker_client import BrokerClient
@@ -28,33 +29,57 @@ def serve(
     broker: BrokerClient,
     stdin: IO[str] = sys.stdin,
     stdout: IO[str] = sys.stdout,
+    *,
+    home: Path | None = None,
 ) -> int:
-    """Serve newline-delimited JSON-RPC until EOF; stdout carries JSON only."""
-    while True:
-        line = stdin.readline(MAX_LINE_BYTES + 1)
-        if line == "":
-            return 0
-        if len(line) > MAX_LINE_BYTES:
-            while line and not line.endswith("\n"):
-                line = stdin.readline(MAX_LINE_BYTES + 1)
-            _emit(stdout, _error(None, -32700, "request exceeds maximum size"))
-            continue
-        try:
-            encoded = line.encode("utf-8")
-        except UnicodeEncodeError:
-            _emit(stdout, _error(None, -32700, "request is not valid UTF-8"))
-            continue
-        if len(encoded) > MAX_LINE_BYTES:
-            _emit(stdout, _error(None, -32700, "request exceeds maximum size"))
-            continue
-        try:
-            request = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            _emit(stdout, _error(None, -32700, "parse error"))
-            continue
-        response = _handle(broker, request)
-        if response is not None:
-            _emit(stdout, response)
+    """Serve newline-delimited JSON-RPC until EOF; stdout carries JSON only.
+
+    When ``home`` is given, a Codex Desktop relay is started for the
+    duration of this call and is owned by this frame: a ``finally`` block
+    closes it on every return or exception so a relay socket never outlives
+    the serve loop. ``atexit`` registration remains as a backstop for
+    process-exit paths that bypass this frame (for example ``os._exit``);
+    ``CodexDesktopRelayServer.close`` is idempotent, so the two cleanup paths
+    never double-close.
+    """
+
+    relay_server = None
+    if home is not None:
+        import atexit
+        from .delivery.codex_desktop_relay import CodexDesktopRelayServer
+
+        relay_server = CodexDesktopRelayServer.start_from_environment(home)
+        if relay_server is not None:
+            atexit.register(relay_server.close)
+    try:
+        while True:
+            line = stdin.readline(MAX_LINE_BYTES + 1)
+            if line == "":
+                return 0
+            if len(line) > MAX_LINE_BYTES:
+                while line and not line.endswith("\n"):
+                    line = stdin.readline(MAX_LINE_BYTES + 1)
+                _emit(stdout, _error(None, -32700, "request exceeds maximum size"))
+                continue
+            try:
+                encoded = line.encode("utf-8")
+            except UnicodeEncodeError:
+                _emit(stdout, _error(None, -32700, "request is not valid UTF-8"))
+                continue
+            if len(encoded) > MAX_LINE_BYTES:
+                _emit(stdout, _error(None, -32700, "request exceeds maximum size"))
+                continue
+            try:
+                request = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                _emit(stdout, _error(None, -32700, "parse error"))
+                continue
+            response = _handle(broker, request)
+            if response is not None:
+                _emit(stdout, response)
+    finally:
+        if relay_server is not None:
+            relay_server.close()
 
 
 def _handle(broker: BrokerClient, request: object) -> dict | None:
