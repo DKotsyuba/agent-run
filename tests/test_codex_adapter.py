@@ -239,6 +239,45 @@ env_from = ["PATH"]
         )
         self.assertNotEqual(digest, ADAPTER.materialize(self.runtime_config(), self.home, mcp_servers={}))
 
+    def test_materialize_trusts_post_tool_use_failure_plugin_hook(self) -> None:
+        """Translate the LSP failure hook to Codex's trusted native label."""
+
+        plugin = self.make_plugin()
+        hooks = plugin / "hooks" / "hooks.json"
+        hooks.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PostToolUseFailure": [
+                            {
+                                "matcher": "mcp__agent-lsp__.*",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/lsp_guard.py",
+                                        "timeout": 5,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        ADAPTER.materialize(
+            self.runtime_config(plugins=(plugin,)), self.home, mcp_servers={}
+        )
+
+        generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn(
+            "agent-pipline-compressor@personal:hooks/hooks.json:"
+            "post_tool_use_failure:0:0",
+            generated,
+        )
+
+
     def test_materialize_refuses_plugin_hooks_it_cannot_trust(self) -> None:
         no_manifest = Path(self._mkdtemp()).resolve()
         with self.assertRaisesRegex(ValidationError, "no usable manifest"):

@@ -45,6 +45,7 @@ _EVENT_LABELS = {
     "PreToolUse": "pre_tool_use",
     "PermissionRequest": "permission_request",
     "PostToolUse": "post_tool_use",
+    "PostToolUseFailure": "post_tool_use_failure",
     "PreCompact": "pre_compact",
     "PostCompact": "post_compact",
     "SessionStart": "session_start",
