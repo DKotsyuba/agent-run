@@ -1549,24 +1549,25 @@ def _replace(request, **changes):
     return StartRequest(**values)
 
 
-#: The rows the in-container SQL produces from the newest real opencode-go
-#: round (``quota_snapshots`` ids 27506-27511, copied out of the live store):
-#: newest snapshot per active, quota-visible connection. Averaged they
-#: reproduce the pool figures OmniRoute itself recorded that round:
-#: weekly 92, session 95, mcp_monthly 99.
+#: The rows the in-container query produces from the newest real opencode-go
+#: round, sourced from each connection's *current* quota cache
+#: (``key_value`` namespace ``providerLimitsCache``), copied out of the live
+#: store: one row per known window per active, quota-visible connection.
+#: Averaged they reproduce the pool figures OmniRoute itself recorded that
+#: round: weekly 92, session 95, mcp_monthly 99.
 _REAL_ROWS = (
     {"window_key": "session", "remaining_percentage": 90.0,
-     "next_reset_at": "2026-08-24T19:20:58.435Z", "created_at": "2026-08-24T19:17:02.435Z"},
+     "next_reset_at": "2026-08-24T19:20:58.435Z", "fetched_at": "2026-08-24T19:17:02.435Z"},
     {"window_key": "weekly", "remaining_percentage": 84.0,
-     "next_reset_at": "2026-08-31T00:00:00.435Z", "created_at": "2026-08-24T19:17:02.436Z"},
+     "next_reset_at": "2026-08-31T00:00:00.435Z", "fetched_at": "2026-08-24T19:17:02.436Z"},
     {"window_key": "mcp_monthly", "remaining_percentage": 98.0,
-     "next_reset_at": "2026-09-24T13:23:17.435Z", "created_at": "2026-08-24T19:17:02.437Z"},
+     "next_reset_at": "2026-09-24T13:23:17.435Z", "fetched_at": "2026-08-24T19:17:02.437Z"},
     {"window_key": "session", "remaining_percentage": 100.0,
-     "next_reset_at": "2026-08-24T19:24:59.554Z", "created_at": "2026-08-24T19:17:02.555Z"},
+     "next_reset_at": "2026-08-24T19:24:59.554Z", "fetched_at": "2026-08-24T19:17:02.555Z"},
     {"window_key": "weekly", "remaining_percentage": 100.0,
-     "next_reset_at": "2026-08-31T00:00:00.555Z", "created_at": "2026-08-24T19:17:02.555Z"},
+     "next_reset_at": "2026-08-31T00:00:00.555Z", "fetched_at": "2026-08-24T19:17:02.555Z"},
     {"window_key": "mcp_monthly", "remaining_percentage": 100.0,
-     "next_reset_at": "2026-09-23T22:16:31.555Z", "created_at": "2026-08-24T19:17:02.555Z"},
+     "next_reset_at": "2026-09-23T22:16:31.555Z", "fetched_at": "2026-08-24T19:17:02.555Z"},
 )
 _NEWEST_OBSERVATION = "2026-08-24T19:17:02.555Z"
 
@@ -1600,7 +1601,7 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
             self.assertEqual(
                 sample.observed_at,
                 min(
-                    datetime.fromisoformat(row["created_at"])
+                    datetime.fromisoformat(row["fetched_at"])
                     for row in _REAL_ROWS
                     if omniroute.WINDOWS.get(row["window_key"]) == sample.window
                 ),
@@ -1628,9 +1629,9 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
     def test_unnamed_windows_and_unusable_rows_are_not_reported(self):
         rows = (
             {"window_key": "some_new_window", "remaining_percentage": 50.0,
-             "next_reset_at": None, "created_at": _NEWEST_OBSERVATION},
+             "next_reset_at": None, "fetched_at": _NEWEST_OBSERVATION},
             {"window_key": "session", "remaining_percentage": 100.0,
-             "next_reset_at": None, "created_at": _NEWEST_OBSERVATION},
+             "next_reset_at": None, "fetched_at": _NEWEST_OBSERVATION},
         )
         samples = self.samples_by_window(self.fresh, rows)
         self.assertEqual(sorted(samples), ["session_5h"])
@@ -1657,25 +1658,25 @@ class OmniRouteQuotaPoolTests(unittest.TestCase):
     def test_invalid_window_state_does_not_inflate_pool_remaining(self):
         rows = [
             {"window_key": "session", "remaining_percentage": 90.0,
-             "next_reset_at": "2026-08-25T00:00:00Z", "created_at": _NEWEST_OBSERVATION},
+             "next_reset_at": "2026-08-25T00:00:00Z", "fetched_at": _NEWEST_OBSERVATION},
             {"window_key": "session", "remaining_percentage": 10.0,
-             "next_reset_at": "2026-08-25T00:00:00Z", "created_at": "2026-08-24T17:17:02.437Z"},
+             "next_reset_at": "2026-08-25T00:00:00Z", "fetched_at": "2026-08-24T17:17:02.437Z"},
         ]
         sample = self.samples_by_window(self.fresh, rows)["session_5h"]
         self.assertIsNone(sample.remaining_percent)
-        self.assertEqual(sample.observed_at, datetime.fromisoformat(rows[1]["created_at"]))
+        self.assertEqual(sample.observed_at, datetime.fromisoformat(rows[1]["fetched_at"]))
 
     def test_future_and_reset_boundary_make_window_unknown(self):
         future = [{"window_key": "weekly", "remaining_percentage": 99.0,
-                   "next_reset_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z"}]
+                   "next_reset_at": "2026-09-01T00:00:00Z", "fetched_at": "2026-09-01T00:00:00Z"}]
         self.assertIsNone(self.samples_by_window(self.fresh, future)["weekly"].remaining_percent)
         boundary = [{"window_key": "weekly", "remaining_percentage": 99.0,
-                     "next_reset_at": _NEWEST_OBSERVATION, "created_at": _NEWEST_OBSERVATION}]
+                     "next_reset_at": _NEWEST_OBSERVATION, "fetched_at": _NEWEST_OBSERVATION}]
         self.assertIsNone(self.samples_by_window(self.fresh, boundary)["weekly"].remaining_percent)
 
     def test_row_cap_overflow_is_a_source_failure(self):
         row = {"window_key": "weekly", "remaining_percentage": 99.0,
-               "next_reset_at": None, "created_at": _NEWEST_OBSERVATION}
+               "next_reset_at": None, "fetched_at": _NEWEST_OBSERVATION}
         with self.assertRaises(omniroute.CapacitySourceError):
             pool_samples(self.fresh, fetch_rows=lambda: [row] * 65)
 

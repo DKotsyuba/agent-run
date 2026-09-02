@@ -164,6 +164,19 @@ again. Future observations and windows whose reset has arrived are unknown.
 Diagnostic snapshots select the newest row per quota identity before applying
 their result cap, so a busy account cannot hide a stale sibling through repeated
 samples. Stored sample history retains its separate, global retention bound.
+Reset-cycle grouping tolerates up to one second of reporting jitter only when
+both reported resets were still in the future at the latest observation.
+Stored timestamps and the reported latest reset remain unchanged; a reset
+that already passed is not merged into the next cycle.
+
+OmniRoute quotas come from its current `key_value` cache under the
+`providerLimitsCache` namespace, using `fetchedAt` as the observation clock.
+Its `quota_snapshots` table records changes, not every successful poll, and
+therefore cannot establish freshness for unchanged quota values. Active,
+quota-visible members with missing or malformed current evidence fail the
+collection rather than silently disappearing from the pool average. Only
+quota percentages and timestamps cross the Docker reader boundary; cache
+messages, plans, credentials and connection identifiers are not emitted.
 OmniRoute pool freshness is limited by its oldest included member; future
 observations and expired resets invalidate the whole window, never just remove
 the inconvenient member from the mean. Its quota query detects overflow of the

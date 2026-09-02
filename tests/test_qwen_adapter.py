@@ -198,7 +198,7 @@ class QwenAdapterTests(unittest.TestCase):
         rows = [
             {"window_key": "session", "remaining_percentage": 90.0,
              "next_reset_at": "2026-08-28T17:26:35.920Z",
-             "created_at": "2026-08-28T14:06:01.922Z"},
+             "fetched_at": "2026-08-28T14:06:01.922Z"},
         ]
         now = datetime.fromisoformat("2026-08-28T14:06:01.922Z").timestamp() + 60.0
         with patch(
