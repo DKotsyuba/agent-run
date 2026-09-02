@@ -447,9 +447,9 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")
-        if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "none"}:
+        if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(
-                f"{path}.limits_source must be one of 'native', 'omniroute', 'codexbar', 'none'"
+                f"{path}.limits_source must be one of 'native', 'omniroute', 'codexbar', 'codex_appserver', 'none'"
             )
     return MappingProxyType(result)
 

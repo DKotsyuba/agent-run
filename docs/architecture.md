@@ -78,10 +78,11 @@ lookups where configured.
 
 ## State
 
-Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 9`.
+Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 10`.
 Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
 `commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
 `deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
+`capacity_route_snapshots`,
 `workflow_runs` / `workflow_steps` / `workflow_deliveries`, `run_stats`,
 `context_receipts`.
 
@@ -107,6 +108,16 @@ record distinguishes exit status (including 127), spawn errno, timeout, session
 loss, and success while storing no message, session id, argv/environment value,
 or credential. Status exposes only the latest validated safe summary.
 
+On Codex, when the MCP process is handed `CODEX_APP_TOOLS_PIPE_PATH`, it serves
+a volatile, mode-0600 Unix socket under the agent-run home that the queue
+transport probes first. A live relay calls the Desktop host's
+`send_message_to_thread` tool (the same semantic as the UI "Correct" action)
+and, on acceptance, completes the lease without queueing; an explicit rejection
+falls back to the queue sender, and any ambiguity after a request byte is
+written is recorded and retried instead of being double-sent. The relay carries
+only structured lifecycle fields, renders the fixed trusted notice itself, and
+never accepts arbitrary prompt text.
+
 ## Workflows
 
 A restricted Python script (AST-guarded: five names, no imports/IO) runs
@@ -121,9 +132,13 @@ the one-phase parallel script for you.
 
 A collector (`agent-run capacity collect`, launchd-schedulable) samples
 remaining quota per runtime through a pluggable per-runtime source:
-`native` engine data, the `codexbar` CLI, a local OmniRoute router, or
-`none`. Samples carry validity windows; `limits` serves projections with
-burn-rate–based exhaustion risk per lane, worst first, hiding nothing.
+`native` engine data, a short-lived Codex app-server, the `codexbar` CLI,
+a local OmniRoute router, or `none`. A collection stores samples and its
+explicit physical-pool/route topology atomically. Per-account scopes refresh
+independently, so a failed account keeps its previous topology only until that
+snapshot expires instead of deleting healthy sibling scopes. Samples carry
+validity windows; `limits` serves projections with burn-rate–based exhaustion
+risk per lane, worst first, hiding nothing.
 Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
 terminal, with an idempotent `stats backfill`.
 

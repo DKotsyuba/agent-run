@@ -805,6 +805,45 @@ class StateStore:
             )
         ]
 
+    def append_capacity_samples(
+        self,
+        samples: Iterable[dict[str, object]],
+        *,
+        runtime: str,
+        scope_id: str,
+        observed_at: float,
+        valid_until: float,
+        payload: object,
+    ) -> None:
+        """Atomically persist samples and one route topology snapshot.
+
+        ``samples`` is consumed once; each mapping must belong to ``runtime``.
+        ``scope_id`` must be nonblank, timestamps must be finite and ordered
+        with expiry no earlier than observation, and the JSON ``payload`` is
+        limited to 65,536 UTF-8 bytes. The store commits all rows and the
+        snapshot together or leaves both unchanged. Validation errors and
+        SQLite failures are propagated according to the StateStore contract.
+        """
+
+        capacity.append_capacity_samples(
+            self.connection, samples, runtime=runtime, scope_id=scope_id,
+            observed_at=observed_at, valid_until=valid_until, payload=payload,
+        )
+
+    def capacity_route_snapshots(
+        self, *, runtime: str | None = None
+    ) -> list[dict[str, object]]:
+        """Return route topology snapshots in deterministic key order.
+
+        An omitted runtime returns all snapshots; a supplied runtime filters
+        the result. The returned dictionaries are detached copies ordered by
+        ``(runtime, scope_id)`` and this read does not mutate the store.
+        """
+
+        return [dict(row) for row in capacity.capacity_route_snapshots(
+            self.connection, runtime=runtime
+        )]
+
     def claim_delivery(
         self, owner: str, *, at: float | None = None, lease_seconds: float = 30
     ) -> dict[str, object] | None:

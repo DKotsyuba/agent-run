@@ -107,7 +107,12 @@ Add more `[runtimes.<name>]` blocks for other engines (`codex`, `qwen`,
 `glm`, `opencode`) the same way. Per-runtime options cover auth (env-var
 names or file links — never secret values in config), allowed skills,
 declared MCP servers, lifecycle hooks, plugins, and the limits source
-(`native` / `codexbar` / `omniroute` / `none`).
+(`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
+
+For Codex, `codex_appserver` reads each configured account through a
+short-lived local app-server process. Standard and model-specific buckets
+(including Spark when the plan exposes it) remain separate routes, and one
+account failure does not erase fresh evidence from the others.
 
 **Multiple accounts** (codex): declare labels on the runtime —
 `accounts = ["personal1", "personal2"]` (optionally `default_account`) —

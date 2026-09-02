@@ -142,6 +142,40 @@ class MigrationRegistryTests(unittest.TestCase):
             list(range(2, SCHEMA_VERSION + 1)),
         )
 
+    def test_v9_to_v10_creates_bounded_route_snapshot_table(self) -> None:
+        """Migration 010 must create the keyed, bounded topology table."""
+        directory = tempfile.TemporaryDirectory()
+        database = Path(directory.name) / "state.db"
+        store = StateStore.initialize(database)
+        store.close()
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("DROP TABLE capacity_route_snapshots")
+            connection.execute("PRAGMA user_version = 9")
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = StateStore.open(database)
+        try:
+            columns = migrated.connection.execute(
+                "PRAGMA table_info(capacity_route_snapshots)"
+            ).fetchall()
+            self.assertEqual(
+                [column[1] for column in columns],
+                ["runtime", "scope_id", "observed_at", "valid_until", "payload_json"],
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                migrated.connection.execute(
+                    """INSERT INTO capacity_route_snapshots
+                       (runtime, scope_id, observed_at, valid_until, payload_json)
+                       VALUES ('codex', 'oversized', 1, 2, ?)""",
+                    ("x" * 65537,),
+                )
+        finally:
+            migrated.close()
+            directory.cleanup()
+
     def test_stale_backup_cleanup_spares_newer_versions_snapshots(self) -> None:
         from agent_run.state.migrations import _drop_stale_backups
 

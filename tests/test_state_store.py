@@ -542,6 +542,84 @@ class StateStoreTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(rows), 1)
 
+    def test_capacity_samples_and_route_snapshots_are_atomic_and_isolated(self) -> None:
+        """A batch commits samples and one keyed snapshot together or not at all."""
+
+        sample: dict[str, object] = {
+            "lane": "requests",
+            "window": "5h",
+            "source": "provider",
+            "remaining_percent": 50.0,
+        }
+        self.store.append_capacity_samples(
+            [sample], runtime="codex", scope_id="z", observed_at=10.0,
+            valid_until=20.0, payload={"route": "z"},
+        )
+        self.store.append_capacity_samples(
+            [sample], runtime="claude", scope_id="a", observed_at=11.0,
+            valid_until=21.0, payload={"route": "a"},
+        )
+        self.store.append_capacity_samples(
+            [sample], runtime="codex", scope_id="a", observed_at=12.0,
+            valid_until=22.0, payload={"route": "new"},
+        )
+        snapshots = self.store.capacity_route_snapshots()
+        self.assertEqual([(row["runtime"], row["scope_id"]) for row in snapshots],
+                         [("claude", "a"), ("codex", "a"), ("codex", "z")])
+        self.assertEqual(snapshots[1]["payload_json"], '{"route":"new"}')
+        self.assertEqual(len(self.store.recent_capacity_samples(at=0.0, limit=10)), 3)
+
+        with self.assertRaises(ValidationError):
+            self.store.append_capacity_samples(
+                [sample, {**sample, "remaining_percent": 101}],
+                runtime="codex", scope_id="a", observed_at=13.0,
+                valid_until=23.0, payload={"route": "bad"},
+            )
+        with self.assertRaises(ValidationError):
+            self.store.append_capacity_samples(
+                [sample], runtime="codex", scope_id="a", observed_at=13.0,
+                valid_until=12.0, payload={"route": "bad"},
+            )
+        self.assertEqual(len(self.store.recent_capacity_samples(at=0.0, limit=10)), 3)
+        self.assertEqual(self.store.capacity_route_snapshots()[1]["payload_json"],
+                         '{"route":"new"}')
+
+    def test_capacity_sample_runtime_and_payload_constraints(self) -> None:
+        """Batch validation rejects cross-runtime samples and oversized JSON."""
+
+        sample: dict[str, object] = {
+            "lane": "requests", "window": "5h", "source": "provider", "observed_at": 1.0
+        }
+        with self.assertRaisesRegex(ValidationError, "runtime must match"):
+            self.store.append_capacity_samples(
+                [{**sample, "runtime": "claude"}], runtime="codex", scope_id="main",
+                observed_at=1.0, valid_until=2.0, payload={},
+            )
+        with self.assertRaises(ValidationError):
+            self.store.append_capacity_samples(
+                [sample], runtime="codex", scope_id="main", observed_at=1.0,
+                valid_until=2.0, payload="x" * 65537,
+            )
+        self.assertEqual(self.store.recent_capacity_samples(at=0.0, limit=10), [])
+
+    def test_capacity_history_survives_successful_appends(self) -> None:
+        """Successful snapshot upserts append rather than replace sample history."""
+
+        sample: dict[str, object] = {
+            "lane": "requests", "window": "5h", "source": "provider", "observed_at": 1.0
+        }
+        self.store.append_capacity_samples(
+            [sample], runtime="codex", scope_id="main", observed_at=1.0,
+            valid_until=2.0, payload={"version": 1},
+        )
+        self.store.append_capacity_samples(
+            [{**sample, "remaining_percent": 25.0, "observed_at": 3.0}], runtime="codex", scope_id="main",
+            observed_at=3.0, valid_until=4.0, payload={"version": 2},
+        )
+        rows = self.store.recent_capacity_samples(at=0.0, limit=10)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["observed_at"] for row in rows], [3.0, 1.0])
+
 
 if __name__ == "__main__":
     unittest.main()

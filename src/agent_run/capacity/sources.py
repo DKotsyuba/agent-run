@@ -26,6 +26,15 @@ from ..adapters import omniroute
 from ..adapters.base import Capability, LimitSample, RuntimeAdapter
 from ..adapters.claude.auth import keychain_token
 from ..config import CapacityConfig, RuntimeConfig
+from .topology import (
+    CapacityCollectionSlice,
+    CapacityRouteDescriptor,
+    CapacityTopology,
+    PhysicalPoolDescriptor,
+    pools_from_samples,
+    validate_slice,
+    validate_topology,
+)
 
 _logger = logging.getLogger("agent_run.capacity")
 
@@ -51,6 +60,10 @@ _CODEXBAR_LANES = ("primary", "secondary", "tertiary")
 _CLAUDE_NATIVE_URL = "https://api.anthropic.com/api/oauth/usage"
 _CLAUDE_NATIVE_TIMEOUT_SECONDS = 20
 _CLAUDE_NATIVE_VALID_FOR_SECONDS = 900
+#: Shelf life applied to a codex_appserver slice whose samples carry no
+#: positive ``valid_for_seconds``; slices never stay fresh until the provider
+#: reset, only for the bounded evidence interval.
+_CODEX_APPSERVER_VALID_FOR_SECONDS = 900
 
 
 def _bounded_error_tail(stderr: object) -> str:
@@ -305,6 +318,70 @@ def _claude_native_samples() -> tuple[LimitSample, ...]:
     return tuple(samples)
 
 
+def collect_codex_appserver_slices(
+    name: str,
+    runtime_config: RuntimeConfig,
+    observed_at: float,
+) -> tuple[CapacityCollectionSlice, ...]:
+    """Probe Codex base and configured account homes into independent slices.
+
+    ``name`` is the configured runtime name, ``runtime_config`` supplies the
+    Codex binary, base home, and ordered account labels, and ``observed_at`` is
+    the collection epoch seconds shared by this round.  Each successful home
+    is normalized and validated before it is returned as an opaque collection
+    slice.  One account failure is logged without response details and does
+    not affect other homes; failed or zero-valid-sample scopes yield no slice,
+    preserving any previously stored snapshot for natural aging.  Backend
+    account ids are retained only while de-duplicating this invocation and are
+    never included in a slice or log.
+    """
+
+    from ..accounts import account_runtime_home
+    from ..adapters.codex.rate_limits import read_rate_limits
+    from .codex_appserver import normalize_rate_limits
+
+    homes = [(None, runtime_config.home)] + [
+        (label, account_runtime_home(runtime_config.home, label))
+        for label in runtime_config.accounts
+    ]
+    slices: list[CapacityCollectionSlice] = []
+    seen_account_ids: set[str] = set()
+    for target, home in homes:
+        try:
+            response = read_rate_limits(runtime_config, home)
+            samples, topology, account_id = normalize_rate_limits(
+                name, target, response, observed_at
+            )
+            if not samples or not getattr(topology, "routes", ()):
+                continue
+            if account_id is not None and account_id in seen_account_ids:
+                continue
+            if account_id is not None:
+                seen_account_ids.add(account_id)
+            # Evidence shelf life is the bounded source interval, never the
+            # provider reset distance: a weekly reset must not keep a stale
+            # topology snapshot fresh for days.
+            valid_for = min(
+                (
+                    sample.valid_for_seconds
+                    for sample in samples
+                    if sample.valid_for_seconds and sample.valid_for_seconds > 0
+                ),
+                default=_CODEX_APPSERVER_VALID_FOR_SECONDS,
+            )
+            valid_until = observed_at + valid_for
+            scope_id = f"codex:{target if target is not None else 'base'}"
+            slices.append(validate_slice(
+                name, scope_id, samples, topology, observed_at, valid_until
+            ))
+        except Exception as error:
+            _logger.warning(
+                "codex_appserver runtime=%s target=%s failed=%s",
+                name, target if target is not None else "base", type(error).__name__,
+            )
+    return tuple(slices)
+
+
 def collect_samples(
     name: str,
     runtime_config: RuntimeConfig,
@@ -329,3 +406,140 @@ def collect_samples(
     if Capability.LIVE_LIMITS not in info.capabilities:
         return None
     return tuple(adapter.limits(runtime_config, runtime_config.home))
+
+
+# --- source-specific topology normalizers -----------------------------------
+#
+# Everything below knows provider conventions; the topology module itself
+# stays neutral. Normalizers turn already-collected LimitSample tuples into an
+# explicit CapacityTopology: pools come from the neutral identity grouping,
+# routes encode each source's launchability rules.
+
+
+def _pool_index(
+    pools: tuple[PhysicalPoolDescriptor, ...],
+) -> dict[tuple[str, str, str | None, str], str]:
+    """Map each pool's sample identity ``(lane, window, target, source)`` to its id.
+
+    Each pool produced by :func:`pools_from_samples` holds exactly one
+    identity, so the mapping is bijective for these pools; a pool with several
+    keys would simply appear once per key.
+    """
+
+    return {
+        (key.lane, key.window, key.target, key.source): pool.pool_id
+        for pool in pools
+        for key in pool.keys
+    }
+
+
+def _account_routes(
+    name: str,
+    samples: tuple[LimitSample, ...],
+    launchable_targets: frozenset[str] | None,
+) -> CapacityTopology:
+    """Build one codexbar route per launchable account over all its pools.
+
+    Pools are the neutral per-identity grouping; a route collects every pool
+    for one account, where the account is the sample target (``None`` meaning
+    the default account, which is always launchable). Its ``quota_lane`` is
+    the routing-neutral ``default`` value: primary and secondary windows must
+    never split an account into separate launch routes.
+    ``launchable_targets`` is the set of configured account labels that may be
+    launched; ``None`` means every target is launchable (the native
+    scoped-model case). A discovered target outside ``launchable_targets``
+    keeps its samples and pools but gets no route: it is evidence, never a
+    launch target.
+    """
+
+    pools = pools_from_samples(name, samples)
+    grouped: dict[str | None, set[str]] = {}
+    for identity, pool_id in _pool_index(pools).items():
+        target = identity[2]
+        if (
+            target is not None
+            and launchable_targets is not None
+            and target not in launchable_targets
+        ):
+            continue
+        grouped.setdefault(target, set()).add(pool_id)
+    routes = tuple(
+        CapacityRouteDescriptor(
+            route_id=f"{name}:{account if account is not None else 'default'}:default",
+            runtime=name,
+            account=account,
+            quota_lane="default",
+            pool_ids=tuple(sorted(pool_ids)),
+        )
+        for account, pool_ids in sorted(grouped.items(), key=lambda item: item[0] or "")
+    )
+    return validate_topology(pools, routes)
+
+
+def _native_routes(name: str, samples: tuple[LimitSample, ...]) -> CapacityTopology:
+    """Build Claude's shared route and scoped-model routes from sample targets.
+
+    Target-less pools are shared by every model route and have one default
+    route. Each non-empty target is a model scope, represented by a route with
+    no account, a quota lane equal to that scope, and the union of shared and
+    scope-specific pools. Names are data rather than a fixed model catalogue,
+    so any configured or discovered scope follows the same rule.
+    """
+
+    pools = pools_from_samples(name, samples)
+    shared: set[str] = set()
+    scoped: dict[str, set[str]] = {}
+    for identity, pool_id in _pool_index(pools).items():
+        target = identity[2]
+        if target is None:
+            shared.add(pool_id)
+        else:
+            scoped.setdefault(target, set()).add(pool_id)
+    routes: list[CapacityRouteDescriptor] = []
+    if shared:
+        routes.append(CapacityRouteDescriptor(
+            route_id=f"{name}:default", runtime=name, account=None,
+            quota_lane="default", pool_ids=tuple(sorted(shared)),
+        ))
+    for scope, pool_ids in sorted(scoped.items()):
+        routes.append(CapacityRouteDescriptor(
+            route_id=f"{name}:scope:{scope}", runtime=name, account=None,
+            quota_lane=scope, pool_ids=tuple(sorted(shared | pool_ids)),
+        ))
+    return validate_topology(pools, routes)
+
+
+def sample_topology(
+    name: str,
+    runtime_config: RuntimeConfig,
+    samples: tuple[LimitSample, ...],
+) -> CapacityTopology:
+    """Derive the explicit topology one source's collected samples describe.
+
+    ``codexbar`` restricts routes to the configured account labels (plus the
+    default account), so discovered unknown accounts stay as pools and
+    evidence without becoming launchable routes. The native path creates a
+    shared default route plus one route per scope, each including shared
+    capacity. ``omniroute`` reports one aggregate route over
+    all of its pooled windows. The result is validated and canonically
+    ordered; input sample order never changes it.
+    """
+
+    source = runtime_config.limits_source or "native"
+    if source == "omniroute":
+        pools = pools_from_samples(name, samples)
+        return validate_topology(
+            pools,
+            (
+                CapacityRouteDescriptor(
+                    route_id=f"{name}:aggregate",
+                    runtime=name,
+                    account=None,
+                    quota_lane="aggregate",
+                    pool_ids=tuple(pool.pool_id for pool in pools),
+                ),
+            ),
+        )
+    if source == "codexbar":
+        return _account_routes(name, samples, frozenset(runtime_config.accounts))
+    return _native_routes(name, samples)
