@@ -244,6 +244,51 @@ class StateStore:
         ).fetchone()
         return None if row is None else str(row["id"])
 
+    def list_orchestrator_sessions(self, *, limit: int) -> list[dict[str, object]]:
+        """Return the most active bound sessions and one aggregate unbound row.
+
+        ``limit`` is a positive row bound.  Each returned mapping contains the
+        session metadata, active and total agent counts, and ``page_total`` for
+        the exact number of available rows before the bound; the synthetic
+        unbound mapping has a null ``id`` and is omitted when no agents are
+        unbound.  The read does not mutate state.
+        """
+
+        integer("limit", limit, minimum=1)
+        active = tuple(status.value for status in ACTIVE)
+        placeholders = ",".join("?" for _ in active)
+        rows = self.connection.execute(
+            f"""WITH bound AS (
+                    SELECT sessions.id, sessions.transport,
+                           sessions.external_session_id, sessions.external_turn_id,
+                           sessions.created_at, sessions.last_seen_at,
+                           SUM(CASE WHEN agents.status IN ({placeholders})
+                                    THEN 1 ELSE 0 END) AS active,
+                           COUNT(agents.id) AS total
+                    FROM orchestrator_sessions AS sessions
+                    JOIN agents ON agents.orchestrator_session_id = sessions.id
+                    GROUP BY sessions.id
+                ), unbound AS (
+                    SELECT NULL AS id, '' AS transport, '' AS external_session_id,
+                           NULL AS external_turn_id, MIN(created_at) AS created_at,
+                           MAX(created_at) AS last_seen_at,
+                           SUM(CASE WHEN status IN ({placeholders})
+                                    THEN 1 ELSE 0 END) AS active,
+                           COUNT(*) AS total
+                    FROM agents
+                    WHERE orchestrator_session_id IS NULL
+                    HAVING COUNT(*) > 0
+                ), all_sessions AS (
+                    SELECT * FROM bound UNION ALL SELECT * FROM unbound
+                )
+                SELECT *, COUNT(*) OVER () AS page_total
+                FROM all_sessions
+                ORDER BY active DESC, last_seen_at DESC
+                LIMIT ?""",
+            (*active, *active, limit),
+        )
+        return [dict(row) for row in rows]
+
     def record_context_receipt(
         self,
         orchestrator_session_id: str,

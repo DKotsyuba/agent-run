@@ -1037,6 +1037,7 @@ target = "auth.json"
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             [
                 "capacity_order", "start", "fast", "cancel", "steer", "status", "list_agents",
+                "list_orchestrators",
                 "summary", "transcript", "answer", "models", "limits", "doc",
                 "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
                 "workflow_resume",
