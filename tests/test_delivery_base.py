@@ -168,12 +168,13 @@ class CompletionNoticeTests(unittest.TestCase):
                 self.notice(version=version)
 
     def test_metadata_must_be_bounded_strings_or_none(self) -> None:
+        """Check each invalid field before the outer subtest handles exceptions."""
         for name in ("runtime", "model", "effort"):
             self.assertIsNone(getattr(self.notice(**{name: None}), name))
             for invalid in ("", "   ", "x" * (MAX_METADATA_LENGTH + 1), 7, True, [], {}):
                 with (
-                    self.assertRaises(ValidationError),
                     self.subTest(name=name, value=invalid),
+                    self.assertRaises(ValidationError),
                 ):
                     self.notice(**{name: invalid})
 
