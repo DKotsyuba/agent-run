@@ -78,10 +78,11 @@ lookups where configured.
 
 ## State
 
-Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 9`.
+Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 10`.
 Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
 `commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
 `deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
+`capacity_route_snapshots`,
 `workflow_runs` / `workflow_steps` / `workflow_deliveries`, `run_stats`,
 `context_receipts`.
 
@@ -98,14 +99,45 @@ dedicated dispatch thread for exactly this reason).
 An agent started by an MCP session (or with explicit `--session-*` flags)
 is **bound** to that orchestrator session. On terminal state, a delivery
 row is created and a dispatcher pushes the completion notice back to the
-orchestrator's chat (codex queue and Claude UDS transports exist).
+orchestrator's chat (the relay-backed `codex_queue` compatibility identifier
+and Claude UDS transports exist).
 Unbound runs create no delivery row — `wait` on them is the delivery.
 Deliveries retry with backoff and expire instead of retrying forever.
-Each Codex queue attempt records an immutable bounded evidence row in the same
+Each Codex delivery attempt records an immutable bounded evidence row in the same
 transaction that completes, retries, or fails its owned delivery claim. The
 record distinguishes exit status (including 127), spawn errno, timeout, session
 loss, and success while storing no message, session id, argv/environment value,
 or credential. Status exposes only the latest validated safe summary.
+
+Codex Desktop delivery uses a volatile local relay. With both
+`CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` supplied by the host, the
+MCP CLI replaces itself with the host's signed Node executable. That wrapper
+owns a private Unix socket and a thin Python MCP child; the child receives
+neither host capability, preventing recursive wrappers. The wrapper calls only
+`send_message_to_thread` and renders the same structured completion notice from
+validated lifecycle fields and immutable runtime/model/effort selectors. Task,
+answer, and error prose never enter the notice; selector text is escaped for
+safe single-line display. Missing effort is shown as `unspecified`.
+Host tool inventories have an 8 MiB frame limit;
+local delivery requests remain bounded to 8 KiB. No socket path, host response,
+or message text enters delivery evidence.
+
+Agent completion notices use a short list: ID, terminal status,
+`runtime/model:effort`, result lookup methods, and the notification identity
+with a no-replacement guard. Workflow notices keep their separate format.
+The local relay protocol accepts strict legacy v1 requests and metadata-bearing
+v2 requests. A host advertises v2 with an `ar-cdx-v2-*.sock` endpoint; clients
+prefer those endpoints and use legacy requests for older hosts. Existing
+outbox rows require no migration. Already-running old MCP hosts keep delivering
+their old format until the `agent-run` MCP connection is restarted.
+
+Codex completion delivery uses only the signed Desktop relay. The persisted
+`codex_queue` name is a compatibility identifier; it never invokes the Codex
+UI queue or requires a queue executable. Missing or rejected relays are
+retryable; unknown acceptance after transmission remains ambiguous and
+retryable. Relay discovery has a ten-second total budget and the host call
+has an eight-second budget, within the existing thirty-second lease.
+The Node wrapper preserves MCP stdio and removes its socket on child exit.
 
 ## Workflows
 
@@ -121,9 +153,87 @@ the one-phase parallel script for you.
 
 A collector (`agent-run capacity collect`, launchd-schedulable) samples
 remaining quota per runtime through a pluggable per-runtime source:
-`native` engine data, the `codexbar` CLI, a local OmniRoute router, or
-`none`. Samples carry validity windows; `limits` serves projections with
-burn-rate–based exhaustion risk per lane, worst first, hiding nothing.
+`native` engine data, a short-lived Codex app-server, the `codexbar` CLI,
+a local OmniRoute router, or `none`. A collection stores samples and its
+explicit physical-pool/route topology atomically. Per-account scopes refresh
+independently, so a failed account keeps its previous topology only until that
+snapshot expires instead of deleting healthy sibling scopes. Samples carry
+validity windows; `limits` serves projections with burn-rate–based exhaustion
+risk per lane, worst first, hiding nothing.
+
+Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
+and `unsupported`. A source failure is not a successful collection of zero
+samples. Successful account slices remain independently committed when a
+sibling probe or write fails; reported sample counts reflect those commits.
+`capacity collect --once` still prints its JSON report, but exits with status
+2 for partial, failed, or empty supported-source collection. Logs carry safe
+reason codes and counts, never provider response bodies or raw child stderr.
+Sources retain their bounded call deadlines; a round exceeding the configured
+collection interval is explicitly warned about.
+
+Freshness uses source observations, not the time an old payload was fetched
+again. Future observations and windows whose reset has arrived are unknown.
+Diagnostic snapshots select the newest row per quota identity before applying
+their result cap, so a busy account cannot hide a stale sibling through repeated
+samples. Stored sample history retains its separate, global retention bound.
+Reset-cycle grouping tolerates up to one second of reporting jitter only when
+both reported resets were still in the future at the latest observation.
+Stored timestamps and the reported latest reset remain unchanged; a reset
+that already passed is not merged into the next cycle.
+
+OmniRoute quotas come from its current `key_value` cache under the
+`providerLimitsCache` namespace, using `fetchedAt` as the observation clock.
+Its `quota_snapshots` table records changes, not every successful poll, and
+therefore cannot establish freshness for unchanged quota values. Active,
+quota-visible members with missing or malformed current evidence fail the
+collection rather than silently disappearing from the pool average. Only
+quota percentages and timestamps cross the Docker reader boundary; cache
+messages, plans, credentials and connection identifiers are not emitted.
+OmniRoute pool freshness is limited by its oldest included member; future
+observations and expired resets invalidate the whole window, never just remove
+the inconvenient member from the mean. Its quota query detects overflow of the
+64-row bound rather than silently returning a truncated, apparently healthy
+pool. Upstream snapshot timestamps and the source's shelf life remain intact.
+
+For Claude's native usage source, a usable Keychain token is read without a
+refresh. Missing or expired credentials trigger the adapter's existing Claude
+CLI renewal once, bounded to 60 seconds, followed by a validated Keychain
+reread. Failure stays an explicit collection failure. A declared, explicitly
+exported OAuth token remains authoritative and is never replaced by this
+renewal path; API keys are not treated as OAuth credentials.
+
+Account labels are opaque: a labelled account cannot collide with the absent
+account even when its label is `base`, `default`, or `shared`. Provider-scoped
+identifiers encode that distinction without changing the original sample keys.
+For Codex, a malformed present quota window disables that bucket's route;
+valid sibling samples remain advisory evidence, never proof that the unknown
+governing limit does not exist.
+
+Capacity route ranking is a pure read of those snapshots. Every governing
+window must be fresh and known; a zero window is omitted before scoring.
+Evidence spanning at least one hour projects remaining capacity to reset,
+while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
+at 50%. The worst window defines a nonnegative route score, then a positive
+runtime multiplier scales its priority. Optional account and quota-lane weight
+maps override that default, with account taking precedence over lane. Weights
+are absolute replacements, not products. Concrete account/model aliases sharing
+the same runtime and physical pool set remain one capacity choice, with the
+highest applicable alias weight and preferred selector first.
+`agent-run capacity order` exposes that same read-only, role-independent order:
+its first route is highest priority, while the orchestrator still chooses a
+compatible role/model alias and decides whether to launch. The output retains
+deferred evidence, exhausted omissions, unavailable runtimes, and the
+`insufficient_diversity` signal alongside the working routes.
+
+The context hook uses the same capacity-order builder and injects a compact
+English Runtime priorities summary, not raw quota windows. It instructs the
+orchestrator to choose the first compatible route while retaining role/model
+selection. A model-specific quota lane cannot lend its priority to a different
+model on the same runtime/account. Per-session component receipts suppress unchanged visible summaries,
+including when only active-agent context changes; a later return to a previous
+summary is delivered again. Visible rounded priorities and route identities
+determine changes, not observation timestamps or insignificant float tails.
+The diagnostic `limits` view is not a required routing step.
 Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
 terminal, with an idempotent `stats backfill`.
 

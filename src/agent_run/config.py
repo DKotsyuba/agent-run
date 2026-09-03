@@ -75,6 +75,13 @@ class RuntimeHookConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    """Static configuration for one arbitrary runtime name.
+
+    ``priority_multiplier`` is a positive finite routing weight. It is applied
+    only to that runtime's capacity priority and defaults to ``1.0``. Account
+    and quota-lane mappings optionally override it for opaque descriptors.
+    """
+
     enabled: bool
     adapter: str
     binary: Path
@@ -90,6 +97,9 @@ class RuntimeConfig:
     limits_source: str | None = None
     accounts: tuple[str, ...] = ()
     default_account: str | None = None
+    priority_multiplier: float = 1.0
+    priority_account_multipliers: Mapping[str, float] = field(default_factory=dict)
+    priority_lane_multipliers: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,6 +153,30 @@ def _names(value: object, path: str) -> tuple[str, ...]:
     return names
 
 
+def _priority_multipliers(value: object, path: str) -> Mapping[str, float]:
+    """Validate and freeze a name-to-positive-finite-priority mapping.
+
+    ``value`` must be a mapping whose nonblank string keys identify opaque
+    accounts or lanes and whose values are numeric, non-boolean, finite
+    factors greater than zero.  The returned read-only mapping contains
+    normalized ``float`` values; missing mappings are supplied by callers as
+    ``{}``.  Invalid container, key, or factor values raise ``ValidationError``.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{path} must be a mapping")
+    result: dict[str, float] = {}
+    for key, factor in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError(f"{path} keys must be nonblank strings")
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            raise ValidationError(f"{path}.{key} must be a finite number > 0")
+        if not math.isfinite(factor) or factor <= 0:
+            raise ValidationError(f"{path}.{key} must be a finite number > 0")
+        result[key] = float(factor)
+    return MappingProxyType(result)
+
+
 def _bool(value: object, path: str) -> bool:
     if not isinstance(value, bool):
         raise ValidationError(f"{path} must be a boolean")
@@ -161,7 +195,20 @@ def _number(value: object, path: str, *, minimum: float) -> float:
     return float(value)
 
 
-def _path(value: object, path: str) -> Path:
+def _path(value: object, path: str, *, resolve: bool = True) -> Path:
+    """Validate one configured path field and return it as an absolute ``Path``.
+
+    ``value`` is the raw TOML field and ``path`` is the dotted configuration
+    location reported in error messages.  A leading ``~`` is expanded; a
+    relative result, or an ``~`` that cannot be expanded, raises
+    ``ValidationError``.  ``resolve`` selects canonicalization: the default
+    ``True`` resolves symlinks and ``..`` segments, which homes, auth sources,
+    plugin directories, MCP commands, and other filesystem anchors want;
+    ``False`` keeps the configured path verbatim, which only the runtime
+    binary uses so a version-managed launcher symlink (nvm, Homebrew) stays
+    intact and its own directory still anchors child ``PATH`` resolution.
+    """
+
     text = _string(value, path)
     try:
         expanded = Path(text).expanduser()
@@ -169,7 +216,7 @@ def _path(value: object, path: str) -> Path:
         raise ValidationError(f"{path} must be an absolute path") from error
     if not expanded.is_absolute():
         raise ValidationError(f"{path} must be an absolute path")
-    return expanded.resolve()
+    return expanded.resolve() if resolve else expanded
 
 
 def _relative_target(value: object, path: str) -> str:
@@ -380,6 +427,18 @@ def _parse_hooks(value: object, path: str) -> tuple[RuntimeHookConfig, ...]:
 
 
 def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
+    """Parse arbitrary runtime tables into an immutable validated mapping.
+
+    Every runtime must declare its adapter, binary, home, models, and enabled
+    state. The binary keeps its configured absolute path verbatim (``~``
+    expanded, symlinks unresolved) so a version-managed launcher symlink keeps
+    anchoring its own interpreter directory; every other path field resolves.
+    Optional account/auth, hook, plugin, capacity-source, and concurrency
+    fields retain their existing validation. ``priority_multiplier`` defaults
+    to ``1.0`` and rejects booleans, non-numeric or non-finite values, and
+    numbers less than or equal to zero. Unknown fields raise ``ValidationError``.
+    """
+
     result: dict[str, RuntimeConfig] = {}
     allowed = {
         "enabled",
@@ -397,6 +456,9 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "limits_source",
         "accounts",
         "default_account",
+        "priority_multiplier",
+        "priority_account_multipliers",
+        "priority_lane_multipliers",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -428,10 +490,26 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         parsed_auth = None if auth is None else _parse_auth(auth, f"{path}.auth")
         if account_names and (parsed_auth is None or parsed_auth.kind != "file_link"):
             raise ValidationError(f"{path}.accounts requires file_link auth")
+        priority_multiplier = table.get("priority_multiplier", 1.0)
+        if (
+            isinstance(priority_multiplier, bool)
+            or not isinstance(priority_multiplier, (int, float))
+            or not math.isfinite(priority_multiplier)
+            or priority_multiplier <= 0
+        ):
+            raise ValidationError(f"{path}.priority_multiplier must be a finite number > 0")
+        account_multipliers = _priority_multipliers(
+            table.get("priority_account_multipliers", {}),
+            f"{path}.priority_account_multipliers",
+        )
+        lane_multipliers = _priority_multipliers(
+            table.get("priority_lane_multipliers", {}),
+            f"{path}.priority_lane_multipliers",
+        )
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
-            _path(table.get("binary"), f"{path}.binary"),
+            _path(table.get("binary"), f"{path}.binary", resolve=False),
             _path(table.get("home"), f"{path}.home"),
             models,
             _names(table.get("skills", []), f"{path}.skills"),
@@ -444,12 +522,15 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             None if limits_source is None else _string(limits_source, f"{path}.limits_source"),
             account_names,
             default_account,
+            float(priority_multiplier),
+            account_multipliers,
+            lane_multipliers,
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")
-        if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "none"}:
+        if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(
-                f"{path}.limits_source must be one of 'native', 'omniroute', 'codexbar', 'none'"
+                f"{path}.limits_source must be one of 'native', 'omniroute', 'codexbar', 'codex_appserver', 'none'"
             )
     return MappingProxyType(result)
 

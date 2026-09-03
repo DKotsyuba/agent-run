@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from importlib import resources
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from .capacity.launchd import build_configured_job, render_plist
 from .config import load_config
 from .delivery.claude_uds import TRANSPORT_NAME as CLAUDE_UDS_TRANSPORT_NAME
 from .delivery.claude_uds import ClaudeSessionSender, ClaudeUdsTransport
-from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueSender, CodexQueueTransport
+from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueTransport
 from .delivery.dispatch import DeliveryDispatcher
 from .doctor import run_doctor
 from .domain import AgentId, OrchestratorRef, StartRequest
@@ -47,7 +48,6 @@ _logger = logging.getLogger("agent_run.cli")
 
 _MAX_STDIN_CHARS = 1_048_576
 _EXPECTED_ERROR_EXIT = 2
-_QUEUE_TIMEOUT_SECONDS = 30.0
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
@@ -158,6 +158,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     collect = capacity.add_parser("collect")
     collect.add_argument("--once", action="store_true", required=True)
+    capacity.add_parser(
+        "order",
+        help=(
+            "List capacity priority (first route is highest); the orchestrator "
+            "still chooses a compatible role/model alias and does not launch work."
+        ),
+    )
     launchd = capacity.add_parser("launchd")
     launchd.add_argument("--binary", required=True)
     launchd.add_argument("--label", default=_CAPACITY_LAUNCHD_LABEL)
@@ -479,7 +486,11 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     if command == "context":
         return service.context(_ref(args, required=True))
     if command == "capacity":
-        return service.capacity_collect()
+        return (
+            service.capacity_collect()
+            if args.capacity_command == "collect"
+            else service.capacity_order()
+        )
     if command == "delivery":
         if args.delivery_command == "status":
             return service.delivery_status(args.agent_id)
@@ -653,24 +664,17 @@ def _dispatch_once(home: Path):
     """Drain both agent and workflow lifecycle outboxes once."""
 
     config = load_config(config_path(home))
-    executable = (
-        os.environ["CODEX_QUEUE_BIN"]
-        if "CODEX_QUEUE_BIN" in os.environ
-        else config.delivery.codex_queue_bin
-    )
-    if executable is None or not str(executable) or not Path(executable).is_absolute():
-        raise ValidationError(
-            "delivery.codex_queue_bin or CODEX_QUEUE_BIN must name an absolute executable"
-        )
     store = StateStore.open(state_db_path(home))
     try:
         if isinstance(store, StateStore):
             reconcile_active_agents(store)
-        sender = CodexQueueSender(str(executable), timeout_seconds=_QUEUE_TIMEOUT_SECONDS)
+        from .delivery.codex_desktop_relay import CodexDesktopRelayClient
+
+        relay = CodexDesktopRelayClient(home)
         dispatcher = DeliveryDispatcher(
             store,
             {
-                TRANSPORT_NAME: CodexQueueTransport(sender),
+                TRANSPORT_NAME: CodexQueueTransport(relay),
                 CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
             },
             config.delivery,
@@ -682,7 +686,7 @@ def _dispatch_once(home: Path):
             WorkflowDeliveryDispatcher(
                 store,
                 {
-                    TRANSPORT_NAME: CodexQueueTransport(sender),
+                    TRANSPORT_NAME: CodexQueueTransport(relay),
                     CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
                 },
                 config.delivery,
@@ -936,6 +940,25 @@ def _stats(home: Path, args: argparse.Namespace) -> dict[str, object]:
     raise AgentRunError(f"unsupported stats command: {args.stats_command}")
 
 
+def _exec_desktop_relay(home: Path) -> None:
+    """Replace a real MCP process with the signed Node relay when configured."""
+
+    node = os.environ.get("CODEX_MCP_NODE_PATH")
+    pipe = os.environ.get("CODEX_APP_TOOLS_PIPE_PATH")
+    if (
+        not node or not pipe or "\x00" in node or "\x00" in pipe
+        or len(node) > 4096 or len(pipe) > 4096
+        or not Path(node).is_absolute() or not Path(pipe).is_absolute()
+        or not Path(node).is_file() or not os.access(node, os.X_OK)
+    ):
+        return
+    wrapper = resources.files("agent_run.delivery").joinpath("codex_desktop_host.cjs")
+    try:
+        os.execv(node, [node, str(wrapper), sys.executable, str(home), "-m", "agent_run.cli", "--home", str(home), "mcp"])
+    except OSError:
+        _logger.warning("Desktop Node wrapper unavailable; using queue-only MCP")
+
+
 def _doc(args: argparse.Namespace) -> dict[str, object]:
     from .doc import topic_text
 
@@ -977,6 +1000,8 @@ def main(
     started = time.monotonic()
     try:
         home = agent_run_home(args.home)
+        if service is None and args.command == "mcp":
+            _exec_desktop_relay(home)
         configure_logging(home, "mcp" if args.command == "mcp" else "cli")
         _logger.info("cli command=%s", args.command)
         if service is None and args.command == "init":
@@ -1061,12 +1086,24 @@ def main(
             result = _execute(args, target, stdin)
         _emit(result, stdout)
         _logger.info(
-            "cli command=%s outcome=ok duration_ms=%.1f",
-            args.command, (time.monotonic() - started) * 1000,
+            "cli command=%s outcome=%s duration_ms=%.1f",
+            args.command,
+            "degraded" if getattr(result, "ok", True) is False else "ok",
+            (time.monotonic() - started) * 1000,
         )
         # A doctor report with any error-severity finding is a failed check,
         # not a successful command -- surface that as a nonzero exit.
         if args.command == "doctor" and getattr(result, "ok", True) is False:
+            return _EXPECTED_ERROR_EXIT
+        # A collection report with any failed, partial, or data-less runtime
+        # is a degraded round: the capacity view is incomplete or stale, so
+        # the one-shot command (and the launchd loop driving it) must not
+        # report success while the JSON payload stays intact on stdout.
+        if (
+            args.command == "capacity"
+            and args.capacity_command == "collect"
+            and getattr(result, "ok", True) is False
+        ):
             return _EXPECTED_ERROR_EXIT
         return 0
     except AgentRunError as error:

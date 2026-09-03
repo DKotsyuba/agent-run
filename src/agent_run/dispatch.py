@@ -38,6 +38,11 @@ _ORCHESTRATOR = _schema(
 )
 TOOLS = (
     {
+        "name": "capacity_order",
+        "description": "Return the committed, transport-neutral capacity routing order.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "start",
         "description": "Start one asynchronous durable agent.",
         "inputSchema": _schema(
@@ -296,6 +301,8 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
         topic = _optional_string(args, "topic")
         return {"topic": topic or "index", "text": topic_text(topic)}
     args = _arguments(raw, set())
+    if name == "capacity_order":
+        return service.capacity_order()
     return service.models() if name == "models" else service.limits()
 
 

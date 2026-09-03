@@ -77,11 +77,26 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-The tool set (17 at the time of writing, same names as the MCP server):
+The tool set (18 at the time of writing, same names as the MCP server):
 `start`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
-`list_agents`, `models`, `limits`, `fast`, `doc`, and the workflow verbs
+`list_agents`, `models`, `limits`, `capacity_order`, `fast`, `doc`, and the workflow verbs
 `workflow_start`, `workflow_status`, `workflow_answer`, `workflow_cancel`,
 `workflow_resume`.
+
+`capacity_order` takes no parameters. It returns fresh non-exhausted physical
+quota routes in descending priority, plus deferred evidence, exhausted
+`omitted` routes, and `unavailable_runtimes`. Each working route includes its
+concrete runtime/account/quota-lane aliases, governing windows, raw score,
+configured multiplier, final priority, and limiting exact key/reset. The list
+is role-independent: callers still choose the first alias whose models fit the
+task. `insufficient_diversity` is true when fewer than two working physical
+choices remain; the routes list is still authoritative and may contain one or
+zero entries.
+
+The equivalent human-facing command is `agent-run capacity order`. Its first
+route is the highest capacity priority; it only reports a read-only order and
+never launches work. The orchestrator still selects a compatible role and model
+alias from that route's aliases.
 
 Two extra methods exist only on this transport:
 
@@ -142,8 +157,9 @@ Notes for the loop:
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
-- Model rosters and health come from `models`; remaining quota and risk
-  from `limits`. Check them before fanning out work.
+- Model rosters and health come from `models`. Choose the first compatible
+  route from the injected Runtime priorities; if absent, obtain `capacity_order`.
+  Do not repeatedly query `limits` for routing; it remains a diagnostic view.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit

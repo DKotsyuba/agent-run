@@ -198,7 +198,7 @@ class QwenAdapterTests(unittest.TestCase):
         rows = [
             {"window_key": "session", "remaining_percentage": 90.0,
              "next_reset_at": "2026-08-28T17:26:35.920Z",
-             "created_at": "2026-08-28T14:06:01.922Z"},
+             "fetched_at": "2026-08-28T14:06:01.922Z"},
         ]
         now = datetime.fromisoformat("2026-08-28T14:06:01.922Z").timestamp() + 60.0
         with patch(
@@ -214,11 +214,20 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertEqual(sample.remaining_percent, 90.0)
         self.assertEqual(sample.valid_for_seconds, omniroute.LIMITS_STALE_SECONDS)
 
-    def test_a_failing_row_source_reports_no_samples(self) -> None:
-        """A docker failure is no evidence, never an exception."""
+    def test_a_failing_row_source_raises_a_safe_source_error(self) -> None:
+        """A failed quota read propagates a safe error for collector isolation."""
+        from agent_run.errors import CapacitySourceError
+
         with patch(
             "agent_run.adapters.omniroute._docker_rows", return_value=None
         ):
+            with self.assertRaises(CapacitySourceError) as raised:
+                self.adapter.limits(self.config(), self.home)
+        self.assertEqual(raised.exception.reason, "omniroute_unavailable")
+
+    def test_a_successfully_read_empty_pool_has_no_samples(self) -> None:
+        """A genuine empty pool remains distinct from an unreadable source."""
+        with patch("agent_run.adapters.omniroute._docker_rows", return_value=[]):
             self.assertEqual(self.adapter.limits(self.config(), self.home), ())
 
     def test_skills_are_materialized_and_context_notes_the_absolute_path(self) -> None:

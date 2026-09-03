@@ -1,10 +1,12 @@
 import base64
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +22,7 @@ from agent_run.adapters.base import (
 )
 from agent_run.capacity import sources
 from agent_run.config import CapacityConfig, RuntimeAuthConfig, RuntimeConfig
+from agent_run.errors import CapacitySourceError
 
 
 def _runtime_config(**overrides) -> RuntimeConfig:
@@ -105,14 +108,17 @@ class AccountEmailTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
-    def test_none_source_collects_zero_samples(self) -> None:
+    def test_none_source_is_unsupported(self) -> None:
         def load(_name, _config):
             raise AssertionError("adapter must not be loaded")
 
-        result = sources.collect_samples(
-            "codex", _runtime_config(limits_source="none"), CapacityConfig(), load
+        # "none" declares that the limits concept does not apply: the source
+        # is unsupported, not a collected zero-sample round.
+        self.assertIsNone(
+            sources.collect_samples(
+                "codex", _runtime_config(limits_source="none"), CapacityConfig(), load
+            )
         )
-        self.assertEqual(result, ())
 
     def test_native_source_gates_on_live_limits_capability(self) -> None:
         sample = LimitSample(
@@ -157,11 +163,29 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(result, (sample,))
 
     def test_codexbar_source_rejects_undocumented_providers(self) -> None:
+        # A runtime codexbar cannot serve is unsupported, not a failure.
         with self.assertLogs("agent_run.capacity", level="WARNING"):
-            result = sources.collect_samples(
-                "opencode", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
+            self.assertIsNone(
+                sources.collect_samples(
+                    "opencode",
+                    _runtime_config(limits_source="codexbar"),
+                    CapacityConfig(),
+                    None,
+                )
             )
-        self.assertEqual(result, ())
+
+
+class TimestampTests(unittest.TestCase):
+    def test_rejects_naive_and_garbage_stamps(self) -> None:
+        # A naive stamp has an unknown timezone: honoring it as UTC would
+        # invent freshness, so it is unknown exactly like an unparsable value.
+        for value in ("2026-08-29T12:12:53", "", 12345, None, "not-a-stamp"):
+            with self.subTest(value=value):
+                self.assertIsNone(sources._timestamp(value))
+        aware = sources._timestamp("2026-08-29T12:12:53Z")
+        self.assertEqual(aware.utcoffset(), timedelta(0))
+        offset = sources._timestamp("2026-09-01T15:00:00-04:00")
+        self.assertEqual(offset.utcoffset(), timedelta(hours=-4))
 
 
 class NativeClaudeMappingTests(unittest.TestCase):
@@ -199,7 +223,6 @@ class NativeClaudeMappingTests(unittest.TestCase):
                 "scope": None,
                 "is_active": True,
             },
-            {"kind": "weekly_all", "resets_at": None},
         ]
     }
 
@@ -216,14 +239,17 @@ class NativeClaudeMappingTests(unittest.TestCase):
         def read(self):
             return json.dumps(self._payload).encode()
 
-    def collect(self, payload=None, *, urlopen=None):
+    def collect(self, payload=None, *, urlopen=None, runtime=None, keychain_token_value="access-token"):
         payload = self._PAYLOAD if payload is None else payload
         opener = urlopen or (lambda request, timeout, **kwargs: self.Response(payload))
-        with mock.patch.object(sources, "keychain_token", return_value="access-token"), mock.patch.object(
+        with mock.patch.object(sources, "keychain_token", return_value=keychain_token_value), mock.patch.object(
             sources.urllib.request, "urlopen", side_effect=opener
         ), mock.patch.object(sources.time, "time", return_value=1788278400.0):
             return sources.collect_samples(
-                "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
+                "claude",
+                runtime if runtime is not None else _runtime_config(limits_source="native"),
+                CapacityConfig(),
+                None,
             )
 
     def test_live_payload_maps_lanes_targets_and_remaining(self) -> None:
@@ -262,29 +288,101 @@ class NativeClaudeMappingTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Anthropic-beta"], "oauth-2025-04-20")
         self.assertEqual(captured["timeout"], 20)
 
-    def test_missing_token_http_error_and_timeout_are_no_samples(self) -> None:
-        with mock.patch.object(sources, "keychain_token", return_value=None), self.assertLogs(
-            "agent_run.capacity", level="WARNING"
-        ):
-            self.assertEqual(
+    def test_missing_token_http_error_and_timeout_are_source_failures(self) -> None:
+        # Missing token, HTTP failure, and timeout are failures, never
+        # collected-empty evidence.
+        with mock.patch.object(sources, "keychain_token", return_value=None):
+            with self.assertRaises(CapacitySourceError) as raised:
                 sources.collect_samples(
                     "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
-                ),
-                (),
-            )
+                )
+        self.assertEqual(raised.exception.reason, "claude_token_missing")
 
         for error in (urllib.error.HTTPError("https://example.com", 401, "unauthorized", {}, None), TimeoutError()):
-            with self.subTest(error=type(error).__name__), self.assertLogs(
-                "agent_run.capacity", level="WARNING"
+            with self.subTest(error=type(error).__name__):
+                with self.assertRaises(CapacitySourceError) as raised:
+                    self.collect(urlopen=mock.Mock(side_effect=error))
+                self.assertEqual(raised.exception.reason, "claude_usage_unreachable")
+
+    def test_malformed_present_entries_and_responses_are_source_failures(self) -> None:
+        # A present limits entry with an unusable percent must not silently
+        # disappear (the model would look unconstrained); a response without
+        # a limits array or with an unparsable body is malformed.
+        for payload in (
+            {"limits": "nope"},
+            {"other": []},
+            {"limits": [{"kind": "session", "percent": True}]},
+            {"limits": [{"kind": "session", "percent": float("nan")}]},
+            {"limits": [{"kind": "session", "percent": "50"}]},
+            {"limits": ["not-a-mapping"]},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(CapacitySourceError) as raised:
+                    self.collect(payload)
+                self.assertEqual(raised.exception.reason, "claude_malformed_response")
+
+        class RawResponse(self.Response):
+            def read(self):
+                return b"not-json"
+
+        with mock.patch.object(sources, "keychain_token", return_value="access-token"):
+            with mock.patch.object(
+                sources.urllib.request, "urlopen", return_value=RawResponse({})
             ):
-                self.assertEqual(self.collect(urlopen=mock.Mock(side_effect=error)), ())
+                with self.assertRaises(CapacitySourceError) as raised:
+                    sources.collect_samples(
+                        "claude",
+                        _runtime_config(limits_source="native"),
+                        CapacityConfig(),
+                        None,
+                    )
+        self.assertEqual(raised.exception.reason, "claude_malformed_response")
+
+    def test_declared_oauth_env_takes_precedence_over_keychain(self) -> None:
+        captured = {}
+
+        def opener(request, timeout, context=None):
+            captured["auth"] = request.headers["Authorization"]
+            return self.Response({"limits": []})
+
+        runtime = _runtime_config(
+            limits_source="native",
+            auth=RuntimeAuthConfig("env", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+        )
+        environment = {
+            "CLAUDE_CODE_OAUTH_TOKEN": "env-oauth-value",
+            "ANTHROPIC_API_KEY": "api-key-value",
+        }
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            sources, "keychain_token", return_value="keychain-value"
+        ) as keychain:
+            self.assertEqual(self.collect(urlopen=opener, runtime=runtime), ())
+        self.assertEqual(captured["auth"], "Bearer env-oauth-value")
+        keychain.assert_not_called()
+
+    def test_undeclared_or_api_key_env_never_becomes_the_oauth_token(self) -> None:
+        captured = {}
+
+        def opener(request, timeout, context=None):
+            captured["auth"] = request.headers["Authorization"]
+            return self.Response({"limits": []})
+
+        environment = {
+            "CLAUDE_CODE_OAUTH_TOKEN": "env-oauth-value",
+            "ANTHROPIC_API_KEY": "api-key-value",
+        }
+        # No auth declaration: an exported variable must not silently widen
+        # the auth bridge, and an API key is never an OAuth token.
+        with mock.patch.dict(os.environ, environment):
+            self.assertEqual(self.collect(urlopen=opener, keychain_token_value="keychain-value"), ())
+        self.assertEqual(captured["auth"], "Bearer keychain-value")
 
 
 class CodexbarMappingTests(unittest.TestCase):
     def test_glm_maps_to_the_zai_provider(self) -> None:
         self.assertEqual(sources._CODEXBAR_PROVIDERS["glm"], "zai")
 
-    def collect(self, payload):
+    def collect(self, payload, *, runtime=None):
         def run(argv):
             return Completed(
                 json.dumps(payload)
@@ -294,7 +392,10 @@ class CodexbarMappingTests(unittest.TestCase):
 
         with mock.patch.object(sources, "_run_codexbar", side_effect=run):
             return sources.collect_samples(
-                "codex", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
+                "codex",
+                runtime if runtime is not None else _runtime_config(limits_source="codexbar"),
+                CapacityConfig(),
+                None,
             )
 
     def test_real_shape_maps_lanes_and_shelves_honestly(self) -> None:
@@ -322,12 +423,15 @@ class CodexbarMappingTests(unittest.TestCase):
 
     def test_first_account_only_and_ignored_sections(self) -> None:
         payload = [
-            {"usage": {"updatedAt": None, "primary": {"usedPercent": 35}}},
-            {"usage": {"updatedAt": None, "primary": {"usedPercent": 99}}},
+            {"usage": {"updatedAt": "2026-08-29T12:12:53Z", "primary": {"usedPercent": 35, "windowMinutes": 300}}},
+            {"usage": {"updatedAt": "2026-08-29T12:12:53Z", "primary": {"usedPercent": 99, "windowMinutes": 300}}},
         ]
         (sample,) = self.collect(payload)
         self.assertEqual(sample.remaining_percent, 65.0)
-        self.assertIsNone(sample.observed_at)
+        self.assertEqual(
+            sample.observed_at,
+            datetime(2026, 8, 29, 12, 12, 53, tzinfo=timezone.utc),
+        )
 
     def test_declared_accounts_map_targets_and_add_all_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -343,9 +447,9 @@ class CodexbarMappingTests(unittest.TestCase):
                 "personal2@example.com",
             )
             payload = [
-                {"usage": {"accountEmail": "default@example.com", "primary": {"usedPercent": 3, "windowMinutes": 300}}},
-                {"usage": {"identity": {"accountEmail": "personal2@example.com"}, "primary": {"usedPercent": 4, "windowMinutes": 300}}},
-                {"usage": {"identity": {"accountEmail": "stranger@example.com"}, "primary": {"usedPercent": 5, "windowMinutes": 300}}},
+                {"usage": {"updatedAt": "2026-08-29T12:12:53Z", "accountEmail": "default@example.com", "primary": {"usedPercent": 3, "windowMinutes": 300}}},
+                {"usage": {"updatedAt": "2026-08-29T12:12:53Z", "identity": {"accountEmail": "personal2@example.com"}, "primary": {"usedPercent": 4, "windowMinutes": 300}}},
+                {"usage": {"updatedAt": "2026-08-29T12:12:53Z", "identity": {"accountEmail": "stranger@example.com"}, "primary": {"usedPercent": 5, "windowMinutes": 300}}},
             ]
             captured = []
 
@@ -367,41 +471,93 @@ class CodexbarMappingTests(unittest.TestCase):
         self.assertIn("--all-accounts", captured[0])
 
     def test_unknown_window_minutes_names_itself(self) -> None:
-        payload = [{"usage": {"primary": {"usedPercent": 80.0, "windowMinutes": 30}}}]
+        payload = [{"usage": {"updatedAt": "2026-08-29T12:12:53Z", "primary": {"usedPercent": 80.0, "windowMinutes": 30}}}]
         (sample,) = self.collect(payload)
         self.assertEqual(sample.window, "min30")
 
-    def test_bool_and_nonfinite_and_missing_usage_are_no_samples(self) -> None:
+    def test_absent_lanes_are_absent_but_present_windows_must_be_valid(self) -> None:
+        # A null or missing lane is real absence; a present window mapping
+        # with unusable numbers fails the round instead of silently
+        # dropping a governing constraint.
+        (sample,) = self.collect(
+            [{"usage": {"updatedAt": "2026-08-29T12:12:53Z", "primary": None, "secondary": {"usedPercent": 10, "windowMinutes": 300}}}]
+        )
+        self.assertEqual(sample.lane, "secondary")
+
         for window in (
             {"usedPercent": True, "windowMinutes": 300},
             {"usedPercent": float("nan"), "windowMinutes": 300},
+            {"usedPercent": 50},
+            {"usedPercent": 50, "windowMinutes": True},
+            {"usedPercent": 50, "windowMinutes": 0},
+            {"usedPercent": 50, "windowMinutes": -5},
             {},
         ):
             with self.subTest(window=window):
-                result = self.collect([{"usage": {"primary": window}}])
-                self.assertEqual(result, ())
+                with self.assertRaises(CapacitySourceError) as raised:
+                    self.collect(
+                        [{"usage": {"updatedAt": "2026-08-29T12:12:53Z", "primary": window}}]
+                    )
+                self.assertEqual(raised.exception.reason, "codexbar_invalid_window")
 
-    def test_command_failure_and_garbage_are_no_samples(self) -> None:
+    def test_missing_or_naive_updated_at_cannot_revive_old_evidence(self) -> None:
+        # Neither a missing nor a timezone-less observation stamp may fall
+        # back to collector-now: that would make stale evidence fresh.
+        for updated in (None, "2026-08-29T12:12:53", 1_785_000_000):
+            with self.subTest(updated=updated):
+                payload = [
+                    {
+                        "usage": {
+                            "updatedAt": updated,
+                            "primary": {"usedPercent": 3, "windowMinutes": 300},
+                        }
+                    }
+                ]
+                with self.assertRaises(CapacitySourceError) as raised:
+                    self.collect(payload)
+                self.assertEqual(
+                    raised.exception.reason, "codexbar_invalid_observed_at"
+                )
+
+    def test_spawn_failure_timeout_nonzero_exit_and_garbage_fail_the_round(self) -> None:
         def raising_run(argv):
             raise OSError("codexbar missing")
 
         with mock.patch.object(sources, "_run_codexbar", side_effect=raising_run):
-            self.assertEqual(
+            with self.assertRaises(CapacitySourceError) as raised:
                 sources.collect_samples(
                     "codex", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
-                ),
-                (),
-            )
+                )
+        self.assertEqual(raised.exception.reason, "codexbar_spawn_failed")
 
-        for stdout in ("garbage", '{"usage":{}}', "{}", "[]"):
-            with self.subTest(stdout=stdout), self.assertLogs(
-                "agent_run.capacity", level="WARNING"
-            ):
-                result = self.collect(stdout)
-                self.assertEqual(result, ())
+        timed_out = subprocess.TimeoutExpired(cmd="codexbar", timeout=120)
+        with mock.patch.object(sources, "_run_codexbar", side_effect=timed_out):
+            with self.assertRaises(CapacitySourceError) as raised:
+                sources.collect_samples(
+                    "codex", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
+                )
+        self.assertEqual(raised.exception.reason, "codexbar_timeout")
+
+        garbage_cases = (
+            ("garbage", "codexbar_malformed_response"),
+            ("{}", "codexbar_malformed_response"),
+            ("[]", "codexbar_missing_data"),
+        )
+        for stdout, reason in garbage_cases:
+            with self.subTest(stdout=stdout):
+                with self.assertRaises(CapacitySourceError) as raised:
+                    self.collect(stdout)
+                self.assertEqual(raised.exception.reason, reason)
+
+    def test_empty_usage_object_is_an_invalid_observation(self) -> None:
+        # A usage object without a timezone-aware updatedAt cannot be
+        # aged honestly, so the round fails instead of reviving evidence.
+        with self.assertRaises(CapacitySourceError) as raised:
+            self.collect('{"usage":{}}')
+        self.assertEqual(raised.exception.reason, "codexbar_invalid_observed_at")
 
     def test_single_object_payload_still_maps_one_account_without_accounts(self) -> None:
-        payload = {"usage": {"primary": {"usedPercent": 20, "windowMinutes": 300}}}
+        payload = {"usage": {"updatedAt": "2026-08-29T12:12:53Z", "primary": {"usedPercent": 20, "windowMinutes": 300}}}
         (sample,) = self.collect(payload)
         self.assertEqual(sample.target, None)
         self.assertEqual(sample.remaining_percent, 80.0)
@@ -411,31 +567,24 @@ class CodexbarMappingTests(unittest.TestCase):
         # clears it while staying far under the 900s validity window.
         self.assertEqual(sources._CODEXBAR_TIMEOUT_SECONDS, 120)
 
-    def test_bounded_error_tail_collapses_to_one_bounded_line(self) -> None:
-        noisy = "first line\nsecond line " + "x" * 400
-        tail = sources._bounded_error_tail(noisy)
-        self.assertEqual(tail, " ".join(noisy.split())[:200])
-        self.assertEqual(len(tail), 200)
-        self.assertNotIn("\n", tail)
-        self.assertEqual(sources._bounded_error_tail(None), "")
-        self.assertEqual(sources._bounded_error_tail(b"raw bytes\n"), "raw bytes")
-
-    def test_failure_warning_carries_the_bounded_stderr_tail(self) -> None:
-        noisy = "provider exploded\n" + "x" * 400
+    def test_failure_logs_and_exception_are_secret_safe(self) -> None:
+        secret = "provider-secret-token"
+        noisy = f"provider exploded {secret}\n"
         failed = Completed("[]", returncode=1, stderr=noisy)
         with mock.patch.object(
             sources, "_run_codexbar", return_value=failed
         ), self.assertLogs("agent_run.capacity", level="WARNING") as logs:
-            result = sources.collect_samples(
-                "claude", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
-            )
-        self.assertEqual(result, ())
+            with self.assertRaises(CapacitySourceError) as raised:
+                sources.collect_samples(
+                    "claude", _runtime_config(limits_source="codexbar"), CapacityConfig(), None
+                )
         self.assertEqual(len(logs.output), 1)
         message = logs.output[0]
         self.assertIn("runtime=claude", message)
         self.assertIn("rc=1", message)
-        self.assertIn("stderr=provider exploded", message)
-        self.assertNotIn("\n", message)
+        self.assertIn("codexbar_nonzero_exit", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(secret, str(raised.exception))
 
 
 if __name__ == "__main__":

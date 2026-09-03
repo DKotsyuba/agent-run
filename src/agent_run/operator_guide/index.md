@@ -9,7 +9,7 @@ parallel workflow from a JSON array of agent job specifications.
 
 | Topic | Covers |
 |---|---|
-| config | ~/.agent-run/config.toml: source of truth, fail-closed, safe-edit discipline |
+| config | ~/.agent-run/config.toml: source of truth, fail-closed, priority multiplier/order, safe-edit discipline |
 | skills | `skills = [...]` per runtime, plugin ownership, symlinks, rematerialize |
 | mcp-servers | `[mcp.<name>]` declarations, per-runtime attach, opencode engine gap |
 | plugins | `runtimes.<rt>.plugins`, per-runtime load mechanics, fail-closed refusal |

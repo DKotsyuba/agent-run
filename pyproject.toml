@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-run"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local supervisor for durable, isolated coding-agent runs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,4 +45,5 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "agent_run" = ["operator_guide/*.md"]
+"agent_run.delivery" = ["*.cjs"]
 "agent_run.state" = ["schema.sql", "migrations/*.sql"]

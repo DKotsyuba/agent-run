@@ -68,13 +68,13 @@ cause of "the agent ran but never delivered a result back."
 
 ## Delivery attempt evidence
 
-When Codex queue delivery retries or fails, inspect `status.delivery.last_attempt`.
+When relay-backed Codex delivery retries or fails, inspect `status.delivery.last_attempt`.
 `classifier`, `returncode`, `spawn_errno`, `error_class`, and `duration_ms`
-separate an executable failure, exit 127, timeout, lost session, malformed
-result, and success. Output tails are redacted and capped at 4096 UTF-8 bytes;
-byte counts and truncation flags show when the original output was larger.
-`null` means no Codex queue attempt has been recorded. Raw messages, session
-ids, argument/environment values, and credentials are intentionally unavailable.
+separate relay unavailability, rejection, ambiguous post-write acceptance,
+and success. `codex_queue` is only a compatibility binding name: completion
+delivery never invokes the Codex UI queue. `null` means no attempt evidence
+has been recorded. Raw messages, session ids, argument/environment values,
+and credentials are intentionally unavailable.
 
 ## Orphan check
 

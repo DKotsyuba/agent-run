@@ -271,6 +271,44 @@ class StateStore:
                 self.connection, session_id, context_key, injected_at
             )
 
+    def record_context_components_for_ref(
+        self,
+        ref: OrchestratorRef,
+        components: dict[str, str],
+        *,
+        at: float | None = None,
+    ) -> tuple[str, frozenset[str]]:
+        """Find-or-create the ref's session, then atomically compare-and-store
+        per-component context fingerprints.
+
+        ``components`` maps nonblank names to nonblank fingerprint strings and
+        must be a non-empty dict. Returns ``(session_id, changed_names)``:
+        ``changed_names`` holds exactly the components whose stored
+        fingerprint differed, and is empty when nothing was rewritten. The
+        session lookup and the receipt compare/update share one immediate
+        transaction, so concurrent callers can never interleave the read with
+        the write; a missing or legacy receipt row reports every component as
+        changed and is rewritten in place in the versioned encoding.
+        """
+
+        from .db import record_context_component_receipt
+
+        if not isinstance(ref, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        if not isinstance(components, dict) or not components:
+            raise ValidationError("components must be a non-empty mapping")
+        checked: dict[str, str] = {}
+        for name, value in components.items():
+            nonblank("component name", name)
+            nonblank(f"component {name}", value)
+            checked[name] = value
+        injected_at = timestamp(at)
+        with immediate(self.connection):
+            session_id = session_for_ref(self.connection, ref, injected_at)
+            return session_id, record_context_component_receipt(
+                self.connection, session_id, checked, injected_at
+            )
+
     def get_agent(self, agent_id: str | AgentId) -> dict[str, object]:
         return dict(agent_row(self.connection, validate_agent_id(agent_id)))
 
@@ -804,6 +842,45 @@ class StateStore:
                 self.connection, retention=retention, runtime=runtime
             )
         ]
+
+    def append_capacity_samples(
+        self,
+        samples: Iterable[dict[str, object]],
+        *,
+        runtime: str,
+        scope_id: str,
+        observed_at: float,
+        valid_until: float,
+        payload: object,
+    ) -> None:
+        """Atomically persist samples and one route topology snapshot.
+
+        ``samples`` is consumed once; each mapping must belong to ``runtime``.
+        ``scope_id`` must be nonblank, timestamps must be finite and ordered
+        with expiry no earlier than observation, and the JSON ``payload`` is
+        limited to 65,536 UTF-8 bytes. The store commits all rows and the
+        snapshot together or leaves both unchanged. Validation errors and
+        SQLite failures are propagated according to the StateStore contract.
+        """
+
+        capacity.append_capacity_samples(
+            self.connection, samples, runtime=runtime, scope_id=scope_id,
+            observed_at=observed_at, valid_until=valid_until, payload=payload,
+        )
+
+    def capacity_route_snapshots(
+        self, *, runtime: str | None = None
+    ) -> list[dict[str, object]]:
+        """Return route topology snapshots in deterministic key order.
+
+        An omitted runtime returns all snapshots; a supplied runtime filters
+        the result. The returned dictionaries are detached copies ordered by
+        ``(runtime, scope_id)`` and this read does not mutate the store.
+        """
+
+        return [dict(row) for row in capacity.capacity_route_snapshots(
+            self.connection, runtime=runtime
+        )]
 
     def claim_delivery(
         self, owner: str, *, at: float | None = None, lease_seconds: float = 30

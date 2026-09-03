@@ -29,7 +29,7 @@ def serve(
     stdin: IO[str] = sys.stdin,
     stdout: IO[str] = sys.stdout,
 ) -> int:
-    """Serve newline-delimited JSON-RPC until EOF; stdout carries JSON only."""
+    """Serve bounded MCP stdio until EOF; the optional Node parent owns its relay."""
     while True:
         line = stdin.readline(MAX_LINE_BYTES + 1)
         if line == "":

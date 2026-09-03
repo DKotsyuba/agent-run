@@ -14,7 +14,11 @@ from agent_run.delivery.base import (
     DeliveryError,
     DeliveryReceipt,
 )
-from agent_run.delivery.dispatch import DeliveryDispatcher, dispatcher_lock
+from agent_run.delivery.dispatch import (
+    DeliveryDispatcher,
+    dispatcher_lock,
+    notice_for,
+)
 
 
 import time
@@ -57,9 +61,10 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def finished_agent(self) -> str:
+    def finished_agent(self, effort: str | None = None) -> str:
         request = StartRequest(
-            "codex", "model", "profile", "task", self.root, timeout_seconds=480
+            "codex", "model", "profile", "task", self.root,
+            effort=effort, timeout_seconds=480
         )
         agent_id = self.store.create_agent(
             request, task_summary="summary", config_revision="cfg-1", at=1
@@ -111,6 +116,105 @@ class DeliveryDispatchTests(unittest.TestCase):
 
         again = dispatcher.run(lock_path=self.lock_path, at=11)
         self.assertEqual((again.claimed, len(transport.calls)), (0, 1))
+
+    def test_delivered_notice_carries_launch_metadata_from_the_row(self) -> None:
+        """Runtime and model come from agents columns and effort from request_json."""
+        second = self.finished_agent(effort="high")
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+        result = self.dispatcher(transport).run(lock_path=self.lock_path, at=10)
+
+        self.assertEqual((result.claimed, result.delivered), (2, 2))
+        by_agent = {str(call[1].agent_id): call[1] for call in transport.calls}
+        for notice in by_agent.values():
+            self.assertEqual((notice.runtime, notice.model), ("codex", "model"))
+        self.assertIsNone(by_agent[self.agent_id].effort)
+        self.assertEqual(by_agent[second].effort, "high")
+        self.assertIn(
+            f"- Runtime/model: codex/model:high\n", by_agent[second].render()
+        )
+
+    def test_notice_for_degrades_malformed_effort_to_unspecified(self) -> None:
+        """Missing, old, or malformed stored effort never breaks notice building."""
+        row = dict(
+            self.store.connection.execute(
+                """SELECT d.*, a.status AS agent_status, a.runtime AS agent_runtime,
+                          a.model AS agent_model, a.request_json AS agent_request_json
+                   FROM deliveries d JOIN agents a ON a.id = d.agent_id
+                   WHERE d.agent_id = ?""",
+                (self.agent_id,),
+            ).fetchone()
+        )
+        self.assertEqual((row["agent_runtime"], row["agent_model"]), ("codex", "model"))
+        for bad in (
+            "not json",
+            "",
+            "null",
+            '["x"]',
+            '{"effort": 12}',
+            '{"effort": "  "}',
+            '{"effort": "' + "x" * 200 + '"}',
+        ):
+            with self.subTest(bad=bad):
+                row["agent_request_json"] = bad
+                self.assertIsNone(notice_for(row).effort)
+        row["agent_request_json"] = '{"effort":"medium"}'
+        self.assertEqual(notice_for(row).effort, "medium")
+
+    def test_corrupt_request_json_still_delivers_with_unspecified_effort(self) -> None:
+        """A queued notice is delivered even when its stored request JSON is broken."""
+        self.store.connection.execute(
+            "UPDATE agents SET request_json = ? WHERE id = ?", ("{broken", self.agent_id)
+        )
+        self.store.connection.commit()
+        transport = FakeTransport(DeliveryReceipt("remote-1"))
+
+        result = self.dispatcher(transport).run(lock_path=self.lock_path, at=10)
+
+        self.assertEqual((result.claimed, result.delivered), (1, 1))
+        notice = transport.calls[0][1]
+        self.assertIsNone(notice.effort)
+        self.assertIn("- Runtime/model: codex/model:unspecified\n", notice.render())
+
+    def test_notice_for_tolerates_rows_without_metadata_projection(self) -> None:
+        """Older rows lacking the metadata columns still produce a valid notice."""
+        notice = notice_for(
+            {"id": "ntf_old", "agent_id": self.agent_id, "agent_status": "succeeded"}
+        )
+        self.assertEqual(
+            (notice.notification_id, notice.status, notice.runtime, notice.model,
+             notice.effort),
+            ("ntf_old", AgentStatus.SUCCEEDED, None, None, None),
+        )
+        self.assertIn("- Runtime/model: unknown/unknown:unspecified\n", notice.render())
+
+    def test_missing_codex_relay_retries_then_recovers_without_queue(self) -> None:
+        """A real missing relay leaves durable work that later succeeds without UI queue."""
+        from unittest.mock import patch as patch_queue
+        from agent_run.delivery.base import DeliveryAttemptEvidence
+        from agent_run.delivery.codex_desktop_relay import CodexDesktopRelayClient
+        from agent_run.delivery.codex_queue import CodexQueueTransport
+
+        relay = CodexDesktopRelayClient(self.root)
+        dispatcher = self.dispatcher(CodexQueueTransport(relay), lease_seconds=30)
+        with patch_queue("agent_run.delivery.codex_queue.CodexQueueSender.__call__") as queue:
+            result = dispatcher.run(lock_path=self.lock_path, at=10)
+            self.assertEqual((result.delivered, result.retried), (0, 1))
+            row = self.delivery_row()
+            self.assertEqual(row["state"], "retry_wait")
+            self.assertIsNone(row["remote_message_id"])
+            self.assertFalse(row["ambiguous_result"])
+            assert relay.last_evidence is not None
+            self.assertEqual(relay.last_evidence.classifier, "relay_unavailable")
+            relay.last_evidence = DeliveryAttemptEvidence(
+                classifier="relay_accepted", executable="codex_desktop_relay",
+                argv_shape=("relay",), duration_ms=1,
+            )
+            with patch_queue.object(relay, "send", return_value=True):
+                recovered = dispatcher.run(lock_path=self.lock_path, at=row["next_attempt_at"])
+            self.assertEqual(recovered.delivered, 1)
+            self.assertEqual(self.delivery_row()["state"], "delivered")
+            self.assertIsNone(self.delivery_row()["remote_message_id"])
+            queue.assert_not_called()
 
     def test_trigger_drains_bounded_backlog_and_overflow_is_recoverable(self) -> None:
         self.finished_agent()

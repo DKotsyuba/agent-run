@@ -32,7 +32,7 @@ you / your agent / your app
   (completion sentinels, answer hashes, classified failure kinds) — not
   from an engine's exit code. Error-only replies, stalls, and timeouts are
   classified, not celebrated.
-- **One tool table, three transports.** The same 17 verbs are exposed via
+- **One tool table, three transports.** The same 18 verbs are exposed via
   CLI, MCP, and the socket API, generated from a single dispatcher; a
   parity test keeps them from drifting.
 - **Isolated children.** Each run gets a generated home: no ambient
@@ -40,9 +40,9 @@ you / your agent / your app
   agent may read or write is explicit (`--write`, `--read-root`).
 - **Quota-aware.** A capacity collector samples remaining limits per
   provider (native engine data, [codexbar](https://github.com/steipete/codexbar),
-  or a local router), computes exhaustion risk from burn rate, and serves
-  it via `limits` — so an orchestrator can route work to the lane that has
-  headroom.
+  or a local router), computes usage priorities from burn rate and reset time,
+  and injects an ordered summary when it changes. The orchestrator chooses the
+  first role-compatible route; `limits` remains available for diagnostics.
 - **Zero dependencies.** Python 3.11+ standard library only. The whole
   runtime installs from `pyproject.toml` with nothing else.
 
@@ -107,7 +107,21 @@ Add more `[runtimes.<name>]` blocks for other engines (`codex`, `qwen`,
 `glm`, `opencode`) the same way. Per-runtime options cover auth (env-var
 names or file links — never secret values in config), allowed skills,
 declared MCP servers, lifecycle hooks, plugins, and the limits source
-(`native` / `codexbar` / `omniroute` / `none`).
+(`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
+`priority_multiplier = 1.0` is the optional positive finite weight used by
+capacity ordering; it scales only viable routes and never revives an exhausted
+window.
+
+Optional `priority_account_multipliers` and `priority_lane_multipliers` tables
+override that weight for an account or quota lane: account wins over lane,
+which wins over the runtime default. Values are absolute weights, not products;
+all must be positive and finite. Shared-pool aliases remain one capacity choice,
+using the highest applicable weight rather than adding their weights.
+
+For Codex, `codex_appserver` reads each configured account through a
+short-lived local app-server process. Standard and model-specific buckets
+(including Spark when the plan exposes it) remain separate routes, and one
+account failure does not erase fresh evidence from the others.
 
 **Multiple accounts** (codex): declare labels on the runtime —
 `accounts = ["personal1", "personal2"]` (optionally `default_account`) —
@@ -183,7 +197,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 
 The proxy exposes the same tool surface as the resident daemon: `start`,
 `status`, `answer`, `wait`-free async flow, `cancel`, `steer`, `summary`,
-`transcript`, `list_agents`, `models`, `limits`, `fast`, `doc`, and
+`transcript`, `list_agents`, `models`, `limits`, `capacity_order`, `fast`, `doc`, and
 `workflow_start` / `workflow_status` / `workflow_answer` /
 `workflow_cancel` / `workflow_resume`.
 
@@ -245,11 +259,12 @@ parallel group without writing a script.
 | Surface | Command | Notes |
 |---|---|---|
 | CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
-| MCP server | `agent-run mcp` | stdio, 17 tools |
+| MCP server | `agent-run mcp` | stdio, 18 tools |
 | JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
 | Operator guide | `agent-run doc` | built into the package |
 | Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
 | Capacity collector | `agent-run capacity collect` | + launchd plist generator |
+| Capacity priority | `agent-run capacity order` | read-only, role-independent route order |
 | State | `~/.agent-run/state.db` | SQLite, versioned schema + migrations |
 
 Engine adapters included: **codex** (app-server JSON-RPC),

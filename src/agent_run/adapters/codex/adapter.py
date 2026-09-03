@@ -38,6 +38,7 @@ from ..base import (
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
+from .environment import build_environment
 
 
 _CONFIG_REL = "config.toml"
@@ -597,11 +598,7 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
-        environment = {
-            "CODEX_HOME": str(home_path),
-            "HOME": str(home_path),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        }
+        environment = build_environment(config.binary, home_path)
         if config.plugins and not effective_write:
             # A read-only sandbox cannot write the raw spool the plugin's
             # pre-execution wrapper needs, so that wrapper fails open to the

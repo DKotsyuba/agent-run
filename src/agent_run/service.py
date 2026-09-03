@@ -814,6 +814,18 @@ class AgentService:
         )
         return CapacityReport(observed_at, ordered)
 
+    def capacity_order(self) -> "CapacityOrder":
+        """Return enabled runtimes' deterministic capacity routing order.
+
+        Reads one clock value and the committed capacity snapshot only. Disabled
+        runtimes are removed from routes and all evidence. Enabled configured
+        runtimes with no fresh topology evidence are reported unavailable.
+        """
+
+        from .capacity.order import build_capacity_order
+
+        return build_capacity_order(self._store, self._config, now=self._now())
+
     def _runtime_config(self, name: str) -> RuntimeConfig:
         try:
             return self._config.runtimes[name]

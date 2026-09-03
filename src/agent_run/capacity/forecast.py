@@ -32,9 +32,21 @@ _BURN_HIGH_MULTIPLIER = 1.5
 #: thresholds cover that case until the evidence is an hour deep.
 _BURN_MIN_SPAN_SECONDS = 3600.0
 
+#: Maximum reset-reporting jitter in seconds. Nearby timestamps may share a
+#: cycle only before both reported resets; see :func:`_same_reset_cycle`.
+_RESET_MATCH_TOLERANCE_SECONDS = 1.0
+
 
 @dataclass(frozen=True)
 class CapacityForecast:
+    """Forecast and risk evidence for one exact capacity identity.
+
+    ``burn_span_seconds`` is the elapsed observation span used by the burn
+    calculation, or ``None`` when the forecast is unknown or has fewer than
+    two usable reset-matched samples.  All existing risk and rate fields keep
+    their prior meanings and are not altered by exposing this evidence.
+    """
+
     key: CapacityKey
     known: bool
     remaining_percent: float | None
@@ -44,6 +56,7 @@ class CapacityForecast:
     burn_percent_per_hour: float | None
     sustainable_percent_per_hour: float | None
     risk: str
+    burn_span_seconds: float | None = None
 
 
 def build_forecasts(
@@ -53,12 +66,51 @@ def build_forecasts(
 
 
 def _is_fresh(sample: NormalizedSample, now: float) -> bool:
+    """Accept observations from now or earlier only while their window is open."""
     valid = sample.valid_until is None or sample.valid_until >= now
-    not_yet_reset = sample.reset_at is None or sample.reset_at >= now
-    return valid and not_yet_reset
+    observed = sample.observed_at is None or sample.observed_at <= now
+    not_yet_reset = sample.reset_at is None or sample.reset_at > now
+    return valid and observed and not_yet_reset
+
+
+def _same_reset_cycle(sample: NormalizedSample, latest: NormalizedSample) -> bool:
+    """Report whether ``sample`` belongs to the reset window ``latest`` reports.
+
+    Both arguments are :class:`~agent_run.capacity.history.NormalizedSample`
+    values from one newest-first series; only
+    ``reset_at`` and ``latest.observed_at`` (epoch seconds) are read.
+
+    A ``None`` reset matches only another ``None`` reset. Two non-null resets
+    name the same cycle when they are equal, or when they differ by at most
+    ``_RESET_MATCH_TOLERANCE_SECONDS`` (seconds) and the older of the two
+    resets was still in the future at ``latest.observed_at``: a reset that had
+    already passed by the newest observation belongs to a window that genuinely
+    rolled over, however close the two timestamps are. Without a usable
+    ``latest.observed_at`` -- or once the difference exceeds the tolerance --
+    only exact equality groups samples, which preserves the pre-tolerance
+    behavior for histories that cannot be judged.
+    """
+
+    if sample.reset_at is None or latest.reset_at is None:
+        return sample.reset_at == latest.reset_at
+    if sample.reset_at == latest.reset_at:
+        return True
+    if abs(sample.reset_at - latest.reset_at) > _RESET_MATCH_TOLERANCE_SECONDS:
+        return False
+    observed = latest.observed_at
+    if observed is None:
+        return False
+    return min(sample.reset_at, latest.reset_at) > observed
 
 
 def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
+    """Build a forecast from one newest-first series at epoch seconds ``now``.
+
+    Missing, stale or unknown latest evidence produces an unknown forecast.
+    Otherwise burn uses the current reset cycle with bounded reporting jitter;
+    insufficient history stays in warmup. The latest raw reset is preserved,
+    and neither input samples nor stored data are modified.
+    """
     if (
         not series.samples
         or not _is_fresh(series.samples[0], now)
@@ -74,11 +126,18 @@ def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
             burn_percent_per_hour=None,
             sustainable_percent_per_hour=None,
             risk=RISK_UNKNOWN,
+            burn_span_seconds=None,
         )
     latest = series.samples[0]
     remaining = latest.remaining_percent
+    assert remaining is not None  # guarded by the unknown-forecast branch above
     reset_at = latest.reset_at
-    window_samples = [sample for sample in series.samples if sample.reset_at == reset_at]
+    # Burn evidence groups every sample reporting the current reset instant,
+    # tolerating the subsecond jitter providers add to one shared reset time.
+    # The reported ``reset_at`` stays exactly what the newest sample said.
+    window_samples = [
+        sample for sample in series.samples if _same_reset_cycle(sample, latest)
+    ]
     burn = _burn_rate(window_samples)
     warmup = burn is None
     sustainable = _sustainable_pace(remaining, reset_at, now)
@@ -93,6 +152,7 @@ def _forecast_one(series: CapacitySeries, now: float) -> CapacityForecast:
         burn_percent_per_hour=burn,
         sustainable_percent_per_hour=sustainable,
         risk=risk,
+        burn_span_seconds=_burn_span_seconds(window_samples),
     )
 
 

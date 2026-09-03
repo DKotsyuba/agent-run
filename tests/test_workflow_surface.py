@@ -84,9 +84,9 @@ class WorkflowSurfaceTests(unittest.TestCase):
     """Exercise workflow visibility and its independent delivery channel."""
 
     def test_mcp_has_resume_schema_and_dispatches_all_workflow_verbs(self) -> None:
-        """Expose exactly seventeen tools and decode each workflow request."""
+        """Expose exactly eighteen tools and decode each workflow request."""
 
-        self.assertEqual(len(TOOLS), 17)
+        self.assertEqual(len(TOOLS), 18)
         self.assertTrue(all(tool.get("inputSchema", {}).get("type") == "object" for tool in TOOLS))
         service = _WorkflowService()
         session = Session()

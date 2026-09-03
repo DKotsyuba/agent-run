@@ -2,6 +2,26 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.0] - 2026-09-03
+
+- Added quota-aware runtime ordering through the CLI, MCP, and socket API,
+  using burn rate, reset time, and shared physical quota pools.
+- Added configurable runtime, account, and quota-lane priority multipliers;
+  exhausted or unknown routes remain excluded from the usable order.
+- Replaced automatic raw-quota context with a changed-only priority summary,
+  while leaving role and model suitability decisions to the orchestrator.
+- Improved scheduled quota collection with account-scoped failure isolation,
+  honest degraded outcomes, current OmniRoute cache observations, and reset
+  timestamp jitter handling.
+- Routed Codex completion delivery exclusively through the signed Desktop
+  relay, with no direct queue fallback.
+- Structured agent completion notices as a concise list with ID, status,
+  runtime/model/effort, and result lookup guidance; retained compatibility
+  with older relay hosts.
+- Added the schema v10 quota-topology migration. Restart long-lived agent-run
+  processes after upgrading, and reconnect the agent-run MCP connection in
+  Codex to activate the richer notification format.
+
 ## [0.3.1] - 2026-09-02
 
 - Accepted the LSP plugin's `PostToolUseFailure` hook in Codex plugin trust
@@ -50,6 +70,7 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[0.4.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.0
 [0.3.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.1
 [0.3.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.0
 [0.2.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.2.1

@@ -48,7 +48,8 @@ class ContextHookTests(unittest.TestCase):
         self.assertEqual(self.store.list_agents(), [])
         self.assertTrue(first.injected)
         self.assertLessEqual(len(first.text), CONTEXT_HARD_LIMIT_CHARS)
-        self.assertIn("Capacity: unknown.", first.text)
+        self.assertIn("Runtime priorities (highest first).", first.text)
+        self.assertIn("No currently available routes.", first.text)
 
         second = build_context(self.store, self.ref, config=self.config, now=1001.0)
         self.assertFalse(second.injected)
@@ -91,11 +92,11 @@ class ContextHookTests(unittest.TestCase):
         self.assertEqual(second.text, "")
         self.assertEqual(second.context_key, first.context_key)
 
-        # A material state change (terminal transition) must change the key and
-        # trigger re-injection.
+        # A terminal transition removes the active component; unchanged
+        # priorities remain silent rather than repeating a receipt.
         self.store.transition(agent_id, AgentStatus.SUCCEEDED, at=1040)
         third = build_context(self.store, self.ref, config=self.config, now=1041.0)
-        self.assertTrue(third.injected)
+        self.assertFalse(third.injected)
         self.assertNotEqual(third.context_key, first.context_key)
         self.assertNotIn("Active agents", third.text)
 
@@ -174,9 +175,9 @@ class ContextHookTests(unittest.TestCase):
             valid_until=1100,
         )
         first = build_context(self.store, self.ref, config=self.config, now=1000)
-        self.assertIn("risk=high", first.text)
-        self.assertIn("target=model-a", first.text)
-        self.assertIn("source=provider", first.text)
+        self.assertIn("Runtime priorities (highest first).", first.text)
+        self.assertNotIn("target=model-a", first.text)
+        self.assertNotIn("source=provider", first.text)
 
         for index in range(20):
             self.store.insert_capacity_sample(
@@ -193,7 +194,7 @@ class ContextHookTests(unittest.TestCase):
             )
         tight = Config(schema_version=1, capacity=CapacityConfig(context_max_chars=120))
         truncated = build_context(self.store, self.ref, config=tight, now=1001)
-        self.assertTrue(truncated.injected)
+        self.assertFalse(truncated.injected)
         self.assertLessEqual(len(truncated.text), 120)
 
     def test_capacity_block_renders_every_lane_worst_first(self) -> None:
@@ -235,11 +236,9 @@ class ContextHookTests(unittest.TestCase):
         )
         result = build_context(self.store, self.ref, config=self.config, now=1000)
         capacity_line = result.text.splitlines()[0]
-        self.assertIn("risk=high", capacity_line)
-        self.assertIn("risk=low", capacity_line)
-        self.assertIn("risk=unknown", capacity_line)
-        self.assertLess(capacity_line.index("risk=high"), capacity_line.index("risk=low"))
-        self.assertLess(capacity_line.index("risk=low"), capacity_line.index("risk=unknown"))
+        self.assertIn("model belonging to its quota lane", capacity_line)
+        self.assertIn("skip the entire entry", capacity_line)
+        self.assertIn("account=null means omit the account selector", capacity_line)
 
 
 if __name__ == "__main__":

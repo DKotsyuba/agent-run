@@ -34,7 +34,9 @@ def test_start_accepts_account() -> None:
 
 
 def test_tools_table_and_mcp_tools_list_are_exactly_pinned() -> None:
-    assert len(TOOLS) == 17
+    """Keep all eighteen shared tools identical through MCP discovery."""
+
+    assert len(TOOLS) == 18
     assert TOOL_NAMES == frozenset(tool["name"] for tool in TOOLS)
 
     output = StringIO()

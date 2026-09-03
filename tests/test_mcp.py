@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from agent_run.broker_client import BrokerClient
 from agent_run.dispatch import TOOLS
@@ -103,6 +104,8 @@ class McpTests(unittest.TestCase):
         ])
         self.assertEqual([response["error"]["code"] for response in responses], [-32700, -32700, -32602])
         self.assertEqual(broker.calls, [])
+
+
 
 
 if __name__ == "__main__":

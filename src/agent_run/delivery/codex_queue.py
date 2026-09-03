@@ -22,6 +22,7 @@ from .base import (
     DeliveryError,
     DeliveryReceipt,
 )
+from .codex_desktop_relay import CodexDesktopRelayClient
 
 
 TRANSPORT_NAME = "codex_queue"
@@ -255,20 +256,21 @@ class CodexQueueSender:
 
 
 class CodexQueueTransport:
-    """Deliver a completion notice by queueing one message on a live session.
+    """Send only through Desktop relay, retaining the persisted binding name.
 
-    The transport has no session-open path by construction. A missing session
-    is a hard failure: a completion wake never starts a replacement session and
-    never starts a replacement agent.
+    Existing ``codex_queue`` bindings remain valid, but this transport never
+    invokes the UI queue. Failures use the durable dispatcher's retry policy.
     """
 
     name = TRANSPORT_NAME
     api_version = TRANSPORT_API_VERSION
 
-    def __init__(self, sender: QueueSender) -> None:
-        if not callable(sender):
-            raise ValidationError("codex queue sender must be callable")
-        self._sender = sender
+    def __init__(self, relay: CodexDesktopRelayClient) -> None:
+        """Keep a CodexDesktopRelayClient; reject a missing callable send method."""
+
+        if not callable(getattr(relay, "send", None)):
+            raise ValidationError("codex desktop relay must provide send")
+        self._relay = relay
 
     def validate(self, config: ChatTransportConfig) -> None:
         if not isinstance(config, ChatTransportConfig):
@@ -283,6 +285,20 @@ class CodexQueueTransport:
     def send(
         self, target: OrchestratorRef, notice: CompletionNotice
     ) -> DeliveryReceipt:
+        """Send a validated notice to its bound target and return relay evidence.
+
+        Args:
+            target (OrchestratorRef): Existing Codex session binding.
+            notice (CompletionNotice): Trusted terminal lifecycle facts.
+
+        Returns:
+            DeliveryReceipt: Confirmed acceptance, without a queue message id.
+
+        Raises:
+            ValidationError: Invalid argument types.
+            DeliveryError: Wrong transport, unavailable or rejected relay.
+            AmbiguousDeliveryError: Relay acceptance is unknown after writing.
+        """
         if not isinstance(target, OrchestratorRef):
             raise ValidationError("target must be an OrchestratorRef")
         if not isinstance(notice, CompletionNotice):
@@ -291,32 +307,11 @@ class CodexQueueTransport:
             raise DeliveryError(
                 f"{self.name} cannot deliver to transport {target.transport!r}"
             )
-        try:
-            remote_message_id = self._sender(
-                target.external_session_id, notice.render()
-            )
-        except TimeoutError as error:
-            # The queue may have accepted the message. At-least-once: report
-            # ambiguity so the dispatcher records it and retries.
-            raise AmbiguousDeliveryError(
-                f"codex queue acceptance is unknown for {notice.notification_id}",
-                evidence=getattr(self._sender, "last_evidence", None),
-            ) from error
-        except SessionGoneError as error:
-            raise DeliveryError(
-                "codex queue session is gone; agent-run never opens a replacement",
-                evidence=getattr(self._sender, "last_evidence", None),
-            ) from error
-        except OSError as error:
-            raise DeliveryError(
-                f"codex queue is unreachable ({type(error).__name__})",
-                evidence=getattr(self._sender, "last_evidence", None),
-            ) from error
-        if remote_message_id is not None and not isinstance(remote_message_id, str):
-            raise DeliveryError("codex queue returned a non-string message id")
-        evidence = getattr(self._sender, "last_evidence", None)
+        if self._relay.send(target, notice) is not True:
+            raise DeliveryError("codex desktop relay did not accept completion")
+        evidence = self._relay.last_evidence
         return DeliveryReceipt(
-            remote_message_id=remote_message_id,
+            remote_message_id=None,
             ambiguous=False,
             evidence=evidence if isinstance(evidence, DeliveryAttemptEvidence) else None,
         )
