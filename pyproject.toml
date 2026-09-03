@@ -32,6 +32,7 @@ release = ["build>=1.2", "twine>=5.0"]
 
 [project.scripts]
 agent-run = "agent_run.cli:main"
+agent-run-tui = "agent_run_tui.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/DKotsyuba/agent-run"
