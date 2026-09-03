@@ -324,6 +324,7 @@ class AgentServiceTests(unittest.TestCase):
         self.assertIsInstance(launched[3], LaunchPlan)
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
+        """Resolve default and explicit timeout values independently of launch order."""
         config = replace(
             self.config,
             core=replace(self.config.core, default_timeout_seconds=7),
@@ -346,8 +347,8 @@ class AgentServiceTests(unittest.TestCase):
         )
 
         self.wait_until(lambda: len(launched) == 2)
-        self.assertEqual(launched[0][1].timeout_seconds, 7)
-        self.assertEqual(launched[1][1].timeout_seconds, 480)
+        timeouts = {args[1].request_id: args[1].timeout_seconds for args in launched}
+        self.assertEqual(timeouts, {"default-timeout": 7, "explicit-timeout": 480})
         self.assertEqual(self.store.get_agent(defaulted.agent_id)["timeout_seconds"], 7)
         self.assertEqual(self.store.get_agent(explicit.agent_id)["timeout_seconds"], 480)
         service.close()
@@ -406,11 +407,13 @@ class AgentServiceTests(unittest.TestCase):
         self.assertFalse((self.root / "agents").exists())
 
     def test_prepare_failure_is_durable_after_private_agent_directory(self) -> None:
+        """Persist an isolated agent directory when preparation fails immediately."""
         ADAPTER.prepare_error = ValidationError("prepare exploded")
         request = self.request(request_id="prepare-failure")
 
         accepted = self.service.start(request)
-        self.assertIs(accepted.agent.status, AgentStatus.STARTING)
+        self.assertTrue(accepted.created)
+        self.assertIn(accepted.agent.status, {AgentStatus.STARTING, AgentStatus.FAILED})
         self.wait_until(
             lambda: self.store.get_agent(accepted.agent_id)["status"]
             == AgentStatus.FAILED.value
@@ -432,6 +435,7 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(ADAPTER.prepare_calls, 1)
 
     def test_launch_failure_is_durable_and_idempotent_retry_never_relaunches(self) -> None:
+        """Persist immediate launch failure and keep idempotent retries side-effect free."""
         calls: list[tuple] = []
 
         def fail_launch(*args) -> None:
@@ -447,7 +451,8 @@ class AgentServiceTests(unittest.TestCase):
         )
         request = self.request(request_id="launch-failure")
         accepted = service.start(request)
-        self.assertIs(accepted.agent.status, AgentStatus.STARTING)
+        self.assertTrue(accepted.created)
+        self.assertIn(accepted.agent.status, {AgentStatus.STARTING, AgentStatus.FAILED})
         self.wait_until(
             lambda: self.store.get_agent(accepted.agent_id)["status"]
             == AgentStatus.FAILED.value

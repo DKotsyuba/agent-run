@@ -268,6 +268,16 @@ class NodeWrapperTests(unittest.TestCase):
         """The exact legacy six-key request still renders and delivers."""
         self.assertTrue(self.run_delivery("true", wire="legacy"))
 
+    def test_placeholder_metadata_is_literal_on_the_real_host(self):
+        """Rich metadata cannot expand braces or replacement tokens in either renderer."""
+        notice = CompletionNotice(
+            "ntf_literal", AGENT, AgentStatus.SUCCEEDED,
+            runtime="codex", model="{agent_id}-$&-$1", effort="{version}",
+        )
+        self.assertIn("codex/{agent_id}-$&-$1:{version}", notice.render())
+        self.assertIn("[notification ntf_literal v1]", notice.render())
+        self.assertTrue(self.run_delivery("true", notice))
+
     def test_arbitrary_extra_keys_are_rejected_before_any_host_contact(self):
         """Extra message/task/prompt fields or wrong shapes never reach the pipe."""
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:

@@ -57,6 +57,12 @@ The supervisor enforces:
 Answers are stored with size and sha256; `answer <id>` re-serves the
 verified envelope indefinitely.
 
+An owned engine may exit before process-group discovery. This is not an
+automatic failure or success: completion still requires the real engine outcome,
+answer proof, and absence of both the leader PID and live members of its expected
+group. Without verified ownership, neither native cancellation nor group signals
+are used; a surviving or reused process identity fails closed.
+
 ## Adapters
 
 One package per engine under `src/agent_run/adapters/`. An adapter renders
@@ -117,14 +123,20 @@ neither host capability, preventing recursive wrappers. The wrapper calls only
 `send_message_to_thread` and renders the same structured completion notice from
 validated lifecycle fields and immutable runtime/model/effort selectors. Task,
 answer, and error prose never enter the notice; selector text is escaped for
-safe single-line display. Missing effort is shown as `unspecified`.
+safe single-line display. Effort is the explicit value persisted in the launch
+request, not an inferred runtime default; missing effort is `unspecified`.
 Host tool inventories have an 8 MiB frame limit;
 local delivery requests remain bounded to 8 KiB. No socket path, host response,
 or message text enters delivery evidence.
 
-Agent completion notices use a short list: ID, terminal status,
-`runtime/model:effort`, result lookup methods, and the notification identity
-with a no-replacement guard. Workflow notices keep their separate format.
+Agent completion notices use the `agent-run/completion` header and a short list:
+ID, terminal status, `runtime/model:effort`, and notification identity. Python
+and the Node relay render one packaged template. Handling instructions live in
+the same contract, exposed by the MCP `start` description and `agent-run doc
+completion`; they are not repeated in each notice. The contract explains
+asynchronous launch, bound delivery, result retrieval, and why a completion
+notice is neither a new task nor user approval. Host-added trust warnings remain
+under the host's control. Workflow notices keep their separate format.
 The local relay protocol accepts strict legacy v1 requests and metadata-bearing
 v2 requests. A host advertises v2 with an `ar-cdx-v2-*.sock` endpoint; clients
 prefer those endpoints and use legacy requests for older hosts. Existing

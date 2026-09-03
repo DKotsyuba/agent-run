@@ -78,6 +78,12 @@ const LEGACY_KEYS = ["agent_id", "notification_id", "op", "status", "thread_id",
 const RICH_KEYS = ["agent_id", "effort", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
 /** Launch metadata bound in code points, matching the Python notice exactly. */
 const META_LIMIT = 128;
+/** Path to the packaged contract shared with Python, never user-selected. */
+const NOTICE_TEMPLATE_PATH = path.join(__dirname, "completion_notice_contract.json");
+/** Trusted template loaded once at startup; package I/O/JSON errors fail startup. */
+const NOTICE_CONTRACT = JSON.parse(fs.readFileSync(NOTICE_TEMPLATE_PATH, "utf8"));
+/** Notice marker version, independent of the accepted relay wire versions. */
+const COMPLETION_NOTICE_VERSION = 1;
 
 /** Escape controls and Unicode line separators as literal \uXXXX, matching Python. */
 function escapeMeta(value) {
@@ -95,7 +101,21 @@ function metaText(value, marker) {
   return typeof value === "string" ? escapeMeta(value) : marker;
 }
 
-/** Accept only the exact legacy or rich lifecycle facts and reproduce CompletionNotice.render exactly. */
+/**
+ * Render the package template once; braces and dollar signs in values stay literal.
+ * @param {Record<string, string | number>} values Validated, display-safe fields.
+ * @returns {string} Notice text without changing values or doing further I/O.
+ */
+function renderTemplate(values) {
+  return NOTICE_CONTRACT.template.replace(/\{([^}]+)\}/g, (match, key) => values[key] ?? match);
+}
+
+/**
+ * Validate an unknown legacy/rich request and return compact lifecycle text.
+ * Invalid keys, identifiers, metadata or versions throw before host contact.
+ * @param {unknown} request Decoded relay JSON, never arbitrary message prose.
+ * @returns {string} Escaped notice using notice v1 independently of wire v1/v2.
+ */
 function notice(request) {
   if (!request || typeof request !== "object" || Array.isArray(request))
     throw new Error("invalid request");
@@ -116,13 +136,15 @@ function notice(request) {
       !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
       !["succeeded", "failed", "timed_out", "cancelled", "lost"].includes(request.status))
     throw new Error("invalid lifecycle");
-  return "agent-run\n" +
-    "\n" +
-    `- ID: ${request.agent_id}\n` +
-    `- Status: ${request.status}\n` +
-    `- Runtime/model: ${metaText(request.runtime, "unknown")}/${metaText(request.model, "unknown")}:${metaText(request.effort, "unspecified")}\n` +
-    `- Details: summary / transcript (ID above)\n` +
-    `- Service: [notification ${request.notification_id} v1]. Do not start a replacement agent.`;
+  return renderTemplate({
+    agent_id: request.agent_id,
+    status: request.status,
+    runtime: metaText(request.runtime, "unknown"),
+    model: metaText(request.model, "unknown"),
+    effort: metaText(request.effort, "unspecified"),
+    notification_id: request.notification_id,
+    version: COMPLETION_NOTICE_VERSION,
+  });
 }
 
 /** Only a pre-call failure permits queue fallback; uncertain calls stay ambiguous. */

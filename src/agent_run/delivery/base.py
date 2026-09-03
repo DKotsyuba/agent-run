@@ -14,6 +14,7 @@ from ..domain import (
     validate_agent_id,
 )
 from ..errors import AgentRunError, ValidationError
+from .completion_notice_contract import format_notice_message
 
 
 TRANSPORT_API_VERSION = 1
@@ -298,17 +299,15 @@ class CompletionNotice:
         effort = (
             _escaped_metadata(self.effort) if self.effort is not None else "unspecified"
         )
-        return (
-            "agent-run\n"
-            "\n"
-            f"- ID: {self.agent_id}\n"
-            f"- Status: {self.status.value}\n"
-            f"- Runtime/model: {runtime}/{model}:{effort}\n"
-            "- Details: summary / transcript (ID above)\n"
-            f"- Service: [notification {self.notification_id} v{self.version}]. "
-            "Do not start a replacement agent."
+        return format_notice_message(
+            agent_id=str(self.agent_id),
+            status=self.status.value,
+            runtime=runtime,
+            model=model,
+            effort=effort,
+            version=self.version,
+            notification_id=self.notification_id,
         )
-
 
 @dataclass(frozen=True, slots=True)
 class DeliveryReceipt:

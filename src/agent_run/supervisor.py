@@ -319,6 +319,20 @@ class Supervisor:
             raise
 
     def _run_launched(self, session: RuntimeSession, steerable: bool) -> Outcome:
+        """Persist and supervise a launched session without trusting a missing leader.
+
+        A session that owns its process group must provide a valid engine PID.
+        A leader that has already exited is not itself a fault: ``_finish``
+        later proves that no group or descendant remains before accepting its
+        real outcome and answer evidence. An unverified or mismatched group is never
+        treated as verified and therefore cannot be signalled by this supervisor.
+
+        ``session`` is the launched RuntimeSession; ``steerable`` is the bool
+        capability for steering commands and warnings. Returns a persisted
+        Outcome. Validation, process and storage errors reach the caller's
+        common failure-cleanup path.
+        """
+
         self._owns_process_group = bool(
             getattr(session, "owns_process_group", True)
         )
@@ -327,9 +341,10 @@ class Supervisor:
                 raise ValidationError("runtime session has no engine pid")
             self._owned_pid = session.pid
             self._group = verify_process_group(self._ops, self._owned_pid)
-            if self._group is None:
-                raise ValidationError("engine exited before process-group verification")
-            self._recorded_group_id = self._group.pgid
+            if self._group is not None:
+                self._recorded_group_id = self._group.pgid
+            else:
+                self._recorded_group_id = self._pid
         else:
             self._owned_pid = None
             self._group = None
@@ -557,6 +572,20 @@ class Supervisor:
         return self._await_exit(session)
 
     def _safe_cancel(self, session: RuntimeSession) -> None:
+        """Best-effort native cancellation only while its process ownership is proven.
+
+        Shared-service sessions retain their adapter-defined cancellation path.
+        An owned process without a verified group can be an already-exited
+        engine, a child in a different group, or a reused PID.  Calling the
+        adapter in any of those cases could target an unrelated process and is
+        skipped.
+
+        ``session`` is a RuntimeSession. Returns None; adapter errors are
+        recorded best-effort and do not escape this cancellation helper.
+        """
+
+        if self._owns_process_group and self._group is None:
+            return
         try:
             session.cancel(self._settings.grace_seconds)
         except Exception as error:  # native cancel is best effort before signals
@@ -578,10 +607,17 @@ class Supervisor:
     def _finish(
         self, session: RuntimeSession, session_outcome: Outcome | None
     ) -> Outcome:
-        """Verify the group is gone and the answer is real before going terminal."""
+        """Verify the group, or its proven absence, and answer before going terminal.
 
-        if self._owns_process_group and self._group is None:
-            raise ValidationError("engine process group was not verified")
+        An early-exited leader has no ``VerifiedProcessGroup`` to signal.  In
+        that case ``terminate_process_group`` performs a no-signal liveness
+        proof instead; any surviving descendant or reused PGID fails closed.
+
+        ``session`` is a RuntimeSession; ``session_outcome`` is its Outcome or
+        None when unavailable. Returns the durably committed Outcome after
+        cleanup and answer inspection. Process, I/O and storage errors propagate
+        to the common failure-cleanup path.
+        """
         natural_grace = (
             self._settings.natural_grace_seconds
             if self._stop_reason is None and session_outcome is not None

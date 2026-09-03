@@ -9,6 +9,7 @@ parallel workflow from a JSON array of agent job specifications.
 
 | Topic | Covers |
 |---|---|
+| completion | MCP start response, automatic bound-chat delivery, compact notice format, result retrieval |
 | config | ~/.agent-run/config.toml: source of truth, fail-closed, priority multiplier/order, safe-edit discipline |
 | skills | `skills = [...]` per runtime, plugin ownership, symlinks, rematerialize |
 | mcp-servers | `[mcp.<name>]` declarations, per-runtime attach, opencode engine gap |

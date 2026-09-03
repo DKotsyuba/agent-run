@@ -212,6 +212,15 @@ def terminate_process_group(
 
     Signalling the group rather than the engine pid is what removes wrapper
     grandchildren; the returned evidence says whether the group is really gone.
+    Without a verified group this function never signals. If ``owned_pid`` is
+    supplied, ``gone`` requires both an absent leader PID and no live group at
+    that PGID; with neither group nor owned PID there is no owned process to stop.
+
+    ``ops`` supplies ProcessOps; ``group`` is a VerifiedProcessGroup or None,
+    and ``owned_pid`` is an optional int leader PID. Duration floats are seconds:
+    natural grace may be zero, while termination graces and polling must be
+    positive. Returns Termination with sent signals, group absence and elapsed
+    seconds. Invalid durations/PIDs raise ValidationError; process errors propagate.
     """
 
     natural_grace_seconds = _nonnegative(
@@ -222,7 +231,10 @@ def terminate_process_group(
     poll_seconds = _positive("poll_seconds", poll_seconds)
     started = ops.monotonic()
     if group is None:
-        gone = owned_pid is None or ops.process_group(checked_pgid(owned_pid)) is None
+        gone = owned_pid is None or (
+            ops.process_group(checked_pgid(owned_pid)) is None
+            and not ops.group_alive(checked_pgid(owned_pid))
+        )
         return Termination((), gone, ops.monotonic() - started)
 
     gone, _ = _await_group_exit(
