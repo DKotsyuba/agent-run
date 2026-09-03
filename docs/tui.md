@@ -29,19 +29,40 @@ successful snapshot stays on screen; the dashboard keeps retrying.
 The layout adapts to the terminal width, caps the content width at 72 columns,
 and stays usable in a narrow side pane (about 36 columns).
 
-**Sessions.** One card per orchestrator session from `list_orchestrators`:
-the session title, then `active N · total M · <transport> · <cwd basename>`.
-Agents launched without a binding appear under a synthetic `unbound` card.
+Every card is a light box (`┌─┐ │ └─┘`) separated from the next by a blank
+row. Nothing is drawn with a background fill: the selected card has a bold
+border and a `▶` before its title; colour is used only as an accent (green
+for active/succeeded, red for failed/timed out, dim for secondary rows).
 
-**Agents of a session.** Active agents first, newest first: task summary;
-`runtime · model · effort`; a spinner with the elapsed time and, when the
-runtime streams a transcript, a one-line hint of the newest message. Finished
-agents sit below a divider in a collapsed section (`Tab` expands it) and show
-their terminal status, elapsed time, and failure kind.
+**Sessions.** Header `agent-run · sessions` with the key hint on the right.
+One card per orchestrator session from `list_orchestrators`:
 
-Keys: `j`/`k` or arrows move, `Enter` opens a session, `Esc`/`Backspace`/`h`
-goes back, `Tab`/`Space` toggles the finished section, `r` reloads, `q` quits.
-A left mouse click selects a card and opens it on the sessions screen.
+```
+┌────────────────────────────────┐
+│ ▶ Implement dashboard          │   title
+│ claude · agent-run             │   host runtime · cwd basename
+│ ● 2 active   ○ 1 done          │   child counts
+└────────────────────────────────┘
+```
+
+The host runtime is derived from the transport (`claude_uds` → `claude`,
+`codex_queue` → `codex`, `unbound` → `—`). Agents launched without a binding
+appear under a synthetic `unbound` card.
+
+**Agents of a session.** Header `◀ <session title> · <host runtime>`. A
+`RUNNING (n)` section lists active agents, newest first: `<spinner> summary`;
+`runtime · model · effort` with `⏱ elapsed` right-aligned; `↳ last event`
+when the runtime streams a transcript. A `FINISHED (k)` section is collapsed
+by default (`Tab` toggles it) and shows `✔`/`✘`/`⏰`/`⊘`/`⚠` for succeeded,
+failed, timed out, cancelled and lost agents, plus `✘ <failure kind>` when
+one is recorded. Below about 40 columns the right-aligned parts collapse and
+summaries are cut with `…`.
+
+Keys work on the Russian layout as well as the Latin one: `j`/`k` (`о`/`л`)
+or arrows move, `Enter`/`l`/`→` (`д`) opens a session, `h`/`←`/`Esc`/
+`Backspace` (`р`) goes back, `Tab`/`Space` toggles the finished section,
+`r` (`к`) reloads, `q` (`й`) quits. A left mouse click selects a card and
+opens it on the sessions screen.
 
 ## Session titles
 

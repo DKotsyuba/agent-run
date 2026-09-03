@@ -12,8 +12,8 @@ from .model import AgentCard, SessionCard, Snapshot
 def demo_snapshot(now: float) -> Snapshot:
     """Return a stable, representative snapshot for interactive dashboard demos."""
     sessions = (
-        SessionCard("ors_demo", "stdio", "demo-1", "Implement dashboard", "/tmp/agent-run", 2, 3, now),
-        SessionCard("ors_review", "socket", "demo-2", "Review release", "/tmp/release", 0, 1, now - 30),
+        SessionCard("ors_demo", "claude_uds", "demo-1", "Implement dashboard", "/tmp/agent-run", 2, 3, now),
+        SessionCard("ors_review", "codex_queue", "demo-2", "Review release", "/tmp/release", 0, 1, now - 30),
     )
     agents = {
         "ors_demo": (
