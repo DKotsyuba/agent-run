@@ -114,10 +114,22 @@ Codex Desktop delivery uses a volatile local relay. With both
 MCP CLI replaces itself with the host's signed Node executable. That wrapper
 owns a private Unix socket and a thin Python MCP child; the child receives
 neither host capability, preventing recursive wrappers. The wrapper calls only
-`send_message_to_thread` and renders the same fixed completion notice from
-validated lifecycle fields. Host tool inventories have an 8 MiB frame limit;
+`send_message_to_thread` and renders the same structured completion notice from
+validated lifecycle fields and immutable runtime/model/effort selectors. Task,
+answer, and error prose never enter the notice; selector text is escaped for
+safe single-line display. Missing effort is shown as `unspecified`.
+Host tool inventories have an 8 MiB frame limit;
 local delivery requests remain bounded to 8 KiB. No socket path, host response,
 or message text enters delivery evidence.
+
+Agent completion notices use a short list: ID, terminal status,
+`runtime/model:effort`, result lookup methods, and the notification identity
+with a no-replacement guard. Workflow notices keep their separate format.
+The local relay protocol accepts strict legacy v1 requests and metadata-bearing
+v2 requests. A host advertises v2 with an `ar-cdx-v2-*.sock` endpoint; clients
+prefer those endpoints and use legacy requests for older hosts. Existing
+outbox rows require no migration. Already-running old MCP hosts keep delivering
+their old format until the `agent-run` MCP connection is restarted.
 
 Codex completion delivery uses only the signed Desktop relay. The persisted
 `codex_queue` name is a compatibility identifier; it never invokes the Codex

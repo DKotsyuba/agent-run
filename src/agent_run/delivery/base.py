@@ -19,6 +19,8 @@ from ..errors import AgentRunError, ValidationError
 TRANSPORT_API_VERSION = 1
 NOTICE_VERSION = 1
 _MAX_ID_LENGTH = 512
+#: Bound selector display; the relay independently enforces its frame ceiling.
+MAX_METADATA_LENGTH = 128
 _MAX_EVIDENCE_TAIL_BYTES = 4096
 
 
@@ -188,21 +190,71 @@ def _trusted_id(name: str, value: str) -> str:
     return value
 
 
+def _metadata(name: str, value: object) -> str | None:
+    """Return one validated optional launch-metadata string or ``None``.
+
+    ``value`` must be ``None`` or a nonblank string of at most
+    :data:`MAX_METADATA_LENGTH` code points. Punctuation that configured
+    runtime and model identifiers legitimately contain (slashes, ``@``,
+    colons, dashes) is accepted; rendering neutralizes untrusted characters
+    separately through :func:`_escaped_metadata`.
+
+    Raises:
+        ValidationError: ``value`` is neither ``None`` nor a bounded nonblank
+            string.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{name} must be a nonblank string or None")
+    if len(value) > MAX_METADATA_LENGTH:
+        raise ValidationError(
+            f"{name} must be at most {MAX_METADATA_LENGTH} characters"
+        )
+    return value
+
+
+def _escaped_metadata(value: str) -> str:
+    """Escape control and Unicode line-separator characters as ``\\uXXXX``.
+
+    Every C0/C1 control, DEL, and U+2028/U+2029 code point becomes a literal
+    backslash escape, so metadata can never start a new rendered line or
+    command. The Node host in ``codex_desktop_host.cjs`` implements the
+    identical mapping; the two must stay in lockstep or rendered notices
+    diverge between transports.
+    """
+
+    escaped: list[str] = []
+    for character in value:
+        code = ord(character)
+        if code < 0x20 or 0x7F <= code <= 0x9F or code in (0x2028, 0x2029):
+            escaped.append(f"\\u{code:04x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
 @dataclass(frozen=True, slots=True)
 class CompletionNotice:
     """The only payload a transport may send.
 
-    It carries lifecycle facts alone. Task text, answer text, runtime error
-    prose, and tool output never enter this type, so no untrusted string can
-    reach an orchestration session through delivery.
+    It carries lifecycle facts plus optional immutable launch metadata
+    (runtime, model, effort). Task text, answer text, runtime error prose,
+    and tool output never enter this type. Optional selector facts are bounded
+    and escaped before display rather than treated as trusted prose.
     """
 
     notification_id: str
     agent_id: AgentId
     status: AgentStatus
     version: int = NOTICE_VERSION
+    runtime: str | None = None
+    model: str | None = None
+    effort: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate terminal facts and bounded optional selectors, or raise ValidationError."""
         _trusted_id("notification_id", self.notification_id)
         if isinstance(self.version, bool) or not isinstance(self.version, int):
             raise ValidationError(f"notice version must be {NOTICE_VERSION}")
@@ -211,8 +263,18 @@ class CompletionNotice:
         if not isinstance(self.status, AgentStatus) or self.status not in TERMINAL:
             raise ValidationError("completion notice status must be terminal")
         object.__setattr__(self, "agent_id", validate_agent_id(self.agent_id))
+        object.__setattr__(self, "runtime", _metadata("runtime", self.runtime))
+        object.__setattr__(self, "model", _metadata("model", self.model))
+        object.__setattr__(self, "effort", _metadata("effort", self.effort))
 
     def payload(self) -> dict[str, object]:
+        """Return the frozen four-field transport payload, without metadata.
+
+        The payload shape predates launch metadata and stays exactly four
+        fields for every notice; the rich metadata travels only on the local
+        relay wire, chosen per endpoint by ``codex_desktop_relay``.
+        """
+
         return {
             "version": self.version,
             "notification_id": self.notification_id,
@@ -221,14 +283,30 @@ class CompletionNotice:
         }
 
     def render(self) -> str:
-        """Render the fixed chat message; every part is derived from this notice."""
+        """Render the fixed structured message; every part is derived from this notice.
 
+        Missing launch metadata renders as ``unknown`` (runtime, model) or
+        ``unspecified`` (effort) and is never inferred. Metadata control and
+        line-separator characters are escaped by :func:`_escaped_metadata`,
+        so metadata can never add a list line or command to the text.
+        """
+
+        runtime = (
+            _escaped_metadata(self.runtime) if self.runtime is not None else "unknown"
+        )
+        model = _escaped_metadata(self.model) if self.model is not None else "unknown"
+        effort = (
+            _escaped_metadata(self.effort) if self.effort is not None else "unspecified"
+        )
         return (
-            f"agent-run: agent {self.agent_id} finished with status "
-            f"{self.status.value}. Call summary({self.agent_id}) or "
-            f"transcript({self.agent_id}) for details. Do not start a "
-            f"replacement agent for this notification. "
-            f"[notification {self.notification_id} v{self.version}]"
+            "agent-run\n"
+            "\n"
+            f"- ID: {self.agent_id}\n"
+            f"- Status: {self.status.value}\n"
+            f"- Runtime/model: {runtime}/{model}:{effort}\n"
+            "- Details: summary / transcript (ID above)\n"
+            f"- Service: [notification {self.notification_id} v{self.version}]. "
+            "Do not start a replacement agent."
         )
 
 

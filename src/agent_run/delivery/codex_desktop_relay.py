@@ -14,6 +14,43 @@ _MAX_FRAME = 8192
 #: Total discovery budget in seconds, below the thirty-second delivery lease.
 _TIMEOUT = 10.0
 _MAX_RELAYS = 16
+#: Socket names starting with this prefix advertise the rich local protocol
+#: v2; every other ``ar-cdx-*.sock`` endpoint keeps the legacy six-key wire.
+_V2_PREFIX = "ar-cdx-v2-"
+
+
+def _request(path: Path, target: OrchestratorRef, notice: CompletionNotice) -> bytes:
+    """Encode one endpoint's bounded request: legacy six keys, or rich v2 nine.
+
+    Only the discovered socket's name selects the wire version, and the tag
+    is advisory: a rich frame that reaches a stale legacy host is rejected
+    before any send, so discovery safely continues to the next endpoint.
+
+    Args:
+        path (Path): Discovered relay socket path.
+        target (OrchestratorRef): Existing session receiving the notice.
+        notice (CompletionNotice): Validated terminal lifecycle facts; its
+            optional launch metadata is included only on the rich wire.
+
+    Returns:
+        bytes: The uint32-LE framed JSON request for this endpoint.
+
+    Raises:
+        ValidationError: The encoded frame exceeds the local size limit,
+            before any socket is opened.
+    """
+
+    request: dict[str, object] = {
+        "version": 1, "op": "completion", "thread_id": target.external_session_id,
+        "notification_id": notice.notification_id, "agent_id": str(notice.agent_id),
+        "status": notice.status.value,
+    }
+    if path.name.startswith(_V2_PREFIX):
+        request.update({
+            "version": 2,
+            "runtime": notice.runtime, "model": notice.model, "effort": notice.effort,
+        })
+    return _frame(request)
 
 
 def _frame(value: object) -> bytes:
@@ -70,9 +107,13 @@ class CodexDesktopRelayClient:
     def send(self, target: OrchestratorRef, notice: CompletionNotice) -> bool:
         """Return True on acceptance or raise a retryable/ambiguous delivery error.
 
-        Discovery takes at most ten seconds total across candidates. Any error
-        once sendall is attempted is ambiguous; only rejection or a pre-write
-        failure permits another relay. No queue or state/database access occurs.
+        Discovery takes at most ten seconds total across candidates. Each
+        endpoint receives the wire its socket name advertises: the rich
+        version 2 frame with launch metadata for ``ar-cdx-v2-*.sock`` paths,
+        the unchanged legacy six-key version 1 frame for older hosts. Any
+        error once sendall is attempted is ambiguous; only rejection or a
+        pre-write failure permits another relay. No queue or state/database
+        access occurs.
 
         Args:
             target (OrchestratorRef): Existing session receiving the notice.
@@ -88,16 +129,12 @@ class CodexDesktopRelayClient:
         self.last_evidence = None
         started = time.monotonic()
         deadline = started + _TIMEOUT
-        request = _frame({
-            "version": 1, "op": "completion", "thread_id": target.external_session_id,
-            "notification_id": notice.notification_id, "agent_id": str(notice.agent_id),
-            "status": notice.status.value,
-        })
         rejected = False
         for path in self._paths():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            request = _request(path, target, notice)
             written = False
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -131,8 +168,19 @@ class CodexDesktopRelayClient:
         )
 
     def _paths(self) -> tuple[Path, ...]:
-        """Return at most sixteen local endpoints in sorted order; unreadable is empty."""
+        """Return at most sixteen endpoints, rich v2 sockets first; unreadable is empty.
+
+        Ordering prefers ``ar-cdx-v2-*.sock`` endpoints so the rich wire is
+        used whenever a capable host is live, inside the same sixteen
+        endpoint discovery bound as before.
+        """
+
         try:
-            return tuple(sorted(self._home.glob("ar-cdx-*.sock"))[:_MAX_RELAYS])
+            return tuple(
+                sorted(
+                    self._home.glob("ar-cdx-*.sock"),
+                    key=lambda path: (not path.name.startswith(_V2_PREFIX), path.name),
+                )[:_MAX_RELAYS]
+            )
         except OSError:
             return ()

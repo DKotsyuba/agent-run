@@ -551,6 +551,14 @@ def message_rows(
 def claim_delivery_row(
     connection: sqlite3.Connection, owner: str, now: float, lease_until: float
 ) -> sqlite3.Row | None:
+    """Claim the next due delivery and return its routing and launch facts.
+
+    The caller owns ``connection`` and its write transaction, validates the
+    string lease ``owner`` and epoch-second ``now``/``lease_until`` values.
+    A successful claim increments attempts and assigns the sending lease;
+    no eligible row or a lost claim returns None. Returned request JSON is
+    internal input for effort extraction, never notification message text.
+    """
     row = connection.execute(
         """SELECT id FROM deliveries
            WHERE ((state IN ('pending', 'retry_wait')
@@ -573,7 +581,9 @@ def claim_delivery_row(
     if updated != 1:
         return None
     return connection.execute(
-        """SELECT d.*, a.status AS agent_status, s.transport,
+        """SELECT d.*, a.status AS agent_status, a.runtime AS agent_runtime,
+                  a.model AS agent_model, a.request_json AS agent_request_json,
+                  s.transport,
                   s.external_session_id, s.external_turn_id FROM deliveries d
            JOIN agents a ON a.id = d.agent_id
            JOIN orchestrator_sessions s ON s.id = d.orchestrator_session_id

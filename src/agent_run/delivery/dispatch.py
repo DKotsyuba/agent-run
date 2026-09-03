@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import uuid
@@ -17,6 +18,7 @@ from ..errors import ValidationError
 from ..paths import agent_run_home
 from ..state.store import StateStore
 from .base import (
+    MAX_METADATA_LENGTH,
     AmbiguousDeliveryError,
     ChatTransport,
     CompletionNotice,
@@ -73,11 +75,64 @@ class DispatchResult:
     locked_out: bool = False
 
 
+def _row_value(row: Mapping[str, object], key: str) -> object:
+    """Return one row column, or ``None`` when an older stored row lacks it.
+
+    Accepts both :class:`sqlite3.Row` (raises ``IndexError``) and mapping
+    rows from tests (raise ``KeyError``) so notice construction never breaks
+    on a row projected before launch metadata existed.
+    """
+
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def _bounded_metadata(value: object) -> str | None:
+    """Degrade untrustworthy launch metadata to ``None`` instead of failing a send."""
+
+    if isinstance(value, str) and value.strip() and len(value) <= MAX_METADATA_LENGTH:
+        return value
+    return None
+
+
+def _effort_from_request_json(raw: object) -> str | None:
+    """Extract one bounded effort from stored request JSON, tolerating old rows.
+
+    Missing, malformed, or non-object request JSON, and a non-string or
+    oversized ``effort`` value, all degrade to ``None`` (rendered as
+    ``unspecified``) so a queued notice is still delivered. Parsing uses the
+    standard library alone; no SQLite JSON1 dependency is introduced.
+    """
+
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return _bounded_metadata(parsed.get("effort"))
+
+
 def notice_for(row: Mapping[str, object]) -> CompletionNotice:
+    """Build a notice from a claimed mapping or sqlite row without side effects.
+
+    Required lifecycle columns are id, agent_id, and agent_status; invalid
+    facts raise the existing validation errors. Optional launch columns are
+    bounded, and only effort is extracted from request JSON. Missing or
+    malformed optional data becomes unknown/unspecified rather than blocking
+    an already queued delivery.
+    """
     return CompletionNotice(
         notification_id=str(row["id"]),
         agent_id=str(row["agent_id"]),
         status=AgentStatus(str(row["agent_status"])),
+        runtime=_bounded_metadata(_row_value(row, "agent_runtime")),
+        model=_bounded_metadata(_row_value(row, "agent_model")),
+        effort=_effort_from_request_json(_row_value(row, "agent_request_json")),
     )
 
 

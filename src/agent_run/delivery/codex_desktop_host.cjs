@@ -9,7 +9,8 @@ const { spawn } = require("node:child_process");
 const LOCAL_LIMIT = 8192, HOST_LIMIT = 8 * 1024 * 1024, HOST_MS = 8000;
 const [python, home, ...pythonArgs] = process.argv.slice(2);
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
-const relayPath = path.join(home, `ar-cdx-${process.pid}.sock`);
+/** The v2 tag in this name advertises rich local-protocol support to clients. */
+const relayPath = path.join(home, `ar-cdx-v2-${process.pid}.sock`);
 
 /** Encode a bounded JSON object as a uint32-LE frame. */
 function frame(value, limit) {
@@ -72,23 +73,56 @@ async function rpc(socket, id, method, params, deadline) {
   return value.result;
 }
 
-/** Accept only typed lifecycle facts and reproduce CompletionNotice.render exactly. */
+/** Exact request shapes: legacy six keys (wire v1) or rich nine keys (wire v2). */
+const LEGACY_KEYS = ["agent_id", "notification_id", "op", "status", "thread_id", "version"];
+const RICH_KEYS = ["agent_id", "effort", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
+/** Launch metadata bound in code points, matching the Python notice exactly. */
+const META_LIMIT = 128;
+
+/** Escape controls and Unicode line separators as literal \uXXXX, matching Python. */
+function escapeMeta(value) {
+  let out = "";
+  for (const ch of value) {
+    const code = ch.codePointAt(0);
+    out += code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029
+      ? "\\u" + code.toString(16).padStart(4, "0") : ch;
+  }
+  return out;
+}
+
+/** Render one metadata field, or its fixed marker when the field is absent. */
+function metaText(value, marker) {
+  return typeof value === "string" ? escapeMeta(value) : marker;
+}
+
+/** Accept only the exact legacy or rich lifecycle facts and reproduce CompletionNotice.render exactly. */
 function notice(request) {
-  const keys = ["agent_id", "notification_id", "op", "status", "thread_id", "version"];
-  if (!request || typeof request !== "object" || Array.isArray(request) ||
-      JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(keys) ||
-      request.version !== 1 || request.op !== "completion") throw new Error("invalid request");
+  if (!request || typeof request !== "object" || Array.isArray(request))
+    throw new Error("invalid request");
+  const keys = JSON.stringify(Object.keys(request).sort());
+  const legacy = keys === JSON.stringify(LEGACY_KEYS);
+  const rich = keys === JSON.stringify(RICH_KEYS);
+  if (!legacy && !rich) throw new Error("invalid request");
+  if (request.version !== (legacy ? 1 : 2) || request.op !== "completion") throw new Error("invalid request");
   for (const key of ["agent_id", "notification_id", "thread_id", "status"])
     if (typeof request[key] !== "string" || !request[key].trim() || request[key].length > 512 || request[key].includes("\0"))
       throw new Error("invalid identifier");
+  if (rich)
+    for (const key of ["effort", "model", "runtime"])
+      if (request[key] !== null &&
+          (typeof request[key] !== "string" || !request[key].trim() || [...request[key]].length > META_LIMIT))
+        throw new Error("invalid metadata");
   if (!/^ag-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.agent_id) ||
       !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
       !["succeeded", "failed", "timed_out", "cancelled", "lost"].includes(request.status))
     throw new Error("invalid lifecycle");
-  return `agent-run: agent ${request.agent_id} finished with status ${request.status}. ` +
-    `Call summary(${request.agent_id}) or transcript(${request.agent_id}) for details. ` +
-    `Do not start a replacement agent for this notification. ` +
-    `[notification ${request.notification_id} v1]`;
+  return "agent-run\n" +
+    "\n" +
+    `- ID: ${request.agent_id}\n` +
+    `- Status: ${request.status}\n` +
+    `- Runtime/model: ${metaText(request.runtime, "unknown")}/${metaText(request.model, "unknown")}:${metaText(request.effort, "unspecified")}\n` +
+    `- Details: summary / transcript (ID above)\n` +
+    `- Service: [notification ${request.notification_id} v1]. Do not start a replacement agent.`;
 }
 
 /** Only a pre-call failure permits queue fallback; uncertain calls stay ambiguous. */
