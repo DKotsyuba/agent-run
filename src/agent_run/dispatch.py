@@ -11,6 +11,7 @@ from typing import IO, Mapping
 from .domain import OrchestratorRef, StartRequest
 from .errors import ValidationError
 from .service import AgentQuery, AgentService
+from .delivery.completion_notice_contract import completion_notice_contract_text
 
 _MAX_ERROR_CHARS = 512
 _MAX_LINE_BYTES = 1024 * 1024
@@ -44,7 +45,7 @@ TOOLS = (
     },
     {
         "name": "start",
-        "description": "Start one asynchronous durable agent.",
+        "description": "Start one asynchronous durable agent. " + completion_notice_contract_text(),
         "inputSchema": _schema(
             {
                 "runtime": {"type": "string"},

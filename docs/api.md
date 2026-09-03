@@ -154,6 +154,14 @@ Notes for the loop:
 
 - `start` returns immediately with a durable `agent_id`; the agent runs
   detached and survives your process.
+- The returned agent view is a snapshot, not a promise of `starting`: a fast
+  bootstrap failure may already be terminal. Match concurrent results by agent
+  or request ID rather than submission order.
+- Bound Codex/Claude chats receive completion notices automatically when
+  delivery is configured. The MCP `start` description includes the shared
+  notice format and handling contract; `agent-run doc completion` (or MCP
+  `doc` with `{"topic": "completion"}`) serves the same contract. The `wait`
+  example above is for an unbound API caller, not a bound-chat polling loop.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.

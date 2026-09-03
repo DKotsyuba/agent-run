@@ -419,6 +419,107 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(agent["answer_path"], str(self.answer))
         self.assertEqual(self.events("process_group_terminated")[0]["kind"], "process_group_terminated")
 
+    def test_early_exited_engine_succeeds_only_with_complete_answer_evidence(self) -> None:
+        """A vanished leader may succeed after no group remains and answer proof exists."""
+
+        body = f"final answer\n{DEFAULT_SENTINEL}\n"
+        ops = FakeOps(members=())
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0, runtime_session_id="s-1"),
+            exit_after_polls=1,
+        )
+        self.write_answer(body)
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(outcome.answer_bytes, len(body.encode("utf-8")))
+        self.assertEqual(ops.sent, [])
+
+    def test_early_exited_engine_keeps_nonzero_failure(self) -> None:
+        """The early-exit path preserves the engine's real nonzero outcome."""
+
+        ops = FakeOps(members=())
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.FAILED, exit_code=23, failure_kind="engine_failed"),
+            exit_after_polls=1,
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.exit_code, 23)
+        self.assertEqual(outcome.failure_kind, "engine_failed")
+
+    def test_early_exited_engine_success_without_an_answer_stays_failed(self) -> None:
+        """A claimed success cannot bypass the completion-sentinel requirement."""
+
+        ops = FakeOps(members=())
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0),
+            exit_after_polls=1,
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.exit_code, 0)
+
+    def test_early_exited_engine_success_without_sentinel_stays_failed(self) -> None:
+        """A partial answer cannot turn a vanished leader into a successful run."""
+
+        ops = FakeOps(members=())
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0),
+            exit_after_polls=1,
+        )
+        self.write_answer("partial answer\n")
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.exit_code, 0)
+
+    def test_early_exited_engine_never_cancels_or_signals_an_unverified_group(self) -> None:
+        """A descendant-bearing or reused PGID fails closed without unsafe cleanup."""
+
+        ops = FakeOps(members=(GRANDCHILD_PID,))
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0),
+            exit_after_polls=1,
+        )
+        self.write_answer(f"final answer\n{DEFAULT_SENTINEL}\n")
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, GROUP_SURVIVED)
+        self.assertEqual(session.cancels, 0)
+        self.assertEqual(ops.sent, [])
+
+    def test_reused_group_id_never_receives_native_cancel_or_signal(self) -> None:
+        """A leaderless group with unrelated members is treated as unsafe evidence."""
+
+        ops = FakeOps(members=(9999,))
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0),
+            exit_after_polls=1,
+        )
+        self.write_answer(f"final answer\n{DEFAULT_SENTINEL}\n")
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.failure_kind, GROUP_SURVIVED)
+        self.assertEqual(session.cancels, 0)
+        self.assertEqual(ops.sent, [])
+
     def test_one_warning_at_ninety_percent_then_a_hard_stop_at_one_hundred(self) -> None:
         ops = FakeOps()
         session = FakeSession(ops, native_cancel=False)
@@ -738,7 +839,8 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(session.cancels, 1)
         self.assertEqual(ops.alive_members(), set())
 
-    def test_non_group_leader_is_native_cancelled_but_never_group_signalled(self) -> None:
+    def test_non_group_leader_is_never_native_cancelled_or_group_signalled(self) -> None:
+        """A present PID in the wrong group has no cancellation authority."""
         ops = FakeOps()
         session = FakeSession(ops)
         session.pid = GRANDCHILD_PID
@@ -746,7 +848,7 @@ class SupervisorTests(unittest.TestCase):
         outcome = self.supervisor(FakeAdapter(session), ops).run()
 
         self.assertIs(outcome.status, AgentStatus.FAILED)
-        self.assertEqual(session.cancels, 1)
+        self.assertEqual(session.cancels, 0)
         self.assertEqual(ops.sent, [])
         self.assertIn(GRANDCHILD_PID, ops.reaped)
 

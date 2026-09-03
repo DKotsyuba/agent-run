@@ -2,6 +2,21 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.1] - 2026-09-03
+
+- Fixed successful engines being misclassified when they exit before process-group
+  discovery; completion still requires the actual outcome, a verified answer,
+  and proof that no owned processes remain.
+- Prevented native cancellation of unverified owned processes, including PIDs
+  observed in the wrong group, and tightened leaderless-group cleanup checks.
+- Standardized compact Claude and Codex completion notices with one packaged
+  template. The MCP `start` description and `doc completion` now share the
+  handling instructions and format instead of repeating them in every notice.
+- Stabilized asynchronous-start tests without imposing execution order or
+  weakening durable-failure and idempotency checks.
+- Kept schema v10 and relay wire v1/v2 compatibility. Reconnect existing Codex
+  agent-run MCP hosts after upgrading to load the compact notice template.
+
 ## [0.4.0] - 2026-09-03
 
 - Added quota-aware runtime ordering through the CLI, MCP, and socket API,
@@ -70,6 +85,7 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[0.4.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.1
 [0.4.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.0
 [0.3.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.1
 [0.3.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.0

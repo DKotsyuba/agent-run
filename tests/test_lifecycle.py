@@ -143,6 +143,16 @@ class TerminateProcessGroupTests(unittest.TestCase):
         self.assertTrue(result.group_gone)
         self.assertEqual(ops.sent, [])
 
+    def test_missing_leader_does_not_hide_a_surviving_descendant(self) -> None:
+        """An unverified group remains unsafe when its leader has already exited."""
+
+        ops = FakeOps({4242: {4243}})
+
+        result = terminate_process_group(ops, None, owned_pid=4242)
+
+        self.assertFalse(result.group_gone)
+        self.assertEqual(ops.sent, [])
+
     def test_a_surviving_group_is_reported_not_gone(self) -> None:
         ops = UnkillableOps({4242: {4242}})
         result = terminate_process_group(
