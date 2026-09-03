@@ -326,6 +326,44 @@ class CapacityRankingTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     call()
 
+    def test_route_multiplier_is_scoped_by_runtime_and_alias_weight_is_maximum(self) -> None:
+        """Same route ids stay isolated while aliases choose the largest factor."""
+
+        shared_a = _route("provider-a", "shared", "pool-a", (_forecast("provider-a", "a", 80.0),))
+        alias_a = _route("provider-a", "alias", "pool-a", (_forecast("provider-a", "a", 80.0),))
+        shared_b = _route("provider-b", "shared", "pool-b", (_forecast("provider-b", "b", 80.0),))
+        order = rank_capacity_routes(
+            _snapshot(shared_b, alias_a, shared_a),
+            {"provider-a": 1.0, "provider-b": 1.0},
+            now=_NOW,
+            route_multipliers={("provider-a", "shared"): 3.0, ("provider-a", "alias"): 2.0, ("provider-b", "shared"): 0.5},
+        )
+        self.assertEqual(order.routes[0].runtime, "provider-a")
+        self.assertEqual(order.routes[0].aliases[0].route_id, "shared")
+        self.assertEqual(order.routes[0].multiplier, 3.0)
+        self.assertEqual(order.routes[1].multiplier, 0.5)
+
+    def test_route_multiplier_keys_and_values_are_strictly_validated(self) -> None:
+        """Reject non-pair keys, blank parts, booleans, and nonpositive/nonfinite factors."""
+
+        invalid = (
+            {"route": 1.0},
+            {("runtime",): 1.0},
+            {("", "route"): 1.0},
+            {("runtime", ""): 1.0},
+            {("runtime", "route"): True},
+            {("runtime", "route"): 0.0},
+            {("runtime", "route"): -1.0},
+            {("runtime", "route"): float("nan")},
+            {("runtime", "route"): float("inf")},
+        )
+        for mapping in invalid:
+            with self.subTest(mapping=mapping), self.assertRaises(ValidationError):
+                rank_capacity_routes(
+                    _snapshot(), {}, now=_NOW,
+                    route_multipliers=cast(Mapping[tuple[str, str], float], mapping),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

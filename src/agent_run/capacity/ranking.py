@@ -56,8 +56,9 @@ class RankedCapacityRoute:
     """One physical capacity choice in descending usage priority.
 
     ``aliases`` retains every concrete launch descriptor sharing the same
-    runtime and physical pool set; the first descriptor is canonical by
-    ``route_id``. ``score`` is the unmultiplied value in ``[0, 2]`` and
+    runtime and physical pool set; descriptors are ordered by descending
+    effective factor, then by ``route_id``. ``score`` is the unmultiplied
+    value in ``[0, 2]`` and
     ``priority`` equals ``score * multiplier``. ``limiting_key`` and
     ``limiting_reset_at`` belong to the window that produced the minimum
     slack, not merely the earliest reset in the route.
@@ -237,6 +238,7 @@ def rank_capacity_routes(
     multipliers: Mapping[str, float],
     *,
     now: float,
+    route_multipliers: Mapping[tuple[str, str], float] | None = None,
 ) -> CapacityOrder:
     """Rank capacity routes without provider calls, role selection, or writes.
 
@@ -245,8 +247,14 @@ def rank_capacity_routes(
     to ``1.0``. ``now`` is one finite nonnegative epoch used for every
     projection. Unknown or malformed evidence is deferred; any zero governing
     window is omitted before scoring. The result is a total deterministic
-    order independent of input iteration order. Invalid arguments raise
-    ``ValidationError``.
+    order independent of input iteration order.
+    ``route_multipliers`` optionally maps ``(runtime, route_id)`` pairs to
+    absolute effective factors, preventing same-named route ids from crossing
+    runtime boundaries. Aliases sharing runtime and pool ids collapse using
+    their maximum factor; the canonical alias is ordered by factor descending
+    then route id.
+    Exhausted choices are never revived by a multiplier. Invalid arguments
+    raise ``ValidationError``.
     """
 
     if not isinstance(snapshot, CapacityRouteSnapshot):
@@ -264,6 +272,21 @@ def rank_capacity_routes(
         if value <= 0:
             raise ValidationError("multiplier must be positive")
         checked[runtime] = value
+    checked_routes: dict[tuple[str, str], float] = {}
+    if route_multipliers is not None:
+        if not isinstance(route_multipliers, Mapping):
+            raise ValidationError("route_multipliers must be a mapping")
+        for route_key, multiplier in route_multipliers.items():
+            if (
+                not isinstance(route_key, tuple)
+                or len(route_key) != 2
+                or any(not isinstance(part, str) or not part.strip() for part in route_key)
+            ):
+                raise ValidationError("route multiplier keys must be (runtime, route_id) tuples")
+            value = _finite(multiplier, "route multiplier")
+            if value <= 0:
+                raise ValidationError("route multiplier must be positive")
+            checked_routes[route_key] = value
 
     deferred = [
         _snapshot_evidence(item)
@@ -283,12 +306,11 @@ def rank_capacity_routes(
     ranked: list[RankedCapacityRoute] = []
     available_runtimes: set[str] = set()
     for (runtime, pool_ids), values in sorted(grouped.items()):
-        aliases = tuple(
-            sorted(
-                {value.descriptor.route_id: value.descriptor for value in values}.values(),
-                key=lambda descriptor: descriptor.route_id,
-            )
-        )
+        aliases = tuple({value.descriptor.route_id: value.descriptor for value in values}.values())
+        aliases = tuple(sorted(aliases, key=lambda descriptor: (
+            -checked_routes.get((runtime, descriptor.route_id), checked.get(runtime, 1.0)),
+            descriptor.route_id,
+        )))
         canonical = min(values, key=lambda value: value.descriptor.route_id)
         windows: list[CapacityWindowExplanation] = []
         malformed = False
@@ -344,7 +366,13 @@ def rank_capacity_routes(
             ),
         )
         score = 1.0 + limiting.slack
-        multiplier = checked.get(runtime, 1.0)
+        multiplier = max(
+            (
+                checked_routes.get((runtime, alias.route_id), checked.get(runtime, 1.0))
+                for alias in aliases
+            ),
+            default=checked.get(runtime, 1.0),
+        )
         ranked.append(
             RankedCapacityRoute(
                 runtime,

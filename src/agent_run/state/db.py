@@ -316,6 +316,99 @@ def _upsert_context_receipt(
     ).rowcount == 1
 
 
+#: Version tag written into every component-fingerprint context receipt key.
+_CONTEXT_RECEIPT_VERSION = 2
+
+
+def encode_context_components(components: dict[str, str]) -> str:
+    """Encode component fingerprints as one versioned, order-independent key.
+
+    ``components`` maps nonblank names to nonblank fingerprint strings. The
+    result is canonical JSON (sorted names, fixed separators), so the same
+    component set always encodes to the same single ``context_receipts`` key.
+    """
+
+    if "v" in components:
+        raise ValidationError("component name v is reserved")
+    if not all(
+        isinstance(name, str) and name.strip() and isinstance(value, str) and value.strip()
+        for name, value in components.items()
+    ):
+        raise ValidationError("context components must use nonblank string names and values")
+    return json.dumps(
+        {"v": _CONTEXT_RECEIPT_VERSION, "components": components},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def parse_context_components(context_key: str) -> dict[str, str] | None:
+    """Decode a versioned component receipt key back into its fingerprints.
+
+    Returns the name-to-fingerprint mapping for any key produced by
+    :func:`encode_context_components`, or ``None`` for anything else --
+    legacy single-digest keys, foreign formats, or malformed JSON -- so the
+    caller can treat those rows as "every component changed".
+    """
+
+    try:
+        decoded = json.loads(context_key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict) or decoded.get("v") != _CONTEXT_RECEIPT_VERSION:
+        return None
+    values = decoded.get("components")
+    if not isinstance(values, dict) or not values or not all(
+        isinstance(name, str) and name.strip() and isinstance(value, str) and value.strip()
+        for name, value in values.items()
+    ):
+        return None
+    return values
+
+
+def record_context_component_receipt(
+    connection: sqlite3.Connection,
+    orchestrator_session_id: str,
+    components: dict[str, str],
+    injected_at: float,
+) -> frozenset[str]:
+    """Compare and store component fingerprints in one already-open write
+    transaction, returning the names whose stored fingerprint differs.
+
+    Must run inside the caller's ``BEGIN IMMEDIATE`` block so the read,
+    compare, and write are atomic against concurrent callers. A missing row,
+    or a row holding a legacy non-versioned key, compares as changed for
+    every component and is (re)written in place in the versioned encoding;
+    fingerprint values equal to the stored ones neither change the row nor
+    touch ``injected_at``. Components absent from ``components`` but present
+    in a valid stored row are preserved unchanged.
+    """
+
+    row = connection.execute(
+        "SELECT context_key FROM context_receipts WHERE orchestrator_session_id = ?",
+        (orchestrator_session_id,),
+    ).fetchone()
+    stored = {} if row is None else (parse_context_components(str(row["context_key"])) or {})
+    changed = frozenset(
+        name for name, value in components.items() if stored.get(name) != value
+    )
+    if not changed:
+        return changed
+    merged = dict(stored)
+    merged.update(components)
+    connection.execute(
+        """INSERT INTO context_receipts (
+               orchestrator_session_id, context_key, injected_at
+           ) VALUES (?, ?, ?)
+           ON CONFLICT(orchestrator_session_id) DO UPDATE SET
+               context_key = excluded.context_key,
+               injected_at = excluded.injected_at""",
+        (orchestrator_session_id, encode_context_components(merged), injected_at),
+    )
+    return changed
+
+
 def insert_event(
     connection: sqlite3.Connection,
     agent_id: AgentId,

@@ -60,7 +60,7 @@ checked = pipeline(oks[:1],
 ```
 
 `agent()` spec fields: `runtime`, `model`, `profile`, `task`, `workdir`,
-optional `write`, `read_roots`, `timeout_seconds`, `output_schema` (the ENGINE
+optional `account`, `write`, `read_roots`, `timeout_seconds`, `output_schema` (the ENGINE
 validates the answer against it; mismatch = failed step with the raw answer
 preserved). Step result: `{"agent_id", "status", "answer", ...}` — always
 check `status`, a failed step returns a dict, not an exception.
@@ -70,12 +70,19 @@ stable specs give stable keys, which is what makes the journal replayable.
 
 ## Runtime-specific step notes
 
+Choose each step's role/model from the existing eligibility matrix, then use
+the first compatible runtime/account/lane in the latest injected Runtime
+priorities. Carry the selected `account` into the step spec; never silently
+drop it. A null/unlabelled account means omit the field. Models must belong to
+the selected quota lane; do not use a Spark-only entry's priority for a
+standard Codex model. Skip an incompatible entry and continue down the list.
+If no summary is available, obtain `capacity_order` (CLI:
+`agent-run capacity order`) once. Do not poll limits or manually recalculate
+quota windows; `limits` is for requested diagnostics. Apply updated priorities
+to work not yet started, without restarting healthy children.
+
 - **codex**: a read-only profile with no `read_roots` and no `write` is
   refused ("no-filesystem"). Give it `read_roots: [workdir]` at minimum.
-  HARD RULE (owner directive, 01.09.2026): codex steps set
-  `"account": "personal2"` until that account's lanes in `limits` are
-  exhausted; only then omit the field to use the default account. Never
-  split codex steps across both accounts to balance load.
   Engine limitation (permanent, codex 0.151.0 schema has no extra-roots
   fields on write threads): codex + external read_roots on a write step
   refuses EARLY with guidance — copy the material into the workdir and omit
@@ -88,10 +95,10 @@ stable specs give stable keys, which is what makes the journal replayable.
   commands in the step brief); read-only children have none, and git commits
   stay with acceptance.
 - **glm**: the claude engine on the Z.ai GLM Coding Plan (subscription
-  quota — watch the glm lane in limits). glm-5.3-flash is the normal step
+  quota reflected in Runtime priorities). glm-5.3-flash is the normal step
   for easy-to-medium coding; glm-5.3 is the escalation for complex steps,
   review, and architecture. Write children have a sandboxed shell.
-- **claude**: watch the capacity advisory before fanning out; sonnet steps
+- **claude**: follow Runtime priorities for eligible steps; sonnet steps
   are the cheap option.
 
 ## Launching and watching
@@ -144,5 +151,5 @@ codes), and keep doing other work. Single agents have the same watchdog:
   succeeded/cancelled/running runs refuse.
 - Cancel is safe and proven: run → cancelled, in-flight step journaled
   `runner_cancelled`, the child agent is cancelled with it, no orphans.
-- A workflow burns quota on every step: intersect the plan with the capacity
-  advisory (delegate skill) before a wide fan-out.
+- A workflow burns quota on every step: use the latest Runtime priorities
+  through the delegate skill when choosing compatible step runtimes.

@@ -202,13 +202,26 @@ window must be fresh and known; a zero window is omitted before scoring.
 Evidence spanning at least one hour projects remaining capacity to reset,
 while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
 at 50%. The worst window defines a nonnegative route score, then a positive
-runtime multiplier scales its priority. Concrete account/model aliases sharing
-the same runtime and physical pool set remain one capacity choice.
+runtime multiplier scales its priority. Optional account and quota-lane weight
+maps override that default, with account taking precedence over lane. Weights
+are absolute replacements, not products. Concrete account/model aliases sharing
+the same runtime and physical pool set remain one capacity choice, with the
+highest applicable alias weight and preferred selector first.
 `agent-run capacity order` exposes that same read-only, role-independent order:
 its first route is highest priority, while the orchestrator still chooses a
 compatible role/model alias and decides whether to launch. The output retains
 deferred evidence, exhausted omissions, unavailable runtimes, and the
 `insufficient_diversity` signal alongside the working routes.
+
+The context hook uses the same capacity-order builder and injects a compact
+English Runtime priorities summary, not raw quota windows. It instructs the
+orchestrator to choose the first compatible route while retaining role/model
+selection. A model-specific quota lane cannot lend its priority to a different
+model on the same runtime/account. Per-session component receipts suppress unchanged visible summaries,
+including when only active-agent context changes; a later return to a previous
+summary is delivered again. Visible rounded priorities and route identities
+determine changes, not observation timestamps or insignificant float tails.
+The diagnostic `limits` view is not a required routing step.
 Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
 terminal, with an idempotent `stats backfill`.
 

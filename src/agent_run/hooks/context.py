@@ -13,11 +13,8 @@ import math
 import time
 from dataclasses import dataclass
 
-from ..capacity import advice as advice_module
-from ..capacity import forecast as forecast_module
-from ..capacity import history as history_module
 from ..config import Config
-from ..domain import ACTIVE, OrchestratorRef
+from ..domain import OrchestratorRef
 from ..errors import ValidationError
 from ..state import StateStore, context_agents
 
@@ -29,13 +26,6 @@ _SILENCE_THRESHOLD_SECONDS = 60.0
 #: Presentation order for capacity lines. Every lane is rendered -- filtering
 #: healthy rows got a healthy lane read as "no data" twice -- but the worst
 #: known risk leads, so the char budget can only ever clip the tail.
-_RISK_ORDER = {
-    forecast_module.RISK_HIGH: 0,
-    forecast_module.RISK_MEDIUM: 1,
-    forecast_module.RISK_UNKNOWN: 2,
-    forecast_module.RISK_LOW: 3,
-}
-_NOT_KNOWN_ORDER = 4
 
 
 @dataclass(frozen=True)
@@ -53,6 +43,13 @@ def build_context(
     config: Config,
     now: float | None = None,
 ) -> ContextResult:
+    """Return newly changed visible context blocks for one orchestrator ref.
+
+    ``store`` is read and receipt-written on its owning thread; ``ref`` scopes
+    deduplication, ``config`` supplies the bounded budget, and ``now`` is an
+    optional finite epoch. A zero budget returns an empty, non-injected result
+    without recording a receipt.
+    """
     if not isinstance(store, StateStore):
         raise ValidationError("store must be a StateStore")
     if not isinstance(ref, OrchestratorRef):
@@ -65,56 +62,50 @@ def build_context(
     at = float(at)
     session_id = store.find_orchestrator_session(ref)
 
-    capacity_text, capacity_key = _capacity_block(
-        store, at, config.capacity.sample_retention
-    )
+    capacity_text = _capacity_block(store, config, at)
     agents = () if session_id is None else _active_agents(store, session_id, at)
     active_text, active_key = _active_block(agents, at)
-    context_key = _combine_key(capacity_key, active_key)
     budget = min(max(config.capacity.context_max_chars, 0), CONTEXT_HARD_LIMIT_CHARS)
-    text = _assemble(capacity_text, active_text, budget)
-
-    session_id, changed = store.record_context_receipt_for_ref(ref, context_key, at=at)
-    return ContextResult(session_id, context_key, text if changed else "", changed)
-
-
-def _advice_order(item: advice_module.CapacityAdvice) -> tuple[int, str, str, str, str, str]:
-    """Sort key putting the worst-known lanes first and no-data lanes last.
-
-    Known lanes order by risk severity -- high, then medium, then any known
-    lane carrying an unrecognized risk -- followed by low. Lanes with no data
-    sort after every known lane. Ties break on the stable identity tuple, so
-    the same advice always renders in the same order regardless of how the
-    samples were collected.
-    """
-
-    rank = (
-        _RISK_ORDER.get(item.risk, _RISK_ORDER[forecast_module.RISK_UNKNOWN])
-        if item.known
-        else _NOT_KNOWN_ORDER
+    priority_text, active_text, active_slot = _assemble(capacity_text, active_text, budget)
+    components = {}
+    if priority_text:
+        components["priority"] = hashlib.sha256(priority_text.encode()).hexdigest()
+    if active_text:
+        components["active"] = hashlib.sha256(f"{active_slot}:{active_key}".encode()).hexdigest()
+    if not components:
+        return ContextResult(session_id, _combine_key("", active_key), "", False)
+    session_id, changed = store.record_context_components_for_ref(ref, components, at=at)
+    text = "\n".join(
+        value for name, value in (("priority", priority_text), ("active", active_text))
+        if name in changed
     )
-    key = item.key
-    return (rank, key.runtime, key.lane, key.window, key.target or "", key.source)
+    return ContextResult(session_id, _combine_key(components.get("priority", ""), components.get("active", "")), text, bool(text))
 
 
-def _capacity_block(
-    store: StateStore, at: float, retention: int
-) -> tuple[str, str]:
-    series = history_module.load_series(store, retention=retention)
-    forecasts = forecast_module.build_forecasts(series, now=at)
-    items = advice_module.build_advice(forecasts)
-    key = advice_module.advice_key(items)
+def _capacity_block(store: StateStore, config: Config, at: float) -> str:
+    """Render ordered, JSON-safe route selectors without raw measurements."""
+    from ..capacity.order import build_capacity_order
+    import json
+
+    order = build_capacity_order(store, config, now=at)
     lines = [
-        (
-            f"{advice_module.capacity_label(item.key)}: "
-            f"{'unknown' if item.remaining_percent is None else f'{item.remaining_percent:.0f}%'} "
-            f"remaining, risk={item.risk}"
-        )
-        for item in sorted(items, key=_advice_order)
+        "Runtime priorities (highest first). Choose the first compatible subagent using the role/model table. A route applies only to a model belonging to its quota lane; if incompatible, skip the entire entry. account=null means omit the account selector. Do not recheck raw limits."
     ]
-    summary = "unknown" if not items else "; ".join(lines)
-    text = f"Capacity: {summary}."
-    return text, key
+    if not order.routes:
+        lines.append("No currently available routes.")
+    for index, route in enumerate(order.routes, 1):
+        selectors = []
+        for alias in route.aliases:
+            selector = {"quota_lane": alias.quota_lane}
+            if alias.account is not None:
+                selector["account"] = alias.account
+            selectors.append(selector)
+        lines.append(
+            f"{index}. runtime={json.dumps(route.runtime)}; "
+            f"selectors={json.dumps(selectors, separators=(',', ':'))}; "
+            f"priority={route.priority:.3f}"
+        )
+    return "\n".join(lines)
 
 
 def _active_agents(
@@ -176,9 +167,28 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def _assemble(capacity_text: str, active_text: str, budget: int) -> str:
-    active_text = _truncate(active_text, ACTIVE_BLOCK_MAX_CHARS)
-    remaining_for_capacity = max(budget - len(active_text) - 1, 0)
-    capacity_text = _truncate(capacity_text, remaining_for_capacity)
-    parts = [part for part in (capacity_text, active_text) if part]
-    return _truncate("\n".join(parts), budget)
+def _truncate_priority(text: str, limit: int) -> str:
+    """Keep complete priority lines and an omission instruction within ``limit``."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    lines = text.splitlines()
+    hint = "More routes omitted; use capacity_order if needed"
+    if not lines or len(lines[0]) + 1 + len(hint) > limit:
+        return ""
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if len("\n".join((*kept, line, hint))) > limit:
+            break
+        kept.append(line)
+    return "\n".join((*kept, hint))
+
+
+def _assemble(capacity_text: str, active_text: str, budget: int) -> tuple[str, str, int]:
+    """Reserve fixed slots so active-agent changes cannot resize priorities."""
+    active_slot = min(ACTIVE_BLOCK_MAX_CHARS, budget)
+    priority_slot = max(budget - active_slot - 1, 0)
+    active = _truncate(active_text, active_slot)
+    priority = _truncate_priority(capacity_text, priority_slot)
+    return priority, active, active_slot

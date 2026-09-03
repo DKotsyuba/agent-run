@@ -157,8 +157,9 @@ Notes for the loop:
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
-- Model rosters and health come from `models`; remaining quota and risk
-  from `limits`. Check them before fanning out work.
+- Model rosters and health come from `models`. Choose the first compatible
+  route from the injected Runtime priorities; if absent, obtain `capacity_order`.
+  Do not repeatedly query `limits` for routing; it remains a diagnostic view.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit

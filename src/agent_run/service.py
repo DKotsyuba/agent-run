@@ -822,44 +822,9 @@ class AgentService:
         runtimes with no fresh topology evidence are reported unavailable.
         """
 
-        from .capacity.ranking import CapacityOrder, rank_capacity_routes
-        from .capacity.snapshot import CapacityRouteSnapshot, build_capacity_routes
+        from .capacity.order import build_capacity_order
 
-        observed_at = self._now()
-        enabled = {
-            name: runtime
-            for name, runtime in self._config.runtimes.items()
-            if runtime.enabled
-        }
-        snapshot = build_capacity_routes(
-            self._store,
-            retention=self._config.capacity.sample_retention,
-            now=observed_at,
-        )
-        filtered = CapacityRouteSnapshot(
-            tuple(route for route in snapshot.routes if route.descriptor.runtime in enabled),
-            tuple(item for item in snapshot.deferred if item.runtime in enabled),
-            tuple(item for item in snapshot.unavailable if item.runtime in enabled),
-        )
-        order = rank_capacity_routes(
-            filtered,
-            {name: runtime.priority_multiplier for name, runtime in enabled.items()},
-            now=observed_at,
-        )
-        evidenced = {
-            route.descriptor.runtime for route in filtered.routes
-        } | {item.runtime for item in filtered.deferred} | {
-            item.runtime for item in filtered.unavailable
-        }
-        unavailable = tuple(sorted(set(order.unavailable_runtimes) | (set(enabled) - evidenced)))
-        return CapacityOrder(
-            order.observed_at,
-            order.routes,
-            order.deferred,
-            order.omitted,
-            unavailable,
-            order.insufficient_diversity,
-        )
+        return build_capacity_order(self._store, self._config, now=self._now())
 
     def _runtime_config(self, name: str) -> RuntimeConfig:
         try:

@@ -53,6 +53,13 @@ Each `[runtimes.<name>]` table may declare:
 - `priority_multiplier` — positive finite number, default `1.0`; multiplies
   this runtime's nonnegative capacity-order score. It cannot make an exhausted
   route usable and does not affect role/model suitability.
+- `priority_account_multipliers` / `priority_lane_multipliers` — optional
+  tables of opaque account labels or quota-lane names to positive finite
+  weights. Account overrides lane, lane overrides `priority_multiplier`;
+  these are absolute replacements, not multiplied factors. Shared-pool aliases
+  use the highest applicable weight and remain one capacity choice.
+  Account overrides match explicit route labels; unlabelled routes use the
+  lane/runtime fallback.
 
 Declaring a key with an unsupported value fails closed at load time
 (`ValidationError`), not silently at first use.

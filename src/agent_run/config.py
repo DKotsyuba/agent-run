@@ -78,7 +78,8 @@ class RuntimeConfig:
     """Static configuration for one arbitrary runtime name.
 
     ``priority_multiplier`` is a positive finite routing weight. It is applied
-    only to that runtime's capacity priority and defaults to ``1.0``.
+    only to that runtime's capacity priority and defaults to ``1.0``. Account
+    and quota-lane mappings optionally override it for opaque descriptors.
     """
 
     enabled: bool
@@ -97,6 +98,8 @@ class RuntimeConfig:
     accounts: tuple[str, ...] = ()
     default_account: str | None = None
     priority_multiplier: float = 1.0
+    priority_account_multipliers: Mapping[str, float] = field(default_factory=dict)
+    priority_lane_multipliers: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,30 @@ def _names(value: object, path: str) -> tuple[str, ...]:
         if not _ASSET_NAME.fullmatch(name):
             raise ValidationError(f"{path}[{index}] must be a name, not a path")
     return names
+
+
+def _priority_multipliers(value: object, path: str) -> Mapping[str, float]:
+    """Validate and freeze a name-to-positive-finite-priority mapping.
+
+    ``value`` must be a mapping whose nonblank string keys identify opaque
+    accounts or lanes and whose values are numeric, non-boolean, finite
+    factors greater than zero.  The returned read-only mapping contains
+    normalized ``float`` values; missing mappings are supplied by callers as
+    ``{}``.  Invalid container, key, or factor values raise ``ValidationError``.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValidationError(f"{path} must be a mapping")
+    result: dict[str, float] = {}
+    for key, factor in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError(f"{path} keys must be nonblank strings")
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            raise ValidationError(f"{path}.{key} must be a finite number > 0")
+        if not math.isfinite(factor) or factor <= 0:
+            raise ValidationError(f"{path}.{key} must be a finite number > 0")
+        result[key] = float(factor)
+    return MappingProxyType(result)
 
 
 def _bool(value: object, path: str) -> bool:
@@ -430,6 +457,8 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "accounts",
         "default_account",
         "priority_multiplier",
+        "priority_account_multipliers",
+        "priority_lane_multipliers",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -469,6 +498,14 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             or priority_multiplier <= 0
         ):
             raise ValidationError(f"{path}.priority_multiplier must be a finite number > 0")
+        account_multipliers = _priority_multipliers(
+            table.get("priority_account_multipliers", {}),
+            f"{path}.priority_account_multipliers",
+        )
+        lane_multipliers = _priority_multipliers(
+            table.get("priority_lane_multipliers", {}),
+            f"{path}.priority_lane_multipliers",
+        )
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -486,6 +523,8 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             account_names,
             default_account,
             float(priority_multiplier),
+            account_multipliers,
+            lane_multipliers,
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")

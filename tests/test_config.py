@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -446,6 +447,26 @@ names = ["{secret}"]
                 ValidationError, "priority_multiplier"
             ):
                 self.runtime_with_limits_source(f"priority_multiplier = {value}")
+
+    def test_priority_account_and_lane_multipliers_parse_with_defaults(self) -> None:
+        """Account and lane routing maps are immutable and preserve numeric factors."""
+
+        config = self.runtime_with_limits_source(
+            'priority_account_multipliers = { "new-account" = 2.0 }\n'
+            'priority_lane_multipliers = { "new-lane" = 1.5 }\n'
+        )
+        runtime = config.runtimes["fake"]
+        self.assertEqual(runtime.priority_account_multipliers["new-account"], 2.0)
+        self.assertEqual(runtime.priority_lane_multipliers["new-lane"], 1.5)
+        with self.assertRaises(TypeError):
+            cast(dict[str, float], runtime.priority_account_multipliers)["x"] = 1.0
+
+    def test_priority_maps_reject_bad_shapes_keys_and_factors(self) -> None:
+        """Reject non-mappings, blank keys, booleans, and nonpositive/nonfinite values."""
+
+        for value in ("[]", '{ "" = 1.0 }', '{ "x" = true }', '{ "x" = 0 }', '{ "x" = -1 }', '{ "x" = nan }', '{ "x" = inf }'):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                self.runtime_with_limits_source(f"priority_account_multipliers = {value}")
 
 
 if __name__ == "__main__":

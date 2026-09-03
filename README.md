@@ -40,9 +40,9 @@ you / your agent / your app
   agent may read or write is explicit (`--write`, `--read-root`).
 - **Quota-aware.** A capacity collector samples remaining limits per
   provider (native engine data, [codexbar](https://github.com/steipete/codexbar),
-  or a local router), computes exhaustion risk from burn rate, and serves
-  it via `limits` — so an orchestrator can route work to the lane that has
-  headroom.
+  or a local router), computes usage priorities from burn rate and reset time,
+  and injects an ordered summary when it changes. The orchestrator chooses the
+  first role-compatible route; `limits` remains available for diagnostics.
 - **Zero dependencies.** Python 3.11+ standard library only. The whole
   runtime installs from `pyproject.toml` with nothing else.
 
@@ -111,6 +111,12 @@ declared MCP servers, lifecycle hooks, plugins, and the limits source
 `priority_multiplier = 1.0` is the optional positive finite weight used by
 capacity ordering; it scales only viable routes and never revives an exhausted
 window.
+
+Optional `priority_account_multipliers` and `priority_lane_multipliers` tables
+override that weight for an account or quota lane: account wins over lane,
+which wins over the runtime default. Values are absolute weights, not products;
+all must be positive and finite. Shared-pool aliases remain one capacity choice,
+using the highest applicable weight rather than adding their weights.
 
 For Codex, `codex_appserver` reads each configured account through a
 short-lived local app-server process. Standard and model-specific buckets
