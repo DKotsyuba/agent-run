@@ -233,7 +233,7 @@ class CliTests(unittest.TestCase):
             self.assertIn(AGENT_ID, output.getvalue())
 
     def test_auth_runs_codex_login_in_account_home(self):
-        """Run account login with the configured binary's canonical path."""
+        """Run account login without resolving away the configured launcher path."""
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             (home / "config.toml").write_text('''schema_version = 1
@@ -266,7 +266,7 @@ target = "auth.json"
                 output, error = stdout.getvalue(), stderr.getvalue()
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output), {"account": "personal2", "runtime": "codex", "status": "ok"})
-        binary = str(Path("/bin/codex").resolve())
+        binary = "/bin/codex"
         self.assertEqual(calls[0][0], [binary, "login"])
         self.assertEqual(calls[1][0], [binary, "login", "status"])
         self.assertEqual(Path(calls[0][1]["env"]["CODEX_HOME"]).resolve(), home.resolve() / "accounts" / "codex" / "personal2")
