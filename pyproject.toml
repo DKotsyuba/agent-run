@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-run"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local supervisor for durable, isolated coding-agent runs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,7 @@ release = ["build>=1.2", "twine>=5.0"]
 
 [project.scripts]
 agent-run = "agent_run.cli:main"
+agent-run-tui = "agent_run_tui.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/DKotsyuba/agent-run"

@@ -24,6 +24,12 @@ class StubService:
         self.call_threads.append(threading.get_ident())
         return {"ok": True}
 
+    def list_orchestrators(self, *, limit=100):
+        """Return a deterministic response used to prove socket dispatch."""
+
+        self.calls.append(("list_orchestrators", limit))
+        return {"limit": limit}
+
 
 @dataclass(frozen=True)
 class _AgentView:
@@ -99,6 +105,12 @@ class ApiSocketTests(unittest.TestCase):
     def test_successful_tool_round_trip(self):
         response = self.request({"jsonrpc": "2.0", "id": 1, "method": "limits", "params": {}})
         self.assertEqual(response["result"], {"ok": True})
+
+    def test_list_orchestrators_round_trip(self):
+        response = self.request({
+            "jsonrpc": "2.0", "id": 1, "method": "list_orchestrators", "params": {"limit": 7},
+        })
+        self.assertEqual(response["result"], {"limit": 7})
 
     def test_unknown_method_and_validation_error(self):
         unknown = self.request({"jsonrpc": "2.0", "id": 1, "method": "missing"})

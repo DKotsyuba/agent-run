@@ -77,11 +77,25 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-The tool set (18 at the time of writing, same names as the MCP server):
+The tool set (19 at the time of writing, same names as the MCP server):
 `start`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
-`list_agents`, `models`, `limits`, `capacity_order`, `fast`, `doc`, and the workflow verbs
-`workflow_start`, `workflow_status`, `workflow_answer`, `workflow_cancel`,
-`workflow_resume`.
+`list_agents`, `list_orchestrators`, `models`, `limits`, `capacity_order`,
+`fast`, `doc`, and the workflow verbs `workflow_start`, `workflow_status`,
+`workflow_answer`, `workflow_cancel`, `workflow_resume`.
+
+`list_orchestrators` (optional `limit`, default 100, max 1000) is a read-only
+view of the orchestrator sessions that launched agents. Each item carries
+`session_id`, `transport`, `external_session_id`, `external_turn_id`,
+`created_at`, `last_seen_at`, and two counters: `active` (children in a
+non-terminal status) and `total`. Items are ordered by `active` descending,
+then `last_seen_at` descending. When agents were launched without an
+orchestrator binding, one synthetic item with `session_id: null` and empty
+`transport` carries their counters; it is absent when no such agents exist.
+The page reports `total` (exact number of items available) and `complete`.
+
+Agent views returned by `status`, `list_agents`, and `summary` include
+`effort` — the reasoning effort requested at launch, or `null` when the
+request did not set one.
 
 `capacity_order` takes no parameters. It returns fresh non-exhausted physical
 quota routes in descending priority, plus deferred evidence, exhausted
