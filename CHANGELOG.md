@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.3] - 2026-09-04
+
+- fix(glm): preserve bounded stderr diagnostics
+- docs(release): add one-command operational runbook
+- feat(release): automate verified publication and local deployment
+
 ## [0.6.2] - 2026-09-04
 
 - Prevented accepted starts from being marked lost while a live coordinator is
