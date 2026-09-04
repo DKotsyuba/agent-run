@@ -68,6 +68,41 @@ class TitleResolverTests(unittest.TestCase):
             self.assertEqual(resolver.resolve("codex_queue", "abcdefgh"), ("Thread", "/codex"))
             self.assertEqual(resolver.resolve("unknown", "123456789"), ("12345678", None))
 
+    def test_transcript_paths_are_cached_until_missing_or_retry_due(self) -> None:
+        """A found path is reused without globbing; misses re-glob only after 30 s; a vanished file re-globs."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "claude"
+            path = home / "projects" / "slug" / "cached01.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"type":"custom-title","customTitle":"one"}\n')
+            now = [0.0]
+            resolver = TitleResolver(claude_home=home, clock=lambda: now[0])
+            real_glob, patterns = Path.glob, []
+
+            def counting_glob(self: Path, pattern: str, *args: object, **kwargs: object):
+                """Record ``pattern`` and delegate to the real ``Path.glob``."""
+                patterns.append(pattern)
+                return real_glob(self, pattern, *args, **kwargs)
+
+            with patch.object(Path, "glob", counting_glob):
+                self.assertEqual(resolver.resolve("claude_uds", "cached01")[0], "one")
+                self.assertEqual(len(patterns), 1)
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write('{"type":"custom-title","customTitle":"two"}\n')
+                self.assertEqual(resolver.resolve("claude_uds", "cached01")[0], "two")
+                self.assertEqual(len(patterns), 1)
+
+                self.assertEqual(resolver.resolve("claude_uds", "missing1")[0], "missing1")
+                resolver.resolve("claude_uds", "missing1")
+                self.assertEqual(len(patterns), 2)
+                now[0] = 30.0
+                resolver.resolve("claude_uds", "missing1")
+                self.assertEqual(len(patterns), 3)
+
+                path.unlink()
+                resolver.resolve("claude_uds", "cached01")
+                self.assertEqual(len(patterns), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

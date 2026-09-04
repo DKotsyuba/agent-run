@@ -24,6 +24,16 @@ Options:
 If the socket is missing, the status bar shows the error and the last
 successful snapshot stays on screen; the dashboard keeps retrying.
 
+Data is loaded on a background thread: the key loop only picks up the newest
+finished snapshot, so keys, mouse and the spinner never wait for socket or
+file I/O (a `⟳` in the header hint marks a load in progress). `--refresh` is
+the pause between the end of one load and the start of the next; `r` starts
+the next load immediately. The cursor follows the selected session and agent
+by id, not by row: when a session becomes active and jumps to the top, or an
+agent moves from running to finished, the selection stays on it (a finished
+agent stays selected only while the finished section is expanded; otherwise
+the cursor falls back to the nearest active card).
+
 ## Screens
 
 The layout adapts to the terminal width, caps the content width at 72 columns,

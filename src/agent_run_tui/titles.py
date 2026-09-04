@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from collections.abc import Callable
 from pathlib import Path
+
+#: Seconds before a transcript lookup that found nothing is globbed again.
+MISS_RETRY_SECONDS = 30.0
 
 
 class TitleResolver:
     """Resolve session metadata from append-only local Claude and Codex indexes."""
 
-    def __init__(self, claude_home: Path | None = None, codex_home: Path | None = None) -> None:
-        """Set optional homes, defaulting to the current user's runtime homes."""
+    def __init__(self, claude_home: Path | None = None, codex_home: Path | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        """Set optional homes, defaulting to the current user's runtime homes; ``clock`` times glob retries."""
         self.claude_home = claude_home or Path.home() / ".claude"
         self.codex_home = codex_home or Path.home() / ".codex"
+        self.clock = clock
         self._positions: dict[str, tuple[int, int]] = {}
         self._records_by_path: dict[str, list[dict]] = {}
+        self._paths: dict[tuple[str, str], tuple[tuple[Path, ...], float]] = {}
 
     def resolve(self, transport: str, external_session_id: str) -> tuple[str, str | None]:
         """Return ``(title, cwd)`` or a safe fallback without unsafe path access.
@@ -38,10 +46,27 @@ class TitleResolver:
     def _files(self, transport: str, external_id: str) -> list[Path]:
         """Return relevant candidate files whose mtimes invalidate cached metadata."""
         if transport == "claude_uds":
-            return list(self.claude_home.glob(f"projects/*/{external_id}.jsonl")) + [self.claude_home / "history.jsonl"]
+            return self._glob(transport, external_id, self.claude_home, f"projects/*/{external_id}.jsonl") + [self.claude_home / "history.jsonl"]
         if transport == "codex_queue":
-            return [self.codex_home / "session_index.jsonl"] + list(self.codex_home.glob(f"sessions/**/rollout-*-{external_id}.jsonl"))
+            return [self.codex_home / "session_index.jsonl"] + self._glob(transport, external_id, self.codex_home, f"sessions/**/rollout-*-{external_id}.jsonl")
         return []
+
+    def _glob(self, transport: str, external_id: str, home: Path, pattern: str) -> list[Path]:
+        """Return the transcript paths for a session, globbing only when the cache cannot answer.
+
+        A hit is reused while every cached file still exists; a miss is
+        retried after ``MISS_RETRY_SECONDS`` so a session whose transcript
+        appears later is still picked up without a glob on every refresh.
+        """
+        key = (transport, external_id)
+        cached, looked_up = self._paths.get(key, ((), float("-inf")))
+        if cached and all(path.exists() for path in cached):
+            return list(cached)
+        if not cached and self.clock() - looked_up < MISS_RETRY_SECONDS:
+            return []
+        found = tuple(home.glob(pattern))
+        self._paths[key] = (found, self.clock())
+        return list(found)
 
     def _records(self, path: Path):
         """Yield cached records, parsing only appended bytes up to 64 KiB per line."""

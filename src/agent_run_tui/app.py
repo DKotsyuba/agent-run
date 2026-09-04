@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import curses
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
-from .model import Snapshot
+from .model import AgentCard, Snapshot
 from .render import MAX_WIDTH, Line, display_width, host_runtime, render_agents, render_header, render_sessions, truncate
 
 
@@ -72,12 +73,90 @@ def read_key(stdscr: curses.window) -> int | str:
         return stdscr.getch()
 
 
+def _position(ids: Iterable[str], wanted: str | None, fallback: int) -> int:
+    """Return the index of ``wanted`` in ``ids``, or ``fallback`` when absent."""
+    for index, candidate in enumerate(ids):
+        if candidate == wanted:
+            return index
+    return fallback
+
+
+class SnapshotWorker:
+    """Run ``loader`` on a daemon thread so the curses loop never waits on I/O.
+
+    The thread loads, publishes the result under a lock, then sleeps
+    ``refresh_seconds`` on an event that :meth:`request` sets to reload early.
+    A failing load keeps the previous snapshot and records the error text.
+    ``updated`` is set after every attempt so callers (and tests) can wait
+    deterministically instead of polling.
+    """
+
+    def __init__(self, loader: Callable[[float], Snapshot], refresh_seconds: float, clock: Callable[[], float] = time.time) -> None:
+        """Bind the loader and interval without starting the thread."""
+        self.loader = loader
+        self.refresh_seconds = refresh_seconds
+        self.clock = clock
+        self.busy = False
+        self.updated = threading.Event()
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stopped = False
+        self._snapshot: Snapshot | None = None
+        self._error: str | None = None
+        self._observed_at = 0.0
+        self._thread = threading.Thread(target=self._loop, name="agent-run-tui-loader", daemon=True)
+
+    def start(self) -> None:
+        """Start the loader thread; the first load begins immediately."""
+        self._thread.start()
+
+    def request(self) -> None:
+        """Ask for a reload now instead of after the remaining interval."""
+        self._wake.set()
+
+    def stop(self) -> None:
+        """Stop the loop and wait briefly for the thread; a stuck load is abandoned."""
+        self._stopped = True
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def latest(self) -> tuple[Snapshot | None, str | None, float]:
+        """Return ``(snapshot, error, observed_at)`` of the last attempt without blocking."""
+        with self._lock:
+            return self._snapshot, self._error, self._observed_at
+
+    def _loop(self) -> None:
+        """Load, publish, then wait for the interval or an early request, until stopped."""
+        while not self._stopped:
+            self._wake.clear()
+            self.busy = True
+            now = self.clock()
+            snapshot: Snapshot | None = None
+            error: str | None = None
+            try:
+                snapshot = self.loader(now)
+            except Exception as exc:  # The injected loader is an external boundary.
+                error = str(exc) or exc.__class__.__name__
+            with self._lock:
+                if snapshot is not None:
+                    self._snapshot = snapshot
+                self._error = error
+                self._observed_at = now
+            self.busy = False
+            self.updated.set()
+            if not self._stopped:
+                self._wake.wait(self.refresh_seconds)
+
+
 class Dashboard:
     """Display snapshots supplied by ``loader`` in a small curses dashboard.
 
     ``loader`` receives epoch seconds and may raise; failures retain the prior
-    snapshot and are displayed in the status row.  Refresh and spinner periods
-    are seconds and are clamped to a small positive timeout for curses polling.
+    snapshot and are displayed in the status row.  The loader runs only on a
+    :class:`SnapshotWorker` thread every ``refresh_seconds``; the key loop
+    polls at ``spinner_seconds`` and never blocks on it.  Selection follows the
+    session/agent id across snapshots, not the row position.
     """
 
     def __init__(
@@ -91,9 +170,12 @@ class Dashboard:
         self.refresh_seconds = max(0.05, refresh_seconds)
         self.spinner_seconds = max(0.05, spinner_seconds)
         self.snapshot = Snapshot(observed_at=0.0)
+        self.worker: SnapshotWorker | None = None
         self.screen = "sessions"
         self.session_index = 0
         self.agent_index = 0
+        self.session_id: str | None = None
+        self.agent_id: str | None = None
         self.finished_expanded = False
         self.scroll = 0
         self.card_rows: dict[int, int] = {}
@@ -107,32 +189,43 @@ class Dashboard:
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         stdscr.keypad(True)
         self.styles = init_styles()
-        last_reload = 0.0
-        while True:
-            now = time.time()
-            if now - last_reload >= self.refresh_seconds:
-                self._reload(now)
-                last_reload = now
-            self._draw(stdscr)
-            active = any(agent.active for cards in self.snapshot.agents.values() for agent in cards)
-            timeout = self.spinner_seconds if active else self.refresh_seconds
-            stdscr.timeout(max(1, int(timeout * 1000)))
-            key = read_key(stdscr)
-            if key == -1:
-                if active:
-                    self.tick += 1
-                continue
-            if self._handle_key(key):
-                return
-
-    def _reload(self, now: float) -> None:
-        """Refresh the snapshot, retaining the last usable one on loader failure."""
+        self.worker = SnapshotWorker(self.loader, self.refresh_seconds)
+        self.worker.start()
         try:
-            self.snapshot = self.loader(now)
-            self.error = None
-        except Exception as exc:  # The injected loader is an external boundary.
-            self.error = str(exc) or exc.__class__.__name__
+            while True:
+                self._pull()
+                self._draw(stdscr)
+                stdscr.timeout(max(1, int(self.spinner_seconds * 1000)))
+                key = read_key(stdscr)
+                if key == -1:
+                    if any(agent.active for cards in self.snapshot.agents.values() for agent in cards):
+                        self.tick += 1
+                    continue
+                if self._handle_key(key):
+                    return
+        finally:
+            self.worker.stop()
+
+    def _pull(self) -> None:
+        """Adopt the worker's newest snapshot and error without waiting."""
+        if self.worker is None:
+            return
+        snapshot, self.error, _ = self.worker.latest()
+        if snapshot is not None and snapshot is not self.snapshot:
+            self._apply(snapshot)
+
+    def _apply(self, snapshot: Snapshot) -> None:
+        """Swap in ``snapshot`` and re-find the selected session and agent by id."""
+        self.snapshot = snapshot
+        self.session_index = _position((card.session_id for card in snapshot.sessions), self.session_id, self.session_index)
         self._clamp_selection()
+        self.agent_index = _position((card.agent_id for card in self._visible_agents()), self.agent_id, self.agent_index)
+
+    def _remember_selection(self) -> None:
+        """Record the ids under the cursor so later snapshots can follow them."""
+        self.session_id = self._selected_session_id()
+        visible = self._visible_agents()
+        self.agent_id = visible[self.agent_index].agent_id if visible else None
 
     def _selected_session_id(self) -> str | None:
         """Return the selected session id, or ``None`` when no card exists."""
@@ -140,13 +233,15 @@ class Dashboard:
             return None
         return self.snapshot.sessions[self.session_index].session_id
 
+    def _visible_agents(self) -> tuple[AgentCard, ...]:
+        """Return selectable cards of the selected session: active ones first, finished only when expanded."""
+        session_id = self._selected_session_id()
+        cards = self.snapshot.agents.get(session_id, ()) if session_id is not None else ()
+        return cards if self.finished_expanded else tuple(card for card in cards if card.active)
+
     def _agent_count(self) -> int:
         """Return selectable cards for the current agent view."""
-        session_id = self._selected_session_id()
-        if session_id is None:
-            return 0
-        cards = self.snapshot.agents.get(session_id, ())
-        return len(cards) if self.finished_expanded else sum(card.active for card in cards)
+        return len(self._visible_agents())
 
     def _clamp_selection(self) -> None:
         """Keep indices valid after refreshes and section toggles."""
@@ -169,7 +264,8 @@ class Dashboard:
         if action == "quit":
             return True
         if action == "reload":
-            self._reload(time.time())
+            if self.worker is not None:
+                self.worker.request()
         elif action == "down":
             self._move(1)
         elif action == "up":
@@ -185,6 +281,7 @@ class Dashboard:
             self.scroll = 0
         elif action == "mouse":
             self._handle_mouse()
+        self._remember_selection()
         return False
 
     def _open_session(self) -> None:
@@ -211,14 +308,15 @@ class Dashboard:
 
     def _lines(self, width: int) -> tuple[str, str, list[Line], int]:
         """Return header title, key hint, body lines and the selected card index."""
+        loading = "⟳ " if self.worker is not None and self.worker.busy else ""
         if self.screen == "sessions":
             lines = render_sessions(self.snapshot, width, self.session_index)
-            return "agent-run · sessions", "q quit · r reload", lines, self.session_index
+            return "agent-run · sessions", loading + "q quit · r reload", lines, self.session_index
         session = self.snapshot.sessions[self.session_index] if self.snapshot.sessions else None
         session_id = session.session_id if session else ""
         left = f"◀ {session.title} · {host_runtime(session.transport)}" if session else "◀ agents"
         lines = render_agents(self.snapshot, session_id, width, self.agent_index, self.finished_expanded, self.tick)
-        return left, "h back · tab finished · r reload · q quit", lines, self.agent_index
+        return left, loading + "h back · tab finished · r reload · q quit", lines, self.agent_index
 
     def _draw(self, stdscr: curses.window) -> None:
         """Draw the current screen, keeping the selected card inside the viewport.

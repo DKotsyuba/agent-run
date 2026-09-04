@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import curses
+import threading
 import unittest
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from agent_run_tui.app import Dashboard, normalize_key
+from agent_run_tui.app import Dashboard, SnapshotWorker, normalize_key
 from agent_run_tui.model import AgentCard, SessionCard, Snapshot
 
 
@@ -132,6 +133,100 @@ class ScrollTests(unittest.TestCase):
         view._draw(FakeScreen(6, 40))
         self.assertEqual(view.scroll, 32)
         self.assertEqual(view.card_rows, {2: 5, 3: 5, 4: 5})
+
+
+class GatedLoader:
+    """Counting loader that blocks on ``gate`` and raises once ``fail`` is set."""
+
+    def __init__(self) -> None:
+        """Start with an open call counter, a closed gate and no failure."""
+        self.gate = threading.Event()
+        self.started = threading.Event()
+        self.calls = 0
+        self.fail = False
+
+    def __call__(self, now: float) -> Snapshot:
+        """Record the call, wait for the gate, then return a numbered snapshot or raise."""
+        self.calls += 1
+        self.started.set()
+        self.gate.wait(2)
+        if self.fail:
+            raise RuntimeError("boom")
+        return Snapshot(float(self.calls))
+
+
+class WorkerTests(unittest.TestCase):
+    """Check that the background loader never blocks the dashboard."""
+
+    def test_latest_never_blocks_and_errors_keep_the_previous_snapshot(self) -> None:
+        """A load in flight leaves ``latest`` empty; ``request`` reloads early; failures keep data."""
+        loader = GatedLoader()
+        worker = SnapshotWorker(loader, refresh_seconds=60)
+        worker.start()
+        self.assertTrue(loader.started.wait(1))
+        self.assertTrue(worker.busy)
+        self.assertEqual(worker.latest(), (None, None, 0.0))
+        loader.gate.set()
+        self.assertTrue(worker.updated.wait(1))
+        snapshot, error, observed_at = worker.latest()
+        self.assertEqual((snapshot.observed_at, error), (1.0, None))
+        self.assertGreater(observed_at, 0.0)
+
+        worker.updated.clear()
+        loader.fail = True
+        worker.request()
+        self.assertTrue(worker.updated.wait(1))
+        self.assertEqual(loader.calls, 2)
+        self.assertEqual(worker.latest()[:2], (snapshot, "boom"))
+        view = Dashboard(loader)
+        view.worker = worker
+        view._pull()
+        self.assertIs(view.snapshot, snapshot)
+        self.assertEqual(view.error, "boom")
+        worker.stop()
+        self.assertFalse(worker._thread.is_alive())
+
+    def test_stop_without_start_returns(self) -> None:
+        """Stopping a worker that never ran is a no-op."""
+        SnapshotWorker(GatedLoader(), refresh_seconds=1).stop()
+
+
+class SelectionTests(unittest.TestCase):
+    """Check that the cursor follows ids, not row positions, across snapshots."""
+
+    def test_selection_follows_the_session_id_when_snapshots_reorder(self) -> None:
+        """A reordered session keeps the cursor; a vanished one falls back by position."""
+        view = dashboard(Snapshot(1.0, (session(0), session(1), session(2))))
+        view._handle_key("j")
+        self.assertEqual(view._selected_session_id(), "s1")
+        view._apply(Snapshot(2.0, (session(1), session(2), session(0))))
+        self.assertEqual((view.session_index, view._selected_session_id()), (0, "s1"))
+        view._apply(Snapshot(3.0, (session(0), session(2))))
+        self.assertEqual(view.session_index, 0)
+        view._apply(Snapshot(4.0, (session(2), session(1))))
+        self.assertEqual(view._selected_session_id(), "s1")
+
+    def test_agents_screen_follows_the_session_and_the_agent(self) -> None:
+        """The opened session stays open; a finished agent stays selected only when expanded."""
+        second = AgentCard("c", "codex", None, None, "running", True, "second", 1.0, None, 1.0, None)
+        second_done = AgentCard("c", "codex", None, None, "succeeded", False, "second", 1.0, 3.0, 2.0, None)
+        before = Snapshot(1.0, (session(0), session(1)), {"s1": (ACTIVE, second, FINISHED)})
+        after = Snapshot(2.0, (session(1), session(0)), {"s1": (ACTIVE, second_done, FINISHED)})
+
+        view = dashboard(before)
+        for key in "jlj":
+            view._handle_key(key)
+        self.assertEqual((view.screen, view.session_id, view.agent_id), ("agents", "s1", "c"))
+        view._apply(after)
+        self.assertIn("session 1", view._lines(60)[0])
+        self.assertEqual((view.session_index, view.agent_index), (0, 0))
+
+        view = dashboard(before)
+        for key in "jl\tj":
+            view._handle_key(key)
+        view._apply(after)
+        self.assertEqual((view.session_index, view.agent_index), (0, 1))
+        self.assertEqual(view._visible_agents()[view.agent_index].agent_id, "c")
 
 
 if __name__ == "__main__":
