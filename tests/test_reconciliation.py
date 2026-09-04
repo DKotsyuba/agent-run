@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
+from agent_run.supervisor import supervisor_identity
 
 
 class UnownedStartingReconciliationTests(unittest.TestCase):
@@ -106,6 +108,49 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
             at=101,
         )
         self.assertTrue(admitted.created)
+
+    def test_live_owner_is_bounded_by_startup_deadline(self) -> None:
+        """A live broker protects preparation only before its fixed deadline."""
+
+        agent_id = self.starting("owned-startup", at=10)
+        self.store.claim_startup(
+            agent_id,
+            f"{os.getpid()} {supervisor_identity()}",
+            at=10,
+            deadline_seconds=120,
+        )
+
+        self.assertEqual(
+            reconcile_unowned_starting(self.store, at=100, grace_seconds=30), ()
+        )
+        self.assertEqual(
+            reconcile_unowned_starting(self.store, at=131, grace_seconds=30),
+            (agent_id,),
+        )
+
+    def test_expired_startup_cannot_bind_a_supervisor(self) -> None:
+        """A delayed supervisor cannot revive an expired accepted start."""
+
+        agent_id = self.starting("expired-bind", at=10)
+        self.store.claim_startup(agent_id, "1 stale", at=10, deadline_seconds=1)
+
+        with self.assertRaisesRegex(ValidationError, "expired startup"):
+            self.store.record_supervisor(
+                agent_id, pid=123, identity="identity", process_group_id=123, at=11
+            )
+
+    def test_owned_supervisor_can_refine_its_group_after_startup_expiry(self) -> None:
+        """A completed handoff does not make later group refinement expire."""
+
+        agent_id = self.starting("refine-after-expiry", at=10)
+        self.store.claim_startup(agent_id, "1 owner", at=10, deadline_seconds=1)
+        self.store.record_supervisor(
+            agent_id, pid=123, identity="identity", process_group_id=123, at=10.5
+        )
+
+        self.store.record_supervisor(
+            agent_id, pid=123, identity="identity", process_group_id=456, at=12
+        )
 
 
 if __name__ == "__main__":

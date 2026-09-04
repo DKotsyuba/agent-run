@@ -32,7 +32,7 @@ from agent_run.errors import SchemaMigrationRequired, ValidationError
 
 _logger = logging.getLogger("agent_run.state")
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # The tables schema v1 created.  A store stamped with a version at or above 1
 # must still have all of them before any migration is allowed to touch it, so

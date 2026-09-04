@@ -527,6 +527,14 @@ class StateStore:
         process_group_id: int,
         at: float | None = None,
     ) -> None:
+        """Record the detached supervisor's immutable ownership proof.
+
+        The first binding for a ``STARTING`` agent must occur before its startup
+        lease expires. Once recorded, the same supervisor may refine its process
+        group after engine launch even if that lease has elapsed; terminal rows
+        and conflicting identities remain rejected.
+        """
+
         agent_id = validate_agent_id(agent_id)
         if (
             isinstance(pid, bool)
@@ -542,6 +550,14 @@ class StateStore:
             agent = agent_row(self.connection, agent_id)
             if AgentStatus(agent["status"]) in TERMINAL:
                 raise StateTransitionError("terminal agent cannot bind a supervisor")
+            deadline = agent["startup_deadline_at"]
+            if (
+                AgentStatus(agent["status"]) is AgentStatus.STARTING
+                and agent["supervisor_pid"] is None
+                and isinstance(deadline, (int, float))
+                and deadline <= timestamp(at)
+            ):
+                raise StateTransitionError("expired startup cannot bind a supervisor")
             fields = ("supervisor_pid", "supervisor_identity", "process_group_id")
             stored = tuple(agent[field] for field in fields)
             if any(value is not None for value in stored) and stored != (
@@ -557,6 +573,67 @@ class StateStore:
                    process_group_id = ?, heartbeat_at = ? WHERE id = ?""",
                 (pid, identity, process_group_id, timestamp(at), agent_id),
             )
+
+    def claim_startup(
+        self,
+        agent_id: str | AgentId,
+        owner_identity: str,
+        *,
+        at: float | None = None,
+        deadline_seconds: float = 120.0,
+    ) -> None:
+        """Durably bind one accepted ``STARTING`` row to its live coordinator owner.
+
+        ``owner_identity`` is a nonblank ``"<pid> <ps command>"`` proof.  The
+        binding is immutable and is valid only until ``deadline_seconds`` after
+        ``at``. A terminal row cannot be claimed. The fixed deadline prevents a
+        live but wedged broker from exempting an abandoned start forever.
+        """
+
+        checked = validate_agent_id(agent_id)
+        nonblank("startup owner identity", owner_identity)
+        if (
+            isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds)
+            or deadline_seconds <= 0
+        ):
+            raise ValidationError("startup deadline must be positive and finite")
+        claimed_at = timestamp(at)
+        with immediate(self.connection):
+            agent = agent_row(self.connection, checked)
+            if AgentStatus(agent["status"]) in TERMINAL:
+                raise StateTransitionError("terminal agent cannot claim startup")
+            if AgentStatus(agent["status"]) is not AgentStatus.STARTING:
+                raise StateTransitionError("startup owner requires starting agent")
+            current = agent["startup_owner_pid_identity"]
+            if current is not None and current != owner_identity:
+                raise StateTransitionError("startup is already owned")
+            if current is None:
+                self.connection.execute(
+                    """UPDATE agents SET startup_owner_pid_identity = ?,
+                       startup_deadline_at = ? WHERE id = ?""",
+                    (owner_identity, claimed_at + float(deadline_seconds), checked),
+                )
+
+    def startup_preparation_live(
+        self, agent_id: str | AgentId, *, at: float | None = None
+    ) -> bool:
+        """Return whether an accepted start may still create its supervisor.
+
+        A worker uses this immediately before spawning. It returns ``False`` for
+        terminal, non-starting, unclaimed, or expired rows, preventing stale
+        queued work from creating a runtime after reconciliation has converged.
+        """
+
+        checked = validate_agent_id(agent_id)
+        row = agent_row(self.connection, checked)
+        deadline = row["startup_deadline_at"]
+        return (
+            row["status"] == AgentStatus.STARTING.value
+            and isinstance(deadline, (int, float))
+            and deadline > timestamp(at)
+        )
 
     def transition(
         self,

@@ -74,7 +74,7 @@ class M008IntegrationTests(unittest.TestCase):
             self.store,
             self.root,
             launch=lambda *args: self.launches.append(args),
-            now=lambda: 100.0,
+            now=time.time,
         )
 
     def tearDown(self) -> None:

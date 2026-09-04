@@ -129,6 +129,8 @@ def _build_poisoned_v5_store(path: Path, run_id: str) -> None:
         # genuine v5 one so migrations 006..end can re-run over it.
         connection.execute("DROP TABLE run_stats")
         connection.execute("DROP TABLE delivery_attempt_evidence")
+        connection.execute("ALTER TABLE agents DROP COLUMN startup_deadline_at")
+        connection.execute("ALTER TABLE agents DROP COLUMN startup_owner_pid_identity")
         connection.execute("PRAGMA user_version=5")
         connection.commit()
     finally:
@@ -151,6 +153,8 @@ class MigrationRegistryTests(unittest.TestCase):
         connection = sqlite3.connect(database)
         try:
             connection.execute("DROP TABLE capacity_route_snapshots")
+            connection.execute("ALTER TABLE agents DROP COLUMN startup_deadline_at")
+            connection.execute("ALTER TABLE agents DROP COLUMN startup_owner_pid_identity")
             connection.execute("PRAGMA user_version = 9")
             connection.commit()
         finally:

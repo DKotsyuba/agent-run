@@ -34,6 +34,9 @@ touch the store or an engine directly.
 agent id before authentication, materialization, adapter preparation, spawn, or
 READY. A bounded worker with its own thread-affine store performs those slow
 steps and launches a **detached supervisor process** that owns the child engine.
+The accepted preparation lease is finite: a worker that has not handed off to
+the supervisor before its deadline is reconciled as `lost`, and cannot revive
+the agent with a late supervisor.
 On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
 the legacy fork path is only a compatibility fallback when session-creating
 spawn is explicitly unavailable.

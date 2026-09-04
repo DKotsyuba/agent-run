@@ -2,6 +2,17 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.2] - 2026-09-04
+
+- Prevented accepted starts from being marked lost while a live coordinator is
+  preparing them or waiting to hand ownership to the supervisor.
+- Bounded preparation ownership to 120 seconds, preserving orphan cleanup and
+  preventing expired or cancelled workers from launching a runtime later.
+- Kept supervisor process-group updates valid after a successful handoff and
+  moved process identity probes outside SQLite write transactions.
+- Added schema v11 startup ownership fields. Restart long-lived agent-run
+  processes and reconnect MCP clients after upgrading.
+
 ## [0.6.1] - 2026-09-04
 
 - Fixed the dashboard reporting the API as unavailable on stores with many

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -38,6 +39,8 @@ from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir,
 from . import workflow_facade
 from .profiles import assign_role, load_profile
 from .start_coordinator import StartCoordinator
+from .state.reconciliation import workflow_owner_identity
+from .supervisor import supervisor_identity
 from .state.store import StateStore
 
 
@@ -385,6 +388,11 @@ class AgentService:
             at=accepted_at,
         )
         try:
+            self._store.claim_startup(
+                creation.agent_id,
+                workflow_owner_identity(os.getpid(), supervisor_identity()),
+                at=accepted_at,
+            )
             self._starts.submit(
                 creation.agent_id,
                 lambda worker_store, cancelled: self._continue_start(
@@ -508,6 +516,9 @@ class AgentService:
                 lambda: cancelled.is_set() or store.has_pending_cancel(agent_id)
             ):
                 if self._cancel_accepted_start(store, cancelled, agent_id):
+                    return
+                if not store.startup_preparation_live(agent_id, at=self._now()):
+                    _logger.warning("start agent_id=%s expired before supervisor spawn", agent_id)
                     return
                 failure_kind = "supervisor_start_failed"
                 self._launch(agent_id, request, adapter, plan, candidate_dir)

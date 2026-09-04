@@ -43,6 +43,8 @@ CREATE TABLE agents (
   answer_path TEXT,
   answer_bytes INTEGER,
   answer_sha256 TEXT,
+  startup_owner_pid_identity TEXT,
+  startup_deadline_at REAL,
   UNIQUE (orchestrator_session_id, request_id)
 );
 
@@ -248,4 +250,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;

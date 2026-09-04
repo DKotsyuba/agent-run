@@ -100,10 +100,13 @@ def reconcile_unowned_starting(
     grace_seconds: float = DEFAULT_UNOWNED_STARTING_GRACE_SECONDS,
     limit: int = 100,
 ) -> tuple[AgentId, ...]:
-    """Converge only stale, wholly unowned ``STARTING`` rows to ``LOST``.
+    """Converge stale or expired ``STARTING`` rows to ``LOST``.
 
-    Selection and terminal transition share one immediate transaction. Recent,
-    owned, and non-``STARTING`` rows are untouched.
+    Candidate selection and process probes run outside the short terminal
+    transition transaction. Recent, supervisor-owned and non-``STARTING`` rows are untouched. A coordinator
+    owner protects preparation only until its durable deadline; probes run
+    outside the short transition transactions so a slow ``ps`` cannot block
+    writers.
     """
 
     from .store import StateStore
@@ -123,20 +126,50 @@ def reconcile_unowned_starting(
     checked_at = timestamp(at)
     cutoff = checked_at - float(grace_seconds)
     changed: list[AgentId] = []
-    with immediate(store.connection):
-        rows = list(
-            store.connection.execute(
-                """SELECT id FROM agents
-                   WHERE status = ? AND created_at <= ?
-                     AND supervisor_pid IS NULL
-                     AND process_group_id IS NULL
-                     AND supervisor_identity IS NULL
-                   ORDER BY created_at, id LIMIT ?""",
-                (AgentStatus.STARTING.value, cutoff, limit),
-            )
+    rows = list(
+        store.connection.execute(
+            """SELECT id, startup_owner_pid_identity, startup_deadline_at
+               FROM agents
+               WHERE status = ? AND supervisor_pid IS NULL
+                 AND process_group_id IS NULL AND supervisor_identity IS NULL
+                 AND (created_at <= ? OR startup_deadline_at <= ?)
+               ORDER BY created_at, id LIMIT ?""",
+            (AgentStatus.STARTING.value, cutoff, checked_at, limit),
         )
-        for row in rows:
-            agent_id = AgentId(str(row["id"]))
+    )
+    for row in rows:
+        agent_id = AgentId(str(row["id"]))
+        deadline = row["startup_deadline_at"]
+        owner_live = False
+        if isinstance(deadline, (int, float)) and deadline > checked_at:
+            owner = row["startup_owner_pid_identity"]
+            if isinstance(owner, str):
+                pid, expected = _split_owner(owner)
+                if pid is not None and expected:
+                    from ..doctor import _probe_process
+
+                    alive, identity, _group_alive = _probe_process(pid, None)
+                    if alive and (
+                        identity is None
+                        or identity == expected
+                        or (isinstance(identity, str) and identity.endswith(f" {expected}"))
+                    ):
+                        owner_live = True
+        if owner_live:
+            continue
+        with immediate(store.connection):
+            current = store.connection.execute(
+                """SELECT status, supervisor_pid, process_group_id, supervisor_identity,
+                          startup_deadline_at FROM agents WHERE id = ?""",
+                (agent_id,),
+            ).fetchone()
+            if current is None or current["status"] != AgentStatus.STARTING.value:
+                continue
+            if any(current[field] is not None for field in ("supervisor_pid", "process_group_id", "supervisor_identity")):
+                continue
+            current_deadline = current["startup_deadline_at"]
+            if current_deadline != deadline:
+                continue
             store._transition(
                 agent_id,
                 AgentStatus.LOST,
