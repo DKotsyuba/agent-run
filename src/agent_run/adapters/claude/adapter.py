@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -40,6 +41,7 @@ from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .limits import agent_rate_limit_samples
 from .materialize import render_mcp_config, render_plugin_dirs, render_settings
+from .stderr import StderrTail
 from .stream import StreamDecoder, classify_failure, sanitize_line, terminal_event_data
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
@@ -361,7 +363,7 @@ class ClaudeAdapter:
             env=dict(plan.environment),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             start_new_session=True,
@@ -417,12 +419,13 @@ def _known_secrets(plan: LaunchPlan) -> frozenset[str]:
 
 
 class ClaudeSession:
-    """A launched Claude Code child process and its stream reader thread.
+    """A launched Claude Code child process and its stream reader threads.
 
     Owns the child from construction until ``wait`` returns; any failure
-    while wiring up the log, the reader thread, or the initial prompt
+    while wiring up the log, stdout/stderr readers, or the initial prompt
     propagates out of ``__init__`` so ``launch`` can native-cancel the
-    process group instead of leaking a running child.
+    process group instead of leaking a running child. Stderr is retained only
+    as a bounded, secret-redacted tail for failed-run classification.
     """
 
     def __init__(self, process: subprocess.Popen, plan: LaunchPlan, sink: EventSink) -> None:
@@ -446,6 +449,7 @@ class ClaudeSession:
         # otherwise-successful engine result to failed.
         self._force_stopped = False
         self._secrets = _known_secrets(plan)
+        self._stderr = StderrTail(process.stderr, self._secrets)
         self._raw_stream = _open_runtime_log(plan.runtime_stream_path)
         try:
             if plan.initial_input and process.stdin is not None:
@@ -454,6 +458,8 @@ class ClaudeSession:
                     process.stdin.flush()
                 except (BrokenPipeError, OSError):
                     pass
+            self._stderr_reader = threading.Thread(target=self._stderr.drain, daemon=True)
+            self._stderr_reader.start()
             self._reader = threading.Thread(target=self._read_stdout, daemon=True)
             self._reader.start()
         except BaseException:
@@ -592,11 +598,12 @@ class ClaudeSession:
             except subprocess.TimeoutExpired:
                 return None
         self._reader.join(timeout=5 if timeout_seconds is None else timeout_seconds)
-        if self._reader.is_alive():
+        self._stderr_reader.join(timeout=5 if timeout_seconds is None else timeout_seconds)
+        if self._reader.is_alive() or self._stderr_reader.is_alive():
             return None
         with self._lock:
             self._raw_stream.close()
-        for pipe in (self._process.stdin, self._process.stdout):
+        for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
             if pipe is not None:
                 try:
                     pipe.close()
@@ -605,6 +612,7 @@ class ClaudeSession:
         if self._reader_error is not None:
             raise self._reader_error
         metadata = self._decoder.finalize()
+        stderr_text = self._stderr.text()
         # A signal-terminated exit code from ``_stop_process`` reflects how
         # agent-run ended an already-answered child, not whether the engine
         # itself succeeded; only a naturally-exited child must report 0.
@@ -632,6 +640,14 @@ class ClaudeSession:
             if error_only_line is not None:
                 failure_kind = "provider_error"
                 failure_text = error_only_line
+            elif metadata.subtype == "no_answer" and stderr_text:
+                classified = classify_failure(
+                    replace(metadata, subtype="", result_text=stderr_text)
+                )
+                failure_kind = (
+                    "provider_error" if classified == "engine_error" else classified
+                )
+                failure_text = stderr_text
             else:
                 empty_result = (
                     exit_ok

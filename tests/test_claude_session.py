@@ -115,6 +115,38 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertEqual(outcome.exit_code, 0)
         self.assertEqual(outcome.failure_kind, "empty_result")
 
+    def test_empty_stdout_preserves_bounded_redacted_stderr_failure(self) -> None:
+        """An exit-1 stderr diagnostic replaces opaque ``no_answer`` safely."""
+
+        secret = "glm-secret-value"
+        script = (
+            "import os, sys\n"
+            "sys.stdin.readline()\n"
+            "sys.stderr.write('x' * 5000 + ' provider refused token=' + os.environ['ANTHROPIC_AUTH_TOKEN'] + '\\n')\n"
+            "raise SystemExit(1)\n"
+        )
+        session = ADAPTER.launch(
+            self.plan(
+                script,
+                environment={"ANTHROPIC_AUTH_TOKEN": secret},
+                adapter_state={"secret_env_names": ("ANTHROPIC_AUTH_TOKEN",)},
+            ),
+            FakeSink(),
+        )
+
+        outcome = session.wait(timeout_seconds=5)
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.FAILED)
+        self.assertEqual(outcome.exit_code, 1)
+        self.assertEqual(outcome.failure_kind, "provider_error")
+        failure_text = outcome.failure_text or ""
+        self.assertIn("provider refused", failure_text)
+        self.assertNotIn(secret, failure_text)
+        self.assertIn("<redacted>", failure_text)
+        self.assertLessEqual(len(failure_text.encode("utf-8")), 4096)
+        self.assertEqual(self.log_path.read_bytes(), b"")
+
     def test_engine_error_labelled_success_never_becomes_failure_kind_success(self) -> None:
         # Shaped byte-for-byte like the live regression (canary agent
         # ag-20260827-062657-dae47a2121): the CLI reports an expired OAuth
