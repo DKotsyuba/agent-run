@@ -80,7 +80,7 @@ def _key(value: object) -> CapacityKey:
 
 
 def _topology(payload: object) -> CapacityTopology:
-    """Parse and validate one persisted topology payload atomically."""
+    """Parse one persisted topology payload, treating bad optional credit metadata as absent."""
 
     if not isinstance(payload, dict):
         raise ValidationError("route payload must be an object")
@@ -105,12 +105,18 @@ def _topology(payload: object) -> CapacityTopology:
         pool_ids = raw.get("pool_ids")
         if not isinstance(pool_ids, list):
             raise ValidationError("route pool_ids must be a list")
+        reset_credits = raw.get("reset_credits")
+        if reset_credits is not None and (
+            not isinstance(reset_credits, int) or isinstance(reset_credits, bool) or reset_credits < 0
+        ):
+            reset_credits = None
         routes.append(CapacityRouteDescriptor(
             _text(raw.get("route_id"), "route_id"),
             _text(raw.get("runtime"), "runtime"),
             account,
             _text(raw.get("quota_lane"), "quota_lane"),
             tuple(_text(item, "pool reference") for item in pool_ids),
+            reset_credits,
         ))
     return validate_topology(pools, routes)
 

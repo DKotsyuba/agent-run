@@ -87,7 +87,11 @@ The tool set (18 at the time of writing, same names as the MCP server):
 quota routes in descending priority, plus deferred evidence, exhausted
 `omitted` routes, and `unavailable_runtimes`. Each working route includes its
 concrete runtime/account/quota-lane aliases, governing windows, raw score,
-configured multiplier, final priority, and limiting exact key/reset. The list
+configured multiplier, manual-reset credit count and its bounded bonus, final
+priority, and limiting exact key/reset. The manual reset bonus is only applied
+to the stable Codex ``codex`` limit id after the route remains eligible: with
+``n`` credits its factor is ``1 + n/(n+1)``. It never creates quota, changes
+forecasts, or restores an exhausted route. The list
 is role-independent: callers still choose the first alias whose models fit the
 task. `insufficient_diversity` is true when fewer than two working physical
 choices remain; the routes list is still authoritative and may contain one or

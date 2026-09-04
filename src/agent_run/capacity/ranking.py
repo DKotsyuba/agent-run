@@ -59,7 +59,9 @@ class RankedCapacityRoute:
     runtime and physical pool set; descriptors are ordered by descending
     effective factor, then by ``route_id``. ``score`` is the unmultiplied
     value in ``[0, 2]`` and
-    ``priority`` equals ``score * multiplier``. ``limiting_key`` and
+    ``priority`` equals ``score * multiplier * reset_credit_multiplier``;
+    ``multiplier`` remains the configured factor and the optional credits are
+    reported separately. ``limiting_key`` and
     ``limiting_reset_at`` belong to the window that produced the minimum
     slack, not merely the earliest reset in the route.
     """
@@ -74,6 +76,8 @@ class RankedCapacityRoute:
     limiting_key: CapacityKey
     limiting_reset_at: float | None
     windows: tuple[CapacityWindowExplanation, ...]
+    reset_credits: int | None = None
+    reset_credit_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -253,7 +257,9 @@ def rank_capacity_routes(
     runtime boundaries. Aliases sharing runtime and pool ids collapse using
     their maximum factor; the canonical alias is ordered by factor descending
     then route id.
-    Exhausted choices are never revived by a multiplier. Invalid arguments
+    Exhausted choices are never revived by either multiplier. A known reset
+    credit count adds only ``1 + n/(n+1)`` after eligibility; aliases use the
+    maximum count once. Invalid arguments
     raise ``ValidationError``.
     """
 
@@ -373,6 +379,11 @@ def rank_capacity_routes(
             ),
             default=checked.get(runtime, 1.0),
         )
+        known_reset_credits = tuple(
+            alias.reset_credits for alias in aliases if alias.reset_credits is not None
+        )
+        reset_credits = max(known_reset_credits, default=0)
+        reset_credit_multiplier = 1.0 + reset_credits / (reset_credits + 1)
         ranked.append(
             RankedCapacityRoute(
                 runtime,
@@ -380,11 +391,13 @@ def rank_capacity_routes(
                 pool_ids,
                 score,
                 multiplier,
-                score * multiplier,
+                score * multiplier * reset_credit_multiplier,
                 min(item.remaining_percent for item in windows),
                 limiting.key,
                 limiting.reset_at,
                 tuple(windows),
+                reset_credits if known_reset_credits else None,
+                reset_credit_multiplier,
             )
         )
         available_runtimes.add(runtime)

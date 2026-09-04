@@ -396,6 +396,7 @@ def persist_slice(store: StateStore, collected: CapacityCollectionSlice) -> None
                     "account": route.account,
                     "quota_lane": route.quota_lane,
                     "pool_ids": list(route.pool_ids),
+                    "reset_credits": route.reset_credits,
                 }
                 for route in collected.topology.routes
             ],

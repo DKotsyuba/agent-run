@@ -68,18 +68,20 @@ def _route(
     *,
     account: str | None = None,
     quota_lane: str = "lane",
+    reset_credits: int | None = None,
 ) -> CapacityRoute:
     """Build one route whose single physical pool governs ``forecasts``.
 
     Identical ``runtime`` and ``pool_id`` values let tests model concrete route
-    aliases without inventing provider-specific names.
+    aliases without inventing provider-specific names. ``reset_credits``
+    supplies optional provider metadata for priority-bonus regression tests.
     """
 
     pool = PhysicalPoolDescriptor(
         pool_id, frozenset(forecast.key for forecast in forecasts)
     )
     descriptor = CapacityRouteDescriptor(
-        route_id, runtime, account, quota_lane, (pool_id,)
+        route_id, runtime, account, quota_lane, (pool_id,), reset_credits
     )
     return CapacityRoute(descriptor, (pool,), forecasts)
 
@@ -363,6 +365,18 @@ class CapacityRankingTests(unittest.TestCase):
                     _snapshot(), {}, now=_NOW,
                     route_multipliers=cast(Mapping[tuple[str, str], float], mapping),
                 )
+
+    def test_manual_reset_credits_are_bounded_and_never_revive_exhaustion(self) -> None:
+        """Credit metadata boosts eligible Codex routes but cannot restore zero windows."""
+
+        one = _route("codex", "one", "one", (_forecast("codex", "one", 80.0),), reset_credits=1)
+        two = _route("codex", "two", "two", (_forecast("codex", "two", 80.0),), reset_credits=2)
+        exhausted = _route("codex", "empty", "empty", (_forecast("codex", "empty", 0.0),), reset_credits=2)
+        order = rank_capacity_routes(_snapshot(one, two, exhausted), {}, now=_NOW)
+        self.assertEqual([item.aliases[0].route_id for item in order.routes], ["two", "one"])
+        self.assertAlmostEqual(order.routes[0].reset_credit_multiplier, 1 + 2 / 3)
+        self.assertAlmostEqual(order.routes[1].reset_credit_multiplier, 1.5)
+        self.assertEqual(order.omitted[0].reason, "exhausted")
 
 
 if __name__ == "__main__":
