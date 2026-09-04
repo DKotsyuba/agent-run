@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.4] - 2026-09-05
+
+- feat(delivery): add failure guidance to completion notices
+
 ## [0.6.3] - 2026-09-04
 
 - fix(glm): preserve bounded stderr diagnostics
