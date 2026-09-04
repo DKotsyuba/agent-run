@@ -4,13 +4,37 @@ The canonical package version is `[project].version` in `pyproject.toml`.
 Releases use annotated Semantic Versioning tags (`vX.Y.Z`); the release workflow
 refuses a tag that does not match the package version.
 
-## One-command release and local update
+## Runbook
 
-From a maintainer checkout, run:
+Start from a clean maintainer checkout at the current `origin/main`. The command
+validates that precondition before changing anything.
+
+| Operation | Command |
+|---|---|
+| Publish and update the local runtime | `python3 scripts/release.py X.Y.Z` |
+| Resume an interrupted release | Run the same command with the same version |
+| Publish without a local update | `python3 scripts/release.py X.Y.Z --publish-only` |
+
+For example:
 
 ```bash
 python3 scripts/release.py 0.6.3
 ```
+
+Wait for the command to finish. Success is reported as:
+
+```text
+Done: v0.6.3 published and local runtime updated. Reconnect existing MCP clients.
+```
+
+If the command fails, preserve its output, `<home>/standalone/deploy.json`, and
+the reported backup directory. Correct the reported cause and run the same
+command again. Do not move an existing tag, delete a backup or deployment
+journal, or point an older runtime at a newer database schema. A failed CI or
+Release workflow remains failed evidence; inspect it before retrying or issuing
+a corrected patch version.
+
+## What the command does
 
 The command waits until the GitHub Release is public, verifies the downloaded
 wheel and sdist against `SHA256SUMS` and GitHub attestations (repository,
