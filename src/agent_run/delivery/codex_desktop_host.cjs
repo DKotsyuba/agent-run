@@ -10,7 +10,7 @@ const LOCAL_LIMIT = 8192, HOST_LIMIT = 8 * 1024 * 1024, HOST_MS = 8000;
 const [python, home, ...pythonArgs] = process.argv.slice(2);
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
 /** The v2 tag in this name advertises rich local-protocol support to clients. */
-const relayPath = path.join(home, `ar-cdx-v2-${process.pid}.sock`);
+const relayPath = path.join(home, `ar-cdx-v3-${process.pid}.sock`);
 
 /** Encode a bounded JSON object as a uint32-LE frame. */
 function frame(value, limit) {
@@ -73,9 +73,10 @@ async function rpc(socket, id, method, params, deadline) {
   return value.result;
 }
 
-/** Exact request shapes: legacy six keys (wire v1) or rich nine keys (wire v2). */
+/** Exact request shapes for legacy v1, selector-rich v2, and failure-aware v3. */
 const LEGACY_KEYS = ["agent_id", "notification_id", "op", "status", "thread_id", "version"];
-const RICH_KEYS = ["agent_id", "effort", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
+const V2_KEYS = ["agent_id", "effort", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
+const V3_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
 /** Launch metadata bound in code points, matching the Python notice exactly. */
 const META_LIMIT = 128;
 /** Path to the packaged contract shared with Python, never user-selected. */
@@ -110,20 +111,32 @@ function renderTemplate(values) {
   return NOTICE_CONTRACT.template.replace(/\{([^}]+)\}/g, (match, key) => values[key] ?? match);
 }
 
+/** Return fixed trusted failure guidance without accepting runtime error prose. */
+function failureBlock(status, failureKind) {
+  if (!["failed", "timed_out", "lost"].includes(status)) return "";
+  const kind = metaText(failureKind, "unknown");
+  const guidance = status === "timed_out"
+    ? NOTICE_CONTRACT.status_guidance.timed_out
+    : NOTICE_CONTRACT.failure_guidance[failureKind] ||
+      NOTICE_CONTRACT.status_guidance[status] || NOTICE_CONTRACT.default_failure;
+  return `\n- Failure: ${kind} — ${guidance.reason}\n- Advice: ${guidance.advice}`;
+}
+
 /**
- * Validate an unknown legacy/rich request and return compact lifecycle text.
+ * Validate an unknown v1/v2/v3 request and return compact lifecycle text.
  * Invalid keys, identifiers, metadata or versions throw before host contact.
  * @param {unknown} request Decoded relay JSON, never arbitrary message prose.
- * @returns {string} Escaped notice using notice v1 independently of wire v1/v2.
+ * @returns {string} Escaped notice using notice v1 independently of relay wire version.
  */
 function notice(request) {
   if (!request || typeof request !== "object" || Array.isArray(request))
     throw new Error("invalid request");
   const keys = JSON.stringify(Object.keys(request).sort());
   const legacy = keys === JSON.stringify(LEGACY_KEYS);
-  const rich = keys === JSON.stringify(RICH_KEYS);
+  const v2 = keys === JSON.stringify(V2_KEYS), v3 = keys === JSON.stringify(V3_KEYS);
+  const rich = v2 || v3;
   if (!legacy && !rich) throw new Error("invalid request");
-  if (request.version !== (legacy ? 1 : 2) || request.op !== "completion") throw new Error("invalid request");
+  if (request.version !== (legacy ? 1 : v2 ? 2 : 3) || request.op !== "completion") throw new Error("invalid request");
   for (const key of ["agent_id", "notification_id", "thread_id", "status"])
     if (typeof request[key] !== "string" || !request[key].trim() || request[key].length > 512 || request[key].includes("\0"))
       throw new Error("invalid identifier");
@@ -132,6 +145,10 @@ function notice(request) {
       if (request[key] !== null &&
           (typeof request[key] !== "string" || !request[key].trim() || [...request[key]].length > META_LIMIT))
         throw new Error("invalid metadata");
+  if (v3 && request.failure_kind !== null &&
+      (typeof request.failure_kind !== "string" || !request.failure_kind.trim() ||
+       [...request.failure_kind].length > META_LIMIT))
+    throw new Error("invalid metadata");
   if (!/^ag-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.agent_id) ||
       !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
       !["succeeded", "failed", "timed_out", "cancelled", "lost"].includes(request.status))
@@ -139,6 +156,7 @@ function notice(request) {
   return renderTemplate({
     agent_id: request.agent_id,
     status: request.status,
+    failure_block: failureBlock(request.status, v3 ? request.failure_kind : null),
     runtime: metaText(request.runtime, "unknown"),
     model: metaText(request.model, "unknown"),
     effort: metaText(request.effort, "unspecified"),

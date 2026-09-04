@@ -121,10 +121,10 @@ def notice_for(row: Mapping[str, object]) -> CompletionNotice:
     """Build a notice from a claimed mapping or sqlite row without side effects.
 
     Required lifecycle columns are id, agent_id, and agent_status; invalid
-    facts raise the existing validation errors. Optional launch columns are
-    bounded, and only effort is extracted from request JSON. Missing or
-    malformed optional data becomes unknown/unspecified rather than blocking
-    an already queued delivery.
+    facts raise the existing validation errors. Optional launch and failure
+    columns are bounded, and only effort is extracted from request JSON.
+    Missing or malformed optional data becomes unknown/unspecified rather than
+    blocking an already queued delivery.
     """
     return CompletionNotice(
         notification_id=str(row["id"]),
@@ -133,6 +133,7 @@ def notice_for(row: Mapping[str, object]) -> CompletionNotice:
         runtime=_bounded_metadata(_row_value(row, "agent_runtime")),
         model=_bounded_metadata(_row_value(row, "agent_model")),
         effort=_effort_from_request_json(_row_value(row, "agent_request_json")),
+        failure_kind=_bounded_metadata(_row_value(row, "agent_failure_kind")),
     )
 
 

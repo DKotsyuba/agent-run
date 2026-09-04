@@ -124,25 +124,29 @@ MCP CLI replaces itself with the host's signed Node executable. That wrapper
 owns a private Unix socket and a thin Python MCP child; the child receives
 neither host capability, preventing recursive wrappers. The wrapper calls only
 `send_message_to_thread` and renders the same structured completion notice from
-validated lifecycle fields and immutable runtime/model/effort selectors. Task,
-answer, and error prose never enter the notice; selector text is escaped for
-safe single-line display. Effort is the explicit value persisted in the launch
-request, not an inferred runtime default; missing effort is `unspecified`.
+validated lifecycle fields, immutable runtime/model/effort selectors, and an
+optional bounded failure category. Task, answer, and runtime error prose never
+enter the notice; metadata is escaped for safe single-line display. Failure
+reasons and recovery advice come from a package-owned allowlist keyed by that
+category. Effort is the explicit value persisted in the launch request, not an
+inferred runtime default; missing effort is `unspecified`.
 Host tool inventories have an 8 MiB frame limit;
 local delivery requests remain bounded to 8 KiB. No socket path, host response,
 or message text enters delivery evidence.
 
 Agent completion notices use the `agent-run/completion` header and a short list:
-ID, terminal status, `runtime/model:effort`, and notification identity. Python
-and the Node relay render one packaged template. Handling instructions live in
+ID, terminal status, optional Failure/Advice lines, `runtime/model:effort`, and
+notification identity. Failure/Advice appear only for failed, lost, and timed-out
+agents. Python and the Node relay render one packaged template. Handling instructions live in
 the same contract, exposed by the MCP `start` description and `agent-run doc
 completion`; they are not repeated in each notice. The contract explains
 asynchronous launch, bound delivery, result retrieval, and why a completion
 notice is neither a new task nor user approval. Host-added trust warnings remain
 under the host's control. Workflow notices keep their separate format.
-The local relay protocol accepts strict legacy v1 requests and metadata-bearing
-v2 requests. A host advertises v2 with an `ar-cdx-v2-*.sock` endpoint; clients
-prefer those endpoints and use legacy requests for older hosts. Existing
+The local relay protocol accepts strict legacy v1 requests, selector-bearing v2,
+and failure-aware v3. A current host advertises `ar-cdx-v3-*.sock`; clients
+prefer v3, then v2, and use legacy requests for older hosts. Old clients send
+their v1 shape to a v3 host and remain compatible. Existing
 outbox rows require no migration. Already-running old MCP hosts keep delivering
 their old format until the `agent-run` MCP connection is restarted.
 

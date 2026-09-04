@@ -61,7 +61,15 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def finished_agent(self, effort: str | None = None) -> str:
+    def finished_agent(
+        self,
+        effort: str | None = None,
+        *,
+        status: AgentStatus = AgentStatus.SUCCEEDED,
+        failure_kind: str | None = None,
+    ) -> str:
+        """Create one bound terminal agent with optional failure evidence."""
+
         request = StartRequest(
             "codex", "model", "profile", "task", self.root,
             effort=effort, timeout_seconds=480
@@ -77,7 +85,10 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.store.transition(agent_id, AgentStatus.STARTING, at=3)
         self.store.transition(agent_id, AgentStatus.RUNNING, at=4)
         self.store.transition(
-            agent_id, AgentStatus.SUCCEEDED, outcome=Outcome(AgentStatus.SUCCEEDED), at=5
+            agent_id,
+            status,
+            outcome=Outcome(status, failure_kind=failure_kind),
+            at=5,
         )
         return agent_id
 
@@ -119,7 +130,9 @@ class DeliveryDispatchTests(unittest.TestCase):
 
     def test_delivered_notice_carries_launch_metadata_from_the_row(self) -> None:
         """Runtime and model come from agents columns and effort from request_json."""
-        second = self.finished_agent(effort="high")
+        second = self.finished_agent(
+            effort="high", status=AgentStatus.FAILED, failure_kind="prepare_failed"
+        )
         transport = FakeTransport(DeliveryReceipt("remote-1"))
         result = self.dispatcher(transport).run(lock_path=self.lock_path, at=10)
 
@@ -132,6 +145,8 @@ class DeliveryDispatchTests(unittest.TestCase):
         self.assertIn(
             f"- Runtime/model: codex/model:high\n", by_agent[second].render()
         )
+        self.assertEqual(by_agent[second].failure_kind, "prepare_failed")
+        self.assertIn("- Advice: Check model availability", by_agent[second].render())
 
     def test_notice_for_degrades_malformed_effort_to_unspecified(self) -> None:
         """Missing, old, or malformed stored effort never breaks notice building."""
@@ -182,8 +197,8 @@ class DeliveryDispatchTests(unittest.TestCase):
         )
         self.assertEqual(
             (notice.notification_id, notice.status, notice.runtime, notice.model,
-             notice.effort),
-            ("ntf_old", AgentStatus.SUCCEEDED, None, None, None),
+             notice.effort, notice.failure_kind),
+            ("ntf_old", AgentStatus.SUCCEEDED, None, None, None, None),
         )
         self.assertIn("- Runtime/model: unknown/unknown:unspecified\n", notice.render())
 

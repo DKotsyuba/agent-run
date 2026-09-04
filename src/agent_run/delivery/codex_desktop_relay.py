@@ -15,12 +15,13 @@ _MAX_FRAME = 8192
 _TIMEOUT = 10.0
 _MAX_RELAYS = 16
 #: Socket names starting with this prefix advertise the rich local protocol
-#: v2; every other ``ar-cdx-*.sock`` endpoint keeps the legacy six-key wire.
+#: v2/v3; every other ``ar-cdx-*.sock`` endpoint keeps the legacy six-key wire.
 _V2_PREFIX = "ar-cdx-v2-"
+_V3_PREFIX = "ar-cdx-v3-"
 
 
 def _request(path: Path, target: OrchestratorRef, notice: CompletionNotice) -> bytes:
-    """Encode one endpoint's bounded request: legacy six keys, or rich v2 nine.
+    """Encode one endpoint's bounded request: legacy v1, rich v2, or failure-aware v3.
 
     Only the discovered socket's name selects the wire version, and the tag
     is advisory: a rich frame that reaches a stale legacy host is rejected
@@ -45,7 +46,13 @@ def _request(path: Path, target: OrchestratorRef, notice: CompletionNotice) -> b
         "notification_id": notice.notification_id, "agent_id": str(notice.agent_id),
         "status": notice.status.value,
     }
-    if path.name.startswith(_V2_PREFIX):
+    if path.name.startswith(_V3_PREFIX):
+        request.update({
+            "version": 3,
+            "runtime": notice.runtime, "model": notice.model, "effort": notice.effort,
+            "failure_kind": notice.failure_kind,
+        })
+    elif path.name.startswith(_V2_PREFIX):
         request.update({
             "version": 2,
             "runtime": notice.runtime, "model": notice.model, "effort": notice.effort,
@@ -108,9 +115,8 @@ class CodexDesktopRelayClient:
         """Return True on acceptance or raise a retryable/ambiguous delivery error.
 
         Discovery takes at most ten seconds total across candidates. Each
-        endpoint receives the wire its socket name advertises: the rich
-        version 2 frame with launch metadata for ``ar-cdx-v2-*.sock`` paths,
-        the unchanged legacy six-key version 1 frame for older hosts. Any
+        endpoint receives the wire its socket name advertises: failure-aware
+        v3, selector-rich v2, or the unchanged six-key v1 for older hosts. Any
         error once sendall is attempted is ambiguous; only rejection or a
         pre-write failure permits another relay. No queue or state/database
         access occurs.
@@ -168,18 +174,22 @@ class CodexDesktopRelayClient:
         )
 
     def _paths(self) -> tuple[Path, ...]:
-        """Return at most sixteen endpoints, rich v2 sockets first; unreadable is empty.
+        """Return at most sixteen endpoints, newest rich sockets first; unreadable is empty.
 
-        Ordering prefers ``ar-cdx-v2-*.sock`` endpoints so the rich wire is
-        used whenever a capable host is live, inside the same sixteen
-        endpoint discovery bound as before.
+        Ordering prefers failure-aware v3, then selector-rich v2, inside the
+        same sixteen-endpoint discovery bound. Every other endpoint receives
+        the exact legacy v1 request.
         """
 
         try:
             return tuple(
                 sorted(
                     self._home.glob("ar-cdx-*.sock"),
-                    key=lambda path: (not path.name.startswith(_V2_PREFIX), path.name),
+                    key=lambda path: (
+                        not path.name.startswith(_V3_PREFIX),
+                        not path.name.startswith(_V2_PREFIX),
+                        path.name,
+                    ),
                 )[:_MAX_RELAYS]
             )
         except OSError:

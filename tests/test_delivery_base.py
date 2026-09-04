@@ -35,6 +35,7 @@ class CompletionNoticeTests(unittest.TestCase):
             [
                 "agent_id",
                 "effort",
+                "failure_kind",
                 "model",
                 "notification_id",
                 "runtime",
@@ -66,7 +67,8 @@ class CompletionNoticeTests(unittest.TestCase):
         )
         self.assertEqual(legacy, with_version)
         self.assertEqual(
-            (legacy.runtime, legacy.model, legacy.effort), (None, None, None)
+            (legacy.runtime, legacy.model, legacy.effort, legacy.failure_kind),
+            (None, None, None, None),
         )
 
     def test_render_is_the_exact_structured_list(self) -> None:
@@ -109,6 +111,27 @@ class CompletionNoticeTests(unittest.TestCase):
                 rendered = self.notice(status=status).render()
                 self.assertIn(f"- Status: {status.value}\n", rendered)
                 self.assertIn("- Notice: [notification ntf_abc v1]", rendered)
+
+    def test_failed_notice_explains_known_and_unknown_failure_categories(self) -> None:
+        """Failure notices provide fixed guidance without runtime error prose."""
+
+        known = self.notice(
+            status=AgentStatus.FAILED, failure_kind="prepare_failed"
+        ).render()
+        self.assertIn(
+            "- Failure: prepare_failed — Runtime preparation rejected", known
+        )
+        self.assertIn("- Advice: Check model availability", known)
+        unknown = self.notice(status=AgentStatus.LOST).render()
+        self.assertIn("- Failure: unknown — The supervisor could no longer", unknown)
+        self.assertNotIn("traceback", known.casefold())
+
+    def test_success_and_cancelled_notices_reject_failure_categories(self) -> None:
+        """Nonfailure terminal states cannot carry contradictory failure metadata."""
+
+        for status in (AgentStatus.SUCCEEDED, AgentStatus.CANCELLED):
+            with self.subTest(status=status), self.assertRaises(ValidationError):
+                self.notice(status=status, failure_kind="prepare_failed")
 
     def test_metadata_can_never_add_list_lines_or_commands(self) -> None:
         """Escaping confines hostile metadata to the four fixed lifecycle fields."""
@@ -172,7 +195,7 @@ class CompletionNoticeTests(unittest.TestCase):
 
     def test_metadata_must_be_bounded_strings_or_none(self) -> None:
         """Check each invalid field before the outer subtest handles exceptions."""
-        for name in ("runtime", "model", "effort"):
+        for name in ("runtime", "model", "effort", "failure_kind"):
             self.assertIsNone(getattr(self.notice(**{name: None}), name))
             for invalid in ("", "   ", "x" * (MAX_METADATA_LENGTH + 1), 7, True, [], {}):
                 with (
