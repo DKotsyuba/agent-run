@@ -13,6 +13,29 @@ then completes the local update. Repeat the same command to resume; an already
 published version proceeds directly to verified installation. See
 `docs/releasing.md` for prerequisites and options, including `--publish-only`.
 
+## Operational runbook
+
+Run from a clean checkout at the current `origin/main`:
+
+```bash
+# Publish and update the local runtime.
+python3 scripts/release.py X.Y.Z
+
+# Resume after interruption: use the same version.
+python3 scripts/release.py X.Y.Z
+
+# Publish without changing the local runtime.
+python3 scripts/release.py X.Y.Z --publish-only
+```
+
+Wait for `Done: vX.Y.Z published and local runtime updated.` before treating the
+release as complete. After a local update, reconnect existing MCP clients.
+
+On failure, preserve the command output, `standalone/deploy.json`, and the
+reported backup. Correct the reported cause and repeat the same command. Never
+move a release tag, delete recovery evidence, or point an older runtime at a
+newer database schema.
+
 The sealed layout is not created by ordinary pip/pipx installation.
 
 Sealed local releases live under `~/.agent-run/standalone/releases/<sha>`, one
