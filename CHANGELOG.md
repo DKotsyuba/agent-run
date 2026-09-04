@@ -2,6 +2,22 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.0] - 2026-09-04
+
+- Added `agent-run-tui`, a standard-library curses dashboard shipped as the
+  separate `agent_run_tui` package: orchestrator sessions with host runtime,
+  working directory, and child counters, then each session's running and
+  finished agents as bordered cards with status glyphs and elapsed time. Data
+  is read only through the JSON-RPC socket in a background thread; keys work on
+  Latin and Russian layouts; selection follows session and agent ids across
+  refreshes.
+- Resolved session titles from the host runtime's own files (Claude Code
+  custom titles and history, Codex thread names and rollout metadata) with
+  validated ids and incremental, cached reads.
+- Added the read-only `list_orchestrators` tool to the shared CLI/MCP/socket
+  surface with active and total child counters per orchestrator session, and
+  exposed the launch `effort` on agent views.
+
 ## [0.5.0] - 2026-09-04
 
 - Added a bounded priority bonus for available manual Codex reset credits, read
