@@ -104,6 +104,11 @@ TOOLS = (
         ),
     },
     {
+        "name": "list_orchestrators",
+        "description": "List bounded orchestrator-session aggregates with an exact total.",
+        "inputSchema": _schema({"limit": {"type": "integer"}}),
+    },
+    {
         "name": "summary",
         "description": "Summarize exactly one agent or orchestration session.",
         "inputSchema": _schema(
@@ -282,6 +287,12 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 limit=args.get("limit", 100),
             )
         )
+    if name == "list_orchestrators":
+        args = _arguments(raw, {"limit"})
+        limit = args.get("limit", 100)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValidationError("limit must be an integer")
+        return service.list_orchestrators(limit=limit)
     if name == "summary":
         args = _arguments(raw, {"agent_id", "orchestrator"})
         return service.summary(

@@ -32,6 +32,7 @@ from .domain import (
 )
 from .errors import AuthError, StateTransitionError, ValidationError
 from .delivery.base import DeliveryAttemptEvidence
+from .delivery.dispatch import _effort_from_request_json
 from .launch import launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
@@ -105,7 +106,32 @@ class AgentView:
     answer_available: bool
     answer_bytes: int | None
     answer_sha256: str | None
+    effort: str | None
     delivery: DeliveryView
+
+
+@dataclass(frozen=True, slots=True)
+class OrchestratorView:
+    """Read-only aggregate for one launching orchestrator session."""
+
+    session_id: str | None
+    transport: str
+    external_session_id: str
+    external_turn_id: str | None
+    created_at: float
+    last_seen_at: float
+    active: int
+    total: int
+
+
+@dataclass(frozen=True, slots=True)
+class OrchestratorPage:
+    """A bounded read-only orchestrator-session page with an exact total."""
+
+    items: tuple[OrchestratorView, ...]
+    total: int
+    limit: int
+    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -669,6 +695,32 @@ class AgentService:
             complete,
         )
 
+    def list_orchestrators(self, *, limit: int = 100) -> OrchestratorPage:
+        """Return up to ``limit`` session aggregates, ordered by activity.
+
+        ``limit`` must be a positive integer no greater than 1000.  The page
+        includes bound sessions with agents and, when applicable, one null-ID
+        aggregate for unbound agents; no state is changed.
+        """
+
+        _page_limit(limit)
+        rows = self._store.list_orchestrator_sessions(limit=limit)
+        total = 0 if not rows else int(rows[0]["page_total"])
+        items = tuple(
+            OrchestratorView(
+                None if row["id"] is None else str(row["id"]),
+                str(row["transport"]),
+                str(row["external_session_id"]),
+                None if row["external_turn_id"] is None else str(row["external_turn_id"]),
+                float(row["created_at"]),
+                float(row["last_seen_at"]),
+                int(row["active"]),
+                int(row["total"]),
+            )
+            for row in rows
+        )
+        return OrchestratorPage(items, total, limit, len(items) == total)
+
     def transcript(
         self, agent_id: str | AgentId, cursor: int = 0, limit: int = 200
     ) -> TranscriptPage:
@@ -945,6 +997,7 @@ class AgentService:
             row["answer_path"] is not None,
             answer_bytes,
             answer_sha,
+            _effort_from_request_json(row["request_json"]),
             self._delivery_view(
                 agent_id,
                 None

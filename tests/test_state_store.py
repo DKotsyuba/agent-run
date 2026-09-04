@@ -621,5 +621,44 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual([row["observed_at"] for row in rows], [3.0, 1.0])
 
 
+    def test_list_orchestrator_sessions_counts_orders_and_includes_unbound(self) -> None:
+        """Aggregate bound and unbound agents without changing stored rows."""
+
+        unbound = self.create()
+        first = self.create()
+        second = self.create()
+        first_session = self.store.bind_orchestrator(
+            first, OrchestratorRef("socket", "first", "turn-1"), at=10
+        )
+        second_session = self.store.bind_orchestrator(
+            second, OrchestratorRef("socket", "second", "turn-2"), at=20
+        )
+        self.store.transition(first, AgentStatus.STARTING, at=2)
+        self.store.transition(first, AgentStatus.RUNNING, at=3)
+        self.store.transition(
+            unbound, AgentStatus.CANCELLED, outcome=Outcome(AgentStatus.CANCELLED), at=4
+        )
+        rows = self.store.list_orchestrator_sessions(limit=10)
+        self.assertEqual([row["id"] for row in rows], [second_session, first_session, None])
+        self.assertEqual(
+            [(row["active"], row["total"]) for row in rows], [(1, 1), (1, 1), (0, 1)]
+        )
+        self.assertEqual(rows[-1]["created_at"], self.store.get_agent(unbound)["created_at"])
+        self.assertEqual(rows[0]["page_total"], 3)
+        self.assertEqual(len(self.store.list_orchestrator_sessions(limit=1)), 1)
+
+    def test_list_orchestrator_sessions_omits_unbound_row_when_none_are_unbound(self) -> None:
+        """No agent without an orchestrator leaves no synthetic unbound row."""
+
+        bound = self.create()
+        session = self.store.bind_orchestrator(
+            bound, OrchestratorRef("socket", "only", "turn-1"), at=10
+        )
+        rows = self.store.list_orchestrator_sessions(limit=10)
+        self.assertEqual([row["id"] for row in rows], [session])
+        self.assertEqual([(row["active"], row["total"]) for row in rows], [(1, 1)])
+        self.assertEqual(rows[0]["page_total"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

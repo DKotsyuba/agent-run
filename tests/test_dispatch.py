@@ -48,9 +48,9 @@ def test_start_description_includes_completion_contract_text() -> None:
 
 
 def test_tools_table_and_mcp_tools_list_are_exactly_pinned() -> None:
-    """Keep all eighteen shared tools identical through MCP discovery."""
+    """Keep all nineteen shared tools identical through MCP discovery."""
 
-    assert len(TOOLS) == 18
+    assert len(TOOLS) == 19
     assert TOOL_NAMES == frozenset(tool["name"] for tool in TOOLS)
 
     output = StringIO()

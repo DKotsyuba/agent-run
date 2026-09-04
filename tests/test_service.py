@@ -616,6 +616,18 @@ class AgentServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
             self.service.transcript(agent_id, limit=1001)
 
+    def test_list_orchestrators_and_agent_effort_are_read_only(self) -> None:
+        """Expose persisted effort and bounded orchestrator aggregates."""
+
+        result = self.service.start(replace(self.request(request_id="effort"), effort="high"))
+        self.wait_until(lambda: bool(self.launched))
+        self.assertEqual(self.service.get(result.agent_id).effort, "high")
+        self.assertEqual(self.service.list(AgentQuery(limit=1)).items[0].effort, "high")
+        page = self.service.list_orchestrators(limit=1)
+        self.assertEqual((page.total, len(page.items), page.complete), (1, 1, True))
+        with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
+            self.service.list_orchestrators(limit=1001)
+
     def test_transcript_cursor_is_explicit_and_raw_ref_is_preserved(self) -> None:
         agent_id = self.start("transcript").agent_id
         first = self.store.append_message(
