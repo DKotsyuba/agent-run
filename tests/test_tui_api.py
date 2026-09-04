@@ -108,15 +108,19 @@ class ApiClientTests(unittest.TestCase):
                     self.assertEqual(len(server.requests), 1)
 
     def test_read_timeout_after_a_send_is_not_resent(self) -> None:
-        """A reply that never arrives fails without repeating the delivered request."""
+        """A reply that never arrives names a busy server without repeating the delivered request."""
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             server = RpcServer(Path(directory) / "api.sock", [HOLD])
             server.start()
             with self.assertRaises(ApiUnavailable) as raised:
                 ApiClient(server.path, timeout=0.25).call("ping")
-            self.assertIn("agent-run api serve", str(raised.exception))
+            self.assertEqual(str(raised.exception), "agent-run API did not answer within 0.25s (server busy?)")
             server.join()
             self.assertEqual(len(server.requests), 1)
+
+    def test_default_timeout_allows_a_slow_server(self) -> None:
+        """The default read timeout is 20 seconds so a busy server is waited for, not declared missing."""
+        self.assertEqual(ApiClient(Path("/nonexistent/api.sock")).timeout, 20.0)
 
 
 if __name__ == "__main__":

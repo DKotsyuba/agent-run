@@ -10,21 +10,24 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from agent_run_tui.api import ApiError
 from agent_run_tui.model import Snapshot
-from agent_run_tui.snapshot import SnapshotState, load_snapshot, make_loader
+from agent_run_tui.snapshot import LoaderHandle, SnapshotState, load_snapshot, make_loader
 
 
 SESSION = {"session_id": "s1", "transport": "codex_queue", "external_session_id": "thread",
            "active": 1, "total": 3, "last_seen_at": 10}
+SESSION2 = {"session_id": "s2", "transport": "claude_uds", "external_session_id": "other",
+            "active": 0, "total": 1, "last_seen_at": 5}
 #: The service also reports a null-id aggregate row for unbound agents.
 NULL_SESSION = {"session_id": None, "transport": "", "external_session_id": "",
                 "active": 0, "total": 0, "last_seen_at": 9}
+ACTIVE = {"created", "starting", "running", "cancelling"}
 
 
 def agent(agent_id: str, session: str | None, **fields: object) -> dict[str, object]:
     """Build one API agent view delivered to ``session`` (``None`` means unbound).
 
-    The defaults describe a finished agent started at 1.0 and finished at 2.0;
-    ``fields`` overrides any of them, including ``delivery``.
+    The defaults describe a finished codex agent started at 1.0 and finished at
+    2.0; ``fields`` overrides any of them, including ``delivery``.
     """
     item: dict[str, object] = {
         "agent_id": agent_id, "runtime": "codex", "model": None, "effort": None,
@@ -35,13 +38,19 @@ def agent(agent_id: str, session: str | None, **fields: object) -> dict[str, obj
     return item
 
 
-class FakeApi:
-    """Mirror the resident API's paginated agent, session, and transcript replies.
+def running(agent_id: str, session: str | None, runtime: str = "claude", **fields: object) -> dict[str, object]:
+    """Build one active agent view of ``runtime`` (a streaming one by default)."""
+    return agent(agent_id, session, runtime=runtime, status="running", started_at=90, finished_at=None, **fields)
 
-    Pages honour the caller's ``offset``/``limit`` exactly as ``AgentPage`` does:
-    ``next_offset`` is ``None`` on the final page.  Transcript pages validate the
-    cursor like ``AgentService.transcript`` and answer ``next_cursor: None``
-    whenever the page is complete, even when it carried messages.
+
+class FakeApi:
+    """Mirror the resident API's filtered, paginated agent, session, and transcript replies.
+
+    ``list_agents`` honours ``active`` and the ``orchestrator`` reference
+    (matched against the orchestrators' transport and external id) and pages
+    exactly as ``AgentPage`` does: ``next_offset`` is ``None`` on the final
+    page.  Transcript pages validate the cursor like ``AgentService.transcript``
+    and answer ``next_cursor: None`` whenever the page is complete.
     """
 
     def __init__(self, agents: list[dict[str, object]],
@@ -57,6 +66,21 @@ class FakeApi:
         """Return, in order, every parameter mapping received for ``method``."""
         return [params for name, params in self.calls if name == method]
 
+    def reset(self) -> None:
+        """Forget the recorded calls so one refresh can be asserted alone."""
+        self.calls.clear()
+
+    def _matches(self, item: dict[str, object], params: dict[str, object]) -> bool:
+        """Return whether ``item`` passes the ``active`` and ``orchestrator`` filters."""
+        if params.get("active") and item["status"] not in ACTIVE:
+            return False
+        ref = params.get("orchestrator")
+        if ref is not None:
+            session = next(row["session_id"] for row in self.orchestrators
+                           if (row["transport"], row["external_session_id"]) == (ref["transport"], ref["external_session_id"]))
+            return item["delivery"]["orchestrator_session_id"] == session
+        return True
+
     def call(self, method: str, params: dict[str, object]) -> dict[str, object]:
         """Answer one recorded request, raising :class:`ApiError` on a bad cursor."""
         self.calls.append((method, params))
@@ -65,10 +89,11 @@ class FakeApi:
                     "limit": params["limit"], "complete": True}
         if method == "list_agents":
             offset, limit = params["offset"], params["limit"]
-            page = self.agents[offset:offset + limit]
+            matching = [item for item in self.agents if self._matches(item, params)]
+            page = matching[offset:offset + limit]
             consumed = offset + len(page)
-            complete = consumed >= len(self.agents)
-            return {"items": page, "total": len(self.agents), "offset": offset, "limit": limit,
+            complete = consumed >= len(matching)
+            return {"items": page, "total": len(matching), "offset": offset, "limit": limit,
                     "next_offset": None if complete else consumed, "complete": complete}
         if method == "transcript":
             cursor = params["cursor"]
@@ -93,62 +118,100 @@ class Titles:
 
 
 class SnapshotTests(unittest.TestCase):
-    """Check the unfiltered sweep, local grouping, ordering, and cursor reuse."""
+    """Check the active-only listing, the focused finished page, ordering, and cursor reuse."""
 
     def load(self, client: FakeApi, now: float = 100, **kw: object) -> Snapshot:
         """Load one snapshot from ``client`` with the deterministic title resolver."""
         return load_snapshot(now, client=client, titles=Titles(), **kw)
 
-    def test_grouping_ordering_events_and_cursor(self) -> None:
-        """One sweep groups by delivery session and only active agents page transcripts."""
+    def test_refresh_lists_sessions_and_active_agents_only(self) -> None:
+        """Without focus a refresh is one session list, one active page, and streaming transcripts."""
         client = FakeApi(
-            [agent("active", "s1", status="running", started_at=90, finished_at=None,
-                   model="x", effort="high"),
-             agent("new", "s1", finished_at=99),
-             agent("old", "s1", status="failed", finished_at=98)],
+            [running("live", "s1", model="x", effort="high"), running("quiet", "s1", runtime="codex"),
+             agent("new", "s1", finished_at=99), agent("old", "s1", status="failed", finished_at=98)],
             orchestrators=[SESSION, NULL_SESSION],
-            transcripts={"active": [{"seq": 1, "at": 1, "role": "tool_call",
-                                     "name": "Bash", "content": "x" * 90}]},
+            transcripts={"live": [{"seq": 1, "at": 1, "role": "tool_call", "name": "Bash", "content": "x" * 90}]},
         )
         state = SnapshotState()
-        snapshot = self.load(client, finished_limit=1, state=state)
+        snapshot = self.load(client, state=state)
         self.assertEqual([card.session_id for card in snapshot.sessions], ["s1"])
-        self.assertEqual(sorted(snapshot.agents), ["s1"])
-        cards = snapshot.agents["s1"]
-        self.assertEqual([card.agent_id for card in cards], ["active", "new"])
-        self.assertEqual((cards[0].elapsed_seconds, cards[0].last_event), (10, "Bash: " + "x" * 60))
-        self.assertEqual(cards[1].elapsed_seconds, 98)
-        self.assertEqual(client.params("list_agents"), [{"offset": 0, "limit": 200}])
+        self.assertEqual([card.agent_id for card in snapshot.agents["s1"]], ["live", "quiet"])
+        self.assertEqual((snapshot.agents["s1"][0].elapsed_seconds, snapshot.agents["s1"][0].last_event),
+                         (10, "Bash: " + "x" * 60))
+        self.assertEqual(client.params("list_orchestrators"), [{"limit": 200}])
+        self.assertEqual(client.params("list_agents"), [{"active": True, "offset": 0, "limit": 200}])
+        self.assertEqual([params["agent_id"] for params in client.params("transcript")], ["live"])
         self.load(client, now=101, state=state)
         self.assertEqual([params["cursor"] for params in client.params("transcript")], [0, 1])
 
-    def test_three_page_sweep_groups_every_page(self) -> None:
-        """A 450-agent listing is followed through three pages and grouped locally."""
-        agents = [agent(f"a{index}", "s1" if index % 2 else None) for index in range(450)]
+    def test_active_listing_pages_only_while_incomplete(self) -> None:
+        """A 450-agent active listing is followed through three pages; the cap stops at five."""
+        agents = [running(f"a{index}", "s1" if index % 2 else None) for index in range(450)]
         snapshot = self.load(client := FakeApi(agents, orchestrators=[SESSION]))
-        self.assertEqual([params["offset"] for params in client.params("list_agents")],
-                         [0, 200, 400])
+        self.assertEqual([params["offset"] for params in client.params("list_agents")], [0, 200, 400])
+        self.assertTrue(all(params["active"] for params in client.params("list_agents")))
         self.assertEqual(sorted(snapshot.agents), ["s1", "unbound"])
-        counts = {card.session_id: (card.title, card.active, card.total)
-                  for card in snapshot.sessions}
-        self.assertEqual(counts["unbound"], ("unbound", 0, 225))
-        self.assertEqual(len(snapshot.agents["unbound"]), 50)
-
-    def test_sweep_stops_at_the_thousand_agent_cap(self) -> None:
-        """An oversized listing stops after five pages and 1,000 collected agents."""
-        client = FakeApi([agent(f"a{index}", None) for index in range(1200)])
+        self.assertEqual([(card.session_id, card.active) for card in snapshot.sessions], [("unbound", 225), ("s1", 1)])
+        client = FakeApi([running(f"a{index}", None) for index in range(1200)])
         snapshot = self.load(client)
-        self.assertEqual([params["offset"] for params in client.params("list_agents")],
-                         [0, 200, 400, 600, 800])
-        self.assertEqual([(card.session_id, card.total) for card in snapshot.sessions],
-                         [("unbound", 1000)])
+        self.assertEqual([params["offset"] for params in client.params("list_agents")], [0, 200, 400, 600, 800])
+        self.assertEqual([(card.session_id, card.total) for card in snapshot.sessions], [("unbound", 1000)])
+
+    def test_focus_fetches_one_finished_page_and_caches_it(self) -> None:
+        """Only the focused session reads finished agents, once per 15 s, sooner on a focus change."""
+        agents = [running("live", "s1"), agent("new", "s1", finished_at=99), agent("old", "s1", finished_at=98),
+                  agent("other", "s2"), agent("loose", None)]
+        client = FakeApi(agents, orchestrators=[SESSION, SESSION2, dict(NULL_SESSION, total=1)])
+        state = SnapshotState()
+        snapshot = self.load(client, state=state, focus="s1", finished_limit=1)
+        ref = {"transport": "codex_queue", "external_session_id": "thread"}
+        self.assertEqual(client.params("list_agents"), [{"active": True, "offset": 0, "limit": 200},
+                                                        {"orchestrator": ref, "offset": 0, "limit": 2}])
+        self.assertEqual([card.agent_id for card in snapshot.agents["s1"]], ["live", "new"])
+        self.assertNotIn("s2", snapshot.agents)
+        client.reset()
+        snapshot = self.load(client, now=110, state=state, focus="s1", finished_limit=1)
+        self.assertEqual(client.params("list_agents"), [{"active": True, "offset": 0, "limit": 200}])
+        self.assertEqual([card.agent_id for card in snapshot.agents["s1"]], ["live", "new"])
+        client.reset()
+        self.load(client, now=115, state=state, focus="s1", finished_limit=1)
+        self.assertEqual(len(client.params("list_agents")), 2)
+        client.reset()
+        snapshot = self.load(client, now=116, state=state, focus="s2")
+        self.assertEqual(client.params("list_agents")[1]["orchestrator"],
+                         {"transport": "claude_uds", "external_session_id": "other"})
+        self.assertEqual([card.agent_id for card in snapshot.agents["s2"]], ["other"])
+        client.reset()
+        snapshot = self.load(client, now=117, state=state, focus=None)
+        self.assertEqual(len(client.params("list_agents")), 1)
+        self.assertEqual(sorted(snapshot.agents), ["s1"])
+
+    def test_unbound_focus_filters_one_unfiltered_page_client_side(self) -> None:
+        """The unbound session reads one unfiltered page of 200 and keeps its finished agents."""
+        agents = [agent("bound", "s1"), agent("loose", None), running("busy", None, runtime="codex")]
+        client = FakeApi(agents, orchestrators=[SESSION, dict(NULL_SESSION, active=1, total=2)])
+        snapshot = self.load(client, focus="unbound")
+        self.assertEqual(client.params("list_agents"), [{"active": True, "offset": 0, "limit": 200},
+                                                        {"offset": 0, "limit": 200}])
+        self.assertEqual([card.agent_id for card in snapshot.agents["unbound"]], ["busy", "loose"])
+        self.assertEqual(client.params("transcript"), [])
+
+    def test_a_finishing_agent_refreshes_the_focused_page_early(self) -> None:
+        """An agent leaving the active set refreshes the finished page before the interval."""
+        client = FakeApi([running("live", "s1")], orchestrators=[SESSION])
+        state = SnapshotState()
+        self.load(client, state=state, focus="s1")
+        client.agents = [agent("live", "s1", finished_at=105)]
+        client.reset()
+        snapshot = self.load(client, now=106, state=state, focus="s1")
+        self.assertEqual(len(client.params("list_agents")), 2)
+        self.assertEqual([(card.agent_id, card.active) for card in snapshot.agents["s1"]], [("live", False)])
 
     def test_complete_page_resumes_from_the_last_sequence(self) -> None:
         """A complete page returns no cursor, so the next refresh sends the last seq."""
         messages = [{"seq": seq, "at": seq, "role": "assistant", "content": f"m{seq}"}
                     for seq in (4, 5)]
-        client = FakeApi([agent("live", "s1", status="running", finished_at=None)],
-                         orchestrators=[SESSION], transcripts={"live": messages})
+        client = FakeApi([running("live", "s1")], orchestrators=[SESSION], transcripts={"live": messages})
         state = SnapshotState()
         self.load(client, state=state)
         self.assertEqual(state.cursors["live"], 5)
@@ -159,15 +222,16 @@ class SnapshotTests(unittest.TestCase):
             client.call("transcript", {"agent_id": "live", "cursor": None, "limit": 200})
         self.assertEqual(raised.exception.code, -32602)
 
-    def test_make_loader_uses_the_injected_client(self) -> None:
-        """An injected client makes a reusable loader that yields snapshots when called."""
-        client = FakeApi([agent("only", "s1")], orchestrators=[SESSION])
+    def test_make_loader_returns_a_focusable_handle_over_the_injected_client(self) -> None:
+        """The handle loads snapshots and its ``set_focus`` selects the finished page to read."""
+        client = FakeApi([running("live", "s1"), agent("only", "s1")], orchestrators=[SESSION])
         loader = make_loader(client=client, titles=Titles(), state=SnapshotState())
-        self.assertTrue(callable(loader))
+        self.assertIsInstance(loader, LoaderHandle)
         snapshot = loader(100.0)
-        self.assertIsInstance(snapshot, Snapshot)
         self.assertEqual(snapshot.observed_at, 100.0)
-        self.assertEqual([card.agent_id for card in snapshot.agents["s1"]], ["only"])
+        self.assertEqual([card.agent_id for card in snapshot.agents["s1"]], ["live"])
+        loader.set_focus("s1")
+        self.assertEqual([card.agent_id for card in loader(101.0).agents["s1"]], ["live", "only"])
 
 
 if __name__ == "__main__":

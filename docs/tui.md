@@ -92,11 +92,22 @@ file is opened; anything else falls back to the short id.
 
 ## Data path per refresh
 
-1. `list_orchestrators` — sessions and counters.
-2. One paginated `list_agents` sweep (200 per page, newest first, capped at
-   1000 agents), grouped client-side by `delivery.orchestrator_session_id`.
-3. `transcript` from the stored cursor for each active agent only, so a
-   refresh reads new messages, never the whole history.
+1. `list_orchestrators` (limit 200) — sessions and counters; the null row
+   becomes the `unbound` card.
+2. One `list_agents` with `active: true` (200 per page, paged only while
+   `complete` is false, capped at 1000), grouped client-side by
+   `delivery.orchestrator_session_id`.
+3. Finished agents only for the session that is open on screen: one
+   `list_agents` page (limit 50 plus the session's active count) filtered by
+   that session's `orchestrator` reference, cached and refreshed at most every 15 s, at once when another
+   session is opened, or when one of its agents just finished. The `unbound`
+   card reads one unfiltered page of 200 and keeps the unbound agents in it, so
+   older unbound agents beyond the newest 200 overall are not shown.
+4. `transcript` from the stored cursor for each active agent of a streaming
+   runtime (`codex` is skipped: its transcript only appears at the end).
+
+The sessions screen therefore costs two calls per refresh plus one transcript
+per streaming active agent, whatever the size of the agent store.
 
 The dashboard issues read-only methods only; it cannot start, steer, or cancel
 agents.

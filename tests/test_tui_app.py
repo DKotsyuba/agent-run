@@ -191,6 +191,41 @@ class WorkerTests(unittest.TestCase):
         SnapshotWorker(GatedLoader(), refresh_seconds=1).stop()
 
 
+class FocusLoader:
+    """A loader that records ``set_focus`` calls like :class:`LoaderHandle`."""
+
+    def __init__(self, snapshot: Snapshot) -> None:
+        """Serve ``snapshot`` and start with no recorded focus changes."""
+        self.snapshot, self.focus_calls = snapshot, []
+
+    def set_focus(self, session_id: str | None) -> None:
+        """Record the requested focus."""
+        self.focus_calls.append(session_id)
+
+    def __call__(self, now: float) -> Snapshot:
+        """Return the fixed snapshot."""
+        return self.snapshot
+
+
+class FocusTests(unittest.TestCase):
+    """Check that opening and leaving a session drive the loader's focus."""
+
+    def test_open_focuses_and_reloads_and_back_clears(self) -> None:
+        """Enter focuses the opened session and requests a reload; back clears the focus."""
+        snapshot = Snapshot(1.0, (session(0), session(1)), {"s1": (ACTIVE,)})
+        loader = FocusLoader(snapshot)
+        view = Dashboard(loader)
+        view.snapshot = snapshot
+        view.worker = SnapshotWorker(loader, refresh_seconds=60)
+        for key in "jl":
+            view._handle_key(key)
+        self.assertEqual((view.screen, loader.focus_calls), ("agents", ["s1"]))
+        self.assertTrue(view.worker._wake.is_set())
+        view._handle_key("h")
+        self.assertEqual((view.screen, loader.focus_calls), ("sessions", ["s1", None]))
+        dashboard(snapshot)._handle_key("l")  # a plain callable loader has no focus and is fine
+
+
 class SelectionTests(unittest.TestCase):
     """Check that the cursor follows ids, not row positions, across snapshots."""
 
