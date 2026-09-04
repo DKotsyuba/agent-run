@@ -34,7 +34,7 @@ def default_socket_path() -> Path:
 class ApiClient:
     """Persistent newline-delimited JSON-RPC client with safe pre-write retry."""
 
-    def __init__(self, socket_path: Path, timeout: float = 5.0) -> None:
+    def __init__(self, socket_path: Path, timeout: float = 20.0) -> None:
         """Use ``socket_path`` with ``timeout`` seconds for connect and reads."""
         self.socket_path, self.timeout = socket_path, timeout
         self._socket: socket.socket | None = None
@@ -59,7 +59,9 @@ class ApiClient:
         RPC errors become :class:`ApiError`, as does any reply that is not a
         JSON-RPC object carrying ``result`` or ``error``; transport failures,
         including an oversized frame, are :class:`ApiUnavailable` and are not
-        resent because the server may already have performed the request.
+        resent because the server may already have performed the request.  A
+        reply that times out after a complete send names a busy server, not a
+        missing one.
         """
         request_id = self._next_id
         self._next_id += 1
@@ -102,6 +104,8 @@ class ApiClient:
                 self.close()
                 if sent == 0 and _attempt == 0:
                     continue
+                if sent == len(payload) and isinstance(error, TimeoutError):
+                    raise ApiUnavailable(f"agent-run API did not answer within {self.timeout:g}s (server busy?)") from error
                 raise ApiUnavailable("agent-run API is unavailable; run `agent-run api serve`") from error
         raise AssertionError("unreachable")
 

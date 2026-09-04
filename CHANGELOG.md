@@ -2,6 +2,14 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.1] - 2026-09-04
+
+- Fixed the dashboard reporting the API as unavailable on stores with many
+  agents: a refresh now lists orchestrators and active agents only, fetches
+  finished agents just for the opened session at most every 15 seconds, skips
+  transcript polling for runtimes that never stream one, and waits up to 20
+  seconds for a busy server instead of 5.
+
 ## [0.6.0] - 2026-09-04
 
 - Added `agent-run-tui`, a standard-library curses dashboard shipped as the

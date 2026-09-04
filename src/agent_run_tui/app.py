@@ -279,17 +279,27 @@ class Dashboard:
         elif action == "back" and self.screen == "agents":
             self.screen = "sessions"
             self.scroll = 0
+            self._set_focus(None)
         elif action == "mouse":
             self._handle_mouse()
         self._remember_selection()
         return False
 
     def _open_session(self) -> None:
-        """Switch to the agents screen of the selected session from its top."""
+        """Switch to the agents screen of the selected session and focus the loader on it."""
         self.screen = "agents"
         self.agent_index = 0
         self.finished_expanded = False
         self.scroll = 0
+        self._set_focus(self._selected_session_id())
+        if self.worker is not None:
+            self.worker.request()
+
+    def _set_focus(self, session_id: str | None) -> None:
+        """Tell a focusable loader which session's finished agents to read; plain loaders ignore it."""
+        set_focus = getattr(self.loader, "set_focus", None)
+        if set_focus is not None:
+            set_focus(session_id)
 
     def _handle_mouse(self) -> None:
         """Select the clicked card and open a clicked session card when applicable."""
