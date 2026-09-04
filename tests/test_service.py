@@ -32,6 +32,7 @@ from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
+from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
 
 
@@ -246,11 +247,16 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(ADAPTER.materialize_calls, 0)
 
     def test_start_returns_before_prepare_and_pending_replay_stays_single(self) -> None:
-        """Slow prepare must not block admission, status, or idempotent replay."""
+        """A live bounded lease survives slow preparation and sibling queueing."""
 
         entered = threading.Event()
         release = threading.Event()
         original = ADAPTER.prepare
+        clock = [100.0]
+        self.service = AgentService(
+            self.config, self.store, self.root,
+            launch=lambda *args: self.launched.append(args), now=lambda: clock[0],
+        )
 
         def blocked_prepare(*args, **kwargs):
             """Hold prepare until the test has exercised the admission path."""
@@ -274,6 +280,13 @@ class AgentServiceTests(unittest.TestCase):
             sibling = self.service.start(self.request(request_id="pending-sibling"))
             self.assertLess(time.monotonic() - sibling_started, 0.5)
             self.assertIs(sibling.agent.status, AgentStatus.STARTING)
+            clock[0] = 131.0
+            for _ in range(3):
+                self.service.get(first.agent_id)
+                self.service.list()
+                self.assertEqual(
+                    reconcile_unowned_starting(self.store, at=clock[0]), ()
+                )
             with self.assertRaisesRegex(
                 ValidationError, "request_id was reused for a different request"
             ):
@@ -306,6 +319,53 @@ class AgentServiceTests(unittest.TestCase):
                 lambda: self.store.get_agent(accepted.agent_id)["status"]
                 == AgentStatus.CANCELLED.value
             )
+        self.assertEqual(self.launched, [])
+
+    def test_expired_prepare_cannot_launch_after_reconciliation(self) -> None:
+        """A released worker cannot revive a start lost after its lease expires."""
+
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original = ADAPTER.prepare
+        original_continue = self.service._continue_start
+        clock = [100.0]
+        self.service = AgentService(
+            self.config, self.store, self.root,
+            launch=lambda *args: self.launched.append(args), now=lambda: clock[0],
+        )
+
+        def blocked_prepare(*args, **kwargs):
+            """Hold preparation until the durable lease is reconciled lost."""
+
+            entered.set()
+            release.wait(2)
+            return original(*args, **kwargs)
+
+        def tracked_continue(*args, **kwargs):
+            """Expose completion of the worker that resumed after expiry."""
+
+            try:
+                return original_continue(*args, **kwargs)
+            finally:
+                finished.set()
+
+        with (
+            patch.object(ADAPTER, "prepare", side_effect=blocked_prepare),
+            patch.object(self.service, "_continue_start", side_effect=tracked_continue),
+        ):
+            accepted = self.service.start(self.request(request_id="expired-prepare"))
+            self.assertTrue(entered.wait(1))
+            clock[0] = 221.0
+            self.assertEqual(
+                reconcile_unowned_starting(self.store, at=clock[0]),
+                (accepted.agent_id,),
+            )
+            release.set()
+            self.assertTrue(finished.wait(1))
+        self.assertEqual(
+            self.store.get_agent(accepted.agent_id)["status"], AgentStatus.LOST.value
+        )
         self.assertEqual(self.launched, [])
 
     def test_request_id_returns_one_agent_and_launches_once(self) -> None:
