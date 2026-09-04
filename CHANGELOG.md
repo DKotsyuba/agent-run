@@ -2,6 +2,17 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.5.0] - 2026-09-04
+
+- Added a bounded priority bonus for available manual Codex reset credits, read
+  from the existing account-scoped app-server response and preserved in capacity
+  snapshots. One reset gives a 1.5x factor; further resets approach a 2x ceiling.
+- Kept exhausted and stale quota routes excluded regardless of reset credits;
+  accounts return only when fresh quota evidence confirms availability. Credits
+  are never redeemed automatically, and Spark receives no reset-credit bonus.
+- Exposed the reset-credit count and bonus separately from configured priority
+  multipliers. Older snapshots without the optional metadata remain compatible.
+
 ## [0.4.1] - 2026-09-03
 
 - Fixed successful engines being misclassified when they exit before process-group
@@ -85,6 +96,7 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[0.5.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.5.0
 [0.4.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.1
 [0.4.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.0
 [0.3.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.3.1

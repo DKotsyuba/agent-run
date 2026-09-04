@@ -52,7 +52,8 @@ class CapacityRouteDescriptor:
     discovered-but-unconfigured account never becomes a route. ``quota_lane``
     is the lane this route spends from. ``pool_ids`` is the non-empty,
     duplicate-free tuple of physical pools the route draws on, each of which
-    must exist in the same topology.
+    must exist in the same topology. ``reset_credits`` is optional nonnegative
+    provider metadata used only as an advisory ranking bonus.
     """
 
     route_id: str
@@ -60,6 +61,7 @@ class CapacityRouteDescriptor:
     account: str | None
     quota_lane: str
     pool_ids: tuple[str, ...]
+    reset_credits: int | None = None
 
 
 @dataclass(frozen=True)
@@ -173,8 +175,15 @@ def validate_topology(
                 raise ValidationError(f"route {route_id} references unknown pool {pool_id}")
         if route_id in checked_routes:
             raise ValidationError(f"duplicate route_id {route_id}")
+        reset_credits = route.reset_credits
+        if reset_credits is not None and (
+            not isinstance(reset_credits, int)
+            or isinstance(reset_credits, bool)
+            or reset_credits < 0
+        ):
+            raise ValidationError("reset_credits must be a nonnegative integer or None")
         checked_routes[route_id] = CapacityRouteDescriptor(
-            route_id, route.runtime, account, route.quota_lane, pool_ids
+            route_id, route.runtime, account, route.quota_lane, pool_ids, reset_credits
         )
 
     return CapacityTopology(

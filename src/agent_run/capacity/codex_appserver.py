@@ -60,7 +60,9 @@ def normalize_rate_limits(
 
     Each bucket becomes one account-namespaced physical pool and route. Stable
     provider limitId values identify samples and pools; limitName is display-only
-    quota_lane metadata. Evidence remains fresh for the bounded source interval,
+    quota_lane metadata. A nonnegative integer reset-credit count is attached
+    only to stable ``codex`` routes, never display-labelled Spark routes.
+    Evidence remains fresh for the bounded source interval,
     never until the provider reset. The returned backend account id is ephemeral
     deduplication data and callers must neither persist nor log it. Malformed
     envelopes raise ValidationError; absent/null windows represent no quota,
@@ -82,6 +84,10 @@ def normalize_rate_limits(
     account_id = result.get("accountId")
     if not isinstance(account_id, str) or not account_id:
         account_id = None
+    credits = result.get("rateLimitResetCredits")
+    reset_credits = credits.get("availableCount") if isinstance(credits, Mapping) else None
+    if not isinstance(reset_credits, int) or isinstance(reset_credits, bool) or reset_credits < 0:
+        reset_credits = None
     observed = _number(observed_at)
     if observed is None or observed < 0:
         raise ValidationError("observed_at must be a finite nonnegative epoch timestamp")
@@ -152,6 +158,7 @@ def normalize_rate_limits(
                 account=target,
                 quota_lane=quota_lane,
                 pool_ids=(pool_id,),
+                reset_credits=reset_credits if limit_id == "codex" else None,
             )
         )
     return tuple(samples), validate_topology(pools, routes), account_id

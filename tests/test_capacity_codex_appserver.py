@@ -532,5 +532,43 @@ class FetchRateLimitsTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 20)
 
 
+class ResetCreditPersistenceTests(unittest.TestCase):
+    """Verify reset-credit metadata survives the app-server persistence path."""
+
+    def test_codex_credit_metadata_round_trips_without_boosting_spark(self) -> None:
+        """Persist normalized stable-id credits and retain the bounded ordinary-only bonus."""
+        import tempfile
+
+        from agent_run.capacity.ranking import rank_capacity_routes
+        from agent_run.capacity.snapshot import build_capacity_routes
+        from agent_run.state import StateStore
+
+        response = {
+            "rateLimitResetCredits": {"availableCount": 2},
+            "rateLimitsByLimitId": {
+                "codex": {"limitName": "Renamed ordinary", "primary": _window(20.0, 300)},
+                "codex_spark": {"limitName": "Ordinary", "primary": _window(20.0, 300)},
+            },
+        }
+        samples, topology, _ = normalize_rate_limits(_RUNTIME, None, {"result": response}, _OBSERVED)
+        routes = {route.quota_lane: route for route in topology.routes}
+        self.assertEqual(routes["Renamed ordinary"].reset_credits, 2)
+        self.assertIsNone(routes["Ordinary"].reset_credits)
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                persist_slice(store, CapacityCollectionSlice(_RUNTIME, "codex:base", samples, topology, _OBSERVED, _OBSERVED + 900))
+                snapshot = build_capacity_routes(store, retention=10, now=_OBSERVED)
+                order = rank_capacity_routes(snapshot, {}, now=_OBSERVED)
+            finally:
+                store.close()
+        ordinary = next(item for item in order.routes if item.aliases[0].quota_lane == "Renamed ordinary")
+        spark = next(item for item in order.routes if item.aliases[0].quota_lane == "Ordinary")
+        self.assertEqual(ordinary.reset_credits, 2)
+        self.assertAlmostEqual(ordinary.reset_credit_multiplier, 5 / 3)
+        self.assertIsNone(spark.reset_credits)
+        self.assertEqual(spark.reset_credit_multiplier, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
