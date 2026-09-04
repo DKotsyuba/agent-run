@@ -14,7 +14,7 @@ from ..domain import (
     validate_agent_id,
 )
 from ..errors import AgentRunError, ValidationError
-from .completion_notice_contract import format_notice_message
+from .completion_notice_contract import failure_notice_block, format_notice_message
 
 
 TRANSPORT_API_VERSION = 1
@@ -241,9 +241,9 @@ class CompletionNotice:
     """The only payload a transport may send.
 
     It carries lifecycle facts plus optional immutable launch metadata
-    (runtime, model, effort). Task text, answer text, runtime error prose,
-    and tool output never enter this type. Optional selector facts are bounded
-    and escaped before display rather than treated as trusted prose.
+    (runtime, model, effort) and a bounded failure category. Task text, answer
+    text, runtime error prose, and tool output never enter this type. Optional
+    fields are bounded and escaped before display rather than trusted as prose.
     """
 
     notification_id: str
@@ -253,6 +253,7 @@ class CompletionNotice:
     runtime: str | None = None
     model: str | None = None
     effort: str | None = None
+    failure_kind: str | None = None
 
     def __post_init__(self) -> None:
         """Validate terminal facts and bounded optional selectors, or raise ValidationError."""
@@ -267,6 +268,11 @@ class CompletionNotice:
         object.__setattr__(self, "runtime", _metadata("runtime", self.runtime))
         object.__setattr__(self, "model", _metadata("model", self.model))
         object.__setattr__(self, "effort", _metadata("effort", self.effort))
+        object.__setattr__(
+            self, "failure_kind", _metadata("failure_kind", self.failure_kind)
+        )
+        if self.status in {AgentStatus.SUCCEEDED, AgentStatus.CANCELLED} and self.failure_kind:
+            raise ValidationError("successful or cancelled notice cannot carry failure_kind")
 
     def payload(self) -> dict[str, object]:
         """Return the frozen four-field transport payload, without metadata.
@@ -287,9 +293,10 @@ class CompletionNotice:
         """Render the fixed structured message; every part is derived from this notice.
 
         Missing launch metadata renders as ``unknown`` (runtime, model) or
-        ``unspecified`` (effort) and is never inferred. Metadata control and
-        line-separator characters are escaped by :func:`_escaped_metadata`,
-        so metadata can never add a list line or command to the text.
+        ``unspecified`` (effort) and is never inferred. Failed/lost/timed-out
+        notices add package-owned reason/advice for the optional failure kind.
+        Metadata control and line-separator characters are escaped by
+        :func:`_escaped_metadata`, so metadata cannot add a list line or command.
         """
 
         runtime = (
@@ -299,12 +306,16 @@ class CompletionNotice:
         effort = (
             _escaped_metadata(self.effort) if self.effort is not None else "unspecified"
         )
+        failure_kind = (
+            _escaped_metadata(self.failure_kind) if self.failure_kind is not None else None
+        )
         return format_notice_message(
             agent_id=str(self.agent_id),
             status=self.status.value,
             runtime=runtime,
             model=model,
             effort=effort,
+            failure_block=failure_notice_block(self.status.value, failure_kind),
             version=self.version,
             notification_id=self.notification_id,
         )

@@ -556,8 +556,9 @@ def claim_delivery_row(
     The caller owns ``connection`` and its write transaction, validates the
     string lease ``owner`` and epoch-second ``now``/``lease_until`` values.
     A successful claim increments attempts and assigns the sending lease;
-    no eligible row or a lost claim returns None. Returned request JSON is
-    internal input for effort extraction, never notification message text.
+    no eligible row or a lost claim returns None. Returned request JSON and
+    failure category are internal notice inputs; task and failure prose are
+    never projected into the delivery message.
     """
     row = connection.execute(
         """SELECT id FROM deliveries
@@ -583,6 +584,7 @@ def claim_delivery_row(
     return connection.execute(
         """SELECT d.*, a.status AS agent_status, a.runtime AS agent_runtime,
                   a.model AS agent_model, a.request_json AS agent_request_json,
+                  a.failure_kind AS agent_failure_kind,
                   s.transport,
                   s.external_session_id, s.external_turn_id FROM deliveries d
            JOIN agents a ON a.id = d.agent_id
