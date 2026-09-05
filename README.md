@@ -43,12 +43,12 @@ you / your agent / your app
   or a local router), computes usage priorities from burn rate and reset time,
   and injects an ordered summary when it changes. The orchestrator chooses the
   first role-compatible route; `limits` remains available for diagnostics.
-- **Zero dependencies.** Python 3.11+ standard library only. The whole
+- **Zero dependencies.** Python 3.14+ standard library only. The whole
   runtime installs from `pyproject.toml` with nothing else.
 
 ## Install
 
-Requirements: Python ≥ 3.11, macOS or Linux, plus the engine CLIs you intend
+Requirements: Python ≥ 3.14, macOS or Linux, plus the engine CLIs you intend
 to drive (`codex`, `claude`, `qwen`, `opencode` — any subset).
 
 | Feature | macOS | Linux |

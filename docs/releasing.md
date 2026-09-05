@@ -39,7 +39,7 @@ a corrected patch version.
 The command waits until the GitHub Release is public, verifies the downloaded
 wheel and sdist against `SHA256SUMS` and GitHub attestations (repository,
 workflow, tag, commit, and subject hash), then updates the local sealed runtime.
-It requires authenticated `gh`, `git`, Python 3.11, and the existing macOS
+It requires authenticated `gh`, `git`, Python 3.14, and the existing macOS
 standalone installation and API/capacity/delivery launchd plists.
 
 For a new version, start from a clean committed checkout equal to `origin/main`.
@@ -59,7 +59,7 @@ the deadline, and corrupt sealed releases fail explicitly. Correct the reported
 cause (for example, rerun a failed workflow) and repeat the command.
 
 Options: `--publish-only` skips local deployment; `--home` defaults to
-`~/.agent-run`; `--python` defaults to `python3.11`; `--launchd-prefix` defaults
+`~/.agent-run`; `--python` defaults to `python3.14`; `--launchd-prefix` defaults
 to `com.<login>.agent-run`; `--timeout` and `--poll` are positive seconds,
 defaulting to 3600 and 10. Publication itself can run on other operating systems.
 Timeouts stop waiting; they do not cancel a remote workflow or active agent.
