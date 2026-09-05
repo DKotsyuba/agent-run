@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.7.3] - 2026-09-05
+
+- fix(codex): preserve streamed whitespace and early-exit evidence
+
 ## [0.7.2] - 2026-09-05
 
 - fix(runtime): harden supervised execution and workflow recovery
