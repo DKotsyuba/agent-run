@@ -211,6 +211,61 @@ class DetachedLaunchTests(unittest.TestCase):
         with self.assertRaises(ChildProcessError):
             os.waitpid(wrapper, os.WNOHANG)
 
+    def test_preexisting_cancellation_bounds_unread_payload_and_reaps(self) -> None:
+        """Cancellation before payload delivery cannot block or orphan the child."""
+
+        started = time.monotonic()
+        pids = []
+        with mock.patch(
+            "agent_run.launch._spawn_session_leader",
+            side_effect=lambda *args: pids.append(_spawn_session_leader(*args))
+            or pids[-1],
+        ):
+            with self.assertRaisesRegex(ValidationError, "cancelled before supervisor READY"):
+                launch_detached(
+                    {"payload": "x" * (1024 * 1024)},
+                    executable=sys.executable,
+                    module="tests.unread_payload_child",
+                    readiness_timeout_seconds=0.05,
+                    post_terminal_timeout_seconds=0.05,
+                    cleanup_grace_seconds=0.05,
+                    cleanup_kill_seconds=0.05,
+                    cancel_requested=lambda: True,
+                )
+
+        self.assertLess(time.monotonic() - started, 2)
+        pid = pids[0]
+        self.assertFalse(self.alive(pid))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+
+    def test_unread_payload_obeys_ready_deadline_and_reaps(self) -> None:
+        """A full unread payload pipe expires on the READY deadline and is reaped."""
+
+        started = time.monotonic()
+        pids = []
+        with mock.patch(
+            "agent_run.launch._spawn_session_leader",
+            side_effect=lambda *args: pids.append(_spawn_session_leader(*args))
+            or pids[-1],
+        ):
+            with self.assertRaisesRegex(ValidationError, "ready in time"):
+                launch_detached(
+                    {"payload": "x" * (1024 * 1024)},
+                    executable=sys.executable,
+                    module="tests.unread_payload_child",
+                    readiness_timeout_seconds=0.05,
+                    post_terminal_timeout_seconds=0.05,
+                    cleanup_grace_seconds=0.05,
+                    cleanup_kill_seconds=0.05,
+                )
+
+        self.assertLess(time.monotonic() - started, 2)
+        pid = pids[0]
+        self.assertFalse(self.alive(pid))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+
     def test_post_terminal_dispatch_is_bounded_and_never_reruns_the_child(self) -> None:
         events = self.root / "events"
         dispatched = self.root / "dispatched"

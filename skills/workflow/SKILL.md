@@ -43,15 +43,24 @@ an answer to a short prefix and call the result verified. Gate downstream work
 on each required step's status and evidence, not just the wrapper's success.
 
 `agent()` spec fields: `runtime`, `model`, `profile`, `task`, `workdir`,
-optional `account`, `write`, `read_roots`, `timeout_seconds`, `output_schema` (the ENGINE
+optional `account`, `effort`, `write`, `read_roots`, `timeout_seconds`,
+`output_schema` (the ENGINE
 validates the answer against it; mismatch = failed step with the raw answer
-preserved). Step result: `{"agent_id", "status", "answer", ...}` — always
+preserved). `effort` carries the reasoning-effort label `start` accepts; omit
+it to keep the runtime default. Step result: `{"agent_id", "status", "answer", ...}` — always
 check `status`, a failed step returns a dict, not an exception.
 
 Write literal step specs. `step_key` is a deterministic hash of spec+position:
 stable specs give stable keys, which is what makes the journal replayable.
 
 ## Runtime-specific step notes
+
+Apply the `delegate` skill's GPT-6 escalation boundary to each step: only the
+hardest read-only architecture/review judgment, never code writing or routine
+steps. Both the default Codex account and `personal2` are eligible; do not
+reserve GPT-6 for the primary account. Select by the injected account priorities
+and confirm the selected account's roster. Skip unavailable accounts without
+dropping the selector or borrowing priority.
 
 Choose each step's role/model from the existing eligibility matrix, then use
 the first compatible runtime/account/lane in the latest injected Runtime

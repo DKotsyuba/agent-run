@@ -26,6 +26,7 @@ class FakeTransport:
         self._events = list(events or [])
         self._pid = pid
         self.requests = []
+        self.notifications = []
         self.timeouts = []
         self.terminated = None
         self.closed = False
@@ -44,6 +45,10 @@ class FakeTransport:
         if isinstance(response, BaseException):
             raise response
         return response
+
+    def notify(self, method, params=None):
+        self.notifications.append((method, None if params is None else dict(params)))
+
 
     def poll_event(self, timeout):
         if self._events:
@@ -479,6 +484,7 @@ class StartSessionTests(unittest.TestCase):
             }
         )
         session = start_session(transport, plan, FakeSink())
+        self.assertEqual(transport.notifications, [("initialized", None)])
         self.assertEqual(
             transport.requests[-1],
             (
@@ -580,6 +586,59 @@ class CodexAppServerSessionTests(unittest.TestCase):
         self.assertEqual(sink.messages[0].raw_ref, "item_1")
 
         self.assertIsNone(session.wait(0))
+
+    def test_item_completed_preserves_the_message_when_terminal_items_are_empty(self) -> None:
+        """Keep the actual item transcript without manufacturing answer proof."""
+
+        session, _transport, sink = self.start(
+            events=[
+                notification(
+                    "item/completed",
+                    {
+                        "threadId": "th_1",
+                        "turnId": "turn_1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "item_1",
+                            "text": "final before timeout",
+                            "at": 1.0,
+                        },
+                    },
+                ),
+                completed(items=[], exit_code=0),
+            ]
+        )
+        self.assertIsNone(session.wait(0))
+        self.assertEqual([message.content for message in sink.messages], ["final before timeout"])
+
+        outcome = session.wait(0)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual([message.content for message in sink.messages], ["final before timeout"])
+        self.assertIsNone(outcome.answer_path)
+
+    def test_delta_only_output_is_transcript_without_completion_proof(self) -> None:
+        """A missing terminal event must not erase received assistant text."""
+
+        session, _transport, sink = self.start(
+            events=[
+                notification(
+                    "item/agentMessage/delta",
+                    {
+                        "threadId": "th_1",
+                        "turnId": "turn_1",
+                        "itemId": "item_1",
+                        "delta": "partial final",
+                    },
+                )
+            ]
+        )
+        self.assertIsNone(session.wait(0))
+        self.assertEqual([message.content for message in sink.messages], ["partial final"])
+        self.assertIsNone(session.wait(0))
+        self.assertEqual([message.content for message in sink.messages], ["partial final"])
+
+
 
     def test_success_seals_one_canonical_answer_with_proof(self) -> None:
         import hashlib
@@ -721,7 +780,10 @@ class CodexAppServerSessionTests(unittest.TestCase):
     def test_cancel_sends_native_interrupt(self) -> None:
         session, transport, _sink = self.start()
         session.cancel(5)
-        self.assertIn(("turn/interrupt", {"threadId": "th_1"}), transport.requests)
+        self.assertIn(
+            ("turn/interrupt", {"threadId": "th_1", "turnId": "turn_1"}),
+            transport.requests,
+        )
         with self.assertRaises(ValidationError):
             session.cancel(-1)
 
@@ -751,7 +813,9 @@ class CodexAppServerSessionTests(unittest.TestCase):
         )
 
 
-def transport_plan(script, tmpdir):
+def transport_plan(script: str, tmpdir: str) -> LaunchPlan:
+    """Return a subprocess plan for one inline fake app-server script."""
+
     return LaunchPlan(
         argv=(sys.executable, "-c", script),
         cwd=Path(tmpdir),
@@ -785,9 +849,20 @@ import time
 time.sleep(30)
 """
 
+_FAILING_SERVER = """
+import sys
+sys.stderr.write('{"token":"super-secret-value","message":"provider refused"}\\n')
+sys.stderr.flush()
+raise SystemExit(7)
+"""
+
 
 class ProcessTransportTests(unittest.TestCase):
-    def transport(self, script):
+    """Exercise real subprocess framing, deadlines, cleanup, and diagnostics."""
+
+    def transport(self, script: str) -> ProcessTransport:
+        """Launch ``script`` and register bounded cleanup for its transport."""
+
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         transport = ProcessTransport(transport_plan(script, directory.name))
@@ -804,6 +879,29 @@ class ProcessTransportTests(unittest.TestCase):
         self.assertEqual(first["method"], "turn/started")
         self.assertEqual(second["method"], "turn/log")
 
+    def test_server_request_with_the_same_id_is_declined_before_the_response(self) -> None:
+        """A bidirectional request must not be mistaken for its matching response."""
+
+        transport = self.transport(
+            """
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "method": "approval/request", "params": {}}), flush=True)
+decline = json.loads(sys.stdin.readline())
+assert decline == {
+    "jsonrpc": "2.0",
+    "id": request["id"],
+    "error": {"code": -32601, "message": "Method not found"},
+}
+print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}), flush=True)
+"""
+        )
+
+        self.assertEqual(transport.request("initialize", {}), {"ok": True})
+
+
     def test_request_has_a_finite_deadline_while_stream_stays_open(self):
         # Use a child that sleeps well past the deadline instead of exiting,
         # so the stream is verifiably still open when the deadline fires and
@@ -811,6 +909,39 @@ class ProcessTransportTests(unittest.TestCase):
         transport = self.transport(_SLEEPING_SERVER)
         with self.assertRaisesRegex(TimeoutError, "timed out waiting"):
             transport.request("initialize", {}, timeout_seconds=0.2)
+
+    def test_unread_large_request_frame_respects_the_write_deadline(self) -> None:
+        """A non-reading child cannot make a large request block past its budget."""
+
+        transport = self.transport("import time; time.sleep(0.6)")
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "timed out writing"):
+            transport.request("initialize", {"text": "x" * 1_048_576}, timeout_seconds=0.05)
+        self.assertLess(time.monotonic() - started, 0.3)
+        transport.terminate(0.1)
+        self.assertIsNotNone(transport._process.poll())
+
+
+    def test_request_deadline_holds_while_notifications_keep_arriving(self) -> None:
+        """Unrelated traffic cannot extend a request beyond its deadline."""
+
+        transport = self.transport(
+            """
+import json
+import sys
+import time
+
+sys.stdin.readline()
+while True:
+    print(json.dumps({"jsonrpc": "2.0", "method": "turn/log", "params": {}}), flush=True)
+    time.sleep(0.001)
+"""
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting"):
+            transport.request("initialize", {}, timeout_seconds=0.2)
+        self.assertLess(time.monotonic() - started, 2)
+
 
     def test_zero_timeout_never_blocks_and_finite_timeout_is_honored(self) -> None:
         transport = self.transport(_SILENT_SERVER)
@@ -828,10 +959,24 @@ class ProcessTransportTests(unittest.TestCase):
         transport = self.transport(_SILENT_SERVER)
         transport.close()
         transport._process.wait(timeout=5)
-        self.assertIsNone(transport.poll_event(2))
-        self.assertIsNone(transport.poll_event(2))
+        with self.assertRaisesRegex(ConnectionError, "closed the stream while waiting for event"):
+            transport.poll_event(2)
+        with self.assertRaisesRegex(ConnectionError, "closed the stream while waiting for event"):
+            transport.poll_event(2)
         with self.assertRaises(ConnectionError):
             transport.request("initialize", {})
+
+    def test_early_exit_reports_code_and_redacted_bounded_stderr(self) -> None:
+        """Preserve useful startup failure evidence without leaking a token."""
+
+        transport = self.transport(_FAILING_SERVER)
+        with self.assertRaises(ConnectionError) as raised:
+            transport.request("initialize", {})
+        message = str(raised.exception)
+        self.assertIn("exit code 7", message)
+        self.assertIn("provider refused", message)
+        self.assertIn("<redacted>", message)
+        self.assertNotIn("super-secret-value", message)
 
 
 if __name__ == "__main__":

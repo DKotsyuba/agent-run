@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 import sys
@@ -9,6 +10,7 @@ from threading import Barrier
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agent_run.domain import OrchestratorRef
 from agent_run.doctor import run_doctor
 from agent_run.errors import SchemaMigrationRequired, ValidationError
 from agent_run.state import (
@@ -179,6 +181,81 @@ class MigrationRegistryTests(unittest.TestCase):
         finally:
             migrated.close()
             directory.cleanup()
+
+    def test_v11_to_v12_snapshots_or_retires_every_existing_workflow_notice(self) -> None:
+        """Migration 012 must give each surviving notice the terminal status it was
+        queued for, and retire one whose run has since been resumed past it."""
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        database = Path(directory.name) / "state.db"
+        store = StateStore.initialize(database)
+        try:
+            session = OrchestratorRef("stub", "session")
+            kept = store.create_workflow_run("kept", "sha", plan=[], orchestrator=session)
+            store.start_workflow_run(kept)
+            store.finish_workflow_run(kept, "failed", result={"attempt": 1})
+            retired = store.create_workflow_run("retired", "sha", plan=[], orchestrator=session)
+            store.start_workflow_run(retired)
+            store.finish_workflow_run(retired, "failed")
+            store.resume_workflow_run(retired, "1 runner")
+        finally:
+            store.close()
+
+        connection = sqlite3.connect(database)
+        try:
+            # Rebuild the outbox in its exact v11 shape, so 012 runs over a store
+            # indistinguishable from one an older agent-run wrote.
+            connection.execute("ALTER TABLE workflow_deliveries RENAME TO wd_new")
+            connection.execute(
+                """CREATE TABLE workflow_deliveries (
+                     id TEXT PRIMARY KEY,
+                     run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+                     orchestrator_session_id TEXT NOT NULL
+                       REFERENCES orchestrator_sessions(id),
+                     state TEXT NOT NULL CHECK (
+                       state IN ('pending', 'sending', 'delivered', 'retry_wait',
+                                 'failed', 'cancelled')
+                     ),
+                     attempts INTEGER NOT NULL DEFAULT 0,
+                     lease_owner TEXT,
+                     lease_until REAL,
+                     next_attempt_at REAL,
+                     remote_message_id TEXT,
+                     last_error TEXT,
+                     ambiguous_result INTEGER NOT NULL DEFAULT 0
+                       CHECK (ambiguous_result IN (0, 1)),
+                     UNIQUE (run_id)
+                   )"""
+            )
+            connection.execute(
+                """INSERT INTO workflow_deliveries
+                   SELECT id, run_id, orchestrator_session_id, state, attempts,
+                          lease_owner, lease_until, next_attempt_at, remote_message_id,
+                          last_error, ambiguous_result
+                   FROM wd_new"""
+            )
+            connection.execute("DROP TABLE wd_new")
+            connection.execute("PRAGMA user_version = 11")
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = StateStore.open(database)
+        try:
+            rows = {
+                row["run_id"]: row
+                for row in migrated.connection.execute("SELECT * FROM workflow_deliveries")
+            }
+            self.assertEqual(rows[kept]["state"], "pending")
+            self.assertEqual(rows[kept]["run_status"], "failed")
+            self.assertEqual(rows[kept]["attempt_generation"], 1)
+            self.assertEqual(json.loads(rows[kept]["result_json"]), {"attempt": 1})
+            self.assertEqual(rows[retired]["state"], "cancelled")
+            self.assertIsNone(rows[retired]["result_json"])
+            self.assertIn("v12", rows[retired]["last_error"])
+        finally:
+            migrated.close()
 
     def test_stale_backup_cleanup_spares_newer_versions_snapshots(self) -> None:
         from agent_run.state.migrations import _drop_stale_backups

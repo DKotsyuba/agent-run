@@ -13,7 +13,7 @@ one tool surface           `──────  dispatch.py  ──────'
                                         │  TOOLS table + call_tool
 domain facade                     service.py (AgentService)
                                         │
-durable state              state/  (SQLite, schema v8, migrations)
+durable state              state/  (versioned SQLite schema, migrations)
                                         │
 engine drivers          adapters/  ──  supervisor  ──  detached children
                      codex · claude · glm · qwen · opencode
@@ -34,9 +34,13 @@ touch the store or an engine directly.
 agent id before authentication, materialization, adapter preparation, spawn, or
 READY. A bounded worker with its own thread-affine store performs those slow
 steps and launches a **detached supervisor process** that owns the child engine.
-The accepted preparation lease is finite: a worker that has not handed off to
-the supervisor before its deadline is reconciled as `lost`, and cannot revive
-the agent with a late supervisor.
+The accepted preparation lease is finite. Immediately before spawning, the
+coordinator atomically transfers its live claim into a bounded handoff window
+covering READY and failed-launch cleanup. Once the supervisor records its
+ownership proof, the preparation deadline no longer invalidates that proof.
+An abandoned handoff still expires as `lost` and cannot revive the agent later.
+Payload writes share the READY deadline and honor cancellation even when the
+child stops reading the pipe.
 On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
 the legacy fork path is only a compatibility fallback when session-creating
 spawn is explicitly unavailable.
@@ -59,6 +63,14 @@ The supervisor enforces:
 
 Answers are stored with size and sha256; `answer <id>` re-serves the
 verified envelope indefinitely.
+
+Codex assistant deltas are journaled as transcript chunks as they arrive.
+Completed items contribute only text not already streamed. These partial
+messages do not create an answer proof or imply success; an interrupted or
+timed-out run can therefore have a useful transcript without a complete answer.
+Unexpected app-server EOF is a transport failure, not an indefinitely silent
+session. Initialization and native interruption follow the
+[Codex app-server contract](https://learn.chatgpt.com/docs/app-server).
 
 An owned engine may exit before process-group discovery. This is not an
 automatic failure or success: completion still requires the real engine outcome,

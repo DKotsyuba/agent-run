@@ -33,7 +33,7 @@
       "advice": "Inspect status and supervisor bootstrap logs; fix the named executable, database, or ownership failure before retrying."
     },
     "unowned_starting": {
-      "reason": "The accepted start lost its coordinator before supervisor handoff.",
+      "reason": "The accepted start exceeded its startup ownership deadline before supervisor handoff.",
       "advice": "Check API/coordinator health and startup queue latency; retry with a fresh ID only after ownership is stable."
     },
     "supervisor_identity_mismatch": {

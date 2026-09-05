@@ -83,6 +83,12 @@ The tool set (19 at the time of writing, same names as the MCP server):
 `fast`, `doc`, and the workflow verbs `workflow_start`, `workflow_status`,
 `workflow_answer`, `workflow_cancel`, `workflow_resume`.
 
+`fast` settings are ephemeral to the current transport session. Set
+`{"runtime":"codex","enabled":true}` for the runtime default, or add
+`account` for one account. In `start`, explicit `fast` wins over an account
+override, which wins over the runtime default; an omitted account uses the
+runtime's configured default account.
+
 `list_orchestrators` (optional `limit`, default 100, max 1000) is a read-only
 view of the orchestrator sessions that launched agents. Each item carries
 `session_id`, `transport`, `external_session_id`, `external_turn_id`,

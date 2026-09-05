@@ -7,6 +7,8 @@ import unittest
 import os
 from pathlib import Path
 
+from hypothesis import given, settings, strategies as st
+
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.state.reconciliation import reconcile_unowned_starting
@@ -76,6 +78,10 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         self.assertEqual(
             self.store.get_agent(stale)["failure_kind"], "unowned_starting"
         )
+        self.assertEqual(
+            self.store.get_agent(stale)["failure_text"],
+            "accepted start exceeded its startup ownership deadline",
+        )
         self.assertEqual(self.store.get_agent(recent)["status"], "starting")
         self.assertEqual(self.store.get_agent(owned)["status"], "starting")
         self.assertEqual(
@@ -127,6 +133,136 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
             reconcile_unowned_starting(self.store, at=131, grace_seconds=30),
             (agent_id,),
         )
+
+    def test_handoff_renews_deadline_until_late_supervisor_proof(self) -> None:
+        """Atomic handoff prevents reconciliation between spawn and late READY."""
+
+        owner = f"{os.getpid()} {supervisor_identity()}"
+        agent_id = self.starting("handoff-ready", at=10)
+        self.store.claim_startup(
+            agent_id, owner, at=10, deadline_seconds=120
+        )
+
+        self.assertTrue(
+            self.store.begin_supervisor_handoff(
+                agent_id, owner, at=129, deadline_seconds=40
+            )
+        )
+        self.assertEqual(
+            reconcile_unowned_starting(self.store, at=131, grace_seconds=30), ()
+        )
+        self.store.record_supervisor(
+            agent_id, pid=123, identity="identity", process_group_id=123, at=132
+        )
+        self.assertEqual(
+            reconcile_unowned_starting(self.store, at=170, grace_seconds=30), ()
+        )
+
+    def test_expired_handoff_without_supervisor_proof_becomes_lost(self) -> None:
+        """A handoff remains bounded when no child ever records ownership."""
+
+        owner = f"{os.getpid()} {supervisor_identity()}"
+        agent_id = self.starting("handoff-expired", at=10)
+        self.store.claim_startup(
+            agent_id, owner, at=10, deadline_seconds=120
+        )
+        self.assertTrue(
+            self.store.begin_supervisor_handoff(
+                agent_id, owner, at=129, deadline_seconds=10
+            )
+        )
+
+        self.assertEqual(
+            reconcile_unowned_starting(self.store, at=139, grace_seconds=30),
+            (agent_id,),
+        )
+
+    @settings(max_examples=30, deadline=None)
+    @given(
+        preparation_delay=st.integers(min_value=1, max_value=9),
+        handoff_extension=st.integers(min_value=0, max_value=10),
+        ready_before_expiry=st.booleans(),
+    )
+    def test_generated_handoff_preserves_terminal_capacity_invariant(
+        self,
+        preparation_delay: int,
+        handoff_extension: int,
+        ready_before_expiry: bool,
+    ) -> None:
+        """Generated handoffs retain capacity through READY or release it on expiry."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                created = store.create_agent(
+                    self.request("generated"),
+                    task_summary="task",
+                    config_revision="pending:materialization",
+                    at=0,
+                )
+                agent_id = created.agent_id
+                store.transition(agent_id, AgentStatus.STARTING, at=0)
+                owner = f"{os.getpid()} {supervisor_identity()}"
+                store.claim_startup(
+                    agent_id, owner, at=0, deadline_seconds=10
+                )
+                handoff_seconds = 11 - preparation_delay + handoff_extension
+                handoff_deadline = preparation_delay + handoff_seconds
+                self.assertTrue(
+                    store.begin_supervisor_handoff(
+                        agent_id,
+                        owner,
+                        at=preparation_delay,
+                        deadline_seconds=handoff_seconds,
+                    )
+                )
+                self.assertEqual(
+                    reconcile_unowned_starting(store, at=10, grace_seconds=0), ()
+                )
+
+                if ready_before_expiry:
+                    store.record_supervisor(
+                        agent_id,
+                        pid=123,
+                        identity="identity",
+                        process_group_id=123,
+                        at=handoff_deadline - 0.5,
+                    )
+                    self.assertEqual(
+                        reconcile_unowned_starting(
+                            store, at=handoff_deadline + 1, grace_seconds=0
+                        ),
+                        (),
+                    )
+                    with self.assertRaisesRegex(
+                        ValidationError, "global active agent limit reached"
+                    ):
+                        store.create_agent_limited(
+                            self.request("blocked"),
+                            task_summary="task",
+                            config_revision="pending:materialization",
+                            global_limit=1,
+                            runtime_limit=None,
+                            at=handoff_deadline + 1,
+                        )
+                else:
+                    self.assertEqual(
+                        reconcile_unowned_starting(
+                            store, at=handoff_deadline, grace_seconds=0
+                        ),
+                        (agent_id,),
+                    )
+                    replacement = store.create_agent_limited(
+                        self.request("replacement"),
+                        task_summary="task",
+                        config_revision="pending:materialization",
+                        global_limit=1,
+                        runtime_limit=None,
+                        at=handoff_deadline + 1,
+                    )
+                    self.assertTrue(replacement.created)
+            finally:
+                store.close()
 
     def test_expired_startup_cannot_bind_a_supervisor(self) -> None:
         """A delayed supervisor cannot revive an expired accepted start."""

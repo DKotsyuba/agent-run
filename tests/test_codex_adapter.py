@@ -822,13 +822,24 @@ env_from = ["PATH"]
         return config
 
     def test_prepare_builds_launch_plan_for_a_valid_request(self) -> None:
+        """Verify the launch plan exposes only approved environment keys and the managed root."""
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
-        plan = self.prepare(self.start_request(), profile, config)
+        managed_python = Path(self._mkdtemp()).resolve()
+        with patch.dict(
+            os.environ,
+            {"UV_PYTHON_INSTALL_DIR": str(managed_python)},
+            clear=False,
+        ):
+            plan = self.prepare(self.start_request(), profile, config)
         self.assertIsInstance(plan, LaunchPlan)
         self.assertEqual(plan.argv, (str(config.binary), "app-server"))
         self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(set(plan.environment), {"CODEX_HOME", "HOME", "PATH"})
+        self.assertEqual(
+            set(plan.environment),
+            {"CODEX_HOME", "HOME", "PATH", "UV_PYTHON_INSTALL_DIR"},
+        )
+        self.assertEqual(plan.environment["UV_PYTHON_INSTALL_DIR"], str(managed_python))
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(plan.adapter_state["writable_roots"], ())
         self.assertEqual(
@@ -980,6 +991,33 @@ env_from = ["PATH"]
         plan = self.prepare(self.start_request(), profile, config)
         self.assertEqual(plan.adapter_state["model"], "gpt-5.6-sol")
 
+    def test_prepare_limits_gpt_6_astra_to_read_only_architect_and_review_roles(self) -> None:
+        """Keep GPT-6 launches restricted to read-only architecture and review."""
+        config = self.materialized(models=("gpt-5.6-sol", "gpt-6-astra"))
+        self.write_model_cache('{"models": [{"id": "gpt-6-astra"}]}')
+        with self.assertRaisesRegex(ValidationError, "role-architect and role-review"):
+            self.prepare(
+                self.start_request(model="gpt-6-astra"),
+                AgentProfile("role-implement", "body", True, (self.auth_source_dir,)),
+                config,
+            )
+        with self.assertRaisesRegex(ValidationError, "does not permit write-capable"):
+            self.prepare(
+                self.start_request(model="gpt-6-astra", write=True),
+                AgentProfile("role-architect", "body", True, (self.auth_source_dir,)),
+                config,
+            )
+        for role in ("role-architect", "role-review"):
+            with self.subTest(role=role):
+                plan = self.prepare(
+                    self.start_request(model="gpt-6-astra"),
+                    AgentProfile(role, "body", False, (self.auth_source_dir,)),
+                    config,
+                )
+                self.assertEqual(plan.adapter_state["model"], "gpt-6-astra")
+                self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
+                self.assertEqual(plan.adapter_state["writable_roots"], ())
+
     def test_prepare_refuses_output_schema(self) -> None:
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
@@ -1066,6 +1104,32 @@ env_from = ["PATH"]
             with self.assertRaisesRegex(TimeoutError, "startup timed out"):
                 ADAPTER.launch(object(), object())
         transport.terminate.assert_called_once_with(1.0)
+
+    def test_launch_startup_timeout_reaps_the_real_transport_process(self) -> None:
+        """The launch facade owns a real app-server child until session startup succeeds."""
+
+        transports = []
+
+        class CapturingTransport(app_server.ProcessTransport):
+            def __init__(self, plan):
+                super().__init__(plan)
+                transports.append(self)
+
+        plan = LaunchPlan(
+            (sys.executable, "-c", "import time; time.sleep(0.6)"),
+            self.workdir,
+            {},
+            None,
+            self.workdir / "unused.jsonl",
+            {"request_timeout_seconds": 0.05},
+        )
+        with patch.object(app_server, "ProcessTransport", CapturingTransport):
+            with self.assertRaisesRegex(TimeoutError, "timed out waiting for initialize"):
+                ADAPTER.launch(plan, object())
+
+        self.assertEqual(len(transports), 1)
+        self.assertIsNotNone(transports[0]._process.poll())
+
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TextIO
+from typing import IO
 
 from .stream import sanitize_line
 
@@ -22,7 +22,7 @@ class StderrTail:
 
     def __init__(
         self,
-        stream: TextIO | None,
+        stream: IO[str] | None,
         secrets: Iterable[str],
         *,
         limit_bytes: int = _DEFAULT_TAIL_BYTES,

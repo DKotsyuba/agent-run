@@ -194,7 +194,30 @@ def finish_workflow_run(
     result: object = None,
     at: float | None = None,
 ) -> None:
-    """Commit a terminal workflow state, JSON result, and notice atomically."""
+    """Commit a terminal workflow state, JSON result, and notice atomically.
+
+    ``status`` must be one of :data:`RUN_TERMINAL`; ``result`` is any JSON-safe
+    value stored verbatim; ``at`` overrides the finish timestamp for tests.
+    Raises :class:`ValidationError` for an unknown run or a non-terminal status
+    and :class:`StateTransitionError` when the run is already finished.
+
+    Notice contract: every terminal transition of a bound run (one with an
+    orchestrator session) emits *its own* outbox row, carrying the next
+    ``attempt_generation`` for that run plus an immutable ``run_status`` /
+    ``result_json`` snapshot of *this* transition -- the dispatcher announces
+    that snapshot, never the run row, which a later resume would have moved on.
+    A run that fails, is resumed, and
+    then succeeds therefore notifies twice -- once per transition -- instead
+    of colliding on the old ``UNIQUE (run_id)`` and rolling this whole
+    transaction back.  Any notice of an older generation still waiting to be
+    sent (``pending`` or ``retry_wait``) is superseded to ``cancelled`` in the
+    same transaction, so the orchestrator is never told about a stale attempt.
+    An older notice already leased by a dispatcher (``sending``) is left alone:
+    it owns its own row id, so its late completion or retry can only ever
+    settle that row, never the new one, and
+    :meth:`agent_run.state.store.StateStore.claim_workflow_delivery` refuses to
+    claim any row a newer generation has superseded.
+    """
 
     nonblank("run_id", run_id)
     if status not in RUN_TERMINAL:
@@ -212,12 +235,29 @@ def finish_workflow_run(
             raise StateTransitionError("workflow run is already finished")
         run = _run_row(connection, run_id)
         if run["orchestrator_session_id"] is not None:
+            generation = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(attempt_generation), 0) + 1 AS next
+                       FROM workflow_deliveries WHERE run_id = ?""",
+                    (run_id,),
+                ).fetchone()["next"]
+            )
+            connection.execute(
+                """UPDATE workflow_deliveries
+                   SET state = 'cancelled', lease_owner = NULL, lease_until = NULL,
+                       next_attempt_at = NULL,
+                       last_error = 'superseded by a later terminal transition'
+                   WHERE run_id = ? AND state IN ('pending', 'retry_wait')""",
+                (run_id,),
+            )
             connection.execute(
                 """INSERT INTO workflow_deliveries
-                   (id, run_id, orchestrator_session_id, state, next_attempt_at)
-                   VALUES (?, ?, ?, 'pending', ?)""",
+                   (id, run_id, orchestrator_session_id, state, next_attempt_at,
+                    attempt_generation, run_status, result_json)
+                   VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
                 (f"wnt_{uuid.uuid4().hex}", run_id,
-                 run["orchestrator_session_id"], finished_at),
+                 run["orchestrator_session_id"], finished_at, generation,
+                 status, result_json),
             )
 
 

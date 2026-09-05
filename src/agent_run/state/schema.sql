@@ -175,7 +175,12 @@ CREATE TABLE workflow_deliveries (
   remote_message_id TEXT,
   last_error TEXT,
   ambiguous_result INTEGER NOT NULL DEFAULT 0 CHECK (ambiguous_result IN (0, 1)),
-  UNIQUE (run_id)
+  attempt_generation INTEGER NOT NULL DEFAULT 1 CHECK (attempt_generation >= 1),
+  run_status TEXT NOT NULL CHECK (
+    run_status IN ('succeeded', 'failed', 'cancelled', 'lost')
+  ),
+  result_json TEXT,
+  UNIQUE (run_id, attempt_generation)
 );
 
 CREATE INDEX workflow_deliveries_due
@@ -250,4 +255,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 11;
+PRAGMA user_version = 12;

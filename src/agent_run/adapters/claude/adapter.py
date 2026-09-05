@@ -3,7 +3,9 @@
 Materialization and launch preparation never inherit the caller's global
 Claude settings, plugins, or MCP configuration. Every generated asset is
 built only from ``RuntimeConfig``, the selected ``AgentProfile``, and the
-owner-authored skill directories below ``~/.agent-run/skills/claude``.
+owner-authored skill directories below ``~/.agent-run/skills/claude``. The
+sole ambient exception is an existing uv managed-Python root, required for
+offline hooks after their generated ``HOME`` replaces the parent home.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import AgentStatus, Outcome, StartRequest
 from ...errors import ValidationError
-from ..home import seal_answer
+from ..home import content_hash, managed_uv_python_environment, seal_answer
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -36,13 +38,19 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from ..home import content_hash
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
+from .launch_io import abort_launch, known_secrets, open_runtime_log
 from .limits import agent_rate_limit_samples
 from .materialize import render_mcp_config, render_plugin_dirs, render_settings
 from .stderr import StderrTail
-from .stream import StreamDecoder, classify_failure, sanitize_line, terminal_event_data
+from .stream import (
+    StreamDecoder,
+    classify_failure,
+    is_secret_env_name,
+    sanitize_line,
+    terminal_event_data,
+)
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
 
@@ -303,15 +311,27 @@ class ClaudeAdapter:
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
-        environment: dict[str, str] = {"HOME": str(home)}
+        environment: dict[str, str] = {"HOME": str(home), **managed_uv_python_environment()}
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
 
+        # Secret registration follows what was *injected*, not only what the
+        # config declared: a subclass auth bridge (glm's keychain token) can
+        # export a credential the config never names, and with
+        # ``auth.names = ()`` that live token would otherwise never reach
+        # ``secret_env_names`` and so never be redacted out of the runtime log.
+        # Only credential-shaped names are added, so a public companion such as
+        # ANTHROPIC_BASE_URL is not turned into a literal redaction pattern.
         auth_names: tuple[str, ...] = ()
+        injected_secret_names: tuple[str, ...] = ()
         if config.auth is not None:
             auth_names = config.auth.names
-            environment.update(self._auth_environment(config.binary, auth_names))
+            injected = self._auth_environment(config.binary, auth_names)
+            environment.update(injected)
+            injected_secret_names = tuple(
+                name for name in injected if is_secret_env_name(name)
+            )
 
         mcp_env_names: list[str] = []
         for name in config.mcp:
@@ -350,7 +370,9 @@ class ClaudeAdapter:
                     "permission_mode": permission_mode,
                     "allowed_tools": allowed_tools,
                     "model": request.model,
-                    "secret_env_names": tuple(dict.fromkeys((*auth_names, *mcp_env_names))),
+                    "secret_env_names": tuple(
+                        dict.fromkeys((*auth_names, *injected_secret_names, *mcp_env_names))
+                    ),
                 }
             ),
             answer_path=agent_dir / "answer.md",
@@ -371,51 +393,8 @@ class ClaudeAdapter:
         try:
             return ClaudeSession(process, plan, sink)
         except BaseException:
-            _abort_launch(process)
+            abort_launch(process)
             raise
-
-
-def _abort_launch(process: subprocess.Popen) -> None:
-    """Native-cancel, reap, and close pipes for a child that never got a session.
-
-    Runs when opening the runtime log, wiring the reader thread, or writing
-    the initial prompt fails during ``ClaudeSession`` construction, so the
-    child never outlives a failed ``launch``.
-    """
-
-    if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except OSError:
-            try:
-                process.kill()
-            except OSError:
-                pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    for pipe in (process.stdin, process.stdout):
-        if pipe is not None:
-            try:
-                pipe.close()
-            except OSError:
-                pass
-
-
-def _open_runtime_log(path: Path):
-    """Open the runtime stream log privately: O_CREAT|O_APPEND|O_WRONLY, mode 0600."""
-
-    descriptor = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-    os.fchmod(descriptor, 0o600)
-    return os.fdopen(descriptor, "a", encoding="utf-8")
-
-
-def _known_secrets(plan: LaunchPlan) -> frozenset[str]:
-    """Literal secret values that must never reach the decoder or the disk log."""
-
-    names = plan.adapter_state.get("secret_env_names", ())
-    return frozenset(value for name in names if (value := plan.environment.get(name)))
 
 
 class ClaudeSession:
@@ -428,7 +407,21 @@ class ClaudeSession:
     as a bounded, secret-redacted tail for failed-run classification.
     """
 
-    def __init__(self, process: subprocess.Popen, plan: LaunchPlan, sink: EventSink) -> None:
+    def __init__(
+        self, process: "subprocess.Popen[str]", plan: LaunchPlan, sink: EventSink
+    ) -> None:
+        """Attach to a launched text-mode child and start its reader threads.
+
+        :param process: The running child, opened with ``text=True`` and pipes
+            on stdin/stdout/stderr; ownership of those pipes passes here.
+        :param plan: The plan the child was launched from; supplies the initial
+            prompt, the runtime log path, and the secret names to redact.
+        :param sink: Receives session id, messages, and events as they decode.
+        :raises BaseException: Re-raised after closing the runtime log if
+            opening it or starting a reader thread fails; the caller aborts
+            the launch.
+        """
+
         self._process = process
         self._plan = plan
         self._sink = sink
@@ -448,9 +441,14 @@ class ClaudeSession:
         # signal-terminated process rarely reports 0) must not then flip an
         # otherwise-successful engine result to failed.
         self._force_stopped = False
-        self._secrets = _known_secrets(plan)
+        # Last session id handed to the sink. The child repeats its session id
+        # on every stream line, and forwarding each repeat wrote the same row
+        # thousands of times per run; only a first sighting or a genuine switch
+        # is news.
+        self._reported_session_id: str | None = None
+        self._secrets = known_secrets(plan)
         self._stderr = StderrTail(process.stderr, self._secrets)
-        self._raw_stream = _open_runtime_log(plan.runtime_stream_path)
+        self._raw_stream = open_runtime_log(plan.runtime_stream_path)
         try:
             if plan.initial_input and process.stdin is not None:
                 try:
@@ -488,6 +486,17 @@ class ClaudeSession:
         return None
 
     def _read_stdout(self) -> None:
+        """Drain child stdout on the reader thread: log, decode, and publish.
+
+        Each line is redacted, appended to the runtime log, then fed to the
+        decoder; the resulting messages, events and warnings go to the sink.
+        The session id is published only when it first appears or actually
+        changes, so a repeated id costs nothing. A terminal ``result`` line
+        settles the run. Any exception is stored for :meth:`wait` to re-raise
+        while the loop keeps draining the pipe, and ``self._settled`` is set on
+        every exit path, including crash and EOF.
+        """
+
         try:
             stdout = self._process.stdout
             if stdout is None:
@@ -499,7 +508,8 @@ class ClaudeSession:
                         self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
                         self._raw_stream.flush()
                     result = self._decoder.feed(sanitized, at=time.time())
-                    if result.session_id:
+                    if result.session_id and result.session_id != self._reported_session_id:
+                        self._reported_session_id = result.session_id
                         self._sink.session(result.session_id)
                     for message in result.messages:
                         self._sink.message(message)

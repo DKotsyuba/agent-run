@@ -68,9 +68,10 @@ TOOLS = (
     },
     {
         "name": "fast",
-        "description": "Get or set the ephemeral Codex fast-mode toggle.",
+        "description": "Get or set the ephemeral Codex fast-mode toggle, optionally for one account.",
         "inputSchema": _schema(
-            {"runtime": {"type": "string"}, "enabled": {"type": "boolean"}}
+            {"runtime": {"type": "string"}, "enabled": {"type": "boolean"},
+             "account": {"type": ["string", "null"]}}
         ),
     },
     {
@@ -179,25 +180,51 @@ TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 @dataclass
 class Session:
+    """Own fast defaults for one transport session, without persistence.
+
+    ``fast_modes`` maps runtime names (str) to bool defaults.
+    ``fast_account_modes`` maps (runtime, account) string pairs to bool
+    overrides, including explicit False. The owning transport serializes access.
+    """
+
     fast_modes: dict[str, bool] = field(default_factory=lambda: {"codex": False})
+    fast_account_modes: dict[tuple[str, str], bool] = field(default_factory=dict)
 
 
 def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> object:
-    """Validate one MCP tool request and dispatch it to the service."""
+    """Validate and dispatch a named tool using the session's mutable defaults.
+
+    ``service`` is the AgentService facade, ``name`` a tool-name str, ``raw``
+    its argument dict, and ``session`` the transport-owned Session. Return the
+    tool's JSON-compatible result; invalid arguments raise ValidationError.
+    Fast mutations last only for this session. Starts prefer an explicit bool,
+    then the resolved account override, then the runtime default. Fast queries
+    return detached dicts, adding ``accounts`` only when overrides exist.
+    """
 
     fast_modes = session.fast_modes
     if name == "fast":
-        args = _arguments(raw, {"runtime", "enabled"})
+        args = _arguments(raw, {"runtime", "enabled", "account"})
         if not args:
-            return dict(fast_modes)
+            if not session.fast_account_modes:
+                return dict(fast_modes)
+            return {**fast_modes, "accounts": {
+                account: enabled for (runtime, account), enabled in session.fast_account_modes.items()
+                if runtime == "codex"
+            }}
         runtime = _string(args, "runtime")
         if runtime != "codex":
             raise ValidationError(f"{runtime} runtime does not support fast mode")
         enabled = args.get("enabled")
         if not isinstance(enabled, bool):
             raise ValidationError("enabled must be a boolean")
-        fast_modes[runtime] = enabled
-        return dict(fast_modes)
+        account = _optional_string(args, "account")
+        if account is None:
+            fast_modes[runtime] = enabled
+        else:
+            service.resolve_account(runtime, account)
+            session.fast_account_modes[(runtime, account)] = enabled
+        return call_tool(service, "fast", {}, session)
     if name == "workflow_start":
         args = _arguments(raw, {"name", "script", "args", "orchestrator"},
                           {"name", "script"})
@@ -231,7 +258,11 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
         write = args.get("write", False)
         if not isinstance(write, bool):
             raise ValidationError("write must be a boolean")
-        fast = args.get("fast", fast_modes.get(_string(args, "runtime"), False))
+        runtime_name = _string(args, "runtime")
+        account = _optional_string(args, "account")
+        effective_account = service.resolve_account(runtime_name, account)
+        fast = args.get("fast", session.fast_account_modes.get(
+            (runtime_name, effective_account), fast_modes.get(runtime_name, False)))
         if not isinstance(fast, bool):
             raise ValidationError("fast must be a boolean")
         roots = args.get("read_roots", [])
@@ -247,7 +278,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
         )
         return service.start(
             StartRequest(
-                _string(args, "runtime"),
+                runtime_name,
                 _string(args, "model"),
                 _string(args, "profile"),
                 _string(args, "task"),
@@ -260,7 +291,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 output_schema=schema,
                 orchestrator=_optional_orchestrator(args.get("orchestrator")),
                 request_id=_optional_string(args, "request_id"),
-                account=_optional_string(args, "account"),
+                account=account,
             )
         )
     if name in {"cancel", "status", "answer"}:

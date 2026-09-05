@@ -338,6 +338,68 @@ class ClaudeSessionTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertIsNotNone(process.poll())
 
+    # -- session id publication ----------------------------------------------
+
+    def test_repeated_session_id_is_published_once_without_losing_content(self) -> None:
+        """The child stamps every line with its session id; the sink hears it once.
+
+        Forwarding each repeat wrote the same durable row (and progress
+        update) once per stream line -- thousands of times on a real run.
+        Deduplication must not drop any message or event that came with it.
+        """
+
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-1'}))\n"
+            "for index in range(40):\n"
+            "    print(json.dumps({'type': 'assistant', 'session_id': 'sess-1', 'message': "
+            "{'role': 'assistant', 'content': [{'type': 'text', 'text': 'chunk %d' % index}]}}))\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-1', 'subtype': 'success', "
+            "'is_error': False, 'result': 'done', 'duration_ms': 1, 'num_turns': 1, "
+            "'total_cost_usd': 0.0, 'usage': {}}))\n"
+        )
+        sink = FakeSink()
+
+        outcome = ADAPTER.launch(self.plan(script), sink).wait(timeout_seconds=10)
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(sink.sessions, ["sess-1"])
+        assistant_texts = [
+            message.content for message in sink.messages if message.role == MessageRole.ASSISTANT
+        ]
+        self.assertEqual(len(assistant_texts), 40)
+        self.assertEqual(assistant_texts[0], "chunk 0")
+        self.assertEqual(assistant_texts[-1], "chunk 39")
+        self.assertEqual(len([kind for kind, _ in sink.events if kind == "system"]), 1)
+
+    def test_a_real_session_switch_is_still_published(self) -> None:
+        """Only repeats are suppressed: a changed id is a new runtime session."""
+
+        script = (
+            "import sys, json\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-1'}))\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-1'}))\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-2'}))\n"
+            "print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'sess-2'}))\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-2', 'subtype': 'success', "
+            "'is_error': False, 'result': 'done', 'duration_ms': 1, 'num_turns': 1, "
+            "'total_cost_usd': 0.0, 'usage': {}}))\n"
+        )
+        sink = FakeSink()
+
+        outcome = ADAPTER.launch(self.plan(script), sink).wait(timeout_seconds=10)
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(sink.sessions, ["sess-1", "sess-2"])
+        self.assertEqual(outcome.runtime_session_id, "sess-2")
+        # Every system line the child actually emitted is still an event: the
+        # duplicates come from the child, not from a decoder replay, so they
+        # are reported rather than collapsed by type.
+        self.assertEqual(len([kind for kind, _ in sink.events if kind == "system"]), 4)
+
     # -- cancellation --------------------------------------------------------
 
     def test_cancel_marks_the_outcome_cancelled(self) -> None:

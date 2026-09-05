@@ -265,6 +265,116 @@ class WorkflowSurfaceTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_repeated_terminal_transitions_each_get_their_own_bound_notice(self) -> None:
+        """A failed, resumed, then succeeded run notifies once per transition,
+        and each notice announces the status its own transition committed."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                run_id = store.create_workflow_run(
+                    "named", "sha", plan=[], orchestrator=OrchestratorRef("stub", "session")
+                )
+                store.start_workflow_run(run_id)
+                store.finish_workflow_run(run_id, "failed", result={"attempt": 1})
+                store.resume_workflow_run(run_id, "1 runner")
+                store.finish_workflow_run(run_id, "succeeded", result={"attempt": 2})
+
+                rows = {
+                    row["attempt_generation"]: row
+                    for row in store.connection.execute(
+                        "SELECT * FROM workflow_deliveries WHERE run_id = ?", (run_id,)
+                    )
+                }
+                self.assertEqual(sorted(rows), [1, 2])
+                # The first notice never reached a transport, so it is superseded
+                # rather than left to announce a failure the run has moved past.
+                self.assertEqual(rows[1]["state"], "cancelled")
+                self.assertEqual(rows[1]["run_status"], "failed")
+                self.assertEqual(rows[2]["state"], "pending")
+                self.assertEqual(rows[2]["run_status"], "succeeded")
+
+                transport = _Transport()
+                result = WorkflowDeliveryDispatcher(store, {"stub": transport}).drain()
+                self.assertEqual((result.claimed, result.delivered), (1, 1))
+                self.assertEqual(transport.calls[0][1].status, "succeeded")
+            finally:
+                store.close()
+
+    def test_an_old_attempts_leased_notice_never_announces_the_new_result(self) -> None:
+        """A notice claimed before a resume announces its own snapshot, and its
+        released retry is not claimable again once a newer notice exists."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                run_id = store.create_workflow_run(
+                    "named", "sha", plan=[], orchestrator=OrchestratorRef("stub", "session")
+                )
+                store.start_workflow_run(run_id)
+                store.finish_workflow_run(run_id, "failed", at=0.0)
+                claimed = store.claim_workflow_delivery("dispatch", at=1.0)
+                assert claimed is not None
+                self.assertEqual(claimed["run_status"], "failed")
+
+                store.resume_workflow_run(run_id, "1 runner")
+                store.finish_workflow_run(run_id, "succeeded", at=2.0)
+                # The in-flight lease still settles its own row, and only its own.
+                store.retry_workflow_delivery(
+                    str(claimed["id"]), "dispatch", "transport down", at=2.0
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT state FROM workflow_deliveries WHERE id = ?",
+                        (claimed["id"],),
+                    ).fetchone()["state"],
+                    "retry_wait",
+                )
+
+                transport = _Transport()
+                result = WorkflowDeliveryDispatcher(store, {"stub": transport}).drain(at=1000.0)
+                self.assertEqual((result.claimed, result.delivered), (1, 1))
+                self.assertEqual(
+                    [notice.status for _target, notice in transport.calls], ["succeeded"]
+                )
+            finally:
+                store.close()
+
+    def test_cancel_refuses_a_workflow_owner_pid_that_is_not_the_recorded_process(
+        self,
+    ) -> None:
+        """Never signal a pid whose live command does not match the owner identity."""
+
+        from agent_run import workflow_facade
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore.initialize(Path(directory) / "state.db")
+            try:
+                run_id = store.create_workflow_run("named", "sha", plan=[])
+                store.claim_workflow_run(run_id, "4242 agent-run workflow runner")
+                probe = "agent_run.doctor._probe_process"
+                for alive, command in (
+                    (False, None),  # the pid is gone
+                    (True, None),  # live, but its command cannot be read
+                    (True, "/bin/some-unrelated-process"),  # the pid was reused
+                ):
+                    with patch(probe, return_value=(alive, command, False)), \
+                            patch("os.kill") as kill:
+                        with self.assertRaises(ValidationError):
+                            workflow_facade.workflow_cancel(store, run_id)
+                        kill.assert_not_called()
+
+                with patch(
+                    probe, return_value=(True, "python agent-run workflow runner", False)
+                ), patch("os.kill") as kill:
+                    self.assertEqual(
+                        workflow_facade.workflow_cancel(store, run_id),
+                        {"run_id": run_id, "cancel_requested": True},
+                    )
+                    kill.assert_called_once()
+                    self.assertEqual(kill.call_args.args[0], 4242)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

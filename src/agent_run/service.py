@@ -18,6 +18,7 @@ from .accounts import account_auth_source, account_runtime_home
 from .capacity.advice import CapacityAdvice, build_advice
 from .capacity.forecast import build_forecasts
 from .capacity.history import load_series
+from .capacity.ranking import CapacityOrder
 from .config import Config, McpConfig, RuntimeConfig, load_config
 from .domain import (
     ACTIVE,
@@ -33,7 +34,7 @@ from .domain import (
 from .errors import AuthError, StateTransitionError, ValidationError
 from .delivery.base import DeliveryAttemptEvidence
 from .delivery.dispatch import _effort_from_request_json
-from .launch import launch_cancellation
+from .launch import DEFAULT_STARTUP_HANDOFF_SECONDS, launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from . import workflow_facade
@@ -340,14 +341,7 @@ class AgentService:
                 timeout_seconds=self._config.core.default_timeout_seconds,
             )
         runtime = self._runtime_config(request.runtime)
-        label = request.account or runtime.default_account
-        if request.account is not None and not runtime.accounts:
-            raise ValidationError(f"runtime {request.runtime} declares no accounts")
-        if label is not None and label not in runtime.accounts:
-            known = ", ".join(runtime.accounts) or "none"
-            raise ValidationError(
-                f"account {label!r} is not declared for runtime {request.runtime}; known accounts: {known}"
-            )
+        label = self.resolve_account(request.runtime, request.account)
         if label is not None:
             if runtime.auth is None or runtime.auth.target is None:
                 raise ValidationError(f"runtime {request.runtime} account auth is not configured")
@@ -388,9 +382,12 @@ class AgentService:
             at=accepted_at,
         )
         try:
+            startup_owner = workflow_owner_identity(
+                os.getpid(), supervisor_identity()
+            )
             self._store.claim_startup(
                 creation.agent_id,
-                workflow_owner_identity(os.getpid(), supervisor_identity()),
+                startup_owner,
                 at=accepted_at,
             )
             self._starts.submit(
@@ -402,6 +399,7 @@ class AgentService:
                     request,
                     runtime,
                     label,
+                    startup_owner,
                 ),
             )
         except Exception as error:
@@ -425,12 +423,15 @@ class AgentService:
         request: StartRequest,
         runtime: RuntimeConfig,
         account_label: str | None,
+        startup_owner: str,
     ) -> None:
         """Materialize and launch one already accepted start.
 
         ``store`` belongs to this worker thread. Cancellation is checked before
         work, after authentication/materialization/prepare, and before spawn.
-        Post-accept failures are always converted to durable outcomes.
+        ``startup_owner`` is the immutable coordinator identity whose live
+        preparation claim is atomically renewed for the bounded READY and
+        cleanup handoff. Post-accept failures become durable outcomes.
         """
 
         failure_kind = "prepare_failed"
@@ -517,7 +518,12 @@ class AgentService:
             ):
                 if self._cancel_accepted_start(store, cancelled, agent_id):
                     return
-                if not store.startup_preparation_live(agent_id, at=self._now()):
+                if not store.begin_supervisor_handoff(
+                    agent_id,
+                    startup_owner,
+                    at=self._now(),
+                    deadline_seconds=DEFAULT_STARTUP_HANDOFF_SECONDS,
+                ):
                     _logger.warning("start agent_id=%s expired before supervisor spawn", agent_id)
                     return
                 failure_kind = "supervisor_start_failed"
@@ -877,7 +883,7 @@ class AgentService:
         )
         return CapacityReport(observed_at, ordered)
 
-    def capacity_order(self) -> "CapacityOrder":
+    def capacity_order(self) -> CapacityOrder:
         """Return enabled runtimes' deterministic capacity routing order.
 
         Reads one clock value and the committed capacity snapshot only. Disabled
@@ -888,6 +894,25 @@ class AgentService:
         from .capacity.order import build_capacity_order
 
         return build_capacity_order(self._store, self._config, now=self._now())
+
+    def resolve_account(self, runtime: str, account: str | None) -> str | None:
+        """Return a configured account label (str), or None for an unlabelled run.
+
+        ``runtime`` is a configured runtime-name str; ``account`` is an explicit
+        label str or None to use its configured default. Raise ValidationError
+        for an unknown runtime, undeclared explicit label, or invalid default.
+        This lookup performs no I/O and does not mutate configuration.
+        """
+        config = self._runtime_config(runtime)
+        if account is not None and not config.accounts:
+            raise ValidationError(f"runtime {runtime} declares no accounts")
+        label = account if account is not None else config.default_account
+        if label is not None and label not in config.accounts:
+            known = ", ".join(config.accounts) or "none"
+            raise ValidationError(
+                f"account {label!r} is not declared for runtime {runtime}; known accounts: {known}"
+            )
+        return label
 
     def _runtime_config(self, name: str) -> RuntimeConfig:
         try:

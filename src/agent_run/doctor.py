@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Config, RuntimeConfig, load_config
+from .adapters.home import managed_uv_python_environment
 from .errors import AgentRunError, SchemaMigrationRequired
 from .launch import launch_detached
 from .launch_evidence import SupervisorBootstrapError
@@ -177,24 +178,86 @@ def _skills(root: Path, name: str, runtime: RuntimeConfig, findings) -> None:
 #: absolute paths sit outside the trusted roots by design, so the trust check
 #: for such a hook applies to the script argument instead.
 _HOOK_INTERPRETERS = frozenset({"/usr/bin/python3", "/bin/sh", "/bin/zsh", "/usr/bin/env"})
+#: Python executable basenames permitted below uv's managed-install root.
+_PYTHON_EXECUTABLE = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+#: Python options that consume their following argv token before a script path.
+_PYTHON_OPTIONS_WITH_VALUE = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+#: Short Python switches that preserve normal script execution when grouped.
+_PYTHON_SAFE_FLAG_CHARACTERS = frozenset("bBdEiIOPqsuvSx")
+
+
+def _is_hook_interpreter(interpreter: Path) -> bool:
+    """Return whether ``interpreter`` safely introduces a hook script path.
+
+    Fixed system interpreters are accepted directly. A Python executable is
+    accepted only when it has Python's expected basename, resides in ``bin``,
+    and resolves beneath the local uv managed-install root exposed to isolated
+    children. This prevents an arbitrary executable merely named ``python3``
+    from changing which argv token doctor trusts as a script.
+    """
+
+    if str(interpreter) in _HOOK_INTERPRETERS:
+        return True
+    environment = managed_uv_python_environment()
+    root = environment.get("UV_PYTHON_INSTALL_DIR")
+    return (
+        root is not None
+        and interpreter.parent.name == "bin"
+        and _PYTHON_EXECUTABLE.fullmatch(interpreter.name) is not None
+        and _under(interpreter, Path(root))
+    )
+
+
+def _python_hook_script(interpreter: Path, command: tuple[str, ...]) -> Path:
+    """Return a Python hook's script path only after safe interpreter options.
+
+    The parser recognizes standalone safe flags, their grouped short form,
+    options with one value, and ``--`` before a positional script. Execution
+    modes (``-c`` and ``-m``), attached or grouped execution forms, and unknown
+    options return ``interpreter`` so their following words cannot become
+    trusted script paths.
+    """
+
+    index = 1
+    while index < len(command):
+        word = command[index]
+        if word == "--":
+            return Path(command[index + 1]).expanduser() if index + 1 < len(command) else interpreter
+        if word in _PYTHON_OPTIONS_WITH_VALUE:
+            if index + 1 >= len(command):
+                return interpreter
+            index += 2
+            continue
+        if word in {"-c", "-m"} or word.startswith(("-c", "-m")):
+            return interpreter
+        if word.startswith("-"):
+            if len(word) > 1 and set(word[1:]) <= _PYTHON_SAFE_FLAG_CHARACTERS:
+                index += 1
+                continue
+            return interpreter
+        return Path(word).expanduser()
+    return interpreter
 
 
 def _hook_script(command: tuple[str, ...]) -> Path:
     """Return the path the hook trust check should evaluate.
 
-    For a plain hook command that is ``command[0]``. When the hook launches a
-    script through a known system interpreter (see :data:`_HOOK_INTERPRETERS`),
-    the interpreter itself is not the artifact whose location matters, so the
-    first non-flag argument -- the script path -- is returned. A hook that
-    carries an interpreter but no such argument has nothing to trust, so the
-    interpreter path is returned and the hook stays untrusted.
+    For a plain hook command that is ``command[0]``. A recognized system or uv
+    managed Python interpreter launches a script from a later argument, so the
+    interpreter itself is not the artifact whose location matters. Managed
+    Python parses only safe options before that script; execution modes and
+    unknown options return the interpreter, keeping the hook untrusted. Other
+    known system interpreters use their first non-flag argument. An interpreter
+    without a script remains untrusted.
 
     ``command`` is the hook's argv; config parsing guarantees it is non-empty.
     """
 
     interpreter = Path(command[0]).expanduser()
-    if str(interpreter) not in _HOOK_INTERPRETERS:
+    if not _is_hook_interpreter(interpreter):
         return interpreter
+    if _PYTHON_EXECUTABLE.fullmatch(interpreter.name) is not None:
+        return _python_hook_script(interpreter, command)
     for word in command[1:]:
         if not word.startswith("-"):
             return Path(word).expanduser()

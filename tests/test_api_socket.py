@@ -30,6 +30,12 @@ class StubService:
         self.calls.append(("list_orchestrators", limit))
         return {"limit": limit}
 
+    def resolve_account(self, runtime, account):
+        """Return the stub's personal label for a str/None account or reject it."""
+        if account not in {None, "personal"}:
+            raise ValueError("unknown account")
+        return account or "personal"
+
 
 @dataclass(frozen=True)
 class _AgentView:
@@ -151,6 +157,22 @@ class ApiSocketTests(unittest.TestCase):
         second = exchange([{"jsonrpc": "2.0", "id": 3, "method": "fast", "params": {}}])
         self.assertEqual(first[1]["result"], {"codex": True})
         self.assertEqual(second[0]["result"], {"codex": False})
+
+    def test_account_fast_toggle_round_trip(self):
+        """One socket session can set and query an account-specific override."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(self.path))
+            stream = client.makefile("rb")
+            for request in (
+                {"jsonrpc": "2.0", "id": 1, "method": "fast", "params": {"runtime": "codex", "account": "personal", "enabled": True}},
+                {"jsonrpc": "2.0", "id": 2, "method": "fast", "params": {}},
+            ):
+                client.sendall(json.dumps(request).encode() + b"\n")
+            self.assertEqual(json.loads(stream.readline())["result"], {"codex": False, "accounts": {"personal": True}})
+            self.assertEqual(json.loads(stream.readline()), {
+                "jsonrpc": "2.0", "id": 2,
+                "result": {"codex": False, "accounts": {"personal": True}},
+            })
 
     def test_socket_mode_and_stale_socket_replacement(self):
         mode = os.stat(self.path).st_mode & 0o777

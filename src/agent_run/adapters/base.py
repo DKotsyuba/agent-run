@@ -69,10 +69,18 @@ class LimitSample:
 
 @dataclass(frozen=True)
 class LaunchPlan:
+    """Immutable adapter-to-supervisor process launch contract.
+
+    ``argv`` and ``cwd`` select the child command; ``environment`` may contain
+    live secrets and remains pipe-only. ``initial_input`` preserves text,
+    binary, or absent input. The stream and optional answer paths hold durable
+    evidence, while ``adapter_state`` carries JSON-safe adapter metadata.
+    """
+
     argv: tuple[str, ...]
     cwd: Path
     environment: Mapping[str, str]
-    initial_input: str | None
+    initial_input: str | bytes | None
     runtime_stream_path: Path
     adapter_state: Mapping[str, object]
     answer_path: Path | None = None
@@ -96,24 +104,62 @@ class LaunchPlan:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> LaunchPlan:
-        """Rebuild a plan, failing closed on anything the parent did not write."""
+        """Rebuild and validate one private parent-to-supervisor plan payload.
+
+        Every field must retain the exact JSON shape emitted by :meth:`to_payload`;
+        malformed or missing fields raise :class:`ValidationError` before any
+        path, environment, or input value is constructed.
+        """
 
         if not isinstance(payload, Mapping):
             raise ValidationError("launch plan payload must be a mapping")
         try:
+            argv = payload["argv"]
+            cwd = payload["cwd"]
+            environment = payload["environment"]
+            initial_input = payload["initial_input_b64"]
+            initial_input_is_bytes = payload["initial_input_is_bytes"]
+            runtime_stream_path = payload["runtime_stream_path"]
+            adapter_state = payload["adapter_state"]
             answer_path = payload["answer_path"]
-            return cls(
-                tuple(str(item) for item in payload["argv"]),
-                Path(str(payload["cwd"])),
-                {str(k): str(v) for k, v in payload["environment"].items()},
-                _decode_input(
-                    payload["initial_input_b64"], payload["initial_input_is_bytes"]
-                ),
-                Path(str(payload["runtime_stream_path"])),
-                dict(payload["adapter_state"]),
-                None if answer_path is None else Path(str(answer_path)),
+        except KeyError as error:
+            raise ValidationError(f"malformed launch plan payload: {error}") from error
+        if not isinstance(argv, list) or not all(
+            isinstance(item, str) for item in argv
+        ):
+            raise ValidationError("launch plan argv must be a list of strings")
+        if not isinstance(cwd, str) or not cwd:
+            raise ValidationError("launch plan cwd must be a nonblank string")
+        if not isinstance(environment, Mapping) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            raise ValidationError("launch plan environment must map strings to strings")
+        if initial_input is not None and not isinstance(initial_input, str):
+            raise ValidationError("launch plan input must be a base64 string or null")
+        if type(initial_input_is_bytes) is not bool:
+            raise ValidationError("launch plan input byte flag must be a boolean")
+        if not isinstance(runtime_stream_path, str) or not runtime_stream_path:
+            raise ValidationError("launch plan stream path must be a nonblank string")
+        if not isinstance(adapter_state, Mapping):
+            raise ValidationError("launch plan adapter state must be a mapping")
+        if answer_path is not None and (
+            not isinstance(answer_path, str) or not answer_path
+        ):
+            raise ValidationError(
+                "launch plan answer path must be a nonblank string or null"
             )
-        except (AttributeError, KeyError, TypeError, ValueError, binascii.Error) as error:
+        try:
+            return cls(
+                tuple(argv),
+                Path(cwd),
+                dict(environment),
+                _decode_input(initial_input, initial_input_is_bytes),
+                Path(runtime_stream_path),
+                dict(adapter_state),
+                None if answer_path is None else Path(answer_path),
+            )
+        except (TypeError, ValueError, UnicodeError, binascii.Error) as error:
             raise ValidationError(f"malformed launch plan payload: {error}") from error
 
 

@@ -5,7 +5,7 @@ import logging.handlers
 import os
 import sys
 import tempfile
-import time
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -165,20 +165,26 @@ class ServiceLoggingTests(unittest.TestCase):
             "fake", "model", "profile", task, self.workdir, request_id=request_id
         )
 
-    def wait_materialized(self, agent_id, *, timeout: float = 2.0) -> None:
-        """Wait until the async worker replaces its pending config revision."""
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.store.get_agent(agent_id)["config_revision"] == "cfg-1":
-                return
-            time.sleep(0.01)
-        self.fail("start did not materialize before the logging deadline")
-
     def test_service_start_logs_a_reconstructable_lifecycle(self) -> None:
-        with self.assertLogs("agent_run.service", level="DEBUG") as captured:
-            started = self.service.start(self.request(request_id="log-test"))
-            self.wait_materialized(started.agent_id)
+        """Capture logs until the asynchronous start worker has fully returned."""
+
+        finished = threading.Event()
+        original = self.service._continue_start
+
+        def tracked_start(*args, **kwargs):
+            """Signal only after the real worker emitted its terminal lifecycle log."""
+
+            try:
+                return original(*args, **kwargs)
+            finally:
+                finished.set()
+
+        with (
+            self.assertLogs("agent_run.service", level="DEBUG") as captured,
+            patch.object(self.service, "_continue_start", side_effect=tracked_start),
+        ):
+            self.service.start(self.request(request_id="log-test"))
+            self.assertTrue(finished.wait(2), "start worker did not finish")
         joined = "\n".join(captured.output)
         self.assertIn("start runtime=fake model=model", joined)
         self.assertIn("gate=capabilities ok", joined)
