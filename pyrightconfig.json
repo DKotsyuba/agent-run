@@ -2,7 +2,9 @@
   "include": [
     "src/agent_run"
   ],
-  "pythonVersion": "3.11",
+  "pythonVersion": "3.14",
+  "venvPath": ".",
+  "venv": ".venv-py314",
   "reportMissingImports": false,
   "reportMissingModuleSource": false,
   "typeCheckingMode": "basic"

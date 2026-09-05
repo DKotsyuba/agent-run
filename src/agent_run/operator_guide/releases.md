@@ -46,8 +46,8 @@ immutable directory per shipped commit.
 1. Download wheel, sdist and `SHA256SUMS` from the public GitHub Release.
 2. Verify hashes and GitHub provenance, including the expected repository,
    release workflow, tag, commit and signed artifact subject.
-3. Create a fresh venv inside the release directory using the system
-   `python3.11`, then install the wheel into it.
+3. Create a fresh venv inside the release directory using a managed Python 3.14
+   interpreter, then install the wheel into it.
 4. Write `SHA256SUMS` covering every file in the release directory except
    `COMPLETE` and `SHA256SUMS` itself.
 5. Run isolated-home `init`, `doctor`, API ping/tools and MCP `tools/list` checks.

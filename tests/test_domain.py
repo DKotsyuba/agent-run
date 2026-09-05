@@ -27,9 +27,11 @@ from agent_run.state.db import request_json
 
 class DomainTests(unittest.TestCase):
     def test_python_version_gate_refuses_unsupported_version(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "Python 3.11"):
-            _require_supported_python((3, 10))
-        _require_supported_python((3, 11))
+        """Require Python 3.14 while accepting the minimum and newer versions."""
+        with self.assertRaisesRegex(RuntimeError, "Python 3.14"):
+            _require_supported_python((3, 13))
+        _require_supported_python((3, 14))
+        _require_supported_python((3, 15))
 
     def test_state_machine_matches_frozen_contract(self) -> None:
         self.assertEqual(

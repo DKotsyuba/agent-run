@@ -35,6 +35,16 @@ class PublicationTests(unittest.TestCase):
                 release.wait_workflow(runner, "ci.yml", "wanted", "push")
             runner.pause.assert_called_once()
 
+    def test_prepare_rejects_python_before_creating_release(self):
+        """Reject a non-3.14 release interpreter before creating its target."""
+        runner = Mock()
+        runner.run.return_value = subprocess.CompletedProcess([], 0, "3.13\n", "")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "release"
+            with self.assertRaisesRegex(release.ReleaseError, "Python 3.14"):
+                local.prepare(runner, target, Path(directory) / "wheel.whl", "1.2.3", "python3.13")
+            self.assertFalse(target.exists())
+
     def test_cli_uses_shared_exception_identity_and_restores_every_job(self):
         """Real __main__ loading catches local failures and attempts all three restarts."""
         calls = []
@@ -58,7 +68,7 @@ class PublicationTests(unittest.TestCase):
 
             vars(deployment)["deploy"] = deploy
             return argparse.Namespace(version="1.2.3", publish_only=False, home=Path("/unused"),
-                                      python="python3.11", launchd_prefix="com.test", timeout=10, poll=1)
+                                      python="python3.14", launchd_prefix="com.test", timeout=10, poll=1)
 
         with patch.dict(sys.modules), patch.object(argparse.ArgumentParser, "parse_args", side_effect=arguments):
             sys.modules.pop("release_local", None)
@@ -213,7 +223,7 @@ class LocalTests(unittest.TestCase):
 
     def deploy(self):
         """Call local deployment with fixture home and a non-installed dummy wheel path."""
-        local.deploy(self.runner, self.home, self.user / "wheel.whl", "1.2.3", "new", "python3.11", "com.test.agent-run")
+        local.deploy(self.runner, self.home, self.user / "wheel.whl", "1.2.3", "new", "python3.14", "com.test.agent-run")
 
     def migrate(self, runner, target, home):
         """Fake installed migration, asserting backup-before-migration and all shutdowns."""
@@ -329,7 +339,7 @@ class LocalTests(unittest.TestCase):
         for name in ("python", "agent-run"):
             (target / "venv/bin" / name).write_text("binary")
         digest = hashlib.sha256(b"binary").hexdigest()
-        package = "venv/lib/python3.11/site-packages/agent_run/__init__.py"
+        package = "venv/lib/python3.14/site-packages/agent_run/__init__.py"
         (target / package).parent.mkdir(parents=True)
         (target / package).write_text("binary")
         (target / "SHA256SUMS").write_text(f"{digest}  venv/bin/python\n{digest}  venv/bin/agent-run\n{digest}  {package}\n")
@@ -349,7 +359,7 @@ class LocalTests(unittest.TestCase):
         (target / "venv/bin").mkdir(parents=True)
         (target / "venv/bin/python").symlink_to(sys.executable)
         (target / "venv/bin/agent-run").write_text("binary")
-        package = "venv/lib/python3.11/site-packages/agent_run/__init__.py"
+        package = "venv/lib/python3.14/site-packages/agent_run/__init__.py"
         (target / package).parent.mkdir(parents=True)
         (target / package).write_text("binary")
         digest = hashlib.sha256(b"binary").hexdigest()

@@ -1,6 +1,7 @@
 .worktrees/
 .claude/
 .venv/
+.venv-py314/
 __pycache__/
 *.py[cod]
 .pytest_cache/

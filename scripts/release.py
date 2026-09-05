@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Publish a version through GitHub's existing gates, then deploy verified assets.
 
-Run from any directory with Python 3.11+. All subprocess inputs are argv lists;
+Run from any directory with Python 3.14+. All subprocess inputs are argv lists;
 GitHub, git, and the local deployment journal provide resumable state.
 """
 
@@ -297,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("version")
     parser.add_argument("--publish-only", action="store_true")
     parser.add_argument("--home", type=Path, default=Path.home() / ".agent-run")
-    parser.add_argument("--python", default="python3.11")
+    parser.add_argument("--python", default="python3.14")
     parser.add_argument("--launchd-prefix", default=f"com.{getpass.getuser()}.agent-run")
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--poll", type=float, default=10)
