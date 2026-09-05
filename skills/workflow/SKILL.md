@@ -70,6 +70,13 @@ stable specs give stable keys, which is what makes the journal replayable.
 
 ## Runtime-specific step notes
 
+Apply the `delegate` skill's GPT-6 escalation boundary to each step: only the
+hardest read-only architecture/review judgment, never code writing or routine
+steps. Both the default Codex account and `personal2` are eligible; do not
+reserve GPT-6 for the primary account. Select by the injected account priorities
+and confirm the selected account's roster. Skip unavailable accounts without
+dropping the selector or borrowing priority.
+
 Choose each step's role/model from the existing eligibility matrix, then use
 the first compatible runtime/account/lane in the latest injected Runtime
 priorities. Carry the selected `account` into the step spec; never silently

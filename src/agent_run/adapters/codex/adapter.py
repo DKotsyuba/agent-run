@@ -537,8 +537,9 @@ class CodexAdapter:
         profiles receive app-server's tagged sandbox request form; other
         profiles retain the legacy string sandbox mode. Workspace-write
         threads cannot grant external read roots in the pinned app-server
-        contract. Raises ``ValidationError`` when an authorization or runtime
-        constraint fails.
+        contract. ``gpt-6-astra`` is limited to read-only architecture and
+        review roles. Raises ``ValidationError`` when an authorization or
+        runtime constraint fails.
         """
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
@@ -552,6 +553,11 @@ class CodexAdapter:
             raise ValidationError(f"model not allowed for codex: {request.model}")
         if request.output_schema is not None:
             raise ValidationError("codex runtime does not support output_schema")
+        if request.model == "gpt-6-astra":
+            if profile.name not in ("role-architect", "role-review"):
+                raise ValidationError("gpt-6-astra is limited to role-architect and role-review")
+            if request.write:
+                raise ValidationError("gpt-6-astra does not permit write-capable launches")
 
         discovered = {info.id: info for info in self.models(config, home)}
         model = discovered.get(request.model)

@@ -980,6 +980,33 @@ env_from = ["PATH"]
         plan = self.prepare(self.start_request(), profile, config)
         self.assertEqual(plan.adapter_state["model"], "gpt-5.6-sol")
 
+    def test_prepare_limits_gpt_6_astra_to_read_only_architect_and_review_roles(self) -> None:
+        """Keep GPT-6 launches restricted to read-only architecture and review."""
+        config = self.materialized(models=("gpt-5.6-sol", "gpt-6-astra"))
+        self.write_model_cache('{"models": [{"id": "gpt-6-astra"}]}')
+        with self.assertRaisesRegex(ValidationError, "role-architect and role-review"):
+            self.prepare(
+                self.start_request(model="gpt-6-astra"),
+                AgentProfile("role-implement", "body", True, (self.auth_source_dir,)),
+                config,
+            )
+        with self.assertRaisesRegex(ValidationError, "does not permit write-capable"):
+            self.prepare(
+                self.start_request(model="gpt-6-astra", write=True),
+                AgentProfile("role-architect", "body", True, (self.auth_source_dir,)),
+                config,
+            )
+        for role in ("role-architect", "role-review"):
+            with self.subTest(role=role):
+                plan = self.prepare(
+                    self.start_request(model="gpt-6-astra"),
+                    AgentProfile(role, "body", False, (self.auth_source_dir,)),
+                    config,
+                )
+                self.assertEqual(plan.adapter_state["model"], "gpt-6-astra")
+                self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
+                self.assertEqual(plan.adapter_state["writable_roots"], ())
+
     def test_prepare_refuses_output_schema(self) -> None:
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))

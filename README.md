@@ -134,7 +134,12 @@ agent-run start --runtime codex --account personal2 ...
 
 Credentials live in `<home>/accounts/codex/<label>/`, each account gets
 its own child-home lineage, and `--account` works identically over MCP
-and the socket API. With no accounts declared, nothing changes.
+and the socket API. With no accounts declared, nothing changes in account
+selection. A configured model is launchable only when the selected account's
+app-server roster reports it. `gpt-6-astra` permits only read-only
+`role-architect` and `role-review` launches. Delegation reserves this expensive,
+high-demand model for the hardest architecture and review decisions; coding
+and routine work use other models.
 
 The built-in operator guide documents every section:
 
