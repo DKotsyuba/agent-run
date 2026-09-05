@@ -287,7 +287,8 @@ class CodexAppServerSession:
         self._buffered_outcome: Outcome | None = None
         self._pending_raw: list[Mapping[str, object]] = []
         self._completed_item_ids: set[str] = set()
-        self._streamed_text: dict[str, str] = {}
+        self._emitted_text: dict[str, str] = {}
+        self._pending_streamed: dict[str, str] = {}
         self._closed = False
 
     @property
@@ -301,7 +302,11 @@ class CodexAppServerSession:
     def wait(self, timeout_seconds: float | None) -> Outcome | None:
         if self._buffered_outcome is not None:
             return self._pop_outcome()
-        event = self._next_raw(timeout_seconds)
+        try:
+            event = self._next_raw(timeout_seconds)
+        except ConnectionError:
+            self._flush_streamed()
+            raise
         if event is None:
             return None
         self._handle_event(event)
@@ -339,6 +344,7 @@ class CodexAppServerSession:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
+            self._flush_streamed()
             self._transport.close()
 
     def _drain_pending(self) -> None:
@@ -384,32 +390,36 @@ class CodexAppServerSession:
     def _emit_messages(
         self, messages: tuple[Message, ...], malformed: tuple[Mapping[str, object], ...]
     ) -> tuple[Message, ...]:
-        """Persist completed items once while avoiding repeated streamed content."""
+        """Persist canonical items after subtracting only accepted stream text."""
 
         fresh = []
         for message in messages:
             item_id = message.raw_ref
             if item_id and item_id in self._completed_item_ids:
                 continue
-            partial = self._streamed_text.pop(item_id, "") if item_id else ""
-            if item_id and partial and message.content.startswith(partial):
-                self._completed_item_ids.add(item_id)
-                suffix = message.content[len(partial) :]
+            emitted = self._emitted_text.get(item_id, "") if item_id else ""
+            if item_id and emitted and message.content.startswith(emitted):
+                suffix = message.content[len(emitted) :]
                 if not suffix:
+                    self._completed_item_ids.add(item_id)
+                    self._emitted_text.pop(item_id, None)
+                    self._pending_streamed.pop(item_id, None)
                     continue
                 message = replace(
-                    message, content=suffix, raw_ref=f"{item_id}:stream:{len(partial)}"
+                    message, content=suffix, raw_ref=f"{item_id}:stream:{len(emitted)}"
                 )
-            elif item_id:
-                self._completed_item_ids.add(item_id)
-            fresh.append(message)
             self._sink.message(message)
+            fresh.append(message)
+            if item_id:
+                self._completed_item_ids.add(item_id)
+                self._emitted_text.pop(item_id, None)
+                self._pending_streamed.pop(item_id, None)
         for record in malformed:
             self._sink.event("malformed_message", dict(record))
         return tuple(fresh)
 
     def _emit_delta(self, params: Mapping[str, object]) -> bool:
-        """Persist a matching assistant delta without inferring an outcome."""
+        """Buffer a matching assistant delta without inferring an outcome."""
 
         item_id = params.get("itemId")
         delta = params.get("delta")
@@ -421,20 +431,34 @@ class CodexAppServerSession:
             or item_id in self._completed_item_ids
         ):
             return False
-        partial = self._streamed_text.get(item_id, "")
-        if partial.endswith(delta):
-            return True
-        self._streamed_text[item_id] = partial + delta
-        message = _normalize_message(
-            {
-                "type": "agentMessage",
-                "id": f"{item_id}:stream:{len(partial)}",
-                "text": delta,
-                "at": time.time(),
-            }
-        )
-        self._sink.message(message)
+        pending = self._pending_streamed.get(item_id, "")
+        if delta.strip() and pending.strip():
+            self._flush_streamed(item_id)
+            pending = ""
+        self._pending_streamed[item_id] = pending + delta
         return True
+
+    def _flush_streamed(self, item_id: str | None = None) -> None:
+        """Persist pending nonblank text at an actual stream boundary."""
+
+        item_ids = tuple(self._pending_streamed) if item_id is None else (item_id,)
+        for current_id in item_ids:
+            pending = self._pending_streamed.get(current_id, "")
+            if pending.strip() and current_id not in self._completed_item_ids:
+                emitted = self._emitted_text.get(current_id, "")
+                self._sink.message(
+                    _normalize_message(
+                        {
+                            "type": "agentMessage",
+                            "id": f"{current_id}:stream:{len(emitted)}",
+                            "text": pending,
+                            "at": time.time(),
+                        }
+                    )
+                )
+                self._emitted_text[current_id] = emitted + pending
+            self._pending_streamed.pop(current_id, None)
+
 
 
     def _handle_event(self, event: Mapping[str, object]) -> None:
@@ -448,11 +472,12 @@ class CodexAppServerSession:
             return
         if method == "item/agentMessage/delta" and self._current_event(params):
             self._consume_raw()
-            if not self._emit_delta(params):
-                self._sink.event(method, dict(params))
+            self._sink.event(method, dict(params))
+            self._emit_delta(params)
             return
         if method == "item/completed" and self._current_event(params):
             item = _mapping(params.get("item"))
+            item_id = item.get("id")
             messages, malformed = _assistant_messages({"items": [item]})
             if messages or malformed:
                 self._consume_raw()
@@ -486,6 +511,7 @@ class CodexAppServerSession:
         self._consume_raw()
         self._buffered_outcome = outcome
         self._emit_messages(messages, malformed)
+        self._flush_streamed()
 
 
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:

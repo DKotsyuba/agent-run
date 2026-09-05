@@ -142,11 +142,11 @@ class ProcessTransport:
         deadline = time.monotonic() + 30.0 if deadline is None else deadline
         stdin = self._process.stdin
         if stdin is None:
-            raise ConnectionError(f"codex app-server has no stdin for {method}")
+            raise self._closed_error(method, deadline)
         try:
             fd = stdin.fileno()
         except ValueError as error:
-            raise ConnectionError(f"codex app-server stdin is closed for {method}") from error
+            raise self._closed_error(method, deadline) from error
         sent = 0
         while sent < len(frame):
             remaining = deadline - time.monotonic()
@@ -155,7 +155,7 @@ class ProcessTransport:
             try:
                 _, writable, _ = select.select([], [fd], [], remaining)
             except (OSError, ValueError) as error:
-                raise ConnectionError(f"codex app-server stdin is closed for {method}") from error
+                raise self._closed_error(method, deadline) from error
             if not writable:
                 raise TimeoutError(f"codex app-server timed out writing {method}")
             try:
@@ -163,9 +163,9 @@ class ProcessTransport:
             except BlockingIOError:
                 continue
             except OSError as error:
-                raise ConnectionError(f"codex app-server stdin is closed for {method}") from error
+                raise self._closed_error(method, deadline) from error
             if count <= 0:
-                raise ConnectionError(f"codex app-server stdin is closed for {method}")
+                raise self._closed_error(method, deadline)
             sent += count
 
     def request(
@@ -290,14 +290,23 @@ class ProcessTransport:
                 except OSError:
                     pass
 
-    def _closed_error(self, method: str) -> ConnectionError:
-        """Describe an exited child using its exit/signal and redacted stderr."""
+    def _closed_error(
+        self, method: str, deadline: float | None = None
+    ) -> ConnectionError:
+        """Describe a closed stream with bounded, redacted process evidence.
 
-        self._stderr_reader.join(timeout=1)
+        ``deadline`` is an optional absolute monotonic time in seconds. Stderr
+        draining takes at most one second and process waiting at most 0.1
+        seconds; neither wait may consume time beyond a supplied deadline.
+        """
+
+        remaining = 1.0 if deadline is None else max(deadline - time.monotonic(), 0.0)
+        self._stderr_reader.join(timeout=min(1.0, remaining))
         returncode = self._process.poll()
-        if returncode is None:
+        remaining = 0.1 if deadline is None else max(deadline - time.monotonic(), 0.0)
+        if returncode is None and remaining > 0:
             try:
-                returncode = self._process.wait(timeout=0.1)
+                returncode = self._process.wait(timeout=min(0.1, remaining))
             except subprocess.TimeoutExpired:
                 pass
         status = (

@@ -3,6 +3,8 @@ import sys
 import tempfile
 import time
 import unittest
+
+from hypothesis import given, settings, strategies as st
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -634,9 +636,268 @@ class CodexAppServerSessionTests(unittest.TestCase):
             ]
         )
         self.assertIsNone(session.wait(0))
-        self.assertEqual([message.content for message in sink.messages], ["partial final"])
+        self.assertEqual(sink.messages, [])
         self.assertIsNone(session.wait(0))
+        session.close()
         self.assertEqual([message.content for message in sink.messages], ["partial final"])
+
+    def test_stream_deltas_preserve_whitespace_at_timeout_without_answer_proof(self) -> None:
+        """Whitespace fragments remain byte-exact while no terminal turn is claimed."""
+
+        chunks = ["CAN", "ARY", "_OK", "\n\n"]
+        session, _transport, sink = self.start(
+            events=[
+                notification(
+                    "item/agentMessage/delta",
+                    {
+                        "threadId": "th_1",
+                        "turnId": "turn_1",
+                        "itemId": "item_whitespace",
+                        "delta": chunk,
+                    },
+                )
+                for chunk in chunks
+            ]
+        )
+        for _ in chunks:
+            self.assertIsNone(session.wait(0))
+        self.assertIsNone(session.wait(0))
+        session.close()
+        self.assertEqual("".join(message.content for message in sink.messages), "".join(chunks))
+        self.assertEqual(sink.messages[-1].content, "_OK\n\n")
+
+    def test_cancel_keeps_trailing_whitespace_for_canonical_item_completion(self) -> None:
+        """Interrupt requests cannot flush away whitespace pending canonical text."""
+
+        session, _transport, sink = self.start()
+        for delta in ("hello", "\n\n"):
+            session._handle_event(
+                notification(
+                    "item/agentMessage/delta",
+                    {
+                        "threadId": "th_1",
+                        "turnId": "turn_1",
+                        "itemId": "item_cancel_space",
+                        "delta": delta,
+                    },
+                )
+            )
+            if delta == "hello":
+                session.cancel(0.1)
+        session._handle_event(
+            notification(
+                "item/completed",
+                {
+                    "threadId": "th_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item_cancel_space",
+                        "text": "hello\n\n",
+                    },
+                },
+            )
+        )
+        session.close()
+        self.assertEqual("".join(message.content for message in sink.messages), "hello\n\n")
+
+    def test_leading_whitespace_delta_is_preserved_by_canonical_completion(self) -> None:
+        """A whitespace-only prefix waits for canonical nonblank content."""
+
+        session, _transport, sink = self.start()
+        session._handle_event(
+            notification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "th_1",
+                    "turnId": "turn_1",
+                    "itemId": "item_leading_space",
+                    "delta": " ",
+                },
+            )
+        )
+        session._handle_event(
+            notification(
+                "item/completed",
+                {
+                    "threadId": "th_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item_leading_space",
+                        "text": " hello",
+                    },
+                },
+            )
+        )
+        session.close()
+        self.assertEqual([message.content for message in sink.messages], [" hello"])
+
+    def test_unrelated_item_completion_does_not_flush_another_items_stream(self) -> None:
+        """Completing one item leaves every other item's pending text buffered."""
+
+        session, _transport, sink = self.start()
+        session._handle_event(
+            notification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "th_1",
+                    "turnId": "turn_1",
+                    "itemId": "item_pending",
+                    "delta": "pending",
+                },
+            )
+        )
+        session._handle_event(
+            notification(
+                "item/completed",
+                {
+                    "threadId": "th_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "item_other",
+                        "text": "other",
+                    },
+                },
+            )
+        )
+        self.assertEqual([message.content for message in sink.messages], ["other"])
+        session.close()
+        self.assertEqual(
+            [message.content for message in sink.messages], ["other", "pending"]
+        )
+
+    def test_turn_only_completion_preserves_unsent_trailing_whitespace(self) -> None:
+        """Canonical turn items absorb pending text before unresolved streams flush."""
+
+        session, _transport, sink = self.start()
+        session._handle_event(
+            notification(
+                "item/agentMessage/delta",
+                {
+                    "threadId": "th_1",
+                    "turnId": "turn_1",
+                    "itemId": "item_turn_only",
+                    "delta": "hello",
+                },
+            )
+        )
+        session._handle_event(
+            completed(
+                items=[
+                    {
+                        "type": "agentMessage",
+                        "id": "item_turn_only",
+                        "text": "hello\n\n",
+                    }
+                ],
+                id="turn_1",
+            )
+        )
+        outcome = session.wait(0)
+        self.assertIsNotNone(outcome)
+        self.assertEqual([message.content for message in sink.messages], ["hello\n\n"])
+
+    @settings(max_examples=40, deadline=None)
+    @given(
+        st.lists(
+            st.text(alphabet=st.sampled_from(list("ab \n\t")), min_size=1, max_size=6),
+            min_size=1,
+            max_size=8,
+        )
+    )
+    def test_stream_chunks_preserve_text_across_idle_polls(self, chunks) -> None:
+        """Idle polls cannot alter the exact assistant stream."""
+
+        session, _transport, sink = self.start()
+        for offset, chunk in enumerate(chunks):
+            session._handle_event(
+                notification(
+                    "item/agentMessage/delta",
+                    {
+                        "threadId": "th_1",
+                        "turnId": "turn_1",
+                        "itemId": "item_property",
+                        "delta": chunk,
+                    },
+                )
+            )
+            self.assertIsNone(session.wait(0))
+        session.close()
+
+        original = "".join(chunks)
+        transcript = "".join(message.content for message in sink.messages)
+        if original.strip():
+            self.assertEqual(transcript, original)
+            self.assertTrue(all(message.content.strip() for message in sink.messages))
+        else:
+            self.assertEqual(transcript, "")
+        self.assertEqual(
+            sum(method == "item/agentMessage/delta" for method, _params in sink.events),
+            len(chunks),
+        )
+
+    @settings(max_examples=40, deadline=None)
+    @given(
+        chunks=st.lists(
+            st.text(alphabet=st.sampled_from(list("ab \n\t")), min_size=1, max_size=5),
+            min_size=1,
+            max_size=6,
+        ),
+        suffix=st.text(
+            alphabet=st.sampled_from(list("xy \n\t")), min_size=1, max_size=6
+        ).filter(lambda value: bool(value.strip())),
+        cancel_after=st.integers(min_value=0, max_value=7),
+        item_first=st.booleans(),
+    )
+    def test_canonical_completion_preserves_chunking_cancel_and_unsent_suffix(
+        self, chunks, suffix, cancel_after, item_first
+    ) -> None:
+        """Canonical item text completes any chunking without duplicates or blanks."""
+
+        session, _transport, sink = self.start()
+        for offset, chunk in enumerate(chunks):
+            session._handle_event(
+                notification(
+                    "item/agentMessage/delta",
+                    {
+                        "threadId": "th_1",
+                        "turnId": "turn_1",
+                        "itemId": "item_property_complete",
+                        "delta": chunk,
+                    },
+                )
+            )
+            self.assertIsNone(session.wait(0))
+            if offset == cancel_after % len(chunks):
+                session.cancel(0.1)
+        original = "".join(chunks) + suffix
+        item = {
+            "type": "agentMessage",
+            "id": "item_property_complete",
+            "text": original,
+        }
+        completion = notification(
+            "item/completed",
+            {"threadId": "th_1", "turnId": "turn_1", "item": item},
+        )
+        if item_first:
+            session._handle_event(completion)
+            self.assertIsNone(session.wait(0))
+            session._handle_event(completion)
+        turn_completion = completed(items=[item], id="turn_1")
+        session._handle_event(turn_completion)
+        outcome = session.wait(0)
+        if not item_first:
+            session._handle_event(turn_completion)
+            self.assertIsNotNone(session.wait(0))
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual("".join(message.content for message in sink.messages), original)
+        self.assertTrue(all(message.content.strip() for message in sink.messages))
+
+
 
 
 
@@ -969,14 +1230,37 @@ while True:
     def test_early_exit_reports_code_and_redacted_bounded_stderr(self) -> None:
         """Preserve useful startup failure evidence without leaking a token."""
 
-        transport = self.transport(_FAILING_SERVER)
-        with self.assertRaises(ConnectionError) as raised:
-            transport.request("initialize", {})
-        message = str(raised.exception)
-        self.assertIn("exit code 7", message)
-        self.assertIn("provider refused", message)
-        self.assertIn("<redacted>", message)
-        self.assertNotIn("super-secret-value", message)
+        for exited_before_write in (False, True):
+            with self.subTest(exited_before_write=exited_before_write):
+                transport = self.transport(_FAILING_SERVER)
+                if exited_before_write:
+                    self.assertEqual(transport._process.wait(timeout=3), 7)
+                with self.assertRaises(ConnectionError) as raised:
+                    transport.request("initialize", {})
+                message = str(raised.exception)
+                self.assertIn("exit code 7", message)
+                self.assertIn("provider refused", message)
+                self.assertIn("<redacted>", message)
+                self.assertNotIn("super-secret-value", message)
+
+    def test_closed_error_rechecks_deadline_after_stderr_drain(self) -> None:
+        """A drained deadline cannot be spent again while waiting for exit."""
+        from unittest.mock import Mock, patch
+
+        transport = ProcessTransport.__new__(ProcessTransport)
+        transport._stderr_reader = Mock()
+        transport._process = Mock()
+        transport._process.poll.return_value = None
+        transport._stderr = Mock()
+        transport._stderr.text.return_value = ""
+        with patch(
+            "agent_run.adapters.codex.process_transport.time.monotonic",
+            side_effect=[0.0, 1.0],
+        ):
+            error = transport._closed_error("initialize", deadline=1.0)
+        self.assertIsInstance(error, ConnectionError)
+        transport._stderr_reader.join.assert_called_once_with(timeout=1.0)
+        transport._process.wait.assert_not_called()
 
 
 if __name__ == "__main__":
