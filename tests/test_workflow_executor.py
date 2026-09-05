@@ -9,10 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
-from agent_run.domain import AgentStatus
+from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.state.store import StateStore
 from agent_run.workflow_executor import WorkflowStepExecutor, validate_agent_spec
+
+_AGENT_ID = "ag-20240101-000000-0123456789"
 
 
 class _Service:
@@ -30,7 +32,7 @@ class _Service:
         """Record a request and return the fixed agent identity."""
 
         self.requests.append(request)
-        return SimpleNamespace(agent_id="a" * 32)
+        return SimpleNamespace(agent_id=_AGENT_ID)
 
     def get(self, _agent_id):
         """Return the configured terminal agent view and failure metadata."""
@@ -67,6 +69,21 @@ class WorkflowExecutorTests(unittest.TestCase):
         self.store = StateStore.initialize(self.root / "state.db")
         self.run_id = self.store.create_workflow_run("workflow", "digest")
         self.store.claim_workflow_run(self.run_id, "1 test")
+        # The journal binds a running step to a real agent row, so the id the
+        # service double hands back has to exist like a live service's would.
+        self.store.create_agent(
+            StartRequest(
+                runtime="codex",
+                model="model",
+                profile="default",
+                task="do work",
+                workdir=self.root,
+                timeout_seconds=60.0,
+            ),
+            task_summary="do work",
+            config_revision="revision",
+            agent_id=_AGENT_ID,
+        )
 
     def tearDown(self) -> None:
         """Close the database and remove the isolated temporary tree."""
@@ -112,6 +129,45 @@ class WorkflowExecutorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unknown keys: extra"):
             validate_agent_spec(self.spec(extra=True))
 
+    def test_effort_is_optional_and_validated_by_the_start_request(self) -> None:
+        """Pass a given effort through and leave an omitted one at the default."""
+
+        self.assertEqual(validate_agent_spec(self.spec(effort="high")).effort, "high")
+        self.assertIsNone(validate_agent_spec(self.spec()).effort)
+        self.assertIsNone(validate_agent_spec(self.spec(effort=None)).effort)
+        with self.assertRaisesRegex(ValidationError, "effort"):
+            validate_agent_spec(self.spec(effort="  "))
+
+    def test_a_running_step_records_the_accepted_agent_id(self) -> None:
+        """Bind the accepted agent to the journal row while the step is running,
+        not only once its terminal result_json is written."""
+
+        seen: list[object] = []
+
+        class _Blocking(_Service):
+            """Report the journal row once, mid-flight, then finish the step."""
+
+            def get(self, agent_id):
+                """Capture the stored step row on the first poll only."""
+
+                if not seen:
+                    seen.append(
+                        self_test.store.connection.execute(
+                            "SELECT status, agent_id FROM workflow_steps"
+                            " WHERE run_id = ? AND step_key = ?",
+                            (self_test.run_id, "bound"),
+                        ).fetchone()
+                    )
+                    return SimpleNamespace(
+                        status=AgentStatus.RUNNING, failure_kind=None, failure_params=None
+                    )
+                return super().get(agent_id)
+
+        self_test = self
+        result = self.executor(_Blocking(AgentStatus.SUCCEEDED, "ok"))("bound", self.spec())
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual((seen[0]["status"], seen[0]["agent_id"]), ("running", _AGENT_ID))
+
     def test_success_failure_timeout_and_output_validation_are_journalled(self) -> None:
         """Persist normal, failed, timed-out, and invalid-output terminal results."""
 
@@ -129,7 +185,7 @@ class WorkflowExecutorTests(unittest.TestCase):
         )
         result = timed_out("three", self.spec(timeout_seconds=1))
         self.assertEqual(result["failure_kind"], "step_timeout")
-        self.assertEqual(timed_out._service.cancelled, ["a" * 32])
+        self.assertEqual(timed_out._service.cancelled, [_AGENT_ID])
 
         invalid = self.executor(_Service(AgentStatus.SUCCEEDED, "not json"))
         result = invalid(

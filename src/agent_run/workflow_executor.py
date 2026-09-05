@@ -30,6 +30,7 @@ _SPEC_KEYS = frozenset(
         "timeout_seconds",
         "output_schema",
         "account",
+        "effort",
     }
 )
 _REQUIRED_SPEC_KEYS = frozenset({"runtime", "model", "profile", "task", "workdir"})
@@ -41,6 +42,7 @@ class _Stop(Protocol):
     @property
     def requested(self) -> bool:
         """Return whether the enclosing runner should cancel its active work."""
+        ...
 
 
 def validate_agent_spec(spec: object) -> StartRequest:
@@ -49,6 +51,18 @@ def validate_agent_spec(spec: object) -> StartRequest:
     The workflow language intentionally exposes only the stable subset of
     ``StartRequest`` fields. Paths and the optional schema are left to the
     domain object and service to validate with their normal policy checks.
+
+    ``spec`` must be a plain ``dict`` holding ``runtime``, ``model``,
+    ``profile``, ``task``, and ``workdir``, plus any of the optional
+    ``write``, ``read_roots``, ``timeout_seconds``, ``output_schema``,
+    ``account``, and ``effort`` keys; any other key is refused. ``effort`` is
+    the runtime's reasoning-effort label, passed straight through to
+    ``StartRequest`` and validated there; omitting it leaves the runtime's own
+    default untouched, exactly as before it was accepted here.
+
+    Raises ``ValidationError`` for a non-dict spec, an unknown key, a missing
+    required key, a non-list ``read_roots``, or any value ``StartRequest``
+    itself rejects.
     """
 
     if type(spec) is not dict:
@@ -77,6 +91,7 @@ def validate_agent_spec(spec: object) -> StartRequest:
         timeout_seconds=spec.get("timeout_seconds"),  # type: ignore[arg-type]
         output_schema=spec.get("output_schema"),  # type: ignore[arg-type]
         account=spec.get("account"),  # type: ignore[arg-type]
+        effort=spec.get("effort"),  # type: ignore[arg-type]
     )
 
 
@@ -223,7 +238,14 @@ class WorkflowStepExecutor:
             )
 
     def _execute(self, step_key: str, spec: dict[str, object]) -> dict[str, object]:
-        """Execute one spec after establishing its durable journal row."""
+        """Execute one spec after establishing its durable journal row.
+
+        A step whose journal already holds a result is replayed from it without
+        touching the service. Otherwise the row is opened ``running``, and
+        re-recorded with the accepted ``agent_id`` as soon as the service
+        returns one, so the binding is durable for the whole time the agent
+        runs rather than only from the terminal ``result_json``.
+        """
 
         cached = self._store_for_caller().cached_step_result(self._run_id, step_key)
         if cached is not None:
@@ -239,6 +261,12 @@ class WorkflowStepExecutor:
         except BaseException as error:
             return self._fail(step_key, "step_start_failed", {"exception": repr(error)})
         agent_id = str(started.agent_id)
+        # Bind the accepted agent to the *running* journal row, so a run that is
+        # inspected or reconciled mid-step can see which agent owns it without
+        # waiting for the terminal result_json.
+        self._store_for_caller().record_step_start(
+            self._run_id, step_key, spec, agent_id=agent_id
+        )
         self.active_agent_id = agent_id
         deadline = None if request.timeout_seconds is None else self._monotonic() + request.timeout_seconds
         try:

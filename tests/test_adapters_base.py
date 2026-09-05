@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
     Capability,
+    LaunchPlan,
     RuntimeAdapter,
     RuntimeHealth,
     RuntimeInfo,
@@ -59,6 +60,32 @@ class LegacyAdapter(FakeAdapter):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_launch_plan_payload_preserves_bytes_and_rejects_shape_coercion(self) -> None:
+        """Private launch payloads round-trip bytes and reject ambiguous JSON shapes."""
+
+        plan = LaunchPlan(
+            ("command", "argument"),
+            Path("/tmp/work"),
+            {"TOKEN": "secret"},
+            b"\x00payload",
+            Path("/tmp/stream.jsonl"),
+            {"mode": "test"},
+            None,
+        )
+        payload = plan.to_payload()
+        self.assertEqual(LaunchPlan.from_payload(payload), plan)
+
+        invalid = (
+            ("argv", "command", "argv"),
+            ("cwd", None, "cwd"),
+            ("initial_input_is_bytes", "false", "byte flag"),
+        )
+        for field, value, message in invalid:
+            with self.subTest(field=field):
+                malformed = {**payload, field: value}
+                with self.assertRaisesRegex(ValidationError, message):
+                    LaunchPlan.from_payload(malformed)
+
     def module(self, **changes):
         values = {"ADAPTER_API_VERSION": ADAPTER_API_VERSION, "ADAPTER": FakeAdapter()}
         values.update(changes)

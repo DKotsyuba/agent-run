@@ -43,8 +43,13 @@ class WorkflowNotice:
                 "run_id": self.run_id, "status": self.status}
 
     def render(self) -> str:
-        """Render a fixed message containing no workflow-authored content."""
+        """Render an attempt notice with explicit current-state lookup guidance.
+
+        The fixed str includes no workflow-authored content. A resumed run may
+        have advanced after this notice's terminal snapshot was recorded.
+        """
 
         return (f"agent-run: workflow {self.run_id} finished with status {self.status}. "
-                f"Call workflow_answer({self.run_id}) for its result. "
+                f"Call workflow_status({self.run_id}) for current state and "
+                f"workflow_answer({self.run_id}) for the latest step result. "
                 f"[notification {self.notification_id} v{self.version}]")

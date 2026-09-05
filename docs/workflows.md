@@ -9,7 +9,7 @@ session that started it.
 agent-run workflow start <name> "$(cat plan.wf)"
 agent-run workflow wait   wf_...        # block until terminal
 agent-run workflow status wf_...        # per-step truth
-agent-run workflow answer wf_...        # the script's result
+agent-run workflow answer wf_...        # latest journaled step result
 agent-run workflow resume wf_...        # re-run only the broken tail
 agent-run workflow cancel wf_...
 ```
@@ -34,9 +34,11 @@ fail the run:
 - The value of the script's **last expression** becomes the run's result.
 
 `agent()` spec fields: `runtime`, `model`, `profile`, `task`, `workdir`,
-optional `write`, `read_roots`, `timeout_seconds`, `output_schema` (the
-engine validates the answer against the schema; mismatch = failed step
-with the raw answer preserved).
+optional `account`, `effort`, `write`, `read_roots`, `timeout_seconds`,
+`output_schema` (the engine validates the answer against the schema;
+mismatch = failed step with the raw answer preserved). `effort` is the
+runtime's reasoning-effort label, validated exactly as `start` validates it;
+omit it to keep the runtime's own default.
 
 A step result is `{"agent_id", "status", "answer", ...}` — **always check
 `status`**; a failed step returns a dict, not an exception.
@@ -73,8 +75,8 @@ of spec + position, and stable specs are what make the journal replayable.
 
 1. `workflow status` shows every step; a run can succeed with failed steps
    if the script tolerated them.
-2. Step truth is the journaled per-step result: a real `agent_id` and
-   answer per step.
+2. A running step records its accepted `agent_id`; completed step truth is
+   the journaled result with the agent id and answer.
 3. Step failures carry a `failure_kind` and parameters (exception text,
    refused permission, timeout) — read them before re-running anything.
 4. `runner.log` under `<home>/workflows/<run_id>/` holds phases, `log()`
@@ -87,8 +89,20 @@ under the same run id: completed steps return instantly from the journal
 cache (no new agents), only the broken tail re-executes.
 Succeeded, cancelled, and still-running runs refuse to resume.
 
-Cancel is safe: the run goes to `cancelled`, an in-flight step is
-journaled as runner-cancelled, and its child agent is cancelled with it.
+Each terminal transition records a separate notification generation with an
+immutable status and result snapshot. A later generation supersedes older
+pending or retrying notices. A notice already being sent retains its original
+status; it never reads a newer run's status. `workflow answer` continues to
+return the current run result, so callers should check the returned status
+after a resume rather than assume a delayed notice describes the latest state.
+The answer command returns the latest available step result from the finished
+run; `workflow status` also exposes the run-level script result.
+
+Cancellation checks the recorded runner identity against the live process and
+refuses dead, unreadable or mismatched identities. An accepted cancellation
+asks the runner to journal `cancelled` and cancel its in-flight child; the
+request acknowledgement is not proof that shutdown has finished. The process
+probe narrows but cannot eliminate the race between inspection and signalling.
 
 ## Batch: the degenerate workflow
 

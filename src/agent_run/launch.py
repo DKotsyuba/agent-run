@@ -36,6 +36,13 @@ DEFAULT_DISPATCH_TIMEOUT_SECONDS = 5.0
 DEFAULT_REAP_TIMEOUT_SECONDS = 5.0
 DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
 DEFAULT_CLEANUP_KILL_SECONDS = 1.0
+#: Maximum default spawn-to-cleanup interval protected from reconciliation.
+DEFAULT_STARTUP_HANDOFF_SECONDS = (
+    DEFAULT_READY_TIMEOUT_SECONDS
+    + DEFAULT_DISPATCH_TIMEOUT_SECONDS
+    + 2 * (DEFAULT_CLEANUP_GRACE_SECONDS + DEFAULT_CLEANUP_KILL_SECONDS)
+    + 0.5
+)
 SUPERVISOR_MODULE = "agent_run.supervisor_main"
 _POLL_SECONDS = 0.01
 _launch_context = threading.local()
@@ -257,7 +264,7 @@ def launch_detached(
     fork_started = time.monotonic()
     group: VerifiedProcessGroup | None = None
     try:
-        _write_payload(payload_write, blob)
+        _write_payload(payload_write, blob, deadline, cancel_requested)
         reported_pid = _read_identity(identity_read, deadline, pid=pid, error_fd=error_read)
         if reported_pid != pid:
             raise ValidationError("detached supervisor reported the wrong process identity")
@@ -366,15 +373,48 @@ def _fork_session_leader(executable: str, argv: list[str], error_fd: int) -> int
         os._exit(1)
 
 
-def _write_payload(fd: int, blob: bytes) -> None:
-    """Hand the child its payload; a child that died before exec closes the pipe."""
+def _write_payload(
+    fd: int,
+    blob: bytes,
+    deadline: float,
+    cancel_requested: Callable[[], bool] | None,
+) -> None:
+    """Deliver ``blob`` before ``deadline`` while honoring cancellation.
+
+    ``fd`` is switched to nonblocking mode and always closed. A child that does
+    not read cannot hold the launcher past the shared READY deadline.
+    """
 
     try:
+        os.set_blocking(fd, False)
         offset = 0
         while offset < len(blob):
-            offset += os.write(fd, blob[offset:])
+            if cancel_requested is not None:
+                try:
+                    cancelled = bool(cancel_requested())
+                except Exception as error:
+                    raise ValidationError(
+                        "launch cancellation predicate failed"
+                    ) from error
+                if cancelled:
+                    raise ValidationError(
+                        "detached launch cancelled before supervisor READY"
+                    )
+            _, writable, _ = select.select(
+                [], [fd], [], min(_remaining(deadline), _POLL_SECONDS)
+            )
+            if not writable:
+                continue
+            try:
+                offset += os.write(fd, blob[offset:])
+            except BlockingIOError:
+                continue
+    except ValidationError:
+        raise
     except OSError as error:
-        raise ValidationError("detached supervisor closed the payload channel") from error
+        raise ValidationError(
+            "detached supervisor closed the payload channel"
+        ) from error
     finally:
         _close(fd)
 

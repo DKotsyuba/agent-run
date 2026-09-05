@@ -115,10 +115,15 @@ def runner_identity() -> str:
 
     The pid travels with the ps command because ``workflow_runs`` has a single
     ownership column; :func:`agent_run.state.reconcile_workflow_runs` needs
-    both to decide whether the owner is still alive.
+    both to decide whether the owner is still alive. If ``ps`` is unavailable,
+    the interpreter argument suffix remains specific to this module and still
+    matches the end of the later process probe.
     """
 
-    return workflow_owner_identity(os.getpid(), supervisor_identity())
+    identity = supervisor_identity()
+    if identity == "agent-run-supervisor":
+        identity = " ".join(sys.orig_argv[1:])
+    return workflow_owner_identity(os.getpid(), identity)
 
 
 def execute_plan(

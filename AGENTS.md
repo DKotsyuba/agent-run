@@ -6,10 +6,12 @@ reliability of *this* code is set by everything that will run on top of it.
 
 ## Ground rules
 
-- **Python 3.14+, standard library only.** The runtime package has zero
-  dependencies (`pyproject.toml`) and ships as a sealed venv release. Do
-  not add runtime dependencies — not for HTTP, not for CLI parsing, not
-  for anything. `pytest` is the only dev-time extra.
+- **Python 3.14+, small deliberate dependency set.** The runtime currently
+  has zero dependencies (`pyproject.toml`) and ships as a sealed venv release.
+  Add a runtime dependency only when it replaces concrete fragile code and
+  passes the supported-platform package checks. Prefer existing code and the
+  standard library when they satisfy the contract. `pytest` and `Hypothesis`
+  provide example-based and stateful regression checks.
 - **No monolithic modules.** Keep files focused; a module drifting past
   a few hundred lines is a design smell here, not a habit to copy.
 - **Engines are driven only through adapters + the supervisor.** Never

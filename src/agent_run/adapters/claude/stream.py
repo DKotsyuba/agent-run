@@ -19,6 +19,23 @@ from ...domain import Message, MessageRole
 _SECRET_KEY = re.compile(r"(key|token|secret|password|credential)", re.IGNORECASE)
 
 
+def is_secret_env_name(name: str) -> bool:
+    """Report whether an environment variable name is credential-shaped.
+
+    Applies the same key-name test :func:`sanitize_line` uses structurally, so
+    an adapter registering the variables it actually injected redacts exactly
+    the ones the JSON pass would already redact.
+
+    :param name: Environment variable name, e.g. ``ANTHROPIC_AUTH_TOKEN``.
+    :returns: ``True`` when the name contains ``key``, ``token``, ``secret``,
+        ``password``, or ``credential`` in any case; ``False`` otherwise, so a
+        public companion value such as ``ANTHROPIC_BASE_URL`` is not registered
+        as a literal secret and does not blank out endpoint URLs in the log.
+    """
+
+    return _SECRET_KEY.search(name) is not None
+
+
 def _redact(value: object) -> object:
     """Drop string values whose key names look like a credential, recursively.
 
@@ -167,19 +184,36 @@ class StreamMetadata:
 
 
 def _terminal_metadata(payload: Mapping[str, object], session_id: str | None) -> StreamMetadata:
+    """Extract the trusted terminal facts from one decoded ``result`` payload.
+
+    Every field is an untrusted external value, so each is bound once and
+    accepted only when it already has the declared type; anything else becomes
+    ``None`` (or ``{}`` for ``usage``) rather than being coerced. ``is_error``
+    is the sole deliberately loose field: any truthy value means failure.
+
+    :param payload: Decoded ``result`` JSON object from the child.
+    :param session_id: Session id observed on this line or carried by the
+        decoder; ``None`` when the child never reported one.
+    :returns: The populated :class:`StreamMetadata`; never raises on a
+        malformed payload.
+    """
+
     usage = payload.get("usage")
     result_text = payload.get("result")
+    subtype = payload.get("subtype")
+    duration_ms = payload.get("duration_ms")
+    num_turns = payload.get("num_turns")
+    total_cost_usd = payload.get("total_cost_usd")
     return StreamMetadata(
         runtime_session_id=session_id,
-        subtype=payload.get("subtype") if isinstance(payload.get("subtype"), str) else None,
+        subtype=subtype if isinstance(subtype, str) else None,
         is_error=bool(payload.get("is_error", False)),
         result_text=result_text if isinstance(result_text, str) and result_text.strip() else None,
-        duration_ms=payload.get("duration_ms") if isinstance(payload.get("duration_ms"), int) else None,
-        num_turns=payload.get("num_turns") if isinstance(payload.get("num_turns"), int) else None,
+        duration_ms=duration_ms if isinstance(duration_ms, int) and not isinstance(duration_ms, bool) else None,
+        num_turns=num_turns if isinstance(num_turns, int) and not isinstance(num_turns, bool) else None,
         total_cost_usd=(
-            float(payload["total_cost_usd"])
-            if isinstance(payload.get("total_cost_usd"), (int, float))
-            and not isinstance(payload.get("total_cost_usd"), bool)
+            float(total_cost_usd)
+            if isinstance(total_cost_usd, (int, float)) and not isinstance(total_cost_usd, bool)
             else None
         ),
         usage=_safe_event_data(usage) if isinstance(usage, Mapping) else {},

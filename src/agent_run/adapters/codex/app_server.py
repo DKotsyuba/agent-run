@@ -1,20 +1,14 @@
 """Codex ``app-server`` protocol: initialize/thread/turn/steer/completion.
 
-No live process I/O happens in this module's tested paths; ``ProcessTransport``
-wraps the real subprocess and is exercised only inside the detached
-supervisor (deferred to M011). Every other function here is a pure,
-deterministic transformation driven through the ``AppServerTransport``
-protocol so it can be tested with a fake transport.
+``ProcessTransport`` owns the real subprocess, its JSON-RPC pipes, and bounded
+secret-safe startup diagnostics. Protocol transformations remain testable
+through the ``AppServerTransport`` fake without launching Codex.
 """
 
 from __future__ import annotations
 
 import json
-import queue
-import subprocess
-import threading
 import time
-from collections import deque
 from dataclasses import dataclass, replace
 
 from ..home import seal_answer
@@ -23,13 +17,12 @@ from typing import Mapping, Protocol
 
 from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
+from .process_transport import ProcessTransport
 
 
 # Startup is outside the agent deadline: default to 30s, cap production at 120s.
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 _MAX_STARTUP_TIMEOUT_SECONDS = 120.0
-
-
 class VerificationError(ValidationError):
     """Effective app-server parameters do not match the requested launch plan."""
 
@@ -49,6 +42,8 @@ class AppServerTransport(Protocol):
         *,
         timeout_seconds: float = 30.0,
     ) -> Mapping[str, object]: ...
+
+    def notify(self, method: str, params: Mapping[str, object] | None = None) -> None: ...
 
     def poll_event(self, timeout: float | None) -> Mapping[str, object] | None: ...
 
@@ -291,6 +286,8 @@ class CodexAppServerSession:
         self._answer_path = answer_path
         self._buffered_outcome: Outcome | None = None
         self._pending_raw: list[Mapping[str, object]] = []
+        self._completed_item_ids: set[str] = set()
+        self._streamed_text: dict[str, str] = {}
         self._closed = False
 
     @property
@@ -335,7 +332,7 @@ class CodexAppServerSession:
         self._drain_pending()
         self._transport.request(
             "turn/interrupt",
-            {"threadId": self._thread_id},
+            {"threadId": self._thread_id, "turnId": self._turn_id},
             timeout_seconds=max(float(grace_seconds), 0.001),
         )
 
@@ -370,13 +367,78 @@ class CodexAppServerSession:
         self._buffered_outcome = None
         return outcome
 
-    def _handle_event(self, event: Mapping[str, object]) -> None:
-        """Interpret one JSON-RPC notification: ``{method, params}``.
+    def _current_event(self, params: Mapping[str, object]) -> bool:
+        """Return whether an item event belongs to this active thread and turn."""
 
-        The raw envelope stays retained until it has been normalized, so a
-        refused completion is not lost; once an outcome exists it is buffered
-        before any sink call, so a raising sink cannot drop it either.
-        """
+        thread_id = params.get("threadId")
+        if isinstance(thread_id, str) and thread_id and thread_id != self._thread_id:
+            return False
+        turn_id = params.get("turnId")
+        return not (
+            isinstance(turn_id, str)
+            and turn_id
+            and self._turn_id is not None
+            and turn_id != self._turn_id
+        )
+
+    def _emit_messages(
+        self, messages: tuple[Message, ...], malformed: tuple[Mapping[str, object], ...]
+    ) -> tuple[Message, ...]:
+        """Persist completed items once while avoiding repeated streamed content."""
+
+        fresh = []
+        for message in messages:
+            item_id = message.raw_ref
+            if item_id and item_id in self._completed_item_ids:
+                continue
+            partial = self._streamed_text.pop(item_id, "") if item_id else ""
+            if item_id and partial and message.content.startswith(partial):
+                self._completed_item_ids.add(item_id)
+                suffix = message.content[len(partial) :]
+                if not suffix:
+                    continue
+                message = replace(
+                    message, content=suffix, raw_ref=f"{item_id}:stream:{len(partial)}"
+                )
+            elif item_id:
+                self._completed_item_ids.add(item_id)
+            fresh.append(message)
+            self._sink.message(message)
+        for record in malformed:
+            self._sink.event("malformed_message", dict(record))
+        return tuple(fresh)
+
+    def _emit_delta(self, params: Mapping[str, object]) -> bool:
+        """Persist a matching assistant delta without inferring an outcome."""
+
+        item_id = params.get("itemId")
+        delta = params.get("delta")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or not isinstance(delta, str)
+            or not delta
+            or item_id in self._completed_item_ids
+        ):
+            return False
+        partial = self._streamed_text.get(item_id, "")
+        if partial.endswith(delta):
+            return True
+        self._streamed_text[item_id] = partial + delta
+        message = _normalize_message(
+            {
+                "type": "agentMessage",
+                "id": f"{item_id}:stream:{len(partial)}",
+                "text": delta,
+                "at": time.time(),
+            }
+        )
+        self._sink.message(message)
+        return True
+
+
+    def _handle_event(self, event: Mapping[str, object]) -> None:
+        """Normalize completed assistant items without treating stream text as proof."""
 
         method = event.get("method")
         params = _mapping(event.get("params"))
@@ -384,12 +446,23 @@ class CodexAppServerSession:
             self._consume_raw()
             self._sink.event("malformed_event", {"raw": dict(event)})
             return
+        if method == "item/agentMessage/delta" and self._current_event(params):
+            self._consume_raw()
+            if not self._emit_delta(params):
+                self._sink.event(method, dict(params))
+            return
+        if method == "item/completed" and self._current_event(params):
+            item = _mapping(params.get("item"))
+            messages, malformed = _assistant_messages({"items": [item]})
+            if messages or malformed:
+                self._consume_raw()
+                self._emit_messages(messages, malformed)
+                return
         if method != "turn/completed":
             self._consume_raw()
             self._sink.event(method, dict(params))
             return
-        thread_id = params.get("threadId")
-        if isinstance(thread_id, str) and thread_id and thread_id != self._thread_id:
+        if not self._current_event(params):
             self._consume_raw()
             self._sink.event(method, dict(params))
             return
@@ -412,10 +485,7 @@ class CodexAppServerSession:
             )
         self._consume_raw()
         self._buffered_outcome = outcome
-        for message in messages:
-            self._sink.message(message)
-        for record in malformed:
-            self._sink.event("malformed_message", dict(record))
+        self._emit_messages(messages, malformed)
 
 
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:
@@ -448,6 +518,7 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
         {"clientInfo": {"name": "agent-run", "version": "1"}},
         timeout_seconds=remaining(),
     )
+    transport.notify("initialized")
     roots = tuple(state["roots"])
     writable_roots = tuple(state["writable_roots"])
     sandbox = state.get("sandbox", state["sandbox_mode"])
@@ -501,153 +572,6 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     )
 
 
-_STREAM_CLOSED = object()
-
-
-class ProcessTransport:
-    """Real ``codex app-server`` subprocess speaking newline-delimited JSON-RPC."""
-
-    def __init__(self, plan) -> None:
-        self._process = subprocess.Popen(
-            list(plan.argv),
-            cwd=str(plan.cwd),
-            env=dict(plan.environment),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        self._next_id = 1
-        self._incoming: queue.Queue = queue.Queue()
-        self._notifications: deque = deque()
-        self._reader = threading.Thread(
-            target=self._read_stream, name="codex-app-server-reader", daemon=True
-        )
-        self._reader.start()
-
-    @property
-    def pid(self) -> int | None:
-        return self._process.pid
-
-    def _read_stream(self) -> None:
-        """Drain stdout on a daemon thread so no caller ever blocks on readline."""
-
-        stream = self._process.stdout
-        try:
-            if stream is not None:
-                for line in iter(stream.readline, b""):
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        message = json.loads(text)
-                    except ValueError:
-                        continue
-                    if isinstance(message, dict):
-                        self._incoming.put(message)
-        finally:
-            self._incoming.put(_STREAM_CLOSED)
-
-    def _take(self, timeout: float | None) -> Mapping[str, object] | None:
-        """Pull one parsed message; ``None`` on timeout or end of stream."""
-
-        try:
-            if timeout is None:
-                message = self._incoming.get()
-            elif timeout <= 0:
-                message = self._incoming.get_nowait()
-            else:
-                message = self._incoming.get(timeout=timeout)
-        except queue.Empty:
-            return None
-        if message is _STREAM_CLOSED:
-            self._incoming.put(_STREAM_CLOSED)
-            return None
-        return message
-
-    def request(
-        self,
-        method: str,
-        params: Mapping[str, object],
-        *,
-        timeout_seconds: float = 30.0,
-    ) -> Mapping[str, object]:
-        if (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, (int, float))
-            or not 0 < timeout_seconds < float("inf")
-        ):
-            raise ValidationError("timeout_seconds must be positive and finite")
-        deadline = time.monotonic() + float(timeout_seconds)
-        request_id = self._next_id
-        self._next_id += 1
-        payload = json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)}
-        ).encode("utf-8")
-        if self._process.stdin is None:
-            raise ConnectionError(f"codex app-server has no stdin for {method}")
-        try:
-            self._process.stdin.write(payload + b"\n")
-            self._process.stdin.flush()
-        except (OSError, ValueError) as error:
-            raise ConnectionError(f"codex app-server stdin is closed for {method}") from error
-        while True:
-            remaining = max(deadline - time.monotonic(), 0.0)
-            message = self._take(remaining)
-            if message is None:
-                if self._process.poll() is None:
-                    raise TimeoutError(f"codex app-server timed out waiting for {method}")
-                raise ConnectionError(
-                    f"codex app-server closed the stream while waiting for {method}"
-                )
-            if message.get("id") == request_id:
-                if "error" in message:
-                    raise ValidationError(f"codex app-server rejected {method}: {message['error']}")
-                result = message.get("result", {})
-                return result if isinstance(result, Mapping) else {}
-            if isinstance(message.get("method"), str):
-                self._notifications.append(message)
-
-    def poll_event(self, timeout: float | None) -> Mapping[str, object] | None:
-        if self._notifications:
-            return self._notifications.popleft()
-        deadline = None if timeout is None else time.monotonic() + max(float(timeout), 0.0)
-        while True:
-            remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
-            message = self._take(remaining)
-            if message is None:
-                return None
-            if isinstance(message.get("method"), str):
-                return message
-            if deadline is not None and time.monotonic() >= deadline:
-                return None
-
-    def terminate(self, grace_seconds: float) -> None:
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=grace_seconds)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait(timeout=max(grace_seconds, 1))
-        finally:
-            # The reader owns stdout, so the pipes can only be released once it
-            # has seen end of stream.
-            self._reader.join(timeout=1)
-            self._close_pipes()
-
-    def close(self) -> None:
-        if self._process.stdin:
-            self._process.stdin.close()
-
-    def _close_pipes(self) -> None:
-        for pipe in (self._process.stdin, self._process.stdout):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-
-
 def fetch_models(plan, *, timeout_seconds: float = 20.0) -> tuple[Mapping[str, object], ...]:
     """Fetch the app-server model catalog without starting a thread or turn."""
 
@@ -672,6 +596,7 @@ def fetch_models(plan, *, timeout_seconds: float = 20.0) -> tuple[Mapping[str, o
             {"clientInfo": {"name": "agent-run", "version": "1"}},
             timeout_seconds=remaining(),
         )
+        transport.notify("initialized")
         models: list[Mapping[str, object]] = []
         cursor: str | None = None
         while True:

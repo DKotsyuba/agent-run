@@ -104,7 +104,7 @@ def reconcile_unowned_starting(
 
     Candidate selection and process probes run outside the short terminal
     transition transaction. Recent, supervisor-owned and non-``STARTING`` rows are untouched. A coordinator
-    owner protects preparation only until its durable deadline; probes run
+    owner protects preparation and spawn handoff only until its durable deadline; probes run
     outside the short transition transactions so a slow ``ps`` cannot block
     writers.
     """
@@ -177,7 +177,7 @@ def reconcile_unowned_starting(
                 outcome=Outcome(
                     AgentStatus.LOST,
                     failure_kind="unowned_starting",
-                    failure_text="accepted start remained unowned beyond its grace period",
+                    failure_text="accepted start exceeded its startup ownership deadline",
                 ),
                 attempt_id=None,
                 kind="reconciled_lost",

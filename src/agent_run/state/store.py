@@ -616,24 +616,59 @@ class StateStore:
                     (owner_identity, claimed_at + float(deadline_seconds), checked),
                 )
 
-    def startup_preparation_live(
-        self, agent_id: str | AgentId, *, at: float | None = None
+    def begin_supervisor_handoff(
+        self,
+        agent_id: str | AgentId,
+        owner_identity: str,
+        *,
+        at: float | None = None,
+        deadline_seconds: float,
     ) -> bool:
-        """Return whether an accepted start may still create its supervisor.
+        """Atomically transfer live preparation into a bounded spawn handoff.
 
-        A worker uses this immediately before spawning. It returns ``False`` for
-        terminal, non-starting, unclaimed, or expired rows, preventing stale
-        queued work from creating a runtime after reconciliation has converged.
+        ``owner_identity`` must match the immutable coordinator claim and its
+        preparation deadline must still be live. Returning ``True`` extends the
+        deadline by ``deadline_seconds`` from ``at`` so READY failure cleanup
+        finishes before reconciliation may release capacity. The coordinator
+        calls this once immediately before spawn; a repeated matching call can
+        renew the deadline and must not be used as an unbounded retry. Terminal,
+        non-starting, expired, conflicting, or supervisor-owned rows return
+        ``False`` without mutation.
         """
 
         checked = validate_agent_id(agent_id)
-        row = agent_row(self.connection, checked)
-        deadline = row["startup_deadline_at"]
-        return (
-            row["status"] == AgentStatus.STARTING.value
-            and isinstance(deadline, (int, float))
-            and deadline > timestamp(at)
-        )
+        nonblank("startup owner identity", owner_identity)
+        if (
+            isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds)
+            or deadline_seconds <= 0
+        ):
+            raise ValidationError("startup deadline must be positive and finite")
+        handoff_at = timestamp(at)
+        with immediate(self.connection):
+            row = agent_row(self.connection, checked)
+            deadline = row["startup_deadline_at"]
+            if (
+                row["status"] != AgentStatus.STARTING.value
+                or row["startup_owner_pid_identity"] != owner_identity
+                or not isinstance(deadline, (int, float))
+                or deadline <= handoff_at
+                or any(
+                    row[field] is not None
+                    for field in (
+                        "supervisor_pid",
+                        "process_group_id",
+                        "supervisor_identity",
+                    )
+                )
+            ):
+                return False
+            self.connection.execute(
+                "UPDATE agents SET startup_deadline_at = ? WHERE id = ?",
+                (handoff_at + float(deadline_seconds), checked),
+            )
+            return True
 
     def transition(
         self,
@@ -1080,22 +1115,48 @@ class StateStore:
     def claim_workflow_delivery(
         self, owner: str, *, at: float | None = None, lease_seconds: float = 30
     ) -> dict[str, object] | None:
-        """Claim one due workflow notice for an owner until its lease expires."""
+        """Claim one due workflow notice for an owner until its lease expires.
+
+        ``owner`` is the dispatcher's lease identity, ``at`` overrides the
+        current time, and ``lease_seconds`` bounds how long the claim holds.
+        Returns the claimed row joined with its orchestrator session as a plain
+        dict, or ``None`` when nothing is due.  ``run_status`` on the returned
+        row is the notice's own immutable snapshot of the terminal transition it
+        was created for, *not* the current ``workflow_runs`` status: a notice
+        queued for a failed attempt announces that failure even after the run
+        has been resumed and has succeeded.
+
+        A notice is only due while it is the newest ``attempt_generation`` for
+        its run: a row a later terminal transition superseded is never claimed,
+        including one that had already reached ``retry_wait`` from a lease taken
+        before the new transition was committed. An expired ``sending`` row of
+        the latest generation is reclaimed with the same id and an incremented
+        attempt count, so a dispatcher crash cannot strand it. See
+        :func:`agent_run.state.workflow.finish_workflow_run` for the generation
+        contract.
+        """
 
         nonblank("lease owner", owner)
         now = timestamp(at)
         with immediate(self.connection):
             row = self.connection.execute(
-                """SELECT wd.*, wr.status AS run_status, os.transport,
+                """SELECT wd.*, os.transport,
                           os.external_session_id, os.external_turn_id
                    FROM workflow_deliveries wd
-                   JOIN workflow_runs wr ON wr.id = wd.run_id
                    JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
-                   WHERE wd.state IN ('pending', 'retry_wait')
-                     AND wd.next_attempt_at <= ?
-                     AND (wd.lease_until IS NULL OR wd.lease_until <= ?)
+                   WHERE (
+                         (wd.state IN ('pending', 'retry_wait')
+                          AND wd.next_attempt_at <= ?
+                          AND (wd.lease_until IS NULL OR wd.lease_until <= ?))
+                         OR (wd.state = 'sending' AND wd.lease_until <= ?)
+                     )
+                     AND NOT EXISTS (
+                           SELECT 1 FROM workflow_deliveries newer
+                           WHERE newer.run_id = wd.run_id
+                             AND newer.attempt_generation > wd.attempt_generation
+                     )
                    ORDER BY wd.next_attempt_at, wd.id LIMIT 1""",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -1103,16 +1164,18 @@ class StateStore:
                 """UPDATE workflow_deliveries
                    SET state = 'sending', lease_owner = ?, lease_until = ?,
                        attempts = attempts + 1
-                   WHERE id = ? AND state IN ('pending', 'retry_wait')""",
-                (owner, now + lease_seconds, row["id"]),
+                   WHERE id = ? AND (
+                         state IN ('pending', 'retry_wait')
+                         OR (state = 'sending' AND lease_until <= ?)
+                   )""",
+                (owner, now + lease_seconds, row["id"], now),
             ).rowcount
             if updated != 1:
                 return None
             row = self.connection.execute(
-                """SELECT wd.*, wr.status AS run_status, os.transport,
+                """SELECT wd.*, os.transport,
                           os.external_session_id, os.external_turn_id
                    FROM workflow_deliveries wd
-                   JOIN workflow_runs wr ON wr.id = wd.run_id
                    JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
                    WHERE wd.id = ?""",
                 (row["id"],),
@@ -1123,14 +1186,16 @@ class StateStore:
         self, delivery_id: str, owner: str, *, remote_message_id: str | None = None,
         at: float | None = None,
     ) -> None:
-        """Complete a workflow delivery only while its lease belongs to the caller."""
+        """Complete a workflow delivery only under the caller's live lease."""
 
+        now = timestamp(at)
         with immediate(self.connection):
             updated = self.connection.execute(
                 """UPDATE workflow_deliveries SET state = 'delivered', lease_owner = NULL,
                        lease_until = NULL, remote_message_id = ?
-                   WHERE id = ? AND state = 'sending' AND lease_owner = ?""",
-                (remote_message_id, delivery_id, owner),
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?
+                     AND lease_until > ?""",
+                (remote_message_id, delivery_id, owner, now),
             ).rowcount
             if updated != 1:
                 raise ValidationError("workflow delivery lease is not owned by caller")
@@ -1139,13 +1204,15 @@ class StateStore:
         self, delivery_id: str, owner: str, error: str, *, at: float | None = None,
         base_delay: float = 1, max_delay: float = 300,
     ) -> float:
-        """Release an owned workflow notice claim with capped exponential delay."""
+        """Release a live owned workflow lease with capped exponential delay."""
 
         now = timestamp(at)
         with immediate(self.connection):
             row = self.connection.execute(
-                "SELECT attempts FROM workflow_deliveries WHERE id = ? AND state = 'sending' AND lease_owner = ?",
-                (delivery_id, owner),
+                """SELECT attempts FROM workflow_deliveries
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?
+                     AND lease_until > ?""",
+                (delivery_id, owner, now),
             ).fetchone()
             if row is None:
                 raise ValidationError("workflow delivery lease is not owned by caller")
@@ -1161,14 +1228,16 @@ class StateStore:
     def fail_workflow_delivery(
         self, delivery_id: str, owner: str, error: str, *, at: float | None = None
     ) -> None:
-        """Permanently fail a workflow notice whose lease belongs to the caller."""
+        """Permanently fail a workflow notice under the caller's live lease."""
 
+        now = timestamp(at)
         with immediate(self.connection):
             updated = self.connection.execute(
                 """UPDATE workflow_deliveries SET state = 'failed', lease_owner = NULL,
                        lease_until = NULL, last_error = ?
-                   WHERE id = ? AND state = 'sending' AND lease_owner = ?""",
-                (error, delivery_id, owner),
+                   WHERE id = ? AND state = 'sending' AND lease_owner = ?
+                     AND lease_until > ?""",
+                (error, delivery_id, owner, now),
             ).rowcount
             if updated != 1:
                 raise ValidationError("workflow delivery lease is not owned by caller")
