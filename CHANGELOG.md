@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.7.2] - 2026-09-05
+
+- fix(runtime): harden supervised execution and workflow recovery
+
 ## [0.7.1] - 2026-09-05
 
 - fix: keep Python hooks working in isolated runtime homes (#15)
