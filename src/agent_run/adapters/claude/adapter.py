@@ -3,7 +3,9 @@
 Materialization and launch preparation never inherit the caller's global
 Claude settings, plugins, or MCP configuration. Every generated asset is
 built only from ``RuntimeConfig``, the selected ``AgentProfile``, and the
-owner-authored skill directories below ``~/.agent-run/skills/claude``.
+owner-authored skill directories below ``~/.agent-run/skills/claude``. The
+sole ambient exception is an existing uv managed-Python root, required for
+offline hooks after their generated ``HOME`` replaces the parent home.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import AgentStatus, Outcome, StartRequest
 from ...errors import ValidationError
-from ..home import seal_answer
+from ..home import content_hash, managed_uv_python_environment, seal_answer
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -36,7 +38,6 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from ..home import content_hash
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .limits import agent_rate_limit_samples
@@ -303,7 +304,7 @@ class ClaudeAdapter:
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
-        environment: dict[str, str] = {"HOME": str(home)}
+        environment: dict[str, str] = {"HOME": str(home), **managed_uv_python_environment()}
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value

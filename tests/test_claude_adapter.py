@@ -608,11 +608,15 @@ class ClaudeAdapterTests(unittest.TestCase):
         )
 
     def test_prepare_sets_isolated_home_and_copies_only_declared_environment(self) -> None:
+        """Verify preparation resolves the managed Python directory from the child environment."""
+        managed_python = self.root / "managed-uv-python"
+        managed_python.mkdir()
         ambient = {
             "HOME": "/ambient/home",
             "CLAUDE_CONFIG_DIR": "/ambient/claude",
             "UNRELATED_SECRET": "must-not-copy",
             "ANTHROPIC_API_KEY": "sk-test",
+            "UV_PYTHON_INSTALL_DIR": str(managed_python),
         }
         with patch.dict("os.environ", ambient, clear=False):
             plan = self.prepare(
@@ -624,7 +628,12 @@ class ClaudeAdapterTests(unittest.TestCase):
             )
         self.assertEqual(
             dict(plan.environment),
-            {"HOME": str(self.home), "PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-test"},
+            {
+                "HOME": str(self.home),
+                "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "sk-test",
+                "UV_PYTHON_INSTALL_DIR": str(managed_python),
+            },
         )
         self.assertNotIn("/ambient", " ".join(plan.argv))
 

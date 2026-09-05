@@ -19,6 +19,33 @@ def content_hash(content: str | bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def managed_uv_python_environment() -> dict[str, str]:
+    """Return uv's existing managed-install root for isolated child processes.
+
+    uv normally derives its install directory from ``HOME``. Agent-run replaces
+    that value for children, so this exposes only an already-present parent
+    installation through uv's documented ``UV_PYTHON_INSTALL_DIR`` override.
+    An explicit override wins; otherwise XDG data location and then uv's
+    default ``~/.local/share`` location are checked. Missing or non-directory
+    paths yield no variable, preserving uv's normal failure behavior.
+    """
+
+    configured = os.environ.get("UV_PYTHON_INSTALL_DIR")
+    data_home = os.environ.get("XDG_DATA_HOME")
+    candidate = (
+        Path(configured).expanduser()
+        if configured
+        else (Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share")
+        / "uv"
+        / "python"
+    )
+    try:
+        root = candidate.resolve(strict=True)
+    except OSError:
+        return {}
+    return {"UV_PYTHON_INSTALL_DIR": str(root)} if root.is_dir() else {}
+
+
 def _root(home: str | Path) -> Path:
     try:
         path = Path(home).expanduser()

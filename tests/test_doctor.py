@@ -414,6 +414,96 @@ class HookTrustTests(unittest.TestCase):
             ["hook_untrusted"],
         )
 
+    def test_uv_managed_python_trusts_a_declared_plugin_script(self) -> None:
+        """A managed Python interpreter makes its following plugin token the script."""
+
+        install = self.home / "uv" / "python"
+        interpreter = install / "cpython-3.14" / "bin" / "python3.14"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch(mode=0o700)
+        with mock.patch.object(
+            doctor,
+            "managed_uv_python_environment",
+            return_value={"UV_PYTHON_INSTALL_DIR": str(install)},
+        ):
+            codes = self._codes_with_plugins(
+                (str(interpreter), "{plugin:agent-lsp-plugin}/hooks/guard.py"),
+                (Path("/anywhere/agent-lsp-plugin"),),
+            )
+        self.assertEqual(codes, [])
+
+    def test_an_arbitrary_python_named_program_does_not_trust_its_argument(self) -> None:
+        """Only a Python binary beneath uv's managed root can introduce a script."""
+
+        interpreter = self.home / "outside" / "bin" / "python3.14"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch(mode=0o700)
+        script = self.root / "hooks" / "context.py"
+        script.write_text("pass\n", encoding="utf-8")
+        with mock.patch.object(
+            doctor,
+            "managed_uv_python_environment",
+            return_value={"UV_PYTHON_INSTALL_DIR": str(self.home / "uv" / "python")},
+        ):
+            findings = self._findings((str(interpreter), str(script)))
+        self.assertEqual([item.code for item in findings], ["hook_untrusted"])
+        self.assertEqual(findings[0].detail, str(interpreter))
+
+    def test_python_flag_operands_are_not_trusted_as_scripts(self) -> None:
+        """Python ``-c`` payloads do not turn a trusted-looking operand into a script."""
+
+        install = self.home / "uv" / "python"
+        interpreter = install / "cpython-3.14" / "bin" / "python3.14"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch(mode=0o700)
+        script = self.root / "hooks" / "context.py"
+        script.write_text("pass\n", encoding="utf-8")
+        with mock.patch.object(
+            doctor,
+            "managed_uv_python_environment",
+            return_value={"UV_PYTHON_INSTALL_DIR": str(install)},
+        ):
+            findings = self._findings((str(interpreter), "-c", str(script)))
+        self.assertEqual([item.code for item in findings], ["hook_untrusted"])
+        self.assertEqual(findings[0].detail, str(interpreter))
+
+    def test_attached_or_grouped_python_execution_modes_stay_untrusted(self) -> None:
+        """Attached and grouped execution modes cannot expose a later plugin path."""
+
+        install = self.home / "uv" / "python"
+        interpreter = install / "cpython-3.14" / "bin" / "python3.14"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch(mode=0o700)
+        command_tail = "{plugin:agent-lsp-plugin}/hooks/guard.py"
+        with mock.patch.object(
+            doctor,
+            "managed_uv_python_environment",
+            return_value={"UV_PYTHON_INSTALL_DIR": str(install)},
+        ):
+            for mode in ("-cprint(1)", "-mmodule", "-Icprint(1)"):
+                with self.subTest(mode=mode):
+                    findings = self._findings((str(interpreter), mode, command_tail))
+                    self.assertEqual([item.code for item in findings], ["hook_untrusted"])
+                    self.assertEqual(findings[0].detail, str(interpreter))
+
+    def test_grouped_safe_python_flags_keep_the_plugin_script_trusted(self) -> None:
+        """Script-preserving Python flags may be grouped before a plugin token."""
+
+        install = self.home / "uv" / "python"
+        interpreter = install / "cpython-3.14" / "bin" / "python3.14"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch(mode=0o700)
+        with mock.patch.object(
+            doctor,
+            "managed_uv_python_environment",
+            return_value={"UV_PYTHON_INSTALL_DIR": str(install)},
+        ):
+            codes = self._codes_with_plugins(
+                (str(interpreter), "-EsS", "{plugin:agent-lsp-plugin}/hooks/guard.py"),
+                (Path("/anywhere/agent-lsp-plugin"),),
+            )
+        self.assertEqual(codes, [])
+
     def _codes_with_plugins(
         self, command: tuple[str, ...], plugins: tuple[Path, ...]
     ) -> list:

@@ -822,13 +822,24 @@ env_from = ["PATH"]
         return config
 
     def test_prepare_builds_launch_plan_for_a_valid_request(self) -> None:
+        """Verify the launch plan exposes only approved environment keys and the managed root."""
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
-        plan = self.prepare(self.start_request(), profile, config)
+        managed_python = Path(self._mkdtemp()).resolve()
+        with patch.dict(
+            os.environ,
+            {"UV_PYTHON_INSTALL_DIR": str(managed_python)},
+            clear=False,
+        ):
+            plan = self.prepare(self.start_request(), profile, config)
         self.assertIsInstance(plan, LaunchPlan)
         self.assertEqual(plan.argv, (str(config.binary), "app-server"))
         self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(set(plan.environment), {"CODEX_HOME", "HOME", "PATH"})
+        self.assertEqual(
+            set(plan.environment),
+            {"CODEX_HOME", "HOME", "PATH", "UV_PYTHON_INSTALL_DIR"},
+        )
+        self.assertEqual(plan.environment["UV_PYTHON_INSTALL_DIR"], str(managed_python))
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(plan.adapter_state["writable_roots"], ())
         self.assertEqual(
