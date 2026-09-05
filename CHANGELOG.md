@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.7.1] - 2026-09-05
+
+- fix: keep Python hooks working in isolated runtime homes (#15)
+
 ## [0.7.0] - 2026-09-05
 
 - build!: require Python 3.14
