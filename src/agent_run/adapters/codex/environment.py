@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 
 from ...errors import ValidationError
+from ..home import managed_uv_python_environment
 
 
 def build_environment(binary: Path, home: Path) -> dict[str, str]:
@@ -28,8 +29,9 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
     module hard-coding a Node or package version.  ``home`` is the runtime home
     that owns the child's state -- either the base runtime home or one
     account-specific home -- and both ``HOME`` and ``CODEX_HOME`` point at it;
-    no other variable is copied from the collector, so the returned mapping
-    holds exactly ``HOME``, ``CODEX_HOME``, and ``PATH``.
+    no other variable is copied from the collector, except uv's existing
+    managed-install root when present, so managed Python remains discoverable
+    after ``HOME`` is replaced.
 
     ``PATH`` preserves the inherited entries in their original order and
     deduplicates them, so repeated launches cannot inflate the value, and it
@@ -49,6 +51,7 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
         "CODEX_HOME": home_text,
         "HOME": home_text,
         "PATH": _child_path(str(executable.parent)),
+        **managed_uv_python_environment(),
     }
 
 

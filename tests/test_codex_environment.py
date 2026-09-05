@@ -23,6 +23,7 @@ from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
 from agent_run.adapters.codex import model_cache as codex_model_cache
 from agent_run.adapters.codex import rate_limits as codex_rate_limits
+from agent_run.adapters import home as adapter_home
 from agent_run.config import RuntimeConfig, load_config
 from agent_run.errors import ValidationError
 
@@ -189,13 +190,33 @@ class BuildEnvironmentTests(unittest.TestCase):
     def test_home_and_codex_home_track_only_the_supplied_home(self):
         """Each supplied home is used verbatim and never mixed with another."""
 
-        base = codex_environment.build_environment(Path("/opt/bin/codex"), Path("/tmp/base"))
-        account = codex_environment.build_environment(Path("/opt/bin/codex"), Path("/tmp/plus"))
+        with mock.patch.object(
+            codex_environment,
+            "managed_uv_python_environment",
+            return_value={"UV_PYTHON_INSTALL_DIR": "/managed/uv/python"},
+        ):
+            base = codex_environment.build_environment(Path("/opt/bin/codex"), Path("/tmp/base"))
+            account = codex_environment.build_environment(Path("/opt/bin/codex"), Path("/tmp/plus"))
         self.assertEqual(base["HOME"], "/tmp/base")
         self.assertEqual(base["CODEX_HOME"], "/tmp/base")
         self.assertEqual(account["HOME"], "/tmp/plus")
         self.assertEqual(account["CODEX_HOME"], "/tmp/plus")
-        self.assertEqual(set(base), {"HOME", "CODEX_HOME", "PATH"})
+        self.assertEqual(base["UV_PYTHON_INSTALL_DIR"], "/managed/uv/python")
+        self.assertEqual(set(base), {"HOME", "CODEX_HOME", "PATH", "UV_PYTHON_INSTALL_DIR"})
+
+    def test_uv_install_root_honors_the_explicit_parent_setting(self):
+        """An existing explicit uv root survives the child's replaced HOME."""
+
+        with tempfile.TemporaryDirectory() as workspace:
+            install = Path(workspace) / "python"
+            install.mkdir()
+            with mock.patch.dict(
+                os.environ, {"UV_PYTHON_INSTALL_DIR": str(install)}, clear=True
+            ):
+                self.assertEqual(
+                    adapter_home.managed_uv_python_environment(),
+                    {"UV_PYTHON_INSTALL_DIR": str(install.resolve())},
+                )
 
 
 class SharedHelperCallersTests(unittest.TestCase):
