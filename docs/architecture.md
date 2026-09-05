@@ -64,8 +64,11 @@ The supervisor enforces:
 Answers are stored with size and sha256; `answer <id>` re-serves the
 verified envelope indefinitely.
 
-Codex assistant deltas are journaled as transcript chunks as they arrive.
-Completed items contribute only text not already streamed. These partial
+Codex raw assistant deltas are journaled as they arrive. Normalized transcript
+chunks retain a final nonblank segment and adjacent whitespace until more text
+or a completion boundary arrives. Idle polls and interrupt requests do not end
+the stream. Canonical completed items contribute only text not already saved;
+whitespace and repeated deltas are preserved. These partial
 messages do not create an answer proof or imply success; an interrupted or
 timed-out run can therefore have a useful transcript without a complete answer.
 Unexpected app-server EOF is a transport failure, not an indefinitely silent

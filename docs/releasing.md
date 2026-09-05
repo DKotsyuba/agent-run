@@ -9,6 +9,13 @@ refuses a tag that does not match the package version.
 Start from a clean maintainer checkout at the current `origin/main`. The command
 validates that precondition before changing anything.
 
+Before publishing streaming-adapter changes, run a candidate smoke through the
+adapter and supervisor in an isolated home with a supported real engine. Verify
+both the answer proof and the exact transcript of whitespace-bearing output.
+Keep regressions for fragmented tokens, idle polls, cancellation requests and
+canonical completion; contiguous fake output alone does not establish wire
+compatibility. Never modify an installed sealed release to perform this check.
+
 | Operation | Command |
 |---|---|
 | Publish and update the local runtime | `python3 scripts/release.py X.Y.Z` |
