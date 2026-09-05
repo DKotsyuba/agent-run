@@ -1,12 +1,12 @@
 # Contributing
 
-agent-run is a Python 3.11+ standard-library runtime. Runtime dependencies are
+agent-run is a Python 3.14+ standard-library runtime. Runtime dependencies are
 not accepted; `pytest` and packaging tools are development-only.
 
 ```bash
-python3.11 -m venv .venv
-.venv/bin/python -m pip install -e ".[test,release]"
-.venv/bin/python -m pytest -q --rootdir . tests
+python3.14 -m venv .venv-py314
+.venv-py314/bin/python -m pip install -e ".[test,release]"
+.venv-py314/bin/python -m pytest -q --rootdir . tests
 ```
 
 If a timing-sensitive test in `tests/test_launch.py` fails under load, rerun

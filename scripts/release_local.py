@@ -129,7 +129,7 @@ def smoke(runner: Runner, release: Path) -> None:
 def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable: str) -> int:
     """Reuse or build Path target from verified wheel; return supported schema int.
 
-    String executable must be Python 3.11. Incomplete candidates are preserved
+    String executable must be Python 3.14. Incomplete candidates are preserved
     under timestamped names before rebuilding; corrupt COMPLETE candidates fail.
     COMPLETE is written only after isolated smoke.
     """
@@ -139,8 +139,8 @@ def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable:
         verify_complete(target)
     else:
         result = runner.run(executable, "-I", "-c", "import sys; print('%d.%d' % sys.version_info[:2])").stdout.strip()
-        if result != "3.11":
-            raise ReleaseError("Local releases require Python 3.11")
+        if result != "3.14":
+            raise ReleaseError("Local releases require Python 3.14")
         target.mkdir(parents=True)
         runner.run(executable, "-m", "venv", str(target / "venv"))
         runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-deps", str(wheel), env=environment())

@@ -35,15 +35,18 @@ def _framework_python() -> str | None:
     Only a Framework build re-execs into its ``Resources/Python.app`` binary
     on launch, which is what makes ``ps -o command=`` report a different
     path than the argv0 it was exec'd with -- the exact hazard this
-    reproduces. A non-Framework interpreter (pyenv, Homebrew) leaves argv0
-    alone, so it cannot trigger it.
+    reproduces. A non-Framework interpreter (including uv-managed runtimes)
+    leaves argv0 alone, so it cannot trigger it. Only a supported Python 3.14
+    Framework build is eligible; older installed Framework builds are skipped.
     """
     for candidate in sorted(
         glob.glob("/Library/Frameworks/Python.framework/Versions/*/bin/python3.*")
     ):
         name = os.path.basename(candidate)
         suffix = name[len("python3.") :] if name.startswith("python3.") else ""
-        if suffix.isdigit() and os.access(candidate, os.X_OK):
+        # The runtime now rejects old Framework interpreters before the
+        # re-exec assertion can run; never select one as a test executable.
+        if suffix == "14" and os.access(candidate, os.X_OK):
             return candidate
     return None
 

@@ -6,7 +6,7 @@ reliability of *this* code is set by everything that will run on top of it.
 
 ## Ground rules
 
-- **Python 3.11+, standard library only.** The runtime package has zero
+- **Python 3.14+, standard library only.** The runtime package has zero
   dependencies (`pyproject.toml`) and ships as a sealed venv release. Do
   not add runtime dependencies — not for HTTP, not for CLI parsing, not
   for anything. `pytest` is the only dev-time extra.
@@ -20,7 +20,7 @@ reliability of *this* code is set by everything that will run on top of it.
   collected by pytest:
 
   ```bash
-  python3 -m pytest -q --rootdir . tests
+  .venv-py314/bin/python -m pytest -q --rootdir . tests
   ```
 
   It must end `N passed, 1 skipped, 0 failed`. A handful of

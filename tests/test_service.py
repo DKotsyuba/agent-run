@@ -549,7 +549,14 @@ class AgentServiceTests(unittest.TestCase):
     def test_bootstrap_failure_keeps_the_agent_id_stage_and_evidence_on_the_error(
         self,
     ) -> None:
+        """Preserve the accepted agent identity while bootstrap failure evidence settles."""
+
+        release_callback = threading.Event()
+
         def fail_launch(*args) -> None:
+            """Wait until the caller has asserted the STARTING snapshot."""
+
+            release_callback.wait()
             raise SupervisorBootstrapError(
                 "detached supervisor died before session proof at stage "
                 "'import': ModuleNotFoundError: no module named agent_run.adapters "
@@ -570,8 +577,11 @@ class AgentServiceTests(unittest.TestCase):
             now=lambda: 100.0,
         )
         request = self.request(request_id="bootstrap-failure")
-        accepted = service.start(request)
-        self.assertIs(accepted.agent.status, AgentStatus.STARTING)
+        try:
+            accepted = service.start(request)
+            self.assertIs(accepted.agent.status, AgentStatus.STARTING)
+        finally:
+            release_callback.set()
         self.wait_until(
             lambda: self.store.get_agent(accepted.agent_id)["status"]
             == AgentStatus.FAILED.value
