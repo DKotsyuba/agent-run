@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.7.0] - 2026-09-05
+
+- build!: require Python 3.14
+
 ## [0.6.4] - 2026-09-05
 
 - feat(delivery): add failure guidance to completion notices
