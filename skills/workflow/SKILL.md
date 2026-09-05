@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: Orchestrate multi-step, multi-family agent runs through the agent-run workflow engine — deterministic Python scripts with phases, parallel fan-out, and pipelines over codex/claude/qwen children, journaled and survivable across orchestrator sessions. Use when a delegation has two or more dependent stages, a fan-out plus verification, or must outlive the session; on the words «воркфлоу», «запусти цепочку», «фан-аут с проверкой», "workflow", "fan out and verify". For one job use agent-run start; for one flat parallel batch use batch.
+description: Run authorized agent tasks with dependent stages or durable parallel orchestration. Use start for one job; use fanout first for five or more independent units.
 ---
 
 # Running agent-run workflows
@@ -35,29 +35,12 @@ network, no subprocess (AST-guarded, escape attempts fail the run):
 - `phase(name)`, `log(text)` — progress markers, land in runner.log.
 - The value of the script's last expression becomes the run's `result_json`.
 
-Example (fan across three families, verify one answer):
-
-```python
-phase("fan")
-results = parallel([
-    lambda: agent({"runtime": "qwen", "model": "opencode/MiniMaxM3",
-                   "profile": "review", "task": "...", "workdir": WORK}),
-    lambda: agent({"runtime": "claude", "model": "sonnet",
-                   "profile": "review", "task": "...", "workdir": WORK}),
-    lambda: agent({"runtime": "codex", "model": "gpt-5.6-luna",
-                   "profile": "review", "task": "...", "workdir": WORK,
-                   "read_roots": [WORK]}),
-])
-phase("verify")
-oks = [r for r in results if r and r.get("status") == "succeeded"]
-checked = pipeline(oks[:1],
-    lambda r: agent({"runtime": "qwen", "model": "opencode/MiniMaxM3",
-                     "profile": "review",
-                     "task": "Verify: " + str(r.get("answer", ""))[:80],
-                     "workdir": WORK}),
-)
-{"fan": len(oks), "verified": bool(checked and checked[0].get("status") == "succeeded")}
-```
+Use `parallel` for independent steps and `pipeline` for dependent stages.
+Resolve every step's role/model/account through `$delegate` before constructing
+the script, rather than copying fixed model names. Pass complete task-relevant
+evidence or accessible artifact references into verification; do not truncate
+an answer to a short prefix and call the result verified. Gate downstream work
+on each required step's status and evidence, not just the wrapper's success.
 
 `agent()` spec fields: `runtime`, `model`, `profile`, `task`, `workdir`,
 optional `account`, `write`, `read_roots`, `timeout_seconds`, `output_schema` (the ENGINE
@@ -103,7 +86,7 @@ to work not yet started, without restarting healthy children.
 
 ## Launching and watching
 
-Prefer the MCP tools: `workflow_start(script, args?)`, `workflow_status`,
+Prefer the MCP tools: `workflow_start(name, script, orchestrator, args?)`, `workflow_status`,
 `workflow_cancel`, `workflow_answer`, `workflow_resume`. CLI fallback (server not connected or
 stale — see cautions):
 
@@ -116,8 +99,9 @@ The CLI positional is the SCRIPT SOURCE TEXT, not a path — always pass
 `"$(cat file)"`. Passing a path makes the runner compile the path string and
 fail with a SyntaxError.
 
-Do not block your turn on a run: put `agent-run workflow wait <run_id>`
-in the background (it blocks until terminal — succeeded / failed /
+For MCP-started workflows, follow the live tool's binding and completion
+contract; do not add a CLI watcher when chat delivery is confirmed. For an
+unbound or CLI-started run, put `agent-run workflow wait <run_id>` in the background (it blocks until terminal — succeeded / failed /
 cancelled / lost — and prints the status report with class-mapped exit
 codes), and keep doing other work. Single agents have the same watchdog:
 `agent-run wait <agent_id>`. Never hand-roll status/sleep poll loops.
