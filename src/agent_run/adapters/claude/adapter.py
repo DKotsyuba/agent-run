@@ -38,9 +38,15 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from ..command_policy import materialize_refusal_commands, render_claude_denials
 from ..continuation import cli_resume_plan
+from ..developer_environment import (
+    configured_environment_keys,
+    developer_environment,
+    environment_digest,
+)
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
-from ..rust import RUST_ENVIRONMENT_NAMES, rust_environment
+from ..rust import RUST_ENVIRONMENT_NAMES
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .constants import (
     ALWAYS_DISALLOWED as _ALWAYS_DISALLOWED, AUTH_NAMES as _AUTH_NAMES,
@@ -124,8 +130,10 @@ class ClaudeAdapter:
         emitting a non-functional entry.
 
         The returned newline-delimited digest includes declared Rust roots when
-        provisioning is enabled, so materialization revision evidence changes
-        with the launch environment without storing credentials.
+        provisioning is enabled and a selected developer-environment preset's
+        declared paths, variables, and command policy, so materialization
+        revision evidence changes with the launch environment without storing
+        credentials.
         """
 
         settings_digest = render_settings(home, config.hooks)
@@ -139,6 +147,7 @@ class ClaudeAdapter:
         digests = [settings_digest, mcp_digest, plugin_digest, declared_digest]
         if config.rust is not None:
             digests.append(content_hash(f"{config.rust.rustup_home}\0{config.rust.cargo_bin}"))
+        digests.append(environment_digest(config))
         return "\n".join(digests)
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
@@ -194,7 +203,16 @@ class ClaudeAdapter:
         ``claude-fable-5-1``); every other id passes through unchanged.
         An optional Rust declaration adds a bounded preflight and shared child
         environment for both Claude and its stdio MCP subprocesses; failures
-        raise ``ValidationError`` before a launch process is created.
+        raise ``ValidationError`` before a launch process is created. A
+        selected developer-environment preset extends the same isolated
+        ``HOME``-rooted baseline PATH with declared paths and non-secret
+        variables, and its denied commands are enforced both by a private
+        PATH refusal shim directory under ``home`` and by native
+        ``--disallowedTools`` Bash entries, so a permitted shell still
+        refuses the exact denied names via an absolute path. MCP subprocess
+        env only copies ambient values for names outside the preset/Rust
+        contract; preset and Rust names are forwarded from the resolved
+        child environment instead.
         """
 
         if request.fast:
@@ -295,7 +313,32 @@ class ClaudeAdapter:
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
-        environment = rust_environment(environment, config, request.workdir)
+        environment = developer_environment(environment, config, request.workdir)
+
+        # A selected preset's denied commands get a private refusal shim
+        # directory prepended to the child's own PATH, and the same denials
+        # are rendered as native Bash disallow patterns so a permitted shell
+        # still refuses the exact denied names even off the shimmed PATH.
+        selected_environment = config.environment
+        if selected_environment is not None and selected_environment.denied_commands:
+            policy = materialize_refusal_commands(
+                selected_environment.denied_commands,
+                home / "command-policy",
+                search_paths=tuple(
+                    part for part in environment.get("PATH", "").split(os.pathsep) if part
+                ),
+                environment=environment,
+            )
+            environment["PATH"] = os.pathsep.join(
+                (str(policy.directory), *environment.get("PATH", "").split(os.pathsep))
+            )
+            denial_patterns = render_claude_denials(
+                selected_environment.denied_commands,
+                command_paths=tuple(policy.resolved_commands.values()),
+            )
+            argv[argv.index("--disallowedTools") + 1] = ",".join(
+                dict.fromkeys((*disallowed_tools, *denial_patterns))
+            )
 
         # Secret registration follows what was *injected*, not only what the
         # config declared: a subclass auth bridge (glm's keychain token) can
@@ -314,13 +357,16 @@ class ClaudeAdapter:
                 name for name in injected if is_secret_env_name(name)
             )
 
+        configured_keys = configured_environment_keys(config)
         mcp_env_names: list[str] = []
         for name in config.mcp:
             server = mcp_servers.get(name)
             if server is None:
                 raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
             for env_name in server.env_from:
-                if config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES:
+                if env_name in configured_keys or (
+                    config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES
+                ):
                     value = environment.get(env_name)
                 else:
                     value = os.environ.get(env_name)
