@@ -3,6 +3,8 @@
 Token and timing data arrives inside runtime-specific event payloads -- one
 ``runtime_result`` event for the claude/glm/qwen family, a stream of
 ``thread/tokenUsage/updated`` events for codex whose last entry is cumulative.
+For a resumed Codex thread, a durable ``resume_usage_baseline`` is required
+before that cumulative total can be attributed to the new run.
 ``record_run_stats`` reads the agents row plus that one agent's events,
 normalizes both shapes, and keeps a single ``run_stats`` row per agent.
 
@@ -23,7 +25,7 @@ from .db import agent_row, immediate, timestamp
 
 _logger = logging.getLogger("agent_run.state")
 
-_USAGE_EVENT_KINDS = ("runtime_result", "thread/tokenUsage/updated")
+_USAGE_EVENT_KINDS = ("runtime_result", "thread/tokenUsage/updated", "resume_usage_baseline")
 
 _INSERT = """INSERT OR REPLACE INTO run_stats
    (agent_id, runtime, model, profile, status, failure_kind,
@@ -112,6 +114,40 @@ def _empty_stats() -> dict[str, object]:
     }
 
 
+def _resumed_token_usage_stats(
+    current: Mapping[str, Any] | None, baseline: Mapping[str, Any] | None
+) -> dict[str, object]:
+    """Return per-run Codex token deltas from two cumulative observations.
+
+    ``current`` is the latest cumulative token-usage payload after the new
+    turn; ``baseline`` is the same payload captured at resume attachment.
+    Missing either observation makes all usage unavailable rather than
+    assigning prior-thread totals to this run.  Each known metric is
+    subtracted independently and a negative delta is unavailable because it
+    cannot be a trustworthy monotonic cumulative counter.
+    """
+    if current is None or baseline is None:
+        return _empty_stats()
+    current_stats = _token_usage_stats(current)
+    baseline_stats = _token_usage_stats(baseline)
+    stats = _empty_stats()
+    stats["usage_source"] = "token_usage_updated"
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    ):
+        total = current_stats[key]
+        initial = baseline_stats[key]
+        if isinstance(total, float) and isinstance(initial, float):
+            difference = total - initial
+            stats[key] = difference if difference >= 0 else None
+    return stats
+
+
 def _usage_stats(events: list[sqlite3.Row]) -> dict[str, object]:
     """Normalize the most informative usage payload this agent recorded.
 
@@ -134,6 +170,33 @@ def _usage_stats(events: list[sqlite3.Row]) -> dict[str, object]:
     if parsed["thread/tokenUsage/updated"]:
         return _token_usage_stats(parsed["thread/tokenUsage/updated"][-1])
     return _empty_stats()
+
+
+def _resumed_usage_stats(events: list[sqlite3.Row]) -> dict[str, object]:
+    """Normalize a resumed run without double-counting cumulative Codex usage.
+
+    A regular runtime result remains per-run data.  Codex cumulative counters
+    require the final update and a separately persisted attachment baseline;
+    no baseline is reported with explicit unavailable provenance.
+    """
+    parsed: dict[str, list[Mapping[str, Any]]] = {kind: [] for kind in _USAGE_EVENT_KINDS}
+    for event in events:
+        try:
+            payload = json.loads(str(event["data_json"]))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, Mapping):
+            bucket = parsed.get(str(event["kind"]))
+            if bucket is not None:
+                bucket.append(payload)
+    if parsed["runtime_result"]:
+        return _runtime_result_stats(parsed["runtime_result"][-1])
+    return _resumed_token_usage_stats(
+        parsed["thread/tokenUsage/updated"][-1]
+        if parsed["thread/tokenUsage/updated"]
+        else None,
+        parsed["resume_usage_baseline"][-1] if parsed["resume_usage_baseline"] else None,
+    )
 
 
 _TERMINAL_VALUES = frozenset(status.value for status in TERMINAL)
@@ -183,7 +246,11 @@ def record_run_stats(
         agent = agent_row(connection, agent_id)
         events = _transition_events(connection, agent_id)
         started_at, finished_at = _transition_times(events)
-        stats = _usage_stats(events)
+        stats = (
+            _resumed_usage_stats(events)
+            if agent["resume_of_runtime_session_id"] is not None
+            else _usage_stats(events)
+        )
         duration_seconds = None
         if started_at is not None and finished_at is not None:
             duration_seconds = max(0.0, finished_at - started_at)

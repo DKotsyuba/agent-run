@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import Capability, LimitSample
 from agent_run.adapters.claude import auth as claude_auth
 from agent_run.adapters.claude.adapter import ADAPTER, ADAPTER_API_VERSION, ClaudeAdapter
-from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
+from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import AuthError, ValidationError
 from agent_run.profiles import AgentProfile
@@ -447,7 +447,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertIn("--setting-sources", argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
         self.assertIn("--strict-mcp-config", argv)
-        self.assertIn("--no-session-persistence", argv)
+        self.assertNotIn("--no-session-persistence", argv)
         self.assertIn("--permission-mode", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         tools = argv[argv.index("--tools") + 1].split(",")
@@ -672,6 +672,66 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.prepare(
                     self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
                 )
+
+    def test_prepare_provisions_rust_for_read_only_mcp_without_ambient_overrides(self) -> None:
+        """Configured Rust works for a read-only plan and supplies the same values to MCP."""
+
+        rustup_home = self.root / "rustup"
+        rustup_home.mkdir()
+        cargo_bin = self.root / "cargo-bin"
+        cargo_bin.mkdir()
+        for name, text in {
+            "cargo": "#!/bin/sh\nexit 0\n",
+            "rustc": "#!/bin/sh\nexit 0\n",
+            "rust-analyzer": "#!/bin/sh\nexit 0\n",
+            "rustup": (
+                "#!/bin/sh\n"
+                "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\n"
+                "if [ \"$1\" = show ]; then echo active; exit 0; fi\n"
+                "printf '%s\\n' rust-src rust-analyzer\n"
+            ),
+        }.items():
+            proxy = cargo_bin / name
+            proxy.write_text(text, encoding="utf-8")
+            proxy.chmod(0o755)
+        config = self.runtime_config(mcp=("rust_lsp",), rust=RustConfig(rustup_home, cargo_bin))
+        servers = {
+            "rust_lsp": McpConfig(
+                "stdio", Path("/bin/agent-lsp"), (), ("RUSTUP_HOME", "CARGO_HOME", "PATH")
+            )
+        }
+        with patch.dict(
+            "os.environ",
+            {"ANTHROPIC_API_KEY": "sk-test", "RUSTUP_HOME": "/stale", "PATH": "/ambient/bin"},
+            clear=False,
+        ):
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
+            )
+        self.assertEqual(plan.environment["RUSTUP_HOME"], str(rustup_home))
+        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
+        self.assertTrue(plan.environment["PATH"].startswith(str(cargo_bin) + os.pathsep))
+        self.assertEqual(plan.environment["RUSTUP_AUTO_INSTALL"], "0")
+        self.assertFalse((self.workdir / ".cargo-home").exists())
+        descriptor = json.loads((self.agent_dir / "mcp" / "mcp-config.json").read_text())
+        mcp_environment = descriptor["mcpServers"]["rust_lsp"]["env"]
+        self.assertEqual(mcp_environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
+        self.assertEqual(set(mcp_environment), {"PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"})
+        self.assertNotIn("ANTHROPIC_API_KEY", json.dumps(descriptor))
+        other_workdir = self.root / "other-work"
+        other_workdir.mkdir()
+        other_agent_dir = self.root / "agents" / "ag-2"
+        other_agent_dir.mkdir()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "PATH": "/ambient/bin"}, clear=False):
+            self.prepare(
+                self.request(workdir=other_workdir), self.profile(), config, self.home, other_agent_dir,
+                mcp_servers=servers,
+            )
+        other_descriptor = json.loads((other_agent_dir / "mcp" / "mcp-config.json").read_text())
+        self.assertEqual(
+            other_descriptor["mcpServers"]["rust_lsp"]["env"]["CARGO_HOME"],
+            str(other_workdir / ".cargo-home"),
+        )
 
     def test_prepare_exposes_the_skill_tool_only_when_skills_are_configured(self) -> None:
         # --plugin-dir registers the skills, but the child can neither see

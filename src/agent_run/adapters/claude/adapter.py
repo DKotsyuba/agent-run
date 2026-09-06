@@ -38,8 +38,19 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from ..continuation import cli_resume_plan
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
+from ..rust import RUST_ENVIRONMENT_NAMES, rust_environment
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
+from .constants import (
+    ALWAYS_DISALLOWED as _ALWAYS_DISALLOWED, AUTH_NAMES as _AUTH_NAMES,
+    CAPABILITIES as _CAPABILITIES, KNOWN_HOOK_EVENTS as _KNOWN_HOOK_EVENTS,
+    MODEL_ALIASES as _MODEL_ALIASES, MODEL_DESCRIPTIONS as _MODEL_DESCRIPTIONS,
+    NETWORK_TOOLS as _NETWORK_TOOLS,
+    READ_TOOLS as _READ_TOOLS, SHELL_TOOLS as _SHELL_TOOLS,
+    SKILL_TOOLS as _SKILL_TOOLS, SUPPORTED_EFFORTS as _SUPPORTED_EFFORTS,
+    WRITE_TOOLS as _WRITE_TOOLS,
+)
 from .launch_io import abort_launch, known_secrets, open_runtime_log
 from .limits import agent_rate_limit_samples
 from .materialize import render_mcp_config, render_plugin_dirs, render_settings
@@ -54,53 +65,6 @@ from .stream import (
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
 
-_CAPABILITIES = frozenset(
-    {
-        Capability.STEER,
-        Capability.EFFORT,
-        Capability.OUTPUT_SCHEMA,
-        Capability.READ_ROOTS,
-        Capability.WRITE,
-        Capability.TRANSCRIPT,
-        Capability.MODEL_ROSTER,
-        Capability.LIVE_LIMITS,
-        Capability.MCP,
-        Capability.SKILLS,
-        Capability.HOOKS,
-    }
-)
-
-_READ_TOOLS = ("Read", "Grep", "Glob")
-_SKILL_TOOLS = ("Skill",)
-_WRITE_TOOLS = ("Edit", "Write", "NotebookEdit")
-_SHELL_TOOLS = ("Bash",)
-_NETWORK_TOOLS = ("WebFetch", "WebSearch")
-_ALWAYS_DISALLOWED = _NETWORK_TOOLS
-_AUTH_NAMES = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
-_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-# Adapter-owned translation of public model ids to Claude API model ids.
-# Only the child argv's ``--model`` value is translated: the request model
-# id, the roster, and the persisted ``model`` adapter state all keep the
-# configured public id. Ids absent from this mapping pass through verbatim,
-# so every other configured model is untouched.
-_MODEL_ALIASES = {"fable": "claude-fable-5-1"}
-# Roster descriptions that name the concrete Claude release behind a public
-# id; ids absent from this mapping keep the generic description.
-_MODEL_DESCRIPTIONS = {"fable": "Claude Fable 5.1 (API model id: claude-fable-5-1)"}
-_KNOWN_HOOK_EVENTS = frozenset(
-    {
-        "PreToolUse",
-        "PostToolUse",
-        "UserPromptSubmit",
-        "Stop",
-        "SubagentStop",
-        "Notification",
-        "PreCompact",
-        "SessionStart",
-        "SessionEnd",
-    }
-)
-
 
 class ClaudeAdapter:
     """Runtime adapter for the ``claude`` engine."""
@@ -109,6 +73,13 @@ class ClaudeAdapter:
         return RuntimeInfo("claude", ADAPTER_API_VERSION, _CAPABILITIES)
 
     def validate(self, config: RuntimeConfig) -> None:
+        """Validate Claude-specific runtime configuration before materialization.
+
+        ``config`` must provide environment auth, supported hooks, and complete
+        plugin skill declarations. Rust provisioning is accepted here and
+        applied only by ``prepare``; invalid auth, plugins, or hooks raise
+        ``ValidationError`` without touching the filesystem.
+        """
         if config.service_mode is not None:
             raise ValidationError("claude runtime does not support service_mode")
         if config.auth is None:
@@ -151,6 +122,10 @@ class ClaudeAdapter:
         to their full definitions, required per the frozen adapter contract.
         A configured but unresolved MCP name fails closed rather than
         emitting a non-functional entry.
+
+        The returned newline-delimited digest includes declared Rust roots when
+        provisioning is enabled, so materialization revision evidence changes
+        with the launch environment without storing credentials.
         """
 
         settings_digest = render_settings(home, config.hooks)
@@ -161,7 +136,10 @@ class ClaudeAdapter:
             raise ValidationError("claude skills_root must be absolute")
         plugin_digest = render_plugin_dirs(home, skills_root, local_skill_names(config.plugins, config.skills))
         declared_digest = content_hash(",".join(str(plugin) for plugin in config.plugins))
-        return "\n".join((settings_digest, mcp_digest, plugin_digest, declared_digest))
+        digests = [settings_digest, mcp_digest, plugin_digest, declared_digest]
+        if config.rust is not None:
+            digests.append(content_hash(f"{config.rust.rustup_home}\0{config.rust.cargo_bin}"))
+        return "\n".join(digests)
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
@@ -214,6 +192,9 @@ class ClaudeAdapter:
         ``request.model`` verbatim. Only the child argv's ``--model`` value
         is translated through ``_MODEL_ALIASES`` (``fable`` ->
         ``claude-fable-5-1``); every other id passes through unchanged.
+        An optional Rust declaration adds a bounded preflight and shared child
+        environment for both Claude and its stdio MCP subprocesses; failures
+        raise ``ValidationError`` before a launch process is created.
         """
 
         if request.fast:
@@ -278,7 +259,6 @@ class ClaudeAdapter:
             "--input-format",
             "stream-json",
             "--verbose",
-            "--no-session-persistence",
             "--model",
             _MODEL_ALIASES.get(request.model, request.model),
             "--permission-mode",
@@ -315,6 +295,7 @@ class ClaudeAdapter:
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
+        environment = rust_environment(environment, config, request.workdir)
 
         # Secret registration follows what was *injected*, not only what the
         # config declared: a subclass auth bridge (glm's keychain token) can
@@ -339,13 +320,29 @@ class ClaudeAdapter:
             if server is None:
                 raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
             for env_name in server.env_from:
-                value = os.environ.get(env_name)
+                if config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES:
+                    value = environment.get(env_name)
+                else:
+                    value = os.environ.get(env_name)
                 if not value:
+                    detail = (
+                        "Rust provisioning does not permit RUSTUP_TOOLCHAIN; use rust-toolchain files"
+                        if config.rust is not None and env_name == "RUSTUP_TOOLCHAIN"
+                        else f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
+                    )
                     raise ValidationError(
-                        f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
+                        detail
                     )
                 environment[env_name] = value
                 mcp_env_names.append(env_name)
+
+        if config.rust is not None and config.mcp:
+            rust_mcp_environment = {
+                name: environment[name]
+                for name in ("PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL")
+            }
+            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=rust_mcp_environment)
+            argv[argv.index("--mcp-config") + 1] = str(agent_dir / "mcp" / "mcp-config.json")
 
         initial_input = (
             json.dumps(
@@ -379,6 +376,8 @@ class ClaudeAdapter:
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> "ClaudeSession":
+        """Launch a fresh or explicitly resumed Claude session in its own process group."""
+        plan = cli_resume_plan(plan, session_option="--session-id")
         process = subprocess.Popen(
             list(plan.argv),
             cwd=str(plan.cwd),
@@ -486,15 +485,11 @@ class ClaudeSession:
         return None
 
     def _read_stdout(self) -> None:
-        """Drain child stdout on the reader thread: log, decode, and publish.
+        """Redact/log stdout and publish decoded messages, events and warnings.
 
-        Each line is redacted, appended to the runtime log, then fed to the
-        decoder; the resulting messages, events and warnings go to the sink.
-        The session id is published only when it first appears or actually
-        changes, so a repeated id costs nothing. A terminal ``result`` line
-        settles the run. Any exception is stored for :meth:`wait` to re-raise
-        while the loop keeps draining the pipe, and ``self._settled`` is set on
-        every exit path, including crash and EOF.
+        Publish native identity once and verify it for continuations. Store
+        reader exceptions for wait() while draining the pipe; wake wait() on
+        any error, terminal result, crash or EOF.
         """
 
         try:
@@ -508,6 +503,11 @@ class ClaudeSession:
                         self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
                         self._raw_stream.flush()
                     result = self._decoder.feed(sanitized, at=time.time())
+                    expected = self._plan.resume_session_id
+                    if expected is not None and result.session_id and result.session_id != expected:
+                        raise ValidationError("runtime resumed a different native session")
+                    if expected is not None and result.terminal and result.terminal.runtime_session_id != expected:
+                        raise ValidationError("runtime did not confirm the resumed native session")
                     if result.session_id and result.session_id != self._reported_session_id:
                         self._reported_session_id = result.session_id
                         self._sink.session(result.session_id)
@@ -528,6 +528,7 @@ class ClaudeSession:
                 except BaseException as error:  # persisted for wait(); keep draining the pipe
                     if self._reader_error is None:
                         self._reader_error = error
+                    self._settled.set()
         finally:
             # Covers the crash/EOF case too: the child exited (or the pipe
             # closed) without ever producing a terminal line, so ``wait``

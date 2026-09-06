@@ -78,10 +78,13 @@ Discover the authoritative surface at runtime:
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
 The tool set (19 at the time of writing, same names as the MCP server):
-`start`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
+`start`, `resume`, `chain`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
 `list_agents`, `list_orchestrators`, `models`, `limits`, `capacity_order`,
 `fast`, `doc`, and the workflow verbs `workflow_start`, `workflow_status`,
 `workflow_answer`, `workflow_cancel`, `workflow_resume`.
+
+See [continuations](continuations.md) for native-context `resume` and chronological
+`chain` pages, including inherited authority, idempotency and history availability.
 
 `fast` settings are ephemeral to the current transport session. Set
 `{"runtime":"codex","enabled":true}` for the runtime default, or add

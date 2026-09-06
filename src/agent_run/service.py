@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -39,6 +40,10 @@ from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from . import workflow_facade
 from .profiles import assign_role, load_profile
+from .resume import (
+    identity_snapshot, inherited_request, proven_identity, record_profile_grants,
+    replayed_resume,
+)
 from .start_coordinator import StartCoordinator
 from .state.reconciliation import workflow_owner_identity
 from .supervisor import supervisor_identity
@@ -54,6 +59,27 @@ _MAX_PAGE_SIZE = 1000
 _FAILURE_TEXT_CHARS = 512
 _CHUNK = 65536
 _PENDING_CONFIG_REVISION = "pending:materialization"
+
+
+def _log_start_preparation_stage(
+    agent_id: AgentId, stage: str, started_at: float
+) -> None:
+    """Record one bounded startup-preparation stage without request payloads.
+
+    ``agent_id`` (AgentId) identifies the accepted run; ``stage`` (str) is a
+    caller-supplied fixed internal label, never request or exception text.
+    ``started_at`` (float) is the worker's monotonic preparation start in seconds.
+    Returns None after emitting the id, stage and cumulative elapsed seconds to
+    the existing logger. Successive entries identify each stage's duration;
+    the entry is emitted before work so a blocked stage remains identifiable.
+    This helper does not alter deadlines or state and uses no request payloads.
+    """
+    _logger.info(
+        "start preparation agent_id=%s stage=%s elapsed_seconds=%.3f",
+        agent_id,
+        stage,
+        time.monotonic() - started_at,
+    )
 
 LaunchAgent: TypeAlias = Callable[
     [AgentId, StartRequest, RuntimeAdapter, LaunchPlan, Path], None
@@ -89,6 +115,13 @@ class DeliveryView:
 
 @dataclass(frozen=True, slots=True)
 class AgentView:
+    """One agent's read-only status, plus its place in a resume chain.
+
+    ``parent_agent_id`` is the agent this one resumed (``None`` for a fresh
+    run), ``root_agent_id`` the chain's first agent (itself when it has no
+    parent), and ``sequence`` its 1-based position in that chain.
+    """
+
     agent_id: AgentId
     runtime: str
     model: str
@@ -109,6 +142,9 @@ class AgentView:
     answer_sha256: str | None
     effort: str | None
     delivery: DeliveryView
+    parent_agent_id: AgentId | None = None
+    root_agent_id: AgentId | None = None
+    sequence: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +208,24 @@ class AgentPage:
     offset: int
     limit: int
     next_offset: int | None
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ChainPage:
+    """One bounded, chronological page of a resume chain.
+
+    ``items`` are the chain's agents ordered by ``sequence``. ``cursor`` is the
+    1-based sequence this page started at, ``limit`` the requested page size,
+    and ``next_cursor`` the sequence to pass back for the following page, or
+    ``None`` when this page reached the end. ``complete`` mirrors that: it is
+    ``True`` only when no further page exists.
+    """
+
+    items: tuple[AgentView, ...]
+    cursor: int
+    limit: int
+    next_cursor: int | None
     complete: bool
 
 
@@ -358,6 +412,35 @@ class AgentService:
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
+        return self._admit(request, runtime, label)
+
+    def _admit(
+        self,
+        request: StartRequest,
+        runtime: RuntimeConfig,
+        label: str | None,
+        *,
+        parent_agent_id: AgentId | None = None,
+    ) -> StartResult:
+        """Durably accept one already validated start and hand it to a worker.
+
+        Shared by :meth:`start` and :meth:`resume`; everything runtime- and
+        model-specific has been checked by the caller. ``parent_agent_id`` is
+        set only for a resume, and joins the parent's chain atomically.
+
+        The effective identity this start resolved to (``label``, runtime home,
+        auth target, granted permissions, ``fast``) is persisted alongside the
+        row but outside ``request_json``, so a later resume can prove what this
+        run used without changing what idempotent replay compares.
+        A continuation preserves its parent's completed grant snapshot, which
+        the preparation worker compares with the actual loaded profile.
+
+        The native session a resumed child attaches to is read back from the
+        row that was just committed, never from the caller: store and adapter
+        cannot then disagree about which session was accepted. Returns the
+        :class:`StartResult` for the new -- or idempotently replayed -- agent.
+        """
+
         candidate = new_agent_id()
         accepted_at = self._now()
         creation = self._store.create_agent_limited(
@@ -368,6 +451,12 @@ class AgentService:
             runtime_limit=runtime.max_active_agents,
             agent_id=candidate,
             at=accepted_at,
+            parent_agent_id=parent_agent_id,
+            identity_json=(
+                identity_snapshot(request.runtime, runtime, label, request)
+                if parent_agent_id is None
+                else self._store.get_agent(parent_agent_id)["identity_json"]
+            ),
         )
         if not creation.created:
             _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)
@@ -375,6 +464,13 @@ class AgentService:
                 creation.agent_id, False, self.get(creation.agent_id)
             )
         _logger.info("start agent_id=%s created=True", creation.agent_id)
+        resume_session_id = (
+            None
+            if parent_agent_id is None
+            else self._store.get_agent(creation.agent_id)[
+                "resume_of_runtime_session_id"
+            ]
+        )
         self._store.transition(
             creation.agent_id,
             AgentStatus.STARTING,
@@ -400,6 +496,7 @@ class AgentService:
                     runtime,
                     label,
                     startup_owner,
+                    None if resume_session_id is None else str(resume_session_id),
                 ),
             )
         except Exception as error:
@@ -424,6 +521,7 @@ class AgentService:
         runtime: RuntimeConfig,
         account_label: str | None,
         startup_owner: str,
+        resume_session_id: str | None = None,
     ) -> None:
         """Materialize and launch one already accepted start.
 
@@ -432,9 +530,19 @@ class AgentService:
         ``startup_owner`` is the immutable coordinator identity whose live
         preparation claim is atomically renewed for the bounded READY and
         cleanup handoff. Post-accept failures become durable outcomes.
+
+        ``resume_session_id`` is the parent's native runtime session for a
+        resumed start, or ``None`` for a fresh one. It is stamped onto the
+        adapter's plan after ``prepare`` and before the plan is serialized for
+        launch, so an adapter builds its plan without needing to know it is a
+        resume. Attachment is only requested here; the runtime session the
+        supervisor later records is whatever the adapter's sink actually emits.
         """
 
         failure_kind = "prepare_failed"
+        preparation_started = time.monotonic()
+        stage = "account"
+        _log_start_preparation_stage(agent_id, stage, preparation_started)
         try:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
@@ -464,16 +572,22 @@ class AgentService:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
+            stage = "adapter"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             adapter = AdapterRegistry(self._config).load(
                 request.runtime,
                 self._required_capabilities(request, effective_runtime),
             )
             adapter.validate(effective_runtime)
+            stage = "models"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             roster = adapter.models(effective_runtime, effective_home)
             if request.model not in {model.id for model in roster}:
                 raise ValidationError(
                     f"model is not available for runtime {request.runtime}: {request.model}"
                 )
+            stage = "profile"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             profile = assign_role(
                 load_profile(
                     self._config.profiles,
@@ -484,13 +598,18 @@ class AgentService:
                 request.runtime,
                 effective_runtime.skills,
             )
+            record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
+            stage = "materialize"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             revision = adapter.materialize(
                 effective_runtime,
                 effective_home,
                 mcp_servers=mcp_servers,
                 skills_root=runtime_skills_dir(request.runtime, self._home),
             )
+            stage = "config_revision"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             store.replace_config_revision(
                 agent_id, _PENDING_CONFIG_REVISION, revision
             )
@@ -499,10 +618,13 @@ class AgentService:
                 request.runtime,
                 revision,
             )
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
             candidate_dir = create_agent_dir(agent_id, self._home)
+            stage = "prepare"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             plan = adapter.prepare(
                 request,
                 profile,
@@ -511,6 +633,8 @@ class AgentService:
                 candidate_dir,
                 mcp_servers=mcp_servers,
             )
+            if resume_session_id is not None:
+                plan = replace(plan, resume_session_id=resume_session_id)
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
             with launch_cancellation(
@@ -518,6 +642,8 @@ class AgentService:
             ):
                 if self._cancel_accepted_start(store, cancelled, agent_id):
                     return
+                stage = "handoff"
+                _log_start_preparation_stage(agent_id, stage, preparation_started)
                 if not store.begin_supervisor_handoff(
                     agent_id,
                     startup_owner,
@@ -527,14 +653,18 @@ class AgentService:
                     _logger.warning("start agent_id=%s expired before supervisor spawn", agent_id)
                     return
                 failure_kind = "supervisor_start_failed"
+                stage = "supervisor"
+                _log_start_preparation_stage(agent_id, stage, preparation_started)
                 self._launch(agent_id, request, adapter, plan, candidate_dir)
             _logger.info("start agent_id=%s done", agent_id)
         except BaseException as error:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
             _logger.warning(
-                "start agent_id=%s failed asynchronous error_kind=%s",
+                "start agent_id=%s failed stage=%s elapsed_seconds=%.3f error_kind=%s",
                 agent_id,
+                stage,
+                time.monotonic() - preparation_started,
                 type(error).__name__,
             )
             self._fail_created_start(
@@ -622,6 +752,107 @@ class AgentService:
         self._starts.cancel(agent_id)
         _logger.info("cancel agent_id=%s", agent_id)
         return self.get(agent_id)
+
+    def resume(
+        self,
+        agent_id: str | AgentId,
+        task: str,
+        *,
+        timeout_seconds: float | None = None,
+        request_id: str | None = None,
+        orchestrator: OrchestratorRef | None = None,
+    ) -> StartResult:
+        """Continue one finished agent's native session as a new durable agent.
+
+        ``agent_id`` names the exact predecessor to resume; it must be the
+        latest node of its chain, be finished in a :data:`RESUMABLE
+        <agent_run.state.start.RESUMABLE>` status, and have recorded a native
+        runtime session. ``task`` is the new prompt and the only inherited
+        field that changes; ``timeout_seconds`` overrides the parent's when
+        given and inherits it when omitted. Everything else -- runtime, model,
+        profile, effort, fast, account, workdir, read roots, write right and
+        output schema -- comes from the parent's persisted request, so config
+        or default-account drift cannot silently redirect the continuation.
+
+        ``request_id`` makes the call idempotent: repeating it with the same
+        inputs returns the child already accepted, even after the parent has
+        stopped being a valid source; reusing it with different inputs raises
+        :class:`ValidationError`. ``orchestrator`` binds notifications for the
+        new agent only -- the parent's binding is untouched, as are its
+        artifacts, transcript and answer.
+
+        Returns a :class:`StartResult` whose ``agent_id`` is a *new* durable
+        agent. Raises :class:`ValidationError` when the parent is unknown,
+        unfinished, lost, already resumed, has no session to attach to, when
+        the inherited identity can no longer be proved against configuration,
+        when an inherited directory no longer exists, or when the runtime
+        adapter does not declare :attr:`Capability.RESUME`. Attachment is only
+        requested here: the runtime session actually established is whatever
+        the adapter reports later.
+        """
+
+        parent_id = validate_agent_id(agent_id)
+        row = self._store.get_agent(parent_id)
+        replay = replayed_resume(
+            self._store.connection, row, task, timeout_seconds, request_id, orchestrator
+        )
+        if replay is not None:
+            return StartResult(replay, False, self.get(replay))
+        runtime_name = str(row["runtime"])
+        runtime = self._runtime_config(runtime_name)
+        label, snapshot = proven_identity(
+            parent_id, row["identity_json"], runtime_name, runtime
+        )
+        request = inherited_request(
+            row, snapshot, label, task, timeout_seconds, request_id, orchestrator
+        )
+        _logger.info(
+            "resume parent_agent_id=%s runtime=%s request_id=%s",
+            parent_id, runtime_name, request_id,
+        )
+        adapter = self._registry.load(
+            request.runtime,
+            self._required_capabilities(request, runtime) | {Capability.RESUME},
+        )
+        adapter.validate(runtime)
+        if request.model not in runtime.models:
+            raise ValidationError(
+                f"model is no longer configured for runtime {request.runtime}: "
+                f"{request.model}"
+            )
+        return self._admit(request, runtime, label, parent_agent_id=parent_id)
+
+    def chain(
+        self,
+        agent_id: str | AgentId,
+        *,
+        cursor: int | None = None,
+        limit: int = _SUMMARY_LIMIT,
+    ) -> ChainPage:
+        """Page one resume chain in chronological order.
+
+        ``agent_id`` may be any member of the chain; the whole chain is
+        returned regardless of which node was named. ``cursor`` is the 1-based
+        ``sequence`` to resume paging from, defaulting to the chain's first
+        agent, and ``limit`` bounds the page at :data:`_MAX_PAGE_SIZE`.
+
+        Returns a :class:`ChainPage` whose ``next_cursor`` is the sequence of
+        the first unreturned agent, or ``None`` when the page ends the chain.
+        Raises :class:`ValidationError` for a non-positive cursor or an
+        out-of-range limit.
+        """
+
+        start = 1 if cursor is None else cursor
+        if isinstance(start, bool) or not isinstance(start, int) or start < 1:
+            raise ValidationError("cursor must be a positive integer")
+        bounded = _page_limit(limit)
+        rows = self._store.resume_chain(agent_id, cursor=start, limit=bounded)
+        now = self._now()
+        items = tuple(self._agent_view(row, now) for row in rows[:bounded])
+        next_cursor = (
+            int(rows[bounded]["sequence"]) if len(rows) > bounded else None
+        )
+        return ChainPage(items, start, bounded, next_cursor, next_cursor is None)
 
     def workflow_start(
         self,
@@ -1029,6 +1260,11 @@ class AgentService:
                 if row["orchestrator_session_id"] is None
                 else str(row["orchestrator_session_id"]),
             ),
+            None
+            if row["parent_agent_id"] is None
+            else AgentId(str(row["parent_agent_id"])),
+            AgentId(str(row["root_agent_id"] or agent_id)),
+            int(row["sequence"]),
         )
 
     def _delivery_view(

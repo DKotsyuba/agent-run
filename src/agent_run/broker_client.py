@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import socket
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-from .domain import StartRequest
+from .domain import OrchestratorRef, StartRequest
 from .errors import AgentRunError, BrokerUnavailable, ValidationError
 
 MAX_LINE_BYTES = 1024 * 1024
@@ -20,6 +21,32 @@ _BROKER_MESSAGE = (
 
 class BrokerClient:
     """Lazily connect to the broker and preserve one API session per client."""
+
+    def resume(
+        self, agent_id: str, task: str, *, timeout_seconds: float | None = None,
+        request_id: str | None = None, orchestrator: OrchestratorRef | None = None,
+    ) -> SimpleNamespace:
+        """Submit a continuation to the resident broker and return its new run ID.
+
+        Parameters follow AgentService.resume; authority is inherited server-side.
+        Connection/domain errors propagate, and malformed success replies raise
+        AgentRunError. This client never starts a local preparation worker.
+        """
+        result = self.call("resume", {
+            "agent_id": agent_id, "task": task, "timeout_seconds": timeout_seconds,
+            "request_id": request_id,
+            "orchestrator": None if orchestrator is None else asdict(orchestrator),
+        })
+        if not isinstance(result, dict) or not isinstance(result.get("agent_id"), str) or not isinstance(result.get("created"), bool):
+            raise AgentRunError("broker returned an invalid resume result")
+        return SimpleNamespace(**result)
+
+    def chain(self, agent_id: str, *, cursor: int | None = None, limit: int = 50) -> dict:
+        """Read one server-validated continuation page without opening a local store."""
+        result = self.call("chain", {"agent_id": agent_id, "cursor": cursor, "limit": limit})
+        if not isinstance(result, dict):
+            raise AgentRunError("broker returned an invalid chain result")
+        return result
 
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = Path(socket_path)

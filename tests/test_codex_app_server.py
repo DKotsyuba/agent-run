@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import LaunchPlan
 from agent_run.adapters.codex.app_server import (
+    CodexAppServerSession,
     EffectiveTurnParams,
     ProcessTransport,
     SteerRejected,
@@ -80,7 +81,7 @@ class FakeSink:
         self.events.append((kind, dict(data)))
 
 
-def make_plan(cwd, adapter_state, initial_input="do the thing"):
+def make_plan(cwd, adapter_state, initial_input="do the thing", resume_session_id=None):
     return LaunchPlan(
         argv=("codex", "app-server"),
         cwd=cwd,
@@ -88,6 +89,7 @@ def make_plan(cwd, adapter_state, initial_input="do the thing"):
         initial_input=initial_input,
         runtime_stream_path=cwd / "runtime.jsonl",
         adapter_state=adapter_state,
+        resume_session_id=resume_session_id,
     )
 
 
@@ -309,6 +311,56 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
 
 
 class StartSessionTests(unittest.TestCase):
+    def test_resume_uses_exact_thread_id_then_starts_a_new_turn(self) -> None:
+        """A native continuation never creates a replacement thread."""
+        cwd = Path("/work")
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol", "effort": None, "sandbox_mode": "read-only",
+                "approval_policy": "never", "roots": (str(cwd),), "writable_roots": (),
+            },
+            initial_input="write to the new answer path",
+            resume_session_id="th_saved",
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/resume": [{**thread_response(cwd, thread_id="th_saved"), "historyMode": "paginated"}],
+                "turn/start": [{"turn": {"id": "turn_new"}}],
+            }
+        )
+        session = start_session(transport, plan, FakeSink())
+        self.assertEqual(session._turn_id, "turn_new")
+        self.assertEqual(
+            [method for method, _params in transport.requests],
+            ["initialize", "thread/resume", "turn/start"],
+        )
+        self.assertEqual(transport.requests[1][1], {"threadId": "th_saved"})
+        self.assertEqual(transport.requests[-1][1]["input"], [{"type": "text", "text": "write to the new answer path"}])
+
+    def test_resume_refuses_a_replacement_or_active_thread(self) -> None:
+        """Require the same idle thread before sending a new task to the runtime."""
+        cwd = Path("/work")
+        state = {
+            "model": "gpt-5.6-sol", "effort": None, "sandbox_mode": "read-only",
+            "approval_policy": "never", "roots": (str(cwd),), "writable_roots": (),
+        }
+        for response, error in (
+            (thread_response(cwd, thread_id="th_other"), "different threadId"),
+            ({**thread_response(cwd, thread_id="th_saved"), "status": {"type": "active"}}, "active native session"),
+        ):
+            with self.subTest(error=error):
+                transport = FakeTransport(
+                    responses={"initialize": [{}], "thread/resume": [response]}
+                )
+                with self.assertRaisesRegex(VerificationError, error):
+                    start_session(
+                        transport, make_plan(cwd, state, resume_session_id="th_saved"), FakeSink()
+                    )
+                self.assertNotIn("thread/start", [method for method, _ in transport.requests])
+                self.assertNotIn("turn/start", [method for method, _ in transport.requests])
+
     def test_success_verifies_params_and_starts_the_turn(self) -> None:
         cwd = Path("/work")
         plan = make_plan(
@@ -336,12 +388,60 @@ class StartSessionTests(unittest.TestCase):
         self.assertEqual(sink.sessions, ["th_1"])
         methods = [method for method, _ in transport.requests]
         self.assertEqual(methods, ["initialize", "thread/start", "turn/start"])
+        start_params = transport.requests[1][1]
+        self.assertEqual(start_params["runtimeWorkspaceRoots"], [str(cwd)])
+        self.assertNotIn("roots", start_params)
+        self.assertNotIn("writableRoots", start_params)
         self.assertEqual(len(transport.timeouts), 3)
         self.assertTrue(all(100 < value <= 120 for value in transport.timeouts))
         self.assertEqual(
             transport.requests[-1][1]["input"],
             [{"type": "text", "text": "do the thing"}],
         )
+
+    def test_read_only_thread_start_preserves_every_workspace_root(self) -> None:
+        """Negotiate experimental roots support and reject a dropped read root."""
+        cwd = Path("/work")
+        roots = (str(cwd), "/external")
+        response = thread_response(cwd, roots=roots)
+        del response["roots"]
+        response["runtimeWorkspaceRoots"] = list(roots)
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "roots": roots,
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [response],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            }
+        )
+
+        start_session(transport, plan, FakeSink())
+
+        self.assertEqual(transport.requests[0][0], "initialize")
+        self.assertEqual(
+            transport.requests[0][1].get("capabilities"), {"experimentalApi": True}
+        )
+        params = transport.requests[1][1]
+        self.assertEqual(params["runtimeWorkspaceRoots"], list(roots))
+        self.assertNotIn("writableRoots", params)
+
+        incomplete = dict(response)
+        incomplete["runtimeWorkspaceRoots"] = [str(cwd)]
+        rejected = FakeTransport(
+            responses={"initialize": [{}], "thread/start": [incomplete]}
+        )
+        with self.assertRaisesRegex(VerificationError, "roots mismatch"):
+            start_session(rejected, plan, FakeSink())
 
     def test_non_network_sandbox_mode_is_sent_as_a_plain_string(self) -> None:
         """The legacy non-network request continues to send a string sandbox."""
@@ -536,6 +636,32 @@ class RaisingSink(FakeSink):
 
 
 class CodexAppServerSessionTests(unittest.TestCase):
+    def test_resumed_session_accepts_new_nested_turn_identity(self) -> None:
+        """Native terminal events with turn.id finish only the current turn."""
+        old = completed(items=[{"type": "agentMessage", "text": "old"}])
+        old["params"]["turn"]["id"] = "turn_old"
+        new = completed(items=[{"type": "agentMessage", "text": "new"}])
+        new["params"]["turn"]["id"] = "turn_new"
+        sink = FakeSink()
+        session = CodexAppServerSession(
+            FakeTransport(events=[old, new]), sink, "th_1",
+            turn_id="turn_new", require_turn_id=True,
+        )
+        self.assertIsNone(session.wait(0))
+        outcome = session.wait(0)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual([message.content for message in sink.messages], ["new"])
+
+    def test_resumed_session_ignores_replayed_completion_without_new_turn_id(self) -> None:
+        """An old thread completion cannot settle the continuation's new turn."""
+        transport = FakeTransport(events=[completed(items=[{"type": "agentMessage", "text": "old"}])])
+        session = CodexAppServerSession(
+            transport, FakeSink(), "th_1", turn_id="turn_new", require_turn_id=True
+        )
+        self.assertIsNone(session.wait(0))
+        self.assertEqual(session._sink.messages, [])
+
     def start(self, events=(), sink=None):
         cwd = Path("/work")
         plan = make_plan(

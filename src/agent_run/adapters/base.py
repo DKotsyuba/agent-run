@@ -31,6 +31,7 @@ class Capability(str, Enum):
     MCP = "mcp"
     SKILLS = "skills"
     HOOKS = "hooks"
+    RESUME = "resume"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,9 @@ class LaunchPlan:
     live secrets and remains pipe-only. ``initial_input`` preserves text,
     binary, or absent input. The stream and optional answer paths hold durable
     evidence, while ``adapter_state`` carries JSON-safe adapter metadata.
+    ``resume_session_id`` carries the exact source-runtime session identity an
+    adapter with :attr:`Capability.RESUME` should resume instead of starting a
+    fresh session; ``None`` means a fresh start.
     """
 
     argv: tuple[str, ...]
@@ -84,6 +88,7 @@ class LaunchPlan:
     runtime_stream_path: Path
     adapter_state: Mapping[str, object]
     answer_path: Path | None = None
+    resume_session_id: str | None = None
 
     def to_payload(self) -> dict[str, object]:
         """JSON form handed to the exec'd supervisor over a private pipe.
@@ -100,6 +105,7 @@ class LaunchPlan:
             "runtime_stream_path": str(self.runtime_stream_path),
             "adapter_state": dict(self.adapter_state),
             "answer_path": None if self.answer_path is None else str(self.answer_path),
+            "resume_session_id": self.resume_session_id,
         }
 
     @classmethod
@@ -122,6 +128,7 @@ class LaunchPlan:
             runtime_stream_path = payload["runtime_stream_path"]
             adapter_state = payload["adapter_state"]
             answer_path = payload["answer_path"]
+            resume_session_id = payload.get("resume_session_id")
         except KeyError as error:
             raise ValidationError(f"malformed launch plan payload: {error}") from error
         if not isinstance(argv, list) or not all(
@@ -149,6 +156,10 @@ class LaunchPlan:
             raise ValidationError(
                 "launch plan answer path must be a nonblank string or null"
             )
+        if resume_session_id is not None and not isinstance(resume_session_id, str):
+            raise ValidationError(
+                "launch plan resume session id must be a string or null"
+            )
         try:
             return cls(
                 tuple(argv),
@@ -158,6 +169,7 @@ class LaunchPlan:
                 Path(runtime_stream_path),
                 dict(adapter_state),
                 None if answer_path is None else Path(answer_path),
+                resume_session_id,
             )
         except (TypeError, ValueError, UnicodeError, binascii.Error) as error:
             raise ValidationError(f"malformed launch plan payload: {error}") from error

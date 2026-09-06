@@ -244,7 +244,8 @@ def idempotent_agent(
     connection: sqlite3.Connection, request_id: str
 ) -> sqlite3.Row | None:
     return connection.execute(
-        """SELECT id, request_json, task_summary, config_revision FROM agents
+        """SELECT id, request_json, task_summary, config_revision,
+                  parent_agent_id FROM agents
            WHERE request_id = ?""",
         (request_id,),
     ).fetchone()
@@ -446,13 +447,37 @@ def insert_agent_row(
     serialized_request: str,
     config_revision: str,
     created_at: float,
+    *,
+    parent_agent_id: AgentId | None = None,
+    root_agent_id: AgentId | None = None,
+    sequence: int = 1,
+    resume_of_runtime_session_id: str | None = None,
+    identity_json: str | None = None,
 ) -> None:
+    """Insert one new agent row, starting or continuing a resume chain.
+
+    ``parent_agent_id`` is the immediate predecessor this row resumes, or
+    ``None`` for a chain's first agent. ``root_agent_id`` defaults to
+    ``agent_id`` itself (a chain of one); a resuming caller passes the
+    chain's existing root instead. ``sequence`` is this row's 1-based
+    position in the chain. ``resume_of_runtime_session_id`` is the source
+    runtime session identity this row asks an adapter to resume, carried
+    only for later adapter use -- never fabricated when absent.
+    ``identity_json`` is the secret-free effective-identity snapshot (resolved
+    account label, runtime home, auth target, granted permissions) this run was
+    launched under, or ``None`` for a row created before snapshots existed. It
+    is deliberately *not* part of ``request_json``: replay equality compares the
+    caller's request only, so recording what the service resolved cannot change
+    whether an ordinary start replays.
+    """
+
     connection.execute(
         """INSERT INTO agents
            (id, request_id, orchestrator_session_id, runtime, model, profile,
             task, task_summary, workdir, request_json, status, created_at,
-            timeout_seconds, config_revision)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?)""",
+            timeout_seconds, config_revision, parent_agent_id, root_agent_id,
+            sequence, resume_of_runtime_session_id, identity_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             agent_id,
             request.request_id,
@@ -467,6 +492,11 @@ def insert_agent_row(
             created_at,
             request.timeout_seconds,
             config_revision,
+            parent_agent_id,
+            agent_id if root_agent_id is None else root_agent_id,
+            integer("sequence", sequence, minimum=1),
+            resume_of_runtime_session_id,
+            identity_json,
         ),
     )
 

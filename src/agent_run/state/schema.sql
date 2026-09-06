@@ -45,8 +45,15 @@ CREATE TABLE agents (
   answer_sha256 TEXT,
   startup_owner_pid_identity TEXT,
   startup_deadline_at REAL,
+  parent_agent_id TEXT REFERENCES agents(id),
+  root_agent_id TEXT NOT NULL DEFAULT '',
+  sequence INTEGER NOT NULL DEFAULT 1 CHECK (sequence >= 1),
+  resume_of_runtime_session_id TEXT,
+  identity_json TEXT,
   UNIQUE (orchestrator_session_id, request_id)
 );
+CREATE UNIQUE INDEX agents_parent_agent_id_unique
+  ON agents(parent_agent_id) WHERE parent_agent_id IS NOT NULL;
 
 CREATE TABLE attempts (
   id TEXT PRIMARY KEY,
@@ -255,4 +262,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 12;
+PRAGMA user_version = 13;

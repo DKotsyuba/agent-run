@@ -4,6 +4,15 @@ How the pieces fit, as shipped today. For the operator's how-to see
 `agent-run doc`; for API integration see [api.md](api.md); for workflow
 scripts see [workflows.md](workflows.md).
 
+## Managed Codex context
+
+Every agent start regenerates its managed Codex `config.toml`. The generator
+writes root-level `model_context_window = 1000000`,
+`model_auto_compact_token_limit = 780000`, and
+`model_auto_compact_token_limit_scope = "total"`. These defaults survive
+regeneration and also apply to account-specific runtime homes. They are explicit
+client settings; they do not increase a model's server-side context limit.
+
 ## The shape
 
 ```
@@ -90,7 +99,7 @@ child. What the adapters drive:
 
 | Runtime | Engine process | Notes |
 |---|---|---|
-| `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots supported on read-only runs |
+| `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots are sent as `runtimeWorkspaceRoots` on read-only runs |
 | `claude` | `claude` CLI headless | `--setting-sources ""`, per-run plugin dirs |
 | `glm` | `claude` CLI pointed at Z.ai's Anthropic-compatible endpoint | subclass of the claude adapter; auth via env/keychain, base URL pinned in the adapter |
 | `qwen` | `qwen -p … --output-format stream-json --sandbox` | headless one-shot; approval mode maps to write/read-only; macOS uses Xcode's real Git binary instead of the sandbox-hostile `/usr/bin` shim |

@@ -31,7 +31,7 @@ from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
-from agent_run.service import AgentQuery, AgentService
+from agent_run.service import AgentQuery, AgentService, _log_start_preparation_stage
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
 
@@ -353,9 +353,12 @@ class AgentServiceTests(unittest.TestCase):
         with (
             patch.object(ADAPTER, "prepare", side_effect=blocked_prepare),
             patch.object(self.service, "_continue_start", side_effect=tracked_continue),
+            patch("agent_run.service._log_start_preparation_stage", wraps=_log_start_preparation_stage) as stages,
+            self.assertLogs("agent_run.service", "INFO") as logs,
         ):
             accepted = self.service.start(self.request(request_id="expired-prepare"))
             self.assertTrue(entered.wait(1))
+            self.assertTrue(any("stage=prepare " in message for message in logs.output))
             clock[0] = 221.0
             self.assertEqual(
                 reconcile_unowned_starting(self.store, at=clock[0]),

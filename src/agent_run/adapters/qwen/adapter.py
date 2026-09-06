@@ -22,6 +22,8 @@ from agent_run.adapters.base import (
     RuntimeInfo,
 )
 from agent_run.adapters.claude.adapter import ClaudeSession
+from agent_run.adapters.claude.launch_io import abort_launch
+from agent_run.adapters.continuation import cli_resume_plan
 from agent_run.adapters.home import content_hash, write_managed_file
 from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
@@ -45,6 +47,7 @@ _CAPABILITIES = frozenset(
         Capability.MCP,
         Capability.SKILLS,
         Capability.HOOKS,
+        Capability.RESUME,
     }
 )
 #: Qwen's only supported provider protocol; without this, headless (`-p`)
@@ -159,9 +162,16 @@ class QwenAdapter:
         return RuntimeInfo("qwen", ADAPTER_API_VERSION, _CAPABILITIES)
 
     def validate(self, config: RuntimeConfig) -> None:
-        """Validate Qwen's environment-auth and one-shot-only configuration."""
+        """Validate Qwen's environment-auth and one-shot-only configuration.
+
+        ``config`` must use supported environment auth and no service mode.
+        A declared Rust table raises ``ValidationError`` because Qwen builds an
+        independent sandbox environment.
+        """
         if config.service_mode is not None:
             raise ValidationError("qwen runtime does not support service_mode")
+        if config.rust is not None:
+            raise ValidationError("qwen runtime does not support Rust provisioning")
         if config.auth is None or config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
         unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
@@ -320,12 +330,17 @@ class QwenAdapter:
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> QwenSession:
         """Launch Qwen in its own process group and decode its JSONL stream."""
+        plan = cli_resume_plan(plan)
         process = subprocess.Popen(
             list(plan.argv), cwd=str(plan.cwd), env=dict(plan.environment), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             start_new_session=True,
         )
-        return QwenSession(process, plan, sink)
+        try:
+            return QwenSession(process, plan, sink)
+        except BaseException:
+            abort_launch(process)
+            raise
 
 
 ADAPTER = QwenAdapter()

@@ -6,7 +6,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.config import load_config
+from agent_run.config import RustConfig, load_config
 from agent_run.errors import ValidationError
 
 
@@ -54,6 +54,60 @@ target = "auth.json"
             self.assertEqual(runtime.binary.parent, linked.parent)
             self.assertEqual(runtime.home, home.resolve())
             self.assertEqual(runtime.auth.source, source.resolve())
+
+    def test_runtime_rust_requires_both_paths_and_keeps_cargo_bin_lexical(self) -> None:
+        """Rust provisioning accepts paired absolute roots and preserves proxy directories."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rustup = root / "rustup"
+            rustup.mkdir()
+            cargo_target = root / "cargo-target"
+            cargo_target.mkdir()
+            cargo_link = root / "cargo-bin"
+            cargo_link.symlink_to(cargo_target, target_is_directory=True)
+            config = self.load(
+                f"""
+schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "{root / 'home'}"
+models = ["test"]
+[runtimes.claude.rust]
+rustup_home = "{rustup}"
+cargo_bin = "{cargo_link}"
+"""
+            )
+            self.assertEqual(config.runtimes["claude"].rust, RustConfig(rustup.resolve(), cargo_link))
+            with self.assertRaisesRegex(ValidationError, "requires rustup_home and cargo_bin together"):
+                self.load(
+                    f"""
+schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "{root / 'home'}"
+models = ["test"]
+[runtimes.claude.rust]
+rustup_home = "{rustup}"
+"""
+                )
+            with self.assertRaisesRegex(ValidationError, "requires rustup_home and cargo_bin together"):
+                self.load(
+                    f"""
+schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "{root / 'home'}"
+models = ["test"]
+[runtimes.claude.rust]
+"""
+                )
 
     def test_relative_runtime_binary_is_rejected(self) -> None:
         """A relative launcher is still rejected instead of falling back to PATH."""

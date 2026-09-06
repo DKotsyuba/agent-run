@@ -37,6 +37,24 @@ _ORCHESTRATOR = _schema(
     },
     ("transport", "external_session_id"),
 )
+_CONTINUATION_TOOLS = (
+    {
+        "name": "resume",
+        "description": "Continue a terminal agent's native context as a NEW durable run; inherit identity and permissions. " + completion_notice_contract_text(),
+        "inputSchema": _schema({
+            "agent_id": _ID, "task": {"type": "string"},
+            "timeout_seconds": {"type": ["number", "null"]},
+            "request_id": {"type": ["string", "null"]},
+            "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
+        }, ("agent_id", "task")),
+    },
+    {
+        "name": "chain",
+        "description": "Read a chronological page of the continuation chain containing this agent.",
+        "inputSchema": _schema({"agent_id": _ID, "cursor": {"type": ["integer", "null"]},
+                                "limit": {"type": "integer"}}, ("agent_id",)),
+    },
+)
 TOOLS = (
     {
         "name": "capacity_order",
@@ -175,6 +193,7 @@ TOOLS += (
      "inputSchema": _schema({"run_id": _ID}, ("run_id",))},
 )
 
+TOOLS += _CONTINUATION_TOOLS
 TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 
@@ -203,6 +222,17 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
     """
 
     fast_modes = session.fast_modes
+    if name == "resume":
+        args = _arguments(raw, {"agent_id", "task", "timeout_seconds", "request_id", "orchestrator"}, {"agent_id", "task"})
+        return service.resume(
+            _string(args, "agent_id"), _string(args, "task"),
+            timeout_seconds=args.get("timeout_seconds"),
+            request_id=_optional_string(args, "request_id"),
+            orchestrator=_optional_orchestrator(args.get("orchestrator")),
+        )
+    if name == "chain":
+        args = _arguments(raw, {"agent_id", "cursor", "limit"}, {"agent_id"})
+        return service.chain(_string(args, "agent_id"), cursor=args.get("cursor"), limit=args.get("limit", 50))
     if name == "fast":
         args = _arguments(raw, {"runtime", "enabled", "account"})
         if not args:
