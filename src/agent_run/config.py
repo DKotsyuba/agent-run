@@ -87,6 +87,23 @@ class RustConfig:
 
 
 @dataclass(frozen=True)
+class EnvironmentConfig:
+    """A named, declarative developer environment available to runtimes.
+
+    Paths are absolute directories in precedence order, variables are immutable
+    non-secret string declarations, and commands are bare executable names.
+    ``rust`` optionally supplies the same explicit Rust roots as a runtime;
+    a runtime-local Rust declaration has higher precedence when selected.
+    """
+
+    path: tuple[Path, ...] = ()
+    variables: Mapping[str, str] = field(default_factory=dict)
+    required_commands: tuple[str, ...] = ()
+    denied_commands: tuple[str, ...] = ()
+    rust: RustConfig | None = None
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Static configuration for one arbitrary runtime name.
 
@@ -114,6 +131,7 @@ class RuntimeConfig:
     priority_account_multipliers: Mapping[str, float] = field(default_factory=dict)
     priority_lane_multipliers: Mapping[str, float] = field(default_factory=dict)
     rust: RustConfig | None = None
+    environment: EnvironmentConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +145,9 @@ class Config:
         default_factory=lambda: MappingProxyType({})
     )
     runtimes: Mapping[str, RuntimeConfig] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    environments: Mapping[str, EnvironmentConfig] = field(
         default_factory=lambda: MappingProxyType({})
     )
 
@@ -460,7 +481,45 @@ def _parse_rust(value: object, path: str) -> RustConfig | None:
     )
 
 
-def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
+def _bare_commands(value: object, path: str) -> tuple[str, ...]:
+    """Parse unique bare executable names without accepting paths or whitespace."""
+
+    commands = _strings(value, path)
+    for index, command in enumerate(commands):
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", command):
+            raise ValidationError(f"{path}[{index}] must be a bare executable name")
+    if len(set(commands)) != len(commands):
+        raise ValidationError(f"{path} must not contain duplicates")
+    return commands
+
+
+def _parse_environments(value: object) -> Mapping[str, EnvironmentConfig]:
+    """Parse named developer-environment declarations into immutable values."""
+
+    result: dict[str, EnvironmentConfig] = {}
+    for name, table in _named_table(value, "environments").items():
+        path = f"environments.{name}"
+        _reject_unknown(table, {"path", "variables", "required_commands", "denied_commands", "rust"}, path)
+        paths = tuple(_path(item, f"{path}.path[{index}]") for index, item in enumerate(_strings(table.get("path", []), f"{path}.path")))
+        raw_variables = _table(table.get("variables", {}), f"{path}.variables")
+        variables: dict[str, str] = {}
+        for key, item in raw_variables.items():
+            if not isinstance(key, str) or not _ENV_NAME.fullmatch(key):
+                raise ValidationError(f"{path}.variables key must be an environment variable name")
+            if not isinstance(item, str) or "\0" in item:
+                raise ValidationError(f"{path}.variables.{key} must be a string without NUL")
+            variables[key] = item
+        required = _bare_commands(table.get("required_commands", []), f"{path}.required_commands")
+        denied = _bare_commands(table.get("denied_commands", []), f"{path}.denied_commands")
+        overlap = sorted(set(required) & set(denied))
+        if overlap:
+            raise ValidationError(f"{path} commands cannot be both required and denied: {', '.join(overlap)}")
+        rust = None if "rust" not in table else _parse_rust(table["rust"], f"{path}.rust")
+        result[name] = EnvironmentConfig(paths, MappingProxyType(variables), required, denied, rust)
+    return MappingProxyType(result)
+
+
+def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]) -> Mapping[str, RuntimeConfig]:
     """Parse arbitrary runtime tables into an immutable validated mapping.
 
     Every runtime must declare its adapter, binary, home, models, and enabled
@@ -494,6 +553,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "priority_account_multipliers",
         "priority_lane_multipliers",
         "rust",
+        "environment",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -542,6 +602,14 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             f"{path}.priority_lane_multipliers",
         )
         rust = None if "rust" not in table else _parse_rust(table["rust"], f"{path}.rust")
+        environment_name = table.get("environment")
+        environment = None
+        if environment_name is not None:
+            environment_name = _string(environment_name, f"{path}.environment")
+            try:
+                environment = environments[environment_name]
+            except KeyError as error:
+                raise ValidationError(f"{path}.environment references unknown environment {environment_name!r}") from error
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -562,6 +630,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             account_multipliers,
             lane_multipliers,
             rust,
+            environment,
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")
@@ -580,14 +649,13 @@ def load_config(path: str | Path) -> Config:
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValidationError(f"cannot load config {path}: {error}") from error
-    _reject_unknown(
-        raw, {"schema_version", "core", "capacity", "delivery", "profiles", "mcp", "runtimes"}, ""
-    )
+    _reject_unknown(raw, {"schema_version", "core", "capacity", "delivery", "profiles", "mcp", "environments", "runtimes"}, "")
     version = raw.get("schema_version")
     if type(version) is not int or version != 1:
         raise ValidationError(f"unsupported schema_version: {version!r}")
     mcp = _parse_mcp(raw.get("mcp", {}))
-    runtimes = _parse_runtimes(raw.get("runtimes", {}))
+    environments = _parse_environments(raw.get("environments", {}))
+    runtimes = _parse_runtimes(raw.get("runtimes", {}), environments)
     for runtime_name, runtime in runtimes.items():
         for index, mcp_name in enumerate(runtime.mcp):
             if mcp_name not in mcp:
@@ -601,5 +669,6 @@ def load_config(path: str | Path) -> Config:
         delivery=_parse_delivery(raw.get("delivery", {})),
         profiles=_parse_profiles(raw.get("profiles", {})),
         mcp=mcp,
+        environments=environments,
         runtimes=runtimes,
     )
