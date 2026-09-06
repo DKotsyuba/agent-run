@@ -287,6 +287,7 @@ class CodexAdapter:
             frozenset(
                 {
                     Capability.STEER,
+                    Capability.RESUME,
                     Capability.EFFORT,
                     Capability.READ_ROOTS,
                     Capability.WRITE,

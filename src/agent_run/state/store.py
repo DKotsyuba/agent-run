@@ -145,7 +145,16 @@ class StateStore:
         runtime_limit: int | None,
         agent_id: str | AgentId | None = None,
         at: float | None = None,
+        parent_agent_id: str | AgentId | None = None,
+        identity_json: str | None = None,
     ) -> AgentCreation:
+        """Admit one capped agent. See :func:`agent_run.state.start.create_agent`.
+
+        ``parent_agent_id`` is the agent this start resumes, or ``None`` for a
+        fresh run; it is validated and claimed inside the same transaction.
+        ``identity_json`` is the effective-identity snapshot for this run.
+        """
+
         if isinstance(request, StartRequest) and request.timeout_seconds is None:
             raise ValidationError("timeout_seconds must be resolved before persistence")
         return create_agent_record(
@@ -157,6 +166,35 @@ class StateStore:
             runtime_limit=runtime_limit,
             agent_id=agent_id,
             at=at,
+            parent_agent_id=parent_agent_id,
+            identity_json=identity_json,
+        )
+
+    def resume_chain(
+        self,
+        agent_id: str | AgentId,
+        *,
+        cursor: int = 1,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """Return one resume chain's rows in chronological (``sequence``) order.
+
+        ``agent_id`` may name any member of the chain; its ``root_agent_id``
+        selects the whole chain. ``cursor`` is the 1-based ``sequence`` to
+        start at and ``limit`` the maximum number of rows returned. Returns
+        ``limit + 1`` rows at most, so the caller can detect a further page
+        without a second count query; an unknown agent raises
+        :class:`agent_run.errors.NotFoundError` via :meth:`get_agent`.
+        """
+
+        root = self.get_agent(agent_id)["root_agent_id"]
+        return list(
+            self.connection.execute(
+                """SELECT * FROM agents
+                   WHERE root_agent_id = ? AND sequence >= ?
+                   ORDER BY sequence LIMIT ?""",
+                (root, cursor, limit + 1),
+            )
         )
 
     def replace_config_revision(

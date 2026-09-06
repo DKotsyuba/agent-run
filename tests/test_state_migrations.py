@@ -105,6 +105,26 @@ def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]
     )
 
 
+def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
+    """Remove migration 013's artifacts so a store looks genuinely pre-v13.
+
+    The downgrade fixtures below start from the *current* schema and peel
+    later versions back off. ``parent_agent_id`` is covered by a partial
+    unique index, and SQLite refuses to drop an indexed column, so the index
+    goes first. ``connection`` is left uncommitted for the caller.
+    """
+
+    connection.execute("DROP INDEX agents_parent_agent_id_unique")
+    for column in (
+        "identity_json",
+        "resume_of_runtime_session_id",
+        "sequence",
+        "root_agent_id",
+        "parent_agent_id",
+    ):
+        connection.execute(f"ALTER TABLE agents DROP COLUMN {column}")
+
+
 def _build_poisoned_v5_store(path: Path, run_id: str) -> None:
     """Create a v5 store whose workflow foreign keys name a dropped rebuild table."""
 
@@ -129,6 +149,7 @@ def _build_poisoned_v5_store(path: Path, run_id: str) -> None:
         # Downgrade the stamp and the post-v5 tables afterwards: replaying 005
         # is what proves 006's repair, and the store must look exactly like a
         # genuine v5 one so migrations 006..end can re-run over it.
+        _strip_v13_lineage(connection)
         connection.execute("DROP TABLE run_stats")
         connection.execute("DROP TABLE delivery_attempt_evidence")
         connection.execute("ALTER TABLE agents DROP COLUMN startup_deadline_at")
@@ -154,6 +175,7 @@ class MigrationRegistryTests(unittest.TestCase):
         store.close()
         connection = sqlite3.connect(database)
         try:
+            _strip_v13_lineage(connection)
             connection.execute("DROP TABLE capacity_route_snapshots")
             connection.execute("ALTER TABLE agents DROP COLUMN startup_deadline_at")
             connection.execute("ALTER TABLE agents DROP COLUMN startup_owner_pid_identity")
@@ -206,6 +228,7 @@ class MigrationRegistryTests(unittest.TestCase):
         try:
             # Rebuild the outbox in its exact v11 shape, so 012 runs over a store
             # indistinguishable from one an older agent-run wrote.
+            _strip_v13_lineage(connection)
             connection.execute("ALTER TABLE workflow_deliveries RENAME TO wd_new")
             connection.execute(
                 """CREATE TABLE workflow_deliveries (

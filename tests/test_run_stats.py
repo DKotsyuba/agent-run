@@ -131,6 +131,29 @@ class RunStatsTests(unittest.TestCase):
         self.assertIsNone(row["api_duration_ms"])
         self.assertIsNone(row["cost_usd"])
 
+    def test_resumed_codex_usage_requires_a_baseline_and_counts_only_the_delta(self) -> None:
+        """Cumulative thread counters never charge a continuation for its parent turn."""
+        agent_id = self.create_agent("codex")
+        self.run_terminal(agent_id)
+        self.store.connection.execute(
+            "UPDATE agents SET resume_of_runtime_session_id = ? WHERE id = ?",
+            ("thread-old", agent_id),
+        )
+        self.store.connection.commit()
+        self.store.append_event(agent_id, "thread/tokenUsage/updated", data=_TOKEN_USAGE_PAYLOAD)
+        unknown = record_run_stats(self.store, agent_id)
+        self.assertEqual(unknown["usage_source"], "none")
+        self.assertIsNone(unknown["total_tokens"])
+        self.store.append_event(
+            agent_id,
+            "resume_usage_baseline",
+            data={"tokenUsage": {"total": {"inputTokens": 4000, "outputTokens": 800, "cachedInputTokens": 2000, "cacheWriteInputTokens": 600, "reasoningOutputTokens": 200, "totalTokens": 4800}}},
+        )
+        row = record_run_stats(self.store, agent_id)
+        self.assertEqual(row["usage_source"], "token_usage_updated")
+        self.assertEqual(row["input_tokens"], 1001)
+        self.assertEqual(row["total_tokens"], 1103)
+
     def test_an_agent_without_usage_events_records_all_nulls(self) -> None:
         agent_id = self.create_agent("claude")
         self.run_terminal(agent_id)

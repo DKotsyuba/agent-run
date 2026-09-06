@@ -278,12 +278,20 @@ class CodexAppServerSession:
         *,
         turn_id: str | None = None,
         answer_path: Path | None = None,
+        require_turn_id: bool = False,
     ) -> None:
+        """Bind one transport to the active thread and turn.
+
+        ``require_turn_id`` is true only for a resumed thread.  It rejects
+        replayed events lacking the newly-started turn id, so a historical
+        completion cannot complete the new agent run.
+        """
         self._transport = transport
         self._sink = sink
         self._thread_id = thread_id
         self._turn_id = turn_id
         self._answer_path = answer_path
+        self._require_turn_id = require_turn_id
         self._buffered_outcome: Outcome | None = None
         self._pending_raw: list[Mapping[str, object]] = []
         self._completed_item_ids: set[str] = set()
@@ -374,12 +382,22 @@ class CodexAppServerSession:
         return outcome
 
     def _current_event(self, params: Mapping[str, object]) -> bool:
+        """Return whether event parameters identify this run's thread and turn.
+
+        Accept both the flat item-event turnId and terminal-event turn.id.
+        Resumed runs require an explicit matching turn; missing identity is
+        insufficient evidence that a historical event belongs to this run.
+        """
         """Return whether an item event belongs to this active thread and turn."""
 
         thread_id = params.get("threadId")
         if isinstance(thread_id, str) and thread_id and thread_id != self._thread_id:
             return False
         turn_id = params.get("turnId")
+        if not isinstance(turn_id, str):
+            turn_id = _mapping(params.get("turn")).get("id")
+        if self._require_turn_id:
+            return isinstance(turn_id, str) and turn_id == self._turn_id
         return not (
             isinstance(turn_id, str)
             and turn_id
@@ -519,7 +537,11 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
 
     Forwards the adapter's sandbox request unchanged, including a tagged
     network sandbox, then compares the server's flat echo to the requested
-    permissions. Raises ``VerificationError`` for any effective-param drift.
+    permissions.  A plan with ``resume_session_id`` uses ``thread/resume``
+    and must return that exact identity; it never falls back to a fresh
+    thread. Raises ``VerificationError`` for effective-param drift or an
+    already active native session.
+    Unsupported history is rejected by the runtime's resume request itself.
     """
 
     state = plan.adapter_state
@@ -555,21 +577,32 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
             isinstance(sandbox_params, Mapping)
             and sandbox_params.get("networkAccess") is True
         )
-    thread = transport.request(
-        "thread/start",
-        {
-            "cwd": str(plan.cwd),
-            "model": state["model"],
-            "effort": state.get("effort"),
-            "sandbox": sandbox,
-            "approvalPolicy": state["approval_policy"],
-            "roots": list(roots),
-            "writableRoots": list(writable_roots),
-            "mcpServers": list(state.get("mcp", ())),
-            "skills": list(state.get("skills", ())),
-        },
-        timeout_seconds=remaining(),
-    )
+    resume_session_id = plan.resume_session_id
+    if resume_session_id is None:
+        thread = transport.request(
+            "thread/start",
+            {
+                "cwd": str(plan.cwd),
+                "model": state["model"],
+                "effort": state.get("effort"),
+                "sandbox": sandbox,
+                "approvalPolicy": state["approval_policy"],
+                "roots": list(roots),
+                "writableRoots": list(writable_roots),
+                "mcpServers": list(state.get("mcp", ())),
+                "skills": list(state.get("skills", ())),
+            },
+            timeout_seconds=remaining(),
+        )
+    else:
+        thread = transport.request(
+            "thread/resume", {"threadId": resume_session_id}, timeout_seconds=remaining()
+        )
+        native_status = _mapping(thread.get("thread")).get("status", thread.get("status"))
+        if isinstance(native_status, Mapping):
+            native_status = native_status.get("type")
+        if native_status in ("active", "running"):
+            raise VerificationError("codex thread/resume found an active native session")
     expected = EffectiveTurnParams(
         model=state["model"],
         cwd=str(plan.cwd),
@@ -582,7 +615,12 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     verify_effective_params(expected, thread)
     thread_id = _thread_id_echo(thread)
     if not isinstance(thread_id, str) or not thread_id:
-        raise VerificationError("codex thread/start did not return a threadId")
+        raise VerificationError("codex thread start/resume did not return a threadId")
+    if resume_session_id is not None and thread_id != resume_session_id:
+        raise VerificationError(
+            "codex thread/resume returned a different threadId: "
+            f"expected {resume_session_id!r}, got {thread_id!r}"
+        )
     sink.session(thread_id)
     turn_ack = transport.request(
         "turn/start",
@@ -594,7 +632,12 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     if not isinstance(turn_id, str) or not turn_id:
         raise VerificationError("codex turn/start did not return a turn id")
     return CodexAppServerSession(
-        transport, sink, thread_id, turn_id=turn_id, answer_path=plan.answer_path
+        transport,
+        sink,
+        thread_id,
+        turn_id=turn_id,
+        answer_path=plan.answer_path,
+        require_turn_id=resume_session_id is not None,
     )
 
 
