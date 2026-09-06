@@ -2,6 +2,24 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.9.0] - 2026-09-07
+
+- feat(codex): review developer write escalations
+- fix(codex): disable login shells for developer environments
+- docs(runtime): link supported developer environment adapters
+- refactor(codex): move launch environment preparation
+- refactor(claude): keep adapter focused
+- fix(claude): render effective MCP environment
+- fix(qwen): preserve declared developer toolchains
+- feat(claude): integrate developer-environment presets and command policy
+- feat(codex): apply developer environments to launches
+- feat(qwen): connect declared developer environment providers
+- fix(codex): align native thread grants with the app server schema
+- test(runtime): preserve lexical command path evidence
+- feat(runtime): add configurable command denial policies
+- feat(config): add declared developer environment presets
+- fix(codex): provision declared Rust for shell and MCP
+
 ## [0.8.0] - 2026-09-06
 
 - fix(codex): negotiate experimental workspace roots capability
