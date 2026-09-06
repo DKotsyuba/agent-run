@@ -2,6 +2,27 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.8.0] - 2026-09-06
+
+- fix(codex): negotiate experimental workspace roots capability
+- docs: declare owner-authorized native and agent-run parity
+- refactor(adapters): separate static policy and TOML helpers
+- fix(rust): provision coding shells and MCP environments explicitly
+- docs: verify worktree source selection before tests
+- fix(start): distinguish handoff and supervisor diagnostics
+- test(start): verify prepare stage before release
+- fix(start): log preparation stage entry
+- fix(start): log preparation stage on failure
+- test(codex): cover multiple runtime workspace roots
+- fix(codex): send runtime workspace roots
+- docs: clarify scoped fixture checks and Codex root grants
+- fix(resume): exclude unsupported opencode continuation
+- feat(resume): expose native continuation across runtime adapters
+- fix(resume): preserve profile grants and accepted request replay
+- chore: checkpoint native session continuation
+- feat(adapters): carry native session identity in launch plans
+- fix(codex): retain extended context settings on generation
+
 ## [0.7.3] - 2026-09-05
 
 - fix(codex): preserve streamed whitespace and early-exit evidence
