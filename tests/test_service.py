@@ -358,7 +358,7 @@ class AgentServiceTests(unittest.TestCase):
         ):
             accepted = self.service.start(self.request(request_id="expired-prepare"))
             self.assertTrue(entered.wait(1))
-            self.assertTrue(any(call.args[1] == "prepare" for call in stages.call_args_list))
+            self.assertTrue(any("stage=prepare " in message for message in logs.output))
             clock[0] = 221.0
             self.assertEqual(
                 reconcile_unowned_starting(self.store, at=clock[0]),

@@ -66,9 +66,13 @@ def _log_start_preparation_stage(
 ) -> None:
     """Record one bounded startup-preparation stage without request payloads.
 
-    ``started_at`` is a monotonic timestamp set by the worker before preparation;
-    only its elapsed duration, the opaque agent id, and a fixed stage name reach
-    the log.
+    ``agent_id`` (AgentId) identifies the accepted run; ``stage`` (str) is a
+    caller-supplied fixed internal label, never request or exception text.
+    ``started_at`` (float) is the worker's monotonic preparation start in seconds.
+    Returns None after emitting the id, stage and cumulative elapsed seconds to
+    the existing logger. Successive entries identify each stage's duration;
+    the entry is emitted before work so a blocked stage remains identifiable.
+    This helper does not alter deadlines or state and uses no request payloads.
     """
     _logger.info(
         "start preparation agent_id=%s stage=%s elapsed_seconds=%.3f",
@@ -574,9 +578,9 @@ class AgentService:
                 request.runtime,
                 self._required_capabilities(request, effective_runtime),
             )
+            adapter.validate(effective_runtime)
             stage = "models"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
-            adapter.validate(effective_runtime)
             roster = adapter.models(effective_runtime, effective_home)
             if request.model not in {model.id for model in roster}:
                 raise ValidationError(
@@ -638,6 +642,8 @@ class AgentService:
             ):
                 if self._cancel_accepted_start(store, cancelled, agent_id):
                     return
+                stage = "handoff"
+                _log_start_preparation_stage(agent_id, stage, preparation_started)
                 if not store.begin_supervisor_handoff(
                     agent_id,
                     startup_owner,
@@ -647,6 +653,8 @@ class AgentService:
                     _logger.warning("start agent_id=%s expired before supervisor spawn", agent_id)
                     return
                 failure_kind = "supervisor_start_failed"
+                stage = "supervisor"
+                _log_start_preparation_stage(agent_id, stage, preparation_started)
                 self._launch(agent_id, request, adapter, plan, candidate_dir)
             _logger.info("start agent_id=%s done", agent_id)
         except BaseException as error:
