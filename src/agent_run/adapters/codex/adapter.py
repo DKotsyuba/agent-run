@@ -40,7 +40,7 @@ from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
-from .environment import build_environment, prepared_environment
+from .environment import build_environment, developer_config_lines, prepared_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
@@ -409,6 +409,7 @@ class CodexAdapter:
             "model_auto_compact_token_limit = 780000",
             'model_auto_compact_token_limit_scope = "total"',
             "",
+            *developer_config_lines(config),
             *mcp_lines,
             *hook_lines,
             *trust_lines,

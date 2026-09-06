@@ -160,6 +160,7 @@ env_from = ["PATH"]
         config = self.runtime_config(environment=preset, mcp=("agent_lsp",))
         digest = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertIs(generated["allow_login_shell"], False)
         self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH", "PROJECT"])
         self.assertNotEqual(
             digest,
@@ -204,6 +205,7 @@ env_from = ["PATH"]
 
         self.assertEqual((self.home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "demo skill")
         generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertNotIn("allow_login_shell", generated)
         self.assertNotIn("skills =", generated)
         self.assertEqual(
             [path.name for path in (self.home / "skills").iterdir()],

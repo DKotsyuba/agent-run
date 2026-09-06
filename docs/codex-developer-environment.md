@@ -5,6 +5,10 @@ the preset's `PATH`, declared variables, and effective Rust variables to its
 configured MCP servers. The app-server child receives the same isolated preset
 environment, with `{workdir}` and `{home}` expanded for that launch.
 
+Selected developer environments disable login shells so shell startup files
+cannot reorder the preset's command lookup path. Legacy Codex runtimes leave
+that native setting unset.
+
 `required_commands` are resolved through that child `PATH` before launch. A
 missing command rejects the launch.
 

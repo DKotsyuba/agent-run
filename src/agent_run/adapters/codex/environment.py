@@ -58,6 +58,12 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
     }
 
 
+def developer_config_lines(config: RuntimeConfig) -> tuple[str, ...]:
+    """Return native config lines needed by a selected developer environment."""
+
+    return ("allow_login_shell = false", "") if config.environment is not None else ()
+
+
 def prepared_environment(
     binary: Path, home: Path, config: RuntimeConfig, workdir: Path
 ) -> dict[str, str]:
