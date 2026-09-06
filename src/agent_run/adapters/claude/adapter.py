@@ -382,12 +382,11 @@ class ClaudeAdapter:
                 environment[env_name] = value
                 mcp_env_names.append(env_name)
 
-        if config.rust is not None and config.mcp:
-            rust_mcp_environment = {
-                name: environment[name]
-                for name in ("PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL")
-            }
-            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=rust_mcp_environment)
+        mcp_environment = {
+            name: environment[name] for name in configured_keys if name in environment
+        }
+        if config.mcp and mcp_environment:
+            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=mcp_environment)
             argv[argv.index("--mcp-config") + 1] = str(agent_dir / "mcp" / "mcp-config.json")
 
         initial_input = (

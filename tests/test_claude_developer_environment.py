@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -30,6 +31,7 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
     """Verify the preset/command-policy seams added to ``ClaudeAdapter``."""
 
     def setUp(self) -> None:
+        """Create one isolated home, agent directory, workdir, and environment."""
         self.adapter: ClaudeAdapter = ADAPTER
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -46,6 +48,8 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         self.addCleanup(self.env_patch.stop)
 
     def runtime_config(self, **overrides) -> RuntimeConfig:
+        """Build a valid Claude runtime config with optional test overrides."""
+
         values = dict(
             enabled=True,
             adapter="agent_run.adapters.claude.adapter:ADAPTER",
@@ -58,11 +62,15 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         return RuntimeConfig(**values)
 
     def profile(self, **overrides) -> AgentProfile:
+        """Build the default Claude review profile with optional test overrides."""
+
         values = dict(write=False, read_roots=(), network=False)
         values.update(overrides)
         return AgentProfile("review", "Review carefully.", **values)
 
     def request(self, **overrides) -> StartRequest:
+        """Build one default Claude start request with optional test overrides."""
+
         values = dict(
             runtime="claude", model="sonnet", profile="review", task="do the thing", workdir=self.workdir
         )
@@ -86,13 +94,15 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
             plan = self.adapter.prepare(
                 self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
             )
-        # The MCP stdio subprocess is spawned inheriting this launched
-        # environment (claude's own child), so shell/MCP parity means the
-        # child dict itself, not a static per-server "env" file, carries the
-        # resolved preset PATH/variables sourced from the effective child
-        # environment rather than the ambient os.environ.
-        self.assertTrue(plan.environment["PATH"].startswith(str(tools) + os.pathsep))
-        self.assertEqual(plan.environment["PROJECT"], str(self.workdir))
+        descriptor_path = self.agent_dir / "mcp" / "mcp-config.json"
+        self.assertEqual(plan.argv[plan.argv.index("--mcp-config") + 1], str(descriptor_path))
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        mcp_environment = descriptor["mcpServers"]["agent_lsp"]["env"]
+        self.assertEqual(
+            mcp_environment,
+            {"PATH": plan.environment["PATH"], "PROJECT": str(self.workdir)},
+        )
+        self.assertNotIn("ANTHROPIC_API_KEY", mcp_environment)
 
     def test_prepare_fails_closed_when_required_command_is_missing(self) -> None:
         """A required preset command absent from PATH raises before launch."""
@@ -114,7 +124,12 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         config = self.runtime_config(environment=EnvironmentConfig(path=(host,), denied_commands=("gh",)))
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}, clear=False):
             plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={}
+                self.request(write=True),
+                self.profile(write=True, network=True),
+                config,
+                self.home,
+                self.agent_dir,
+                mcp_servers={},
             )
         disallowed = plan.argv[plan.argv.index("--disallowedTools") + 1]
         self.assertIn("Bash(gh)", disallowed)

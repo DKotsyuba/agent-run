@@ -36,16 +36,13 @@ confinement: both are ordinary-use refusals, not a sandbox guarantee.
 
 ## MCP subprocess environment
 
-Claude spawns each configured stdio MCP server inheriting its own launched
-process environment. The `env_from` validation loop that populates that
-environment now sources a requested name from the *effective* child
-environment (the preset's `PATH`/variables and any effective Rust roots, as
-reported by `configured_environment_keys(config)`) instead of unconditionally
-reading the ambient `os.environ`, for every name that selection provides.
-Names outside that contract still read the ambient environment exactly as
-before, so MCP subprocesses see the same PATH and non-secret preset variables
-that Claude itself was launched with, never a copy of the whole parent
-environment.
+For a selected preset or Rust declaration, `prepare` writes a per-launch MCP
+descriptor under the agent directory. Each selected server receives an explicit
+`env` containing the final `PATH`, expanded non-secret preset variables, and
+effective Rust values. This makes `{workdir}` expansion visible to native MCP
+processes without copying the parent environment or credentials. `env_from`
+validation uses those resolved values where declared; names outside that
+contract still read the ambient environment exactly as before.
 
 ## Materialization revision
 
