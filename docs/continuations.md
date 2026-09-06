@@ -55,9 +55,7 @@ to a new conversation. The new caller's binding must be confirmed just as for
   with the former `--no-session-persistence` setting may have no recoverable
   native history.
 - Qwen uses its explicit `--resume <id>` selector, never its latest-session option.
-- OpenCode reuses the session on its verified private service. Its prior
-  messages and prior terminal status are excluded from the new result. The
-  managed service and selected model must actually be available.
+- OpenCode does not support continuation.
 
 Native compaction still applies: continuity preserves the history the runtime
 retains, not an unlimited verbatim memory. Old runs without a sufficient

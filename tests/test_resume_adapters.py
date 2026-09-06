@@ -7,23 +7,25 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agent_run.adapters.base import LaunchPlan
+from agent_run.adapters.base import Capability, LaunchPlan
 from agent_run.adapters.continuation import cli_resume_plan
 from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.glm.adapter import ADAPTER as GLM
 from agent_run.adapters.qwen.adapter import ADAPTER as QWEN
-from agent_run.adapters.opencode.adapter import OpenCodeRuntimeSession
-from agent_run.adapters.opencode.continuation import resume_boundary
+from agent_run.adapters.opencode.adapter import ADAPTER as OPENCODE
 from agent_run.dispatch import Session, call_tool
 from agent_run.domain import AgentStatus
 from agent_run.errors import ValidationError
 from test_claude_session import FakeSink
-from test_opencode_adapter import AdapterCase, FakeService, message, PRIMARY_AGENT
 
 
 class ArgumentsTests(unittest.TestCase):
     """Verify that native selectors cannot accidentally request a fresh session."""
+
+    def test_opencode_does_not_advertise_resume(self):
+        """The unsupported runtime must be rejected before continuation admission."""
+        self.assertNotIn(Capability.RESUME, OPENCODE.describe().capabilities)
 
     def test_resume_arguments_preserve_other_settings(self):
         """Both CLI families target an exact ID without changing prompt or answer path."""
@@ -87,38 +89,3 @@ class StreamIdentityTests(unittest.TestCase):
                     with self.assertRaises(ValidationError):
                         session.wait(3)
                     self.assertFalse((root / "answer.md").exists())
-
-
-class OpenCodeResumeTests(AdapterCase):
-    """Use existing captured-native-shape fixtures to delimit a resumed turn."""
-
-    def test_old_completion_does_not_finish_new_turn(self):
-        """Old messages are excluded from both the result and normalized transcript."""
-        self.prove_service()
-        plan = replace(self.prepare(), resume_session_id="ses_1")
-        old = {**message("assistant", "old"), "id": "old"}
-        new = {**message("assistant", "new", at=2), "id": "new"}
-        service = FakeService(self.agent_dir, [None], [[old], [old], [new, old]])
-        info = {"id": "ses_1", "agent": PRIMARY_AGENT, "location": {"directory": str(self.workdir)}, "model": dict(plan.adapter_state["model"]), "outcome": "failed"}
-        service.session_info = Mock(return_value=info)
-        sink = FakeSink()
-        session = self.adapter.launch(plan, sink, client=service)
-        session._interval = 0.001
-        outcome = session.wait(2)
-        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
-        self.assertEqual([item.content for item in sink.messages], ["new"])
-        self.assertNotIn("create_session", [call[0] for call in service.calls])
-        self.assertEqual(Path(outcome.answer_path).read_text().splitlines()[0], "new")
-
-    def test_active_or_mismatched_context_is_never_prompted(self):
-        """Refuse a busy or moved native context before a new prompt is sent."""
-        model = {"providerID": "omniroute", "id": "model"}
-        client = Mock()
-        valid = {"id": "saved", "agent": PRIMARY_AGENT, "model": model, "location": {"directory": str(self.workdir)}}
-        for info, status in ((valid, {"saved": {"type": "running"}}), ({**valid, "id": "other"}, {})):
-            with self.subTest(info=info, status=status):
-                client.session_info.return_value = info
-                client.session_status.return_value = status
-                with self.assertRaises(ValidationError):
-                    resume_boundary(client, "saved", str(self.workdir), model)
-        client.prompt_async.assert_not_called()
