@@ -73,12 +73,14 @@ If no summary is available, obtain `capacity_order` (CLI:
 quota windows; `limits` is for requested diagnostics. Apply updated priorities
 to work not yet started, without restarting healthy children.
 
-- **codex**: a read-only profile with no `read_roots` and no `write` is
-  refused ("no-filesystem"). Give it `read_roots: [workdir]` at minimum.
-  Engine limitation (permanent, codex 0.151.0 schema has no extra-roots
-  fields on write threads): codex + external read_roots on a write step
-  refuses EARLY with guidance — copy the material into the workdir and omit
-  read_roots. Read-only root grants keep working.
+- **codex**: apply the canonical `delegate` filesystem check to every literal
+  step before submission. A read-only profile needs a declared read root;
+  use `read_roots: [workdir]` for a task confined to its working directory.
+  Additional roots require a verified adapter/engine contract. Write steps
+  keep their material inside the permitted workdir or provisioned skill paths
+  and omit external `read_roots`; the adapter rejects unsupported external
+  grants. Do not widen permissions to make a step start or assume that a
+  historical engine restriction applies permanently to future versions.
 - **qwen**: the cheap-OSS lane (Chinese models through the local OmniRoute
   router; combo aliases keep the historical `opencode/` prefix). Check the
   LIVE roster with the `models` tool. `opencode/MiniMaxM3` answers one-liners
