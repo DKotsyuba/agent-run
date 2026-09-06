@@ -1,11 +1,7 @@
 """Claude Code runtime adapter: strict isolation, no live auth/quota calls.
 
-Materialization and launch preparation never inherit the caller's global
-Claude settings, plugins, or MCP configuration. Every generated asset is
-built only from ``RuntimeConfig``, the selected ``AgentProfile``, and the
-owner-authored skill directories below ``~/.agent-run/skills/claude``. The
-sole ambient exception is an existing uv managed-Python root, required for
-offline hooks after their generated ``HOME`` replaces the parent home.
+Generated assets use only declared configuration, profiles, and skills. An
+existing uv managed-Python root is the sole ambient exception for offline hooks.
 """
 
 from __future__ import annotations
@@ -97,10 +93,6 @@ class ClaudeAdapter:
             raise ValidationError(
                 f"claude runtime auth.names has unsupported entries: {', '.join(unknown)}"
             )
-        # Unlike codex and opencode, this runtime hands claude the whole
-        # declared plugin directory, so every skill inside it reaches the child
-        # whether or not ``skills`` selected it. Listed names only: an unlisted
-        # one is a config defect, not a bonus.
         unlisted = unlisted_plugin_skills(config.plugins, config.skills)
         if unlisted:
             raise ValidationError(
@@ -196,23 +188,9 @@ class ClaudeAdapter:
     ) -> LaunchPlan:
         """Build the isolated launch plan for one start request.
 
-        Model ids are public everywhere on the plan boundary: validation,
-        the roster, and the persisted ``adapter_state["model"]`` all keep
-        ``request.model`` verbatim. Only the child argv's ``--model`` value
-        is translated through ``_MODEL_ALIASES`` (``fable`` ->
-        ``claude-fable-5-1``); every other id passes through unchanged.
-        An optional Rust declaration adds a bounded preflight and shared child
-        environment for both Claude and its stdio MCP subprocesses; failures
-        raise ``ValidationError`` before a launch process is created. A
-        selected developer-environment preset extends the same isolated
-        ``HOME``-rooted baseline PATH with declared paths and non-secret
-        variables, and its denied commands are enforced both by a private
-        PATH refusal shim directory under ``home`` and by native
-        ``--disallowedTools`` Bash entries, so a permitted shell still
-        refuses the exact denied names via an absolute path. MCP subprocess
-        env only copies ambient values for names outside the preset/Rust
-        contract; preset and Rust names are forwarded from the resolved
-        child environment instead.
+        Public model ids remain on the plan boundary; only child argv aliases
+        ``fable``. Presets add declared paths, variables, Rust, and command
+        denials to the isolated environment; invalid inputs raise before launch.
         """
 
         if request.fast:
@@ -240,11 +218,6 @@ class ClaudeAdapter:
                         f"inside a writable workdir: {root}"
                     )
 
-        # Skills are registered by --plugin-dir, but the child can only see
-        # and invoke them through the built-in Skill tool; without it in the
-        # --tools allowlist the generated plugins load and stay invisible
-        # (observed live: a child that listed the MCP server's own prompt
-        # skills and none of ours).
         skill_tools = _SKILL_TOOLS if config.skills else ()
         shell_tools = _SHELL_TOOLS if allow_write else ()
         network_tools = _NETWORK_TOOLS if profile.network else ()
@@ -291,12 +264,6 @@ class ClaudeAdapter:
             argv += ["--mcp-config", str(home / "mcp" / "mcp-config.json")]
         for name in local_skill_names(config.plugins, config.skills):
             argv += ["--plugin-dir", str(home / "plugins" / name)]
-        # Declared plugins load straight from their own directory. Verified
-        # live against claude 2.1.245: a plugin's own hooks/hooks.json is
-        # picked up from --plugin-dir alone, with the generated settings.json
-        # holding no hook entry of its own. Write-enabled children also grant
-        # Bash, so plugin ^Bash$ matchers fire with the same shell-hook
-        # coverage as Codex children.
         for plugin in config.plugins:
             argv += ["--plugin-dir", str(plugin)]
         for root in roots:
@@ -315,10 +282,6 @@ class ClaudeAdapter:
             environment["PATH"] = path_value
         environment = developer_environment(environment, config, request.workdir)
 
-        # A selected preset's denied commands get a private refusal shim
-        # directory prepended to the child's own PATH, and the same denials
-        # are rendered as native Bash disallow patterns so a permitted shell
-        # still refuses the exact denied names even off the shimmed PATH.
         selected_environment = config.environment
         if selected_environment is not None and selected_environment.denied_commands:
             policy = materialize_refusal_commands(
@@ -340,13 +303,6 @@ class ClaudeAdapter:
                 dict.fromkeys((*disallowed_tools, *denial_patterns))
             )
 
-        # Secret registration follows what was *injected*, not only what the
-        # config declared: a subclass auth bridge (glm's keychain token) can
-        # export a credential the config never names, and with
-        # ``auth.names = ()`` that live token would otherwise never reach
-        # ``secret_env_names`` and so never be redacted out of the runtime log.
-        # Only credential-shaped names are added, so a public companion such as
-        # ANTHROPIC_BASE_URL is not turned into a literal redaction pattern.
         auth_names: tuple[str, ...] = ()
         injected_secret_names: tuple[str, ...] = ()
         if config.auth is not None:
