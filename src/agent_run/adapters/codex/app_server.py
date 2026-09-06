@@ -577,8 +577,10 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     writable_roots = tuple(state["writable_roots"])
     sandbox_mode = state["sandbox_mode"]
     network_access = bool(state.get("network_access", False))
+    approvals_reviewer = state.get("approvals_reviewer")
     grant_params = thread_grant_params(
         str(plan.cwd), state["model"], sandbox_mode, state["approval_policy"], roots, network_access,
+        approvals_reviewer,
     )
     resume_session_id = plan.resume_session_id
     if resume_session_id is None:
@@ -612,6 +614,8 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
         network_access=network_access,
     )
     verify_effective_params(expected, thread)
+    if approvals_reviewer is not None and thread.get("approvalsReviewer") != approvals_reviewer:
+        raise VerificationError("codex thread/start approvalsReviewer mismatch")
     thread_id = _thread_id_echo(thread)
     if not isinstance(thread_id, str) or not thread_id:
         raise VerificationError("codex thread start/resume did not return a threadId")

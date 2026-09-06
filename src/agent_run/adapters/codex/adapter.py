@@ -40,7 +40,7 @@ from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
-from .environment import build_environment, developer_config_lines, prepared_environment
+from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
@@ -51,7 +51,6 @@ _LIMITS_STALE_SECONDS = 900
 _ROLLOUT_FILES = 24
 _ROLLOUT_TAIL_BYTES = 262_144
 _ROLLOUT_TAIL_LINES = 2_048
-_APPROVAL_POLICY = "never"
 
 
 def _read_json(path: Path) -> object | None:
@@ -647,7 +646,7 @@ class CodexAdapter:
             "model": request.model,
             "effort": request.effort,
             "sandbox_mode": sandbox_mode,
-            "approval_policy": _APPROVAL_POLICY,
+            **developer_approval_fields(config, effective_write),
             "roots": roots,
             "writable_roots": writable_roots,
             "mcp": tuple(config.mcp),
