@@ -538,6 +538,7 @@ class AgentService:
         failure_kind = "prepare_failed"
         preparation_started = time.monotonic()
         stage = "account"
+        _log_start_preparation_stage(agent_id, stage, preparation_started)
         try:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
@@ -567,17 +568,22 @@ class AgentService:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
-            stage = "configuration"
+            stage = "adapter"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             adapter = AdapterRegistry(self._config).load(
                 request.runtime,
                 self._required_capabilities(request, effective_runtime),
             )
+            stage = "models"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             adapter.validate(effective_runtime)
             roster = adapter.models(effective_runtime, effective_home)
             if request.model not in {model.id for model in roster}:
                 raise ValidationError(
                     f"model is not available for runtime {request.runtime}: {request.model}"
                 )
+            stage = "profile"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             profile = assign_role(
                 load_profile(
                     self._config.profiles,
@@ -591,12 +597,15 @@ class AgentService:
             record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
             stage = "materialize"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             revision = adapter.materialize(
                 effective_runtime,
                 effective_home,
                 mcp_servers=mcp_servers,
                 skills_root=runtime_skills_dir(request.runtime, self._home),
             )
+            stage = "config_revision"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             store.replace_config_revision(
                 agent_id, _PENDING_CONFIG_REVISION, revision
             )
@@ -611,6 +620,7 @@ class AgentService:
 
             candidate_dir = create_agent_dir(agent_id, self._home)
             stage = "prepare"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             plan = adapter.prepare(
                 request,
                 profile,
