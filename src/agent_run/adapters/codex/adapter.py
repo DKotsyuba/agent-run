@@ -35,9 +35,14 @@ from ..base import (
     RuntimeInfo,
     RuntimeSession,
 )
+from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
+from ..developer_environment import (
+    configured_environment_keys,
+    developer_environment,
+    environment_digest,
+)
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
-from ..rust import rust_environment
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
@@ -362,11 +367,9 @@ class CodexAdapter:
             mcp_lines.append(f"[mcp_servers.{name}]")
             mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
             mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
-            mcp_environment = mcp_def.env_from
-            if config.rust is not None:
-                mcp_environment = tuple(
-                    dict.fromkeys((*mcp_environment, "PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"))
-                )
+            mcp_environment = tuple(
+                dict.fromkeys((*mcp_def.env_from, *configured_environment_keys(config)))
+            )
             if mcp_environment:
                 mcp_lines.append(f"env_vars = {_toml_array(mcp_environment)}")
             mcp_lines.append("")
@@ -417,6 +420,9 @@ class CodexAdapter:
         ]
         generated_config = "\n".join(body_lines).rstrip() + "\n"
         write_managed_file(home, _CONFIG_REL, generated_config)
+        denied_commands = config.environment.denied_commands if config.environment is not None else ()
+        denial_rules = render_codex_denial_rules(denied_commands)
+        write_managed_file(home, "rules/agent-run-command-policy.rules", denial_rules)
 
         auth_digest = ""
         if config.auth is not None and config.auth.kind == "file_link":
@@ -430,6 +436,7 @@ class CodexAdapter:
                 *hook_digests,
                 plugin_digest,
                 auth_digest,
+                environment_digest(config),
             ]
         )
         return content_hash(fingerprint)
@@ -630,7 +637,22 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
-        environment = rust_environment(build_environment(config.binary, home_path), config, workdir)
+        environment = developer_environment(build_environment(config.binary, home_path), config, workdir)
+        denied_commands = config.environment.denied_commands if config.environment is not None else ()
+        command_policy = materialize_refusal_commands(
+            denied_commands,
+            home_path / "command-refusals",
+            environment=environment,
+        )
+        environment["PATH"] = os.pathsep.join((str(command_policy.directory), environment["PATH"]))
+        write_managed_file(
+            home_path,
+            "rules/agent-run-command-policy.rules",
+            render_codex_denial_rules(
+                denied_commands,
+                command_paths=tuple(command_policy.resolved_commands.values()),
+            ),
+        )
         if config.plugins and not effective_write:
             # A read-only sandbox cannot write the raw spool the plugin's
             # pre-execution wrapper needs, so that wrapper fails open to the

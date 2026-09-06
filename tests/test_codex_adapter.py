@@ -1,12 +1,16 @@
 import inspect
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -14,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
-from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
+from agent_run.adapters.developer_environment import configured_environment_keys
+from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
 from agent_run.profiles import AgentProfile
@@ -126,15 +131,66 @@ env_from = ["PATH"]
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(
             generated["mcp_servers"]["agent_lsp"]["env_vars"],
-            ["PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"],
+            list(configured_environment_keys(config)),
         )
         profile = AgentProfile("review", "body", False, (self.workdir,))
-        with patch("agent_run.adapters.codex.adapter.rust_environment", side_effect=lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}) as provision:
+        with patch.dict(
+            ADAPTER.prepare.__globals__,
+            {"developer_environment": lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}},
+        ):
             plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
         self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
-        provision.assert_called_once()
+
+    def test_developer_preset_reaches_shell_mcp_and_native_denial_rules(self) -> None:
+        """Codex forwards only declared preset keys and denies configured commands."""
+        tools = Path(self._mkdtemp())
+        for name in ("git", "gh"):
+            command = tools / name
+            command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        preset = EnvironmentConfig(
+            path=(tools,),
+            variables=MappingProxyType({"PROJECT": "{workdir}/project"}),
+            required_commands=("git",),
+            denied_commands=("gh",),
+        )
+        config = self.runtime_config(environment=preset, mcp=("agent_lsp",))
+        digest = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH", "PROJECT"])
+        self.assertNotEqual(
+            digest,
+            ADAPTER.materialize(
+                replace(config, environment=replace(preset, denied_commands=())),
+                self.home,
+                mcp_servers=self.resolved_mcp(),
+            ),
+        )
+        ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        profile = AgentProfile("review", "body", False, (self.workdir,))
+        plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+        self.assertEqual(plan.environment["PROJECT"], str(self.workdir / "project"))
+        self.assertEqual(
+            subprocess.run(("/bin/sh", "-c", "gh --version"), env=plan.environment).returncode,
+            126,
+        )
+        self.assertEqual(
+            subprocess.run(("/bin/sh", "-c", "git --version"), env=plan.environment).returncode,
+            0,
+        )
+        rules = (self.home / "rules" / "agent-run-command-policy.rules").read_text(encoding="utf-8")
+        self.assertIn('"gh"', rules)
+        self.assertIn(str(tools / "gh"), rules)
+
+    def test_developer_preset_fails_closed_when_a_required_command_is_missing(self) -> None:
+        """An unavailable required command prevents Codex from receiving a launch plan."""
+        config = self.runtime_config(environment=EnvironmentConfig(required_commands=("missing",)))
+        ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        profile = AgentProfile("review", "body", False, (self.workdir,))
+        with self.assertRaisesRegex(ValidationError, "missing executable: missing"):
+            self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
 
     # -- materialize ----------------------------------------------------------
 
