@@ -229,6 +229,7 @@ class QwenAdapter:
         *,
         mcp_servers: Mapping[str, McpConfig],
         skills_root: Path | None = None,
+        command_search_paths: tuple[str, ...] | None = None,
     ) -> str:
         """Create an isolated Qwen home with strict MCP, skill, and hook settings.
 
@@ -237,6 +238,9 @@ class QwenAdapter:
             mirroring :func:`agent_run.paths.runtime_skills_dir`, when the
             caller (unit tests calling this directly, or :meth:`prepare`'s
             own internal re-materialize) does not supply one.
+        :param command_search_paths: The final isolated child PATH entries to
+            resolve native denial aliases against. Direct callers omit it and
+            use the selected preset paths.
         :returns: A content hash covering the rendered settings document,
             every delivered skill's content, every installed plugin file, and
             :func:`environment_digest`, so a changed skill, plugin selection,
@@ -249,7 +253,7 @@ class QwenAdapter:
         and as native ``permissions.deny`` Bash entries, which Qwen's
         documented precedence ranks above allow and ask entries. The native
         entries cover the bare name plus the lexical and symlink-resolved
-        absolute paths of each denied command found on the declared PATH.
+        absolute paths of each denied command found on the final child PATH.
         """
 
         if skills_root is None:
@@ -264,7 +268,9 @@ class QwenAdapter:
         policy = materialize_refusal_commands(
             denied,
             command_policy_directory(Path(home)),
-            search_paths=() if selected is None else selected.path,
+            search_paths=command_search_paths if command_search_paths is not None else (
+                () if selected is None else selected.path
+            ),
         )
         document: dict[str, object] = {
             "context": {"fileName": str(context_path)},
@@ -346,18 +352,24 @@ class QwenAdapter:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
         role_text += skills_context_note(Path(home), config.skills)
         write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
-        self.materialize(config, Path(home), mcp_servers=mcp_servers)
-
         environment: dict[str, str] = {"HOME": str(home), "OPENAI_MODEL": request.model}
-        if config.environment is None:
-            # Legacy runtimes without a declared preset keep the inherited
-            # PATH and the macOS Xcode Git bypass exactly as before.
-            parent_path = os.environ.get("PATH")
-            if parent_path:
-                if (_XCODE_GIT_DIRECTORY / "git").is_file():
-                    parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
-                environment["PATH"] = parent_path
+        # Keep the narrow PATH baseline Qwen needs for its launcher and native
+        # utilities; a selected preset still leads it and no other ambient
+        # variables cross into the child.
+        parent_path = os.environ.get("PATH")
+        if parent_path:
+            if (_XCODE_GIT_DIRECTORY / "git").is_file():
+                parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
+            environment["PATH"] = parent_path
         environment = developer_environment(environment, config, Path(request.workdir))
+        self.materialize(
+            config,
+            Path(home),
+            mcp_servers=mcp_servers,
+            command_search_paths=tuple(
+                entry for entry in environment.get("PATH", "").split(os.pathsep) if entry
+            ),
+        )
         # The refusal shims must win ordinary PATH lookup, so they are
         # prepended after required_commands were checked against the real
         # declared PATH. This is ordinary-lookup refusal, not OS confinement.
