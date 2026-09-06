@@ -4,6 +4,14 @@ Instructions for coding agents (and humans in a hurry). The product is a
 local supervisor for running other coding agents — so the bar for
 reliability of *this* code is set by everything that will run on top of it.
 
+## Delegation authorization
+
+The canonical owner-adopted declaration is
+[docs/delegation-authorization.md](docs/delegation-authorization.md). Its marked
+block is installed in the owner's global agent instructions for cross-project
+use. Keep that projection synchronized with the canonical text; repository
+presence alone does not grant authority over a different owner's data.
+
 ## Ground rules
 
 - **Python 3.14+, small deliberate dependency set.** The runtime currently

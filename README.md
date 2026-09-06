@@ -282,6 +282,7 @@ macOS Git bootstrap),
 
 - [docs/architecture.md](docs/architecture.md) — how the pieces fit
 - [docs/api.md](docs/api.md) — socket API integration guide
+- [docs/delegation-authorization.md](docs/delegation-authorization.md) — owner-adopted delegation and context-transfer authorization
 - [docs/workflows.md](docs/workflows.md) — workflow script contract
 - [docs/tui.md](docs/tui.md) — terminal dashboard (`agent-run-tui`)
 - [docs/releasing.md](docs/releasing.md) — version, CI, and GitHub Release procedure
