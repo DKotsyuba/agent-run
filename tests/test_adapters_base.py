@@ -86,6 +86,34 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, message):
                     LaunchPlan.from_payload(malformed)
 
+    def test_launch_plan_resume_session_id_round_trips_and_defaults_absent_key(
+        self,
+    ) -> None:
+        """``resume_session_id`` survives the payload round trip, and a payload
+        missing the key entirely (an older sender) still decodes to None."""
+
+        plan = LaunchPlan(
+            ("command", "argument"),
+            Path("/tmp/work"),
+            {"TOKEN": "secret"},
+            None,
+            Path("/tmp/stream.jsonl"),
+            {"mode": "test"},
+            None,
+            "runtime-session-123",
+        )
+        payload = plan.to_payload()
+        self.assertEqual(payload["resume_session_id"], "runtime-session-123")
+        self.assertEqual(LaunchPlan.from_payload(payload), plan)
+
+        legacy_payload = dict(payload)
+        del legacy_payload["resume_session_id"]
+        rebuilt = LaunchPlan.from_payload(legacy_payload)
+        self.assertIsNone(rebuilt.resume_session_id)
+
+        with self.assertRaisesRegex(ValidationError, "resume session id"):
+            LaunchPlan.from_payload({**payload, "resume_session_id": 7})
+
     def module(self, **changes):
         values = {"ADAPTER_API_VERSION": ADAPTER_API_VERSION, "ADAPTER": FakeAdapter()}
         values.update(changes)
