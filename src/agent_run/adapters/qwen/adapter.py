@@ -162,9 +162,16 @@ class QwenAdapter:
         return RuntimeInfo("qwen", ADAPTER_API_VERSION, _CAPABILITIES)
 
     def validate(self, config: RuntimeConfig) -> None:
-        """Validate Qwen's environment-auth and one-shot-only configuration."""
+        """Validate Qwen's environment-auth and one-shot-only configuration.
+
+        ``config`` must use supported environment auth and no service mode.
+        A declared Rust table raises ``ValidationError`` because Qwen builds an
+        independent sandbox environment.
+        """
         if config.service_mode is not None:
             raise ValidationError("qwen runtime does not support service_mode")
+        if config.rust is not None:
+            raise ValidationError("qwen runtime does not support Rust provisioning")
         if config.auth is None or config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
         unknown = sorted(set(config.auth.names) - _AUTH_NAMES)

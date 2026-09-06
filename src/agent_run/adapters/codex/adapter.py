@@ -302,8 +302,16 @@ class CodexAdapter:
         )
 
     def validate(self, config: RuntimeConfig) -> None:
+        """Validate Codex configuration and reject unsupported Rust provisioning.
+
+        ``config`` must be a ``RuntimeConfig`` with Codex's file-link auth and
+        at least one model. A declared Rust table raises ``ValidationError``
+        because this adapter has a separate environment boundary.
+        """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
+        if config.rust is not None:
+            raise ValidationError("codex runtime does not support Rust provisioning")
         if config.service_mode is not None:
             raise ValidationError("codex runtime does not use service_mode")
         if config.auth is None or config.auth.kind != "file_link":

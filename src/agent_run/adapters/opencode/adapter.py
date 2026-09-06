@@ -299,8 +299,16 @@ class OpenCodeAdapter:
         return RuntimeInfo(RUNTIME_NAME, ADAPTER_API_VERSION, CAPABILITIES)
 
     def validate(self, config: RuntimeConfig) -> None:
+        """Validate managed OpenCode configuration and reject Rust provisioning.
+
+        ``config`` must be a ``RuntimeConfig`` for the managed service with an
+        absolute executable and valid model references. A declared Rust table
+        raises ``ValidationError`` because the service owns its environment.
+        """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("opencode validate requires a RuntimeConfig")
+        if config.rust is not None:
+            raise ValidationError("opencode runtime does not support Rust provisioning")
         if config.service_mode != "managed":
             raise ValidationError(
                 "runtimes.opencode.service_mode must be 'managed'; "

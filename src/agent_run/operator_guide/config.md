@@ -60,6 +60,19 @@ Each `[runtimes.<name>]` table may declare:
   use the highest applicable weight and remain one capacity choice.
   Account overrides match explicit route labels; unlabelled routes use the
   lane/runtime fallback.
+- `rust` — Claude and GLM only: an explicit host Rust toolchain declaration.
+  When declared, both paths are required: `rustup_home` is the installed
+  toolchain store and `cargo_bin` is the directory containing Cargo's lexical
+  `cargo`, `rustc`, `rustup`, and `rust-analyzer` proxies. The child keeps its
+  generated `HOME`, sets `CARGO_HOME` to `<workdir>/.cargo-home`, prepends
+  `cargo_bin`, and sets `RUSTUP_AUTO_INSTALL=0`; it does not download or select
+  a default toolchain. Rustup must be version 1.28.1 or newer to honor that
+  no-install setting, and project `rust-toolchain` files retain precedence.
+  Existing `.cargo-home` paths that escape the workdir through a symlink are
+  refused. This declaration does not grant write permission or create the
+  cache; a write-requiring Cargo command still needs the profile/request's
+  ordinary write authority. Attached stdio MCPs inherit the same prepared
+  Rust values. Other runtimes reject this key.
 
 Declaring a key with an unsupported value fails closed at load time
 (`ValidationError`), not silently at first use.

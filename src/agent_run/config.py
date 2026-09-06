@@ -74,6 +74,19 @@ class RuntimeHookConfig:
 
 
 @dataclass(frozen=True)
+class RustConfig:
+    """Explicit host Rust toolchain roots for Claude-compatible launches.
+
+    ``rustup_home`` is an absolute ``Path`` to installed toolchains and
+    ``cargo_bin`` is an absolute lexical ``Path`` to their executable proxies.
+    Both values are required when the optional ``rust`` table is declared.
+    """
+
+    rustup_home: Path
+    cargo_bin: Path
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Static configuration for one arbitrary runtime name.
 
@@ -100,6 +113,7 @@ class RuntimeConfig:
     priority_multiplier: float = 1.0
     priority_account_multipliers: Mapping[str, float] = field(default_factory=dict)
     priority_lane_multipliers: Mapping[str, float] = field(default_factory=dict)
+    rust: RustConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -426,6 +440,26 @@ def _parse_hooks(value: object, path: str) -> tuple[RuntimeHookConfig, ...]:
     return tuple(hooks)
 
 
+def _parse_rust(value: object, path: str) -> RustConfig | None:
+    """Parse an optional explicit Rust provisioning table.
+
+    ``value`` is the raw TOML table and ``path`` identifies it in validation
+    errors. Returns immutable absolute paths, preserving ``cargo_bin``
+    lexically so its proxy argv0 behavior survives. Both fields are required;
+    malformed tables and relative paths raise ``ValidationError``. Callers
+    represent an absent table as ``None`` without calling this parser.
+    """
+
+    table = _table(value, path)
+    _reject_unknown(table, {"rustup_home", "cargo_bin"}, path)
+    if set(table) != {"rustup_home", "cargo_bin"}:
+        raise ValidationError(f"{path} requires rustup_home and cargo_bin together")
+    return RustConfig(
+        _path(table["rustup_home"], f"{path}.rustup_home"),
+        _path(table["cargo_bin"], f"{path}.cargo_bin", resolve=False),
+    )
+
+
 def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
     """Parse arbitrary runtime tables into an immutable validated mapping.
 
@@ -459,6 +493,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
         "priority_multiplier",
         "priority_account_multipliers",
         "priority_lane_multipliers",
+        "rust",
     }
     for name, table in _named_table(value, "runtimes").items():
         path = f"runtimes.{name}"
@@ -506,6 +541,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             table.get("priority_lane_multipliers", {}),
             f"{path}.priority_lane_multipliers",
         )
+        rust = None if "rust" not in table else _parse_rust(table["rust"], f"{path}.rust")
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -525,6 +561,7 @@ def _parse_runtimes(value: object) -> Mapping[str, RuntimeConfig]:
             float(priority_multiplier),
             account_multipliers,
             lane_multipliers,
+            rust,
         )
         if result[name].service_mode not in {None, "managed"}:
             raise ValidationError(f"{path}.service_mode must be 'managed'")

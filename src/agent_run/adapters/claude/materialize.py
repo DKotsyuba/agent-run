@@ -33,12 +33,18 @@ def render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
 
 
 def render_mcp_config(
-    home: Path, names: tuple[str, ...], mcp_servers: Mapping[str, McpConfig]
+    home: Path,
+    names: tuple[str, ...],
+    mcp_servers: Mapping[str, McpConfig],
+    *,
+    environment: Mapping[str, str] | None = None,
 ) -> str:
     """Write the strict MCP config for the selected names only.
 
     Fails closed when a configured name has no resolved definition rather
-    than emitting a non-functional entry.
+    than emitting a non-functional entry. ``environment`` is optional,
+    nonsecret stdio child environment shared by selected servers; absent it
+    preserves the ordinary descriptor shape.
     """
 
     if not names:
@@ -53,6 +59,8 @@ def render_mcp_config(
             "command": str(server.command),
             "args": list(server.args),
         }
+        if environment is not None:
+            servers[name]["env"] = dict(environment)
     return write_managed_file(home, "mcp/mcp-config.json", json.dumps({"mcpServers": servers}, sort_keys=True))
 
 
