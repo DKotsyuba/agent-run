@@ -376,12 +376,14 @@ class StartSessionTests(unittest.TestCase):
         cwd = Path("/work")
         state = {
             "model": "gpt-5.6-sol", "effort": "high", "sandbox_mode": "workspace-write",
-            "approval_policy": "never", "roots": (str(cwd),), "writable_roots": (str(cwd),),
+            "approval_policy": "on-request", "approvals_reviewer": "auto_review", "roots": (str(cwd),), "writable_roots": (str(cwd),),
         }
         resume_echo = thread_response(
             cwd,
             roots=(str(cwd),),
             thread_id="th_saved",
+            approvalPolicy="on-request",
+            approvalsReviewer="auto_review",
             sandbox={"type": "workspaceWrite", "writableRoots": []},
         )
         resume_echo.pop("writableRoots")
@@ -395,6 +397,8 @@ class StartSessionTests(unittest.TestCase):
         start_session(transport, make_plan(cwd, state, resume_session_id="th_saved"), FakeSink())
         grant = transport.requests[1][1]
         self.assertEqual(grant["sandbox"], "workspace-write")
+        self.assertEqual(grant["approvalPolicy"], "on-request")
+        self.assertEqual(grant["approvalsReviewer"], "auto_review")
         self.assertNotIn("effort", grant)
         self.assertNotIn("mcpServers", grant)
         self.assertNotIn("skills", grant)

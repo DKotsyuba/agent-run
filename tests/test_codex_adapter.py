@@ -171,9 +171,11 @@ env_from = ["PATH"]
             ),
         )
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
-        profile = AgentProfile("review", "body", False, (self.workdir,))
-        plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+        profile = AgentProfile("review", "body", True, (self.workdir,))
+        plan = self.prepare(self.start_request(write=True), profile, config, mcp_servers=self.resolved_mcp())
         self.assertEqual(plan.environment["PROJECT"], str(self.workdir / "project"))
+        self.assertEqual(plan.adapter_state["approval_policy"], "on-request")
+        self.assertEqual(plan.adapter_state["approvals_reviewer"], "auto_review")
         self.assertEqual(
             subprocess.run(("/bin/sh", "-c", "gh --version"), env=plan.environment).returncode,
             126,

@@ -9,6 +9,11 @@ Selected developer environments disable login shells so shell startup files
 cannot reorder the preset's command lookup path. Legacy Codex runtimes leave
 that native setting unset.
 
+Write-capable developer-environment threads use `on-request` approval with
+Codex's `auto_review` reviewer. The native thread echo must confirm both
+settings before agent-run starts the turn; read-only and legacy threads keep
+their existing approval behavior.
+
 `required_commands` are resolved through that child `PATH` before launch. A
 missing command rejects the launch.
 

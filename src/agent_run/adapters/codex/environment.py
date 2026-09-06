@@ -64,6 +64,14 @@ def developer_config_lines(config: RuntimeConfig) -> tuple[str, ...]:
     return ("allow_login_shell = false", "") if config.environment is not None else ()
 
 
+def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, str | None]:
+    """Return the retained-review policy for a write-capable developer run."""
+
+    if write and config.environment is not None:
+        return {"approval_policy": "on-request", "approvals_reviewer": "auto_review"}
+    return {"approval_policy": "never", "approvals_reviewer": None}
+
+
 def prepared_environment(
     binary: Path, home: Path, config: RuntimeConfig, workdir: Path
 ) -> dict[str, str]:
@@ -95,7 +103,7 @@ def prepared_environment(
 
 def thread_grant_params(
     cwd: str, model: str, sandbox_mode: str, approval_policy: str,
-    roots: tuple[str, ...], network_access: bool,
+    roots: tuple[str, ...], network_access: bool, approvals_reviewer: str | None = None,
 ) -> dict[str, object]:
     """Return the shared ``thread/start``/``thread/resume`` grant fields.
 
@@ -106,7 +114,8 @@ def thread_grant_params(
     generated native config the app-server already reads). A requested
     network grant is instead conveyed through ``config``'s dotted
     ``sandbox_workspace_write.network_access``, verified live to yield
-    ``networkAccess: true`` on the echoed thread.
+    ``networkAccess: true`` on the echoed thread. A selected reviewer is sent
+    only for the developer write contract that requires automatic review.
     """
 
     params: dict[str, object] = {
@@ -115,6 +124,8 @@ def thread_grant_params(
     }
     if network_access and sandbox_mode == "workspace-write":
         params["config"] = {"sandbox_workspace_write": {"network_access": True}}
+    if approvals_reviewer is not None:
+        params["approvalsReviewer"] = approvals_reviewer
     return params
 
 
