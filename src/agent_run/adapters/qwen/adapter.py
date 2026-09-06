@@ -23,7 +23,13 @@ from agent_run.adapters.base import (
 )
 from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.launch_io import abort_launch
+from agent_run.adapters.command_policy import materialize_refusal_commands, render_qwen_denials
 from agent_run.adapters.continuation import cli_resume_plan
+from agent_run.adapters.developer_environment import (
+    configured_environment_keys,
+    developer_environment,
+    environment_digest,
+)
 from agent_run.adapters.home import content_hash, write_managed_file
 from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
@@ -64,8 +70,27 @@ _API_ERROR_PREFIX = "[API Error:"
 #: line of Qwen's ``[API Error: ...]`` payload carries no secrets, and the
 #: cap keeps pathological provider payloads out of the durable store.
 _MAX_FAILURE_LINE = 500
-# Bypass macOS' /usr/bin/git Xcode shim inside Qwen's seatbelt sandbox.
+# Bypass macOS' /usr/bin/git Xcode shim inside Qwen's seatbelt sandbox. Only
+# the legacy no-preset path uses it; a declared developer environment supplies
+# every PATH entry from owner configuration instead.
 _XCODE_GIT_DIRECTORY = Path("/Applications/Xcode.app/Contents/Developer/usr/bin")
+
+#: Managed HOME-relative directory holding this runtime's PATH refusal shims.
+#: It lives beside ``.qwen/settings.json`` so a rebuilt home rebuilds the
+#: policy, and it is prepended to the child PATH ahead of the declared entries.
+_COMMAND_POLICY_DIRECTORY = ".qwen/denied-commands"
+
+
+def command_policy_directory(home: Path) -> Path:
+    """Return the managed refusal-shim directory inside one Qwen HOME.
+
+    :param home: Absolute managed HOME this adapter materializes into.
+    :returns: The absolute directory :func:`materialize_refusal_commands`
+        owns for this runtime. The directory may not exist yet; nothing is
+        created or read here.
+    """
+
+    return Path(home) / _COMMAND_POLICY_DIRECTORY
 
 
 def qwen_error_only_result_line(result_text: str) -> str | None:
@@ -89,11 +114,25 @@ class QwenSession(ClaudeSession):
         return qwen_error_only_result_line(result_text)
 
 
-def _mcp_document(names: tuple[str, ...], servers: Mapping[str, McpConfig]) -> dict[str, object]:
+def _mcp_document(
+    names: tuple[str, ...], servers: Mapping[str, McpConfig], environment_keys: tuple[str, ...] = ()
+) -> dict[str, object]:
     """Return strict Qwen stdio MCP settings for resolved configured names.
 
-    Raises ``ValidationError`` when a selected server is absent or is not a
-    stdio command, because silently dropping it would weaken the child role.
+    :param names: Owner-configured ``runtimes.qwen.mcp`` entries, in order.
+    :param servers: Caller-resolved definitions keyed by the same names.
+    :param environment_keys: Declared developer-environment variable names
+        from :func:`configured_environment_keys` to forward to every server.
+        Each is rendered as a ``${NAME}`` reference, which Qwen 0.22.2 expands
+        from its own already isolated process environment, so the declared
+        toolchain reaches an MCP subprocess without embedding a value in the
+        settings document and without forwarding the full parent environment
+        or any credential. An empty tuple renders no ``env`` table at all.
+    :returns: The ``mcpServers`` table for ``.qwen/settings.json``.
+    :raises ValidationError: When a selected server is absent or is not a
+        stdio command, because silently dropping it would weaken the child
+        role.
+
     Every entry is marked ``trust: true``: a headless (``-p``) run has no
     prompt to confirm a tool call, so an untrusted MCP server's tools are
     silently denied (verified live against 0.22.2 -- see
@@ -110,7 +149,12 @@ def _mcp_document(names: tuple[str, ...], servers: Mapping[str, McpConfig]) -> d
             raise ValidationError(f"no resolved MCP definition for runtimes.qwen.mcp entry: {name}")
         if server.transport != "stdio" or server.command is None:
             raise ValidationError(f"qwen MCP {name!r} must use stdio with a command")
-        rendered[name] = {"command": str(server.command), "args": list(server.args), "trust": True}
+        entry: dict[str, object] = {
+            "command": str(server.command), "args": list(server.args), "trust": True
+        }
+        if environment_keys:
+            entry["env"] = {key: f"${{{key}}}" for key in environment_keys}
+        rendered[name] = entry
     return rendered
 
 
@@ -165,13 +209,13 @@ class QwenAdapter:
         """Validate Qwen's environment-auth and one-shot-only configuration.
 
         ``config`` must use supported environment auth and no service mode.
-        A declared Rust table raises ``ValidationError`` because Qwen builds an
-        independent sandbox environment.
+        A declared ``rust`` table -- legacy ``runtimes.qwen.rust`` or the
+        ``rust`` of a selected ``environment`` preset -- is supported and is
+        provisioned by the shared developer-environment provider, so it is no
+        longer rejected here.
         """
         if config.service_mode is not None:
             raise ValidationError("qwen runtime does not support service_mode")
-        if config.rust is not None:
-            raise ValidationError("qwen runtime does not support Rust provisioning")
         if config.auth is None or config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
         unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
@@ -185,6 +229,7 @@ class QwenAdapter:
         *,
         mcp_servers: Mapping[str, McpConfig],
         skills_root: Path | None = None,
+        command_search_paths: tuple[str, ...] | None = None,
     ) -> str:
         """Create an isolated Qwen home with strict MCP, skill, and hook settings.
 
@@ -193,10 +238,22 @@ class QwenAdapter:
             mirroring :func:`agent_run.paths.runtime_skills_dir`, when the
             caller (unit tests calling this directly, or :meth:`prepare`'s
             own internal re-materialize) does not supply one.
+        :param command_search_paths: The final isolated child PATH entries to
+            resolve native denial aliases against. Direct callers omit it and
+            use the selected preset paths.
         :returns: A content hash covering the rendered settings document,
-            every delivered skill's content, and every installed plugin
-            file, so a changed skill or plugin selection is reflected in the
-            revision.
+            every delivered skill's content, every installed plugin file, and
+            :func:`environment_digest`, so a changed skill, plugin selection,
+            or developer-environment declaration is reflected in the revision
+            and a stale home is not reused.
+
+        Owner-declared ``denied_commands`` are materialized twice, by design:
+        as PATH refusal shims under :func:`command_policy_directory` (ordinary
+        lookup only -- not aliases, absolute paths, or arbitrary machine code)
+        and as native ``permissions.deny`` Bash entries, which Qwen's
+        documented precedence ranks above allow and ask entries. The native
+        entries cover the bare name plus the lexical and symlink-resolved
+        absolute paths of each denied command found on the final child PATH.
         """
 
         if skills_root is None:
@@ -206,12 +263,27 @@ class QwenAdapter:
         context_path = Path(home) / "agent-run-context.md"
         skill_hashes = materialize_skills(Path(home), config.plugins, skills_root, config.skills)
         plugin_roots, plugin_digest = plugin_install.install(Path(home), config.plugins)
+        selected = config.environment
+        denied = () if selected is None else selected.denied_commands
+        policy = materialize_refusal_commands(
+            denied,
+            command_policy_directory(Path(home)),
+            search_paths=command_search_paths if command_search_paths is not None else (
+                () if selected is None else selected.path
+            ),
+        )
         document: dict[str, object] = {
             "context": {"fileName": str(context_path)},
-            "mcpServers": _mcp_document(config.mcp, mcp_servers),
+            "mcpServers": _mcp_document(config.mcp, mcp_servers, configured_environment_keys(config)),
             "tools": {"sandbox": True},
             "security": {"auth": {"selectedType": _SELECTED_AUTH_TYPE}},
         }
+        if denied:
+            document["permissions"] = {
+                "deny": list(
+                    render_qwen_denials(denied, command_paths=sorted(policy.resolved_commands.values()))
+                )
+            }
         hooks_document = _hooks_document(config.hooks, plugin_roots)
         if hooks_document:
             document["hooks"] = hooks_document
@@ -222,6 +294,7 @@ class QwenAdapter:
                 text,
                 *(f"{name}:{digest}" for name, digest in sorted(skill_hashes.items())),
                 plugin_digest,
+                environment_digest(config),
             ]
         )
         return content_hash(fingerprint)
@@ -279,14 +352,32 @@ class QwenAdapter:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
         role_text += skills_context_note(Path(home), config.skills)
         write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
-        self.materialize(config, Path(home), mcp_servers=mcp_servers)
-
-        environment = {"HOME": str(home), "OPENAI_MODEL": request.model}
+        environment: dict[str, str] = {"HOME": str(home), "OPENAI_MODEL": request.model}
+        # Keep the narrow PATH baseline Qwen needs for its launcher and native
+        # utilities; a selected preset still leads it and no other ambient
+        # variables cross into the child.
         parent_path = os.environ.get("PATH")
         if parent_path:
             if (_XCODE_GIT_DIRECTORY / "git").is_file():
                 parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
             environment["PATH"] = parent_path
+        environment = developer_environment(environment, config, Path(request.workdir))
+        self.materialize(
+            config,
+            Path(home),
+            mcp_servers=mcp_servers,
+            command_search_paths=tuple(
+                entry for entry in environment.get("PATH", "").split(os.pathsep) if entry
+            ),
+        )
+        # The refusal shims must win ordinary PATH lookup, so they are
+        # prepended after required_commands were checked against the real
+        # declared PATH. This is ordinary-lookup refusal, not OS confinement.
+        if config.environment is not None and config.environment.denied_commands:
+            policy_directory = command_policy_directory(Path(home))
+            environment["PATH"] = os.pathsep.join(
+                entry for entry in (str(policy_directory), environment.get("PATH", "")) if entry
+            )
         secret_names: list[str] = []
         assert config.auth is not None
         for name in config.auth.names:

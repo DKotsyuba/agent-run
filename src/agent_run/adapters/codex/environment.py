@@ -15,8 +15,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ...config import RuntimeConfig
 from ...errors import ValidationError
-from ..home import managed_uv_python_environment
+from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
+from ..developer_environment import developer_environment
+from ..home import managed_uv_python_environment, write_managed_file
 
 
 def build_environment(binary: Path, home: Path) -> dict[str, str]:
@@ -53,6 +56,77 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
         "PATH": _child_path(str(executable.parent)),
         **managed_uv_python_environment(),
     }
+
+
+def developer_config_lines(config: RuntimeConfig) -> tuple[str, ...]:
+    """Return native config lines needed by a selected developer environment."""
+
+    return ("allow_login_shell = false", "") if config.environment is not None else ()
+
+
+def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, str | None]:
+    """Return the retained-review policy for a write-capable developer run."""
+
+    if write and config.environment is not None:
+        return {"approval_policy": "on-request", "approvals_reviewer": "auto_review"}
+    return {"approval_policy": "never", "approvals_reviewer": None}
+
+
+def prepared_environment(
+    binary: Path, home: Path, config: RuntimeConfig, workdir: Path
+) -> dict[str, str]:
+    """Return the Codex child environment with its managed command policy.
+
+    The selected developer environment augments the isolated Codex baseline.
+    Private refusal shims lead ``PATH`` for normal shell lookup, while native
+    ``.rules`` also deny each bare command and resolved executable path.
+    """
+
+    environment = developer_environment(build_environment(binary, home), config, workdir)
+    denied_commands = config.environment.denied_commands if config.environment is not None else ()
+    command_policy = materialize_refusal_commands(
+        denied_commands,
+        home / "command-refusals",
+        environment=environment,
+    )
+    environment["PATH"] = os.pathsep.join((str(command_policy.directory), environment["PATH"]))
+    write_managed_file(
+        home,
+        "rules/agent-run-command-policy.rules",
+        render_codex_denial_rules(
+            denied_commands,
+            command_paths=tuple(command_policy.resolved_commands.values()),
+        ),
+    )
+    return environment
+
+
+def thread_grant_params(
+    cwd: str, model: str, sandbox_mode: str, approval_policy: str,
+    roots: tuple[str, ...], network_access: bool, approvals_reviewer: str | None = None,
+) -> dict[str, object]:
+    """Return the shared ``thread/start``/``thread/resume`` grant fields.
+
+    The installed 0.153.4 experimental schema's ``sandbox`` field on both
+    ``ThreadStartParams`` and ``ThreadResumeParams`` is the plain kebab-case
+    enum string; neither accepts an ``effort``, ``mcpServers``, or ``skills``
+    field (effort belongs on ``TurnStartParams``; MCPs/skills come from the
+    generated native config the app-server already reads). A requested
+    network grant is instead conveyed through ``config``'s dotted
+    ``sandbox_workspace_write.network_access``, verified live to yield
+    ``networkAccess: true`` on the echoed thread. A selected reviewer is sent
+    only for the developer write contract that requires automatic review.
+    """
+
+    params: dict[str, object] = {
+        "cwd": cwd, "model": model, "sandbox": sandbox_mode,
+        "approvalPolicy": approval_policy, "runtimeWorkspaceRoots": list(roots),
+    }
+    if network_access and sandbox_mode == "workspace-write":
+        params["config"] = {"sandbox_workspace_write": {"network_access": True}}
+    if approvals_reviewer is not None:
+        params["approvalsReviewer"] = approvals_reviewer
+    return params
 
 
 def _child_path(launcher_directory: str) -> str:

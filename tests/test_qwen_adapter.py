@@ -13,11 +13,12 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 from agent_run.adapters import omniroute
+from agent_run.adapters.developer_environment import environment_digest
 from agent_run.adapters.claude import adapter as claude_adapter
 from agent_run.adapters.qwen import auth as qwen_auth
 from agent_run.adapters.qwen.adapter import ADAPTER, QwenAdapter
 from agent_run.adapters.base import Capability, LaunchPlan
-from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
+from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
@@ -120,6 +121,65 @@ class QwenAdapterTests(unittest.TestCase):
             else "/usr/bin:/bin"
         )
         self.assertEqual(plan.environment["PATH"], expected)
+
+    def test_environment_preset_reaches_shell_mcp_and_native_denials(self) -> None:
+        """Keep declared tools and workdir values in Qwen plus its MCP child."""
+
+        tools = self.root / "tools"
+        tools.mkdir()
+        git = tools / "git"
+        git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        git.chmod(0o700)
+        target = self.root / "actual-gh"
+        target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        target.chmod(0o700)
+        (tools / "gh").symlink_to(target)
+        environment = EnvironmentConfig(
+            (tools,), MappingProxyType({"PROJECT": "{workdir}/generated"}),
+            ("git",), ("gh",),
+        )
+        config = self.config(environment=environment, mcp=("agent_lsp",))
+        changed = self.config(environment=EnvironmentConfig(
+            (tools,), MappingProxyType({"PROJECT": "{workdir}/other"}), ("git",), ("gh",),
+        ))
+        self.assertNotEqual(environment_digest(config), environment_digest(changed))
+        servers = {"agent_lsp": McpConfig("stdio", Path("/bin/lsp"), ("--stdio",), ())}
+        with patch.dict(os.environ, {
+            "PATH": "/bin", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
+        }, clear=True):
+            plan = self.adapter.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers,
+            )
+        settings = json.loads((self.home / ".qwen" / "settings.json").read_text(encoding="utf-8"))
+        denied = settings["permissions"]["deny"]
+        self.assertEqual(plan.environment["PROJECT"], f"{self.workdir}/generated")
+        expected_path = [str(self.home / ".qwen" / "denied-commands"), str(tools)]
+        if (Path("/Applications/Xcode.app/Contents/Developer/usr/bin") / "git").is_file():
+            expected_path.append("/Applications/Xcode.app/Contents/Developer/usr/bin")
+        expected_path.append("/bin")
+        self.assertEqual(plan.environment["PATH"], os.pathsep.join(expected_path))
+        self.assertEqual(settings["mcpServers"]["agent_lsp"]["env"], {
+            "PATH": "${PATH}", "PROJECT": "${PROJECT}",
+        })
+        self.assertIn("Bash(gh)", denied)
+        self.assertIn(f"Bash({tools / 'gh'})", denied)
+        self.assertIn(f"Bash({target})", denied)
+        self.assertNotIn("Bash(git)", denied)
+
+    def test_environment_missing_required_command_fails_before_settings_write(self) -> None:
+        """Reject a preset whose final child PATH lacks its required command."""
+
+        tools = self.root / "tools"
+        tools.mkdir()
+        config = self.config(environment=EnvironmentConfig((tools,), required_commands=("git",)))
+        with patch.dict(os.environ, {
+            "PATH": "", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
+        }, clear=True):
+            with self.assertRaisesRegex(ValidationError, "missing executable: git"):
+                self.adapter.prepare(
+                    self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={},
+                )
+        self.assertFalse((self.home / ".qwen" / "settings.json").exists())
 
     def test_provider_model_mcp_and_role_are_isolated(self) -> None:
         """Carry provider values in env and materialize MCP plus the role under HOME."""

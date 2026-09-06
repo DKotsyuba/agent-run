@@ -35,10 +35,12 @@ from ..base import (
     RuntimeInfo,
     RuntimeSession,
 )
+from ..developer_environment import configured_environment_keys, environment_digest
+from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
-from .environment import build_environment
+from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
@@ -49,7 +51,6 @@ _LIMITS_STALE_SECONDS = 900
 _ROLLOUT_FILES = 24
 _ROLLOUT_TAIL_BYTES = 262_144
 _ROLLOUT_TAIL_LINES = 2_048
-_APPROVAL_POLICY = "never"
 
 
 def _read_json(path: Path) -> object | None:
@@ -294,16 +295,14 @@ class CodexAdapter:
         )
 
     def validate(self, config: RuntimeConfig) -> None:
-        """Validate Codex configuration and reject unsupported Rust provisioning.
+        """Validate Codex configuration accepted by the isolated adapter.
 
         ``config`` must be a ``RuntimeConfig`` with Codex's file-link auth and
-        at least one model. A declared Rust table raises ``ValidationError``
-        because this adapter has a separate environment boundary.
+        at least one model. A declared Rust table is applied only to the
+        per-launch child environment.
         """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
-        if config.rust is not None:
-            raise ValidationError("codex runtime does not support Rust provisioning")
         if config.service_mode is not None:
             raise ValidationError("codex runtime does not use service_mode")
         if config.auth is None or config.auth.kind != "file_link":
@@ -363,8 +362,11 @@ class CodexAdapter:
             mcp_lines.append(f"[mcp_servers.{name}]")
             mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
             mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
-            if mcp_def.env_from:
-                mcp_lines.append(f"env_from = {_toml_array(mcp_def.env_from)}")
+            mcp_environment = tuple(
+                dict.fromkeys((*mcp_def.env_from, *configured_environment_keys(config)))
+            )
+            if mcp_environment:
+                mcp_lines.append(f"env_vars = {_toml_array(mcp_environment)}")
             mcp_lines.append("")
 
         plugin_lines, plugin_digest, plugin_roots = plugin_install.install(
@@ -406,6 +408,7 @@ class CodexAdapter:
             "model_auto_compact_token_limit = 780000",
             'model_auto_compact_token_limit_scope = "total"',
             "",
+            *developer_config_lines(config),
             *mcp_lines,
             *hook_lines,
             *trust_lines,
@@ -413,6 +416,9 @@ class CodexAdapter:
         ]
         generated_config = "\n".join(body_lines).rstrip() + "\n"
         write_managed_file(home, _CONFIG_REL, generated_config)
+        denied_commands = config.environment.denied_commands if config.environment is not None else ()
+        denial_rules = render_codex_denial_rules(denied_commands)
+        write_managed_file(home, "rules/agent-run-command-policy.rules", denial_rules)
 
         auth_digest = ""
         if config.auth is not None and config.auth.kind == "file_link":
@@ -426,6 +432,7 @@ class CodexAdapter:
                 *hook_digests,
                 plugin_digest,
                 auth_digest,
+                environment_digest(config),
             ]
         )
         return content_hash(fingerprint)
@@ -626,7 +633,7 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
-        environment = build_environment(config.binary, home_path)
+        environment = prepared_environment(config.binary, home_path, config, workdir)
         if config.plugins and not effective_write:
             # A read-only sandbox cannot write the raw spool the plugin's
             # pre-execution wrapper needs, so that wrapper fails open to the
@@ -639,7 +646,7 @@ class CodexAdapter:
             "model": request.model,
             "effort": request.effort,
             "sandbox_mode": sandbox_mode,
-            "approval_policy": _APPROVAL_POLICY,
+            **developer_approval_fields(config, effective_write),
             "roots": roots,
             "writable_roots": writable_roots,
             "mcp": tuple(config.mcp),
@@ -657,11 +664,7 @@ class CodexAdapter:
                     "codex read-only sandbox cannot grant network access; "
                     "run network profiles on claude or grant write"
                 )
-            adapter_state["sandbox"] = {
-                "workspace-write": {
-                    "networkAccess": True,
-                }
-            }
+            adapter_state["network_access"] = True
         argv = [str(config.binary)]
         if request.fast:
             argv.extend(("-c", "service_tier=fast", "-c", "features.fast_mode=true"))

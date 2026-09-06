@@ -1,12 +1,16 @@
 import inspect
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -14,7 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
-from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
+from agent_run.adapters.codex import environment as codex_environment
+from agent_run.adapters.developer_environment import configured_environment_keys
+from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
 from agent_run.profiles import AgentProfile
@@ -116,6 +122,80 @@ env_from = ["PATH"]
         with self.assertRaisesRegex(ValidationError, "service_mode"):
             ADAPTER.validate(self.runtime_config(service_mode="managed"))
 
+    def test_declared_rust_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
+        """Codex keeps isolated homes while declared Rust reaches both child boundaries."""
+        import tomllib
+
+        rust = RustConfig(Path("/rustup"), Path("/cargo-bin"))
+        config = self.runtime_config(rust=rust, mcp=("agent_lsp",))
+        ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            generated["mcp_servers"]["agent_lsp"]["env_vars"],
+            list(configured_environment_keys(config)),
+        )
+        profile = AgentProfile("review", "body", False, (self.workdir,))
+        with patch.dict(
+            codex_environment.prepared_environment.__globals__,
+            {"developer_environment": lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}},
+        ):
+            plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+        self.assertEqual(plan.environment["HOME"], str(self.home))
+        self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
+        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
+
+    def test_developer_preset_reaches_shell_mcp_and_native_denial_rules(self) -> None:
+        """Codex forwards only declared preset keys and denies configured commands."""
+        tools = Path(self._mkdtemp())
+        for name in ("git", "gh"):
+            command = tools / name
+            command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            command.chmod(0o755)
+        preset = EnvironmentConfig(
+            path=(tools,),
+            variables=MappingProxyType({"PROJECT": "{workdir}/project"}),
+            required_commands=("git",),
+            denied_commands=("gh",),
+        )
+        config = self.runtime_config(environment=preset, mcp=("agent_lsp",))
+        digest = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertIs(generated["allow_login_shell"], False)
+        self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH", "PROJECT"])
+        self.assertNotEqual(
+            digest,
+            ADAPTER.materialize(
+                replace(config, environment=replace(preset, denied_commands=())),
+                self.home,
+                mcp_servers=self.resolved_mcp(),
+            ),
+        )
+        ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        profile = AgentProfile("review", "body", True, (self.workdir,))
+        plan = self.prepare(self.start_request(write=True), profile, config, mcp_servers=self.resolved_mcp())
+        self.assertEqual(plan.environment["PROJECT"], str(self.workdir / "project"))
+        self.assertEqual(plan.adapter_state["approval_policy"], "on-request")
+        self.assertEqual(plan.adapter_state["approvals_reviewer"], "auto_review")
+        self.assertEqual(
+            subprocess.run(("/bin/sh", "-c", "gh --version"), env=plan.environment).returncode,
+            126,
+        )
+        self.assertEqual(
+            subprocess.run(("/bin/sh", "-c", "git --version"), env=plan.environment).returncode,
+            0,
+        )
+        rules = (self.home / "rules" / "agent-run-command-policy.rules").read_text(encoding="utf-8")
+        self.assertIn('"gh"', rules)
+        self.assertIn(str(tools / "gh"), rules)
+
+    def test_developer_preset_fails_closed_when_a_required_command_is_missing(self) -> None:
+        """An unavailable required command prevents Codex from receiving a launch plan."""
+        config = self.runtime_config(environment=EnvironmentConfig(required_commands=("missing",)))
+        ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        profile = AgentProfile("review", "body", False, (self.workdir,))
+        with self.assertRaisesRegex(ValidationError, "missing executable: missing"):
+            self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+
     # -- materialize ----------------------------------------------------------
 
     def test_materialize_writes_declared_assets_and_preserves_runtime_state(self) -> None:
@@ -127,6 +207,7 @@ env_from = ["PATH"]
 
         self.assertEqual((self.home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "demo skill")
         generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertNotIn("allow_login_shell", generated)
         self.assertNotIn("skills =", generated)
         self.assertEqual(
             [path.name for path in (self.home / "skills").iterdir()],
@@ -928,23 +1009,21 @@ env_from = ["PATH"]
             self.prepare(self.start_request(), profile, config)
 
     def test_prepare_enables_network_in_a_write_sandbox(self) -> None:
-        """Write-capable network profiles use the tagged workspace-write form."""
+        """Write-capable network profiles record an explicit network grant flag."""
 
         config = self.materialized()
         profile = AgentProfile("research", "body", True, (), True)
         plan = self.prepare(self.start_request(write=True), profile, config)
-        self.assertEqual(
-            plan.adapter_state["sandbox"], {"workspace-write": {"networkAccess": True}}
-        )
+        self.assertEqual(plan.adapter_state["network_access"], True)
 
     def test_prepare_keeps_non_network_sandbox_mode_plain(self) -> None:
-        """Profiles without network permission do not add a sandbox mapping."""
+        """Profiles without network permission do not add a network grant flag."""
 
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
         plan = self.prepare(self.start_request(), profile, config)
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
-        self.assertNotIn("sandbox", plan.adapter_state)
+        self.assertNotIn("network_access", plan.adapter_state)
 
     def test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents(self) -> None:
         """A read-only sandbox cannot spool before execution, so the outside

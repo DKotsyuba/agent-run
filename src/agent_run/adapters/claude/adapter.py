@@ -1,11 +1,7 @@
 """Claude Code runtime adapter: strict isolation, no live auth/quota calls.
 
-Materialization and launch preparation never inherit the caller's global
-Claude settings, plugins, or MCP configuration. Every generated asset is
-built only from ``RuntimeConfig``, the selected ``AgentProfile``, and the
-owner-authored skill directories below ``~/.agent-run/skills/claude``. The
-sole ambient exception is an existing uv managed-Python root, required for
-offline hooks after their generated ``HOME`` replaces the parent home.
+Generated assets use only declared configuration, profiles, and skills. An
+existing uv managed-Python root is the sole ambient exception for offline hooks.
 """
 
 from __future__ import annotations
@@ -38,9 +34,15 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from ..command_policy import materialize_refusal_commands, render_claude_denials
 from ..continuation import cli_resume_plan
+from ..developer_environment import (
+    configured_environment_keys,
+    developer_environment,
+    environment_digest,
+)
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
-from ..rust import RUST_ENVIRONMENT_NAMES, rust_environment
+from ..rust import RUST_ENVIRONMENT_NAMES
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .constants import (
     ALWAYS_DISALLOWED as _ALWAYS_DISALLOWED, AUTH_NAMES as _AUTH_NAMES,
@@ -91,10 +93,6 @@ class ClaudeAdapter:
             raise ValidationError(
                 f"claude runtime auth.names has unsupported entries: {', '.join(unknown)}"
             )
-        # Unlike codex and opencode, this runtime hands claude the whole
-        # declared plugin directory, so every skill inside it reaches the child
-        # whether or not ``skills`` selected it. Listed names only: an unlisted
-        # one is a config defect, not a bonus.
         unlisted = unlisted_plugin_skills(config.plugins, config.skills)
         if unlisted:
             raise ValidationError(
@@ -124,8 +122,10 @@ class ClaudeAdapter:
         emitting a non-functional entry.
 
         The returned newline-delimited digest includes declared Rust roots when
-        provisioning is enabled, so materialization revision evidence changes
-        with the launch environment without storing credentials.
+        provisioning is enabled and a selected developer-environment preset's
+        declared paths, variables, and command policy, so materialization
+        revision evidence changes with the launch environment without storing
+        credentials.
         """
 
         settings_digest = render_settings(home, config.hooks)
@@ -139,6 +139,7 @@ class ClaudeAdapter:
         digests = [settings_digest, mcp_digest, plugin_digest, declared_digest]
         if config.rust is not None:
             digests.append(content_hash(f"{config.rust.rustup_home}\0{config.rust.cargo_bin}"))
+        digests.append(environment_digest(config))
         return "\n".join(digests)
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
@@ -187,14 +188,9 @@ class ClaudeAdapter:
     ) -> LaunchPlan:
         """Build the isolated launch plan for one start request.
 
-        Model ids are public everywhere on the plan boundary: validation,
-        the roster, and the persisted ``adapter_state["model"]`` all keep
-        ``request.model`` verbatim. Only the child argv's ``--model`` value
-        is translated through ``_MODEL_ALIASES`` (``fable`` ->
-        ``claude-fable-5-1``); every other id passes through unchanged.
-        An optional Rust declaration adds a bounded preflight and shared child
-        environment for both Claude and its stdio MCP subprocesses; failures
-        raise ``ValidationError`` before a launch process is created.
+        Public model ids remain on the plan boundary; only child argv aliases
+        ``fable``. Presets add declared paths, variables, Rust, and command
+        denials to the isolated environment; invalid inputs raise before launch.
         """
 
         if request.fast:
@@ -222,11 +218,6 @@ class ClaudeAdapter:
                         f"inside a writable workdir: {root}"
                     )
 
-        # Skills are registered by --plugin-dir, but the child can only see
-        # and invoke them through the built-in Skill tool; without it in the
-        # --tools allowlist the generated plugins load and stay invisible
-        # (observed live: a child that listed the MCP server's own prompt
-        # skills and none of ours).
         skill_tools = _SKILL_TOOLS if config.skills else ()
         shell_tools = _SHELL_TOOLS if allow_write else ()
         network_tools = _NETWORK_TOOLS if profile.network else ()
@@ -273,12 +264,6 @@ class ClaudeAdapter:
             argv += ["--mcp-config", str(home / "mcp" / "mcp-config.json")]
         for name in local_skill_names(config.plugins, config.skills):
             argv += ["--plugin-dir", str(home / "plugins" / name)]
-        # Declared plugins load straight from their own directory. Verified
-        # live against claude 2.1.245: a plugin's own hooks/hooks.json is
-        # picked up from --plugin-dir alone, with the generated settings.json
-        # holding no hook entry of its own. Write-enabled children also grant
-        # Bash, so plugin ^Bash$ matchers fire with the same shell-hook
-        # coverage as Codex children.
         for plugin in config.plugins:
             argv += ["--plugin-dir", str(plugin)]
         for root in roots:
@@ -295,15 +280,29 @@ class ClaudeAdapter:
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
-        environment = rust_environment(environment, config, request.workdir)
+        environment = developer_environment(environment, config, request.workdir)
 
-        # Secret registration follows what was *injected*, not only what the
-        # config declared: a subclass auth bridge (glm's keychain token) can
-        # export a credential the config never names, and with
-        # ``auth.names = ()`` that live token would otherwise never reach
-        # ``secret_env_names`` and so never be redacted out of the runtime log.
-        # Only credential-shaped names are added, so a public companion such as
-        # ANTHROPIC_BASE_URL is not turned into a literal redaction pattern.
+        selected_environment = config.environment
+        if selected_environment is not None and selected_environment.denied_commands:
+            policy = materialize_refusal_commands(
+                selected_environment.denied_commands,
+                home / "command-policy",
+                search_paths=tuple(
+                    part for part in environment.get("PATH", "").split(os.pathsep) if part
+                ),
+                environment=environment,
+            )
+            environment["PATH"] = os.pathsep.join(
+                (str(policy.directory), *environment.get("PATH", "").split(os.pathsep))
+            )
+            denial_patterns = render_claude_denials(
+                selected_environment.denied_commands,
+                command_paths=tuple(policy.resolved_commands.values()),
+            )
+            argv[argv.index("--disallowedTools") + 1] = ",".join(
+                dict.fromkeys((*disallowed_tools, *denial_patterns))
+            )
+
         auth_names: tuple[str, ...] = ()
         injected_secret_names: tuple[str, ...] = ()
         if config.auth is not None:
@@ -314,13 +313,16 @@ class ClaudeAdapter:
                 name for name in injected if is_secret_env_name(name)
             )
 
+        configured_keys = configured_environment_keys(config)
         mcp_env_names: list[str] = []
         for name in config.mcp:
             server = mcp_servers.get(name)
             if server is None:
                 raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
             for env_name in server.env_from:
-                if config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES:
+                if env_name in configured_keys or (
+                    config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES
+                ):
                     value = environment.get(env_name)
                 else:
                     value = os.environ.get(env_name)
@@ -336,12 +338,11 @@ class ClaudeAdapter:
                 environment[env_name] = value
                 mcp_env_names.append(env_name)
 
-        if config.rust is not None and config.mcp:
-            rust_mcp_environment = {
-                name: environment[name]
-                for name in ("PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL")
-            }
-            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=rust_mcp_environment)
+        mcp_environment = {
+            name: environment[name] for name in configured_keys if name in environment
+        }
+        if config.mcp and mcp_environment:
+            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=mcp_environment)
             argv[argv.index("--mcp-config") + 1] = str(agent_dir / "mcp" / "mcp-config.json")
 
         initial_input = (
