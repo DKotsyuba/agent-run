@@ -119,6 +119,9 @@ env_from = ["PATH"]
     # -- materialize ----------------------------------------------------------
 
     def test_materialize_writes_declared_assets_and_preserves_runtime_state(self) -> None:
+        """Verify regenerated config defaults and preservation of runtime state."""
+        import tomllib
+
         config = self.runtime_config(mcp=("agent_lsp",))
         digest_one = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
 
@@ -157,6 +160,11 @@ env_from = ["PATH"]
         self.assertNotEqual(digest_one, digest_two)
         self.assertEqual(runtime_owned.read_text(encoding="utf-8"), '{"trusted": true}')
         self.assertIn("PostToolUse", (self.home / "config.toml").read_text(encoding="utf-8"))
+        for content in (generated, (self.home / "config.toml").read_text(encoding="utf-8")):
+            parsed = tomllib.loads(content)
+            self.assertEqual(parsed["model_context_window"], 1000000)
+            self.assertEqual(parsed["model_auto_compact_token_limit"], 780000)
+            self.assertEqual(parsed["model_auto_compact_token_limit_scope"], "total")
 
     def make_plugin(self, **manifest) -> Path:
         """A plugin whose PreToolUse hook matches the real compressor byte for byte."""
