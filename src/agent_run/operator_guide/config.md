@@ -60,7 +60,7 @@ Each `[runtimes.<name>]` table may declare:
   use the highest applicable weight and remain one capacity choice.
   Account overrides match explicit route labels; unlabelled routes use the
   lane/runtime fallback.
-- `rust` — Claude and GLM only: an explicit host Rust toolchain declaration.
+- `rust` — Codex, Claude and GLM: an explicit host Rust toolchain declaration.
   When declared, both paths are required: `rustup_home` is the installed
   toolchain store and `cargo_bin` is the directory containing Cargo's lexical
   `cargo`, `rustc`, `rustup`, and `rust-analyzer` proxies. The child keeps its

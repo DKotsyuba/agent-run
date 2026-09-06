@@ -37,6 +37,7 @@ from ..base import (
 )
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
+from ..rust import rust_environment
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
@@ -294,16 +295,14 @@ class CodexAdapter:
         )
 
     def validate(self, config: RuntimeConfig) -> None:
-        """Validate Codex configuration and reject unsupported Rust provisioning.
+        """Validate Codex configuration accepted by the isolated adapter.
 
         ``config`` must be a ``RuntimeConfig`` with Codex's file-link auth and
-        at least one model. A declared Rust table raises ``ValidationError``
-        because this adapter has a separate environment boundary.
+        at least one model. A declared Rust table is applied only to the
+        per-launch child environment.
         """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
-        if config.rust is not None:
-            raise ValidationError("codex runtime does not support Rust provisioning")
         if config.service_mode is not None:
             raise ValidationError("codex runtime does not use service_mode")
         if config.auth is None or config.auth.kind != "file_link":
@@ -363,8 +362,13 @@ class CodexAdapter:
             mcp_lines.append(f"[mcp_servers.{name}]")
             mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
             mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
-            if mcp_def.env_from:
-                mcp_lines.append(f"env_from = {_toml_array(mcp_def.env_from)}")
+            mcp_environment = mcp_def.env_from
+            if config.rust is not None:
+                mcp_environment = tuple(
+                    dict.fromkeys((*mcp_environment, "PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"))
+                )
+            if mcp_environment:
+                mcp_lines.append(f"env_vars = {_toml_array(mcp_environment)}")
             mcp_lines.append("")
 
         plugin_lines, plugin_digest, plugin_roots = plugin_install.install(
@@ -626,7 +630,7 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
-        environment = build_environment(config.binary, home_path)
+        environment = rust_environment(build_environment(config.binary, home_path), config, workdir)
         if config.plugins and not effective_write:
             # A read-only sandbox cannot write the raw spool the plugin's
             # pre-execution wrapper needs, so that wrapper fails open to the

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
-from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
+from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
 from agent_run.profiles import AgentProfile
@@ -115,6 +115,26 @@ env_from = ["PATH"]
             ADAPTER.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("TOKEN",))))
         with self.assertRaisesRegex(ValidationError, "service_mode"):
             ADAPTER.validate(self.runtime_config(service_mode="managed"))
+
+    def test_declared_rust_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
+        """Codex keeps isolated homes while declared Rust reaches both child boundaries."""
+        import tomllib
+
+        rust = RustConfig(Path("/rustup"), Path("/cargo-bin"))
+        config = self.runtime_config(rust=rust, mcp=("agent_lsp",))
+        ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
+        generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            generated["mcp_servers"]["agent_lsp"]["env_vars"],
+            ["PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"],
+        )
+        profile = AgentProfile("review", "body", False, (self.workdir,))
+        with patch("agent_run.adapters.codex.adapter.rust_environment", side_effect=lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}) as provision:
+            plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+        self.assertEqual(plan.environment["HOME"], str(self.home))
+        self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
+        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
+        provision.assert_called_once()
 
     # -- materialize ----------------------------------------------------------
 
