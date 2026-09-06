@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
+from agent_run.adapters.codex import environment as codex_environment
 from agent_run.adapters.developer_environment import configured_environment_keys
 from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
@@ -135,7 +136,7 @@ env_from = ["PATH"]
         )
         profile = AgentProfile("review", "body", False, (self.workdir,))
         with patch.dict(
-            ADAPTER.prepare.__globals__,
+            codex_environment.prepared_environment.__globals__,
             {"developer_environment": lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}},
         ):
             plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
