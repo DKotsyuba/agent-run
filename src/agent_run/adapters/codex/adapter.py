@@ -35,16 +35,12 @@ from ..base import (
     RuntimeInfo,
     RuntimeSession,
 )
-from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
-from ..developer_environment import (
-    configured_environment_keys,
-    developer_environment,
-    environment_digest,
-)
+from ..developer_environment import configured_environment_keys, environment_digest
+from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
-from .environment import build_environment
+from .environment import build_environment, prepared_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
@@ -637,22 +633,7 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
-        environment = developer_environment(build_environment(config.binary, home_path), config, workdir)
-        denied_commands = config.environment.denied_commands if config.environment is not None else ()
-        command_policy = materialize_refusal_commands(
-            denied_commands,
-            home_path / "command-refusals",
-            environment=environment,
-        )
-        environment["PATH"] = os.pathsep.join((str(command_policy.directory), environment["PATH"]))
-        write_managed_file(
-            home_path,
-            "rules/agent-run-command-policy.rules",
-            render_codex_denial_rules(
-                denied_commands,
-                command_paths=tuple(command_policy.resolved_commands.values()),
-            ),
-        )
+        environment = prepared_environment(config.binary, home_path, config, workdir)
         if config.plugins and not effective_write:
             # A read-only sandbox cannot write the raw spool the plugin's
             # pre-execution wrapper needs, so that wrapper fails open to the

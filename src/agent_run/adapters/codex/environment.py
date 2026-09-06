@@ -15,8 +15,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ...config import RuntimeConfig
 from ...errors import ValidationError
-from ..home import managed_uv_python_environment
+from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
+from ..developer_environment import developer_environment
+from ..home import managed_uv_python_environment, write_managed_file
 
 
 def build_environment(binary: Path, home: Path) -> dict[str, str]:
@@ -53,6 +56,35 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
         "PATH": _child_path(str(executable.parent)),
         **managed_uv_python_environment(),
     }
+
+
+def prepared_environment(
+    binary: Path, home: Path, config: RuntimeConfig, workdir: Path
+) -> dict[str, str]:
+    """Return the Codex child environment with its managed command policy.
+
+    The selected developer environment augments the isolated Codex baseline.
+    Private refusal shims lead ``PATH`` for normal shell lookup, while native
+    ``.rules`` also deny each bare command and resolved executable path.
+    """
+
+    environment = developer_environment(build_environment(binary, home), config, workdir)
+    denied_commands = config.environment.denied_commands if config.environment is not None else ()
+    command_policy = materialize_refusal_commands(
+        denied_commands,
+        home / "command-refusals",
+        environment=environment,
+    )
+    environment["PATH"] = os.pathsep.join((str(command_policy.directory), environment["PATH"]))
+    write_managed_file(
+        home,
+        "rules/agent-run-command-policy.rules",
+        render_codex_denial_rules(
+            denied_commands,
+            command_paths=tuple(command_policy.resolved_commands.values()),
+        ),
+    )
+    return environment
 
 
 def thread_grant_params(
