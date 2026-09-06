@@ -19,6 +19,8 @@ holds identifiers and paths only, and is compared, never replayed.
 from __future__ import annotations
 
 import json
+import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 from typing import Mapping
 
@@ -26,6 +28,78 @@ from .accounts import account_runtime_home
 from .config import RuntimeConfig
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import ValidationError
+from .profiles import AgentProfile
+from .state.db import agent_row, idempotent_agent, immediate, nonblank, positive_number
+
+
+def record_profile_grants(
+    connection: sqlite3.Connection, agent_id: AgentId, profile: AgentProfile
+) -> None:
+    """Pin the loaded profile's effective grants before any native launch.
+
+    The connection belongs to the preparation worker. Fresh runs record their
+    actual write, network and read-root grants; continuations must exactly match
+    their inherited snapshot, including after an earlier preparation failure.
+    Missing or changed grants raise ValidationError without changing the row.
+    The single transaction updates only this run's secret-free identity JSON.
+    """
+    grants = {
+        "write": profile.write,
+        "network": profile.network,
+        "read_roots": sorted(str(path) for path in profile.read_roots),
+    }
+    with immediate(connection):
+        row = agent_row(connection, agent_id)
+        try:
+            snapshot = json.loads(row["identity_json"])
+        except (TypeError, ValueError) as error:
+            raise ValidationError("invalid effective-identity snapshot") from error
+        if not isinstance(snapshot, dict):
+            raise ValidationError("invalid effective-identity snapshot")
+        if row["parent_agent_id"] is not None and snapshot.get("profile_grants") != grants:
+            raise ValidationError("profile grants changed or were not recorded; refusing resume")
+        snapshot["profile_grants"] = grants
+        connection.execute(
+            "UPDATE agents SET identity_json = ? WHERE id = ?",
+            (json.dumps(snapshot, sort_keys=True, separators=(",", ":")), agent_id),
+        )
+
+
+def replayed_resume(
+    connection: sqlite3.Connection, parent: Mapping[str, object], task: str,
+    timeout_seconds: float | None, request_id: str | None,
+    orchestrator: OrchestratorRef | None,
+) -> AgentId | None:
+    """Return an accepted matching resume before inspecting mutable resources.
+
+    Validate the caller-controlled task, timeout and notification reference.
+    A known request ID must match its immutable parent, prompt, effective timeout
+    and caller; conflicts raise ValidationError. Unknown or absent IDs return
+    None and normal admission still performs its atomic replay/race check.
+    This read-only lookup never resolves filesystem paths or current config.
+    """
+    nonblank("task", task)
+    timeout = positive_number(
+        "timeout_seconds", parent["timeout_seconds"] if timeout_seconds is None else timeout_seconds
+    )
+    if orchestrator is not None and not isinstance(orchestrator, OrchestratorRef):
+        raise ValidationError("orchestrator must be an OrchestratorRef or None")
+    if request_id is None:
+        return None
+    nonblank("request_id", request_id)
+    existing = idempotent_agent(connection, request_id)
+    if existing is None:
+        return None
+    stored = json.loads(existing["request_json"])
+    caller = None if orchestrator is None else asdict(orchestrator)
+    if (
+        existing["parent_agent_id"] != parent["id"]
+        or stored.get("task") != task
+        or stored.get("timeout_seconds") != timeout
+        or stored.get("orchestrator") != caller
+    ):
+        raise ValidationError("request_id was reused for a different request")
+    return AgentId(str(existing["id"]))
 
 
 def effective_identity(
@@ -69,8 +143,10 @@ def identity_snapshot(
     are recorded here rather than in ``request_json`` because that payload is
     what idempotent replay compares byte-for-byte.
 
-    Returns canonical JSON with sorted keys. Its mere presence on a row is what
-    later distinguishes a proven identity from a legacy, unprovable one.
+    Returns canonical JSON with sorted keys. Preparation completes this routing
+    snapshot with actual profile grants through :func:`record_profile_grants`.
+    A continuation carries its parent's completed snapshot instead of resetting
+    those grants when preparation fails before attaching to the native session.
     """
 
     return json.dumps(
@@ -192,7 +268,7 @@ def inherited_request(
         timeout_seconds=(
             float(row["timeout_seconds"])
             if timeout_seconds is None
-            else timeout_seconds
+            else positive_number("timeout_seconds", timeout_seconds)
         ),
         read_roots=tuple(Path(str(path)) for path in snapshot.get("read_roots") or ()),
         output_schema=stored.get("output_schema"),

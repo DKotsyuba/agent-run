@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import tempfile
 import time
@@ -10,7 +11,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
+from unittest.mock import patch
 
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
@@ -21,7 +23,7 @@ from agent_run.adapters.base import (
     RuntimeInfo,
 )
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
-from agent_run.domain import AgentStatus, Outcome, StartRequest
+from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
@@ -79,6 +81,57 @@ ADAPTER = ResumableAdapter()
 
 
 class ResumeTests(unittest.TestCase):
+    def test_replay_survives_deleted_paths_and_changed_runtime(self) -> None:
+        """An accepted request is immutable even after mutable resources disappear."""
+        parent = self._parent()
+        first = self.service.resume(parent, "continue", request_id="durable-replay")
+        self._wait(2)
+        self.workdir.rmdir()
+        moved = replace(self.config.runtimes["fake"], home=self.root / "changed-home")
+        self.service = self._service(replace(self.config, runtimes={"fake": moved}))
+        again = self.service.resume(parent, "continue", request_id="durable-replay")
+        self.assertEqual(first.agent_id, again.agent_id)
+        self.assertFalse(again.created)
+        with self.assertRaisesRegex(ValidationError, "request_id"):
+            self.service.resume(parent, "different", request_id="durable-replay")
+
+    def test_replay_preserves_notification_caller_and_validates_timeout(self) -> None:
+        """Early replay checks caller identity and does not accept boolean timeouts."""
+        parent = self._parent()
+        caller = OrchestratorRef("codex_queue", "caller-one")
+        first = self.service.resume(parent, "continue", request_id="caller-replay", orchestrator=caller)
+        self._wait(2)
+        again = self.service.resume(parent, "continue", request_id="caller-replay", orchestrator=caller)
+        self.assertEqual(first.agent_id, again.agent_id)
+        with self.assertRaisesRegex(ValidationError, "request_id"):
+            self.service.resume(parent, "continue", request_id="caller-replay")
+        with self.assertRaises(ValidationError):
+            self.service.resume(parent, "continue", request_id="caller-replay", timeout_seconds=True)
+
+    def test_profile_drift_between_admission_and_preparation_cannot_launch(self) -> None:
+        """The worker checks actual grants after loading a concurrently changed profile."""
+        parent = self._parent()
+        with patch.object(self.service._starts, "submit") as submit:
+            child = self.service.resume(parent, "continue")
+        (self.profiles / "profile.md").write_text(
+            "+++\nwrite = true\nnetwork = true\n+++\nDo the requested work.\n"
+        )
+        submit.call_args.args[1](self.store, Event())
+        self.assertEqual(self.service.get(child.agent_id).status, AgentStatus.FAILED)
+        self.assertIn("profile grants", self.service.get(child.agent_id).failure_text)
+        self.assertEqual(len(self.launched), 1)
+
+    def test_unchanged_network_grants_are_preserved(self) -> None:
+        """A legitimately network-enabled parent remains resumable with the same grants."""
+        (self.profiles / "profile.md").write_text(
+            "+++\nwrite = true\nnetwork = true\n+++\nDo the requested work.\n"
+        )
+        parent = self._parent()
+        child = self.service.resume(parent, "continue")
+        self._wait(2)
+        snapshot = json.loads(self.store.get_agent(child.agent_id)["identity_json"])
+        self.assertTrue(snapshot["profile_grants"]["network"])
+
     """End-to-end resume admission over a real store and the fake adapter."""
 
     def setUp(self) -> None:

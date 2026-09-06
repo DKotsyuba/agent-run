@@ -40,7 +40,10 @@ from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from . import workflow_facade
 from .profiles import assign_role, load_profile
-from .resume import identity_snapshot, inherited_request, proven_identity
+from .resume import (
+    identity_snapshot, inherited_request, proven_identity, record_profile_grants,
+    replayed_resume,
+)
 from .start_coordinator import StartCoordinator
 from .state.reconciliation import workflow_owner_identity
 from .supervisor import supervisor_identity
@@ -408,6 +411,8 @@ class AgentService:
         auth target, granted permissions, ``fast``) is persisted alongside the
         row but outside ``request_json``, so a later resume can prove what this
         run used without changing what idempotent replay compares.
+        A continuation preserves its parent's completed grant snapshot, which
+        the preparation worker compares with the actual loaded profile.
 
         The native session a resumed child attaches to is read back from the
         row that was just committed, never from the caller: store and adapter
@@ -426,8 +431,10 @@ class AgentService:
             agent_id=candidate,
             at=accepted_at,
             parent_agent_id=parent_agent_id,
-            identity_json=identity_snapshot(
-                request.runtime, runtime, label, request
+            identity_json=(
+                identity_snapshot(request.runtime, runtime, label, request)
+                if parent_agent_id is None
+                else self._store.get_agent(parent_agent_id)["identity_json"]
             ),
         )
         if not creation.created:
@@ -561,6 +568,7 @@ class AgentService:
                 request.runtime,
                 effective_runtime.skills,
             )
+            record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
             revision = adapter.materialize(
                 effective_runtime,
@@ -742,6 +750,11 @@ class AgentService:
 
         parent_id = validate_agent_id(agent_id)
         row = self._store.get_agent(parent_id)
+        replay = replayed_resume(
+            self._store.connection, row, task, timeout_seconds, request_id, orchestrator
+        )
+        if replay is not None:
+            return StartResult(replay, False, self.get(replay))
         runtime_name = str(row["runtime"])
         runtime = self._runtime_config(runtime_name)
         label, snapshot = proven_identity(
