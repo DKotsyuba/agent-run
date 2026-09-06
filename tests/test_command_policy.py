@@ -39,7 +39,7 @@ class CommandPolicyTest(unittest.TestCase):
             self.assertEqual(denied.returncode, 126)
             self.assertIn("denied by owner policy", denied.stderr)
             self.assertEqual(allowed.stdout, "allowed")
-            self.assertEqual(policy.resolved_commands, {"gh": (host / "gh").resolve()})
+            self.assertEqual(policy.resolved_commands, {"gh": host / "gh"})
 
     def test_refresh_removes_only_unchanged_managed_entries(self) -> None:
         """A changed declaration removes stale owned shims and adds new ones safely."""
