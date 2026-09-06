@@ -399,6 +399,46 @@ class StartSessionTests(unittest.TestCase):
             [{"type": "text", "text": "do the thing"}],
         )
 
+    def test_read_only_thread_start_preserves_every_workspace_root(self) -> None:
+        """Send all read-only roots and reject an echo that drops one."""
+        cwd = Path("/work")
+        roots = (str(cwd), "/external")
+        response = thread_response(cwd, roots=roots)
+        del response["roots"]
+        response["runtimeWorkspaceRoots"] = list(roots)
+        plan = make_plan(
+            cwd,
+            {
+                "model": "gpt-5.6-sol",
+                "effort": None,
+                "sandbox_mode": "read-only",
+                "approval_policy": "never",
+                "roots": roots,
+                "writable_roots": (),
+            },
+        )
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [response],
+                "turn/start": [{"turn": {"id": "turn_1"}}],
+            }
+        )
+
+        start_session(transport, plan, FakeSink())
+
+        params = transport.requests[1][1]
+        self.assertEqual(params["runtimeWorkspaceRoots"], list(roots))
+        self.assertNotIn("writableRoots", params)
+
+        incomplete = dict(response)
+        incomplete["runtimeWorkspaceRoots"] = [str(cwd)]
+        rejected = FakeTransport(
+            responses={"initialize": [{}], "thread/start": [incomplete]}
+        )
+        with self.assertRaisesRegex(VerificationError, "roots mismatch"):
+            start_session(rejected, plan, FakeSink())
+
     def test_non_network_sandbox_mode_is_sent_as_a_plain_string(self) -> None:
         """The legacy non-network request continues to send a string sandbox."""
 

@@ -535,9 +535,10 @@ class CodexAppServerSession:
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:
     """Start a Codex session and verify its effective parameters.
 
-    Forwards the adapter's sandbox request unchanged, including a tagged
-    network sandbox, then compares the server's flat echo to the requested
-    permissions.  A plan with ``resume_session_id`` uses ``thread/resume``
+    A fresh thread sends all declared workspace roots through the current
+    ``runtimeWorkspaceRoots`` input, alongside the adapter's unchanged sandbox
+    request, then compares the server's flat echo to the requested permissions.
+    A plan with ``resume_session_id`` uses ``thread/resume``
     and must return that exact identity; it never falls back to a fresh
     thread. Raises ``VerificationError`` for effective-param drift or an
     already active native session.
