@@ -388,6 +388,10 @@ class StartSessionTests(unittest.TestCase):
         self.assertEqual(sink.sessions, ["th_1"])
         methods = [method for method, _ in transport.requests]
         self.assertEqual(methods, ["initialize", "thread/start", "turn/start"])
+        start_params = transport.requests[1][1]
+        self.assertEqual(start_params["runtimeWorkspaceRoots"], [str(cwd)])
+        self.assertNotIn("roots", start_params)
+        self.assertNotIn("writableRoots", start_params)
         self.assertEqual(len(transport.timeouts), 3)
         self.assertTrue(all(100 < value <= 120 for value in transport.timeouts))
         self.assertEqual(

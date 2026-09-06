@@ -99,7 +99,7 @@ child. What the adapters drive:
 
 | Runtime | Engine process | Notes |
 |---|---|---|
-| `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots supported on read-only runs |
+| `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots are sent as `runtimeWorkspaceRoots` on read-only runs |
 | `claude` | `claude` CLI headless | `--setting-sources ""`, per-run plugin dirs |
 | `glm` | `claude` CLI pointed at Z.ai's Anthropic-compatible endpoint | subclass of the claude adapter; auth via env/keychain, base URL pinned in the adapter |
 | `qwen` | `qwen -p … --output-format stream-json --sandbox` | headless one-shot; approval mode maps to write/read-only; macOS uses Xcode's real Git binary instead of the sandbox-hostile `/usr/bin` shim |
