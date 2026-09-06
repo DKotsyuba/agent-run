@@ -42,6 +42,15 @@ from ..continuation import cli_resume_plan
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from ..rust import RUST_ENVIRONMENT_NAMES, rust_environment
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
+from .constants import (
+    ALWAYS_DISALLOWED as _ALWAYS_DISALLOWED, AUTH_NAMES as _AUTH_NAMES,
+    CAPABILITIES as _CAPABILITIES, KNOWN_HOOK_EVENTS as _KNOWN_HOOK_EVENTS,
+    MODEL_ALIASES as _MODEL_ALIASES, MODEL_DESCRIPTIONS as _MODEL_DESCRIPTIONS,
+    NETWORK_TOOLS as _NETWORK_TOOLS,
+    READ_TOOLS as _READ_TOOLS, SHELL_TOOLS as _SHELL_TOOLS,
+    SKILL_TOOLS as _SKILL_TOOLS, SUPPORTED_EFFORTS as _SUPPORTED_EFFORTS,
+    WRITE_TOOLS as _WRITE_TOOLS,
+)
 from .launch_io import abort_launch, known_secrets, open_runtime_log
 from .limits import agent_rate_limit_samples
 from .materialize import render_mcp_config, render_plugin_dirs, render_settings
@@ -55,54 +64,6 @@ from .stream import (
 )
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
-
-_CAPABILITIES = frozenset(
-    {
-        Capability.STEER,
-        Capability.EFFORT,
-        Capability.OUTPUT_SCHEMA,
-        Capability.READ_ROOTS,
-        Capability.WRITE,
-        Capability.TRANSCRIPT,
-        Capability.MODEL_ROSTER,
-        Capability.LIVE_LIMITS,
-        Capability.MCP,
-        Capability.SKILLS,
-        Capability.HOOKS,
-        Capability.RESUME,
-    }
-)
-
-_READ_TOOLS = ("Read", "Grep", "Glob")
-_SKILL_TOOLS = ("Skill",)
-_WRITE_TOOLS = ("Edit", "Write", "NotebookEdit")
-_SHELL_TOOLS = ("Bash",)
-_NETWORK_TOOLS = ("WebFetch", "WebSearch")
-_ALWAYS_DISALLOWED = _NETWORK_TOOLS
-_AUTH_NAMES = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
-_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-# Adapter-owned translation of public model ids to Claude API model ids.
-# Only the child argv's ``--model`` value is translated: the request model
-# id, the roster, and the persisted ``model`` adapter state all keep the
-# configured public id. Ids absent from this mapping pass through verbatim,
-# so every other configured model is untouched.
-_MODEL_ALIASES = {"fable": "claude-fable-5-1"}
-# Roster descriptions that name the concrete Claude release behind a public
-# id; ids absent from this mapping keep the generic description.
-_MODEL_DESCRIPTIONS = {"fable": "Claude Fable 5.1 (API model id: claude-fable-5-1)"}
-_KNOWN_HOOK_EVENTS = frozenset(
-    {
-        "PreToolUse",
-        "PostToolUse",
-        "UserPromptSubmit",
-        "Stop",
-        "SubagentStop",
-        "Notification",
-        "PreCompact",
-        "SessionStart",
-        "SessionEnd",
-    }
-)
 
 
 class ClaudeAdapter:

@@ -39,6 +39,7 @@ from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment
+from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
 _CONFIG_REL = "config.toml"
@@ -49,15 +50,6 @@ _ROLLOUT_FILES = 24
 _ROLLOUT_TAIL_BYTES = 262_144
 _ROLLOUT_TAIL_LINES = 2_048
 _APPROVAL_POLICY = "never"
-
-
-def _toml_string(value: str) -> str:
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def _toml_array(values) -> str:
-    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
 
 
 def _read_json(path: Path) -> object | None:
