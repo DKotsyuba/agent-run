@@ -38,6 +38,7 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from ..continuation import cli_resume_plan
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .launch_io import abort_launch, known_secrets, open_runtime_log
@@ -67,6 +68,7 @@ _CAPABILITIES = frozenset(
         Capability.MCP,
         Capability.SKILLS,
         Capability.HOOKS,
+        Capability.RESUME,
     }
 )
 
@@ -278,7 +280,6 @@ class ClaudeAdapter:
             "--input-format",
             "stream-json",
             "--verbose",
-            "--no-session-persistence",
             "--model",
             _MODEL_ALIASES.get(request.model, request.model),
             "--permission-mode",
@@ -379,6 +380,8 @@ class ClaudeAdapter:
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> "ClaudeSession":
+        """Launch a fresh or explicitly resumed Claude session in its own process group."""
+        plan = cli_resume_plan(plan, session_option="--session-id")
         process = subprocess.Popen(
             list(plan.argv),
             cwd=str(plan.cwd),
@@ -486,15 +489,11 @@ class ClaudeSession:
         return None
 
     def _read_stdout(self) -> None:
-        """Drain child stdout on the reader thread: log, decode, and publish.
+        """Redact/log stdout and publish decoded messages, events and warnings.
 
-        Each line is redacted, appended to the runtime log, then fed to the
-        decoder; the resulting messages, events and warnings go to the sink.
-        The session id is published only when it first appears or actually
-        changes, so a repeated id costs nothing. A terminal ``result`` line
-        settles the run. Any exception is stored for :meth:`wait` to re-raise
-        while the loop keeps draining the pipe, and ``self._settled`` is set on
-        every exit path, including crash and EOF.
+        Publish native identity once and verify it for continuations. Store
+        reader exceptions for wait() while draining the pipe; wake wait() on
+        any error, terminal result, crash or EOF.
         """
 
         try:
@@ -508,6 +507,11 @@ class ClaudeSession:
                         self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
                         self._raw_stream.flush()
                     result = self._decoder.feed(sanitized, at=time.time())
+                    expected = self._plan.resume_session_id
+                    if expected is not None and result.session_id and result.session_id != expected:
+                        raise ValidationError("runtime resumed a different native session")
+                    if expected is not None and result.terminal and result.terminal.runtime_session_id != expected:
+                        raise ValidationError("runtime did not confirm the resumed native session")
                     if result.session_id and result.session_id != self._reported_session_id:
                         self._reported_session_id = result.session_id
                         self._sink.session(result.session_id)
@@ -528,6 +532,7 @@ class ClaudeSession:
                 except BaseException as error:  # persisted for wait(); keep draining the pipe
                     if self._reader_error is None:
                         self._reader_error = error
+                    self._settled.set()
         finally:
             # Covers the crash/EOF case too: the child exited (or the pipe
             # closed) without ever producing a terminal line, so ``wait``

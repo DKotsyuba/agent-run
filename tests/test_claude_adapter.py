@@ -447,7 +447,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertIn("--setting-sources", argv)
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
         self.assertIn("--strict-mcp-config", argv)
-        self.assertIn("--no-session-persistence", argv)
+        self.assertNotIn("--no-session-persistence", argv)
         self.assertIn("--permission-mode", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         tools = argv[argv.index("--tools") + 1].split(",")

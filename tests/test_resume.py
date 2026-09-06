@@ -454,6 +454,17 @@ class ResumeTests(unittest.TestCase):
             self.service.resume(parent, "again")
         self.assertIn(first.agent_id, str(caught.exception))
 
+    def test_stale_ancestor_names_the_latest_descendant(self) -> None:
+        """An old source identifies the actual chain head, not another stale node."""
+        parent = self._parent()
+        second = self.service.resume(parent, "second")
+        self._wait(2)
+        self._finish(second.agent_id)
+        third = self.service.resume(second.agent_id, "third")
+        self._wait(3)
+        with self.assertRaisesRegex(ValidationError, third.agent_id):
+            self.service.resume(parent, "stale request")
+
     def test_two_processes_racing_one_parent_accept_exactly_one_child(self) -> None:
         """Two separate SQLite connections, one durable child."""
 

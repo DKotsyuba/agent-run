@@ -117,16 +117,19 @@ def resume_lineage(
 def latest_child(
     connection: sqlite3.Connection, parent_agent_id: AgentId
 ) -> AgentId | None:
-    """Return the agent that already resumed ``parent_agent_id``, if any.
+    """Return the latest chain node if ``parent_agent_id`` already has a child.
 
     Used only to name the winner in the error raised for a losing concurrent
-    resume, so the caller can point at the accepted chain node instead of
+    resume, so the caller can point at the current chain head instead of
     reporting an opaque constraint failure. Returns ``None`` when the parent
     has no child, which for a failed INSERT means the conflict was something
     other than the one-child guard.
     """
 
     row = connection.execute(
-        "SELECT id FROM agents WHERE parent_agent_id = ?", (parent_agent_id,)
+        """SELECT latest.id FROM agents AS child
+           JOIN agents AS latest ON latest.root_agent_id = child.root_agent_id
+           WHERE child.parent_agent_id = ?
+           ORDER BY latest.sequence DESC LIMIT 1""", (parent_agent_id,)
     ).fetchone()
     return None if row is None else AgentId(str(row["id"]))

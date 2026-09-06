@@ -53,6 +53,15 @@ class FakeService:
         self.request = request
         return self._return("start", FakeStart())
 
+    def resume(self, agent_id, task, **kwargs):
+        """Capture the continuation request without starting an agent."""
+        self.request = {"agent_id": agent_id, "task": task, **kwargs}
+        return self._return("resume", FakeStart())
+
+    def chain(self, agent_id, **kwargs):
+        """Return a deterministic page for CLI forwarding checks."""
+        return self._return("chain", {"agent_id": agent_id, **kwargs})
+
     def bind(self, agent_id, ref):
         return self._return("bind", {"agent_id": agent_id, "orchestrator": ref})
 
@@ -144,6 +153,40 @@ class FakeService:
 
 
 class CliTests(unittest.TestCase):
+    def test_resume_task_file_preserves_whitespace_and_session_binding(self):
+        """Task-file input remains exact and belongs to the new notification caller."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task.txt"
+            path.write_bytes(b"  fix this\r\n\r\n")
+            service = FakeService()
+            code, output, error = self.run_cli([
+                "resume", AGENT_ID, "--task-file", str(path), "--timeout", "32",
+                "--request-id", "retry", "--session-transport", "codex_queue",
+                "--session-id", "new-caller",
+            ], service=service)
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(output)["agent_id"], AGENT_ID)
+            self.assertEqual(service.request["task"], "  fix this\r\n\r\n")
+            self.assertEqual(service.request["orchestrator"].external_session_id, "new-caller")
+            self.assertEqual(service.request["timeout_seconds"], 32)
+        self.assertEqual(self.run_cli(["resume", AGENT_ID, "--task", "a", "--task-file", "b"])[0], 2)
+
+    def test_resume_uses_broker_without_constructing_local_runtime(self):
+        """A short-lived CLI never owns a continuation preparation worker."""
+        broker = Mock()
+        broker.resume.return_value = FakeStart()
+        with patch.object(cli, "BrokerClient", return_value=broker), patch.object(cli, "_Runtime", side_effect=AssertionError("local runtime")):
+            code = cli.main(["resume", AGENT_ID, "--task", "fix"], stdout=io.StringIO(), stderr=io.StringIO())
+        self.assertEqual(code, 0)
+        broker.resume.assert_called_once()
+        self.assertEqual(broker.resume.call_args.args, (AGENT_ID, "fix"))
+        broker.close.assert_called_once()
+
+    def test_chain_forwards_cursor_and_limit(self):
+        """Chain pagination stays owned by the service."""
+        code, output, error = self.run_cli(["chain", AGENT_ID, "--cursor", "2", "--limit", "3"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output), {"agent_id": AGENT_ID, "cursor": 2, "limit": 3})
     def run_cli(self, argv, *, service=None, stdin=""):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -1040,7 +1083,7 @@ target = "auth.json"
                 "list_orchestrators",
                 "summary", "transcript", "answer", "models", "limits", "doc",
                 "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
-                "workflow_resume",
+                "workflow_resume", "resume", "chain",
             ],
         )
 

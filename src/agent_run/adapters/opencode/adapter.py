@@ -31,10 +31,11 @@ from ..base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from ..home import content_hash, seal_answer, write_managed_file
+from ..home import content_hash, write_managed_file
 from ..plugin_skills import skill_dirs
 from ..omniroute import pool_samples
 from .http import POLL_INTERVAL_SECONDS, HttpError, OpenCodeHttpClient
+from .continuation import ANSWER_NAME, message_entries, resume_boundary, seal_result
 from .normalize import (
     PRIMARY_AGENT,
     _sequence,
@@ -68,7 +69,6 @@ from .service import (
 
 RUNTIME_NAME = "opencode"
 VERIFY_AGENT = "agent-run-verify"
-ANSWER_NAME = "answer.md"
 DEFAULT_WAIT_SECONDS = 480.0
 CAPABILITIES = frozenset(
     {
@@ -80,6 +80,7 @@ CAPABILITIES = frozenset(
         Capability.LIVE_LIMITS,
         Capability.MCP,
         Capability.SKILLS,
+        Capability.RESUME,
     }
 )
 
@@ -453,13 +454,18 @@ class OpenCodeAdapter:
         # files counted as an external directory and raised a permission ask
         # -- the ask that both final canaries died on.
         workdir = str(state["workdir"])
-        opened = client.create_session(
-            {
-                "agent": PRIMARY_AGENT,
-                "model": dict(model),
-                "location": {"directory": workdir},
-            }
-        )
+        previous_ids = None
+        if plan.resume_session_id is not None:
+            previous_ids = resume_boundary(client, plan.resume_session_id, workdir, model)
+            opened = {"id": plan.resume_session_id}
+        else:
+            opened = client.create_session(
+                {
+                    "agent": PRIMARY_AGENT,
+                    "model": dict(model),
+                    "location": {"directory": workdir},
+                }
+            )
         session_id = opened.get("id")
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValidationError("opencode service returned no session id")
@@ -472,6 +478,7 @@ class OpenCodeAdapter:
             pid=service.get("pid"),
             response_dir=response_dir,
             model=dict(model),
+            previous_message_ids=previous_ids,
         )
         # v1's prompt body carries no per-turn agent/model at all -- selection
         # is fixed at session-create time above (proven live via v1's own
@@ -500,6 +507,7 @@ class OpenCodeRuntimeSession:
         sleep=time.sleep,
         monotonic=time.monotonic,
         interval_seconds: float = POLL_INTERVAL_SECONDS,
+        previous_message_ids: frozenset[str] | None = None,
     ) -> None:
         self._client = client
         self._session_id = session_id
@@ -516,6 +524,7 @@ class OpenCodeRuntimeSession:
         self._cancel_requested = False
         self._refused = False
         self._unreadable_permissions = False
+        self._previous_message_ids = previous_message_ids
         sink.session(session_id)
 
     @property
@@ -529,29 +538,15 @@ class OpenCodeRuntimeSession:
         return False
 
     def wait(self, timeout_seconds: float | None) -> Outcome | None:
-        """Settle this session, answering its permissions while it works.
+        """Resolve permissions and poll for an outcome within a positive seconds budget.
 
-        ``/api/session/active`` reports only a currently-running session; it
-        cannot tell "not started yet" from "just finished". So an absence is
-        never itself an outcome: a settled poll only ends the turn once the
-        fetched transcript actually shows one -- the primary agent produced
-        real text, its most recent message carries a structured error, or
-        this session's own ``cancel()`` already fired (a v1 ``/interrupt``
-        sent right after ``prompt`` can settle with neither, proven live,
-        T041). Checking the transcript itself, rather than trusting an
-        absence on its own, also covers the gap ``/active`` leaves *between*
-        a multi-round session's tool calls: the newest message there is an
-        assistant turn with only a tool-call part -- no text, no error -- and
-        that must keep waiting rather than be read as done (proven live,
-        T17B: v1 1.18.18 settled mid-tool-round on a bare tool-call message
-        and raised "opencode session outcome is not terminal: None").
-
-        A rejected permission is the fourth terminal signal, for the same
-        reason ``cancel()`` is: v1 answers a rejection by interrupting the
-        tool and ending the turn outright, leaving the exact text-less
-        tool-only message the T17B rule keeps waiting on. Without this the run
-        polled that dead turn until its deadline and timed out with no answer
-        (proven live: the reject landed in ~100ms, the turn never reopened).
+        None selects DEFAULT_WAIT_SECONDS; expiry returns None. Absence from
+        the active map and bare tool-call rounds are not terminal evidence.
+        Require new primary-agent text, a structured error, this run's cancel,
+        or a rejected permission. A continuation excludes every pre-prompt
+        message, so the preceding turn cannot settle it. Intermediate captures
+        are released; the final capture is retained as evidence. Invalid native
+        payloads and nonpositive budgets raise ValidationError.
         """
 
         deadline = DEFAULT_WAIT_SECONDS if timeout_seconds is None else float(timeout_seconds)
@@ -565,6 +560,9 @@ class OpenCodeRuntimeSession:
                 capture = self._client.messages(self._session_id)
                 try:
                     payload = capture.json()
+                    if self._previous_message_ids is not None:
+                        payload = [item for item in message_entries(payload)
+                                   if item["id"] not in self._previous_message_ids]
                     final = (
                         self._cancel_requested
                         or self._refused
@@ -596,6 +594,11 @@ class OpenCodeRuntimeSession:
     def _finish(self, info, payload, capture) -> Outcome:
         """Emit the transcript, record answer.md, and keep only this capture."""
 
+        if self._previous_message_ids is not None:
+            # Native session outcome can still describe its previous turn.
+            # Infer this run's outcome only from its newly captured messages.
+            info = {}
+
         outcome = normalize_outcome(
             info,
             payload,
@@ -609,16 +612,7 @@ class OpenCodeRuntimeSession:
         # capture.raw_ref would fail it (and would leak this host's tmp layout).
         for message in normalize_transcript(payload, raw_ref=capture.body_path.name):
             self._sink.message(message)
-        answer = extract_answer(payload, agent=self._agent)
-        if answer and self._response_dir is not None:
-            path = Path(self._response_dir) / ANSWER_NAME
-            size, digest = seal_answer(path, answer)
-            outcome = replace(
-                outcome,
-                answer_path=path,
-                answer_bytes=size,
-                answer_sha256=digest,
-            )
+        outcome = seal_result(outcome, payload, self._response_dir, self._agent)
         blocked = self._broker.blocked_summary()
         if blocked:
             self._sink.event("permissions_blocked", blocked)

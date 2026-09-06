@@ -104,6 +104,20 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--account")
     _session(start)
 
+    resume = commands.add_parser("resume")
+    resume.add_argument("agent_id")
+    task = resume.add_mutually_exclusive_group(required=True)
+    task.add_argument("--task")
+    task.add_argument("--task-file")
+    resume.add_argument("--timeout", type=float)
+    resume.add_argument("--request-id")
+    _session(resume)
+
+    chain = commands.add_parser("chain")
+    chain.add_argument("agent_id")
+    chain.add_argument("--cursor", type=int)
+    chain.add_argument("--limit", type=int, default=50)
+
     auth = commands.add_parser("auth")
     auth.add_argument("label")
     auth.add_argument("runtime")
@@ -437,6 +451,21 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     """Dispatch one parsed CLI command to its service operation."""
 
     command = args.command
+    if command == "resume":
+        if args.task_file is None:
+            task = _text(args.task, stream, "resume task")
+        else:
+            try:
+                task = _read(stream) if args.task_file == "-" else Path(args.task_file).read_bytes().decode("utf-8")
+            except (OSError, UnicodeError) as error:
+                raise ValidationError(f"cannot read resume task file: {error}") from error
+        result = service.resume(
+            args.agent_id, task, timeout_seconds=args.timeout,
+            request_id=args.request_id, orchestrator=_ref(args),
+        )
+        return {"agent_id": result.agent_id, "created": result.created}
+    if command == "chain":
+        return service.chain(args.agent_id, cursor=args.cursor, limit=args.limit)
     if command == "workflow":
         if args.workflow_command == "start":
             values = None if args.args is None else _object(args.args, "workflow args")
@@ -1041,7 +1070,7 @@ def main(
             if service is None:
                 if args.command == "api":
                     child_reaper = ChildReaper()
-                if args.command == "start":
+                if args.command in {"start", "resume", "chain"}:
                     start_broker = BrokerClient(home / "api.sock")
                     target = start_broker
                 else:

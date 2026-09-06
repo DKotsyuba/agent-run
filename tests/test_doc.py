@@ -104,7 +104,7 @@ class DocMcpTests(unittest.TestCase):
 
         responses = self.run_server([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
         names = [tool["name"] for tool in responses[0]["result"]["tools"]]
-        self.assertEqual(len(names), 19)
+        self.assertEqual(len(names), 21)
         self.assertIn("doc", names)
 
     def test_doc_tool_call_returns_index_and_topic(self):
