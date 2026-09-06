@@ -60,6 +60,23 @@ _FAILURE_TEXT_CHARS = 512
 _CHUNK = 65536
 _PENDING_CONFIG_REVISION = "pending:materialization"
 
+
+def _log_start_preparation_stage(
+    agent_id: AgentId, stage: str, started_at: float
+) -> None:
+    """Record one bounded startup-preparation stage without request payloads.
+
+    ``started_at`` is a monotonic timestamp set by the worker before preparation;
+    only its elapsed duration, the opaque agent id, and a fixed stage name reach
+    the log.
+    """
+    _logger.info(
+        "start preparation agent_id=%s stage=%s elapsed_seconds=%.3f",
+        agent_id,
+        stage,
+        time.monotonic() - started_at,
+    )
+
 LaunchAgent: TypeAlias = Callable[
     [AgentId, StartRequest, RuntimeAdapter, LaunchPlan, Path], None
 ]
@@ -519,6 +536,8 @@ class AgentService:
         """
 
         failure_kind = "prepare_failed"
+        preparation_started = time.monotonic()
+        stage = "account"
         try:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
@@ -548,6 +567,7 @@ class AgentService:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
+            stage = "configuration"
             adapter = AdapterRegistry(self._config).load(
                 request.runtime,
                 self._required_capabilities(request, effective_runtime),
@@ -570,6 +590,7 @@ class AgentService:
             )
             record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
+            stage = "materialize"
             revision = adapter.materialize(
                 effective_runtime,
                 effective_home,
@@ -584,10 +605,12 @@ class AgentService:
                 request.runtime,
                 revision,
             )
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
             candidate_dir = create_agent_dir(agent_id, self._home)
+            stage = "prepare"
             plan = adapter.prepare(
                 request,
                 profile,
@@ -620,8 +643,10 @@ class AgentService:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
             _logger.warning(
-                "start agent_id=%s failed asynchronous error_kind=%s",
+                "start agent_id=%s failed stage=%s elapsed_seconds=%.3f error_kind=%s",
                 agent_id,
+                stage,
+                time.monotonic() - preparation_started,
                 type(error).__name__,
             )
             self._fail_created_start(
