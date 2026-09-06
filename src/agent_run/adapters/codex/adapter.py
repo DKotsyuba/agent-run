@@ -661,11 +661,7 @@ class CodexAdapter:
                     "codex read-only sandbox cannot grant network access; "
                     "run network profiles on claude or grant write"
                 )
-            adapter_state["sandbox"] = {
-                "workspace-write": {
-                    "networkAccess": True,
-                }
-            }
+            adapter_state["network_access"] = True
         argv = [str(config.binary)]
         if request.fast:
             argv.extend(("-c", "service_tier=fast", "-c", "features.fast_mode=true"))

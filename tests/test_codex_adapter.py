@@ -948,23 +948,21 @@ env_from = ["PATH"]
             self.prepare(self.start_request(), profile, config)
 
     def test_prepare_enables_network_in_a_write_sandbox(self) -> None:
-        """Write-capable network profiles use the tagged workspace-write form."""
+        """Write-capable network profiles record an explicit network grant flag."""
 
         config = self.materialized()
         profile = AgentProfile("research", "body", True, (), True)
         plan = self.prepare(self.start_request(write=True), profile, config)
-        self.assertEqual(
-            plan.adapter_state["sandbox"], {"workspace-write": {"networkAccess": True}}
-        )
+        self.assertEqual(plan.adapter_state["network_access"], True)
 
     def test_prepare_keeps_non_network_sandbox_mode_plain(self) -> None:
-        """Profiles without network permission do not add a sandbox mapping."""
+        """Profiles without network permission do not add a network grant flag."""
 
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
         plan = self.prepare(self.start_request(), profile, config)
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
-        self.assertNotIn("sandbox", plan.adapter_state)
+        self.assertNotIn("network_access", plan.adapter_state)
 
     def test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents(self) -> None:
         """A read-only sandbox cannot spool before execution, so the outside

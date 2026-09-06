@@ -17,6 +17,7 @@ from typing import Mapping, Protocol
 
 from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
+from .environment import thread_grant_params
 from .process_transport import ProcessTransport
 
 
@@ -574,33 +575,27 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     transport.notify("initialized")
     roots = tuple(state["roots"])
     writable_roots = tuple(state["writable_roots"])
-    sandbox = state.get("sandbox", state["sandbox_mode"])
-    network_access = False
-    if isinstance(sandbox, Mapping) and len(sandbox) == 1:
-        _, sandbox_params = next(iter(sandbox.items()))
-        network_access = (
-            isinstance(sandbox_params, Mapping)
-            and sandbox_params.get("networkAccess") is True
-        )
+    sandbox_mode = state["sandbox_mode"]
+    network_access = bool(state.get("network_access", False))
+    grant_params = thread_grant_params(
+        str(plan.cwd), state["model"], sandbox_mode, state["approval_policy"], roots, network_access,
+    )
     resume_session_id = plan.resume_session_id
     if resume_session_id is None:
-        thread = transport.request(
-            "thread/start",
-            {
-                "cwd": str(plan.cwd),
-                "model": state["model"],
-                "effort": state.get("effort"),
-                "sandbox": sandbox,
-                "approvalPolicy": state["approval_policy"],
-                "runtimeWorkspaceRoots": list(roots),
-                "mcpServers": list(state.get("mcp", ())),
-                "skills": list(state.get("skills", ())),
-            },
-            timeout_seconds=remaining(),
-        )
+        thread = transport.request("thread/start", grant_params, timeout_seconds=remaining())
     else:
+        # A bare ``{"threadId": ...}`` resume once let a native continuation
+        # silently drop its original write grant (observed live: resume
+        # returned a read-only echo against a recorded workspace-write
+        # session). Supplying the original grant does not by itself
+        # guarantee the runtime honors it -- a control probe kept its grant
+        # even when these fields were omitted -- so this only prevents
+        # unnoticed drift; ``verify_effective_params`` below still fails
+        # closed on whatever the server actually echoes.
         thread = transport.request(
-            "thread/resume", {"threadId": resume_session_id}, timeout_seconds=remaining()
+            "thread/resume",
+            {**grant_params, "threadId": resume_session_id},
+            timeout_seconds=remaining(),
         )
         native_status = _mapping(thread.get("thread")).get("status", thread.get("status"))
         if isinstance(native_status, Mapping):
@@ -626,11 +621,14 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
             f"expected {resume_session_id!r}, got {thread_id!r}"
         )
     sink.session(thread_id)
-    turn_ack = transport.request(
-        "turn/start",
-        {"threadId": thread_id, "input": [{"type": "text", "text": plan.initial_input}]},
-        timeout_seconds=remaining(),
-    )
+    turn_params: dict[str, object] = {
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": plan.initial_input}],
+    }
+    effort = state.get("effort")
+    if effort is not None:
+        turn_params["effort"] = effort
+    turn_ack = transport.request("turn/start", turn_params, timeout_seconds=remaining())
     turn = turn_ack.get("turn")
     turn_id = turn.get("id") if isinstance(turn, Mapping) else None
     if not isinstance(turn_id, str) or not turn_id:

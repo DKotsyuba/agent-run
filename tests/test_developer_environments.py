@@ -48,6 +48,22 @@ class DeveloperEnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "missing executable: missing"):
             developer_environment({"HOME": "/isolated", "PATH": "/bin"}, _runtime(EnvironmentConfig(required_commands=("missing",))), Path("/tmp"))
 
+    def test_rejects_rustup_toolchain_pin_and_auth_name_overrides(self) -> None:
+        """A preset may not plant the Rust toolchain pin or shadow auth names."""
+        from agent_run.config import RuntimeAuthConfig
+
+        with self.assertRaisesRegex(ValidationError, "protected keys: RUSTUP_TOOLCHAIN"):
+            developer_environment(
+                {"HOME": "/isolated", "PATH": "/bin"},
+                _runtime(EnvironmentConfig(variables=MappingProxyType({"RUSTUP_TOOLCHAIN": "stable"}))),
+                Path("/tmp"),
+            )
+        config = _runtime(EnvironmentConfig(variables=MappingProxyType({"OPENAI_API_KEY": "x"})))
+        from dataclasses import replace
+        config = replace(config, auth=RuntimeAuthConfig(kind="environment", names=("OPENAI_API_KEY",)))
+        with self.assertRaisesRegex(ValidationError, "protected keys: OPENAI_API_KEY"):
+            developer_environment({"HOME": "/isolated", "PATH": "/bin"}, config, Path("/tmp"))
+
     def test_config_resolves_preset_and_validates_command_overlap(self) -> None:
         """Runtime selections resolve objects and invalid command policy is rejected."""
 

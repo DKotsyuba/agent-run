@@ -17,6 +17,14 @@ from .rust import RUST_ENVIRONMENT_NAMES, rust_environment
 
 _PROTECTED = frozenset({"HOME", "CODEX_HOME", "PATH", "ENV", "BASH_ENV", "ZDOTDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"})
 
+#: Engine-owned Rust control variable. ``rust_environment`` deliberately never
+#: sets or clears it so that a directory's own ``rust-toolchain`` pin is never
+#: overridden; leaving it declarable here would let a preset silently plant
+#: that same pin override and then leak back out through
+#: ``configured_environment_keys``, which excludes it from the Rust key set
+#: on the assumption that it is never one of this module's own values.
+_RESERVED_CONTROL = frozenset({"RUSTUP_TOOLCHAIN"})
+
 
 def developer_environment(environment: Mapping[str, str], config: RuntimeConfig, workdir: Path) -> dict[str, str]:
     """Return a child environment from an isolated baseline and one selected preset.
@@ -24,7 +32,9 @@ def developer_environment(environment: Mapping[str, str], config: RuntimeConfig,
     The input mapping is copied and is the sole baseline; no ambient values are
     read. A selected preset prepends declared paths, expands only ``{workdir}``
     and ``{home}`` in declared variables, and checks required commands through
-    the final PATH. Protected identity and shell-startup keys are rejected.
+    the final PATH. Protected identity and shell-startup keys, the configured
+    runtime's ``auth.names`` credentials, and the Rust toolchain-pin control
+    variable ``RUSTUP_TOOLCHAIN`` are all rejected as preset variable names.
     Runtime Rust overrides preset Rust, and the shared Rust provisioner runs
     exactly once. Invalid declarations or missing required executables raise
     ``ValidationError`` without creating files or installing software.
@@ -34,7 +44,8 @@ def developer_environment(environment: Mapping[str, str], config: RuntimeConfig,
     selected = config.environment
     if selected is None:
         return rust_environment(result, config, workdir)
-    protected = sorted(_PROTECTED & selected.variables.keys())
+    auth_names = frozenset(config.auth.names) if config.auth is not None else frozenset()
+    protected = sorted((_PROTECTED | _RESERVED_CONTROL | auth_names) & selected.variables.keys())
     if protected:
         raise ValidationError("environment variables may not override protected keys: " + ", ".join(protected))
     configured = [str(path) for path in selected.path]

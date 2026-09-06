@@ -336,7 +336,17 @@ class StartSessionTests(unittest.TestCase):
             [method for method, _params in transport.requests],
             ["initialize", "thread/resume", "turn/start"],
         )
-        self.assertEqual(transport.requests[1][1], {"threadId": "th_saved"})
+        self.assertEqual(
+            transport.requests[1][1],
+            {
+                "cwd": "/work",
+                "model": "gpt-5.6-sol",
+                "sandbox": "read-only",
+                "approvalPolicy": "never",
+                "runtimeWorkspaceRoots": ["/work"],
+                "threadId": "th_saved",
+            },
+        )
         self.assertEqual(transport.requests[-1][1]["input"], [{"type": "text", "text": "write to the new answer path"}])
 
     def test_resume_refuses_a_replacement_or_active_thread(self) -> None:
@@ -470,8 +480,8 @@ class StartSessionTests(unittest.TestCase):
 
         self.assertEqual(transport.requests[1][1]["sandbox"], "read-only")
 
-    def test_network_sandbox_is_sent_as_a_tagged_mapping(self) -> None:
-        """Tagged network requests are unwrapped only for echo verification."""
+    def test_network_grant_is_sent_as_a_workspace_write_config_flag(self) -> None:
+        """A requested network grant rides in ``config``, not the sandbox field."""
 
         cwd = Path("/work")
         plan = make_plan(
@@ -480,7 +490,7 @@ class StartSessionTests(unittest.TestCase):
                 "model": "gpt-5.6-sol",
                 "effort": None,
                 "sandbox_mode": "workspace-write",
-                "sandbox": {"workspace-write": {"networkAccess": True}},
+                "network_access": True,
                 "approval_policy": "never",
                 "roots": (str(cwd),),
                 "writable_roots": (),
@@ -501,10 +511,9 @@ class StartSessionTests(unittest.TestCase):
 
         start_session(transport, plan, FakeSink())
 
-        self.assertEqual(
-            transport.requests[1][1]["sandbox"],
-            {"workspace-write": {"networkAccess": True}},
-        )
+        sent = transport.requests[1][1]
+        self.assertEqual(sent["sandbox"], "workspace-write")
+        self.assertEqual(sent["config"], {"sandbox_workspace_write": {"network_access": True}})
 
     def test_refuses_when_effective_params_drift(self) -> None:
         cwd = Path("/work")
