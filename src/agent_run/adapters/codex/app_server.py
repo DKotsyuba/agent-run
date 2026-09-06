@@ -535,6 +535,7 @@ class CodexAppServerSession:
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:
     """Start a Codex session and verify its effective parameters.
 
+    Initialize opts into the experimental API required by workspace roots.
     A fresh thread sends all declared workspace roots through the current
     ``runtimeWorkspaceRoots`` input, alongside the adapter's unchanged sandbox
     request, then compares the server's flat echo to the requested permissions.
@@ -564,7 +565,10 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
 
     transport.request(
         "initialize",
-        {"clientInfo": {"name": "agent-run", "version": "1"}},
+        {
+            "clientInfo": {"name": "agent-run", "version": "1"},
+            "capabilities": {"experimentalApi": True},
+        },
         timeout_seconds=remaining(),
     )
     transport.notify("initialized")

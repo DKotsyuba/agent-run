@@ -400,7 +400,7 @@ class StartSessionTests(unittest.TestCase):
         )
 
     def test_read_only_thread_start_preserves_every_workspace_root(self) -> None:
-        """Send all read-only roots and reject an echo that drops one."""
+        """Negotiate experimental roots support and reject a dropped read root."""
         cwd = Path("/work")
         roots = (str(cwd), "/external")
         response = thread_response(cwd, roots=roots)
@@ -427,6 +427,10 @@ class StartSessionTests(unittest.TestCase):
 
         start_session(transport, plan, FakeSink())
 
+        self.assertEqual(transport.requests[0][0], "initialize")
+        self.assertEqual(
+            transport.requests[0][1].get("capabilities"), {"experimentalApi": True}
+        )
         params = transport.requests[1][1]
         self.assertEqual(params["runtimeWorkspaceRoots"], list(roots))
         self.assertNotIn("writableRoots", params)
