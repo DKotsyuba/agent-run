@@ -6,8 +6,21 @@ not accepted; `pytest` and packaging tools are development-only.
 ```bash
 python3.14 -m venv .venv-py314
 .venv-py314/bin/python -m pip install -e ".[test,release]"
-.venv-py314/bin/python -m pytest -q --rootdir . tests
+PYTHONPATH=src .venv-py314/bin/python -m pytest -q --rootdir . tests
 ```
+
+When reusing an environment across worktrees, verify where the package imports
+from before trusting test results. An editable installation can still point to
+the checkout where the environment was created; changing cwd or pytest's
+`--rootdir` does not change that installation.
+
+```bash
+PYTHONPATH=src .venv-py314/bin/python -c 'from pathlib import Path; import agent_run; origin = Path(agent_run.__file__).resolve(); print(origin); assert origin.is_relative_to(Path.cwd() / "src")'
+```
+
+Keep the same explicit source path for the test command. If the import assertion
+fails, repair the environment/source selection before interpreting failures or
+accepting a green run.
 
 If a timing-sensitive test in `tests/test_launch.py` fails under load, rerun
 that module in isolation before treating it as a product failure. Never weaken
