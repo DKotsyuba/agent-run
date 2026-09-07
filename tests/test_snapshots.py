@@ -178,17 +178,35 @@ class ManagedSnapshotTests(unittest.TestCase):
             ),
             profile=profile,
         )
+        observed_version = build_config_snapshot(
+            runtime="claude",
+            adapter_api_version=1,
+            schema_version=1,
+            materialize_revision="files-1",
+            snapshot_index_sha256=index_sha256,
+            config=config,
+            profile=profile,
+            runtime_version="2.1.0 (Claude Code)",
+        )
         self.assertEqual(first, same)
+        self.assertIsNone(first.runtime_version)
+        self.assertEqual(observed_version.runtime_version, "2.1.0 (Claude Code)")
         self.assertNotEqual(first.sha256, changed.sha256)
         self.assertNotEqual(first.sha256, declared_assets.sha256)
+        self.assertNotEqual(first.sha256, observed_version.sha256)
         self.assertNotIn(secret.encode(), first.document)
         candidate = self.root / "candidate"
         candidate.mkdir()
-        (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(first.document)
-        self.assertEqual(inspect_config_snapshot(candidate, first.sha256), first)
-        (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(first.document + b" ")
+        (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(observed_version.document)
+        self.assertEqual(
+            inspect_config_snapshot(candidate, observed_version.sha256),
+            observed_version,
+        )
+        (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(
+            observed_version.document + b" "
+        )
         with self.assertRaisesRegex(ValidationError, "hash"):
-            inspect_config_snapshot(candidate, first.sha256)
+            inspect_config_snapshot(candidate, observed_version.sha256)
 
     def test_runtime_index_detects_an_entire_missing_snapshot_root(self) -> None:
         """Keep expected roots discoverable after their whole directory disappears."""
