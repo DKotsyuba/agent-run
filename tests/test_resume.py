@@ -103,7 +103,7 @@ class ResumeTests(unittest.TestCase):
         self._wait(2)
         again = self.service.resume(parent, "continue", request_id="caller-replay", orchestrator=caller)
         self.assertEqual(first.agent_id, again.agent_id)
-        with self.assertRaisesRegex(ValidationError, "request_id"):
+        with self.assertRaisesRegex(ValidationError, "already been resumed"):
             self.service.resume(parent, "continue", request_id="caller-replay")
         with self.assertRaises(ValidationError):
             self.service.resume(parent, "continue", request_id="caller-replay", timeout_seconds=True)

@@ -412,6 +412,27 @@ class AgentServiceTests(unittest.TestCase):
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
 
+    def test_crash_before_worker_registration_leaves_owned_starting_row(self) -> None:
+        """A process-level interruption cannot expose ownerless ``CREATED`` state."""
+
+        with patch.object(
+            self.service._starts,
+            "submit",
+            side_effect=KeyboardInterrupt("coordinator crashed"),
+        ), self.assertRaisesRegex(KeyboardInterrupt, "coordinator crashed"):
+            self.service.start(self.request(request_id="registration-crash"))
+
+        row = self.store.list_agents()[0]
+        self.assertEqual(row["status"], AgentStatus.STARTING.value)
+        self.assertIsInstance(row["startup_owner_pid_identity"], str)
+        self.assertIsInstance(row["startup_owner_birth_time"], float)
+        self.assertEqual(row["startup_deadline_at"], 220.0)
+        events = self.store.connection.execute(
+            "SELECT kind FROM events WHERE agent_id = ? ORDER BY seq", (row["id"],)
+        ).fetchall()
+        self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
+        self.assertEqual(self.launched, [])
+
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""
         config = replace(

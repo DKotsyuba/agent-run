@@ -73,9 +73,11 @@ def replayed_resume(
     """Return an accepted matching resume before inspecting mutable resources.
 
     Validate the caller-controlled task, timeout and notification reference.
-    A known request ID must match its immutable parent, prompt, effective timeout
-    and caller; conflicts raise ValidationError. Unknown or absent IDs return
-    None and normal admission still performs its atomic replay/race check.
+    A request ID known within the same caller namespace must match its immutable
+    parent, prompt and effective timeout; conflicts raise ValidationError. A
+    different caller namespace is a distinct request and proceeds to the normal
+    one-child admission guard. Unknown or absent IDs return None and normal
+    admission still performs its atomic replay/race check.
     This read-only lookup never resolves filesystem paths or current config.
     """
     nonblank("task", task)

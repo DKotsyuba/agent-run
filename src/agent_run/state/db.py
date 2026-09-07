@@ -294,8 +294,9 @@ def idempotent_agent(
 ) -> sqlite3.Row | None:
     """Return one replay within its exact orchestrator-session namespace.
 
-    ``None`` selects only rows without an orchestrator. A reference selects the
-    exact transport, external session and nullable turn tuple. The caller's
+    ``None`` selects only rows without an orchestrator. A reference selects its
+    transport and external session; the mutable turn remains part of canonical
+    request comparison. The caller's
     immediate transaction serializes the nullable namespace, whose SQLite
     unique constraint alone cannot protect duplicate ``NULL`` values.
     """
@@ -313,12 +314,11 @@ def idempotent_agent(
            FROM agents AS a
            JOIN orchestrator_sessions AS s ON s.id = a.orchestrator_session_id
            WHERE a.request_id = ? AND s.transport = ?
-             AND s.external_session_id = ? AND s.external_turn_id IS ?""",
+             AND s.external_session_id = ?""",
         (
             request_id,
             orchestrator.transport,
             orchestrator.external_session_id,
-            orchestrator.external_turn_id,
         ),
     ).fetchone()
 
