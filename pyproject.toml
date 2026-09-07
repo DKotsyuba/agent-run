@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-dependencies = []
+dependencies = ["psutil>=7.2.2,<8"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0", "hypothesis>=6.167.1,<7"]
