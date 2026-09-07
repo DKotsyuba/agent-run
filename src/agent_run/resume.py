@@ -87,7 +87,7 @@ def replayed_resume(
     if request_id is None:
         return None
     nonblank("request_id", request_id)
-    existing = idempotent_agent(connection, request_id)
+    existing = idempotent_agent(connection, request_id, orchestrator)
     if existing is None:
         return None
     stored = json.loads(existing["request_json"])

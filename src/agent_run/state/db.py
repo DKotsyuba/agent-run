@@ -136,6 +136,13 @@ def json_text(value: object) -> str:
 
 
 def request_json(request: StartRequest) -> str:
+    """Return canonical JSON for every launch-affecting request field.
+
+    Every :class:`StartRequest` field is included. Resolved identity snapshots,
+    normalized task summaries and resume parents live outside ``StartRequest``
+    and are deliberately compared or persisted separately by admission.
+    """
+
     orchestrator = request.orchestrator
     return json_text(
         {
@@ -157,9 +164,30 @@ def request_json(request: StartRequest) -> str:
                 "external_turn_id": orchestrator.external_turn_id,
             },
             "request_id": request.request_id,
+            "fast": request.fast,
             "account": request.account,
         }
     )
+
+
+def request_json_matches(stored: str, current: str) -> bool:
+    """Compare canonical request JSON with the pre-``fast`` legacy default.
+
+    ``stored`` is immutable historical evidence and ``current`` is newly
+    serialized canonical JSON. A historical object missing only ``fast`` is
+    interpreted as ``False`` without rewriting it. Malformed or non-object JSON
+    never matches and both inputs otherwise require exact semantic equality.
+    """
+
+    try:
+        previous = json.loads(stored)
+        candidate = json.loads(current)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(previous, dict) or not isinstance(candidate, dict):
+        return False
+    previous.setdefault("fast", False)
+    return previous == candidate
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, object] | None:
@@ -260,13 +288,38 @@ def checked_supervisor_proof(
 
 
 def idempotent_agent(
-    connection: sqlite3.Connection, request_id: str
+    connection: sqlite3.Connection,
+    request_id: str,
+    orchestrator: OrchestratorRef | None,
 ) -> sqlite3.Row | None:
+    """Return one replay within its exact orchestrator-session namespace.
+
+    ``None`` selects only rows without an orchestrator. A reference selects the
+    exact transport, external session and nullable turn tuple. The caller's
+    immediate transaction serializes the nullable namespace, whose SQLite
+    unique constraint alone cannot protect duplicate ``NULL`` values.
+    """
+
+    if orchestrator is None:
+        return connection.execute(
+            """SELECT id, request_json, task_summary, config_revision,
+                      parent_agent_id FROM agents
+               WHERE request_id = ? AND orchestrator_session_id IS NULL""",
+            (request_id,),
+        ).fetchone()
     return connection.execute(
-        """SELECT id, request_json, task_summary, config_revision,
-                  parent_agent_id FROM agents
-           WHERE request_id = ?""",
-        (request_id,),
+        """SELECT a.id, a.request_json, a.task_summary, a.config_revision,
+                  a.parent_agent_id
+           FROM agents AS a
+           JOIN orchestrator_sessions AS s ON s.id = a.orchestrator_session_id
+           WHERE a.request_id = ? AND s.transport = ?
+             AND s.external_session_id = ? AND s.external_turn_id IS ?""",
+        (
+            request_id,
+            orchestrator.transport,
+            orchestrator.external_session_id,
+            orchestrator.external_turn_id,
+        ),
     ).fetchone()
 
 
