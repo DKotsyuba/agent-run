@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
@@ -86,9 +87,9 @@ class ManagedSnapshotTests(unittest.TestCase):
     def test_interrupted_metadata_and_recovery_states_never_verify(self) -> None:
         """Keep missing metadata, owned temps, orphans, and missing references distinct."""
 
-        from agent_run.adapters import snapshots
+        from agent_run.adapters import snapshot_tree
 
-        real_write = snapshots.write_managed_file
+        real_write = snapshot_tree.write_managed_file
 
         def fail_manifest(home, relative, content, **kwargs):
             """Fail only the metadata publication after copying content."""
@@ -97,7 +98,10 @@ class ManagedSnapshotTests(unittest.TestCase):
                 raise OSError("metadata failed")
             return real_write(home, relative, content, **kwargs)
 
-        with patch("agent_run.adapters.snapshots.write_managed_file", side_effect=fail_manifest):
+        with patch(
+            "agent_run.adapters.snapshot_tree.write_managed_file",
+            side_effect=fail_manifest,
+        ):
             with self.assertRaisesRegex(OSError, "metadata failed"):
                 snapshot_managed_tree(self.home, "skills/demo", self.source)
         incomplete = inspect_managed_snapshot(self.home, "skills/demo")
@@ -160,18 +164,18 @@ class ManagedSnapshotTests(unittest.TestCase):
             config=config,
             profile=AgentProfile("review", "Changed body.", False, (self.root,), False),
         )
-        object.__setattr__(
-            config,
-            "plugin_snapshot_assets",
-            MappingProxyType({"compressor": ("hooks/hooks.json",)}),
-        )
         declared_assets = build_config_snapshot(
             runtime="claude",
             adapter_api_version=1,
             schema_version=1,
             materialize_revision="files-1",
             snapshot_index_sha256=index_sha256,
-            config=config,
+            config=replace(
+                config,
+                plugin_snapshot_assets=MappingProxyType(
+                    {"compressor": ("hooks/hooks.json",)}
+                ),
+            ),
             profile=profile,
         )
         self.assertEqual(first, same)
