@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,25 +54,49 @@ class BrokerClient:
         self._socket: socket.socket | None = None
         self._stream = None
         self._next_id = 1
+        self._lock = threading.Lock()
+        self._aborted = threading.Event()
 
     def _connect(self, timeout: float) -> None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         try:
             sock.connect(str(self.socket_path))
-            self._socket = sock
-            self._stream = sock.makefile("rb")
+            with self._lock:
+                if self._aborted.is_set():
+                    raise ConnectionError("broker call cancelled")
+                self._socket = sock
+                self._stream = sock.makefile("rb")
         except OSError:
             sock.close()
             raise
 
     def _close(self) -> None:
-        stream, sock = self._stream, self._socket
-        self._stream = None
-        self._socket = None
+        with self._lock:
+            stream, sock = self._stream, self._socket
+            self._stream = None
+            self._socket = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         if stream is not None:
             stream.close()
         if sock is not None:
+            sock.close()
+
+    def abort(self) -> None:
+        """Interrupt this caller's pending socket wait without cancelling broker work."""
+        self._aborted.set()
+        with self._lock:
+            sock = self._socket
+            self._socket = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             sock.close()
 
     def _request(self, method: str, params: dict | None, timeout: float) -> object:
@@ -130,6 +155,8 @@ class BrokerClient:
                 return self._request(method, params, timeout)
             except (OSError, ConnectionError, TimeoutError):
                 self._close()
+                if self._aborted.is_set():
+                    raise ConnectionError("broker call cancelled") from None
                 if attempt == 0:
                     continue
                 raise BrokerUnavailable(_BROKER_MESSAGE)

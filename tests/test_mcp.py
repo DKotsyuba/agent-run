@@ -5,14 +5,18 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import unittest
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from agent_run.mcp import _call_tool
+from agent_run.broker_client import MAX_LINE_BYTES
+from agent_run.mcp import _BoundedInput, _call_tool, serve
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -123,3 +127,70 @@ class McpSdkTests(unittest.TestCase):
             self.assertTrue(await anyio.to_thread.run_sync(done.wait, 2))
 
         anyio.run(exercise)
+
+    def test_oversized_stdio_frame_stays_bounded_and_uses_sdk_error_path(self) -> None:
+        """Reject a frame above the former one-MiB ceiling without manual MCP parsing."""
+
+        class Broker:
+            """Fixture that is never reached when the bounded input rejects a frame."""
+
+            def call(self, method: str, params: dict | None = None, timeout: float = 600.0) -> object:
+                """Fail if an oversized protocol frame reaches the broker boundary."""
+                raise AssertionError("oversized frame reached broker")
+
+        stdout = StringIO()
+        self.assertEqual(MAX_LINE_BYTES, 1024 * 1024)
+        with patch("agent_run.mcp.MAX_LINE_BYTES", 64):
+            self.assertEqual(serve(lambda: Broker(), StringIO("x" * 65 + "\n"), stdout), 0)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_pipe_reader_preserves_a_split_utf8_frame(self) -> None:
+        """Keep reading when an incremental UTF-8 decoder needs the next pipe chunk."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+
+        def write_split_frame() -> None:
+            """Write one JSON frame with the two bytes of é separated by a delay."""
+            os.write(write_fd, b'{"text":"\xc3')
+            time.sleep(0.05)
+            os.write(write_fd, b'\xa9"}\n')
+            os.close(write_fd)
+
+        async def consume() -> list[str]:
+            """Collect the bounded reader's complete SDK input frames."""
+            return [line async for line in _BoundedInput(reader)]
+
+        writer = threading.Thread(target=write_split_frame)
+        writer.start()
+        try:
+            self.assertEqual(anyio.run(consume), ['{"text":"é"}'])
+        finally:
+            writer.join(timeout=1)
+            reader.close()
+
+    def test_idle_pipe_cancellation_releases_the_raw_read_worker(self) -> None:
+        """Exit a cancelled SDK reader even while the peer keeps its pipe open and idle."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+
+        async def consume() -> None:
+            """Block on an idle bounded input until the enclosing lifecycle cancels it."""
+            async for _ in _BoundedInput(reader):
+                pass
+
+        async def cancel_reader() -> None:
+            """Cancel the server-side reader under a bounded parent deadline."""
+            with anyio.fail_after(1):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(consume)
+                    await anyio.sleep(0.05)
+                    group.cancel_scope.cancel()
+
+        try:
+            anyio.run(cancel_reader)
+        finally:
+            os.close(write_fd)
+            try:
+                reader.close()
+            except OSError:
+                pass
