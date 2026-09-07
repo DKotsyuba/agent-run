@@ -141,18 +141,25 @@ def ensure_managed_directory(home: str | Path, relative_path: str | Path) -> Pat
 
 
 def write_managed_file(
-    home: str | Path, relative_path: str | Path, content: str | bytes
+    home: str | Path,
+    relative_path: str | Path,
+    content: str | bytes,
+    *,
+    mode: int = 0o600,
 ) -> str:
     """Durably replace one private regular file and return its SHA-256.
 
     ``home`` owns the generated tree, ``relative_path`` must stay beneath it,
-    and ``content`` supplies the exact UTF-8 or byte payload. The temporary file
+    and ``content`` supplies the exact UTF-8 or byte payload. ``mode`` is either
+    private data ``0600`` or private executable ``0700``. The temporary file
     is synchronized before its atomic replacement, then the parent directory is
     synchronized so a successful return makes that one publish durable.
     Validation and path-escape errors are typed; filesystem failures propagate.
     """
 
     data = content.encode("utf-8") if isinstance(content, str) else content
+    if mode not in {0o600, 0o700}:
+        raise ValidationError("managed file mode must be 0600 or 0700")
     digest = content_hash(data)
     candidate = _managed_path(home, relative_path)
     if candidate.is_symlink():
@@ -166,7 +173,7 @@ def write_managed_file(
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(data)

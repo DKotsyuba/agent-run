@@ -43,3 +43,21 @@ materialized file revision to the runtime name, adapter API version, config
 schema version, complete runtime declaration, and effective profile body and
 grants. Configured environment values are represented by hashes, so content-only
 edits change the revision without copying credential-like values into metadata.
+An already-known native runtime version is recorded when available; snapshot
+creation does not run an additional version probe.
+
+Each published tree is also recorded in the generated home's snapshot index.
+Resume checks that index, so deleting an entire skill directory cannot hide its
+missing manifest. The finalized index also binds adapter-known flat config files
+and the materialization revision; resume requires both its stored SHA-256 and
+revision to match. `inspect_config_snapshot()` likewise reads the attempt's
+configuration metadata as a no-follow regular file, checks its recorded hash,
+and requires canonical version-one JSON before reuse.
+
+Claude and GLM may snapshot explicitly declared non-secret plugin assets. The
+optional `plugin_snapshot_assets` mapping is keyed by configured plugin basename;
+each value lists exact relative files or directories. Declared directories are
+recursive. No globbing, import tracing, discovery, or secret-name heuristic is
+performed: the trusted declaration owns complete transitive coverage. A plugin
+without a declaration retains its legacy live path and therefore does not claim
+immutable plugin configuration.

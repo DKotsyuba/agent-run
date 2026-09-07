@@ -38,7 +38,7 @@ from ..base import (
 from ..developer_environment import configured_environment_keys, environment_digest
 from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
-from ..snapshots import snapshot_managed_tree
+from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
@@ -435,7 +435,13 @@ class CodexAdapter:
                 environment_digest(config),
             ]
         )
-        return content_hash(fingerprint)
+        revision = content_hash(fingerprint)
+        finalize_runtime_snapshots(
+            Path(home),
+            revision,
+            ("config.toml", "rules/agent-run-command-policy.rules"),
+        )
+        return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         try:

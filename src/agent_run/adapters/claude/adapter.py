@@ -44,6 +44,7 @@ from ..developer_environment import (
 )
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from ..rust import RUST_ENVIRONMENT_NAMES
+from ..snapshots import finalize_runtime_snapshots
 from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
 from .constants import (
     ALWAYS_DISALLOWED as _ALWAYS_DISALLOWED, AUTH_NAMES as _AUTH_NAMES,
@@ -56,7 +57,12 @@ from .constants import (
 )
 from .launch_io import abort_launch, known_secrets, open_runtime_log
 from .limits import agent_rate_limit_samples
-from .materialize import render_mcp_config, render_plugin_dirs, render_settings
+from .materialize import (
+    render_declared_plugin_snapshots,
+    render_mcp_config,
+    render_plugin_dirs,
+    render_settings,
+)
 from .stderr import StderrTail
 from .stream import (
     StreamDecoder,
@@ -139,12 +145,21 @@ class ClaudeAdapter:
         if not isinstance(skills_root, Path) or not skills_root.is_absolute():
             raise ValidationError("claude skills_root must be absolute")
         plugin_digest = render_plugin_dirs(home, skills_root, local_skill_names(config.plugins, config.skills))
-        declared_digest = content_hash(",".join(str(plugin) for plugin in config.plugins))
+        snapshot_assets = getattr(config, "plugin_snapshot_assets", {})
+        declared_digest = render_declared_plugin_snapshots(
+            home, config.plugins, snapshot_assets
+        )
         digests = [settings_digest, mcp_digest, plugin_digest, declared_digest]
         if config.rust is not None:
             digests.append(content_hash(f"{config.rust.rustup_home}\0{config.rust.cargo_bin}"))
         digests.append(environment_digest(config))
-        return "\n".join(digests)
+        revision = "\n".join(digests)
+        managed_files = (
+            "settings.json",
+            *(("mcp/mcp-config.json",) if config.mcp else ()),
+        )
+        finalize_runtime_snapshots(home, revision, managed_files)
+        return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
@@ -269,7 +284,11 @@ class ClaudeAdapter:
         for name in local_skill_names(config.plugins, config.skills):
             argv += ["--plugin-dir", str(home / "plugins" / name)]
         for plugin in config.plugins:
-            argv += ["--plugin-dir", str(plugin)]
+            selected = getattr(config, "plugin_snapshot_assets", {}).get(plugin.name)
+            argv += [
+                "--plugin-dir",
+                str(home / "declared-plugins" / plugin.name) if selected else str(plugin),
+            ]
         for root in roots:
             argv += ["--add-dir", str(root)]
         argv += ["--tools", ",".join(base_tools)]

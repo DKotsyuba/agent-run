@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +10,16 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 from agent_run.adapters.snapshots import (
+    CONFIG_SNAPSHOT_FILENAME,
+    RUNTIME_SNAPSHOT_INDEX,
     SNAPSHOT_MANIFEST,
     build_config_snapshot,
+    finalize_runtime_snapshots,
+    inspect_config_snapshot,
     inspect_managed_snapshot,
+    inspect_runtime_snapshots,
     snapshot_managed_tree,
+    snapshot_selected_assets,
 )
 from agent_run.config import EnvironmentConfig, RuntimeConfig
 from agent_run.errors import ValidationError
@@ -33,6 +40,7 @@ class ManagedSnapshotTests(unittest.TestCase):
         (self.source / "empty").mkdir()
         (self.source / "SKILL.md").write_text("first", encoding="utf-8")
         (self.source / "scripts" / "run.sh").write_bytes(b"#!/bin/sh\n")
+        (self.source / "scripts" / "run.sh").chmod(0o755)
         self.home = self.root / "home"
 
     def test_full_tree_is_copied_and_content_changes_revision(self) -> None:
@@ -57,6 +65,24 @@ class ManagedSnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "regular"):
             snapshot_managed_tree(self.home, "skills/demo", self.source)
 
+    def test_selected_assets_preserve_layout_without_copying_other_files(self) -> None:
+        """Copy only explicitly named plugin files and selected directory contents."""
+
+        (self.source / "unselected.txt").write_text("do not copy", encoding="utf-8")
+        snapshot_selected_assets(
+            self.home,
+            "declared-plugins/demo",
+            self.source,
+            ("SKILL.md", "scripts"),
+        )
+        copied = self.home / "declared-plugins/demo"
+        self.assertTrue((copied / "SKILL.md").is_file())
+        self.assertTrue((copied / "scripts/run.sh").is_file())
+        self.assertFalse((copied / "unselected.txt").exists())
+        script = copied / "scripts/run.sh"
+        self.assertEqual(script.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(subprocess.run((str(script),), check=False).returncode, 0)
+
     def test_interrupted_metadata_and_recovery_states_never_verify(self) -> None:
         """Keep missing metadata, owned temps, orphans, and missing references distinct."""
 
@@ -64,12 +90,12 @@ class ManagedSnapshotTests(unittest.TestCase):
 
         real_write = snapshots.write_managed_file
 
-        def fail_manifest(home, relative, content):
+        def fail_manifest(home, relative, content, **kwargs):
             """Fail only the metadata publication after copying content."""
 
             if Path(relative).name == SNAPSHOT_MANIFEST:
                 raise OSError("metadata failed")
-            return real_write(home, relative, content)
+            return real_write(home, relative, content, **kwargs)
 
         with patch("agent_run.adapters.snapshots.write_managed_file", side_effect=fail_manifest):
             with self.assertRaisesRegex(OSError, "metadata failed"):
@@ -106,11 +132,13 @@ class ManagedSnapshotTests(unittest.TestCase):
             ),
         )
         profile = AgentProfile("review", "Review exactly.", False, (self.root,), False)
+        index_sha256 = finalize_runtime_snapshots(self.home, "files-1")
         first = build_config_snapshot(
             runtime="claude",
             adapter_api_version=1,
             schema_version=1,
             materialize_revision="files-1",
+            snapshot_index_sha256=index_sha256,
             config=config,
             profile=profile,
         )
@@ -119,6 +147,7 @@ class ManagedSnapshotTests(unittest.TestCase):
             adapter_api_version=1,
             schema_version=1,
             materialize_revision="files-1",
+            snapshot_index_sha256=index_sha256,
             config=config,
             profile=profile,
         )
@@ -127,12 +156,71 @@ class ManagedSnapshotTests(unittest.TestCase):
             adapter_api_version=1,
             schema_version=1,
             materialize_revision="files-1",
+            snapshot_index_sha256=index_sha256,
             config=config,
             profile=AgentProfile("review", "Changed body.", False, (self.root,), False),
         )
+        object.__setattr__(
+            config,
+            "plugin_snapshot_assets",
+            MappingProxyType({"compressor": ("hooks/hooks.json",)}),
+        )
+        declared_assets = build_config_snapshot(
+            runtime="claude",
+            adapter_api_version=1,
+            schema_version=1,
+            materialize_revision="files-1",
+            snapshot_index_sha256=index_sha256,
+            config=config,
+            profile=profile,
+        )
         self.assertEqual(first, same)
         self.assertNotEqual(first.sha256, changed.sha256)
+        self.assertNotEqual(first.sha256, declared_assets.sha256)
         self.assertNotIn(secret.encode(), first.document)
+        candidate = self.root / "candidate"
+        candidate.mkdir()
+        (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(first.document)
+        self.assertEqual(inspect_config_snapshot(candidate, first.sha256), first)
+        (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(first.document + b" ")
+        with self.assertRaisesRegex(ValidationError, "hash"):
+            inspect_config_snapshot(candidate, first.sha256)
+
+    def test_runtime_index_detects_an_entire_missing_snapshot_root(self) -> None:
+        """Keep expected roots discoverable after their whole directory disappears."""
+
+        snapshot_managed_tree(self.home, "skills/demo", self.source)
+        settings = self.home / "settings.json"
+        settings.write_text("{}", encoding="utf-8")
+        index_sha256 = finalize_runtime_snapshots(
+            self.home, "files-1", ("settings.json",)
+        )
+        self.assertTrue(
+            inspect_runtime_snapshots(
+                self.home, "files-1", expected_sha256=index_sha256
+            ).verified
+        )
+        settings.write_text('{"changed":true}', encoding="utf-8")
+        changed = inspect_runtime_snapshots(
+            self.home, "files-1", expected_sha256=index_sha256
+        )
+        self.assertIn("settings.json", changed.mismatched)
+        settings.write_text("{}", encoding="utf-8")
+        (self.home / "skills/demo").rename(self.home / "skills/demo.gone")
+        inspection = inspect_runtime_snapshots(
+            self.home, "files-1", expected_sha256=index_sha256
+        )
+        self.assertFalse(inspection.verified)
+        self.assertIn("skills/demo/.agent-run-snapshot.json", inspection.missing)
+        (self.home / RUNTIME_SNAPSHOT_INDEX).write_text(
+            '{"files":[],"materialize_revision":"files-1",'
+            '"roots":[],"snapshot_index_version":1}\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValidationError, "hash"):
+            inspect_runtime_snapshots(
+                self.home, "files-1", expected_sha256=index_sha256
+            )
 
 
 if __name__ == "__main__":

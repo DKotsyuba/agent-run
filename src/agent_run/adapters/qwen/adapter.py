@@ -35,6 +35,7 @@ from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
 from agent_run.adapters.qwen.auth import DEFAULT_BASE_URL, keychain_omniroute_api_key
 from agent_run.adapters.qwen.skills import materialize_skills, skills_context_note
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
@@ -295,7 +296,9 @@ class QwenAdapter:
                 environment_digest(config),
             ]
         )
-        return content_hash(fingerprint)
+        revision = content_hash(fingerprint)
+        finalize_runtime_snapshots(Path(home), revision, (".qwen/settings.json",))
+        return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         """Report local binary and declared authentication availability only."""

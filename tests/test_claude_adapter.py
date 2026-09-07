@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -548,6 +549,40 @@ class ClaudeAdapterTests(unittest.TestCase):
         # Plugins are loaded from their own directory, never copied into the
         # generated home, so no plugin file is materialized for them.
         self.assertFalse((self.home / "plugins" / "compressor").exists())
+
+    def test_declared_plugin_assets_use_the_managed_snapshot_path(self) -> None:
+        """Load only explicitly selected plugin assets from the immutable home copy."""
+
+        plugin = self.root / "compressor"
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        (plugin / "hooks").mkdir()
+        (plugin / ".claude-plugin/plugin.json").write_text('{"name":"compressor"}')
+        (plugin / "hooks/hooks.json").write_text('{"hooks":{}}')
+        (plugin / "hooks/run.py").write_text("print('safe')\n")
+        (plugin / "credential.txt").write_text("must not copy")
+        assets = (
+            ".claude-plugin/plugin.json",
+            "hooks/hooks.json",
+            "hooks/run.py",
+        )
+        config = self.runtime_config(plugins=(plugin,))
+        object.__setattr__(
+            config,
+            "plugin_snapshot_assets",
+            MappingProxyType({"compressor": assets}),
+        )
+
+        self.materialize(config, self.home)
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir
+            )
+
+        managed = self.home / "declared-plugins/compressor"
+        argv = list(plan.argv)
+        self.assertEqual(argv[argv.index("--plugin-dir") + 1], str(managed))
+        self.assertTrue((managed / "hooks/run.py").is_file())
+        self.assertFalse((managed / "credential.txt").exists())
 
     def test_request_can_narrow_but_not_widen_profile_write(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):

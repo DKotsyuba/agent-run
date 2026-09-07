@@ -15,9 +15,14 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeHookConfig
 from ...errors import ValidationError
 from ..home import content_hash, write_managed_file
-from ..snapshots import snapshot_managed_tree
+from ..snapshots import snapshot_managed_tree, snapshot_selected_assets
 
-__all__ = ["render_mcp_config", "render_plugin_dirs", "render_settings"]
+__all__ = [
+    "render_declared_plugin_snapshots",
+    "render_mcp_config",
+    "render_plugin_dirs",
+    "render_settings",
+]
 
 
 def render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
@@ -88,3 +93,39 @@ def render_plugin_dirs(home: Path, skills_root: Path, names: tuple[str, ...]) ->
         )
         digests.append(f"{name}:{manifest_digest}:{snapshot.sha256}")
     return content_hash(",".join(digests)) if digests else content_hash("no_skills")
+
+
+def render_declared_plugin_snapshots(
+    home: Path,
+    plugins: tuple[Path, ...],
+    declarations: Mapping[str, tuple[str, ...]],
+) -> str:
+    """Snapshot only explicitly declared plugin assets and return their revision.
+
+    ``declarations`` is keyed by configured plugin basename. Missing declarations
+    preserve the legacy live-plugin path and are fingerprinted as unsupported
+    mutability. Declared assets use the shared no-follow selected-path snapshot;
+    unknown names or duplicate configured basenames fail closed.
+    """
+
+    roots: dict[str, Path] = {}
+    for plugin in plugins:
+        if plugin.name in roots:
+            raise ValidationError(f"claude plugin name is declared twice: {plugin.name}")
+        roots[plugin.name] = plugin
+    unknown = sorted(set(declarations) - set(roots))
+    if unknown:
+        raise ValidationError(
+            "claude plugin snapshot names are not configured: " + ", ".join(unknown)
+        )
+    fingerprints: list[str] = []
+    for name, plugin in roots.items():
+        assets = declarations.get(name)
+        if assets is None:
+            fingerprints.append(f"{name}:live:{plugin}")
+            continue
+        snapshot = snapshot_selected_assets(
+            home, f"declared-plugins/{name}", plugin, assets
+        )
+        fingerprints.append(f"{name}:snapshot:{snapshot.sha256}")
+    return content_hash("\n".join(fingerprints)) if fingerprints else content_hash("no_plugins")
