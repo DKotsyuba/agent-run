@@ -70,8 +70,11 @@ The supervisor enforces:
   recorded evidence (result payloads, completion sentinels, error-only
   answer detection), never from exit code alone.
 
-Answers are stored with size and sha256; `answer <id>` re-serves the
-verified envelope indefinitely.
+Current answers store the engine's exact UTF-8 payload without a completion
+sentinel. A directory format marker makes the adjacent versioned proof
+mandatory; the proof binds the payload name, size, and sha256. Historical
+sentinel-framed answers remain readable, and `answer <id>` verifies their
+original stored bytes before stripping the exact terminal frame for display.
 
 Codex raw assistant deltas are journaled as they arrive. Normalized transcript
 chunks retain a final nonblank segment and adjacent whitespace until more text

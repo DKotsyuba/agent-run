@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -54,11 +53,10 @@ from .verify import (
     ANSWER_FORMAT_PROOF,
     ANSWER_KIND,
     ANSWER_MEDIA_TYPE,
-    AnswerEncodingError,
+    MAX_ANSWER_PAYLOAD_BYTES,
     AnswerMissingError,
-    AnswerTamperedError,
     load_answer_proof,
-    strip_legacy_frame,
+    read_answer_payload,
 )
 
 
@@ -69,7 +67,6 @@ _TASK_SUMMARY_CHARS = 160
 _DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
 _MAX_PAGE_SIZE = 1000
 _FAILURE_TEXT_CHARS = 512
-_CHUNK = 65536
 _PENDING_CONFIG_REVISION = "pending:materialization"
 
 
@@ -1021,14 +1018,11 @@ class AgentService:
     def answer(self, agent_id: str | AgentId) -> AnswerView:
         """Return the verified descriptor for one agent's stored answer.
 
-        The artifact's recorded size and hash are always verified against the
-        durable row before any content is returned. A versioned proof sidecar
-        pins the clean ``ANSWER_FORMAT_PROOF`` format; its absence marks the
-        historical sentinel-framed format, whose exact terminal frame is
-        stripped once for inline presentation while the descriptor keeps the
-        original stored byte count and hash. A present but malformed or
-        contradicting sidecar raises ``AnswerProofError`` and never falls
-        back to legacy handling.
+        The artifact's recorded size and hash are verified before content is
+        returned. A durable directory marker pins clean new payloads to the
+        proof format even when their required sidecar is missing or corrupt.
+        Historical sentinel-framed payloads keep their stored byte count and
+        hash while the exact terminal frame is stripped once for presentation.
         """
 
         checked = validate_agent_id(agent_id)
@@ -1045,6 +1039,8 @@ class AgentService:
         size = int(row["answer_bytes"])
         expected_sha = str(row["answer_sha256"])
         path = Path(str(row["answer_path"]))
+        if path.is_symlink():
+            raise ValidationError("stored answer path must not be a symlink")
         try:
             resolved = path.resolve(strict=True)
         except FileNotFoundError:
@@ -1054,36 +1050,16 @@ class AgentService:
         root = agent_dir(checked, self._home).resolve()
         if not resolved.is_relative_to(root) or not resolved.is_file():
             raise ValidationError("stored answer path is outside the agent directory")
-        if resolved.stat().st_size != size:
-            raise AnswerTamperedError("stored answer size does not match the sealed file")
-        digest = hashlib.sha256()
-        content = bytearray() if size <= self._max_inline_answer_bytes else None
-        counted = 0
-        try:
-            with resolved.open("rb") as stream:
-                while chunk := stream.read(_CHUNK):
-                    counted += len(chunk)
-                    digest.update(chunk)
-                    if content is not None:
-                        content.extend(chunk)
-        except FileNotFoundError:
-            raise AnswerMissingError(f"stored answer is missing: {path}") from None
-        except OSError as error:
-            raise ValidationError(f"cannot read stored answer: {error}") from error
-        if counted != size or digest.hexdigest() != expected_sha:
-            raise AnswerTamperedError("stored answer hash does not match the sealed file")
         proof = load_answer_proof(resolved, expected_bytes=size, expected_sha256=expected_sha)
         proof_version = ANSWER_FORMAT_LEGACY if proof is None else ANSWER_FORMAT_PROOF
-        if content is None:
-            text = None
-        else:
-            raw = bytes(content)
-            if proof_version == ANSWER_FORMAT_LEGACY:
-                raw = strip_legacy_frame(raw)
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise AnswerEncodingError("stored answer is not valid UTF-8") from error
+        payload = read_answer_payload(
+            resolved,
+            expected_bytes=size,
+            expected_sha256=expected_sha,
+            max_bytes=MAX_ANSWER_PAYLOAD_BYTES,
+            strip_legacy=proof_version == ANSWER_FORMAT_LEGACY,
+        )
+        text = payload if size <= self._max_inline_answer_bytes else None
         _logger.debug("answer agent_id=%s available=True bytes=%d", checked, size)
         return AnswerView(
             checked,
@@ -1093,7 +1069,7 @@ class AgentService:
             size,
             expected_sha,
             text,
-            content is not None,
+            text is not None,
             str(resolved.relative_to(root)),
             ANSWER_KIND,
             ANSWER_MEDIA_TYPE,

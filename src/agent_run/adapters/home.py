@@ -9,7 +9,12 @@ import tempfile
 from pathlib import Path
 
 from ..errors import PathEscapeError, ValidationError
-from ..verify import ANSWER_PROOF_SUFFIX, answer_proof_document
+from ..verify import (
+    ANSWER_FORMAT_CONTENT,
+    ANSWER_FORMAT_FILENAME,
+    ANSWER_PROOF_SUFFIX,
+    answer_proof_document,
+)
 
 
 def content_hash(content: str | bytes) -> str:
@@ -125,12 +130,10 @@ def seal_answer(path: Path, text: str) -> tuple[int, str]:
     """Seal one completed engine answer as exact payload bytes plus a proof.
 
     The payload file holds ``text`` encoded as UTF-8 with no appended
-    completion marker. Completion and integrity are proven separately by the
-    adjacent ``<name>.proof.json`` sidecar (``ANSWER_FORMAT_PROOF``), which
-    records the payload's byte count and SHA-256. The payload is written
-    first and the proof second, each atomically; there is no cross-file
-    atomicity, so a crash in between leaves an unproven payload that
-    verification treats as incomplete rather than publishing success.
+    completion marker. The adjacent ``<name>.proof.json`` sidecar records the
+    payload's byte count and SHA-256. A directory-level format marker is
+    written first so a crash or deleted proof cannot make a new payload look
+    like a historical sentinel-framed answer. Each file replacement is atomic.
 
     Returns ``(payload_bytes, payload_sha256)`` for the clean payload, the
     values durably recorded with the run's outcome.
@@ -141,6 +144,7 @@ def seal_answer(path: Path, text: str) -> tuple[int, str]:
     if not isinstance(text, str) or not text.strip():
         raise ValidationError("answer text must be nonblank")
     data = text.encode("utf-8")
+    write_managed_file(path.parent, ANSWER_FORMAT_FILENAME, ANSWER_FORMAT_CONTENT)
     digest = write_managed_file(path.parent, path.name, data)
     write_managed_file(
         path.parent,

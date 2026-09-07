@@ -9,24 +9,15 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
-import jsonschema
-from jsonschema import Draft7Validator
-from jsonschema.exceptions import SchemaError
-from jsonschema.validators import validator_for
-from referencing import Registry
-from referencing.exceptions import Unresolvable
-
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
-from agent_run.verify import ANSWER_FORMAT_LEGACY, read_answer_payload
 
 _logger = logging.getLogger("agent_run.workflow_runner")
 
 POLL_SECONDS = 0.05
 _RAW_ANSWER_LIMIT = 4096
-_MAX_ANSWER_PAYLOAD_BYTES = 16 * 1024 * 1024
 _SPEC_KEYS = frozenset(
     {
         "runtime",
@@ -104,70 +95,66 @@ def validate_agent_spec(spec: object) -> StartRequest:
     )
 
 
-class AnswerJsonError(ValidationError):
-    """The agent answer payload is not well-formed JSON."""
-
-
-class AnswerSchemaError(ValidationError):
-    """The workflow output schema is malformed or has an unsupported dialect."""
-
-
 def validate_output(answer_text: str, schema: object) -> None:
-    """Validate JSON answer text against a JSON Schema output schema.
+    """Validate JSON answer text against the workflow's narrow schema subset.
 
-    A schema without ``$schema`` is validated as draft-07, the declared
-    supported dialect; an explicit dialect is selected through
-    ``jsonschema.validators.validator_for`` and an unknown one is rejected
-    deterministically. References resolve against an empty
-    ``referencing.Registry``, so local ``$ref`` targets work (including under
-    an HTTP ``$id``) while remote or file references fail without any
-    retrieval I/O. Raises ``AnswerJsonError`` for malformed JSON,
-    ``AnswerSchemaError`` for a malformed or unresolvable schema, and
-    ``ValidationError`` when the decoded answer does not satisfy the schema.
+    Supported schemas use ``type``, ``properties``, and ``required`` for
+    objects, plus ``items`` for arrays. Values may use the JSON primitive
+    types accepted by the runtime adapter. Invalid JSON and mismatches raise
+    ``ValidationError`` with a concise, caller-facing explanation.
     """
 
     try:
         value = json.loads(answer_text)
     except (TypeError, json.JSONDecodeError) as error:
-        raise AnswerJsonError("agent answer is not valid JSON") from error
-    validator = _output_validator(schema)
-    try:
-        error = next(validator.iter_errors(value), None)
-    except Unresolvable as error:
-        raise AnswerSchemaError(
-            f"output_schema reference cannot be resolved without retrieval: {error}"
-        ) from error
-    if error is not None:
-        location = "$" + "".join(
-            f".{part}" if isinstance(part, str) else f"[{part}]"
-            for part in error.absolute_path
-        )
-        raise ValidationError(
-            f"agent answer does not match output_schema at {location}: {error.message}"
-        )
+        raise ValidationError("agent answer is not valid JSON") from error
+    _validate_value(value, schema, "$")
 
 
-def _output_validator(schema: object) -> jsonschema.Validator:
-    """Build the empty-registry validator for one workflow output schema."""
+def _validate_value(value: object, schema: object, path: str) -> None:
+    """Check one JSON value recursively against a supported schema mapping."""
 
     if not isinstance(schema, dict):
-        raise AnswerSchemaError("output_schema must be a JSON object schema")
-    dialect = schema.get("$schema")
-    if dialect is None:
-        validator_class = Draft7Validator
-    else:
-        validator_class = validator_for(schema, default=None)
-        if validator_class is None:
-            raise AnswerSchemaError(
-                f"output_schema declares an unsupported JSON Schema dialect: {dialect!r}"
-            )
-    try:
-        validator_class.check_schema(schema)
-    except SchemaError as error:
-        raise AnswerSchemaError(
-            f"output_schema is not a valid JSON Schema: {error.message}"
-        ) from error
-    return validator_class(schema, registry=Registry())
+        raise ValidationError("output_schema must be a JSON object schema")
+    allowed = {"type", "properties", "required", "items"}
+    unknown = sorted(set(schema) - allowed)
+    if unknown:
+        raise ValidationError(f"output_schema contains unsupported keys: {', '.join(unknown)}")
+    kind = schema.get("type")
+    if not isinstance(kind, str):
+        raise ValidationError("output_schema type must be a string")
+    checks: dict[str, Callable[[object], bool]] = {
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "string": lambda item: isinstance(item, str),
+        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "null": lambda item: item is None,
+    }
+    check = checks.get(kind)
+    if check is None:
+        raise ValidationError(f"output_schema type is unsupported: {kind}")
+    if not check(value):
+        raise ValidationError(f"agent answer at {path} must be {kind}")
+    if kind == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            raise ValidationError("output_schema object properties and required must be mappings and lists")
+        for name in required:
+            if not isinstance(name, str):
+                raise ValidationError("output_schema required entries must be strings")
+            if name not in value:
+                raise ValidationError(f"agent answer is missing required property: {path}.{name}")
+        for name, child in properties.items():
+            if not isinstance(name, str):
+                raise ValidationError("output_schema property names must be strings")
+            if name in value:
+                _validate_value(value[name], child, f"{path}.{name}")
+    elif kind == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            _validate_value(item, schema["items"], f"{path}[{index}]")
 
 
 class WorkflowStepExecutor:
@@ -307,15 +294,7 @@ class WorkflowStepExecutor:
     def _terminal(
         self, step_key: str, agent_id: str, status: str, schema: object, agent: object
     ) -> dict[str, object]:
-        """Persist a terminal service view, validating successful output.
-
-        Inline answer content is exposed for presentation exactly as before.
-        Schema validation reads the full owned artifact bounded by
-        ``_MAX_ANSWER_PAYLOAD_BYTES`` -- independently of the service's
-        inline display cutoff -- so valid JSON larger than the inline limit
-        still validates, and typed answer failures map to
-        ``step_output_invalid``.
-        """
+        """Persist a terminal service view, validating successful inline output."""
 
         result: dict[str, object] = {"agent_id": agent_id, "status": status}
         answer = self._service_for_caller().answer(agent_id)
@@ -324,7 +303,7 @@ class WorkflowStepExecutor:
         if status == AgentStatus.SUCCEEDED.value:
             if schema is not None:
                 try:
-                    validate_output(self._answer_payload(answer, result), schema)
+                    validate_output(result.get("answer", ""), schema)
                 except ValidationError as error:
                     raw = result.get("answer", "")
                     params = {
@@ -345,31 +324,6 @@ class WorkflowStepExecutor:
         result["failure_kind"] = kind
         result["failure_params"] = params
         return self._fail(step_key, str(kind), params, result)
-
-    @staticmethod
-    def _answer_payload(answer: object, result: Mapping[str, object]) -> object:
-        """Return the fullest available payload text for schema validation.
-
-        When the descriptor carries the sealed path, byte count, and hash,
-        the artifact is re-read in full under the executor's own bound and
-        verified against its recorded proof (legacy sentinel frames are
-        stripped exactly once); otherwise the inline presentation content is
-        all there is. Typed answer read errors propagate as
-        ``ValidationError`` subclasses.
-        """
-
-        path = getattr(answer, "path", None)
-        size = getattr(answer, "size_bytes", None)
-        sha256 = getattr(answer, "sha256", None)
-        if path is not None and isinstance(size, int) and isinstance(sha256, str):
-            return read_answer_payload(
-                path,
-                expected_bytes=size,
-                expected_sha256=sha256,
-                max_bytes=_MAX_ANSWER_PAYLOAD_BYTES,
-                strip_legacy=getattr(answer, "proof_version", None) == ANSWER_FORMAT_LEGACY,
-            )
-        return result.get("answer", "")
 
     def _fail(
         self, step_key: str, kind: str, params: object, result: dict[str, object] | None = None

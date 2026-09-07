@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,18 @@ ANSWER_FORMAT_PROOF = 2
 
 ANSWER_PROOF_SUFFIX = ".proof.json"
 """Filename suffix of the versioned proof sidecar written beside each payload."""
+
+ANSWER_FORMAT_FILENAME = ".answer-format"
+"""Agent-directory marker that makes the current answer format durable."""
+
+ANSWER_FORMAT_CONTENT = b"2\n"
+"""Exact contents of the current agent-directory answer-format marker."""
+
+MAX_ANSWER_PAYLOAD_BYTES = 16 * 1024 * 1024
+"""Maximum answer payload size accepted by the core read path."""
+
+_MAX_ANSWER_METADATA_BYTES = 4096
+"""Maximum bytes read from either answer metadata file."""
 
 
 class AnswerError(ValidationError):
@@ -87,6 +100,8 @@ class AnswerProof:
 
     @property
     def complete(self) -> bool:
+        """Return whether the artifact has valid completion evidence."""
+
         if not self.exists or self.size_bytes == 0:
             return False
         if self.proof_version == ANSWER_FORMAT_PROOF:
@@ -95,6 +110,8 @@ class AnswerProof:
 
     @property
     def evidence(self) -> str:
+        """Return the stable completion-evidence label for this artifact."""
+
         if not self.exists or self.size_bytes == 0:
             return NO_ANSWER
         if self.proof_version == ANSWER_FORMAT_PROOF:
@@ -107,6 +124,39 @@ def answer_proof_path(path: str | Path) -> Path:
 
     answer = Path(path)
     return answer.with_name(f"{answer.name}{ANSWER_PROOF_SUFFIX}")
+
+
+def answer_format_path(path: str | Path) -> Path:
+    """Return the durable format-marker path for one answer artifact."""
+
+    return Path(path).parent / ANSWER_FORMAT_FILENAME
+
+
+def _read_answer_metadata(path: Path, label: str) -> bytes | None:
+    """Read one optional regular metadata file within the fixed sidecar bound."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise AnswerProofError(f"{label} is unreadable: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AnswerProofError(f"{label} must be a regular file")
+    if metadata.st_size > _MAX_ANSWER_METADATA_BYTES:
+        raise AnswerProofError(
+            f"{label} exceeds the {_MAX_ANSWER_METADATA_BYTES}-byte bound"
+        )
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(_MAX_ANSWER_METADATA_BYTES + 1)
+    except OSError as error:
+        raise AnswerProofError(f"{label} is unreadable: {error}") from error
+    if len(data) > _MAX_ANSWER_METADATA_BYTES:
+        raise AnswerProofError(
+            f"{label} exceeds the {_MAX_ANSWER_METADATA_BYTES}-byte bound"
+        )
+    return data
 
 
 def inspect_answer(path: str | Path, *, sentinel: str | None = DEFAULT_SENTINEL) -> AnswerProof:
@@ -123,6 +173,14 @@ def inspect_answer(path: str | Path, *, sentinel: str | None = DEFAULT_SENTINEL)
     if sentinel is not None and (not isinstance(sentinel, str) or not sentinel.strip()):
         raise ValidationError("sentinel must be a nonblank string or None")
     answer = Path(path)
+    try:
+        metadata = answer.lstat()
+    except FileNotFoundError:
+        return AnswerProof(answer, False, 0, None, False)
+    except OSError as error:
+        raise ValidationError(f"cannot inspect answer file: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PathEscapeError(f"answer artifact must be a regular file: {answer}")
     digest = hashlib.sha256()
     size = 0
     tail = b""
@@ -159,21 +217,41 @@ def inspect_answer(path: str | Path, *, sentinel: str | None = DEFAULT_SENTINEL)
 def _inspect_proof_sidecar(answer: Path, size: int, sha256: str) -> tuple[int, str | None]:
     """Classify one hashed payload's proof sidecar without raising.
 
-    A missing sidecar marks the legacy sentinel format; a present sidecar
-    pins the sidecar format and yields the payload mismatch reason, if any.
+    The durable directory marker pins new artifacts to the proof format even
+    when their required proof is missing or corrupt. Only directories with
+    neither marker nor proof are treated as historical sentinel format.
     """
 
     try:
-        raw = answer_proof_path(answer).read_bytes()
-    except FileNotFoundError:
+        version, _ = _load_answer_proof(answer, size, sha256)
+    except AnswerProofError as error:
+        return ANSWER_FORMAT_PROOF, str(error)
+    return version, None
+
+
+def _load_answer_proof(
+    answer: Path, size: int, sha256: str
+) -> tuple[int, dict[str, object] | None]:
+    """Load and verify one proof using the independent durable format marker."""
+
+    marker = _read_answer_metadata(answer_format_path(answer), "answer format marker")
+    raw = _read_answer_metadata(answer_proof_path(answer), "answer proof sidecar")
+    if marker is None and raw is None:
         return ANSWER_FORMAT_LEGACY, None
-    except OSError as error:
-        return ANSWER_FORMAT_PROOF, f"answer proof sidecar is unreadable: {error}"
+    if marker is not None and marker != ANSWER_FORMAT_CONTENT:
+        raise AnswerProofError("answer format marker is malformed")
+    if raw is None:
+        raise AnswerProofError("answer proof sidecar is missing")
     try:
         proof = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        return ANSWER_FORMAT_PROOF, f"answer proof sidecar is malformed: {error}"
-    return ANSWER_FORMAT_PROOF, _proof_mismatch(proof, answer.name, size, sha256)
+        raise AnswerProofError(f"answer proof sidecar is malformed: {error}") from error
+    if not isinstance(proof, dict):
+        raise AnswerProofError("answer proof sidecar must contain a JSON object")
+    problem = _proof_mismatch(proof, answer.name, size, sha256)
+    if problem is not None:
+        raise AnswerProofError(problem)
+    return ANSWER_FORMAT_PROOF, proof
 
 
 def _proof_mismatch(proof: object, answer_name: str, size: int, sha256: str) -> str | None:
@@ -221,28 +299,13 @@ def load_answer_proof(
 ) -> dict | None:
     """Verify the proof sidecar for one stored answer, or ``None`` if legacy.
 
-    A missing sidecar marks the historical sentinel format. A present
-    sidecar that is unreadable, malformed, or contradicts the recorded
-    ``expected_bytes``/``expected_sha256`` raises ``AnswerProofError``; a
-    broken new-format proof is never silently downgraded to legacy handling.
+    An agent-directory format marker makes the current proof mandatory. Only
+    directories with neither marker nor proof use historical legacy handling.
+    Unreadable, oversized, malformed, or contradicting metadata raises
+    ``AnswerProofError`` and never silently downgrades a new-format payload.
     """
 
-    answer = Path(path)
-    try:
-        raw = answer_proof_path(answer).read_bytes()
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        raise AnswerProofError(f"answer proof sidecar is unreadable: {error}") from error
-    try:
-        proof = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise AnswerProofError(f"answer proof sidecar is malformed: {error}") from error
-    if not isinstance(proof, dict):
-        raise AnswerProofError("answer proof sidecar must contain a JSON object")
-    problem = _proof_mismatch(proof, answer.name, expected_bytes, expected_sha256)
-    if problem is not None:
-        raise AnswerProofError(problem)
+    _, proof = _load_answer_proof(Path(path), expected_bytes, expected_sha256)
     return proof
 
 
@@ -291,16 +354,15 @@ def read_answer_payload(
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
         raise ValidationError("max_bytes must be a positive integer")
     answer = Path(path)
-    if answer.is_symlink():
-        raise PathEscapeError(f"answer artifact must not be a symlink: {answer}")
     try:
-        size = answer.stat().st_size
+        metadata = answer.lstat()
     except FileNotFoundError:
         raise AnswerMissingError(f"answer artifact is missing: {answer}") from None
     except OSError as error:
         raise ValidationError(f"cannot stat answer artifact: {error}") from error
-    if not answer.is_file():
+    if not stat.S_ISREG(metadata.st_mode):
         raise PathEscapeError(f"answer artifact must be a regular file: {answer}")
+    size = metadata.st_size
     if size != expected_bytes:
         raise AnswerTamperedError("answer artifact size does not match its recorded proof")
     if size > max_bytes:

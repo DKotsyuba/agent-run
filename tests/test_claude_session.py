@@ -67,9 +67,11 @@ class ClaudeSessionTests(unittest.TestCase):
     # -- success / empty result -----------------------------------------
 
     def test_nonblank_result_succeeds_with_content_and_bounded_metadata_event(self) -> None:
+        """Seal a successful Claude result as a clean, proven answer payload."""
+
         import hashlib
 
-        from agent_run.verify import DEFAULT_SENTINEL
+        from agent_run.verify import ANSWER_FORMAT_PROOF, inspect_answer
 
         script = (
             "import sys, json\n"
@@ -89,10 +91,13 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertEqual(outcome.runtime_session_id, "sess-1")
         answer = self.agent_dir / "answer.md"
         data = answer.read_bytes()
-        self.assertTrue(data.endswith(f"{DEFAULT_SENTINEL}\n".encode()))
+        proof = inspect_answer(answer)
+        self.assertEqual(data, b"the answer")
         self.assertEqual(outcome.answer_path, answer)
         self.assertEqual(outcome.answer_bytes, len(data))
         self.assertEqual(outcome.answer_sha256, hashlib.sha256(data).hexdigest())
+        self.assertTrue(proof.complete)
+        self.assertEqual(proof.proof_version, ANSWER_FORMAT_PROOF)
         self.assertTrue(sink.sessions and set(sink.sessions) == {"sess-1"})
         self.assertTrue(any(m.role == MessageRole.ASSISTANT and m.content == "hi there" for m in sink.messages))
         result_events = [data for kind, data in sink.events if kind == "runtime_result"]

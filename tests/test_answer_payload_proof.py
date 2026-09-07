@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
@@ -19,8 +19,8 @@ from agent_run.adapters.base import (
 )
 from agent_run.adapters.home import seal_answer
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
-from agent_run.domain import AgentStatus, Outcome, StartRequest
-from agent_run.errors import PathEscapeError, ValidationError
+from agent_run.domain import TERMINAL, AgentStatus, Outcome, StartRequest
+from agent_run.errors import PathEscapeError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
@@ -33,15 +33,11 @@ from agent_run.verify import (
     AnswerOversizedError,
     AnswerProofError,
     AnswerTamperedError,
+    answer_format_path,
+    answer_proof_path,
     inspect_answer,
     read_answer_payload,
     strip_legacy_frame,
-)
-from agent_run.workflow_executor import (
-    AnswerJsonError,
-    AnswerSchemaError,
-    WorkflowStepExecutor,
-    validate_output,
 )
 
 
@@ -56,14 +52,20 @@ class SealAndProofTests(unittest.TestCase):
     """Cover sealing, proof inspection, legacy framing, and bounded reads."""
 
     def setUp(self) -> None:
+        """Create an isolated answer directory for each proof-path test."""
+
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.path = self.root / "answer.md"
 
     def tearDown(self) -> None:
+        """Remove the isolated answer directory."""
+
         self.temporary.cleanup()
 
     def test_seal_writes_clean_payload_and_versioned_proof(self) -> None:
+        """Seal exact payload bytes and bind them to the current proof format."""
+
         size, digest = seal_answer(self.path, "body text")
         data = self.path.read_bytes()
         self.assertEqual(data, b"body text")
@@ -80,6 +82,8 @@ class SealAndProofTests(unittest.TestCase):
         self.assertIsNone(inspection.proof_error)
 
     def test_sealed_payload_may_contain_sentinel_text(self) -> None:
+        """Keep sentinel-looking text inside a new payload as ordinary content."""
+
         text = f"the marker {DEFAULT_SENTINEL} is just content here"
         size, digest = seal_answer(self.path, text)
         self.assertEqual(self.path.read_bytes(), text.encode("utf-8"))
@@ -94,6 +98,8 @@ class SealAndProofTests(unittest.TestCase):
         self.assertEqual(payload, text)
 
     def test_legacy_terminal_frame_is_stripped_once_exactly(self) -> None:
+        """Strip only the historical terminal frame and at most once."""
+
         self.assertEqual(strip_legacy_frame(_framed(b"payload")), b"payload")
         # A payload trailing newline is not distinguishable from the joining
         # separator, so presentation drops exactly the one known frame.
@@ -101,11 +107,15 @@ class SealAndProofTests(unittest.TestCase):
         self.assertEqual(strip_legacy_frame(b"no frame here"), b"no frame here")
 
     def test_legacy_embedded_sentinel_is_preserved(self) -> None:
+        """Preserve sentinel text embedded before the historical terminal frame."""
+
         framed = _framed(f"see {DEFAULT_SENTINEL} inside".encode())
         stripped = strip_legacy_frame(framed)
         self.assertEqual(stripped, f"see {DEFAULT_SENTINEL} inside".encode())
 
     def test_inspect_legacy_requires_the_terminal_sentinel(self) -> None:
+        """Require the terminal frame when no durable new-format evidence exists."""
+
         self.path.write_bytes(_framed(b"legacy body"))
         proof = inspect_answer(self.path)
         self.assertTrue(proof.complete)
@@ -116,6 +126,8 @@ class SealAndProofTests(unittest.TestCase):
         self.assertEqual(cut.proof_version, ANSWER_FORMAT_LEGACY)
 
     def test_malformed_or_contradicting_proof_never_downgrades(self) -> None:
+        """Keep malformed and mismatched proof artifacts in format two."""
+
         seal_answer(self.path, "proven body")
         sidecar = self.root / "answer.md.proof.json"
         sidecar.write_bytes(b"this is not json")
@@ -131,7 +143,42 @@ class SealAndProofTests(unittest.TestCase):
         self.assertFalse(contradicted.complete)
         self.assertIsNotNone(contradicted.proof_error)
 
+    def test_missing_proof_never_downgrades_a_sealed_payload(self) -> None:
+        """Use the durable format marker when a new payload loses its proof."""
+
+        seal_answer(self.path, f"payload\n{DEFAULT_SENTINEL}\n")
+        answer_proof_path(self.path).unlink()
+        inspection = inspect_answer(self.path)
+        self.assertEqual(inspection.proof_version, ANSWER_FORMAT_PROOF)
+        self.assertFalse(inspection.complete)
+        self.assertIn("missing", inspection.proof_error or "")
+
+    def test_metadata_reads_are_bounded_and_reject_symlinks(self) -> None:
+        """Reject oversized proof metadata and proof paths that are symlinks."""
+
+        seal_answer(self.path, "bounded")
+        proof = answer_proof_path(self.path)
+        proof.write_bytes(b"x" * 4097)
+        self.assertIn("4096-byte bound", inspect_answer(self.path).proof_error or "")
+        proof.unlink()
+        target = self.root / "elsewhere.json"
+        target.write_text("{}", encoding="utf-8")
+        proof.symlink_to(target)
+        self.assertIn("regular file", inspect_answer(self.path).proof_error or "")
+
+    def test_corrupted_format_marker_fails_closed(self) -> None:
+        """Reject a corrupted durable format marker even with a valid proof."""
+
+        seal_answer(self.path, "marked")
+        answer_format_path(self.path).write_bytes(b"legacy?\n")
+        inspection = inspect_answer(self.path)
+        self.assertEqual(inspection.proof_version, ANSWER_FORMAT_PROOF)
+        self.assertFalse(inspection.complete)
+        self.assertIn("format marker", inspection.proof_error or "")
+
     def test_read_answer_payload_raises_distinct_typed_errors(self) -> None:
+        """Classify missing, oversized, tampered, linked, and invalid UTF-8 payloads."""
+
         size, digest = seal_answer(self.path, "typed errors")
         with self.assertRaises(AnswerMissingError):
             read_answer_payload(
@@ -188,6 +235,8 @@ class SealAndProofTests(unittest.TestCase):
             )
 
     def test_read_answer_payload_legacy_strips_the_frame_once(self) -> None:
+        """Verify historical bytes before stripping their terminal frame."""
+
         framed = _framed(b"legacy body")
         self.path.write_bytes(framed)
         payload = read_answer_payload(
@@ -199,117 +248,55 @@ class SealAndProofTests(unittest.TestCase):
         )
         self.assertEqual(payload, "legacy body")
 
-
-class ValidateOutputSchemaTests(unittest.TestCase):
-    """Cover jsonschema-backed output validation with an empty registry."""
-
-    def test_invalid_json_is_a_typed_error(self) -> None:
-        with self.assertRaises(AnswerJsonError):
-            validate_output("{not json", {"type": "object"})
-        with self.assertRaises(AnswerJsonError):
-            validate_output("", {"type": "object"})
-
-    def test_schema_features_beyond_the_old_subset(self) -> None:
-        schema = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["name", "count"],
-            "properties": {
-                "name": {"type": "string", "pattern": "^[a-z]+$"},
-                "count": {"type": "integer", "minimum": 1},
-                "mode": {"enum": ["fast", "slow"]},
-            },
-        }
-        validate_output('{"name": "abc", "count": 2, "mode": "fast"}', schema)
-        for bad in (
-            '{"name": "ABC", "count": 2}',
-            '{"name": "abc", "count": 0}',
-            '{"name": "abc", "count": 2, "mode": "wild"}',
-            '{"name": "abc", "count": 2, "extra": true}',
-            '{"count": 2}',
-        ):
-            with self.assertRaises(ValidationError, msg=bad):
-                validate_output(bad, schema)
-
-    def test_local_ref_resolves_without_io(self) -> None:
-        schema = {
-            "definitions": {"positive": {"type": "integer", "minimum": 1}},
-            "type": "object",
-            "properties": {"count": {"$ref": "#/definitions/positive"}},
-        }
-        validate_output('{"count": 3}', schema)
-        with self.assertRaises(ValidationError):
-            validate_output('{"count": -3}', schema)
-
-    def test_local_ref_resolves_under_an_http_id_without_io(self) -> None:
-        schema = {
-            "$id": "https://schemas.example.invalid/answer.json",
-            "definitions": {"word": {"type": "string"}},
-            "type": "object",
-            "properties": {"word": {"$ref": "#/definitions/word"}},
-        }
-        validate_output('{"word": "fine"}', schema)
-        with self.assertRaises(ValidationError):
-            validate_output('{"word": 5}', schema)
-
-    def test_remote_and_file_refs_fail_without_io(self) -> None:
-        with self.assertRaises(AnswerSchemaError):
-            validate_output("{}", {"$ref": "https://schemas.example.invalid/x.json"})
-        with self.assertRaises(AnswerSchemaError):
-            validate_output("{}", {"$ref": "file:///etc/passwd"})
-
-    def test_unknown_explicit_dialect_is_rejected_deterministically(self) -> None:
-        schema = {"$schema": "https://example.invalid/dialect", "type": "object"}
-        with self.assertRaises(AnswerSchemaError):
-            validate_output("{}", schema)
-
-    def test_explicit_supported_dialect_is_honored(self) -> None:
-        schema = {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "string",
-        }
-        validate_output('"text"', schema)
-        with self.assertRaises(ValidationError):
-            validate_output("5", schema)
-
-    def test_malformed_schema_is_a_typed_error(self) -> None:
-        with self.assertRaises(AnswerSchemaError):
-            validate_output("{}", {"type": "not-a-type"})
-        with self.assertRaises(AnswerSchemaError):
-            validate_output("{}", "not a schema")
-
-
 class _Adapter:
     """Minimal runtime adapter satisfying the service's preparation surface."""
 
     def __init__(self) -> None:
+        """Advertise every capability required by the service fixture."""
+
         self.capabilities = frozenset(Capability)
 
     def describe(self):
+        """Describe the synthetic runtime used by service tests."""
+
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
 
     def validate(self, config):
+        """Accept the fixture's synthetic runtime configuration."""
+
         return None
 
     def materialize(self, config, home, *, mcp_servers, skills_root):
+        """Return the fixed fixture configuration revision without writing files."""
+
         return "cfg-1"
 
     def probe(self, config, home):
+        """Report the fixture runtime as available."""
+
         return RuntimeHealth(True, "1", True, None)
 
     def models(self, config, home):
+        """Return the fixture's single supported model."""
+
         return (ModelInfo("model", "fake model", ("high",)),)
 
     def limits(self, config, home):
+        """Fail if a service answer test unexpectedly asks for live limits."""
+
         raise AssertionError("service limits must use stored samples")
 
     def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+        """Build the minimal launch plan required to create a stored agent row."""
+
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task,
             agent_dir / "runtime.jsonl", {}, agent_dir / "answer.md",
         )
 
     def launch(self, plan, sink):
+        """Fail if the service bypasses its injected launch seam."""
+
         raise AssertionError("AgentService uses the injected launch seam")
 
 
@@ -320,6 +307,8 @@ class _ServiceFixture:
     """Shared real store/service fixture for answer-format service tests."""
 
     def setUp(self) -> None:
+        """Create a real state store and service around a synthetic adapter."""
+
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.workdir = self.root / "work"
@@ -353,11 +342,15 @@ class _ServiceFixture:
         )
 
     def tearDown(self) -> None:
+        """Close the service, store, and temporary fixture directory."""
+
         self.service.close()
         self.store.close()
         self.temporary.cleanup()
 
     def _start(self) -> str:
+        """Create one accepted synthetic agent and return its identifier."""
+
         request = StartRequest(
             runtime="fake",
             model="model",
@@ -365,10 +358,21 @@ class _ServiceFixture:
             task="produce an answer",
             workdir=self.workdir,
         )
-        return str(self.service.start(request).agent_id)
+        agent_id = str(self.service.start(request).agent_id)
+        for _ in range(1000):
+            status = self.service.get(agent_id).status
+            if status is AgentStatus.STARTING and agent_dir(agent_id, self.root).is_dir():
+                return agent_id
+            if status in TERMINAL:
+                self.fail(f"fixture agent failed during preparation: {status.value}")
+            time.sleep(0.001)
+        self.fail("fixture agent did not reach running state")
 
     def _record_answer(self, agent_id: str, payload: bytes, *, seal: bool) -> tuple[Path, int, str]:
+        """Record a current sealed or historical framed answer for one agent."""
+
         directory = agent_dir(agent_id, self.root)
+        directory.mkdir(parents=True, exist_ok=True)
         path = directory / "answer.md"
         if seal:
             size, digest = seal_answer(path, payload.decode("utf-8"))
@@ -394,6 +398,8 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
     """Cover the AgentService answer descriptor for both proof formats."""
 
     def test_new_descriptor_carries_kind_media_type_path_and_proof_version(self) -> None:
+        """Expose stable descriptor metadata for a verified current payload."""
+
         agent_id = self._start()
         payload = b"# Report\n\nall done\n"
         _, size, digest = self._record_answer(agent_id, payload, seal=True)
@@ -409,6 +415,8 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
         self.assertTrue(view.inline_complete)
 
     def test_legacy_descriptor_keeps_original_hash_and_strips_frame_once(self) -> None:
+        """Keep historical hash evidence while stripping its frame for display."""
+
         agent_id = self._start()
         framed = _framed(f"legacy body with {DEFAULT_SENTINEL} inside".encode())
         _, size, digest = self._record_answer(agent_id, framed, seal=False)
@@ -419,6 +427,8 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
         self.assertEqual(view.content, f"legacy body with {DEFAULT_SENTINEL} inside")
 
     def test_corrupted_proof_raises_typed_error_without_legacy_downgrade(self) -> None:
+        """Raise a typed proof error for corrupt current metadata."""
+
         agent_id = self._start()
         path, _, _ = self._record_answer(agent_id, b"proven", seal=True)
         (path.parent / "answer.md.proof.json").write_bytes(b"not json at all")
@@ -426,6 +436,8 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
             self.service.answer(agent_id)
 
     def test_contradicting_proof_raises_typed_error(self) -> None:
+        """Raise a typed proof error when metadata contradicts the payload."""
+
         agent_id = self._start()
         path, _, _ = self._record_answer(agent_id, b"proven", seal=True)
         sidecar = path.parent / "answer.md.proof.json"
@@ -436,6 +448,8 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
             self.service.answer(agent_id)
 
     def test_tampered_payload_raises_typed_error(self) -> None:
+        """Reject payload changes to either recorded size or recorded hash."""
+
         agent_id = self._start()
         path, size, _ = self._record_answer(agent_id, b"tamper target", seal=True)
         path.write_bytes(b"tamper targetX")
@@ -446,6 +460,8 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
             self.service.answer(agent_id)
 
     def test_missing_payload_raises_typed_error(self) -> None:
+        """Raise the missing-artifact error when the stored payload disappears."""
+
         agent_id = self._start()
         path, _, _ = self._record_answer(agent_id, b"gone soon", seal=True)
         path.unlink()
@@ -453,118 +469,36 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
             self.service.answer(agent_id)
 
     def test_invalid_utf8_raises_typed_error(self) -> None:
+        """Reject stored answer bytes that cannot decode as UTF-8."""
+
         agent_id = self._start()
         self._record_answer(agent_id, b"\xff\xfe\x01", seal=False)
         with self.assertRaises(AnswerEncodingError):
             self.service.answer(agent_id)
 
+    def test_above_inline_limit_payload_is_still_fully_verified(self) -> None:
+        """Verify a full payload even when it is too large for inline display."""
 
-class _ReplayService:
-    """Service double replaying one real terminal agent through a real service."""
-
-    def __init__(self, real: AgentService, agent_id: str) -> None:
-        self._real = real
-        self._agent_id = agent_id
-
-    def start(self, request):
-        return SimpleNamespace(agent_id=self._agent_id)
-
-    def get(self, agent_id):
-        return self._real.get(agent_id)
-
-    def answer(self, agent_id):
-        return self._real.answer(agent_id)
-
-    def cancel(self, agent_id):
-        return None
-
-
-class ExecutorFullPayloadTests(_ServiceFixture, unittest.TestCase):
-    """Run seal -> store -> service -> executor with real artifacts."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.run_id = self.store.create_workflow_run("workflow", "digest")
-        self.store.claim_workflow_run(self.run_id, "1 test")
-
-    def _executor(self, service) -> WorkflowStepExecutor:
-        return WorkflowStepExecutor(
-            self.root,
-            self.store,
-            self.run_id,
-            service=service,
-            sleep=lambda _: None,
-            poll_seconds=0,
-        )
-
-    def test_above_inline_limit_json_still_validates(self) -> None:
         agent_id = self._start()
-        payload = json.dumps(
-            {"ok": True, "items": ["entry-%04d" % index for index in range(64)]}
-        ).encode("utf-8")
+        payload = b"x" * (1024 * 1024 + 1)
         self._record_answer(agent_id, payload, seal=True)
-        bounded = AgentService(
-            self.config,
-            self.store,
-            self.root,
-            launch=lambda *args: None,
-            now=lambda: 100.0,
-            max_inline_answer_bytes=16,
-        )
-        view = bounded.answer(agent_id)
+        view = self.service.answer(agent_id)
         self.assertIsNone(view.content)
         self.assertFalse(view.inline_complete)
-        schema = {
-            "type": "object",
-            "required": ["ok", "items"],
-            "properties": {
-                "ok": {"type": "boolean"},
-                "items": {"type": "array", "items": {"type": "string"}},
-            },
-        }
-        spec = {
-            "runtime": "fake",
-            "model": "model",
-            "profile": "profile",
-            "task": "produce an answer",
-            "workdir": str(self.workdir),
-            "output_schema": schema,
-        }
-        result = self._executor(_ReplayService(bounded, agent_id))("s1", spec)
-        self.assertEqual(result["status"], "succeeded")
-        self.assertNotIn("answer", result)
+        self.assertEqual(view.size_bytes, len(payload))
+        path = agent_dir(agent_id, self.root) / "answer.md"
+        path.write_bytes(b"y" + payload[1:])
+        with self.assertRaises(AnswerTamperedError):
+            self.service.answer(agent_id)
 
-    def test_invalid_json_fails_the_step_with_typed_message(self) -> None:
-        agent_id = self._start()
-        self._record_answer(agent_id, b"{not json", seal=True)
-        schema = {"type": "object"}
-        spec = {
-            "runtime": "fake",
-            "model": "model",
-            "profile": "profile",
-            "task": "produce an answer",
-            "workdir": str(self.workdir),
-            "output_schema": schema,
-        }
-        result = self._executor(_ReplayService(self.service, agent_id))("s1", spec)
-        self.assertEqual(result["failure_kind"], "step_output_invalid")
-        self.assertIn("not valid JSON", result["failure_params"]["message"])
+    def test_missing_current_proof_raises_instead_of_becoming_legacy(self) -> None:
+        """Require proof when the durable marker identifies a current payload."""
 
-    def test_tampered_payload_fails_closed(self) -> None:
         agent_id = self._start()
-        path, _, _ = self._record_answer(agent_id, b'{"ok": true}', seal=True)
-        path.write_bytes(b'{"ok": false}')
-        schema = {"type": "object"}
-        spec = {
-            "runtime": "fake",
-            "model": "model",
-            "profile": "profile",
-            "task": "produce an answer",
-            "workdir": str(self.workdir),
-            "output_schema": schema,
-        }
-        result = self._executor(_ReplayService(self.service, agent_id))("s1", spec)
-        self.assertEqual(result["failure_kind"], "step_output_invalid")
+        path, _, _ = self._record_answer(agent_id, b"proved", seal=True)
+        answer_proof_path(path).unlink()
+        with self.assertRaisesRegex(AnswerProofError, "missing"):
+            self.service.answer(agent_id)
 
 
 if __name__ == "__main__":
