@@ -43,8 +43,9 @@ you / your agent / your app
   or a local router), computes usage priorities from burn rate and reset time,
   and injects an ordered summary when it changes. The orchestrator chooses the
   first role-compatible route; `limits` remains available for diagnostics.
-- **Zero dependencies.** Python 3.14+ standard library only. The whole
-  runtime installs from `pyproject.toml` with nothing else.
+- **Locked dependencies.** Runtime packages are declared in `pyproject.toml`,
+  resolved in the committed `uv.lock`, and release installs verify a hashed
+  dependency closure before the application wheel.
 
 ## Install
 

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -42,7 +43,7 @@ class PublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "release"
             with self.assertRaisesRegex(release.ReleaseError, "Python 3.14"):
-                local.prepare(runner, target, Path(directory) / "wheel.whl", "1.2.3", "python3.13")
+                local.prepare(runner, target, Path(directory) / "wheel.whl", Path(directory) / "requirements.lock", "1.2.3", "python3.13")
             self.assertFalse(target.exists())
 
     def test_cli_uses_shared_exception_identity_and_restores_every_job(self):
@@ -53,7 +54,7 @@ class PublicationTests(unittest.TestCase):
             """Configure the temporary runpy module at parsing, returning Namespace options."""
             script = sys.modules["release"]
             vars(script)["publish"] = Mock(return_value="head")
-            vars(script)["verify_assets"] = Mock(return_value=Path("wheel.whl"))
+            vars(script)["verify_assets"] = Mock(return_value=(Path("wheel.whl"), Path("requirements.lock")))
             deployment = importlib.import_module("release_local")
             self.assertIs(deployment.ReleaseError, script.ReleaseError)
 
@@ -160,7 +161,7 @@ class PublicationTests(unittest.TestCase):
         """Hash corruption and signed identity drift are rejected despite verifier exit 0."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            names = ["agent_run-1.2.3-py3-none-any.whl", "agent_run-1.2.3.tar.gz"]
+            names = ["agent_run-1.2.3-py3-none-any.whl", "agent_run-1.2.3.tar.gz", "requirements.lock"]
             digest = hashlib.sha256(b"artifact").hexdigest()
             for name in names:
                 (root / name).write_bytes(b"artifact")
@@ -171,12 +172,47 @@ class PublicationTests(unittest.TestCase):
                 "statement": {"subject": [{"name": name, "digest": {"sha256": digest}} for name in names]}}}]
             runner = Mock()
             runner.json.return_value = evidence
-            self.assertEqual(release.verify_assets(runner, "1.2.3", "head", root), root / names[0])
+            self.assertEqual(release.verify_assets(runner, "1.2.3", "head", root), (root / names[0], root / names[2]))
             with self.assertRaisesRegex(release.ReleaseError, "Provenance"):
                 release.verify_assets(runner, "1.2.3", "wrong", root)
             (root / names[0]).write_bytes(b"corrupted")
             with self.assertRaisesRegex(release.ReleaseError, "Checksum"):
                 release.verify_assets(runner, "1.2.3", "head", root)
+            (root / names[0]).write_bytes(b"artifact")
+            (root / names[2]).unlink()
+            with self.assertRaisesRegex(release.ReleaseError, "Missing release asset: requirements.lock"):
+                release.verify_assets(runner, "1.2.3", "head", root)
+
+    def test_locked_install_requires_complete_transitive_closure(self):
+        """A missing transitive wheel fails offline; the complete hashed closure installs."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = {}
+            for name, requirement in (("leaf", ""), ("middle", "Requires-Dist: leaf == 1\n"),
+                                      ("application", "Requires-Dist: middle == 1\n")):
+                wheel = root / f"{name}-1-py3-none-any.whl"
+                with zipfile.ZipFile(wheel, "w") as archive:
+                    archive.writestr(f"{name}/__init__.py", "")
+                    archive.writestr(f"{name}-1.dist-info/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: 1\n{requirement}")
+                    archive.writestr(f"{name}-1.dist-info/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+                    archive.writestr(f"{name}-1.dist-info/RECORD", "")
+                wheels[name] = wheel
+            digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            missing = root / "missing.lock"
+            missing.write_text(f"--no-index\n{wheels['middle'].as_uri()} --hash=sha256:{digest(wheels['middle'])}\n")
+            complete = root / "requirements.lock"
+            complete.write_text("--no-index\n" + "".join(
+                f"{wheels[name].as_uri()} --hash=sha256:{digest(wheels[name])}\n" for name in ("leaf", "middle")))
+            runner = release.Runner(30, 0.01)
+            failed = root / "failed"
+            runner.run(sys.executable, "-m", "venv", str(failed / "venv"))
+            with self.assertRaises(release.ReleaseError):
+                local.install_locked_dependencies(runner, failed, missing)
+            target = root / "release"
+            runner.run(sys.executable, "-m", "venv", str(target / "venv"))
+            local.install_locked_dependencies(runner, target, complete)
+            runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-deps", str(wheels["application"]))
+            runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "check")
 
 
 class LocalTests(unittest.TestCase):
@@ -223,7 +259,7 @@ class LocalTests(unittest.TestCase):
 
     def deploy(self):
         """Call local deployment with fixture home and a non-installed dummy wheel path."""
-        local.deploy(self.runner, self.home, self.user / "wheel.whl", "1.2.3", "new", "python3.14", "com.test.agent-run")
+        local.deploy(self.runner, self.home, self.user / "wheel.whl", self.user / "requirements.lock", "1.2.3", "new", "python3.14", "com.test.agent-run")
 
     def migrate(self, runner, target, home):
         """Fake installed migration, asserting backup-before-migration and all shutdowns."""

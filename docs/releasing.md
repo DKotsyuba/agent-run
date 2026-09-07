@@ -71,8 +71,11 @@ to `com.<login>.agent-run`; `--timeout` and `--poll` are positive seconds,
 defaulting to 3600 and 10. Publication itself can run on other operating systems.
 Timeouts stop waiting; they do not cancel a remote workflow or active agent.
 
-Local deployment installs only the verified wheel, verifies or reuses a sealed
-release, and runs isolated init/doctor/API/MCP checks. It waits for every active
+Local deployment verifies the wheel and `requirements.lock`, installs the
+hash-pinned dependency closure, installs the wheel without re-resolving it, and
+runs `pip check` before it seals the release. A release missing the lock is
+refused. It then verifies or reuses the sealed release and runs isolated
+init/doctor/API/MCP checks. It waits for every active
 agent and workflow, reserves the SQLite writer while stopping API admission and
 loaded periodic jobs, then rechecks quiescence. Before migration it backs up
 SQLite with its backup API, saves configuration and the previous pointer under
@@ -93,6 +96,10 @@ needs to wait for SQLite, it has an independent 120-second allowance. An already
 migrated target is reused without running migration again. If recovery itself
 fails, the error identifies the journal and backup and explicitly warns that
 services may remain stopped. Preserve those files and resume the same version.
+
+Release builds generate `dist/requirements.lock` from the committed graph with
+`uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock`.
+The lock is checksummed, attested, and uploaded with the wheel and source archive.
 Incomplete candidate directories are preserved under an `.incomplete-<time>`
 suffix before rebuilding; a corrupt or incomplete current release is refused.
 Reconnect existing MCP clients after the update; application hosts are not killed.

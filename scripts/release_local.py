@@ -126,12 +126,24 @@ def smoke(runner: Runner, release: Path) -> None:
                     process.wait(timeout=10)
 
 
-def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable: str) -> int:
-    """Reuse or build Path target from verified wheel; return supported schema int.
+def install_locked_dependencies(runner: Runner, release: Path, requirements: Path) -> None:
+    """Install the hash-pinned dependency closure into a sealed release venv.
+
+    Requirements must enumerate every runtime dependency as a binary wheel with
+    hashes. Pip rejects incomplete or altered closures before the application
+    wheel is installed.
+    """
+    runner.run(str(release / "venv/bin/python"), "-I", "-m", "pip", "install",
+               "--require-hashes", "--only-binary=:all:", "-r", str(requirements), env=environment())
+
+
+def prepare(runner: Runner, target: Path, wheel: Path, requirements: Path, version: str, executable: str) -> int:
+    """Reuse or build Path target from verified wheel and locked requirements.
 
     String executable must be Python 3.14. Incomplete candidates are preserved
     under timestamped names before rebuilding; corrupt COMPLETE candidates fail.
-    COMPLETE is written only after isolated smoke.
+    COMPLETE is written only after isolated smoke and ``pip check`` confirms
+    that the installed wheel's runtime dependencies are present.
     """
     if target.exists() and not (target / "COMPLETE").exists():
         target.rename(target.with_name(f"{target.name}.incomplete-{time.time_ns()}"))
@@ -143,7 +155,9 @@ def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable:
             raise ReleaseError("Local releases require Python 3.14")
         target.mkdir(parents=True)
         runner.run(executable, "-m", "venv", str(target / "venv"))
+        install_locked_dependencies(runner, target, requirements)
         runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-deps", str(wheel), env=environment())
+        runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "check", env=environment())
         if identity(runner, target)[0] != version:
             raise ReleaseError("Installed wheel version mismatch")
         smoke(runner, target)
@@ -298,9 +312,9 @@ def recover(runner: Runner, home: Path, journal: dict) -> None:
     restart(runner, journal["jobs"])
 
 
-def deploy(runner: Runner, home: Path, wheel: Path, version: str, sha: str,
+def deploy(runner: Runner, home: Path, wheel: Path, requirements: Path, version: str, sha: str,
            executable: str, prefix: str) -> None:
-    """Deploy verified wheel Path at SHA/version strings into existing Path home.
+    """Deploy verified wheel and hash-locked requirements into existing Path home.
 
     A nonblocking flock serializes deploys. Wait read-only for active work, then
     hold a short SQLite write reservation while stopping API admission and the
@@ -332,7 +346,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, version: str, sha: str,
         verify_complete(previous)
         _, previous_schema = identity(runner, previous)
         print(f"Preparing verified local release {version}", flush=True)
-        target_schema = prepare(runner, target, wheel, version, executable)
+        target_schema = prepare(runner, target, wheel, requirements, version, executable)
         live_schema = schema_version(home, runner)
         if live_schema > target_schema:
             raise ReleaseError("Refusing runtime/schema downgrade")
