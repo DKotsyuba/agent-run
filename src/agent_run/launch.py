@@ -222,11 +222,9 @@ def launch_detached(
         str(error_write),
     ]
     try:
-        # The child derives its own identity from `ps -o command=` on its own
-        # pid (see supervisor_identity()): a parent-recorded argv can diverge
-        # from what ps reports once exec'd (e.g. a venv python symlink
-        # resolves to the real framework binary on macOS), so the parent
-        # does not record one here.
+        # The identity pipe reports only the exec'd child's PID, which the
+        # parent validates against the spawned PID. Command text is a later
+        # child-side diagnostic and is not part of this ownership handshake.
         blob = json.dumps(
             {
                 **dict(payload),

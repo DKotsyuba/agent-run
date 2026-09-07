@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import os
-import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,26 +54,16 @@ DEFAULT_WARNING_TEXT = (
 
 
 def supervisor_identity() -> str:
-    """The full command identity reconciliation compares against.
+    """Return a nonblank command diagnostic for the current process.
 
-    Derived from `ps -o command=` on this process's own pid -- the same
-    probe reconciliation and doctor run later -- because argv[0] as passed
-    to exec can diverge from what ps reports (a venv python symlink
-    resolves to the real framework binary on macOS).
+    ``sys.orig_argv`` describes the interpreter invocation without spawning an
+    external probe. PID birth time remains the ownership authority; this text is
+    persisted only for operators. An unusually empty argv falls back to a label
+    containing this process's PID so callers always receive a nonblank value.
     """
 
-    try:
-        result = subprocess.run(
-            ["/bin/ps", "-p", str(os.getpid()), "-o", "command="],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            env={"PATH": "/usr/bin:/bin"},
-        )
-        identity = result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        identity = ""
-    return identity or "agent-run-supervisor"
+    identity = " ".join(sys.orig_argv).strip()
+    return identity or f"pid:{os.getpid()}"
 
 
 def _error_text(error: BaseException) -> str:

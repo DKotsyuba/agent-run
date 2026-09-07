@@ -118,10 +118,7 @@ def runner_identity() -> str:
     suffix remains useful to operators and preserves the legacy row format.
     """
 
-    identity = supervisor_identity()
-    if identity == "agent-run-supervisor":
-        identity = " ".join(sys.orig_argv[1:])
-    return workflow_owner_identity(os.getpid(), identity)
+    return workflow_owner_identity(os.getpid(), supervisor_identity())
 
 
 def execute_plan(

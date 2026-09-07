@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -276,6 +277,18 @@ class SupervisorTests(unittest.TestCase):
 
     def agent(self) -> dict:
         return self.store.get_agent(self.agent_id)
+
+    def test_supervisor_identity_needs_no_process_probe(self) -> None:
+        """Command diagnostics come from argv and retain a unique empty fallback."""
+
+        with mock.patch.object(
+            sys, "orig_argv", ["python", "-m", "agent_run.supervisor_main"]
+        ), mock.patch("subprocess.run", side_effect=AssertionError("unexpected probe")):
+            self.assertEqual(
+                supervisor_identity(), "python -m agent_run.supervisor_main"
+            )
+        with mock.patch.object(sys, "orig_argv", []):
+            self.assertEqual(supervisor_identity(), f"pid:{os.getpid()}")
 
     def events(self, kind: str) -> list[sqlite3.Row]:
         return list(
