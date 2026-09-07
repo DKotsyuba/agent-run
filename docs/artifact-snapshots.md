@@ -37,3 +37,9 @@ Executable contract scenarios live in `tests/test_snapshots.py`:
 These fault injections verify ordering and fail-closed behavior in the process.
 They do not prove persistence through power loss on every filesystem. Directory
 fsync is used when the filesystem supports it.
+
+`build_config_snapshot()` produces canonical attempt metadata binding the
+materialized file revision to the runtime name, adapter API version, config
+schema version, complete runtime declaration, and effective profile body and
+grants. Configured environment values are represented by hashes, so content-only
+edits change the revision without copying credential-like values into metadata.

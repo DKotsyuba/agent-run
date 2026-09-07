@@ -5,14 +5,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 from agent_run.adapters.snapshots import (
     SNAPSHOT_MANIFEST,
+    build_config_snapshot,
     inspect_managed_snapshot,
     snapshot_managed_tree,
 )
+from agent_run.config import EnvironmentConfig, RuntimeConfig
 from agent_run.errors import ValidationError
+from agent_run.profiles import AgentProfile
 
 
 class ManagedSnapshotTests(unittest.TestCase):
@@ -86,6 +90,49 @@ class ManagedSnapshotTests(unittest.TestCase):
         self.assertIn("orphan.txt", recovery.orphans)
         self.assertIn("SKILL.md", recovery.referenced_missing)
         self.assertTrue((destination / "orphan.txt").exists())
+
+    def test_config_snapshot_changes_with_content_without_storing_secret_values(self) -> None:
+        """Bind runtime/profile content while retaining only hashes of configured values."""
+
+        secret = "credential-like-value"
+        config = RuntimeConfig(
+            True,
+            "agent_run.adapters.claude.adapter:ADAPTER",
+            Path("/bin/echo"),
+            self.home,
+            ("sonnet",),
+            environment=EnvironmentConfig(
+                variables=MappingProxyType({"TOKEN_LIKE": secret})
+            ),
+        )
+        profile = AgentProfile("review", "Review exactly.", False, (self.root,), False)
+        first = build_config_snapshot(
+            runtime="claude",
+            adapter_api_version=1,
+            schema_version=1,
+            materialize_revision="files-1",
+            config=config,
+            profile=profile,
+        )
+        same = build_config_snapshot(
+            runtime="claude",
+            adapter_api_version=1,
+            schema_version=1,
+            materialize_revision="files-1",
+            config=config,
+            profile=profile,
+        )
+        changed = build_config_snapshot(
+            runtime="claude",
+            adapter_api_version=1,
+            schema_version=1,
+            materialize_revision="files-1",
+            config=config,
+            profile=AgentProfile("review", "Changed body.", False, (self.root,), False),
+        )
+        self.assertEqual(first, same)
+        self.assertNotEqual(first.sha256, changed.sha256)
+        self.assertNotIn(secret.encode(), first.document)
 
 
 if __name__ == "__main__":
