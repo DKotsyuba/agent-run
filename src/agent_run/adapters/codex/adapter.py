@@ -38,6 +38,7 @@ from ..base import (
 from ..developer_environment import configured_environment_keys, environment_digest
 from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
+from ..snapshots import snapshot_managed_tree
 from ..plugin_skills import skill_dirs
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
@@ -346,12 +347,13 @@ class CodexAdapter:
         sources = skill_dirs(config.plugins, skills_root, config.skills)
         skill_hashes: dict[str, str] = {}
         for name in config.skills:
-            source = sources[name] / "SKILL.md"
             try:
-                text = source.read_text(encoding="utf-8")
-            except OSError as error:
+                snapshot = snapshot_managed_tree(
+                    Path(home), f"skills/{name}", sources[name]
+                )
+            except ValidationError as error:
                 raise ValidationError(f"codex skill is not available: {name}: {error}") from error
-            skill_hashes[name] = write_managed_file(home, f"skills/{name}/SKILL.md", text)
+            skill_hashes[name] = snapshot.sha256
         _prune_skills(Path(home), frozenset(config.skills))
 
         mcp_lines: list[str] = []

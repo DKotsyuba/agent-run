@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import os
 import stat
@@ -18,6 +19,30 @@ from agent_run.errors import PathEscapeError, ValidationError
 
 
 class AdapterHomeTests(unittest.TestCase):
+    def test_new_parent_is_synced_before_file_publication(self) -> None:
+        """Persist a newly created managed directory before publishing beneath it."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            events = []
+            real_replace = os.replace
+
+            def record_fsync(descriptor: int) -> None:
+                """Record file-versus-directory synchronization order."""
+
+                events.append("dir" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
+
+            def record_replace(source, destination) -> None:
+                """Record and perform the atomic replacement."""
+
+                events.append("replace")
+                real_replace(source, destination)
+
+            with patch("agent_run.adapters.home.os.fsync", side_effect=record_fsync), patch(
+                "agent_run.adapters.home.os.replace", side_effect=record_replace
+            ):
+                write_managed_file(Path(directory).resolve(), "nested/answer.md", "done")
+            self.assertEqual(events, ["dir", "file", "replace", "dir"])
+
     def test_managed_replace_fsyncs_file_then_parent_directory(self) -> None:
         """Publish a replacement only after its bytes and directory entry are synced."""
 
@@ -74,6 +99,40 @@ class AdapterHomeTests(unittest.TestCase):
                     write_managed_file(home, "settings/config.toml", "replacement")
             self.assertEqual(target.read_text(encoding="utf-8"), "original")
             self.assertEqual(list(target.parent.glob(".*.tmp")), [])
+
+    def test_failed_file_sync_publishes_nothing_and_cleans_its_temp(self) -> None:
+        """Leave no target or owned temporary when payload synchronization fails."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+
+            def fail_file_sync(descriptor: int) -> None:
+                """Fail only synchronization of the temporary regular file."""
+
+                if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError("file sync failed")
+
+            with patch("agent_run.adapters.home.os.fsync", side_effect=fail_file_sync):
+                with self.assertRaisesRegex(OSError, "file sync failed"):
+                    write_managed_file(home, "answer.md", "replacement")
+            self.assertFalse((home / "answer.md").exists())
+            self.assertEqual(list(home.glob(".agent-run-tmp-*.tmp")), [])
+
+    def test_unsupported_directory_sync_does_not_reject_publication(self) -> None:
+        """Accept a filesystem that explicitly reports directory fsync unsupported."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+
+            def reject_directory_sync(descriptor: int) -> None:
+                """Report EINVAL only for directory descriptors."""
+
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise OSError(errno.EINVAL, "directory fsync unsupported")
+
+            with patch("agent_run.adapters.home.os.fsync", side_effect=reject_directory_sync):
+                write_managed_file(home, "answer.md", "replacement")
+            self.assertEqual((home / "answer.md").read_text(encoding="utf-8"), "replacement")
 
     def test_symlink_bridges_are_explicit_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as source_dir:

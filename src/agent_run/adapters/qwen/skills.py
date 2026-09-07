@@ -13,8 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from agent_run.adapters.home import write_managed_file
 from agent_run.adapters.plugin_skills import skill_dirs
+from agent_run.adapters.snapshots import snapshot_managed_tree
 from agent_run.errors import PathEscapeError, ValidationError
 
 __all__ = ["SKILLS_DIR_NAME", "materialize_skills", "skills_context_note"]
@@ -26,7 +26,7 @@ SKILLS_DIR_NAME = "skills"
 def materialize_skills(
     home: Path, plugins: Iterable[Path], skills_root: Path, names: Iterable[str]
 ) -> dict[str, str]:
-    """Copy every selected skill's ``SKILL.md`` beneath ``home`` and hash it.
+    """Snapshot every selected skill's complete tree beneath ``home`` and hash it.
 
     :param home: The adapter's generated, already-created home directory.
     :param plugins: Declared plugin directories that may own a skill name;
@@ -37,22 +37,23 @@ def materialize_skills(
     :param names: The configured skill names to deliver, in ``config.skills``
         order; duplicates are harmless since each name maps to one file.
     :returns: A mapping of skill name to the SHA-256 hex digest of the copied
-        ``SKILL.md`` content, suitable for folding into a materialize
+        full path/type/content manifest, suitable for folding into a materialize
         fingerprint.
-    :raises ValidationError: A selected skill's ``SKILL.md`` cannot be read
-        from its resolved source directory.
+    :raises ValidationError: A selected skill tree is missing, linked, special,
+        or cannot be read from its resolved source directory.
     """
 
     names = tuple(names)
     sources = skill_dirs(plugins, skills_root, names)
     hashes: dict[str, str] = {}
     for name in names:
-        source = sources[name] / "SKILL.md"
         try:
-            text = source.read_text(encoding="utf-8")
-        except OSError as error:
+            snapshot = snapshot_managed_tree(
+                Path(home), f"{SKILLS_DIR_NAME}/{name}", sources[name]
+            )
+        except ValidationError as error:
             raise ValidationError(f"qwen skill is not available: {name}: {error}") from error
-        hashes[name] = write_managed_file(home, f"{SKILLS_DIR_NAME}/{name}/SKILL.md", text)
+        hashes[name] = snapshot.sha256
     _prune_skills(Path(home), frozenset(names))
     return hashes
 

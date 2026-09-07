@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import secrets
@@ -15,6 +16,9 @@ from ..verify import (
     ANSWER_PROOF_SUFFIX,
     answer_proof_document,
 )
+
+MANAGED_TEMP_PREFIX = ".agent-run-tmp-"
+"""Reserved prefix identifying temporary files owned by managed publication."""
 
 
 def content_hash(content: str | bytes) -> str:
@@ -84,7 +88,11 @@ def _managed_path(home: str | Path, relative_path: str | Path) -> Path:
         if parent.is_symlink():
             raise PathEscapeError(f"managed path crosses a symlink: {relative_path}")
         try:
-            parent.mkdir(mode=0o700, exist_ok=True)
+            parent.mkdir(mode=0o700)
+            _fsync_directory(parent.parent)
+        except FileExistsError:
+            if not parent.is_dir():
+                raise ValidationError(f"managed path parent is not a directory: {relative_path}")
         except OSError as error:
             raise ValidationError(f"cannot create managed directory {parent}: {error}") from error
         if not parent.resolve(strict=True).is_relative_to(root):
@@ -99,15 +107,37 @@ def _fsync_directory(path: Path) -> None:
     """Persist prior directory-entry changes beneath an existing directory.
 
     ``path`` is opened read-only as a directory and synchronized before the
-    descriptor is closed. ``OSError`` from opening or syncing is propagated so
-    callers cannot claim an ordered durable publish when the platform refused it.
+    descriptor is closed. Filesystems that report directory fsync as unsupported
+    are tolerated; other ``OSError`` failures propagate so callers cannot claim
+    an ordered durable publish when an available sync operation failed.
     """
 
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        os.fsync(descriptor)
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+                raise
     finally:
         os.close(descriptor)
+
+
+def ensure_managed_directory(home: str | Path, relative_path: str | Path) -> Path:
+    """Create and return one validated private directory below ``home``.
+
+    The nonempty ``relative_path`` must remain beneath the generated home.
+    Newly created parent entries are synchronized and symlink crossings or
+    non-directory conflicts raise typed validation errors.
+    """
+
+    try:
+        relative = Path(relative_path)
+    except TypeError as error:
+        raise PathEscapeError(f"invalid managed directory: {relative_path!r}") from error
+    if not relative.parts or relative == Path("."):
+        raise PathEscapeError("managed directory path must be nonempty")
+    return _managed_path(home, relative / ".agent-run-directory").parent
 
 
 def write_managed_file(
@@ -130,7 +160,9 @@ def write_managed_file(
     if candidate.exists() and not candidate.is_file():
         raise ValidationError(f"managed path is not a file: {relative_path}")
     descriptor, temporary_name = tempfile.mkstemp(
-        dir=candidate.parent, prefix=f".{candidate.name}.", suffix=".tmp"
+        dir=candidate.parent,
+        prefix=f"{MANAGED_TEMP_PREFIX}{candidate.name}.",
+        suffix=".tmp",
     )
     temporary = Path(temporary_name)
     try:

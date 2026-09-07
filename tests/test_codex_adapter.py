@@ -201,9 +201,22 @@ env_from = ["PATH"]
         import tomllib
 
         config = self.runtime_config(mcp=("agent_lsp",))
+        source_script = self.agent_run_root / "skills" / "codex" / "demo" / "scripts" / "run.sh"
+        source_script.parent.mkdir()
+        source_script.write_text("#!/bin/sh\necho snapshot\n", encoding="utf-8")
         digest_one = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
 
         self.assertEqual((self.home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "demo skill")
+        another_home = self.agent_run_root / "another-home"
+        ADAPTER.materialize(
+            config,
+            another_home,
+            mcp_servers=self.resolved_mcp(),
+            skills_root=self.agent_run_root / "skills" / "codex",
+        )
+        copied_script = another_home / "skills" / "demo" / "scripts" / "run.sh"
+        self.assertEqual(copied_script.read_text(encoding="utf-8"), "#!/bin/sh\necho snapshot\n")
+        self.assertFalse(copied_script.is_symlink())
         generated = (self.home / "config.toml").read_text(encoding="utf-8")
         self.assertNotIn("allow_login_shell", generated)
         self.assertNotIn("skills =", generated)

@@ -293,6 +293,9 @@ class QwenAdapterTests(unittest.TestCase):
     def test_skills_are_materialized_and_context_notes_the_absolute_path(self) -> None:
         """Configured skills land under home/skills, and the context file points at them."""
         self.write_skill("role-implement", "# role-implement contract\n")
+        script = self.root / "skills" / "qwen" / "role-implement" / "scripts" / "run.sh"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\necho snapshot\n", encoding="utf-8")
         plan = self.prepare(config=self.config(skills=("role-implement",)))
         delivered = self.home / "skills" / "role-implement" / "SKILL.md"
         self.assertEqual(delivered.read_text(encoding="utf-8"), "# role-implement contract\n")
@@ -303,6 +306,9 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertIn("role-implement", note)
         self.assertIn("no Skill tool", note)
         self.assertEqual(plan.adapter_state["model"], "qwen-test")
+        copied = self.home / "skills" / "role-implement" / "scripts" / "run.sh"
+        self.assertEqual(copied.read_text(encoding="utf-8"), "#!/bin/sh\necho snapshot\n")
+        self.assertFalse(copied.is_symlink())
 
     def test_settings_select_the_openai_auth_type(self) -> None:
         """A headless run fails closed with 'No auth type is selected' without this."""

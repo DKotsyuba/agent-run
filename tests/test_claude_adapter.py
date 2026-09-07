@@ -353,13 +353,31 @@ class ClaudeAdapterTests(unittest.TestCase):
         config = self.runtime_config(skills=("delegate",))
         self.materialize(config, self.home)
         plugin_manifest = self.home / "plugins" / "delegate" / ".claude-plugin" / "plugin.json"
-        skill_link = self.home / "plugins" / "delegate" / "skills" / "delegate" / "SKILL.md"
-        scripts_link = self.home / "plugins" / "delegate" / "skills" / "delegate" / "scripts"
+        skill_copy = self.home / "plugins" / "delegate" / "skills" / "delegate" / "SKILL.md"
+        scripts_copy = self.home / "plugins" / "delegate" / "skills" / "delegate" / "scripts"
         self.assertTrue(plugin_manifest.is_file())
-        self.assertTrue(skill_link.is_symlink())
-        self.assertEqual(skill_link.read_text(encoding="utf-8"), "Delegate work.")
-        self.assertTrue(scripts_link.is_symlink())
-        self.assertEqual((scripts_link / "run.sh").read_text(encoding="utf-8"), "#!/bin/sh\necho hi\n")
+        self.assertTrue(skill_copy.is_file())
+        self.assertFalse(skill_copy.is_symlink())
+        self.assertEqual(skill_copy.read_text(encoding="utf-8"), "Delegate work.")
+        self.assertTrue(scripts_copy.is_dir())
+        self.assertFalse(scripts_copy.is_symlink())
+        self.assertEqual((scripts_copy / "run.sh").read_text(encoding="utf-8"), "#!/bin/sh\necho hi\n")
+
+        first = self.materialize(config, self.root / "first-home")
+        (scripts_dir / "run.sh").write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
+        second = self.materialize(config, self.root / "second-home")
+        self.assertNotEqual(first, second)
+
+    def test_materialize_rejects_linked_skill_content(self) -> None:
+        """Reject source links instead of exposing mutable content to a running child."""
+
+        skill_dir = self.root / "skills" / "claude" / "delegate"
+        skill_dir.mkdir(parents=True)
+        target = self.root / "outside.md"
+        target.write_text("outside", encoding="utf-8")
+        (skill_dir / "SKILL.md").symlink_to(target)
+        with self.assertRaisesRegex(ValidationError, "regular"):
+            self.materialize(self.runtime_config(skills=("delegate",)), self.home)
 
     def test_materialize_uses_only_each_explicit_service_skill_root(self) -> None:
         config = self.runtime_config(skills=("delegate",))
