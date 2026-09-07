@@ -18,6 +18,7 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import (
     AgentStatus,
@@ -66,10 +67,13 @@ class FakeAdapter:
         self.validate_calls += 1
 
     def materialize(self, config, home, *, mcp_servers, skills_root):
+        """Finalize an empty managed index and return its fixed revision."""
+
         self.materialize_calls += 1
         self.materialize_configs.append(config)
         self.materialize_homes.append(home)
         self.skills_roots.append(skills_root)
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def probe(self, config, home):
@@ -223,9 +227,20 @@ class AgentServiceTests(unittest.TestCase):
         )
         self.service.start(self.request(request_id="account"))
         self.wait_until(lambda: bool(ADAPTER.materialize_homes))
-        self.assertEqual(ADAPTER.materialize_homes[-1], self.runtime_home.with_name("runtime@personal2"))
+        self.wait_until(
+            lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
+                "snapshot:v1:"
+            )
+        )
+        agent = self.store.list_agents()[0]
+        attempt_home = self.root / "agents" / str(agent["id"]) / "runtime-home"
+        self.assertEqual(ADAPTER.materialize_homes[-1], attempt_home)
         self.assertEqual(ADAPTER.materialize_configs[-1].auth.source, auth_source)
-        self.assertEqual((self.runtime_home.with_name("runtime@personal2")).is_dir(), True)
+        self.assertTrue(attempt_home.is_dir())
+        self.assertTrue(str(agent["config_revision"]).startswith("snapshot:v1:"))
+        self.assertTrue(
+            (self.root / "agents" / str(agent["id"]) / "config-snapshot.json").is_file()
+        )
 
     def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
         """The profile is where agent-run assigns the shared role contract.

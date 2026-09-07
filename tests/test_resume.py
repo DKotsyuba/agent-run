@@ -22,6 +22,7 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
@@ -34,7 +35,9 @@ class ResumableAdapter:
 
     def __init__(self) -> None:
         self.capabilities = frozenset(Capability)
+        self.materialize_calls = 0
         self.prepare_calls = 0
+        self.prepare_homes = []
 
     def describe(self) -> RuntimeInfo:
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
@@ -43,8 +46,10 @@ class ResumableAdapter:
         """Accept any configuration; capability gating is the service's job."""
 
     def materialize(self, config, home, *, mcp_servers, skills_root) -> str:
-        """Return a fixed configuration revision without touching disk."""
+        """Finalize an empty managed index and return its fixed revision."""
 
+        self.materialize_calls += 1
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def probe(self, config, home) -> RuntimeHealth:
@@ -66,6 +71,7 @@ class ResumableAdapter:
         """Build a plan with no resume identity, as a real adapter would."""
 
         self.prepare_calls += 1
+        self.prepare_homes.append(Path(home))
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task,
             agent_dir / "runtime.jsonl", {}, agent_dir / "answer.md",
@@ -420,6 +426,54 @@ class ResumeTests(unittest.TestCase):
             self.service.resume(parent, "keep going")
 
     # -- idempotency, races, chains --------------------------------------
+
+    def test_snapshot_resume_reuses_root_home_without_rematerializing(self) -> None:
+        """Every continuation verifies and reuses its root lineage runtime home."""
+
+        parent = self._parent(session="sess-1")
+        root_home = self.root / "agents" / parent / "runtime-home"
+        revision = self.store.get_agent(parent)["config_revision"]
+        self.assertTrue(str(revision).startswith("snapshot:v1:"))
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+
+        second = self.service.resume(parent, "second")
+        self._wait(2)
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(ADAPTER.prepare_homes[-1], root_home)
+        self.assertEqual(
+            self.store.get_agent(second.agent_id)["config_revision"], revision
+        )
+        self._finish(second.agent_id, session="sess-2")
+
+        third = self.service.resume(second.agent_id, "third")
+        self._wait(3)
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(ADAPTER.prepare_homes[-1], root_home)
+        self.assertEqual(
+            self.store.get_agent(third.agent_id)["config_revision"], revision
+        )
+
+    def test_missing_new_lineage_home_never_falls_back_to_legacy(self) -> None:
+        """A prefixed parent fails closed when its authoritative HOME is absent."""
+
+        parent = self._parent()
+        runtime_home = self.root / "agents" / parent / "runtime-home"
+        runtime_home.rename(runtime_home.with_name("runtime-home-missing"))
+
+        child = self.service.resume(parent, "continue")
+        deadline = time.monotonic() + 2
+        while self.service.get(child.agent_id).status not in {
+            AgentStatus.FAILED,
+            AgentStatus.CANCELLED,
+        }:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        view = self.service.get(child.agent_id)
+        self.assertIs(view.status, AgentStatus.FAILED)
+        self.assertIn("snapshot", view.failure_text)
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(len(self.launched), 1)
 
     def test_same_request_id_replays_the_same_child_even_when_stale(self) -> None:
         parent = self._parent()

@@ -23,6 +23,12 @@ it does not rematerialize from live skill sources. Native session logs and cache
 remain mutable runtime state outside the snapshot. Historical attempts without a
 lineage home retain their compatibility path.
 
+The agent row records new-format configuration as
+`snapshot:v1:<config-sha256>`. That prefix is authoritative: a continuation
+whose lineage directory, config document, runtime index, or indexed root is
+missing fails closed instead of being reclassified as historical. Unprefixed
+rows alone use the shared-home compatibility path.
+
 Executable contract scenarios live in `tests/test_snapshots.py`:
 
 1. Copy a skill containing a manifest, script, and empty directory; changing

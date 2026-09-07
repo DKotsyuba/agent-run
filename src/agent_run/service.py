@@ -14,6 +14,14 @@ from typing import Callable, Mapping, TypeAlias
 
 from .adapters.base import Capability, LaunchPlan, ModelInfo, RuntimeAdapter
 from .adapters.registry import AdapterRegistry
+from .adapters.home import write_managed_file
+from .adapters.snapshots import (
+    CONFIG_SNAPSHOT_FILENAME,
+    build_config_snapshot,
+    inspect_config_snapshot,
+    inspect_runtime_snapshots,
+    runtime_snapshot_index_sha256,
+)
 from .accounts import account_auth_source, account_runtime_home
 from .capacity.advice import CapacityAdvice, build_advice
 from .capacity.forecast import build_forecasts
@@ -66,6 +74,7 @@ _DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
 _MAX_PAGE_SIZE = 1000
 _FAILURE_TEXT_CHARS = 512
 _PENDING_CONFIG_REVISION = "pending:materialization"
+_SNAPSHOT_CONFIG_REVISION = "snapshot:v1:"
 
 
 def _log_start_preparation_stage(
@@ -537,6 +546,7 @@ class AgentService:
                     label,
                     startup_owner,
                     None if resume_session_id is None else str(resume_session_id),
+                    parent_agent_id,
                 ),
             )
         except Exception as error:
@@ -562,6 +572,7 @@ class AgentService:
         account_label: str | None,
         startup_owner: str,
         resume_session_id: str | None = None,
+        parent_agent_id: AgentId | None = None,
     ) -> None:
         """Materialize and launch one already accepted start.
 
@@ -577,6 +588,10 @@ class AgentService:
         launch, so an adapter builds its plan without needing to know it is a
         resume. Attachment is only requested here; the runtime session the
         supervisor later records is whatever the adapter's sink actually emits.
+        ``parent_agent_id`` additionally selects snapshot-v1 lineage state: a
+        new-format continuation verifies and reuses its parent's runtime home
+        without rematerializing; an unprefixed historical parent retains the
+        shared-home compatibility path.
         """
 
         failure_kind = "prepare_failed"
@@ -586,8 +601,9 @@ class AgentService:
         try:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
-            effective_runtime = runtime
-            effective_home = runtime.home
+            candidate_dir = create_agent_dir(agent_id, self._home)
+            configured_home = runtime.home
+            effective_auth = runtime.auth
             if account_label is not None:
                 if runtime.auth is None or runtime.auth.target is None:
                     raise ValidationError(
@@ -601,14 +617,38 @@ class AgentService:
                         f"account {account_label!r} is not authenticated; "
                         f"run agent-run auth {account_label} {request.runtime}"
                     )
-                effective_home = account_runtime_home(runtime.home, account_label)
-                effective_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-                effective_home.chmod(0o700)
-                effective_runtime = replace(
-                    runtime,
-                    home=effective_home,
-                    auth=replace(runtime.auth, source=effective_source),
+                configured_home = account_runtime_home(runtime.home, account_label)
+                effective_auth = replace(runtime.auth, source=effective_source)
+
+            parent_revision = None
+            snapshot_resume = False
+            lineage_agent_id = parent_agent_id
+            if parent_agent_id is not None:
+                parent_row = store.get_agent(parent_agent_id)
+                parent_revision = str(parent_row["config_revision"])
+                lineage_agent_id = validate_agent_id(
+                    str(parent_row["root_agent_id"] or parent_agent_id)
                 )
+                snapshot_resume = parent_revision.startswith(
+                    _SNAPSHOT_CONFIG_REVISION
+                )
+            if parent_agent_id is None:
+                effective_home = candidate_dir / "runtime-home"
+                effective_home.mkdir(mode=0o700)
+            elif snapshot_resume:
+                assert lineage_agent_id is not None
+                effective_home = agent_dir(lineage_agent_id, self._home) / "runtime-home"
+            else:
+                effective_home = configured_home
+                effective_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not snapshot_resume:
+                effective_home.chmod(0o700)
+            effective_runtime = replace(
+                runtime,
+                home=effective_home,
+                auth=effective_auth,
+                default_account=account_label,
+            )
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
@@ -619,13 +659,6 @@ class AgentService:
                 self._required_capabilities(request, effective_runtime),
             )
             adapter.validate(effective_runtime)
-            stage = "models"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            roster = adapter.models(effective_runtime, effective_home)
-            if request.model not in {model.id for model in roster}:
-                raise ValidationError(
-                    f"model is not available for runtime {request.runtime}: {request.model}"
-                )
             stage = "profile"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
             profile = assign_role(
@@ -640,14 +673,78 @@ class AgentService:
             )
             record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
-            stage = "materialize"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            revision = adapter.materialize(
-                effective_runtime,
-                effective_home,
-                mcp_servers=mcp_servers,
-                skills_root=runtime_skills_dir(request.runtime, self._home),
-            )
+            if snapshot_resume:
+                assert lineage_agent_id is not None and parent_revision is not None
+                expected_sha256 = parent_revision.removeprefix(
+                    _SNAPSHOT_CONFIG_REVISION
+                )
+                stored_snapshot = inspect_config_snapshot(
+                    agent_dir(lineage_agent_id, self._home), expected_sha256
+                )
+                runtime_snapshot = inspect_runtime_snapshots(
+                    effective_home,
+                    stored_snapshot.materialize_revision,
+                    expected_sha256=stored_snapshot.snapshot_index_sha256,
+                )
+                if not runtime_snapshot.verified:
+                    raise ValidationError(
+                        "runtime snapshot is incomplete or changed: "
+                        f"missing={len(runtime_snapshot.missing)} "
+                        f"mismatched={len(runtime_snapshot.mismatched)} "
+                        f"temps={len(runtime_snapshot.owned_temps)} "
+                        f"orphans={len(runtime_snapshot.orphans)}"
+                    )
+                current_snapshot = build_config_snapshot(
+                    runtime=request.runtime,
+                    adapter_api_version=adapter.describe().adapter_api_version,
+                    schema_version=self._config.schema_version,
+                    materialize_revision=stored_snapshot.materialize_revision,
+                    snapshot_index_sha256=stored_snapshot.snapshot_index_sha256,
+                    config=effective_runtime,
+                    profile=profile,
+                    runtime_version=stored_snapshot.runtime_version,
+                )
+                if current_snapshot.sha256 != expected_sha256:
+                    raise ValidationError(
+                        "effective runtime or profile changed since the parent snapshot"
+                    )
+                revision = parent_revision
+                _logger.info(
+                    "start reused runtime snapshot runtime=%s revision=%s",
+                    request.runtime,
+                    revision,
+                )
+            else:
+                stage = "materialize"
+                _log_start_preparation_stage(
+                    agent_id, stage, preparation_started
+                )
+                materialize_revision = adapter.materialize(
+                    effective_runtime,
+                    effective_home,
+                    mcp_servers=mcp_servers,
+                    skills_root=runtime_skills_dir(request.runtime, self._home),
+                )
+                revision = materialize_revision
+                if parent_agent_id is None:
+                    snapshot_index_sha256 = runtime_snapshot_index_sha256(
+                        effective_home, materialize_revision
+                    )
+                    config_snapshot = build_config_snapshot(
+                        runtime=request.runtime,
+                        adapter_api_version=adapter.describe().adapter_api_version,
+                        schema_version=self._config.schema_version,
+                        materialize_revision=materialize_revision,
+                        snapshot_index_sha256=snapshot_index_sha256,
+                        config=effective_runtime,
+                        profile=profile,
+                    )
+                    write_managed_file(
+                        candidate_dir,
+                        CONFIG_SNAPSHOT_FILENAME,
+                        config_snapshot.document,
+                    )
+                    revision = _SNAPSHOT_CONFIG_REVISION + config_snapshot.sha256
             stage = "config_revision"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
             store.replace_config_revision(
@@ -662,7 +759,13 @@ class AgentService:
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
-            candidate_dir = create_agent_dir(agent_id, self._home)
+            stage = "models"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
+            roster = adapter.models(effective_runtime, effective_home)
+            if request.model not in {model.id for model in roster}:
+                raise ValidationError(
+                    f"model is not available for runtime {request.runtime}: {request.model}"
+                )
             stage = "prepare"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
             plan = adapter.prepare(
