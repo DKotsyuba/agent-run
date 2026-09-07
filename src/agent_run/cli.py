@@ -42,7 +42,7 @@ from .paths import agent_run_home, config_path, state_db_path
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
 from .state.run_stats import backfill_run_stats
-from .wait import DEFAULT_POLL_SECONDS, wait_for_agent, wait_for_workflow
+from .wait import DEFAULT_POLL_SECONDS, wait_for_agent
 
 _logger = logging.getLogger("agent_run.cli")
 
@@ -224,24 +224,6 @@ def _parser() -> argparse.ArgumentParser:
     api_launchd.add_argument("--stderr-log", default=None)
     doc = commands.add_parser("doc")
     doc.add_argument("topic", nargs="?")
-    workflow = commands.add_parser("workflow").add_subparsers(
-        dest="workflow_command", required=True
-    )
-    workflow_start = workflow.add_parser("start")
-    workflow_start.add_argument("name")
-    workflow_start.add_argument("script")
-    workflow_start.add_argument("--args")
-    _session(workflow_start)
-
-    batch = commands.add_parser("batch")
-    batch.add_argument("--file", required=True)
-    batch.add_argument("--name", default="batch")
-
-    for workflow_name in ("status", "resume", "cancel", "answer"):
-        workflow.add_parser(workflow_name).add_argument("run_id")
-    workflow_wait = workflow.add_parser("wait")
-    workflow_wait.add_argument("run_id")
-    _wait_options(workflow_wait)
     return parser
 
 
@@ -271,31 +253,6 @@ def _object(value: str, what: str) -> dict:
 
 def _payload(stream: TextIO) -> dict:
     return _object(_read(stream), "hook payload")
-
-
-def _batch_source(value: str) -> str:
-    """Validate batch JSON and render one flat parallel workflow script.
-
-    ``value`` is the complete JSON text from ``--file`` or standard input.  It
-    must decode to a non-empty JSON array whose elements are dictionaries; the
-    workflow executor remains responsible for validating each job's fields.
-    The returned source embeds each original JSON object and preserves all JSON
-    value types through the sandbox-approved ``json`` module.
-    """
-
-    try:
-        jobs = json.loads(value)
-    except json.JSONDecodeError as error:
-        raise ValidationError("batch file must be valid JSON") from error
-    if not isinstance(jobs, list):
-        raise ValidationError("batch file must contain a JSON array")
-    if not jobs:
-        raise ValidationError("batch file must contain at least one job")
-    if any(not isinstance(job, dict) for job in jobs):
-        raise ValidationError("batch jobs must be JSON objects")
-    encoded = [json.dumps(job, separators=(",", ":"), allow_nan=False) for job in jobs]
-    calls = ", ".join(f"lambda: agent(json.loads({item!r}))" for item in encoded)
-    return f"import json\nparallel([{calls}])"
 
 
 def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME) -> dict:
@@ -457,21 +414,6 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
         return {"agent_id": result.agent_id, "created": result.created}
     if command == "chain":
         return service.chain(args.agent_id, cursor=args.cursor, limit=args.limit)
-    if command == "workflow":
-        if args.workflow_command == "start":
-            values = None if args.args is None else _object(args.args, "workflow args")
-            return service.workflow_start(
-                args.name, args.script, values, _ref(args)
-            )
-        return {
-            "status": service.workflow_status,
-            "resume": service.workflow_resume,
-            "cancel": service.workflow_cancel,
-            "answer": service.workflow_answer,
-        }[args.workflow_command](args.run_id)
-    if command == "batch":
-        value = _read(stream) if args.file == "-" else Path(args.file).read_text()
-        return service.workflow_start(args.name, _batch_source(value), None, _ref(args))
     if command == "start":
         result = service.start(_request(args, stream))
         return {"agent_id": result.agent_id, "created": result.created}
@@ -542,14 +484,8 @@ def _wait_command(
     payload is joined by a one-line note on stderr.
     """
 
-    outcome = (
-        wait_for_workflow(
-            service, args.run_id, timeout=args.timeout, poll=args.poll
-        )
-        if args.command == "workflow"
-        else wait_for_agent(
-            service, args.agent_id, timeout=args.timeout, poll=args.poll
-        )
+    outcome = wait_for_agent(
+        service, args.agent_id, timeout=args.timeout, poll=args.poll
     )
     _emit(outcome.payload, stdout)
     if outcome.note is not None:
@@ -661,7 +597,7 @@ def _api_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
 
 
 def _dispatch_once(home: Path):
-    """Drain both agent and workflow lifecycle outboxes once."""
+    """Drain the agent lifecycle outbox once."""
 
     config = load_config(config_path(home))
     store = StateStore.open(state_db_path(home))
@@ -679,19 +615,7 @@ def _dispatch_once(home: Path):
             },
             config.delivery,
         )
-        result = dispatcher.run(home=home)
-        from .delivery.workflow_dispatch import WorkflowDeliveryDispatcher
-
-        if isinstance(store, StateStore):
-            WorkflowDeliveryDispatcher(
-                store,
-                {
-                    TRANSPORT_NAME: CodexQueueTransport(relay),
-                    CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
-                },
-                config.delivery,
-            ).drain()
-        return result
+        return dispatcher.run(home=home)
     finally:
         store.close()
 
@@ -800,32 +724,6 @@ class _Runtime:
 
     def delivery_dispatch(self):
         return _dispatch_once(self.home)
-
-    def workflow_start(self, name: str, script: str, args: dict | None = None,
-                       orchestrator: OrchestratorRef | None = None) -> dict[str, str]:
-        """Launch a script workflow. Delegates to `AgentService.workflow_start`."""
-
-        return self.core.workflow_start(name, script, args, orchestrator)
-
-    def workflow_status(self, run_id: str) -> dict[str, object]:
-        """Return one workflow run's journal summary. Delegates to `AgentService.workflow_status`."""
-
-        return self.core.workflow_status(run_id)
-
-    def workflow_resume(self, run_id: str) -> dict[str, str]:
-        """Resume one failed or lost workflow. Delegates to `AgentService.workflow_resume`."""
-
-        return self.core.workflow_resume(run_id)
-
-    def workflow_cancel(self, run_id: str) -> dict[str, object]:
-        """Request cancellation of a live workflow run. Delegates to `AgentService.workflow_cancel`."""
-
-        return self.core.workflow_cancel(run_id)
-
-    def workflow_answer(self, run_id: str) -> object:
-        """Return a terminal workflow run's last result. Delegates to `AgentService.workflow_answer`."""
-
-        return self.core.workflow_answer(run_id)
 
     def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
         config, store = self._inputs()
@@ -1070,9 +968,7 @@ def main(
                     (time.monotonic() - started) * 1000,
                 )
                 return returned if isinstance(returned, int) else 0
-            if args.command == "wait" or (
-                args.command == "workflow" and args.workflow_command == "wait"
-            ):
+            if args.command == "wait":
                 # A wait verb exits with the run's own terminal code, so it
                 # returns here instead of through the always-successful emit.
                 code = _wait_command(args, target, stdout, stderr)

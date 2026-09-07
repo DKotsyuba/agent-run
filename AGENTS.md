@@ -88,7 +88,6 @@ presence alone does not grant authority over a different owner's data.
 | `src/agent_run/supervisor*.py` | detached child supervision: timeouts, stall watchdog, outcomes |
 | `src/agent_run/state/` | SQLite store, schema, migrations, reconciliation |
 | `src/agent_run/wait.py` | blocking watchdog logic shared by CLI and socket API |
-| `src/agent_run/workflow*` | the multi-step workflow engine and its runner |
 | `src/agent_run/capacity/` | limits collection (per-runtime sources) and risk advisory |
 | `src/agent_run/doctor.py` | self-diagnosis; keep it free of false alarms |
 | `src/agent_run/operator_guide/` | the pages `agent-run doc` serves |

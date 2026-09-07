@@ -125,7 +125,7 @@ def test_agent_service_resolve_account_validates_defaults_and_overrides() -> Non
 
 
 def test_tools_table_is_exactly_pinned() -> None:
-    """Keep all twenty-one transport-neutral shared tools in the one dispatch table."""
+    """Keep all sixteen transport-neutral tools in the one dispatch table."""
 
-    assert len(TOOLS) == 21
+    assert len(TOOLS) == 16
     assert TOOL_NAMES == frozenset(tool["name"] for tool in TOOLS)

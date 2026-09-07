@@ -10,7 +10,7 @@ from threading import Barrier
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.domain import OrchestratorRef
+from agent_run.domain import StartRequest
 from agent_run.doctor import run_doctor
 from agent_run.errors import SchemaMigrationRequired, ValidationError
 from agent_run.state import (
@@ -221,14 +221,31 @@ class MigrationRegistryTests(unittest.TestCase):
         database = Path(directory.name) / "state.db"
         store = StateStore.initialize(database)
         try:
-            session = OrchestratorRef("stub", "session")
-            kept = store.create_workflow_run("kept", "sha", plan=[], orchestrator=session)
-            store.start_workflow_run(kept)
-            store.finish_workflow_run(kept, "failed", result={"attempt": 1})
-            retired = store.create_workflow_run("retired", "sha", plan=[], orchestrator=session)
-            store.start_workflow_run(retired)
-            store.finish_workflow_run(retired, "failed")
-            store.resume_workflow_run(retired, "1 runner")
+            kept = "wf_kept"
+            retired = "wf_retired"
+            store.connection.execute(
+                """INSERT INTO orchestrator_sessions
+                   (id, transport, external_session_id, created_at, last_seen_at)
+                   VALUES ('os_test', 'stub', 'session', 1, 1)"""
+            )
+            store.connection.executemany(
+                """INSERT INTO workflow_runs
+                   (id, name, script_sha, status, created_at, result_json,
+                    orchestrator_session_id)
+                   VALUES (?, ?, 'sha', ?, 1, ?, 'os_test')""",
+                (
+                    (kept, "kept", "failed", '{"attempt":1}'),
+                    (retired, "retired", "running", None),
+                ),
+            )
+            store.connection.executemany(
+                """INSERT INTO workflow_deliveries
+                   (id, run_id, orchestrator_session_id, state, next_attempt_at,
+                    run_status)
+                   VALUES (?, ?, 'os_test', 'pending', 1, 'failed')""",
+                (("wd_kept", kept), ("wd_retired", retired)),
+            )
+            store.connection.commit()
         finally:
             store.close()
 
@@ -326,7 +343,9 @@ class MigrationRegistryTests(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_open_repairs_poisoned_v5_store_before_reconciliation(self) -> None:
+    def test_open_repairs_poisoned_v5_store_and_preserves_history(self) -> None:
+        """Old workflow rows survive while the current agent store remains usable."""
+
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.db"
             run_id = "wf_poisoned"
@@ -338,8 +357,21 @@ class MigrationRegistryTests(unittest.TestCase):
                     store.connection.execute(
                         "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
                     ).fetchone()[0],
-                    "lost",
+                    "running",
                 )
+                created = store.create_agent(
+                    StartRequest(
+                        "codex",
+                        "model",
+                        "profile",
+                        "task",
+                        Path(directory),
+                        timeout_seconds=60,
+                    ),
+                    task_summary="summary",
+                    config_revision="cfg",
+                )
+                self.assertEqual(store.get_agent(created.agent_id)["status"], "created")
                 store.connection.execute(
                     """INSERT INTO workflow_steps
                        (run_id, step_key, spec_json, status)

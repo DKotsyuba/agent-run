@@ -326,11 +326,11 @@ class LocalTests(unittest.TestCase):
         self.runner.run.assert_not_called()
 
     def test_active_work_waits_and_shutdown_race_refuses_migration(self):
-        """Count agents/workflows and catch work admitted just before the reservation."""
+        """Count agents, ignore legacy workflow rows, and catch admission races."""
         with sqlite3.connect(self.home / "state.db") as connection:
             connection.executescript("INSERT INTO agents VALUES('running'); INSERT INTO workflow_runs VALUES('created');")
         with local.database(self.home) as connection:
-            self.assertEqual(local.active(connection), 2)
+            self.assertEqual(local.active(connection), 1)
         self.runner.pause.side_effect = release.ReleaseError("still active")
         with self.patches(), self.assertRaisesRegex(release.ReleaseError, "still active"):
             self.deploy()

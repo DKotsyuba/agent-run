@@ -58,7 +58,7 @@ immutable directory per shipped commit.
 
 ## Atomic switch
 
-The maintainer script waits for all active agents and workflows, closes API
+The maintainer script waits for all active agents, closes API
 admission under a SQLite writer reservation, stops loaded periodic jobs, and
 rechecks quiescence. It backs up the database and config before migrating with
 the new runtime, then switches `current` with a temporary symlink and

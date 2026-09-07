@@ -39,15 +39,13 @@ from .errors import AgentRunError, ValidationError
 from .launch_evidence import bootstrap_error_fields
 from .wait import (
     WATCHER_TIMEOUT_EXIT,
-    _workflow_status,
     wait_for_agent,
-    wait_for_workflow,
 )
 
 MAX_LINE_BYTES = 1024 * 1024
 _MISSING = object()
 _DEFAULT_SOCKET = ".agent-run/api.sock"
-METHOD_NAMES = TOOL_NAMES | {"tools", "ping", "wait", "workflow_wait"}
+METHOD_NAMES = TOOL_NAMES | {"tools", "ping", "wait"}
 
 
 def default_socket_path() -> Path:
@@ -124,7 +122,9 @@ def _wait_timeout(params: dict) -> float:
     return float(value)
 
 
-def _wait_result(method: str, outcome) -> object:
+def _wait_result(outcome) -> object:
+    """Return one socket wait payload with watcher timeout metadata."""
+
     result = _jsonable(outcome.payload)
     if outcome.exit_code != WATCHER_TIMEOUT_EXIT:
         return result
@@ -132,28 +132,21 @@ def _wait_result(method: str, outcome) -> object:
         result = {"payload": result}
     result["timed_out"] = True
     if "status" not in result:
-        result["status"] = _jsonable(
-            _workflow_status(outcome.payload)
-            if method == "workflow_wait"
-            else getattr(outcome.payload, "status", "unknown")
-        )
+        result["status"] = _jsonable(getattr(outcome.payload, "status", "unknown"))
     return result
 
 
-def _run_wait(method: str, params: dict, service_factory: Callable[[], object]) -> object:
-    if method == "wait":
-        agent_id = _string(_arguments(params, {"agent_id", "timeout_seconds"}, {"agent_id"}), "agent_id")
-    else:
-        run_id = _string(_arguments(params, {"run_id", "timeout_seconds"}, {"run_id"}), "run_id")
+def _run_wait(params: dict, service_factory: Callable[[], object]) -> object:
+    """Run the blocking agent wait method on a thread-local service."""
+
+    agent_id = _string(
+        _arguments(params, {"agent_id", "timeout_seconds"}, {"agent_id"}),
+        "agent_id",
+    )
     timeout = _wait_timeout(params)
     service = service_factory()
     try:
-        outcome = (
-            wait_for_agent(service, agent_id, timeout=timeout)
-            if method == "wait"
-            else wait_for_workflow(service, run_id, timeout=timeout)
-        )
-        return _wait_result(method, outcome)
+        return _wait_result(wait_for_agent(service, agent_id, timeout=timeout))
     finally:
         close = getattr(service, "close", None)
         if callable(close):
@@ -188,8 +181,8 @@ def _handle(
             result = {"ok": True}
         elif method == "tools":
             result = _jsonable(TOOLS)
-        elif method in {"wait", "workflow_wait"}:
-            result = _run_wait(method, params, service_factory)
+        elif method == "wait":
+            result = _run_wait(params, service_factory)
         elif method not in TOOL_NAMES:
             response = _rpc_error(response_id, -32601, "method not found")
             return None if request_id is _MISSING else response

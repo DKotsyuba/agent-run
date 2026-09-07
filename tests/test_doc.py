@@ -133,11 +133,11 @@ class DocMcpTests(unittest.TestCase):
         return [responses[line["id"]] for line in lines]
 
     def test_doc_tool_is_listed(self):
-        """Expose the documentation tool among all nineteen shared tools."""
+        """Expose the documentation tool among all sixteen shared tools."""
 
         responses = self.run_server([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
         names = [tool["name"] for tool in responses[0]["result"]["tools"]]
-        self.assertEqual(len(names), 21)
+        self.assertEqual(len(names), 16)
         self.assertIn("doc", names)
 
     def test_doc_tool_call_returns_index_and_topic(self):

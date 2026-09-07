@@ -37,7 +37,6 @@ from .delivery.dispatch import _effort_from_request_json
 from .launch import DEFAULT_STARTUP_HANDOFF_SECONDS, launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
-from . import workflow_facade
 from .profiles import assign_role, load_profile
 from .process_identity import capture_process_birth
 from .resume import (
@@ -45,7 +44,7 @@ from .resume import (
     replayed_resume,
 )
 from .start_coordinator import StartCoordinator
-from .state.reconciliation import workflow_owner_identity
+from .state.reconciliation import process_owner_identity
 from .supervisor import supervisor_identity
 from .state.store import StateStore
 from .verify import (
@@ -471,7 +470,7 @@ class AgentService:
 
         candidate = new_agent_id()
         accepted_at = self._now()
-        startup_owner = workflow_owner_identity(
+        startup_owner = process_owner_identity(
             os.getpid(), supervisor_identity()
         )
         startup_birth = capture_process_birth(os.getpid())
@@ -874,38 +873,6 @@ class AgentService:
             int(rows[bounded]["sequence"]) if len(rows) > bounded else None
         )
         return ChainPage(items, start, bounded, next_cursor, next_cursor is None)
-
-    def workflow_start(
-        self,
-        name: str,
-        script: str,
-        args: dict | None = None,
-        orchestrator: OrchestratorRef | None = None,
-    ) -> dict[str, str]:
-        """Launch a script workflow. See `workflow_facade.workflow_start`."""
-
-        return workflow_facade.workflow_start(self._home, name, script, args, orchestrator)
-
-    def workflow_status(self, run_id: str) -> dict[str, object]:
-        """Return one workflow run's journal summary. See `workflow_facade.workflow_status`."""
-
-        return workflow_facade.workflow_status(self._store, run_id)
-
-    def workflow_resume(self, run_id: str) -> dict[str, str]:
-        """Resume a failed or lost run. See `workflow_facade.workflow_resume`."""
-
-        return workflow_facade.workflow_resume(self._home, self._store, run_id)
-
-    def workflow_cancel(self, run_id: str) -> dict[str, object]:
-        """Request cancellation of a live workflow run. See `workflow_facade.workflow_cancel`."""
-
-        return workflow_facade.workflow_cancel(self._store, run_id)
-
-    def workflow_answer(self, run_id: str) -> dict[str, object]:
-        """Return a terminal workflow run's last result. See `workflow_facade.workflow_answer`."""
-
-        return workflow_facade.workflow_answer(self._store, run_id)
-
 
     def steer(self, agent_id: str | AgentId, text: str) -> CommandView:
         if not isinstance(text, str) or not text.strip():

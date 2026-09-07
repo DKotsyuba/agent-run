@@ -77,11 +77,10 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-The tool set (19 at the time of writing, same names as the MCP server):
+The tool set (same names as the MCP server):
 `start`, `resume`, `chain`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
 `list_agents`, `list_orchestrators`, `models`, `limits`, `capacity_order`,
-`fast`, `doc`, and the workflow verbs `workflow_start`, `workflow_status`,
-`workflow_answer`, `workflow_cancel`, `workflow_resume`.
+`fast`, and `doc`.
 
 See [continuations](continuations.md) for native-context `resume` and chronological
 `chain` pages, including inherited authority, idempotency and history availability.
@@ -137,8 +136,6 @@ Two extra methods exist only on this transport:
   `answer` tool). If the watcher timeout expires first, the result is a
   normal reply carrying `"timed_out": true` and the current status — not
   a JSON-RPC error.
-- `workflow_wait` — same contract with `run_id` for workflow runs.
-
 A pending `wait` does not block other requests: run it on its own
 connection and keep issuing calls on another.
 
