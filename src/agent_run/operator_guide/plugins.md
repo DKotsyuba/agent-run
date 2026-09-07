@@ -16,7 +16,6 @@ plugins = ["/abs/path/to/tokenpipe-compressor", "/abs/path/to/agent-lsp-plugin"]
 - **codex** copies the plugin into the generated home, and hook trust
   digests are auto-seeded for it (config-level `hooks` entries are seeded
   the same way).
-- **opencode** only picks up plugin-shipped skills; it has no plugin
   hook/tool mechanism of its own today.
 
 ## Operator checklist for a new plugin

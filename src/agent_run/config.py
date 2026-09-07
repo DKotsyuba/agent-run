@@ -527,7 +527,10 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
     expanded, symlinks unresolved) so a version-managed launcher symlink keeps
     anchoring its own interpreter directory; every other path field resolves.
     Optional account/auth, hook, plugin, capacity-source, and concurrency
-    fields retain their existing validation. ``priority_multiplier`` defaults
+    fields retain their existing validation. A legacy ``runtimes.opencode``
+    table is accepted but omitted: OpenCode is no longer a launchable runtime,
+    while accepting the old table keeps state-only commands available during
+    migration. ``priority_multiplier`` defaults
     to ``1.0`` and rejects booleans, non-numeric or non-finite values, and
     numbers less than or equal to zero. Unknown fields raise ``ValidationError``.
     """
@@ -556,6 +559,8 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         "environment",
     }
     for name, table in _named_table(value, "runtimes").items():
+        if name == "opencode":
+            continue
         path = f"runtimes.{name}"
         _reject_unknown(table, allowed, path)
         adapter = _string(table.get("adapter"), f"{path}.adapter")

@@ -6,22 +6,11 @@ Static rosters: whatever model ids are listed in each runtime's `models =
 [...]` in config.toml. There is nothing to sync — editing the list and
 rematerializing is the whole operation.
 
-## opencode
+## Qwen OmniRoute aliases
 
-opencode model ids in config are `omniroute/<alias>`, mapping to OmniRoute
-combos named `opencode/<alias>`. These aliases are not invented locally —
-they must match what the live OmniRoute service actually serves.
-
-### Syncing the opencode roster
-
-1. `GET http://127.0.0.1:20128/v1/models` — use a long timeout, the
-   response is a large JSON document.
-2. Filter returned ids by the `opencode/` prefix.
-3. Write the matching `omniroute/<alias>` names into the opencode
-   runtime's `models = [...]` in config.toml (backup + validate first,
-   per `config`).
-4. Rematerialize and restart the opencode service (see `service`) so the
-   generated config reflects the new roster.
+Qwen may use OmniRoute model ids with an `opencode/<alias>` prefix. The prefix
+is an OmniRoute route name, not a supported agent-run runtime; keep valid
+aliases in Qwen's `models = [...]` configuration.
 
 ### Verifying
 

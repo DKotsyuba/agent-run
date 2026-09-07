@@ -13,7 +13,6 @@ from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.glm.adapter import ADAPTER as GLM
 from agent_run.adapters.qwen.adapter import ADAPTER as QWEN
-from agent_run.adapters.opencode.adapter import ADAPTER as OPENCODE
 from agent_run.dispatch import Session, call_tool
 from agent_run.domain import AgentStatus
 from agent_run.errors import ValidationError
@@ -22,10 +21,6 @@ from test_claude_session import FakeSink
 
 class ArgumentsTests(unittest.TestCase):
     """Verify that native selectors cannot accidentally request a fresh session."""
-
-    def test_opencode_does_not_advertise_resume(self):
-        """The unsupported runtime must be rejected before continuation admission."""
-        self.assertNotIn(Capability.RESUME, OPENCODE.describe().capabilities)
 
     def test_resume_arguments_preserve_other_settings(self):
         """Both CLI families target an exact ID without changing prompt or answer path."""

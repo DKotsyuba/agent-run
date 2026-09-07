@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.codex import plugins as codex_plugins
 from agent_run.adapters.codex.adapter import ADAPTER as CODEX
-from agent_run.adapters.opencode.adapter import render_config
 from agent_run.adapters.plugin_skills import (
     local_skill_names,
     plugin_skill_dir,
@@ -151,24 +150,6 @@ class PluginSkillSourceTests(unittest.TestCase):
         with self.assertRaises(ValidationError) as caught:
             CLAUDE.validate(config)
         self.assertIn("unlisted: delegate", str(caught.exception))
-
-    def test_opencode_skill_paths_point_at_the_plugin_copy(self) -> None:
-        config = RuntimeConfig(
-            enabled=True,
-            adapter="a:b",
-            binary=Path("/bin/echo"),
-            home=self.root,
-            models=("omniroute/demo",),
-            skills=("delegate", "lsp-first"),
-            plugins=(self.plugin,),
-        )
-        document = json.loads(
-            render_config(config, {}, skills_root=self.stale, inherited_environment={})
-        )
-        self.assertEqual(
-            document["skills"]["paths"],
-            [str(self.stale / "delegate"), str(self.plugin / "skills" / "lsp-first")],
-        )
 
 
 class CodexGuardHookTests(unittest.TestCase):
@@ -329,24 +310,6 @@ class ExtraMcpServerTests(unittest.TestCase):
         document = json.loads((home / "mcp" / "mcp-config.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(document["mcpServers"]), ["agent_lsp", "codegraph"])
         self.assertEqual(document["mcpServers"]["codegraph"]["args"], ["serve", "--mcp"])
-
-    def test_opencode_config_lists_both_servers(self) -> None:
-        config = RuntimeConfig(
-            enabled=True,
-            adapter="a:b",
-            binary=Path("/bin/echo"),
-            home=self.root,
-            models=("omniroute/demo",),
-            skills=("delegate",),
-            mcp=("agent_lsp", "codegraph"),
-        )
-        document = json.loads(
-            render_config(config, self.servers, skills_root=self.skills, inherited_environment={})
-        )
-        self.assertEqual(sorted(document["mcp"]), ["agent_lsp", "codegraph"])
-        self.assertEqual(
-            document["mcp"]["codegraph"]["command"], ["/bin/echo", "serve", "--mcp"]
-        )
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ class RoleAssignmentTests(unittest.TestCase):
         # An unshipped role must never be named: the contract is explicit-only,
         # and pointing at a skill the child cannot load is a broken instruction.
         self.assertIs(assign_role(profile, "claude", ("code-reading",)), profile)
-        self.assertIs(assign_role(profile, "opencode", ()), profile)
+        self.assertIs(assign_role(profile, "unsupported", ()), profile)
 
     def test_codex_assigns_the_research_role_when_shipped(self) -> None:
         profile = AgentProfile("research", "Research.", False, ())

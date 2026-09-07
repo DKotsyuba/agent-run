@@ -27,7 +27,6 @@ _SECRET = re.compile(
 _MARKERS = {
     "codex": "config.toml",
     "claude": "settings.json",
-    "opencode": "xdg/config/opencode/opencode.json",
     "qwen": ".qwen/settings.json",
     "glm": "settings.json",
 }
@@ -631,4 +630,3 @@ def _mcp_inventory(
                 f"mcp:{pid}",
                 f"started={started} release={release_hint}",
             )
-

@@ -191,13 +191,13 @@ class AdapterTests(unittest.TestCase):
         modules = (
             "agent_run.adapters.claude.adapter",
             "agent_run.adapters.codex.adapter",
-            "agent_run.adapters.opencode.adapter",
+            "agent_run.adapters.qwen.adapter",
         )
         for module in modules:
             __import__("sys").modules.pop(module, None)
         runtimes = {
             name: RuntimeConfig(True, f"{module}:ADAPTER", Path("/bin/echo"), Path("/tmp"), ())
-            for name, module in zip(("claude", "codex", "opencode"), modules)
+            for name, module in zip(("claude", "codex", "qwen"), modules)
         }
         AdapterRegistry(runtimes).preload_enabled()
         for module in modules:
@@ -217,7 +217,7 @@ class AdapterTests(unittest.TestCase):
         """
 
         root = Path(__file__).parents[1] / "src" / "agent_run" / "adapters"
-        for family in ("claude", "codex", "opencode"):
+        for family in ("claude", "codex", "glm", "qwen"):
             paths = sorted((root / family).glob("*.py"))
             self.assertTrue(paths, f"no adapter sources found for {family}")
             for path in paths:

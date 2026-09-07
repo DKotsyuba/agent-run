@@ -14,7 +14,6 @@ from agent_run.adapters.command_policy import (
     materialize_refusal_commands,
     render_claude_denials,
     render_codex_denial_rules,
-    render_opencode_denials,
     render_qwen_denials,
     validate_denied_commands,
 )
@@ -78,8 +77,6 @@ class CommandPolicyTest(unittest.TestCase):
         expected = ("Bash(/tools/gh)", "Bash(/tools/gh *)", "Bash(gh)", "Bash(gh *)", "Bash(hub)", "Bash(hub *)")
         self.assertEqual(render_claude_denials(("hub", "gh"), command_paths=("/tools/gh",)), expected)
         self.assertEqual(render_qwen_denials(("hub", "gh"), command_paths=("/tools/gh",)), expected)
-        self.assertEqual(render_opencode_denials(("gh",), command_paths=("/tools/gh",)),
-                         {"/tools/gh": "deny", "/tools/gh *": "deny", "gh": "deny", "gh *": "deny"})
 
     def test_marker_symlinks_are_rejected_before_refresh(self) -> None:
         """A substituted ownership marker cannot authorize writes or removals."""

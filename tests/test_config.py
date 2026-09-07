@@ -193,6 +193,15 @@ command = ["echo", "done"]
         self.assertEqual(config.runtimes["fake"].models, ("test",))
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))
 
+    def test_legacy_opencode_runtime_is_ignored(self) -> None:
+        config = self.load(
+            """schema_version = 1
+[runtimes.opencode]
+unexpected_legacy_field = "retired"
+"""
+        )
+        self.assertNotIn("opencode", config.runtimes)
+
     def test_delivery_queue_binary_is_optional_and_absolute(self) -> None:
         self.assertIsNone(self.load("schema_version = 1\n").delivery.codex_queue_bin)
         configured = self.load(

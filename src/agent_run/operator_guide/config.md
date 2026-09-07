@@ -32,8 +32,12 @@ Each `[runtimes.<name>]` table may declare:
 
 - `enabled` — bool; a disabled runtime is invisible everywhere (models,
   doc, service).
-- `adapter` — which adapter drives this runtime (claude, codex, glm, qwen,
-  opencode).
+- `adapter` — which adapter drives this runtime (claude, codex, glm, qwen).
+
+OpenCode is no longer supported. Existing `[runtimes.opencode]` tables are
+accepted and ignored so status and historical records remain readable; remove
+that table after upgrading. `opencode/<alias>` model names configured for Qwen
+remain OmniRoute route aliases.
 - `binary` — absolute path to the runtime's executable; the configured launcher
   path is preserved rather than replaced with its symlink target. This keeps
   interpreter lookup relative to the launcher directory reliable for packaged

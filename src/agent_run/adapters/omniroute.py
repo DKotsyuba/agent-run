@@ -1,8 +1,7 @@
 """The OmniRoute account pool's quota, read from OmniRoute's own store.
 
-Every model the OmniRoute-served runtimes (opencode, qwen) can reach is
-served by OmniRoute out of one ``opencode-go`` account pool, so the pool's
-quota *is* each such runtime's quota.
+Every OmniRoute-served Qwen model shares the ``opencode-go`` account pool, so
+the pool's quota is Qwen's quota.
 
 That store is the only real source there is. Probed live against the local
 server (2026-08-27):
@@ -17,7 +16,7 @@ server (2026-08-27):
 * the whole ``/api/*`` admin surface answers 401 ``AUTH_001`` for *every*
   path, invented ones included, so a 401 there is a catch-all and is no
   evidence that anything exists behind it;
-* agent transcripts carry no opencode provider rate-limit evidence either:
+* agent transcripts carry no OmniRoute provider rate-limit evidence either:
   the ``rate_limit_info`` events under ``<home>/agents/*/runtime.jsonl`` are
   the claude runtime's own.
 

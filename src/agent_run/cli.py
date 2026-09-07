@@ -51,8 +51,6 @@ _EXPECTED_ERROR_EXIT = 2
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
-#: The only runtime that owns a managed service; there is no generic daemon.
-_SERVICE_RUNTIME = "opencode"
 #: Transports a `hook bind`/`hook context` may record, and the only names the
 #: dispatcher can route back to. An unknown name is refused at bind time
 #: rather than becoming an undeliverable row hours later.
@@ -200,13 +198,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     delivery_launchd.add_argument("--stdout-log", default="/dev/null")
     delivery_launchd.add_argument("--stderr-log")
-
-    runtime_service = commands.add_parser("service").add_subparsers(
-        dest="service_command", required=True
-    )
-    service_start = runtime_service.add_parser("start")
-    service_start.add_argument("--runtime", required=True)
-    service_start.add_argument("--port", type=int)
 
     hook = commands.add_parser("hook").add_subparsers(
         dest="hook_command", required=True
@@ -669,26 +660,6 @@ def _api_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _service_start(home: Path, args: argparse.Namespace) -> dict[str, object]:
-    """Start (or reuse) the one managed service of a runtime that owns one."""
-
-    from .adapters.opencode.service import start_service
-
-    if args.runtime != _SERVICE_RUNTIME:
-        raise ValidationError(
-            f"service start supports --runtime {_SERVICE_RUNTIME} only, not {args.runtime!r}"
-        )
-    runtime = load_config(config_path(home)).runtimes.get(_SERVICE_RUNTIME)
-    if runtime is None or not runtime.enabled:
-        raise ValidationError(f"runtime is not configured or not enabled: {_SERVICE_RUNTIME}")
-    started = start_service(runtime, runtime.home, port=args.port)
-    return {
-        "runtime": _SERVICE_RUNTIME,
-        "reused": started.reused,
-        "service": started.descriptor.as_dict(),
-    }
-
-
 def _dispatch_once(home: Path):
     """Drain both agent and workflow lifecycle outboxes once."""
 
@@ -1051,8 +1022,6 @@ def main(
             result = _delivery_launchd(home, args)
         elif args.command == "api" and args.api_command == "launchd":
             result = _api_launchd(home, args)
-        elif args.command == "service":
-            result = _service_start(home, args)
         else:
             if args.command == "mcp":
                 from .mcp import serve

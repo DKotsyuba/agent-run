@@ -1,7 +1,7 @@
 # agent-run
 
 Local supervisor for coding agents. Start Codex, Claude Code, GLM, Qwen
-Code, or OpenCode children as **durable asynchronous jobs** on your own
+Code children as **durable asynchronous jobs** on your own
 machine — with one state store, honest outcome verification, quota
 tracking, multi-step workflows, and three equal access layers: a CLI, an
 MCP server, and a Unix-socket JSON-RPC API.
@@ -19,7 +19,7 @@ you / your agent / your app
         │          transcripts, deliveries, workflows, run stats)
    adapters + supervisor
         │
-   codex · claude · glm · qwen · opencode               ← engine CLIs you
+   codex · claude · glm · qwen                          ← engine CLIs you
                                                           already have
 ```
 
@@ -50,7 +50,7 @@ you / your agent / your app
 ## Install
 
 Requirements: Python ≥ 3.14, macOS or Linux, plus the engine CLIs you intend
-to drive (`codex`, `claude`, `qwen`, `opencode` — any subset).
+to drive (`codex`, `claude`, `qwen` — any subset).
 
 | Feature | macOS | Linux |
 |---|---:|---:|
@@ -105,7 +105,7 @@ models  = ["sonnet", "opus"]
 ```
 
 Add more `[runtimes.<name>]` blocks for other engines (`codex`, `qwen`,
-`glm`, `opencode`) the same way. Per-runtime options cover auth (env-var
+`glm`) the same way. Per-runtime options cover auth (env-var
 names or file links — never secret values in config), allowed skills,
 declared MCP servers, lifecycle hooks, plugins, and the limits source
 (`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
@@ -276,8 +276,7 @@ parallel group without writing a script.
 Engine adapters included: **codex** (app-server JSON-RPC),
 **claude** (Claude Code CLI), **glm** (Claude Code CLI pointed at Z.ai's
 Anthropic-compatible endpoint), **qwen** (Qwen Code headless with sandbox-safe
-macOS Git bootstrap),
-**opencode** (managed HTTP service).
+macOS Git bootstrap).
 
 ## Documentation
 

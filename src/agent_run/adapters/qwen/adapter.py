@@ -316,7 +316,7 @@ class QwenAdapter:
         """Report the OmniRoute account pool this runtime is served from.
 
         Every qwen model here routes through OmniRoute out of the same
-        ``opencode-go`` account pool opencode uses, so the pool's quota is
+        ``opencode-go`` account pool, so the pool's quota is
         this runtime's quota. See :mod:`agent_run.adapters.omniroute`.
         """
         del config, home

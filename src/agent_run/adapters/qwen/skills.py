@@ -4,8 +4,7 @@ Qwen Code has no Skill tool, so parity with the neighboring runtimes is a
 file-delivery mechanism instead: every configured skill's ``SKILL.md`` is
 copied beneath the generated home, and the injected context file is given
 the absolute path so the model can open each one itself. Plugin-owned skill
-names are resolved the same way :mod:`agent_run.adapters.codex.adapter` and
-:mod:`agent_run.adapters.opencode.adapter` resolve them, through the shared
+names are resolved through the shared
 :mod:`agent_run.adapters.plugin_skills` module.
 """
 

@@ -25,6 +25,5 @@ declared but attached to no runtime is inert; a name listed in `mcp =
 Children (agents started via claude and codex) see `agent_lsp` and
 `codegraph` today, when those runtimes' config lists them.
 
-The opencode engine currently cannot expose attached MCP tools to the model.
 This is an upstream engine limitation rather than an agent-run config error;
 use another runtime when a child requires MCP tools.

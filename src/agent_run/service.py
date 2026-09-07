@@ -1146,6 +1146,10 @@ class AgentService:
         return label
 
     def _runtime_config(self, name: str) -> RuntimeConfig:
+        if name == "opencode":
+            raise ValidationError(
+                "runtime 'opencode' is no longer supported; remove [runtimes.opencode] from config.toml"
+            )
         try:
             return self._config.runtimes[name]
         except KeyError as error:

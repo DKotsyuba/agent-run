@@ -116,7 +116,7 @@ class DocMcpTests(unittest.TestCase):
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "tools/call",
-                    "params": {"name": "doc", "arguments": {"topic": "service"}},
+                    "params": {"name": "doc", "arguments": {"topic": "models"}},
                 },
                 {
                     "jsonrpc": "2.0",
@@ -130,8 +130,8 @@ class DocMcpTests(unittest.TestCase):
         second = responses[1]["result"]["structuredContent"]
         third = responses[2]["result"]["structuredContent"]
         self.assertEqual(first["topic"], "index")
-        self.assertEqual(second["topic"], "service")
-        self.assertIn("opencode", second["text"])
+        self.assertEqual(second["topic"], "models")
+        self.assertIn("opencode/", second["text"])
         self.assertEqual(third["topic"], "completion")
         self.assertIn("agent-run/completion", third["text"])
 

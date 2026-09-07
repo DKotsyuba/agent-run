@@ -85,9 +85,8 @@ def _validate_raw_ref(raw_ref: str) -> None:
 
 def _spool_oversized_message(agent_directory: Path, content: str) -> tuple[str, str]:
     """Spool content over the inline limit to a raw file directly under the
-    agent's own directory (same mkstemp-in-place convention as
-    adapters/opencode/http.py:_capture, so its bare filename is already a
-    normalized raw_ref) and return a bounded inline stub plus that raw_ref.
+    agent's own directory, so its bare filename is already a normalized
+    raw_ref) and return a bounded inline stub plus that raw_ref.
     """
 
     agent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)

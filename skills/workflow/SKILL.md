@@ -82,7 +82,7 @@ to work not yet started, without restarting healthy children.
   grants. Do not widen permissions to make a step start or assume that a
   historical engine restriction applies permanently to future versions.
 - **qwen**: the cheap-OSS lane (Chinese models through the local OmniRoute
-  router; combo aliases keep the historical `opencode/` prefix). Check the
+  router; Qwen combo aliases keep the historical `opencode/` prefix). Check the
   LIVE roster with the `models` tool. `opencode/MiniMaxM3` answers one-liners
   in seconds — the default smoke and verify model. Since 29.08.2026 write
   children have a sandboxed shell and run their own tests (name the exact
