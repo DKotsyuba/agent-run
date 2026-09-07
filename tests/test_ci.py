@@ -26,7 +26,7 @@ class CiRetryTests(unittest.TestCase):
             fake_python = fake_bin / "python"
             fake_python.write_text(
                 "#!/bin/sh\n"
-                f"count={count}\n"
+                "count=\"$FAKE_COUNT_FILE\"\n"
                 "calls=$(cat \"$count\" 2>/dev/null || echo 0)\n"
                 "calls=$((calls + 1)); echo \"$calls\" > \"$count\"\n"
                 "if [ \"$calls\" -eq 1 ] && { [ \"$FAKE_MODE\" = firstfail ] || [ \"$FAKE_MODE\" = diagfail ]; }; then exit 7; fi\n"
@@ -39,6 +39,7 @@ class CiRetryTests(unittest.TestCase):
                 **os.environ,
                 "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
                 "RUNNER_OS": "Linux",
+                "FAKE_COUNT_FILE": str(count),
             }
             for mode, expected_status, expected_calls in (
                 ("allpass", 0, 1),
@@ -47,7 +48,7 @@ class CiRetryTests(unittest.TestCase):
             ):
                 count.unlink(missing_ok=True)
                 result = subprocess.run(
-                    ["bash", "-c", block],
+                    ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", block],
                     env={**environment, "FAKE_MODE": mode},
                     capture_output=True,
                     text=True,

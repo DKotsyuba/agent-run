@@ -46,8 +46,8 @@ jobs:
             :
           else
             first_test_status=$?
-            python -m pytest -q --rootdir . tests/test_launch.py
-            python -m pytest -q --rootdir . tests "${pytest_filter[@]}"
+            python -m pytest -q --rootdir . tests/test_launch.py || true
+            python -m pytest -q --rootdir . tests "${pytest_filter[@]}" || true
           fi
           exit "$first_test_status"
       - name: Verify Linux path canonicalization
