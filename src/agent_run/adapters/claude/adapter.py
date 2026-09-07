@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import select
 import signal
 import subprocess
 import threading
@@ -66,6 +67,11 @@ from .stream import (
 )
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
+
+#: Maximum time one prompt or steer may hold the session's input pipe.
+_INPUT_WRITE_TIMEOUT_SECONDS = 1.0
+#: Cancellation polling interval while the child applies stdin backpressure.
+_INPUT_WRITE_POLL_SECONDS = 0.05
 
 
 class ClaudeAdapter:
@@ -425,6 +431,8 @@ class ClaudeSession:
         self._sink = sink
         self._decoder = StreamDecoder()
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._write_cancelled = threading.Event()
         self._cancelled = False
         self._reader_error: BaseException | None = None
         # Set the instant a terminal ``result`` line is decoded, or when the
@@ -448,19 +456,69 @@ class ClaudeSession:
         self._stderr = StderrTail(process.stderr, self._secrets)
         self._raw_stream = open_runtime_log(plan.runtime_stream_path)
         try:
-            if plan.initial_input and process.stdin is not None:
-                try:
-                    process.stdin.write(plan.initial_input)
-                    process.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
+            if process.stdin is not None:
+                os.set_blocking(process.stdin.fileno(), False)
             self._stderr_reader = threading.Thread(target=self._stderr.drain, daemon=True)
             self._stderr_reader.start()
             self._reader = threading.Thread(target=self._read_stdout, daemon=True)
             self._reader.start()
+            if plan.initial_input:
+                self._write_input(plan.initial_input, "initial input")
         except BaseException:
             self._raw_stream.close()
             raise
+
+    def _write_input(self, text: str, label: str) -> None:
+        """Write one UTF-8 frame within a fixed, cancellable pipe budget.
+
+        ``text`` is the complete prompt or steer frame and ``label`` names it
+        in failures. Writes serialize so concurrent callers cannot interleave
+        frames. Child exit, cancellation, and pipe errors raise immediately;
+        sustained backpressure raises ``TimeoutError`` after one second.
+        """
+
+        frame = text.encode("utf-8")
+        deadline = time.monotonic() + _INPUT_WRITE_TIMEOUT_SECONDS
+        with self._write_lock:
+            stdin = self._process.stdin
+            if stdin is None:
+                raise ConnectionError(f"claude closed stdin while writing {label}")
+            try:
+                fd = stdin.fileno()
+            except ValueError as error:
+                raise ConnectionError(
+                    f"claude closed stdin while writing {label}"
+                ) from error
+            sent = 0
+            while sent < len(frame):
+                if self._write_cancelled.is_set():
+                    raise InterruptedError(f"claude cancelled while writing {label}")
+                if self._process.poll() is not None:
+                    raise ConnectionError(f"claude exited while writing {label}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"claude timed out writing {label}")
+                try:
+                    _, writable, _ = select.select(
+                        [], [fd], [], min(remaining, _INPUT_WRITE_POLL_SECONDS)
+                    )
+                except (OSError, ValueError) as error:
+                    raise ConnectionError(
+                        f"claude closed stdin while writing {label}"
+                    ) from error
+                if not writable:
+                    continue
+                try:
+                    count = os.write(fd, frame[sent:])
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    raise ConnectionError(
+                        f"claude closed stdin while writing {label}"
+                    ) from error
+                if count <= 0:
+                    raise ConnectionError(f"claude closed stdin while writing {label}")
+                sent += count
 
     @property
     def pid(self) -> int | None:
@@ -535,9 +593,10 @@ class ClaudeSession:
             self._settled.set()
 
     def steer(self, text: str) -> None:
-        stdin = self._process.stdin
-        if stdin is None or self._process.poll() is not None:
-            return
+        """Deliver one nonblank steer frame within the bounded input budget."""
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValidationError("steer text must be nonblank")
         line = (
             json.dumps(
                 {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}},
@@ -545,14 +604,11 @@ class ClaudeSession:
             )
             + "\n"
         )
-        try:
-            stdin.write(line)
-            stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
+        self._write_input(line, "steer")
 
     def cancel(self, grace_seconds: float) -> None:
         self._cancelled = True
+        self._write_cancelled.set()
         if self._process.poll() is not None:
             return
         try:

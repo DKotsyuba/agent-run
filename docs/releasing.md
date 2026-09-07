@@ -76,7 +76,8 @@ hash-pinned dependency closure, installs the wheel without re-resolving it, and
 runs `pip check` before it seals the release. A release missing the lock is
 refused. It then verifies or reuses the sealed release and runs isolated
 init/doctor/API/MCP checks. It waits for every active
-agent, reserves the SQLite writer while stopping API admission and
+agent and any birth-verified writer from an archived workflow runtime, reserves
+the SQLite writer while stopping API admission and
 loaded periodic jobs, then rechecks quiescence. Before migration it backs up
 SQLite with its backup API, saves configuration and the previous pointer under
 `<home>/standalone/backups/`, and records a private deployment journal. Migration

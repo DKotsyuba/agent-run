@@ -22,6 +22,8 @@ import sys
 import tempfile
 import time
 
+import psutil
+
 from release import ReleaseError, Runner
 
 
@@ -174,11 +176,35 @@ def prepare(runner: Runner, target: Path, wheel: Path, requirements: Path, versi
 
 
 def active(connection: sqlite3.Connection) -> int:
-    """Count active agents on the caller-owned SQLite connection; read only."""
+    """Count active agents and birth-verified legacy workflow writers.
 
-    return connection.execute(
+    Historical workflow rows without a live matching PID/birth identity do not
+    block deployment. A still-running archived workflow writer does, preventing
+    schema migration while that old process can write.
+    """
+
+    agents = connection.execute(
         "SELECT count(*) FROM agents WHERE status IN ('created','starting','running','cancelling')"
     ).fetchone()[0]
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(workflow_runs)")
+    }
+    if not {"status", "owner_pid_identity", "owner_birth_time"} <= columns:
+        return agents
+    writers = 0
+    for owner, birth in connection.execute(
+        """SELECT owner_pid_identity, owner_birth_time FROM workflow_runs
+           WHERE status IN ('created', 'running') AND owner_pid_identity IS NOT NULL
+             AND owner_birth_time IS NOT NULL"""
+    ):
+        try:
+            pid = int(str(owner).partition(" ")[0])
+            process = psutil.Process(pid)
+            if process.create_time() == float(birth) and process.is_running():
+                writers += 1
+        except (ValueError, TypeError, psutil.Error):
+            continue
+    return agents + writers
 
 
 def database(home: Path) -> sqlite3.Connection:

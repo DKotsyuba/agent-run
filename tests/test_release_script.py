@@ -7,6 +7,7 @@ import argparse
 from contextlib import ExitStack
 import hashlib
 import importlib
+import os
 from pathlib import Path
 import plistlib
 import runpy
@@ -17,6 +18,8 @@ import tempfile
 import unittest
 import zipfile
 from unittest.mock import Mock, patch
+
+import psutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import release
@@ -264,7 +267,13 @@ class LocalTests(unittest.TestCase):
         self.current.symlink_to(self.old)
         self.home.joinpath("config.toml").write_text("schema_version=1\n")
         with sqlite3.connect(self.home / "state.db") as connection:
-            connection.executescript("CREATE TABLE agents(status TEXT); CREATE TABLE workflow_runs(status TEXT); PRAGMA user_version=10;")
+            connection.executescript(
+                """CREATE TABLE agents(status TEXT);
+                   CREATE TABLE workflow_runs(
+                     status TEXT, owner_pid_identity TEXT, owner_birth_time REAL
+                   );
+                   PRAGMA user_version=10;"""
+            )
         self.plists = self.user / "Library/LaunchAgents"
         self.plists.mkdir(parents=True)
         for suffix in ("api", "capacity", "delivery"):
@@ -328,7 +337,10 @@ class LocalTests(unittest.TestCase):
     def test_active_work_waits_and_shutdown_race_refuses_migration(self):
         """Count agents, ignore legacy workflow rows, and catch admission races."""
         with sqlite3.connect(self.home / "state.db") as connection:
-            connection.executescript("INSERT INTO agents VALUES('running'); INSERT INTO workflow_runs VALUES('created');")
+            connection.executescript(
+                """INSERT INTO agents VALUES('running');
+                   INSERT INTO workflow_runs(status) VALUES('created');"""
+            )
         with local.database(self.home) as connection:
             self.assertEqual(local.active(connection), 1)
         self.runner.pause.side_effect = release.ReleaseError("still active")
@@ -340,6 +352,25 @@ class LocalTests(unittest.TestCase):
             self.deploy()
         migrate.assert_not_called()
         restart.assert_called_once()
+
+    def test_live_birth_verified_legacy_writer_blocks_release(self):
+        """Only an exact live old writer adds to deployment quiescence."""
+
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (status, owner_pid_identity, owner_birth_time)
+                   VALUES ('running', ?, ?)""",
+                (f"{os.getpid()} fixture", psutil.Process().create_time()),
+            )
+        with local.database(self.home) as connection:
+            self.assertEqual(local.active(connection), 1)
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                "UPDATE workflow_runs SET owner_birth_time = owner_birth_time - 1"
+            )
+        with local.database(self.home) as connection:
+            self.assertEqual(local.active(connection), 0)
 
     def test_failed_migration_restores_old_only_when_schema_is_unchanged(self):
         """A pre-migration exception restarts old compatible services and retains journal."""

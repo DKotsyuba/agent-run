@@ -72,6 +72,13 @@ def _error_text(error: BaseException) -> str:
 
 @dataclass(frozen=True)
 class SupervisorSettings:
+    """Validated timing and work bounds for one supervisor lifecycle.
+
+    Durations are seconds. ``command_limit`` and ``command_seconds`` bound one
+    running command-drain tick so engine polling, heartbeat, and deadline checks
+    regain control even while commands keep arriving.
+    """
+
     heartbeat_seconds: float = 5.0
     poll_seconds: float = 0.25
     grace_seconds: float = 10.0
@@ -81,14 +88,19 @@ class SupervisorSettings:
     warning_text: str = DEFAULT_WARNING_TEXT
     silence_threshold_seconds: float = 60.0
     stalled_after_seconds: float = 900.0
+    command_limit: int = 16
+    command_seconds: float = 1.0
     sentinel: str | None = DEFAULT_SENTINEL
 
     def __post_init__(self) -> None:
+        """Reject unsafe or non-finite supervisor settings before launch."""
+
         for name in (
             "heartbeat_seconds",
             "poll_seconds",
             "grace_seconds",
             "kill_grace_seconds",
+            "command_seconds",
         ):
             value = getattr(self, name)
             if (
@@ -121,6 +133,12 @@ class SupervisorSettings:
             raise ValidationError("warning_fraction must be strictly between 0 and 1")
         if not isinstance(self.warning_text, str) or not self.warning_text.strip():
             raise ValidationError("warning_text must be a nonblank string")
+        if (
+            isinstance(self.command_limit, bool)
+            or not isinstance(self.command_limit, int)
+            or not 1 <= self.command_limit <= 1_000
+        ):
+            raise ValidationError("command_limit must be an integer from 1 to 1000")
         if self.sentinel is not None and (
             not isinstance(self.sentinel, str) or not self.sentinel.strip()
         ):
@@ -512,7 +530,17 @@ class Supervisor:
         )
 
     def _drain_commands(self, session: RuntimeSession, steerable: bool) -> None:
-        while True:
+        """Handle a bounded command page, returning immediately after cancel.
+
+        The store supplies cancellation-first ordering. This loop caps both
+        claimed rows and elapsed monotonic seconds so a sustained producer
+        cannot starve engine polling, heartbeat writes, or deadline checks.
+        """
+
+        started = self._ops.monotonic()
+        for _ in range(self._settings.command_limit):
+            if self._ops.monotonic() - started >= self._settings.command_seconds:
+                return
             command = self._store.claim_command(self._agent_id)
             if command is None:
                 return
@@ -526,6 +554,8 @@ class Supervisor:
             else:
                 result = {"accepted": False, "reason": "unsupported_command"}
             self._store.complete_command(int(command["id"]), self._agent_id, result)
+            if kind == CANCEL_COMMAND:
+                return
 
     @staticmethod
     def _payload(command: Mapping[str, object]) -> dict[str, object]:
@@ -658,16 +688,23 @@ class Supervisor:
         return committed
 
     def _record_termination(self, termination, *, best_effort: bool = False) -> None:
-        if self._group is None or not (termination.signals or not termination.group_gone):
+        """Persist one scoped cleanup verdict for an owned process session."""
+
+        if not self._owns_process_group:
             return
         try:
             self._store.append_event(
                 self._agent_id,
-                "process_group_terminated",
+                "process_cleanup",
                 data={
                     "signals": list(termination.signals),
+                    "scope": termination.scope,
                     "group_gone": termination.group_gone,
-                    "process_group_id": self._group.pgid,
+                    "descendants_gone": termination.descendants_gone,
+                    "confirmed": termination.confirmed,
+                    "process_group_id": (
+                        None if self._group is None else self._group.pgid
+                    ),
                 },
             )
         except Exception:

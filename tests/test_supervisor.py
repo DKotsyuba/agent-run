@@ -117,11 +117,19 @@ class FakeSession:
         exit_after_polls: int | None = None,
         native_cancel: bool = True,
         steer_error: str | None = None,
+        steer_seconds: float = 0.0,
         on_wait=None,
         on_cancel=None,
         owns_process_group: bool = True,
         pid: int = ENGINE_PID,
     ):
+        """Configure deterministic outcome, control latency, and process ownership.
+
+        ``ops`` owns fake time and group state. Optional outcome/poll fields
+        control completion; native cancel, steer failure/latency, callbacks,
+        process-group ownership, and ``pid`` model the supervisor boundaries.
+        """
+
         self.pid = pid
         self.owns_process_group = owns_process_group
         self._ops = ops
@@ -129,6 +137,7 @@ class FakeSession:
         self._exit_after_polls = exit_after_polls
         self._native_cancel = native_cancel
         self._steer_error = steer_error
+        self._steer_seconds = steer_seconds
         self._on_wait = on_wait
         self._on_cancel = on_cancel
         self._exited = False
@@ -151,6 +160,7 @@ class FakeSession:
         return None
 
     def steer(self, text: str) -> None:
+        self._ops.clock += self._steer_seconds
         if self._steer_error is not None:
             raise RuntimeError(self._steer_error)
         self.steers.append(text)
@@ -430,7 +440,10 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(agent["status"], "succeeded")
         self.assertEqual(agent["answer_bytes"], len(body.encode("utf-8")))
         self.assertEqual(agent["answer_path"], str(self.answer))
-        self.assertEqual(self.events("process_group_terminated")[0]["kind"], "process_group_terminated")
+        cleanup = self.events("process_cleanup")[0]
+        self.assertEqual(cleanup["kind"], "process_cleanup")
+        self.assertIn('"scope":"process_group"', cleanup["data_json"])
+        self.assertIn('"confirmed":false', cleanup["data_json"])
 
     def test_early_exited_engine_succeeds_only_with_complete_answer_evidence(self) -> None:
         """A vanished leader may succeed after no group remains and answer proof exists."""
@@ -668,14 +681,14 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.events("stopping"), [])
 
     def test_a_failing_termination_bookkeeping_write_does_not_mask_the_timeout(self) -> None:
-        """Same guarantee for the "process_group_terminated" write in _finish().
+        """Same guarantee for the ``process_cleanup`` write in ``_finish``.
 
         _record_termination already supports ``best_effort`` (used by
         _fail_launched); _finish() must use it too so the group-kill record
         cannot turn a known outcome into supervision_failed.
         """
 
-        self.store.fail_event_kind = "process_group_terminated"
+        self.store.fail_event_kind = "process_cleanup"
         ops = FakeOps()
         session = FakeSession(ops, native_cancel=False)
         settings = SupervisorSettings(
@@ -687,7 +700,7 @@ class SupervisorTests(unittest.TestCase):
 
         self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
         self.assertEqual(self.agent()["status"], "timed_out")
-        self.assertEqual(self.events("process_group_terminated"), [])
+        self.assertEqual(self.events("process_cleanup"), [])
 
     def test_timeout_distinguishes_a_cut_off_answer_from_no_answer(self) -> None:
         ops = FakeOps()
@@ -747,6 +760,49 @@ class SupervisorTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["state"], "completed")
         self.assertIn("capability_unavailable", row["result_json"])
+
+    def test_command_flood_yields_to_engine_poll_after_one_bounded_page(self) -> None:
+        """Continuous steer input cannot keep the supervisor inside one drain."""
+
+        for index in range(40):
+            self.store.enqueue_command(
+                self.agent_id, "steer", {"text": f"steer {index}"}
+            )
+        ops = FakeOps()
+        observed: list[int] = []
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED),
+            exit_after_polls=1,
+            on_wait=lambda _poll: observed.append(len(session.steers)),
+        )
+        self.write_answer(f"done {DEFAULT_SENTINEL}")
+
+        self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertEqual(observed, [16])
+
+    def test_command_time_budget_yields_before_the_count_limit(self) -> None:
+        """Slow bounded controls still return to deadline and heartbeat checks."""
+
+        for index in range(16):
+            self.store.enqueue_command(
+                self.agent_id, "steer", {"text": f"steer {index}"}
+            )
+        ops = FakeOps()
+        observed: list[int] = []
+        session = FakeSession(
+            ops,
+            outcome=Outcome(AgentStatus.SUCCEEDED),
+            exit_after_polls=1,
+            steer_seconds=0.4,
+            on_wait=lambda _poll: observed.append(len(session.steers)),
+        )
+        self.write_answer(f"done {DEFAULT_SENTINEL}")
+
+        self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertEqual(observed, [3])
 
     def test_heartbeats_are_written_while_the_engine_runs(self) -> None:
         ops = FakeOps()

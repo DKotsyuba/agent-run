@@ -3,8 +3,10 @@ import json
 import os
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -419,6 +421,81 @@ class ClaudeSessionTests(unittest.TestCase):
         outcome = session.wait(timeout_seconds=5)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+
+    def test_stdout_larger_than_pipe_capacity_is_drained_before_initial_input(self) -> None:
+        """A child may fill stdout before it starts reading the prompt."""
+
+        script = (
+            "import json, sys\n"
+            "sys.stdout.write('not-json\\n' * 20000)\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-1', "
+            "'subtype': 'success', 'is_error': False, 'result': 'drained'}), flush=True)\n"
+        )
+
+        outcome = ADAPTER.launch(self.plan(script), FakeSink()).wait(timeout_seconds=10)
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertGreater(self.log_path.stat().st_size, 65536)
+
+    def test_nonreading_child_cannot_hold_large_initial_input(self) -> None:
+        """Initial-input backpressure fails and reaps the owned child promptly."""
+
+        plan = self.plan("import time; time.sleep(30)")
+        plan = LaunchPlan(
+            plan.argv,
+            plan.cwd,
+            plan.environment,
+            "x" * 1_048_576,
+            plan.runtime_stream_path,
+            plan.adapter_state,
+        )
+        captured: dict[str, subprocess.Popen] = {}
+        original_popen = claude_adapter_module.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            """Record the fixture child while preserving real ``Popen`` behavior."""
+
+            process = original_popen(*args, **kwargs)
+            captured["process"] = process
+            return process
+
+        started = time.monotonic()
+        with patch.object(claude_adapter_module.subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(TimeoutError, "timed out writing initial input"):
+                ADAPTER.launch(plan, FakeSink())
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIsNotNone(captured["process"].poll())
+
+    def test_stalled_steer_write_is_bounded_and_cancel_interrupts_it(self) -> None:
+        """A child that stops reading stdin cannot trap a control writer."""
+
+        script = "import sys, time\nsys.stdin.readline()\ntime.sleep(30)\n"
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        self.addCleanup(self._force_kill, session)
+        errors: list[BaseException] = []
+
+        def steer() -> None:
+            """Attempt one deliberately oversized steer and capture its failure."""
+
+            try:
+                session.steer("x" * 1_048_576)
+            except BaseException as error:
+                errors.append(error)
+
+        writer = threading.Thread(target=steer)
+        writer.start()
+        time.sleep(0.1)
+        session.cancel(grace_seconds=0.1)
+        writer.join(timeout=3)
+
+        self.assertFalse(writer.is_alive())
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], (InterruptedError, ConnectionError))
+        self.assertIsNotNone(session._process.poll())
 
     # -- settling on stream content instead of process exit ----------------
     #

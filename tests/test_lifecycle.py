@@ -1,8 +1,13 @@
+import contextlib
 import os
 import signal
+import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
+
+import psutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -10,7 +15,9 @@ from agent_run.errors import ValidationError
 from agent_run.lifecycle import (
     Deadline,
     Phase,
+    ProcessIdentity,
     ReadyChannel,
+    SystemProcessOps,
     checked_pgid,
     install_signal_handlers,
     restore_signal_handlers,
@@ -76,6 +83,25 @@ class UnkillableOps(FakeOps):
         if signal_number != 0:
             self.sent.append((pgid, signal_number))
         return bool(self.groups.get(pgid))
+
+
+class ReusedLeaderOps(FakeOps):
+    """Expose a group whose original leader PID now has another birth time."""
+
+    def process_birth(self, pid: int) -> float | None:
+        """Return the original birth time during initial verification."""
+
+        return 1.0
+
+    def descendants(self, process) -> None:
+        """Refuse a descendant snapshot after the leader identity changed."""
+
+        return None
+
+    def process_alive(self, process) -> bool:
+        """Report that the captured PID/birth identity is no longer alive."""
+
+        return False
 
 
 class DeadlineTests(unittest.TestCase):
@@ -192,6 +218,79 @@ class TerminateProcessGroupTests(unittest.TestCase):
         self.assertEqual(result.signals, ())
         self.assertTrue(result.group_gone)
         self.assertGreaterEqual(ops.reaped.count(4242), 2)
+
+    def test_reused_leader_identity_never_signals_the_observed_group(self) -> None:
+        """A stale PID/birth proof cannot authorize TERM or KILL."""
+
+        ops = ReusedLeaderOps({4242: {4242}})
+        result = terminate_process_group(
+            ops,
+            verify_process_group(ops, 4242),
+            grace_seconds=0.1,
+            kill_grace_seconds=0.1,
+            poll_seconds=0.05,
+        )
+
+        self.assertFalse(result.group_gone)
+        self.assertFalse(result.confirmed)
+        self.assertEqual(ops.sent, [])
+
+    def test_escaped_descendant_is_reported_and_cleaned_by_fixture_owner(self) -> None:
+        """Group cleanup never claims or signals a descendant that called setsid."""
+
+        parent = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import subprocess, sys, time\n"
+                    "child = subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(30)'], start_new_session=True)\n"
+                    "print(child.pid, flush=True)\n"
+                    "time.sleep(30)\n"
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        parent_birth = psutil.Process(parent.pid).create_time()
+        self.addCleanup(self._clean_owned_process, parent.pid, parent_birth)
+        assert parent.stdout is not None
+        escaped_pid = int(parent.stdout.readline())
+        escaped_birth = psutil.Process(escaped_pid).create_time()
+        self.addCleanup(self._clean_owned_process, escaped_pid, escaped_birth)
+
+        ops = SystemProcessOps()
+        ops.descendants = lambda _process: (
+            ProcessIdentity(escaped_pid, escaped_birth),
+        )
+        result = terminate_process_group(
+            ops,
+            verify_process_group(ops, parent.pid),
+            grace_seconds=1.0,
+            kill_grace_seconds=1.0,
+            poll_seconds=0.05,
+        )
+
+        self.assertTrue(result.group_gone)
+        self.assertFalse(result.descendants_gone)
+        self.assertEqual(result.scope, "verified_descendants")
+        self.assertFalse(result.confirmed)
+        self.assertTrue(psutil.pid_exists(escaped_pid))
+        parent.wait(timeout=5)
+
+    @staticmethod
+    def _clean_owned_process(pid: int, birth_time: float) -> None:
+        """Kill only the fixture PID whose birth identity still matches."""
+
+        with contextlib.suppress(psutil.NoSuchProcess):
+            process = psutil.Process(pid)
+            if process.create_time() == birth_time:
+                process.kill()
+                with contextlib.suppress(psutil.TimeoutExpired):
+                    process.wait(timeout=5)
 
 
 class SignalHandlerTests(unittest.TestCase):
