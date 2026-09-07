@@ -65,10 +65,16 @@ class _WaitService:
 
 
 class _Factory:
-    def __init__(self, dispatcher_service, wait_service):
-        self.services = [dispatcher_service, wait_service]
+    """Provide two lane services followed by one isolated wait service."""
+
+    def __init__(self, dispatcher_service, wait_service) -> None:
+        """Retain the supplied lane substitute and dedicated wait substitute."""
+
+        self.services = [dispatcher_service, dispatcher_service, wait_service]
 
     def __call__(self):
+        """Return the next service in ApiServer construction/call order."""
+
         return self.services.pop(0)
 
 

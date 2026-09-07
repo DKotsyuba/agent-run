@@ -287,11 +287,11 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
     if name in {"cancel", "status", "answer"}:
         args = _arguments(raw, {"agent_id"}, {"agent_id"})
         agent_id = _string(args, "agent_id")
-        return {
-            "cancel": service.cancel,
-            "status": service.get,
-            "answer": service.answer,
-        }[name](agent_id)
+        if name == "cancel":
+            return service.cancel(agent_id)
+        if name == "status":
+            return service.get(agent_id)
+        return service.answer(agent_id)
     if name == "steer":
         args = _arguments(raw, {"agent_id", "text"}, {"agent_id", "text"})
         return service.steer(_string(args, "agent_id"), _string(args, "text"))

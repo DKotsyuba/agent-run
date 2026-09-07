@@ -569,6 +569,9 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
         if (current.st_dev, current.st_ino) != self._socket_identity:
             return False
         self.socket_path.unlink()
+        if self._startup_lock_fd is not None:
+            os.close(self._startup_lock_fd)
+            self._startup_lock_fd = None
         return True
 
     def server_close(self) -> None:
