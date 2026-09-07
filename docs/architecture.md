@@ -295,5 +295,6 @@ Details: `agent-run doc releases`.
 3. Evidence over optimism: terminal states are derived from recorded
    facts; fabricated success must be structurally impossible.
 4. One dispatcher, many transports; parity is tested, not promised.
-5. Standard library only; the supervisor of other people's agents should
-   not have a supply chain of its own.
+5. Use maintained dependencies for commodity protocols and utilities when
+   they replace concrete handwritten code. Lock and verify their dependency
+   graph; keep durable ownership and outcome guarantees explicit and tested.
