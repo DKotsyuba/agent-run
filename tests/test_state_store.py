@@ -256,11 +256,15 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_agents(), [])
 
     def test_unbound_request_id_is_globally_concurrent_and_exact(self) -> None:
+        """Concurrent replays stay single before and after notification binding."""
+
         request = self.request(request_id="shared-request")
         barrier = Barrier(2)
         database = self.root / "state.db"
 
-        def create_once():
+        def create_once() -> AgentCreation:
+            """Create or replay through one isolated thread-affine connection."""
+
             store = StateStore.open(database)
             try:
                 barrier.wait()
@@ -290,6 +294,22 @@ class StateStoreTests(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+        self.store.bind_orchestrator(
+            results[0].agent_id,
+            OrchestratorRef("codex_queue", "late-session", "turn-1"),
+            at=3,
+        )
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            replays = [
+                future.result()
+                for future in [pool.submit(create_once) for _ in range(2)]
+            ]
+        self.assertTrue(all(not replay.created for replay in replays))
+        self.assertEqual(
+            {replay.agent_id for replay in replays}, {results[0].agent_id}
+        )
+        self.assertEqual(len(self.store.list_agents()), 1)
         self.assertFalse(
             self.store.create_agent(
                 request, task_summary="summary", config_revision="cfg-1", at=3

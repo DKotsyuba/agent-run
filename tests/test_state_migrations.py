@@ -106,14 +106,15 @@ def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]
 
 
 def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
-    """Remove migrations 013 and 014 so a store looks genuinely pre-v13.
+    """Remove migrations 013 through 015 so a store looks genuinely pre-v13.
 
     The downgrade fixtures below start from the *current* schema and peel
-    later versions back off. ``parent_agent_id`` is covered by a partial
-    unique index, and SQLite refuses to drop an indexed column, so the index
-    goes first. ``connection`` is left uncommitted for the caller.
+    later versions back off. The post-v12 agent indexes must go before their
+    columns or version stamp are removed. ``connection`` is left uncommitted
+    for the caller.
     """
 
+    connection.execute("DROP INDEX idx_agents_request_id")
     connection.execute("DROP INDEX agents_parent_agent_id_unique")
     workflow_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(workflow_runs)")

@@ -292,35 +292,48 @@ def idempotent_agent(
     request_id: str,
     orchestrator: OrchestratorRef | None,
 ) -> sqlite3.Row | None:
-    """Return one replay within its exact orchestrator-session namespace.
+    """Return the earliest replay from the immutable request namespace.
 
-    ``None`` selects only rows without an orchestrator. A reference selects its
-    transport and external session; the mutable turn remains part of canonical
-    request comparison. The caller's
-    immediate transaction serializes the nullable namespace, whose SQLite
-    unique constraint alone cannot protect duplicate ``NULL`` values.
+    ``orchestrator`` identifies the original caller by transport and external
+    session; ``None`` is the shared unbound namespace. The later notification
+    binding in ``agents.orchestrator_session_id`` is deliberately ignored.
+    The request's mutable turn and every other semantic field remain subject to
+    the caller's full canonical JSON comparison. Malformed historical evidence
+    cannot establish a namespace and is skipped. The caller's immediate
+    transaction serializes lookup and insertion, including nullable namespaces.
     """
 
-    if orchestrator is None:
-        return connection.execute(
-            """SELECT id, request_json, task_summary, config_revision,
-                      parent_agent_id FROM agents
-               WHERE request_id = ? AND orchestrator_session_id IS NULL""",
-            (request_id,),
-        ).fetchone()
-    return connection.execute(
-        """SELECT a.id, a.request_json, a.task_summary, a.config_revision,
-                  a.parent_agent_id
-           FROM agents AS a
-           JOIN orchestrator_sessions AS s ON s.id = a.orchestrator_session_id
-           WHERE a.request_id = ? AND s.transport = ?
-             AND s.external_session_id = ?""",
-        (
-            request_id,
-            orchestrator.transport,
-            orchestrator.external_session_id,
-        ),
-    ).fetchone()
+    expected = (
+        None
+        if orchestrator is None
+        else (orchestrator.transport, orchestrator.external_session_id)
+    )
+    rows = connection.execute(
+        """SELECT id, request_json, task_summary, config_revision,
+                  parent_agent_id FROM agents
+           WHERE request_id = ? ORDER BY created_at, id""",
+        (request_id,),
+    )
+    for row in rows:
+        try:
+            payload = json.loads(row["request_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        original = payload.get("orchestrator")
+        if original is None:
+            namespace = None
+        elif isinstance(original, dict):
+            namespace = (
+                original.get("transport"),
+                original.get("external_session_id"),
+            )
+        else:
+            continue
+        if namespace == expected:
+            return row
+    return None
 
 
 def require_attempt(

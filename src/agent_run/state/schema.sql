@@ -56,6 +56,8 @@ CREATE TABLE agents (
 );
 CREATE UNIQUE INDEX agents_parent_agent_id_unique
   ON agents(parent_agent_id) WHERE parent_agent_id IS NOT NULL;
+CREATE INDEX idx_agents_request_id
+  ON agents(request_id) WHERE request_id IS NOT NULL;
 
 CREATE TABLE attempts (
   id TEXT PRIMARY KEY,
@@ -264,4 +266,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 14;
+PRAGMA user_version = 15;
