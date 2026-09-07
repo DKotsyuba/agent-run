@@ -9,7 +9,7 @@ from .reconciliation import (
     reconcile_reaped_agent,
     reconcile_reaped_supervisor,
     reconcile_workflow_runs,
-    workflow_owner_identity,
+    process_owner_identity,
 )
 from .store import AgentCreation, StateStore
 from .run_stats import backfill_run_stats, record_run_stats
@@ -32,5 +32,5 @@ __all__ = [
     "reconcile_workflow_runs",
     "record_run_stats",
     "step_key",
-    "workflow_owner_identity",
+    "process_owner_identity",
 ]

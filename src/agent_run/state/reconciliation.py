@@ -256,7 +256,7 @@ def reconcile_active_agents(
     return tuple(changed)
 
 
-def workflow_owner_identity(pid: int, identity: str) -> str:
+def process_owner_identity(pid: int, identity: str) -> str:
     """Return a workflow owner's PID plus diagnostic command text.
 
     The PID remains in the legacy text column for compatibility. Reconciliation

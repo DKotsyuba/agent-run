@@ -30,7 +30,7 @@ from .lifecycle import ReadyChannel, install_signal_handlers, restore_signal_han
 from .logging_setup import configure_logging
 from .paths import state_db_path
 from .process_identity import capture_process_birth
-from .state import step_key, workflow_owner_identity
+from .state import step_key, process_owner_identity
 from .state.db import nonblank
 from .state.store import StateStore
 from .supervisor import supervisor_identity
@@ -118,7 +118,7 @@ def runner_identity() -> str:
     suffix remains useful to operators and preserves the legacy row format.
     """
 
-    return workflow_owner_identity(os.getpid(), supervisor_identity())
+    return process_owner_identity(os.getpid(), supervisor_identity())
 
 
 def execute_plan(

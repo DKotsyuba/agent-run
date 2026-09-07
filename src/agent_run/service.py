@@ -46,7 +46,7 @@ from .resume import (
     replayed_resume,
 )
 from .start_coordinator import StartCoordinator
-from .state.reconciliation import workflow_owner_identity
+from .state.reconciliation import process_owner_identity
 from .supervisor import supervisor_identity
 from .state.store import StateStore
 
@@ -481,7 +481,7 @@ class AgentService:
             at=accepted_at,
         )
         try:
-            startup_owner = workflow_owner_identity(
+            startup_owner = process_owner_identity(
                 os.getpid(), supervisor_identity()
             )
             self._store.claim_startup(
