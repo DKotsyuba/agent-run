@@ -65,8 +65,18 @@ session ids, argv/environment values, and credentials are never persisted.
 
 One connection may send many requests; on a single connection they are
 answered in order. Open several connections for parallelism — dispatch is
-serialized server-side, so calls are cheap-interleaved, not truly parallel
-(`wait` methods are the exception, see below).
+serialized within two bounded owner lanes. Durable start/resume/cancel/steer
+admission uses the control lane; status, answer, model probing and other reads
+use a separate lane, so a slow read cannot starve cancellation. The server caps
+connections and queued calls, rejects overload with JSON-RPC code `-32001`, and
+returns `-32002` when its request deadline expires. Input frames remain limited
+to 1 MiB; idle reads and response writes also have finite deadlines.
+
+The socket path is fenced by a lifetime native file lock. A pre-existing socket
+is reclaimed only when connecting returns `ECONNREFUSED` and the inode is still
+the one inspected. A slow or malformed ping is never evidence that an owner is
+dead. Shutdown rejects submissions, resolves queued calls, closes active
+connections, and closes each thread-affine service in its owner context.
 
 ## Method surface
 
@@ -108,6 +118,13 @@ The page reports `total` (exact number of items available) and `complete`.
 Agent views returned by `status`, `list_agents`, and `summary` include
 `effort` — the reasoning effort requested at launch, or `null` when the
 request did not set one.
+
+Those views also include nullable `cleanup` evidence from the latest owned
+process cleanup observation: attempted `signals`, `scope`, `group_gone`,
+nullable `descendants_gone`, `confirmed`, and nullable `process_group_id`.
+Confirmation requires the original group and the readable pre-signal owned set
+to be gone. Page projections resolve progress, warnings, delivery evidence and
+cleanup in one batched state query.
 
 `capacity_order` takes no parameters. It returns fresh non-exhausted physical
 quota routes in descending priority, plus deferred evidence, exhausted

@@ -19,6 +19,67 @@ _logger = logging.getLogger("agent_run.state")
 DEFAULT_UNOWNED_STARTING_GRACE_SECONDS = 30.0
 
 
+def _fair_rows(
+    store: StateStore,
+    name: str,
+    select: str,
+    params: tuple[object, ...],
+    limit: int,
+) -> list[object]:
+    """Return and advance one persisted keyset window over ``select``.
+
+    ``select`` is an internal fixed SQL prefix ending in a complete WHERE
+    predicate over ``agents``; ``params`` binds that predicate. Rows are ordered
+    by ``created_at, id``, continue strictly after the stored cursor, then wrap
+    once to the beginning. Advancing to the last selected row makes live early
+    entries unable to starve later candidates across process restarts.
+    """
+
+    cursor = store.connection.execute(
+        "SELECT created_at, agent_id FROM reconciliation_cursors WHERE name = ?",
+        (name,),
+    ).fetchone()
+    suffix = " ORDER BY created_at, id LIMIT ?"
+    if cursor is None:
+        rows = list(store.connection.execute(select + suffix, (*params, limit)))
+    else:
+        created_at, agent_id = float(cursor["created_at"]), str(cursor["agent_id"])
+        rows = list(
+            store.connection.execute(
+                select
+                + " AND (created_at > ? OR (created_at = ? AND id > ?))"
+                + suffix,
+                (*params, created_at, created_at, agent_id, limit),
+            )
+        )
+        if len(rows) < limit:
+            rows.extend(
+                store.connection.execute(
+                    select
+                    + " AND (created_at < ? OR (created_at = ? AND id <= ?))"
+                    + suffix,
+                    (
+                        *params,
+                        created_at,
+                        created_at,
+                        agent_id,
+                        limit - len(rows),
+                    ),
+                )
+            )
+    if rows:
+        last = rows[-1]
+        with immediate(store.connection):
+            store.connection.execute(
+                """INSERT INTO reconciliation_cursors(name, created_at, agent_id)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     created_at = excluded.created_at, agent_id = excluded.agent_id""",
+                (name, float(last["created_at"]), str(last["id"])),
+            )
+    return rows
+
+
 def reconcile_reaped_agent(
     store: StateStore,
     agent_id: str | AgentId,
@@ -126,17 +187,17 @@ def reconcile_unowned_starting(
     checked_at = timestamp(at)
     cutoff = checked_at - float(grace_seconds)
     changed: list[AgentId] = []
-    rows = list(
-        store.connection.execute(
-            """SELECT id, startup_owner_pid_identity, startup_owner_birth_time,
-                      startup_deadline_at
-               FROM agents
-               WHERE status = ? AND supervisor_pid IS NULL
-                 AND process_group_id IS NULL AND supervisor_identity IS NULL
-                 AND (created_at <= ? OR startup_deadline_at <= ?)
-               ORDER BY created_at, id LIMIT ?""",
-            (AgentStatus.STARTING.value, cutoff, checked_at, limit),
-        )
+    rows = _fair_rows(
+        store,
+        "unowned_starting",
+        """SELECT id, created_at, startup_owner_pid_identity,
+                  startup_owner_birth_time, startup_deadline_at
+           FROM agents
+           WHERE status = ? AND supervisor_pid IS NULL
+             AND process_group_id IS NULL AND supervisor_identity IS NULL
+             AND (created_at <= ? OR startup_deadline_at <= ?)""",
+        (AgentStatus.STARTING.value, cutoff, checked_at),
+        limit,
     )
     for row in rows:
         agent_id = AgentId(str(row["id"]))
@@ -211,12 +272,14 @@ def reconcile_active_agents(
 
     statuses = tuple(sorted(status.value for status in ACTIVE))
     placeholders = ",".join("?" for _ in statuses)
-    rows = list(
-        store.connection.execute(
-            f"SELECT id, supervisor_pid, process_group_id, supervisor_identity, supervisor_birth_time FROM agents "
-            f"WHERE status IN ({placeholders}) ORDER BY created_at, id LIMIT ?",
-            (*statuses, remaining),
-        )
+    rows = _fair_rows(
+        store,
+        "active_supervisors",
+        f"""SELECT id, created_at, supervisor_pid, process_group_id,
+                   supervisor_identity, supervisor_birth_time FROM agents
+            WHERE status IN ({placeholders})""",
+        statuses,
+        remaining,
     )
     for row in rows:
         pid, pgid, expected, birth = row["supervisor_pid"], row["process_group_id"], row["supervisor_identity"], row["supervisor_birth_time"]

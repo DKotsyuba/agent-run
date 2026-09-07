@@ -413,6 +413,50 @@ class AgentServiceTests(unittest.TestCase):
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
 
+    def test_list_projection_is_batched_and_exposes_cleanup_evidence(self) -> None:
+        """One page uses fixed SQL count and returns validated cleanup evidence."""
+
+        agent_ids = [
+            self.store.create_agent(
+                replace(
+                    self.request(request_id=f"projection-{index}"),
+                    timeout_seconds=480,
+                ),
+                task_summary=f"agent {index}",
+                config_revision="cfg-1",
+                at=index,
+            ).agent_id
+            for index in range(25)
+        ]
+        self.store.append_event(
+            agent_ids[-1],
+            "process_cleanup",
+            data={
+                "signals": ["SIGTERM", "SIGKILL"],
+                "scope": "verified_descendants",
+                "group_gone": True,
+                "descendants_gone": True,
+                "confirmed": True,
+                "process_group_id": 123,
+            },
+            at=30,
+        )
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            page = self.service.list(AgentQuery(limit=100))
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        selects = [statement for statement in statements if statement.startswith("SELECT") or statement.startswith("WITH")]
+        self.assertLessEqual(len(selects), 3)
+        self.assertEqual(page.total, 25)
+        cleanup = next(
+            item.cleanup for item in page.items if item.agent_id == agent_ids[-1]
+        )
+        self.assertEqual(cleanup.scope, "verified_descendants")
+        self.assertTrue(cleanup.confirmed)
+
     def test_post_tool_binding_survives_fresh_service_replay(self) -> None:
         """Late notification binding must not change the original replay namespace."""
 

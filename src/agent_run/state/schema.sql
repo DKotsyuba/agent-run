@@ -155,6 +155,12 @@ CREATE TABLE context_receipts (
   injected_at REAL NOT NULL
 );
 
+CREATE TABLE reconciliation_cursors (
+  name TEXT PRIMARY KEY,
+  created_at REAL NOT NULL,
+  agent_id TEXT NOT NULL
+);
+
 CREATE TABLE workflow_runs (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -266,4 +272,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 15;
+PRAGMA user_version = 16;

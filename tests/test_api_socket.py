@@ -11,6 +11,7 @@ from pathlib import Path
 from agent_run.api_socket import ApiServer, MAX_LINE_BYTES, METHOD_NAMES
 from agent_run.domain import AgentStatus
 from agent_run.dispatch import TOOL_NAMES, TOOLS
+from agent_run.errors import ValidationError
 
 
 class StubService:
@@ -88,12 +89,14 @@ class ApiSocketTests(unittest.TestCase):
         self.path.unlink(missing_ok=True)
         self.tempdir.cleanup()
 
-    def replace_server(self, factory):
+    def replace_server(self, factory, **options):
+        """Replace the active server with ``factory`` and constructor options."""
+
         self.server.shutdown()
         self.thread.join(timeout=2)
         self.server.server_close()
         self.path.unlink(missing_ok=True)
-        self.server = ApiServer(self.path, factory)
+        self.server = ApiServer(self.path, factory, **options)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
@@ -140,6 +143,60 @@ class ApiSocketTests(unittest.TestCase):
             client.sendall(b"{" + b"x" * MAX_LINE_BYTES + b"}\n")
             response = json.loads(client.makefile("rb").readline())
         self.assertEqual(response["error"]["code"], -32700)
+
+    def test_partial_frame_hits_idle_deadline_and_releases_connection(self) -> None:
+        """A client without a newline cannot retain a handler indefinitely."""
+
+        self.replace_server(lambda: StubService(), idle_timeout=0.05)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1)
+            client.connect(str(self.path))
+            client.sendall(b'{"jsonrpc":"2.0"')
+            self.assertEqual(client.recv(1), b"")
+
+    def test_connection_limit_returns_explicit_overload(self) -> None:
+        """A partial first client makes the bounded second slot reject clearly."""
+
+        self.replace_server(
+            lambda: StubService(), max_connections=1, idle_timeout=1
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as blocked:
+            blocked.connect(str(self.path))
+            blocked.sendall(b"{")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(1)
+                client.connect(str(self.path))
+                response = json.loads(client.makefile("rb").readline())
+        self.assertEqual(response["error"]["code"], -32001)
+
+    def test_live_slow_socket_is_never_reclaimed_as_stale(self) -> None:
+        """A successful connect proves ownership even when no ping reply arrives."""
+
+        path = Path(self.tempdir.name) / "slow-owner.sock"
+        owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        owner.bind(str(path))
+        owner.listen()
+        accepted = threading.Event()
+
+        def hold_connection() -> None:
+            """Accept the ownership probe and deliberately send no response."""
+
+            connection, _ = owner.accept()
+            accepted.set()
+            with connection:
+                time.sleep(0.2)
+
+        worker = threading.Thread(target=hold_connection, daemon=True)
+        worker.start()
+        try:
+            with self.assertRaisesRegex(ValidationError, "already in use"):
+                ApiServer(path, lambda: StubService())
+            self.assertTrue(accepted.wait(1))
+            self.assertTrue(path.exists())
+        finally:
+            owner.close()
+            worker.join(timeout=1)
+            path.unlink(missing_ok=True)
 
     def test_connections_have_isolated_sessions(self):
         def exchange(lines):
@@ -252,6 +309,145 @@ class ApiSocketTests(unittest.TestCase):
         self.assertLess(time.monotonic() - began, 0.5)
         waiter.join(timeout=2)
         self.assertTrue(pending["response"]["result"]["timed_out"])
+
+    def test_request_deadline_and_queue_overload_are_explicit(self) -> None:
+        """One running and one queued read bound waiting time and capacity."""
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SlowService(StubService):
+            """Hold every limits call until the test releases the read lane."""
+
+            def limits(self):
+                """Expose one deterministic slow read request."""
+
+                entered.set()
+                release.wait(2)
+                return {"ok": True}
+
+        service = SlowService()
+        self.replace_server(
+            lambda: service, max_pending_requests=1, request_timeout=0.15
+        )
+        responses: list[dict] = []
+
+        def request_limits(request_id: int) -> None:
+            """Record one limits response from a separate connection."""
+
+            responses.append(
+                self.request(
+                    {"jsonrpc": "2.0", "id": request_id, "method": "limits"}
+                )
+            )
+
+        first = threading.Thread(target=request_limits, args=(1,))
+        second = threading.Thread(target=request_limits, args=(2,))
+        first.start()
+        self.assertTrue(entered.wait(1))
+        second.start()
+        deadline = time.monotonic() + 1
+        while self.server._dispatchers[1]._queue.qsize() != 1:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        overloaded = self.request(
+            {"jsonrpc": "2.0", "id": 3, "method": "limits"}
+        )
+        self.assertEqual(overloaded["error"]["code"], -32001)
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertEqual(
+            sorted(response["error"]["code"] for response in responses),
+            [-32002, -32002],
+        )
+        release.set()
+
+    def test_slow_models_lane_does_not_delay_durable_cancel(self) -> None:
+        """Cancel stays responsive while model probing occupies the read owner."""
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class LaneService(StubService):
+            """Expose one slow read and one fast durable control operation."""
+
+            def models(self):
+                """Block model discovery until the latency sample completes."""
+
+                entered.set()
+                release.wait(2)
+                return {}
+
+            def cancel(self, agent_id):
+                """Return an immediate cancellation projection for the agent."""
+
+                return {"agent_id": agent_id, "status": "cancelling"}
+
+        service = LaneService()
+        self.replace_server(lambda: service, request_timeout=2)
+        model_response: list[dict] = []
+        model_worker = threading.Thread(
+            target=lambda: model_response.append(
+                self.request({"jsonrpc": "2.0", "id": 1, "method": "models"})
+            )
+        )
+        model_worker.start()
+        self.assertTrue(entered.wait(1))
+        durations = []
+        for request_id in range(2, 22):
+            started = time.monotonic()
+            response = self.request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "cancel",
+                    "params": {"agent_id": "ag-20260826-120000-0123456789"},
+                }
+            )
+            durations.append(time.monotonic() - started)
+            self.assertEqual(response["result"]["status"], "cancelling")
+        p95 = sorted(durations)[18]
+        self.assertLess(p95, 1.0)
+        release.set()
+        model_worker.join(timeout=2)
+        self.assertEqual(model_response[0]["result"], {})
+
+    def test_shutdown_closes_each_owner_service_once_in_its_thread(self) -> None:
+        """Shutdown closes both thread-affine services exactly once."""
+
+        services = []
+
+        class ClosingService(StubService):
+            """Record construction and close ownership for one dispatcher lane."""
+
+            def __init__(self) -> None:
+                """Capture the dispatcher thread that owns this service."""
+
+                super().__init__()
+                self.created_in = threading.get_ident()
+                self.closed_in: list[int] = []
+
+            def close(self) -> None:
+                """Record the sole owner-context close call."""
+
+                self.closed_in.append(threading.get_ident())
+
+        def factory() -> ClosingService:
+            """Create and retain one distinct lane service."""
+
+            service = ClosingService()
+            services.append(service)
+            return service
+
+        self.replace_server(factory)
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+
+        self.assertEqual(len(services), 2)
+        self.assertTrue(
+            all(service.closed_in == [service.created_in] for service in services)
+        )
 
     def test_all_dispatch_runs_on_the_service_owning_thread(self):
         # SQLite connections are thread-affine: every tool call must execute

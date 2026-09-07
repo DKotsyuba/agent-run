@@ -106,7 +106,7 @@ def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]
 
 
 def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
-    """Remove migrations 013 through 015 so a store looks genuinely pre-v13.
+    """Remove migrations 013 through 016 so a store looks genuinely pre-v13.
 
     The downgrade fixtures below start from the *current* schema and peel
     later versions back off. The post-v12 agent indexes must go before their
@@ -114,6 +114,7 @@ def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
     for the caller.
     """
 
+    connection.execute("DROP TABLE reconciliation_cursors")
     connection.execute("DROP INDEX idx_agents_request_id")
     connection.execute("DROP INDEX agents_parent_agent_id_unique")
     workflow_columns = {

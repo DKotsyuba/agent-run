@@ -427,6 +427,77 @@ class StateStore:
         )
         return [dict(row) for row in rows]
 
+    def agent_projection(
+        self, agent_ids: Iterable[str | AgentId]
+    ) -> dict[str, dict[str, object]]:
+        """Return batched read metadata for the exact distinct ``agent_ids``.
+
+        Progress time, deadline warning, latest delivery and attempt evidence,
+        and latest process-cleanup event are resolved in one SQL statement.
+        Input order is irrelevant; unknown IDs are omitted, duplicates collapse,
+        and an empty iterable performs no query. Stored JSON remains raw for the
+        service boundary to validate into its public typed views.
+        """
+
+        selected = tuple(dict.fromkeys(str(validate_agent_id(value)) for value in agent_ids))
+        if not selected:
+            return {}
+        values = ",".join("(?)" for _ in selected)
+        rows = self.connection.execute(
+            f"""WITH selected(id) AS (VALUES {values}),
+                progress AS (
+                    SELECT agent_id, MAX(at) AS last_progress_at
+                    FROM messages WHERE agent_id IN (SELECT id FROM selected)
+                    GROUP BY agent_id
+                ), warnings AS (
+                    SELECT DISTINCT agent_id, 1 AS deadline_warned
+                    FROM events WHERE agent_id IN (SELECT id FROM selected)
+                      AND kind = 'deadline_warning'
+                ), delivery_seq AS (
+                    SELECT agent_id, MAX(terminal_event_seq) AS terminal_event_seq
+                    FROM deliveries WHERE agent_id IN (SELECT id FROM selected)
+                    GROUP BY agent_id
+                ), latest_delivery AS (
+                    SELECT deliveries.* FROM deliveries
+                    JOIN delivery_seq USING (agent_id, terminal_event_seq)
+                ), evidence_attempt AS (
+                    SELECT delivery_id, MAX(attempt) AS attempt
+                    FROM delivery_attempt_evidence
+                    WHERE delivery_id IN (SELECT id FROM latest_delivery)
+                    GROUP BY delivery_id
+                ), latest_evidence AS (
+                    SELECT evidence.delivery_id, evidence.evidence_json
+                    FROM delivery_attempt_evidence AS evidence
+                    JOIN evidence_attempt USING (delivery_id, attempt)
+                ), cleanup_seq AS (
+                    SELECT agent_id, MAX(seq) AS seq
+                    FROM events WHERE agent_id IN (SELECT id FROM selected)
+                      AND kind = 'process_cleanup'
+                    GROUP BY agent_id
+                ), latest_cleanup AS (
+                    SELECT events.agent_id, events.data_json AS cleanup_json
+                    FROM events JOIN cleanup_seq USING (agent_id, seq)
+                )
+                SELECT selected.id, progress.last_progress_at,
+                       COALESCE(warnings.deadline_warned, 0) AS deadline_warned,
+                       latest_delivery.id AS delivery_id,
+                       latest_delivery.state AS delivery_state,
+                       latest_delivery.attempts AS delivery_attempts,
+                       latest_delivery.ambiguous_result AS delivery_ambiguous,
+                       latest_delivery.last_error AS delivery_last_error,
+                       latest_evidence.evidence_json,
+                       latest_cleanup.cleanup_json
+                FROM selected
+                LEFT JOIN progress ON progress.agent_id = selected.id
+                LEFT JOIN warnings ON warnings.agent_id = selected.id
+                LEFT JOIN latest_delivery ON latest_delivery.agent_id = selected.id
+                LEFT JOIN latest_evidence
+                  ON latest_evidence.delivery_id = latest_delivery.id
+                LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id""",
+            selected,
+        )
+        return {str(row["id"]): dict(row) for row in rows}
+
     def active_count(self) -> int:
         values = tuple(status.value for status in ACTIVE)
         return count_agents(self.connection, values)
@@ -974,7 +1045,9 @@ class StateStore:
             agent_row(self.connection, agent_id)
             row = self.connection.execute(
                 """SELECT * FROM commands
-                   WHERE agent_id = ? AND state = 'pending' ORDER BY id LIMIT 1""",
+                   WHERE agent_id = ? AND state = 'pending'
+                   ORDER BY CASE kind WHEN 'cancel' THEN 0 ELSE 1 END, id
+                   LIMIT 1""",
                 (agent_id,),
             ).fetchone()
             if row is None:

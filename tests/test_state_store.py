@@ -679,6 +679,19 @@ class StateStoreTests(unittest.TestCase):
         self.store.complete_command(first_command, first, {"ok": True}, at=7)
         self.assertEqual(self.store.claim_command(first, at=8)["id"], second_command)
 
+    def test_cancel_is_claimed_before_an_older_steer_backlog(self) -> None:
+        """Durable cancellation takes priority while other commands remain FIFO."""
+
+        agent_id = self.create()
+        steer_ids = [
+            self.store.enqueue_command(agent_id, "steer", {"index": index}, at=index)
+            for index in range(20)
+        ]
+        cancel_id = self.store.enqueue_command(agent_id, "cancel", {}, at=21)
+
+        self.assertEqual(self.store.claim_command(agent_id, at=22)["id"], cancel_id)
+        self.assertEqual(self.store.claim_command(agent_id, at=23)["id"], steer_ids[0])
+
     def test_message_storage_stores_small_content_inline_and_spools_oversized_content(
         self,
     ) -> None:

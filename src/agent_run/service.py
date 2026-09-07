@@ -121,6 +121,25 @@ class DeliveryView:
 
 
 @dataclass(frozen=True, slots=True)
+class CleanupView:
+    """Latest bounded evidence that an agent's owned processes were cleaned up.
+
+    ``signals`` names attempted cleanup signals and ``scope`` whether observation
+    covered a process group or verified descendants. ``descendants_gone`` is
+    absent when that set was unavailable. ``confirmed`` is true only when the
+    original group and every readable pre-signal owned descendant were observed
+    gone; ``process_group_id`` is diagnostic and may be unavailable.
+    """
+
+    signals: tuple[str, ...]
+    scope: str
+    group_gone: bool
+    descendants_gone: bool | None
+    confirmed: bool
+    process_group_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentView:
     """One agent's read-only status, plus its place in a resume chain.
 
@@ -152,6 +171,7 @@ class AgentView:
     parent_agent_id: AgentId | None = None
     root_agent_id: AgentId | None = None
     sequence: int = 1
+    cleanup: CleanupView | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -868,7 +888,14 @@ class AgentService:
         bounded = _page_limit(limit)
         rows = self._store.resume_chain(agent_id, cursor=start, limit=bounded)
         now = self._now()
-        items = tuple(self._agent_view(row, now) for row in rows[:bounded])
+        selected = rows[:bounded]
+        projection = self._store.agent_projection(
+            str(row["id"]) for row in selected
+        )
+        items = tuple(
+            self._agent_view(row, now, projection[str(row["id"])])
+            for row in selected
+        )
         next_cursor = (
             int(rows[bounded]["sequence"]) if len(rows) > bounded else None
         )
@@ -888,7 +915,9 @@ class AgentService:
 
     def get(self, agent_id: str | AgentId) -> AgentView:
         _logger.debug("status agent_id=%s", agent_id)
-        return self._agent_view(self._store.get_agent(agent_id), self._now())
+        row = self._store.get_agent(agent_id)
+        projection = self._store.agent_projection((str(row["id"]),))
+        return self._agent_view(row, self._now(), projection[str(row["id"])])
 
     def list(self, query: AgentQuery = AgentQuery()) -> AgentPage:
         if not isinstance(query, AgentQuery):
@@ -908,7 +937,11 @@ class AgentService:
             offset=query.offset,
         )
         total = self._count_agents(statuses, session_id)
-        items = tuple(self._agent_view(row, self._now()) for row in rows)
+        projection = self._store.agent_projection(str(row["id"]) for row in rows)
+        now = self._now()
+        items = tuple(
+            self._agent_view(row, now, projection[str(row["id"])]) for row in rows
+        )
         consumed = query.offset + len(items)
         complete = consumed >= total
         return AgentPage(
@@ -1222,20 +1255,25 @@ class AgentService:
         ).fetchone()
         return int(row["total"])
 
-    def _agent_view(self, row: Mapping[str, object], now: float) -> AgentView:
+    def _agent_view(
+        self,
+        row: Mapping[str, object],
+        now: float,
+        projection: Mapping[str, object],
+    ) -> AgentView:
+        """Build one public view from an agent row and batched projection row."""
+
         agent_id = validate_agent_id(str(row["id"]))
         status = AgentStatus(str(row["status"]))
         created_at = float(row["created_at"])
         started_at = None if row["started_at"] is None else float(row["started_at"])
         finished_at = None if row["finished_at"] is None else float(row["finished_at"])
-        progress_row = self._store.connection.execute(
-            "SELECT MAX(at) AS at FROM messages WHERE agent_id = ?", (agent_id,)
-        ).fetchone()
-        progress = None if progress_row["at"] is None else float(progress_row["at"])
-        warned = bool(row["warned"]) or self._store.connection.execute(
-            "SELECT 1 FROM events WHERE agent_id = ? AND kind = 'deadline_warning' LIMIT 1",
-            (agent_id,),
-        ).fetchone() is not None
+        progress = (
+            None
+            if projection["last_progress_at"] is None
+            else float(projection["last_progress_at"])
+        )
+        warned = bool(row["warned"]) or bool(projection["deadline_warned"])
         silence = (
             None
             if row["silent_seconds"] is None
@@ -1250,6 +1288,7 @@ class AgentService:
         answer_sha = (
             None if row["answer_sha256"] is None else str(row["answer_sha256"])
         )
+        cleanup = self._cleanup_view(projection["cleanup_json"])
         return AgentView(
             agent_id,
             str(row["runtime"]),
@@ -1275,37 +1314,98 @@ class AgentService:
                 None
                 if row["orchestrator_session_id"] is None
                 else str(row["orchestrator_session_id"]),
+                projection,
             ),
             None
             if row["parent_agent_id"] is None
             else AgentId(str(row["parent_agent_id"])),
             AgentId(str(row["root_agent_id"] or agent_id)),
             int(row["sequence"]),
+            cleanup,
         )
 
     def _delivery_view(
-        self, agent_id: AgentId, session_id: str | None
+        self,
+        agent_id: AgentId,
+        session_id: str | None,
+        projection: Mapping[str, object] | None = None,
     ) -> DeliveryView:
-        row = self._store.connection.execute(
-            """SELECT id, state, attempts, ambiguous_result, last_error
-               FROM deliveries WHERE agent_id = ?
-               ORDER BY terminal_event_seq DESC LIMIT 1""",
-            (agent_id,),
-        ).fetchone()
-        if row is None:
+        """Build delivery state from a supplied or single-agent projection."""
+
+        if projection is None:
+            projection = self._store.agent_projection((agent_id,))[str(agent_id)]
+        if projection["delivery_id"] is None:
             return DeliveryView(
                 agent_id, session_id is not None, session_id, None,
                 "not_created", 0, False, None, None,
             )
-        last_attempt = self._store.latest_delivery_attempt(str(row["id"]))
+        evidence_json = projection["evidence_json"]
+        last_attempt = None
+        if evidence_json is not None:
+            try:
+                evidence = json.loads(str(evidence_json))
+            except ValueError as error:
+                raise ValidationError("invalid stored delivery attempt evidence") from error
+            last_attempt = DeliveryAttemptEvidence.from_payload(evidence)
         return DeliveryView(
             agent_id,
             session_id is not None,
             session_id,
-            str(row["id"]),
-            str(row["state"]),
-            int(row["attempts"]),
-            bool(row["ambiguous_result"]),
-            None if row["last_error"] is None else str(row["last_error"]),
+            str(projection["delivery_id"]),
+            str(projection["delivery_state"]),
+            int(projection["delivery_attempts"]),
+            bool(projection["delivery_ambiguous"]),
+            None
+            if projection["delivery_last_error"] is None
+            else str(projection["delivery_last_error"]),
             last_attempt,
+        )
+
+    @staticmethod
+    def _cleanup_view(value: object) -> CleanupView | None:
+        """Validate one latest process-cleanup JSON value into a public view."""
+
+        if value is None:
+            return None
+        try:
+            payload = json.loads(str(value))
+        except ValueError as error:
+            raise ValidationError("invalid stored process cleanup evidence") from error
+        expected = {
+            "signals",
+            "scope",
+            "group_gone",
+            "descendants_gone",
+            "confirmed",
+            "process_group_id",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValidationError("invalid stored process cleanup evidence")
+        if payload["scope"] not in {"process_group", "verified_descendants"}:
+            raise ValidationError("invalid stored process cleanup evidence")
+        if (
+            not isinstance(payload["signals"], list)
+            or any(not isinstance(signal, str) for signal in payload["signals"])
+            or type(payload["group_gone"]) is not bool
+            or type(payload["confirmed"]) is not bool
+            or (
+                payload["descendants_gone"] is not None
+                and type(payload["descendants_gone"]) is not bool
+            )
+            or (
+                payload["process_group_id"] is not None
+                and (
+                    type(payload["process_group_id"]) is not int
+                    or payload["process_group_id"] <= 0
+                )
+            )
+        ):
+            raise ValidationError("invalid stored process cleanup evidence")
+        return CleanupView(
+            tuple(payload["signals"]),
+            str(payload["scope"]),
+            payload["group_gone"],
+            payload["descendants_gone"],
+            payload["confirmed"],
+            payload["process_group_id"],
         )

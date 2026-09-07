@@ -121,6 +121,17 @@ class BrokerClientTests(unittest.TestCase):
         with self.assertRaisesRegex(BrokerUnavailable, "agent-run broker is not running"):
             BrokerClient(self.path).call("limits")
 
+    def test_invalid_deadlines_are_rejected_before_socket_creation(self) -> None:
+        """Nonpositive and nonfinite client deadlines never reach transport."""
+
+        for value in (0, -1, True, "1", float("inf"), float("nan")):
+            with self.subTest(value=value), patch(
+                "agent_run.broker_client.socket.socket"
+            ) as socket_factory:
+                with self.assertRaisesRegex(ValidationError, "positive and finite"):
+                    BrokerClient(self.path).call("limits", timeout=value)
+                socket_factory.assert_not_called()
+
     def test_validation_error_mapping(self):
         server = FakeSocketApi(self.path, lambda request: {
             "jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "bad params"}

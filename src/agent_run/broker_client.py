@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 from dataclasses import asdict
@@ -113,6 +114,8 @@ class BrokerClient:
             sock.close()
 
     def _request(self, method: str, params: dict | None, timeout: float) -> object:
+        """Send one bounded frame and validate its matching response envelope."""
+
         if self._socket is None or self._stream is None:
             self._connect(timeout)
         request_id = self._next_id
@@ -137,6 +140,8 @@ class BrokerClient:
             raise ConnectionError("broker returned invalid JSON") from error
         if not isinstance(response, dict):
             raise ConnectionError("broker returned an invalid response")
+        if response.get("id") != request_id:
+            raise ConnectionError("broker returned a mismatched response id")
         if "error" in response:
             error = response["error"]
             if not isinstance(error, dict):
@@ -158,11 +163,26 @@ class BrokerClient:
         return response["result"]
 
     def call(self, method: str, params: dict | None = None, timeout: float = _DEFAULT_TIMEOUT) -> object:
-        """Forward one API request, retrying once after a connection failure."""
+        """Forward one API request within a positive finite response deadline.
+
+        ``method`` is nonblank, ``params`` is an optional object, and ``timeout``
+        bounds connect, write, and response reads for each of at most two
+        connection attempts. Validation errors are never retried; transport
+        exhaustion raises :class:`BrokerUnavailable`.
+        """
+
         if not isinstance(method, str) or not method:
             raise ValidationError("method must be a nonblank string")
         if params is not None and not isinstance(params, dict):
             raise ValidationError("params must be an object or null")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValidationError("timeout must be positive and finite")
+        timeout = float(timeout)
         for attempt in range(2):
             try:
                 return self._request(method, params, timeout)
@@ -175,6 +195,8 @@ class BrokerClient:
                 raise BrokerUnavailable(_BROKER_MESSAGE)
 
     def ping(self) -> bool:
+        """Return whether the broker answered the protocol ping."""
+
         return self.call("ping") == {"ok": True}
 
     def start(self, request: StartRequest) -> SimpleNamespace:
