@@ -124,17 +124,8 @@ def test_agent_service_resolve_account_validates_defaults_and_overrides() -> Non
             raise AssertionError("account accepted for runtime without accounts")
 
 
-def test_tools_table_and_mcp_tools_list_are_exactly_pinned() -> None:
-    """Keep all twenty-one shared tools identical through MCP discovery."""
+def test_tools_table_is_exactly_pinned() -> None:
+    """Keep all twenty-one transport-neutral shared tools in the one dispatch table."""
 
     assert len(TOOLS) == 21
     assert TOOL_NAMES == frozenset(tool["name"] for tool in TOOLS)
-
-    output = StringIO()
-    assert serve(
-        _Broker(_Service()),
-        StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"),
-        output,
-    ) == 0
-    response = json.loads(output.getvalue())
-    assert response["result"]["tools"] == list(TOOLS)

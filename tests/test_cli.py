@@ -988,7 +988,17 @@ target = "auth.json"
 
     def test_mcp_uses_injected_stdio_for_initialize_and_tools_list(self):
         requests = (
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         )
         stdin = io.StringIO("".join(json.dumps(request) + "\n" for request in requests))

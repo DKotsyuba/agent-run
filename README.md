@@ -189,7 +189,10 @@ or credentials; non-queue deliveries report `null`.
 
 ## Use as an MCP server
 
-`agent-run mcp` is a thin stdio proxy over the resident Unix-socket daemon.
+`agent-run mcp` is an official MCP SDK stdio server over the resident Unix-socket
+daemon. The SDK owns protocol negotiation, request parsing, cancellation, and
+EOF lifecycle; each tool callback opens its own broker client, so an MCP client
+disconnect never cancels an already admitted durable agent run.
 Start the daemon in the foreground with `agent-run api serve`; MCP requires it
 to be running and reports `BrokerUnavailable` when it is down. The one-shot
 CLI `start` command uses the same resident path for lifecycle safety.

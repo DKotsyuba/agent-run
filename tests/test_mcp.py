@@ -1,112 +1,125 @@
-import json
-import tempfile
+"""Integration coverage for the official MCP SDK stdio transport."""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
 import unittest
-from io import StringIO
 from pathlib import Path
-from unittest import mock
 
-from agent_run.broker_client import BrokerClient
-from agent_run.dispatch import TOOLS
-from agent_run.errors import AgentRunError, BrokerUnavailable, ValidationError
-from agent_run.mcp import MAX_LINE_BYTES, serve
+import anyio
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
-
-class FakeBroker:
-    def __init__(self, result=None, error=None) -> None:
-        self.calls = []
-        self.result = result if result is not None else {"ok": True}
-        self.error = error
-
-    def call(self, method, params=None, timeout=600):
-        self.calls.append((method, params))
-        if self.error is not None:
-            raise self.error
-        return self.result
+from agent_run.mcp import _call_tool
 
 
-class McpTests(unittest.TestCase):
-    def run_server(self, lines, broker=None):
-        source = StringIO("".join(
-            line if isinstance(line, str) else json.dumps(line) + "\n"
-            for line in lines
-        ))
-        output = StringIO()
-        selected = broker or FakeBroker()
-        self.assertEqual(serve(selected, source, output), 0)
-        responses = [json.loads(line) for line in output.getvalue().splitlines()]
-        return selected, responses
+_ROOT = Path(__file__).resolve().parents[1]
+_SERVER = """
+from agent_run.errors import AgentRunError
+from agent_run.mcp import serve
 
-    def test_initialize_and_tools_list_are_local_without_broker(self) -> None:
-        _, responses = self.run_server(
-            [
-                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "test-version"}},
-                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-            ],
-            broker=None,
-        )
-        self.assertEqual(len(responses), 2)
-        self.assertEqual(responses[0]["result"]["protocolVersion"], "test-version")
-        self.assertEqual(responses[0]["result"]["capabilities"], {"tools": {"listChanged": False}})
-        self.assertEqual(responses[1]["result"]["tools"], list(TOOLS))
+class Broker:
+    \"\"\"Controlled resident-broker fixture for one SDK stdio process.\"\"\"
 
-    def test_tools_call_forwards_name_and_arguments_verbatim(self) -> None:
-        broker = FakeBroker({"answer": 42})
-        arguments = {"agent_id": "ag-1", "nested": {"items": [1, True]}}
-        _, responses = self.run_server([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "limits", "arguments": arguments, "_meta": {"x": 1}}},
-        ], broker)
-        self.assertEqual(broker.calls, [("limits", arguments)])
-        self.assertEqual(responses[0]["result"], {
-            "content": [{"type": "text", "text": "result in structuredContent"}],
-            "structuredContent": {"answer": 42},
-            "isError": False,
-        })
+    def call(self, method, params=None, timeout=600.0):
+        \"\"\"Return one deterministic result or one typed domain failure.\"\"\"
+        if method == "limits":
+            raise AgentRunError("controlled broker failure")
+        return {"method": method, "arguments": params or {}}
 
-    def test_broker_validation_error_uses_mcp_error_envelope(self) -> None:
-        _, responses = self.run_server(
-            [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "status", "arguments": {}}}],
-            FakeBroker(error=ValidationError("missing arguments: ['agent_id']")),
-        )
-        result = responses[0]["result"]
-        self.assertTrue(result["isError"])
-        self.assertEqual(result["structuredContent"]["error"], {
-            "code": "ValidationError", "message": "missing arguments: ['agent_id']"
-        })
-
-    def test_broker_down_is_tool_error_but_tools_list_still_works(self) -> None:
-        broker = FakeBroker(error=BrokerUnavailable(
-            "agent-run broker is not running; start it with `agent-run api serve` or its launchd job (agent-run doc service)"
-        ))
-        _, responses = self.run_server([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "limits", "arguments": {}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        ], broker)
-        self.assertTrue(responses[0]["result"]["isError"])
-        self.assertIn("agent-run broker is not running", responses[0]["result"]["structuredContent"]["error"]["message"])
-        self.assertFalse("error" in responses[1])
-        self.assertEqual(responses[1]["result"]["tools"], list(TOOLS))
-
-    def test_unknown_tool_is_rejected_before_broker_call(self) -> None:
-        broker = FakeBroker()
-        _, responses = self.run_server([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "not-a-tool", "arguments": {}}},
-        ], broker)
-        self.assertEqual(broker.calls, [])
-        self.assertEqual(responses[0]["result"]["structuredContent"]["error"]["code"], "unknown_tool")
-
-    def test_protocol_errors_and_size_limit_remain_bounded(self) -> None:
-        oversized = "x" * (MAX_LINE_BYTES + 1) + "\n"
-        broker, responses = self.run_server([
-            "{bad json\n",
-            oversized,
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": []},
-        ])
-        self.assertEqual([response["error"]["code"] for response in responses], [-32700, -32700, -32602])
-        self.assertEqual(broker.calls, [])
+serve(lambda: Broker())
+"""
 
 
+class McpSdkTests(unittest.TestCase):
+    """Exercise a real official MCP client against the official SDK stdio server."""
 
+    def test_official_client_negotiates_lists_and_calls_over_stdio(self) -> None:
+        """Verify the SDK owns handshake and wire parsing while the broker stays thin."""
 
-if __name__ == "__main__":
-    unittest.main()
+        async def exercise() -> None:
+            """Connect one official client and assert discovery plus structured tool output."""
+            environment = {**os.environ, "PYTHONPATH": str(_ROOT / "src")}
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-c", _SERVER],
+                env=environment,
+                cwd=_ROOT,
+            )
+            with anyio.fail_after(10):
+                async with stdio_client(parameters) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        initialized = await session.initialize()
+                        self.assertEqual(initialized.server_info.name, "agent-run")
+                        tools = await session.list_tools()
+                        self.assertIn("models", {tool.name for tool in tools.tools})
+                        result = await session.call_tool(
+                            "models", {"orchestrator": {"id": "root", "name": "root"}}
+                        )
+            self.assertFalse(result.is_error)
+            self.assertEqual(result.structured_content["method"], "models")
+            self.assertEqual(
+                result.structured_content["arguments"]["orchestrator"]["id"], "root"
+            )
+
+        anyio.run(exercise)
+
+    def test_domain_error_is_an_official_tool_error_result(self) -> None:
+        """Keep broker domain failures in MCP tool results instead of raw JSON-RPC errors."""
+
+        async def exercise() -> None:
+            """Call the controlled failing broker method through the official SDK client."""
+            environment = {**os.environ, "PYTHONPATH": str(_ROOT / "src")}
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-c", _SERVER],
+                env=environment,
+                cwd=_ROOT,
+            )
+            with anyio.fail_after(10):
+                async with stdio_client(parameters) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        result = await session.call_tool("limits")
+            self.assertTrue(result.is_error)
+            self.assertEqual(result.structured_content["error"]["message"], "controlled broker failure")
+
+        anyio.run(exercise)
+
+    def test_cancelled_caller_does_not_cancel_admitted_broker_call(self) -> None:
+        """Release the MCP wait while the callback-owned durable broker call completes."""
+
+        class BlockingBroker:
+            """Controlled broker whose accepted call finishes only after test release."""
+
+            def __init__(self, entered: threading.Event, release: threading.Event, done: threading.Event) -> None:
+                """Store the synchronization events owned by the enclosing test."""
+                self.entered = entered
+                self.release = release
+                self.done = done
+
+            def call(self, method: str, params: dict | None = None, timeout: float = 600.0) -> object:
+                """Wait for release, then report the durable call result without cancellation."""
+                self.entered.set()
+                if not self.release.wait(timeout=2):
+                    raise TimeoutError("test did not release the admitted broker call")
+                self.done.set()
+                return {"method": method, "arguments": params or {}}
+
+        async def exercise() -> None:
+            """Cancel the caller wait, then prove its abandoned worker still finishes."""
+            entered = threading.Event()
+            release = threading.Event()
+            done = threading.Event()
+            with anyio.move_on_after(0.1) as scope:
+                await _call_tool(
+                    lambda: BlockingBroker(entered, release, done), "models", {}
+                )
+            self.assertTrue(scope.cancel_called)
+            self.assertTrue(entered.is_set())
+            release.set()
+            self.assertTrue(await anyio.to_thread.run_sync(done.wait, 2))
+
+        anyio.run(exercise)
