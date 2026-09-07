@@ -65,6 +65,8 @@ class CiRetryTests(unittest.TestCase):
         for workflow in (ci, release):
             self.assertIn("python -m pip install uv==0.11.1", workflow)
             self.assertIn("uv lock --check", workflow)
+            self.assertIn("--no-install-project --no-build", workflow)
+            self.assertIn("--no-build-isolation --no-deps --editable .", workflow)
             self.assertIn("uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock", workflow)
             self.assertIn("-m pip install --require-hashes --only-binary=:all: -r dist/requirements.lock", workflow)
             self.assertIn("-m pip check", workflow)
@@ -82,6 +84,9 @@ class CiRetryTests(unittest.TestCase):
                 sdist,
             )
             self.assertLess(sdist_lock_install, workflow.index("--no-build-isolation --no-deps dist/*.tar.gz", sdist))
+            bootstrap = workflow.index("uv sync --locked")
+            self.assertLess(bootstrap, workflow.index("--no-build-isolation --no-deps --editable .", bootstrap))
+            self.assertLess(workflow.index("--no-build-isolation --no-deps --editable .", bootstrap), workflow.index("python -m pytest", bootstrap) if "python -m pytest" in workflow[bootstrap:] else workflow.index("python -m build", bootstrap))
         self.assertIn("requirements.lock > SHA256SUMS", release)
         self.assertIn("dist/requirements.lock dist/SHA256SUMS", release)
         self.assertIn("subject-checksums: dist/SHA256SUMS", release)
