@@ -247,6 +247,14 @@ class QwenAdapterTests(unittest.TestCase):
             health = self.adapter.probe(self.config(binary=Path(__file__)), self.home)
         self.assertTrue(health.authenticated)
 
+    def test_probe_observes_the_configured_binary_version(self) -> None:
+        """Probe reports a fresh local ``--version`` observation."""
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "x", "OPENAI_BASE_URL": "x"}):
+            health = self.adapter.probe(self.config(binary=Path("/bin/echo")), self.home)
+        self.assertTrue(health.available)
+        self.assertEqual(health.version, "--version")
+
     def test_skills_capability_is_declared(self) -> None:
         """Qwen has no Skill tool, but the capability still advertises delivery."""
         self.assertIn(Capability.SKILLS, self.adapter.describe().capabilities)

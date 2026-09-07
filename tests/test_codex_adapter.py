@@ -504,6 +504,7 @@ env_from = ["PATH"]
         health = ADAPTER.probe(config, self.home)
         self.assertTrue(health.available)
         self.assertTrue(health.authenticated)
+        self.assertEqual(health.version, "--version")
 
         missing_binary = self.runtime_config(binary=Path("/no/such/codex-binary"))
         unhealthy = ADAPTER.probe(missing_binary, self.home)

@@ -36,6 +36,7 @@ from agent_run.adapters.qwen import plugins as plugin_install
 from agent_run.adapters.qwen.auth import DEFAULT_BASE_URL, keychain_omniroute_api_key
 from agent_run.adapters.qwen.skills import materialize_skills, skills_context_note
 from agent_run.adapters.snapshots import finalize_runtime_snapshots
+from agent_run.adapters.version import observe_binary_version
 from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
@@ -301,12 +302,13 @@ class QwenAdapter:
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
-        """Report local binary and declared authentication availability only."""
-        del home
+        """Report local health with a fresh bounded configured-binary version."""
+
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
         authenticated = bool(config.auth and all(_auth_value(name) for name in config.auth.names))
-        reason = None if available else f"qwen binary not executable: {config.binary}"
-        return RuntimeHealth(available, "0.22.2" if available else None, authenticated, reason)
+        version, version_reason = observe_binary_version(config.binary, Path(home))
+        reason = version_reason if available else f"qwen binary not executable: {config.binary}"
+        return RuntimeHealth(available, version, authenticated, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
         """Return the configured model roster without a live provider call."""

@@ -42,6 +42,7 @@ from ..developer_environment import (
     developer_environment,
     environment_digest,
 )
+from ..version import observe_binary_version
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from ..rust import RUST_ENVIRONMENT_NAMES
 from ..snapshots import finalize_runtime_snapshots
@@ -162,6 +163,8 @@ class ClaudeAdapter:
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
+        """Report local health with a fresh bounded configured-binary version."""
+
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
         authenticated: bool | None = None
         if config.auth is not None and config.auth.kind == "environment":
@@ -171,8 +174,9 @@ class ClaudeAdapter:
                 # reporting "unauthenticated" on a bare environment would be
                 # a false alarm. Read only -- probe never refreshes.
                 authenticated = keychain_token(time.time()) is not None
-        reason = None if available else f"claude binary not executable: {config.binary}"
-        return RuntimeHealth(available, None, authenticated, reason)
+        version, version_reason = observe_binary_version(config.binary, Path(home))
+        reason = version_reason if available else f"claude binary not executable: {config.binary}"
+        return RuntimeHealth(available, version, authenticated, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
         """Report the configured roster without any live call.

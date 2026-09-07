@@ -299,6 +299,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         health = self.adapter.probe(available, self.home)
         self.assertTrue(health.available)
         self.assertFalse(health.authenticated)
+        self.assertEqual(health.version, "--version")
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
             health = self.adapter.probe(available, self.home)
             self.assertTrue(health.authenticated)

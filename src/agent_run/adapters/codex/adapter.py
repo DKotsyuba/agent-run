@@ -1,10 +1,10 @@
 """Codex runtime adapter: isolated home, app-server launch, models/limits.
 
-No live ``codex`` calls happen anywhere in this module. Model rosters and
-capacity limits are read from an isolated on-disk cache/evidence file below
-the generated ``CODEX_HOME`` (populated by a live probe out of this task's
-scope); this adapter only intersects that cache with the configured
-allowlist and marks missing/stale evidence ``unknown``.
+Only the bounded ``--version`` health observation invokes ``codex`` here.
+Model rosters and capacity limits are read from an isolated on-disk
+cache/evidence file below the generated ``CODEX_HOME``; this adapter only
+intersects that cache with the configured allowlist and marks missing/stale
+evidence ``unknown``.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from ..command_policy import render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
+from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
 from .toml import toml_array as _toml_array, toml_string as _toml_string
@@ -444,6 +445,8 @@ class CodexAdapter:
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
+        """Report health with a fresh bounded configured-binary version observation."""
+
         try:
             self.validate(config)
         except ValidationError as error:
@@ -454,11 +457,14 @@ class CodexAdapter:
         auth_ok = None
         if config.auth is not None and config.auth.kind == "file_link":
             auth_ok = _bridge_points_at_source(home_path / config.auth.target, config.auth.source)
-        cache = _read_json(home_path / _MODEL_CACHE_REL)
-        version = cache.get("codex_version") if isinstance(cache, dict) else None
+        version, version_reason = observe_binary_version(config.binary, home_path)
         available = bool(binary_ok and home_ok and (auth_ok is not False))
-        reason = None if available else "codex binary, generated home, or auth bridge is missing"
-        return RuntimeHealth(available, version if isinstance(version, str) else None, auth_ok, reason)
+        reason = (
+            version_reason
+            if available
+            else "codex binary, generated home, or auth bridge is missing"
+        )
+        return RuntimeHealth(available, version, auth_ok, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
         cache_path = Path(home) / _MODEL_CACHE_REL
