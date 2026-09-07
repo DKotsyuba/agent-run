@@ -6,6 +6,7 @@ import codecs
 import json
 import logging
 import os
+import stat
 import sys
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -35,68 +36,57 @@ class _BoundedInput:
     """Feed complete text frames to the SDK without buffering an unbounded stdin line."""
 
     def __init__(self, stream: IO[str]) -> None:
-        """Bind the bounded iterator to one input stream and select its fastest safe reader."""
+        """Bind one stream and classify whether its file descriptor can be polled."""
         self._stream = stream
         try:
             self._fd = stream.fileno()
         except (AttributeError, OSError):
             self._fd = None
+        self._pollable = self._fd is not None and not stat.S_ISREG(
+            os.fstat(self._fd).st_mode
+        )
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     async def _read_chunk(self) -> str | None:
-        """Read one bounded chunk, returning None only after actual input EOF."""
-        if self._fd is None:
+        """Read one bounded chunk, using cancellable readiness for pipes and sockets."""
+        if self._fd is None or not self._pollable:
             return await anyio.to_thread.run_sync(self._stream.read, 8192) or None
-        data = await anyio.to_thread.run_sync(
-            os.read, self._fd, 8192, abandon_on_cancel=True
-        )
+        await anyio.wait_readable(self._fd)
+        data = os.read(self._fd, 8192)
         if not data:
             return self._decoder.decode(b"", final=True) or None
         return self._decoder.decode(data)
-
-    def _abort_read(self) -> None:
-        """Close a real input fd so an abandoned blocking raw read returns promptly."""
-        if self._fd is not None:
-            fd, self._fd = self._fd, None
-            try:
-                os.close(fd)
-            except OSError:
-                pass
 
     async def __aiter__(self) -> AsyncIterator[str]:
         """Yield complete frames up to one MiB and turn oversized frames into SDK parse errors."""
         parts: list[str] = []
         byte_count = 0
         dropping = False
-        try:
-            while True:
-                chunk = await self._read_chunk()
-                if chunk is None:
-                    break
-                if not chunk:
+        while True:
+            chunk = await self._read_chunk()
+            if chunk is None:
+                break
+            if not chunk:
+                continue
+            for character in chunk:
+                if character == "\n":
+                    yield "{" if dropping else "".join(parts)
+                    parts.clear()
+                    byte_count = 0
+                    dropping = False
                     continue
-                for character in chunk:
-                    if character == "\n":
-                        yield "{" if dropping else "".join(parts)
-                        parts.clear()
-                        byte_count = 0
-                        dropping = False
-                        continue
-                    if dropping:
-                        continue
-                    byte_count += len(character.encode("utf-8"))
-                    if byte_count > MAX_LINE_BYTES:
-                        parts.clear()
-                        dropping = True
-                    else:
-                        parts.append(character)
-            if dropping:
-                yield "{"
-            elif parts:
-                yield "".join(parts)
-        except BaseException:
-            self._abort_read()
-            raise
+                if dropping:
+                    continue
+                byte_count += len(character.encode("utf-8"))
+                if byte_count > MAX_LINE_BYTES:
+                    parts.clear()
+                    dropping = True
+                else:
+                    parts.append(character)
+        if dropping:
+            yield "{"
+        elif parts:
+            yield "".join(parts)
 
 
 def serve(

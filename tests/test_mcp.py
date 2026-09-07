@@ -283,18 +283,9 @@ serve(lambda: ObservedBrokerClient(Path(os.environ[\"AGENT_RUN_TEST_SOCKET\"])))
             reader.close()
 
     def test_idle_pipe_cancellation_releases_the_raw_read_worker(self) -> None:
-        """Exit a cancelled SDK reader even while the peer keeps its pipe open and idle."""
+        """Cancel an idle pipe read without starting a blocking worker or closing the fd."""
         read_fd, write_fd = os.pipe()
         reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
-        worker_done = threading.Event()
-        real_read = os.read
-
-        def tracked_read(fd: int, size: int) -> bytes:
-            """Record when the genuine blocking raw read worker actually exits."""
-            try:
-                return real_read(fd, size)
-            finally:
-                worker_done.set()
 
         async def consume() -> None:
             """Block on an idle bounded input until the enclosing lifecycle cancels it."""
@@ -310,12 +301,49 @@ serve(lambda: ObservedBrokerClient(Path(os.environ[\"AGENT_RUN_TEST_SOCKET\"])))
                     group.cancel_scope.cancel()
 
         try:
-            with patch("agent_run.mcp.os.read", tracked_read):
+            with patch(
+                "agent_run.mcp.anyio.to_thread.run_sync",
+                side_effect=AssertionError("pipe reads must not use worker threads"),
+            ):
                 anyio.run(cancel_reader)
-            self.assertTrue(worker_done.wait(1), "cancelled raw read worker stayed blocked")
+            os.fstat(read_fd)
         finally:
             os.close(write_fd)
+            reader.close()
+
+    def test_endless_oversized_frame_remains_cancellable(self) -> None:
+        """Yield to cancellation while dropping an endless frame without a newline."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        stop = threading.Event()
+
+        def write_forever() -> None:
+            """Keep the pipe readable until cancellation closes the test resources."""
             try:
-                reader.close()
+                while not stop.is_set():
+                    os.write(write_fd, b"x" * 8192)
             except OSError:
                 pass
+
+        async def consume() -> None:
+            """Cancel the oversized reader under a bounded parent deadline."""
+            with anyio.fail_after(1):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(_consume)
+                    await anyio.sleep(0.05)
+                    group.cancel_scope.cancel()
+
+        async def _consume() -> None:
+            """Drain frames until the enclosing cancellation scope stops the reader."""
+            async for _ in _BoundedInput(reader):
+                pass
+
+        writer = threading.Thread(target=write_forever, daemon=True)
+        writer.start()
+        try:
+            anyio.run(consume)
+        finally:
+            stop.set()
+            reader.close()
+            os.close(write_fd)
+            writer.join(timeout=1)
