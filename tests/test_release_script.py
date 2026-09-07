@@ -140,6 +140,39 @@ class PublicationTests(unittest.TestCase):
             release.prepare_pr(runner, "1.2.3")
         self.assertEqual(runner.run.call_count, 1)
 
+    def test_version_pr_updates_and_checks_lock_with_package_version(self):
+        """A version PR stages its regenerated lock atomically with package metadata."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / ".git/release-worktrees/1.0.1"
+            work.mkdir(parents=True)
+            (work / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n')
+            (work / "uv.lock").write_text("version = 1\n")
+            (work / "CHANGELOG.md").write_text("## [1.0.0]\n")
+            runner = Mock()
+            runner.json.side_effect = [[], {"number": 1, "state": "OPEN", "headRefOid": "head", "mergeCommit": None, "baseRefName": "main"}]
+
+            def run(*args, cwd=None, check=True, **_kwargs):
+                """Return deterministic Git/uv results while recording the release contract."""
+                if args == ("git", "rev-parse", "--absolute-git-dir"):
+                    return subprocess.CompletedProcess(args, 0, str(Path(directory) / ".git") + "\n", "")
+                if args in (("git", "rev-parse", "HEAD"), ("git", "rev-parse", "origin/main")):
+                    return subprocess.CompletedProcess(args, 0, "head\n", "")
+                if args == ("git", "status", "--porcelain") and cwd == work:
+                    return subprocess.CompletedProcess(args, 0, " M pyproject.toml\n", "")
+                if args in (("git", "status", "--porcelain", "--untracked-files=all"), ("git", "status", "--porcelain")):
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args == ("git", "diff", "--cached", "--name-only"):
+                    return subprocess.CompletedProcess(args, 0, "pyproject.toml\nCHANGELOG.md\nuv.lock\n", "")
+                if args == ("git", "describe", "--tags", "--abbrev=0"):
+                    return subprocess.CompletedProcess(args, 1, "", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            runner.run.side_effect = run
+            release.prepare_pr(runner, "1.0.1")
+            runner.run.assert_any_call("uv", "lock", cwd=work)
+            runner.run.assert_any_call("uv", "lock", "--check", cwd=work)
+            runner.run.assert_any_call("git", "add", "--", "pyproject.toml", "CHANGELOG.md", "uv.lock", cwd=work)
+
     def test_new_publication_gates_exact_heads_before_annotated_tag(self):
         """PR/main CI gates precede immutable tagging and the existing release workflow."""
         runner = Mock()

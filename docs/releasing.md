@@ -135,7 +135,9 @@ gh attestation verify agent_run-0.1.0-py3-none-any.whl \
 ## Distribution boundary
 
 GitHub Releases is the only public distribution channel. Each release carries
-the Python wheel, source archive, checksums, and GitHub provenance attestation.
+the Python wheel, source archive, hash-pinned `requirements.lock`, checksums,
+and GitHub provenance attestation. The version PR regenerates `uv.lock` and
+checks it before staging the package version, changelog, and lock together.
 The project does not publish to PyPI, GitHub Packages, Docker, or GHCR.
 
 ## Repository settings

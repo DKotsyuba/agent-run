@@ -149,8 +149,8 @@ def prepare_pr(runner: Runner, version: str) -> dict:
     """Reuse/create deterministic version-only branch and PR; return PR metadata.
 
     Require clean checkout on origin/main before new publication. Persist a
-    dedicated worktree under .git for interrupted commits/pushes; never stage
-    anything except pyproject.toml and CHANGELOG.md.
+    dedicated worktree under .git for interrupted commits/pushes; stage the
+    package version, changelog, and regenerated authoritative uv.lock together.
     """
     if runner.run("git", "status", "--porcelain", "--untracked-files=all").stdout:
         raise ReleaseError("New publication requires a clean committed checkout")
@@ -183,6 +183,8 @@ def prepare_pr(runner: Runner, version: str) -> dict:
         if tuple(map(int, version.split("."))) <= tuple(map(int, current.split("."))):
             raise ReleaseError("New version must increase the package version")
         package.write_text(re.sub(r'^version = "[^"]+"$', f'version = "{version}"', old, count=1, flags=re.M))
+        runner.run("uv", "lock", cwd=work)
+    runner.run("uv", "lock", "--check", cwd=work)
     changelog = work / "CHANGELOG.md"
     history = changelog.read_text()
     if f"## [{version}]" not in history:
@@ -194,9 +196,9 @@ def prepare_pr(runner: Runner, version: str) -> dict:
         index = history.find("## [")
         changelog.write_text(history[:index] + insertion + history[index:] if index >= 0 else history + "\n" + insertion)
     if runner.run("git", "status", "--porcelain", cwd=work).stdout:
-        runner.run("git", "add", "--", "pyproject.toml", "CHANGELOG.md", cwd=work)
+        runner.run("git", "add", "--", "pyproject.toml", "CHANGELOG.md", "uv.lock", cwd=work)
         staged = runner.run("git", "diff", "--cached", "--name-only", cwd=work).stdout.splitlines()
-        if set(staged) - {"pyproject.toml", "CHANGELOG.md"}:
+        if set(staged) - {"pyproject.toml", "CHANGELOG.md", "uv.lock"}:
             raise ReleaseError("Unexpected staged files in release worktree")
         runner.run("git", "commit", "-m", f"chore: release {version}", cwd=work)
     runner.run("git", "push", "origin", branch, cwd=work)
