@@ -72,9 +72,10 @@ jobs:
           PY
       - name: Build and check distributions
         run: |
-          python -m build
+          python -m build --no-isolation
           python -m twine check dist/*
           uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock
+          uv export --frozen --extra release --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/build-requirements.lock
       - name: Smoke wheel and source installs
         shell: bash
         run: |
@@ -87,8 +88,8 @@ jobs:
           AGENT_RUN_HOME="$RUNNER_TEMP/wheel-home" "$RUNNER_TEMP/wheel-smoke/bin/agent-run" init
           AGENT_RUN_HOME="$RUNNER_TEMP/wheel-home" "$RUNNER_TEMP/wheel-smoke/bin/agent-run" doc releases
           python -m venv "$RUNNER_TEMP/sdist-smoke"
-          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --require-hashes --only-binary=:all: -r dist/requirements.lock
-          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --no-deps dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --require-hashes --only-binary=:all: -r dist/build-requirements.lock
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --no-build-isolation --no-deps dist/*.tar.gz
           "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip check
           test "$("$RUNNER_TEMP/sdist-smoke/bin/python" -c 'from importlib.metadata import version; print(version("agent-run"))')" = "$version"
       - name: Write and verify checksums

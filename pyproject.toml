@@ -25,7 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8.0", "hypothesis>=6.167.1,<7"]
-release = ["build>=1.2", "twine>=5.0"]
+release = ["build>=1.2", "setuptools>=77", "twine>=5.0", "wheel"]
 
 [project.scripts]
 agent-run = "agent_run.cli:main"
