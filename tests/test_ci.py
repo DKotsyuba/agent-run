@@ -57,6 +57,22 @@ class CiRetryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, expected_status, msg=result.stderr)
                 self.assertEqual(int(count.read_text(encoding="utf-8")), expected_calls)
 
+    def test_release_workflows_publish_verified_lock_before_smoke_and_checksums(self) -> None:
+        """Check the lock generation, hash install, smoke, and publication order graph."""
+
+        ci = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        release = (Path(__file__).parents[1] / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        for workflow in (ci, release):
+            self.assertIn("python -m pip install uv==0.11.1", workflow)
+            self.assertIn("uv lock --check", workflow)
+            self.assertIn("uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock", workflow)
+            self.assertIn("-m pip install --require-hashes --only-binary=:all: -r dist/requirements.lock", workflow)
+            self.assertIn("-m pip check", workflow)
+            self.assertLess(workflow.index("uv export --frozen"), workflow.index("requirements.lock"))
+            self.assertLess(workflow.index("requirements.lock"), workflow.index("-m pip check"))
+        self.assertIn("requirements.lock > SHA256SUMS", release)
+        self.assertIn("dist/requirements.lock dist/SHA256SUMS", release)
+
     @staticmethod
     def _run_tests_block(workflow: str) -> str:
         """Extract the indented bash block belonging to the Run tests step."""
