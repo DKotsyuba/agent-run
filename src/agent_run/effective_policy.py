@@ -65,8 +65,10 @@ class DeclaredCapability:
 class ConstraintEvidence:
     """One constraint's effective level, support bit, and admission status.
 
-    ``constraint`` identifies the boundary, ``enforcement`` names its actual
-    layer, and ``supported`` is false exactly for ``unsupported`` evidence.
+    ``constraint`` identifies the boundary and ``enforcement`` names its actual
+    layer. ``supported`` says whether that layer satisfies this specific
+    boundary; advisory evidence and narrowly scoped tool filtering therefore
+    remain visible without satisfying broader isolation constraints.
     ``required`` records the caller's explicit admission requirement. ``scope``,
     ``platform``, and ``reason`` keep the claim bounded and auditable.
     """
@@ -97,7 +99,9 @@ class EffectivePolicy:
 class AdmissionDecision:
     """Typed admission result listing only required unsupported constraints.
 
-    ``allowed`` is true exactly when ``unsupported_required`` is empty.
+    ``allowed`` is true exactly when ``unsupported_required`` is empty. Despite
+    its stable name, that tuple contains every explicitly required constraint
+    whose reported enforcement level does not satisfy the constraint.
     """
 
     allowed: bool
@@ -139,6 +143,17 @@ def _unsupported(constraint: Constraint, platform: str, reason: str, required: b
         scope=constraint.value,
         platform=platform,
         reason=reason,
+    )
+
+
+def _satisfies(constraint: Constraint, enforcement: Enforcement) -> bool:
+    """Return whether ``enforcement`` is strong enough for ``constraint``."""
+
+    if enforcement in {Enforcement.ADVISORY, Enforcement.UNSUPPORTED}:
+        return False
+    return (
+        enforcement is not Enforcement.TOOL_FILTER
+        or constraint is Constraint.WEB_TOOLS_DISABLED
     )
 
 
@@ -208,7 +223,7 @@ def effective_policy(
                     ConstraintEvidence(
                         constraint=constraint,
                         enforcement=capability.enforcement,
-                        supported=capability.enforcement is not Enforcement.UNSUPPORTED,
+                        supported=_satisfies(constraint, capability.enforcement),
                         required=is_required,
                         scope=capability.scope,
                         platform=platform,
@@ -251,13 +266,13 @@ def effective_policy(
 
 
 def admission_decision(policy: EffectivePolicy) -> AdmissionDecision:
-    """Allow a policy unless an explicitly required constraint is unsupported."""
+    """Allow unless an explicit requirement lacks sufficient enforcement."""
 
     if not isinstance(policy, EffectivePolicy):
         raise ValidationError("policy must be an EffectivePolicy")
     unsupported = tuple(
         item.constraint
         for item in policy.constraints
-        if item.required and item.enforcement is Enforcement.UNSUPPORTED
+        if item.required and not item.supported
     )
     return AdmissionDecision(not unsupported, unsupported)

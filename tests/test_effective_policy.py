@@ -103,6 +103,45 @@ def test_platform_scopes_are_applied_without_upgrading_configuration() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "enforcement", [Enforcement.ADVISORY, Enforcement.TOOL_FILTER]
+)
+def test_required_isolation_rejects_insufficient_levels(enforcement: Enforcement) -> None:
+    """Advisory and tool-only evidence stay visible but cannot satisfy isolation."""
+
+    capability = DeclaredCapability(
+        enforcement,
+        "prompt or tool surface only",
+        "no socket enforcement",
+    )
+    required_policy = effective_policy(
+        _profile(),
+        "claude",
+        "darwin",
+        {Constraint.EXTERNAL_NETWORK_ISOLATION: capability},
+        required=frozenset({Constraint.EXTERNAL_NETWORK_ISOLATION}),
+    )
+    external = next(
+        item
+        for item in required_policy.constraints
+        if item.constraint is Constraint.EXTERNAL_NETWORK_ISOLATION
+    )
+    assert external.enforcement is enforcement
+    assert external.supported is False
+    assert admission_decision(required_policy).allowed is False
+    assert admission_decision(required_policy).unsupported_required == (
+        Constraint.EXTERNAL_NETWORK_ISOLATION,
+    )
+
+    legacy_policy = effective_policy(
+        _profile(),
+        "claude",
+        "darwin",
+        {Constraint.EXTERNAL_NETWORK_ISOLATION: capability},
+    )
+    assert admission_decision(legacy_policy).allowed is True
+
+
 @pytest.mark.parametrize("required", [set(), (Constraint.PLUGIN_IMMUTABILITY,)])
 def test_required_input_is_strictly_typed(required: object) -> None:
     """Mutable sets and tuples cannot silently become admission requirements."""
