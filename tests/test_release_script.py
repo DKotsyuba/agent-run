@@ -372,6 +372,58 @@ class LocalTests(unittest.TestCase):
         with local.database(self.home) as connection:
             self.assertEqual(local.active(connection), 0)
 
+    def test_schema_without_birth_still_blocks_a_live_archived_writer(self):
+        """An older schema can prove PID absence but cannot dismiss a live PID."""
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.executescript(
+            """CREATE TABLE agents(status TEXT);
+               CREATE TABLE workflow_runs(status TEXT, owner_pid_identity TEXT);
+               INSERT INTO workflow_runs VALUES('running', '999999 missing');"""
+        )
+        self.assertEqual(local.active(connection), 0)
+        connection.execute(
+            "UPDATE workflow_runs SET owner_pid_identity = ?",
+            (f"{os.getpid()} fixture",),
+        )
+        self.assertEqual(local.active(connection), 1)
+
+    def test_unobservable_archived_writer_blocks_release(self):
+        """Access denial is uncertainty, never evidence that a writer is dead."""
+
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (status, owner_pid_identity, owner_birth_time)
+                   VALUES ('running', '4242 fixture', 1)"""
+            )
+        with local.database(self.home) as connection, patch.object(
+            local.psutil, "Process", side_effect=psutil.AccessDenied(pid=4242)
+        ):
+            self.assertEqual(local.active(connection), 1)
+
+    def test_malformed_archived_writer_birth_blocks_release(self):
+        """Non-finite or negative birth evidence cannot prove PID reuse."""
+
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (status, owner_pid_identity, owner_birth_time)
+                   VALUES ('running', ?, 1)""",
+                (f"{os.getpid()} fixture",),
+            )
+        for birth in (float("nan"), float("inf"), -1.0):
+            with self.subTest(birth=birth), sqlite3.connect(
+                self.home / "state.db"
+            ) as connection:
+                connection.execute(
+                    "UPDATE workflow_runs SET owner_birth_time = ?", (birth,)
+                )
+                connection.commit()
+                with local.database(self.home) as observed:
+                    self.assertEqual(local.active(observed), 1)
+
     def test_failed_migration_restores_old_only_when_schema_is_unchanged(self):
         """A pre-migration exception restarts old compatible services and retains journal."""
         with self.patches(), patch.object(local, "migrate", side_effect=RuntimeError("migration failed")), \

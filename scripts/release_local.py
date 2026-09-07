@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -175,12 +176,42 @@ def prepare(runner: Runner, target: Path, wheel: Path, requirements: Path, versi
     return schema
 
 
-def active(connection: sqlite3.Connection) -> int:
-    """Count active agents and birth-verified legacy workflow writers.
+def _legacy_writer_may_be_live(owner: object, birth: object) -> bool:
+    """Return false only when an archived writer is provably gone or reused.
 
-    Historical workflow rows without a live matching PID/birth identity do not
-    block deployment. A still-running archived workflow writer does, preventing
-    schema migration while that old process can write.
+    ``owner`` begins with the historical writer PID and ``birth`` is its
+    optional psutil creation time. Missing birth evidence can prove only PID
+    absence; malformed identity, access denial, and other observation failures
+    stay conservative and block migration.
+    """
+
+    try:
+        pid = int(str(owner).partition(" ")[0])
+        if pid <= 1:
+            return True
+    except (ValueError, TypeError):
+        return True
+    try:
+        process = psutil.Process(pid)
+        if birth is not None:
+            expected_birth = float(birth)
+            if expected_birth < 0 or not math.isfinite(expected_birth):
+                return True
+            if process.create_time() != expected_birth:
+                return False
+        return process.is_running()
+    except psutil.NoSuchProcess:
+        return False
+    except (PermissionError, ValueError, TypeError, psutil.Error):
+        return True
+
+
+def active(connection: sqlite3.Connection) -> int:
+    """Count active agents and plausibly live archived workflow writers.
+
+    Historical rows with no owner or a proven dead/reused process do not block.
+    A matching writer, missing birth evidence, or unobservable process does,
+    preventing schema migration while an old runtime may still write.
     """
 
     agents = connection.execute(
@@ -189,22 +220,18 @@ def active(connection: sqlite3.Connection) -> int:
     columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(workflow_runs)")
     }
-    if not {"status", "owner_pid_identity", "owner_birth_time"} <= columns:
+    if not {"status", "owner_pid_identity"} <= columns:
         return agents
-    writers = 0
-    for owner, birth in connection.execute(
-        """SELECT owner_pid_identity, owner_birth_time FROM workflow_runs
-           WHERE status IN ('created', 'running') AND owner_pid_identity IS NOT NULL
-             AND owner_birth_time IS NOT NULL"""
-    ):
-        try:
-            pid = int(str(owner).partition(" ")[0])
-            process = psutil.Process(pid)
-            if process.create_time() == float(birth) and process.is_running():
-                writers += 1
-        except (ValueError, TypeError, psutil.Error):
-            continue
-    return agents + writers
+    birth = "owner_birth_time" if "owner_birth_time" in columns else "NULL"
+    rows = connection.execute(
+        f"""SELECT owner_pid_identity, {birth} FROM workflow_runs
+            WHERE status IN ('created', 'running')
+              AND owner_pid_identity IS NOT NULL"""
+    )
+    return agents + sum(
+        _legacy_writer_may_be_live(owner, observed_birth)
+        for owner, observed_birth in rows
+    )
 
 
 def database(home: Path) -> sqlite3.Connection:
