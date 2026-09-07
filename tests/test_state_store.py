@@ -1,10 +1,13 @@
+import json
 import sqlite3
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields, replace
 from pathlib import Path
 from threading import Barrier
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -18,6 +21,8 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.state import StateStore
+from agent_run.state.db import request_json
+from agent_run.state.start import AgentCreation
 
 
 class StateStoreTests(unittest.TestCase):
@@ -52,6 +57,161 @@ class StateStoreTests(unittest.TestCase):
         return self.store.create_agent(
             request or self.request(), task_summary="summary", config_revision="cfg-1", at=1
         ).agent_id
+
+    def admit(self, request: StartRequest, *, at: float = 2) -> AgentCreation:
+        """Create one capped ``STARTING`` row with deterministic owner proof."""
+
+        return self.store.create_agent_limited(
+            request,
+            task_summary="summary",
+            config_revision="cfg-1",
+            global_limit=100,
+            runtime_limit=100,
+            at=at,
+            startup_owner_identity="123 coordinator",
+            startup_owner_birth_time=12.5,
+            startup_deadline_seconds=120,
+        )
+
+    def test_admission_rolls_back_fault_or_commits_complete_starting_owner(self) -> None:
+        """No durable row exists between insert and complete owned admission."""
+
+        request = self.request(request_id="atomic-fault")
+        with patch(
+            "agent_run.state.start.insert_event", side_effect=RuntimeError("crash")
+        ), self.assertRaisesRegex(RuntimeError, "crash"):
+            self.admit(request)
+        self.assertEqual(self.store.list_agents(), [])
+
+        created = self.admit(request)
+        row = self.store.get_agent(created.agent_id)
+        self.assertEqual(row["status"], AgentStatus.STARTING.value)
+        self.assertEqual(row["startup_owner_pid_identity"], "123 coordinator")
+        self.assertEqual(row["startup_owner_birth_time"], 12.5)
+        self.assertEqual(row["startup_deadline_at"], 122.0)
+        events = self.store.connection.execute(
+            "SELECT kind FROM events WHERE agent_id = ? ORDER BY seq",
+            (created.agent_id,),
+        ).fetchall()
+        self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
+
+    def test_request_json_covers_fields_and_legacy_fast_replay_is_exact(self) -> None:
+        """Every request field participates while missing legacy fast means false."""
+
+        request = self.request(request_id="legacy-fast")
+        self.assertEqual(
+            set(json.loads(request_json(request))),
+            {field.name for field in fields(StartRequest)},
+        )
+        first = self.admit(request)
+        stored = json.loads(self.store.get_agent(first.agent_id)["request_json"])
+        stored.pop("fast")
+        legacy = json.dumps(stored, sort_keys=True, separators=(",", ":"))
+        self.store.connection.execute(
+            "UPDATE agents SET request_json = ? WHERE id = ?", (legacy, first.agent_id)
+        )
+        self.store.connection.commit()
+
+        self.assertFalse(self.admit(request).created)
+        with self.assertRaisesRegex(ValidationError, "request_id was reused"):
+            self.admit(replace(request, fast=True))
+        self.assertEqual(self.store.get_agent(first.agent_id)["request_json"], legacy)
+
+    def test_every_semantic_request_field_rejects_same_key_reuse(self) -> None:
+        """Sweep all launch fields; key and namespace are explicit exclusions."""
+
+        other = self.root / "other"
+        other.mkdir()
+        variants = {
+            "runtime": "other-runtime",
+            "model": "other-model",
+            "profile": "other-profile",
+            "task": "other task",
+            "workdir": other,
+            "write": True,
+            "effort": "high",
+            "timeout_seconds": 481,
+            "read_roots": (other,),
+            "output_schema": {"type": "object"},
+            "fast": True,
+            "account": "other-account",
+        }
+        self.assertEqual(
+            set(variants) | {"request_id", "orchestrator"},
+            {field.name for field in fields(StartRequest)},
+        )
+        namespace = OrchestratorRef("codex_queue", "semantic-fields")
+        for name, value in variants.items():
+            with self.subTest(field=name):
+                request = self.request(
+                    request_id=f"semantic-{name}", orchestrator=namespace
+                )
+                self.admit(request)
+                with self.assertRaisesRegex(ValidationError, "request_id was reused"):
+                    self.admit(replace(request, **{name: value}))
+
+    def test_same_request_id_is_distinct_across_orchestrator_namespaces(self) -> None:
+        """A request key deduplicates within one exact caller namespace only."""
+
+        refs = (
+            None,
+            OrchestratorRef("codex_queue", "namespace-a"),
+            OrchestratorRef("codex_queue", "namespace-b"),
+        )
+        results = [
+            self.admit(self.request(request_id="shared-key", orchestrator=ref))
+            for ref in refs
+        ]
+        self.assertEqual(len({result.agent_id for result in results}), 3)
+        self.assertTrue(all(result.created for result in results))
+
+        turn_one = self.request(
+            request_id="turn-conflict",
+            orchestrator=OrchestratorRef("codex_queue", "same-session", "turn-1"),
+        )
+        self.admit(turn_one)
+        with self.assertRaisesRegex(ValidationError, "request_id was reused"):
+            self.admit(
+                replace(
+                    turn_one,
+                    orchestrator=OrchestratorRef(
+                        "codex_queue", "same-session", "turn-2"
+                    ),
+                )
+            )
+
+    def test_concurrent_same_key_admission_creates_one_owned_row(self) -> None:
+        """Two connections serialize a nullable-namespace replay before capacity."""
+
+        request = self.request(request_id="concurrent-admission")
+        barrier = Barrier(2)
+        database = self.root / "state.db"
+
+        def create_once() -> AgentCreation:
+            """Admit through one thread-affine connection after the shared barrier."""
+
+            store = StateStore.open(database)
+            try:
+                barrier.wait()
+                return store.create_agent_limited(
+                    request,
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    global_limit=1,
+                    runtime_limit=1,
+                    at=2,
+                    startup_owner_identity="123 coordinator",
+                    startup_owner_birth_time=12.5,
+                    startup_deadline_seconds=120,
+                )
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [future.result() for future in [pool.submit(create_once) for _ in range(2)]]
+        self.assertEqual([result.created for result in results].count(True), 1)
+        self.assertEqual(results[0].agent_id, results[1].agent_id)
+        self.assertEqual(self.store.get_agent(results[0].agent_id)["status"], "starting")
 
     def test_session_request_id_is_idempotent_and_binding_is_immutable(self) -> None:
         ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
@@ -96,11 +256,15 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_agents(), [])
 
     def test_unbound_request_id_is_globally_concurrent_and_exact(self) -> None:
+        """Concurrent replays stay single before and after notification binding."""
+
         request = self.request(request_id="shared-request")
         barrier = Barrier(2)
         database = self.root / "state.db"
 
-        def create_once():
+        def create_once() -> AgentCreation:
+            """Create or replay through one isolated thread-affine connection."""
+
             store = StateStore.open(database)
             try:
                 barrier.wait()
@@ -130,6 +294,22 @@ class StateStoreTests(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+        self.store.bind_orchestrator(
+            results[0].agent_id,
+            OrchestratorRef("codex_queue", "late-session", "turn-1"),
+            at=3,
+        )
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            replays = [
+                future.result()
+                for future in [pool.submit(create_once) for _ in range(2)]
+            ]
+        self.assertTrue(all(not replay.created for replay in replays))
+        self.assertEqual(
+            {replay.agent_id for replay in replays}, {results[0].agent_id}
+        )
+        self.assertEqual(len(self.store.list_agents()), 1)
         self.assertFalse(
             self.store.create_agent(
                 request, task_summary="summary", config_revision="cfg-1", at=3
@@ -246,7 +426,11 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(first.agent_id, duplicate.agent_id)
         with self.assertRaisesRegex(ValidationError, "request_id was reused"):
             self.store.create_agent_limited(
-                self.request(request_id="limited-duplicate", task="different"),
+                self.request(
+                    request_id="limited-duplicate",
+                    task="different",
+                    orchestrator=request.orchestrator,
+                ),
                 task_summary="summary",
                 config_revision="cfg-1",
                 global_limit=1,

@@ -136,6 +136,13 @@ def json_text(value: object) -> str:
 
 
 def request_json(request: StartRequest) -> str:
+    """Return canonical JSON for every launch-affecting request field.
+
+    Every :class:`StartRequest` field is included. Resolved identity snapshots,
+    normalized task summaries and resume parents live outside ``StartRequest``
+    and are deliberately compared or persisted separately by admission.
+    """
+
     orchestrator = request.orchestrator
     return json_text(
         {
@@ -157,9 +164,30 @@ def request_json(request: StartRequest) -> str:
                 "external_turn_id": orchestrator.external_turn_id,
             },
             "request_id": request.request_id,
+            "fast": request.fast,
             "account": request.account,
         }
     )
+
+
+def request_json_matches(stored: str, current: str) -> bool:
+    """Compare canonical request JSON with the pre-``fast`` legacy default.
+
+    ``stored`` is immutable historical evidence and ``current`` is newly
+    serialized canonical JSON. A historical object missing only ``fast`` is
+    interpreted as ``False`` without rewriting it. Malformed or non-object JSON
+    never matches and both inputs otherwise require exact semantic equality.
+    """
+
+    try:
+        previous = json.loads(stored)
+        candidate = json.loads(current)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(previous, dict) or not isinstance(candidate, dict):
+        return False
+    previous.setdefault("fast", False)
+    return previous == candidate
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, object] | None:
@@ -260,14 +288,52 @@ def checked_supervisor_proof(
 
 
 def idempotent_agent(
-    connection: sqlite3.Connection, request_id: str
+    connection: sqlite3.Connection,
+    request_id: str,
+    orchestrator: OrchestratorRef | None,
 ) -> sqlite3.Row | None:
-    return connection.execute(
+    """Return the earliest replay from the immutable request namespace.
+
+    ``orchestrator`` identifies the original caller by transport and external
+    session; ``None`` is the shared unbound namespace. The later notification
+    binding in ``agents.orchestrator_session_id`` is deliberately ignored.
+    The request's mutable turn and every other semantic field remain subject to
+    the caller's full canonical JSON comparison. Malformed historical evidence
+    cannot establish a namespace and is skipped. The caller's immediate
+    transaction serializes lookup and insertion, including nullable namespaces.
+    """
+
+    expected = (
+        None
+        if orchestrator is None
+        else (orchestrator.transport, orchestrator.external_session_id)
+    )
+    rows = connection.execute(
         """SELECT id, request_json, task_summary, config_revision,
                   parent_agent_id FROM agents
-           WHERE request_id = ?""",
+           WHERE request_id = ? ORDER BY created_at, id""",
         (request_id,),
-    ).fetchone()
+    )
+    for row in rows:
+        try:
+            payload = json.loads(row["request_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        original = payload.get("orchestrator")
+        if original is None:
+            namespace = None
+        elif isinstance(original, dict):
+            namespace = (
+                original.get("transport"),
+                original.get("external_session_id"),
+            )
+        else:
+            continue
+        if namespace == expected:
+            return row
+    return None
 
 
 def require_attempt(

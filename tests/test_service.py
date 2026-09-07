@@ -29,6 +29,7 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.delivery.base import DeliveryAttemptEvidence
+from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService, _log_start_preparation_stage
@@ -411,6 +412,59 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(launched[0], first.agent_id)
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
+
+    def test_post_tool_binding_survives_fresh_service_replay(self) -> None:
+        """Late notification binding must not change the original replay namespace."""
+
+        request = self.request(request_id="post-tool-replay")
+        first = self.start("post-tool-replay")
+        run_hook(
+            self.store,
+            {
+                "agent_id": first.agent_id,
+                "transport": "codex_queue",
+                "external_session_id": "session-1",
+                "external_turn_id": "turn-1",
+            },
+            at=101,
+        )
+        self.service.close()
+        self.store = StateStore.open(self.root / "state.db")
+        self.service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 102.0,
+        )
+
+        replay = self.service.start(request)
+
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.agent_id, first.agent_id)
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len(self.store.list_agents()), 1)
+
+    def test_crash_before_worker_registration_leaves_owned_starting_row(self) -> None:
+        """A process-level interruption cannot expose ownerless ``CREATED`` state."""
+
+        with patch.object(
+            self.service._starts,
+            "submit",
+            side_effect=KeyboardInterrupt("coordinator crashed"),
+        ), self.assertRaisesRegex(KeyboardInterrupt, "coordinator crashed"):
+            self.service.start(self.request(request_id="registration-crash"))
+
+        row = self.store.list_agents()[0]
+        self.assertEqual(row["status"], AgentStatus.STARTING.value)
+        self.assertIsInstance(row["startup_owner_pid_identity"], str)
+        self.assertIsInstance(row["startup_owner_birth_time"], float)
+        self.assertEqual(row["startup_deadline_at"], 220.0)
+        events = self.store.connection.execute(
+            "SELECT kind FROM events WHERE agent_id = ? ORDER BY seq", (row["id"],)
+        ).fetchall()
+        self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
+        self.assertEqual(self.launched, [])
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""

@@ -435,8 +435,9 @@ class AgentService:
         run used without changing what idempotent replay compares.
         A continuation preserves its parent's completed grant snapshot, which
         the preparation worker compares with the actual loaded profile.
-        The resident coordinator's process birth time is stored with the bounded
-        startup claim so command lookup failures cannot orphan an accepted row.
+        The resident coordinator's process birth time and bounded startup claim
+        commit atomically with ``STARTING`` and both acceptance events, before a
+        worker is registered or this method can return.
 
         The native session a resumed child attaches to is read back from the
         row that was just committed, never from the caller: store and adapter
@@ -446,6 +447,10 @@ class AgentService:
 
         candidate = new_agent_id()
         accepted_at = self._now()
+        startup_owner = workflow_owner_identity(
+            os.getpid(), supervisor_identity()
+        )
+        startup_birth = capture_process_birth(os.getpid())
         creation = self._store.create_agent_limited(
             request,
             task_summary=self._task_summary(request.task),
@@ -460,6 +465,9 @@ class AgentService:
                 if parent_agent_id is None
                 else self._store.get_agent(parent_agent_id)["identity_json"]
             ),
+            startup_owner_identity=startup_owner,
+            startup_owner_birth_time=startup_birth,
+            startup_deadline_seconds=120.0,
         )
         if not creation.created:
             _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)
@@ -474,22 +482,7 @@ class AgentService:
                 "resume_of_runtime_session_id"
             ]
         )
-        self._store.transition(
-            creation.agent_id,
-            AgentStatus.STARTING,
-            kind="start_accepted",
-            at=accepted_at,
-        )
         try:
-            startup_owner = workflow_owner_identity(
-                os.getpid(), supervisor_identity()
-            )
-            self._store.claim_startup(
-                creation.agent_id,
-                startup_owner,
-                owner_birth_time=capture_process_birth(os.getpid()),
-                at=accepted_at,
-            )
             self._starts.submit(
                 creation.agent_id,
                 lambda worker_store, cancelled: self._continue_start(

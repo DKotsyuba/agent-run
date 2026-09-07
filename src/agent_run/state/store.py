@@ -147,12 +147,18 @@ class StateStore:
         at: float | None = None,
         parent_agent_id: str | AgentId | None = None,
         identity_json: str | None = None,
+        startup_owner_identity: str | None = None,
+        startup_owner_birth_time: float | None = None,
+        startup_deadline_seconds: float | None = None,
     ) -> AgentCreation:
         """Admit one capped agent. See :func:`agent_run.state.start.create_agent`.
 
         ``parent_agent_id`` is the agent this start resumes, or ``None`` for a
         fresh run; it is validated and claimed inside the same transaction.
         ``identity_json`` is the effective-identity snapshot for this run.
+        Supplying startup owner identity, optional birth proof, and a finite
+        deadline atomically persists service admission as ``STARTING``.
+        Omitting all three retains low-level ``CREATED`` fixture behavior.
         """
 
         if isinstance(request, StartRequest) and request.timeout_seconds is None:
@@ -168,6 +174,9 @@ class StateStore:
             at=at,
             parent_agent_id=parent_agent_id,
             identity_json=identity_json,
+            startup_owner_identity=startup_owner_identity,
+            startup_owner_birth_time=startup_owner_birth_time,
+            startup_deadline_seconds=startup_deadline_seconds,
         )
 
     def resume_chain(

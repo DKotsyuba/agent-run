@@ -92,6 +92,10 @@ See [continuations](continuations.md) for native-context `resume` and chronologi
 override, which wins over the runtime default; an omitted account uses the
 runtime's configured default account.
 
+`request_id` replay is scoped to the caller namespace in the original request.
+A later PostToolUse notification binding does not change that identity. Clients
+that omit `orchestrator` share the unbound namespace across fresh connections.
+
 `list_orchestrators` (optional `limit`, default 100, max 1000) is a read-only
 view of the orchestrator sessions that launched agents. Each item carries
 `session_id`, `transport`, `external_session_id`, `external_turn_id`,
