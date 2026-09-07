@@ -58,16 +58,29 @@ class BrokerClient:
         self._aborted = threading.Event()
 
     def _connect(self, timeout: float) -> None:
+        """Open one abortable Unix-socket connection within ``timeout`` seconds.
+
+        The socket is published before ``connect`` blocks so another thread may
+        interrupt it through ``abort``. Cancellation raises ``ConnectionError``
+        and leaves no reusable socket or stream.
+        """
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
+        with self._lock:
+            if self._aborted.is_set():
+                sock.close()
+                raise ConnectionError("broker call cancelled")
+            self._socket = sock
         try:
             sock.connect(str(self.socket_path))
             with self._lock:
-                if self._aborted.is_set():
+                if self._aborted.is_set() or self._socket is not sock:
                     raise ConnectionError("broker call cancelled")
-                self._socket = sock
                 self._stream = sock.makefile("rb")
         except OSError:
+            with self._lock:
+                if self._socket is sock:
+                    self._socket = None
             sock.close()
             raise
 
@@ -87,7 +100,7 @@ class BrokerClient:
             sock.close()
 
     def abort(self) -> None:
-        """Interrupt this caller's pending socket wait without cancelling broker work."""
+        """Interrupt this caller's connect or response wait without cancelling broker work."""
         self._aborted.set()
         with self._lock:
             sock = self._socket

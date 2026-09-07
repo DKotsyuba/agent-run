@@ -6,6 +6,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import unittest
 from dataclasses import dataclass
@@ -987,6 +988,18 @@ target = "auth.json"
         self.assertNotIn("agent_run.mcp", sys.modules)
 
     def test_mcp_uses_injected_stdio_for_initialize_and_tools_list(self):
+        """Keep the injected SDK stream alive until its concurrent list reply lands."""
+
+        class _DelayedEofInput(io.StringIO):
+            """Delay EOF briefly after all injected protocol frames are consumed."""
+
+            def read(self, size=-1):
+                """Return buffered frames, then hold EOF for pending SDK callbacks."""
+                value = super().read(size)
+                if not value:
+                    time.sleep(0.2)
+                return value
+
         requests = (
             {
                 "jsonrpc": "2.0",
@@ -1001,7 +1014,9 @@ target = "auth.json"
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         )
-        stdin = io.StringIO("".join(json.dumps(request) + "\n" for request in requests))
+        stdin = _DelayedEofInput(
+            "".join(json.dumps(request) + "\n" for request in requests)
+        )
         stdout = io.StringIO()
         stderr = io.StringIO()
         code = cli.main(

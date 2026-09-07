@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -15,8 +18,8 @@ import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from agent_run.broker_client import MAX_LINE_BYTES
-from agent_run.mcp import _BoundedInput, _call_tool, serve
+from agent_run.broker_client import MAX_LINE_BYTES, BrokerClient
+from agent_run.mcp import _BoundedInput, serve
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -93,40 +96,121 @@ class McpSdkTests(unittest.TestCase):
         anyio.run(exercise)
 
     def test_cancelled_caller_does_not_cancel_admitted_broker_call(self) -> None:
-        """Release the MCP wait while the callback-owned durable broker call completes."""
+        """Abort the real client worker while server-owned admitted work continues."""
 
-        class BlockingBroker:
-            """Controlled broker whose accepted call finishes only after test release."""
+        temporary = tempfile.TemporaryDirectory()
+        socket_path = Path(temporary.name) / "broker.sock"
+        done_path = Path(temporary.name) / "worker.done"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen()
+        listener.settimeout(0.05)
+        admitted = threading.Event()
+        release = threading.Event()
+        stop = threading.Event()
+        connections = []
+        handlers = []
 
-            def __init__(self, entered: threading.Event, release: threading.Event, done: threading.Event) -> None:
-                """Store the synchronization events owned by the enclosing test."""
-                self.entered = entered
-                self.release = release
-                self.done = done
+        def handle(client: socket.socket) -> None:
+            """Own admitted work until release even after its caller disconnects."""
+            with client:
+                request = json.loads(client.makefile("rb").readline())
+                admitted.set()
+                if not release.wait(3):
+                    return
+                response = {"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
+                try:
+                    client.sendall(json.dumps(response).encode() + b"\n")
+                except OSError:
+                    pass
 
-            def call(self, method: str, params: dict | None = None, timeout: float = 600.0) -> object:
-                """Wait for release, then report the durable call result without cancellation."""
-                self.entered.set()
-                if not self.release.wait(timeout=2):
-                    raise TimeoutError("test did not release the admitted broker call")
-                self.done.set()
-                return {"method": method, "arguments": params or {}}
+        def accept() -> None:
+            """Accept every client connection so a forbidden retry is observable."""
+            while not stop.is_set():
+                try:
+                    client, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    return
+                connections.append(client)
+                handler = threading.Thread(target=handle, args=(client,), daemon=True)
+                handlers.append(handler)
+                handler.start()
+
+        accept_thread = threading.Thread(target=accept, daemon=True)
+        accept_thread.start()
+        server_code = """
+import os
+from pathlib import Path
+from agent_run.broker_client import BrokerClient
+from agent_run.mcp import serve
+
+class ObservedBrokerClient(BrokerClient):
+    \"\"\"Signal when the actual callback worker has left BrokerClient.call.\"\"\"
+
+    def call(self, method, params=None, timeout=600.0):
+        \"\"\"Run the real broker call and publish its worker-finally marker.\"\"\"
+        try:
+            return super().call(method, params, timeout)
+        finally:
+            Path(os.environ[\"AGENT_RUN_TEST_DONE\"]).touch()
+
+serve(lambda: ObservedBrokerClient(Path(os.environ[\"AGENT_RUN_TEST_SOCKET\"])))
+"""
 
         async def exercise() -> None:
-            """Cancel the caller wait, then prove its abandoned worker still finishes."""
-            entered = threading.Event()
-            release = threading.Event()
-            done = threading.Event()
-            with anyio.move_on_after(0.1) as scope:
-                await _call_tool(
-                    lambda: BlockingBroker(entered, release, done), "models", {}
-                )
-            self.assertTrue(scope.cancel_called)
-            self.assertTrue(entered.is_set())
-            release.set()
-            self.assertTrue(await anyio.to_thread.run_sync(done.wait, 2))
+            """Cancel one official MCP request and observe real broker resources."""
+            environment = {
+                **os.environ,
+                "PYTHONPATH": str(_ROOT / "src"),
+                "AGENT_RUN_TEST_SOCKET": str(socket_path),
+                "AGENT_RUN_TEST_DONE": str(done_path),
+            }
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-c", server_code],
+                env=environment,
+                cwd=_ROOT,
+            )
+            with anyio.fail_after(10):
+                async with stdio_client(parameters) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        scope = anyio.CancelScope()
+                        finished = anyio.Event()
 
-        anyio.run(exercise)
+                        async def call() -> None:
+                            """Run one cancellable request through the official client."""
+                            try:
+                                with scope:
+                                    await session.call_tool("models")
+                            finally:
+                                finished.set()
+
+                        async with anyio.create_task_group() as group:
+                            group.start_soon(call)
+                            self.assertTrue(await anyio.to_thread.run_sync(admitted.wait, 2))
+                            scope.cancel()
+                            await finished.wait()
+                            while not done_path.exists():
+                                await anyio.sleep(0.01)
+                            await anyio.sleep(0.1)
+                            self.assertFalse(release.is_set())
+                            self.assertEqual(len(connections), 1, "aborted calls must not retry")
+                            release.set()
+                            group.cancel_scope.cancel()
+
+        try:
+            anyio.run(exercise)
+        finally:
+            release.set()
+            stop.set()
+            listener.close()
+            accept_thread.join(timeout=1)
+            for handler in handlers:
+                handler.join(timeout=1)
+            temporary.cleanup()
 
     def test_oversized_stdio_frame_stays_bounded_and_uses_sdk_error_path(self) -> None:
         """Reject a frame above the former one-MiB ceiling without manual MCP parsing."""
@@ -168,10 +252,49 @@ class McpSdkTests(unittest.TestCase):
             writer.join(timeout=1)
             reader.close()
 
+    def test_full_one_mib_frame_completes_within_bounded_deadline(self) -> None:
+        """Read the exact protocol ceiling without truncation or pathological delay."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        payload = b"x" * MAX_LINE_BYTES + b"\n"
+
+        def write_frame() -> None:
+            """Feed the ceiling-sized frame through a real bounded pipe."""
+            try:
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(write_fd, view) :]
+            finally:
+                os.close(write_fd)
+
+        async def consume() -> list[str]:
+            """Collect one ceiling-sized frame under a sane five-second deadline."""
+            with anyio.fail_after(5):
+                return [line async for line in _BoundedInput(reader)]
+
+        writer = threading.Thread(target=write_frame)
+        writer.start()
+        try:
+            frames = anyio.run(consume)
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(len(frames[0]), MAX_LINE_BYTES)
+        finally:
+            writer.join(timeout=1)
+            reader.close()
+
     def test_idle_pipe_cancellation_releases_the_raw_read_worker(self) -> None:
         """Exit a cancelled SDK reader even while the peer keeps its pipe open and idle."""
         read_fd, write_fd = os.pipe()
         reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        worker_done = threading.Event()
+        real_read = os.read
+
+        def tracked_read(fd: int, size: int) -> bytes:
+            """Record when the genuine blocking raw read worker actually exits."""
+            try:
+                return real_read(fd, size)
+            finally:
+                worker_done.set()
 
         async def consume() -> None:
             """Block on an idle bounded input until the enclosing lifecycle cancels it."""
@@ -187,7 +310,9 @@ class McpSdkTests(unittest.TestCase):
                     group.cancel_scope.cancel()
 
         try:
-            anyio.run(cancel_reader)
+            with patch("agent_run.mcp.os.read", tracked_read):
+                anyio.run(cancel_reader)
+            self.assertTrue(worker_done.wait(1), "cancelled raw read worker stayed blocked")
         finally:
             os.close(write_fd)
             try:

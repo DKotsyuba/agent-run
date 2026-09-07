@@ -1,8 +1,11 @@
 import io
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
+
+from mcp.types import LATEST_PROTOCOL_VERSION
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -90,14 +93,44 @@ class DocCliTests(unittest.TestCase):
 
 class DocMcpTests(unittest.TestCase):
     def run_server(self, lines):
-        source = io.StringIO("".join(json.dumps(line) + "\n" for line in lines))
+        """Run requests after the official MCP initialization lifecycle."""
+
+        class _DelayedEofInput(io.StringIO):
+            """Give concurrent SDK callbacks a bounded grace period before EOF."""
+
+            def read(self, size=-1):
+                """Return buffered input, then delay the EOF that stops the SDK runner."""
+                value = super().read(size)
+                if not value:
+                    time.sleep(0.2)
+                return value
+
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test-doc", "version": "1"},
+            },
+        }
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        source = _DelayedEofInput(
+            "".join(json.dumps(line) + "\n" for line in [initialize, initialized, *lines])
+        )
         output = io.StringIO()
 
         class _NoService:
             pass
 
-        self.assertEqual(serve(_Broker(_NoService()), source, output), 0)
-        return [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(serve(lambda: _Broker(_NoService()), source, output), 0)
+        responses = {
+            response["id"]: response
+            for line in output.getvalue().splitlines()
+            if (response := json.loads(line)).get("id") != 0
+        }
+        return [responses[line["id"]] for line in lines]
 
     def test_doc_tool_is_listed(self):
         """Expose the documentation tool among all nineteen shared tools."""
