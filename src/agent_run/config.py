@@ -6,9 +6,21 @@ import math
 import re
 import tomllib
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping
+
+from pydantic import (
+    ConfigDict,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    ValidationError as PydanticValidationError,
+    create_model,
+)
 
 from .errors import ValidationError
 
@@ -19,6 +31,16 @@ _IMPORT_REF = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*\Z"
 )
 _ACCOUNT_LABEL = re.compile(r"[a-z0-9_-]{1,32}\Z")
+
+# Strict adapters validate TOML containers and scalars without coercion. Their
+# diagnostics are deliberately translated below so raw configured values never
+# reach owner-facing errors.
+_TABLE_ADAPTER = TypeAdapter(dict[StrictStr, object], config=ConfigDict(strict=True))
+_STRING_ADAPTER = TypeAdapter(StrictStr)
+_STRINGS_ADAPTER = TypeAdapter(list[StrictStr], config=ConfigDict(strict=True))
+_BOOL_ADAPTER = TypeAdapter(StrictBool)
+_INT_ADAPTER = TypeAdapter(StrictInt)
+_NUMBER_ADAPTER = TypeAdapter(StrictFloat)
 
 
 @dataclass(frozen=True)
@@ -110,6 +132,8 @@ class RuntimeConfig:
     ``priority_multiplier`` is a positive finite routing weight. It is applied
     only to that runtime's capacity priority and defaults to ``1.0``. Account
     and quota-lane mappings optionally override it for opaque descriptors.
+    ``plugin_snapshot_assets`` maps a uniquely configured plugin basename to
+    explicit relative non-secret assets that a runtime may snapshot.
     """
 
     enabled: bool
@@ -131,6 +155,7 @@ class RuntimeConfig:
     priority_lane_multipliers: Mapping[str, float] = field(default_factory=dict)
     rust: RustConfig | None = None
     environment: EnvironmentConfig | None = None
+    plugin_snapshot_assets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -155,28 +180,59 @@ AgentRunConfig = Config
 
 
 def _table(value: object, path: str) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise ValidationError(f"{path} must be a table")
-    return value
+    """Return a strict string-keyed table or raise a value-safe error."""
+
+    try:
+        return _TABLE_ADAPTER.validate_python(value)
+    except PydanticValidationError:
+        raise ValidationError(f"{path} must be a table") from None
+
+
+@lru_cache
+def _extra_forbid_model(allowed: tuple[str, ...]) -> type:
+    """Build the cached strict Pydantic model for one allowed field set."""
+
+    return create_model(
+        "_StrictConfigTable",
+        __config__=ConfigDict(strict=True, extra="forbid"),
+        **{name: (object, None) for name in allowed},
+    )
 
 
 def _reject_unknown(table: Mapping[str, object], allowed: set[str], path: str) -> None:
-    for key in table:
-        if key not in allowed:
-            field = f"{path}.{key}" if path else key
-            raise ValidationError(f"unknown config field: {field}")
+    """Reject extra table keys through Pydantic without echoing their values."""
+
+    try:
+        _extra_forbid_model(tuple(sorted(allowed))).model_validate(table)
+    except PydanticValidationError as error:
+        key = str(error.errors(include_input=False)[0]["loc"][0])
+        field = f"{path}.{key}" if path else key
+        raise ValidationError(f"unknown config field: {field}") from None
 
 
 def _string(value: object, path: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    """Return a strict nonblank string without exposing a rejected value."""
+
+    try:
+        text = _STRING_ADAPTER.validate_python(value)
+    except PydanticValidationError:
+        raise ValidationError(f"{path} must be a nonblank string") from None
+    if not text.strip():
         raise ValidationError(f"{path} must be a nonblank string")
-    return value
+    return text
 
 
 def _strings(value: object, path: str) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        raise ValidationError(f"{path} must be an array of strings")
-    return tuple(_string(item, f"{path}[{index}]") for index, item in enumerate(value))
+    """Return a strict string array without coercing tuples or element types."""
+
+    try:
+        values = _STRINGS_ADAPTER.validate_python(value)
+    except PydanticValidationError:
+        raise ValidationError(f"{path} must be an array of strings") from None
+    for index, item in enumerate(values):
+        if not item.strip():
+            raise ValidationError(f"{path}[{index}] must be a nonblank string")
+    return tuple(values)
 
 
 def _names(value: object, path: str) -> tuple[str, ...]:
@@ -212,21 +268,36 @@ def _priority_multipliers(value: object, path: str) -> Mapping[str, float]:
 
 
 def _bool(value: object, path: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValidationError(f"{path} must be a boolean")
-    return value
+    """Return a strict boolean without integer coercion."""
+
+    try:
+        return _BOOL_ADAPTER.validate_python(value)
+    except PydanticValidationError:
+        raise ValidationError(f"{path} must be a boolean") from None
 
 
 def _int(value: object, path: str, *, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    """Return a strict integer at or above ``minimum``."""
+
+    try:
+        parsed = _INT_ADAPTER.validate_python(value)
+    except PydanticValidationError:
+        raise ValidationError(f"{path} must be an integer >= {minimum}") from None
+    if parsed < minimum:
         raise ValidationError(f"{path} must be an integer >= {minimum}")
-    return value
+    return parsed
 
 
 def _number(value: object, path: str, *, minimum: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < minimum:
+    """Return a strict finite number at or above ``minimum``."""
+
+    try:
+        parsed = _NUMBER_ADAPTER.validate_python(value)
+    except PydanticValidationError:
+        raise ValidationError(f"{path} must be a number >= {minimum}") from None
+    if not math.isfinite(parsed) or parsed < minimum:
         raise ValidationError(f"{path} must be a number >= {minimum}")
-    return float(value)
+    return parsed
 
 
 def _path(value: object, path: str, *, resolve: bool = True) -> Path:
@@ -276,6 +347,51 @@ def _plugin_dirs(value: object, path: str) -> tuple[Path, ...]:
             raise ValidationError(f"{entry} is declared twice: {directory}")
         plugins.append(directory)
     return tuple(plugins)
+
+
+def _plugin_snapshot_assets(
+    value: object,
+    path: str,
+    plugins: tuple[Path, ...],
+) -> Mapping[str, tuple[str, ...]]:
+    """Validate explicit relative assets for uniquely named configured plugins.
+
+    Keys must match one configured plugin directory basename unambiguously.
+    Each value is a nonempty array of unique relative POSIX paths without NUL,
+    dot traversal, or glob syntax. The returned mapping is immutable. Actual
+    filesystem containment and symlink rejection belong to materialization.
+    """
+
+    table = _table(value, path)
+    plugin_names: dict[str, int] = {}
+    for plugin in plugins:
+        plugin_names[plugin.name] = plugin_names.get(plugin.name, 0) + 1
+
+    result: dict[str, tuple[str, ...]] = {}
+    for plugin_name, raw_assets in table.items():
+        if plugin_name not in plugin_names:
+            raise ValidationError(f"{path}.{plugin_name} references an unknown plugin")
+        if plugin_names[plugin_name] != 1:
+            raise ValidationError(f"{path}.{plugin_name} must match one configured plugin")
+        assets = _strings(raw_assets, f"{path}.{plugin_name}")
+        if not assets:
+            raise ValidationError(f"{path}.{plugin_name} must not be empty")
+        if len(set(assets)) != len(assets):
+            raise ValidationError(f"{path}.{plugin_name} must not contain duplicates")
+        for index, asset in enumerate(assets):
+            candidate = PurePosixPath(asset)
+            if (
+                "\0" in asset
+                or candidate.is_absolute()
+                or not candidate.parts
+                or any(part in {".", ".."} for part in candidate.parts)
+                or any(character in asset for character in "*?[]")
+            ):
+                raise ValidationError(
+                    f"{path}.{plugin_name}[{index}] must be a relative POSIX path without dot traversal or glob syntax"
+                )
+        result[plugin_name] = assets
+    return MappingProxyType(result)
 
 
 def _env_names(value: object, path: str) -> tuple[str, ...]:
@@ -525,8 +641,9 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
     state. The binary keeps its configured absolute path verbatim (``~``
     expanded, symlinks unresolved) so a version-managed launcher symlink keeps
     anchoring its own interpreter directory; every other path field resolves.
-    Optional account/auth, hook, plugin, capacity-source, and concurrency
-    fields retain their existing validation. A legacy ``runtimes.opencode``
+    Optional account/auth, hook, plugin, explicit plugin snapshot asset,
+    capacity-source, and concurrency fields retain their existing validation.
+    A legacy ``runtimes.opencode``
     table is accepted but omitted: OpenCode is no longer a launchable runtime,
     while accepting the old table keeps state-only commands available during
     migration. ``priority_multiplier`` defaults
@@ -547,6 +664,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         "auth",
         "hooks",
         "plugins",
+        "plugin_snapshot_assets",
         "limits_source",
         "accounts",
         "default_account",
@@ -612,6 +730,12 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
                 environment = environments[environment_name]
             except KeyError as error:
                 raise ValidationError(f"{path}.environment references unknown environment {environment_name!r}") from error
+        plugins = _plugin_dirs(table.get("plugins", []), f"{path}.plugins")
+        plugin_snapshot_assets = _plugin_snapshot_assets(
+            table.get("plugin_snapshot_assets", {}),
+            f"{path}.plugin_snapshot_assets",
+            plugins,
+        )
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -623,7 +747,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             None if maximum is None else _int(maximum, f"{path}.max_active_agents", minimum=1),
             parsed_auth,
             _parse_hooks(table.get("hooks", []), f"{path}.hooks"),
-            _plugin_dirs(table.get("plugins", []), f"{path}.plugins"),
+            plugins,
             None if limits_source is None else _string(limits_source, f"{path}.limits_source"),
             account_names,
             default_account,
@@ -632,6 +756,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             lane_multipliers,
             rust,
             environment,
+            plugin_snapshot_assets,
         )
         if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(
