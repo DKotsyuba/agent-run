@@ -409,6 +409,18 @@ adapter = "example:ADAPTER"
 binary = "/bin/echo"
 home = "/tmp/home"
 models = ["test"]
+service_mode = "managed"
+""",
+                "runtimes.fake.service_mode",
+            ),
+            (
+                """schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/home"
+models = ["test"]
 [[runtimes.fake.hooks]]
 event = "x"
 command = ["x"]

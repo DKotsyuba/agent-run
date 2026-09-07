@@ -303,8 +303,6 @@ class CodexAdapter:
         """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
-        if config.service_mode is not None:
-            raise ValidationError("codex runtime does not use service_mode")
         if config.auth is None or config.auth.kind != "file_link":
             raise ValidationError("codex runtime requires a file_link auth bridge")
         if not config.models:

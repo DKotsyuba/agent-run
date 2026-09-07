@@ -122,7 +122,6 @@ class RuntimeConfig:
     max_active_agents: int | None = None
     auth: RuntimeAuthConfig | None = None
     hooks: tuple[RuntimeHookConfig, ...] = ()
-    service_mode: str | None = None
     plugins: tuple[Path, ...] = ()
     limits_source: str | None = None
     accounts: tuple[str, ...] = ()
@@ -547,7 +546,6 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         "max_active_agents",
         "auth",
         "hooks",
-        "service_mode",
         "plugins",
         "limits_source",
         "accounts",
@@ -571,7 +569,6 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             raise ValidationError(f"{path}.models must not be empty")
         maximum = table.get("max_active_agents")
         auth = table.get("auth")
-        service_mode = table.get("service_mode")
         limits_source = table.get("limits_source")
         accounts = table.get("accounts", [])
         account_names = _strings(accounts, f"{path}.accounts")
@@ -626,7 +623,6 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             None if maximum is None else _int(maximum, f"{path}.max_active_agents", minimum=1),
             parsed_auth,
             _parse_hooks(table.get("hooks", []), f"{path}.hooks"),
-            None if service_mode is None else _string(service_mode, f"{path}.service_mode"),
             _plugin_dirs(table.get("plugins", []), f"{path}.plugins"),
             None if limits_source is None else _string(limits_source, f"{path}.limits_source"),
             account_names,
@@ -637,8 +633,6 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             rust,
             environment,
         )
-        if result[name].service_mode not in {None, "managed"}:
-            raise ValidationError(f"{path}.service_mode must be 'managed'")
         if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(
                 f"{path}.limits_source must be one of 'native', 'omniroute', 'codexbar', 'codex_appserver', 'none'"

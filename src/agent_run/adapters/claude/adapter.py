@@ -82,8 +82,6 @@ class ClaudeAdapter:
         applied only by ``prepare``; invalid auth, plugins, or hooks raise
         ``ValidationError`` without touching the filesystem.
         """
-        if config.service_mode is not None:
-            raise ValidationError("claude runtime does not support service_mode")
         if config.auth is None:
             raise ValidationError("claude runtime requires an auth bridge")
         if config.auth.kind != "environment":

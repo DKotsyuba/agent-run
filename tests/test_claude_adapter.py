@@ -108,9 +108,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unsupported entries"):
             self.adapter.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("ROGUE_VAR",))))
 
-    def test_validate_refuses_service_mode_and_unknown_hook_events(self) -> None:
-        with self.assertRaisesRegex(ValidationError, "service_mode"):
-            self.adapter.validate(self.runtime_config(service_mode="managed"))
+    def test_validate_refuses_unknown_hook_events(self) -> None:
         with self.assertRaisesRegex(ValidationError, "not a known Claude hook event"):
             self.adapter.validate(
                 self.runtime_config(hooks=(RuntimeHookConfig("BogusEvent", ("echo",)),))

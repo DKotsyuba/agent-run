@@ -115,12 +115,10 @@ env_from = ["PATH"]
         with self.assertRaises(TypeError):
             ADAPTER.materialize(self.runtime_config(), self.home)
 
-    def test_validate_requires_file_link_auth_and_no_service_mode(self) -> None:
+    def test_validate_requires_file_link_auth(self) -> None:
         ADAPTER.validate(self.runtime_config())
         with self.assertRaisesRegex(ValidationError, "file_link auth bridge"):
             ADAPTER.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("TOKEN",))))
-        with self.assertRaisesRegex(ValidationError, "service_mode"):
-            ADAPTER.validate(self.runtime_config(service_mode="managed"))
 
     def test_declared_rust_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
         """Codex keeps isolated homes while declared Rust reaches both child boundaries."""
