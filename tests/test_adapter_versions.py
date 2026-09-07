@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from agent_run.adapters import version as version_module
@@ -72,3 +75,38 @@ def test_version_command_receives_no_ambient_secret(
         "if [ -n \"$AGENT_RUN_TEST_SECRET\" ]; then printf leaked; else printf 'clean 1\\n'; fi",
     )
     assert observe_binary_version(binary, tmp_path) == ("clean 1", None)
+
+
+def test_grandchild_holding_stdout_cannot_outlive_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOF held by an owned grandchild times out and kills the full process group."""
+
+    monkeypatch.setattr(version_module, "_VERSION_TIMEOUT_SECONDS", 0.5)
+    binary = tmp_path / "runtime"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(6)'])\n"
+        "open(os.path.join(os.environ['HOME'], 'child-pid'), 'w').write(str(child.pid))\n"
+        "print('1.2.3')\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o700)
+    started = time.monotonic()
+    version, diagnostic = observe_binary_version(binary, tmp_path)
+    elapsed = time.monotonic() - started
+    assert version is None
+    assert diagnostic == "version command timed out after 0.5 seconds"
+    assert elapsed < 1.5
+    child_pid = int((tmp_path / "child-pid").read_text(encoding="utf-8"))
+    for _ in range(50):
+        try:
+            child_status = psutil.Process(child_pid).status()
+        except psutil.NoSuchProcess:
+            break
+        if child_status == psutil.STATUS_ZOMBIE:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("owned version grandchild survived process-group cleanup")
