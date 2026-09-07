@@ -1,8 +1,7 @@
 # agent-run architecture
 
 How the pieces fit, as shipped today. For the operator's how-to see
-`agent-run doc`; for API integration see [api.md](api.md); for workflow
-scripts see [workflows.md](workflows.md).
+`agent-run doc`; for API integration see [api.md](api.md).
 
 ## Managed Codex context
 
@@ -114,9 +113,9 @@ Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 10`.
 Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
 `commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
 `deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
-`capacity_route_snapshots`,
-`workflow_runs` / `workflow_steps` / `workflow_deliveries`, `run_stats`,
-`context_receipts`.
+`capacity_route_snapshots`, `run_stats`, and `context_receipts`. Legacy
+`workflow_runs`, `workflow_steps`, and `workflow_deliveries` tables remain so
+upgrades preserve historical rows; no current product path reads or writes them.
 
 Schema changes ship as numbered migrations (`state/migrations/`) with a
 pre-migration backup; components version-check and refuse to run against a
@@ -165,7 +164,7 @@ the same contract, exposed by the MCP `start` description and `agent-run doc
 completion`; they are not repeated in each notice. The contract explains
 asynchronous launch, bound delivery, result retrieval, and why a completion
 notice is neither a new task nor user approval. Host-added trust warnings remain
-under the host's control. Workflow notices keep their separate format.
+under the host's control.
 The local relay protocol accepts strict legacy v1 requests, selector-bearing v2,
 and failure-aware v3. A current host advertises `ar-cdx-v3-*.sock`; clients
 prefer v3, then v2, and use legacy requests for older hosts. Old clients send
@@ -180,16 +179,6 @@ retryable; unknown acceptance after transmission remains ambiguous and
 retryable. Relay discovery has a ten-second total budget and the host call
 has an eight-second budget, within the existing thirty-second lease.
 The Node wrapper preserves MCP stdio and removes its socket on child exit.
-
-## Workflows
-
-A restricted Python script (AST-guarded: five names, no imports/IO) runs
-in a detached runner; every `agent()` step goes through the same
-`AgentService.start`, so limits, profiles, and permissions apply
-unchanged. Steps are journaled with their spec hash; `workflow resume`
-replays a failed/lost run under the same id, serving completed steps from
-the journal cache and re-running only the broken tail. `batch` generates
-the one-phase parallel script for you.
 
 ## Capacity and limits
 

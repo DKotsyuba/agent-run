@@ -125,9 +125,9 @@ def test_agent_service_resolve_account_validates_defaults_and_overrides() -> Non
 
 
 def test_tools_table_and_mcp_tools_list_are_exactly_pinned() -> None:
-    """Keep all twenty-one shared tools identical through MCP discovery."""
+    """Keep all sixteen shared tools identical through MCP discovery."""
 
-    assert len(TOOLS) == 21
+    assert len(TOOLS) == 16
     assert TOOL_NAMES == frozenset(tool["name"] for tool in TOOLS)
 
     output = StringIO()

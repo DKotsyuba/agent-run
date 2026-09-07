@@ -203,7 +203,7 @@ class ApiSocketTests(unittest.TestCase):
 
     def test_surface_is_dispatch_tools_plus_control_methods(self):
         self.assertEqual(
-            METHOD_NAMES, TOOL_NAMES | {"tools", "ping", "wait", "workflow_wait"}
+            METHOD_NAMES, TOOL_NAMES | {"tools", "ping", "wait"}
         )
 
     def test_wait_returns_the_answer_envelope_when_agent_finishes(self):

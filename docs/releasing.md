@@ -69,14 +69,14 @@ Options: `--publish-only` skips local deployment; `--home` defaults to
 `~/.agent-run`; `--python` defaults to `python3.14`; `--launchd-prefix` defaults
 to `com.<login>.agent-run`; `--timeout` and `--poll` are positive seconds,
 defaulting to 3600 and 10. Publication itself can run on other operating systems.
-Timeouts stop waiting; they do not cancel a remote workflow or active agent.
+Timeouts stop waiting; they do not cancel a remote CI run or active agent.
 
 Local deployment verifies the wheel and `requirements.lock`, installs the
 hash-pinned dependency closure, installs the wheel without re-resolving it, and
 runs `pip check` before it seals the release. A release missing the lock is
 refused. It then verifies or reuses the sealed release and runs isolated
 init/doctor/API/MCP checks. It waits for every active
-agent and workflow, reserves the SQLite writer while stopping API admission and
+agent, reserves the SQLite writer while stopping API admission and
 loaded periodic jobs, then rechecks quiescence. Before migration it backs up
 SQLite with its backup API, saves configuration and the previous pointer under
 `<home>/standalone/backups/`, and records a private deployment journal. Migration

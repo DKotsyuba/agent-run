@@ -11,7 +11,6 @@ from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.process_identity import ProcessState, observe_process
 
 from .db import immediate, integer, nonblank, timestamp
-from .workflow import finish_workflow_run
 
 if TYPE_CHECKING:
     from .store import StateStore
@@ -257,11 +256,10 @@ def reconcile_active_agents(
 
 
 def process_owner_identity(pid: int, identity: str) -> str:
-    """Return a workflow owner's PID plus diagnostic command text.
+    """Return a process owner's PID plus diagnostic command text.
 
-    The PID remains in the legacy text column for compatibility. Reconciliation
-    uses it only with the separately persisted process birth time; command text
-    is never ownership authority.
+    Reconciliation uses the PID only with the separately persisted process
+    birth time; command text is never ownership authority.
     """
 
     integer("pid", pid, minimum=1)
@@ -269,7 +267,7 @@ def process_owner_identity(pid: int, identity: str) -> str:
 
 
 def _owner_pid(owner: str) -> int | None:
-    """Return the positive PID encoded by a legacy workflow owner string."""
+    """Return the positive PID encoded by a process owner string."""
 
     head, _, _rest = owner.partition(" ")
     try:
@@ -277,52 +275,3 @@ def _owner_pid(owner: str) -> int | None:
     except ValueError:
         return None
     return pid if pid > 1 else None
-
-
-def reconcile_workflow_runs(store, *, at: float | None = None, limit: int = 100) -> tuple[str, ...]:
-    """Flip every run whose owning runner is gone to ``lost``; never resume one.
-
-    Mirrors :func:`reconcile_active_agents`: the owner text carries its PID and
-    the separate birth-time column proves whether that PID is still the same
-    process. A run no runner has claimed yet is nobody's to lose. Missing legacy
-    birth evidence, access denial, and other unavailable observations remain
-    unknown while a confirmed absent or reused owner becomes lost.
-    """
-
-    integer("limit", limit, minimum=1)
-    rows = list(
-        store.connection.execute(
-            """SELECT id, owner_pid_identity, owner_birth_time FROM workflow_runs
-               WHERE status IN ('created', 'running') AND owner_pid_identity IS NOT NULL
-               ORDER BY created_at, id LIMIT ?""",
-            (limit,),
-        )
-    )
-    changed = []
-    for row in rows:
-        owner = row["owner_pid_identity"]
-        if not isinstance(owner, str):
-            continue
-        pid = _owner_pid(owner)
-        if pid is None:
-            continue  # an owner identity that cannot be probed is not a verdict
-        birth = row["owner_birth_time"]
-        observation = observe_process(
-            pid, float(birth) if isinstance(birth, (int, float)) else None
-        )
-        if observation.state in {
-            ProcessState.ALIVE,
-            ProcessState.UNKNOWN,
-            ProcessState.DENIED,
-        }:
-            continue
-        try:
-            finish_workflow_run(store.connection, str(row["id"]), "lost", at=at)
-        except (ValidationError, StateTransitionError):
-            continue  # one stale or concurrently changed row never aborts the sweep
-        changed.append(str(row["id"]))
-    if changed:
-        _logger.info("reconcile_workflow_runs candidates=%d changed_to_lost=%d", len(rows), len(changed))
-    else:
-        _logger.debug("reconcile_workflow_runs candidates=%d changed_to_lost=%d", len(rows), len(changed))
-    return tuple(changed)

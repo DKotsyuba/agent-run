@@ -507,6 +507,13 @@ target = "auth.json"
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(output), {"agent_id": "x"})
 
+    def test_removed_workflow_commands_are_not_parsed(self):
+        """Legacy workflow and batch entry points are absent from the CLI."""
+
+        for command in (["workflow", "status", "wf_old"], ["batch", "--file", "-"]):
+            with self.subTest(command=command), self.assertRaises(ValidationError):
+                cli._parser().parse_args(command)
+
     def test_capacity_launchd_renders_config_without_state_or_collection(self):
         import plistlib
 
@@ -1010,8 +1017,7 @@ target = "auth.json"
                 "capacity_order", "start", "fast", "cancel", "steer", "status", "list_agents",
                 "list_orchestrators",
                 "summary", "transcript", "answer", "models", "limits", "doc",
-                "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
-                "workflow_resume", "resume", "chain",
+                "resume", "chain",
             ],
         )
 

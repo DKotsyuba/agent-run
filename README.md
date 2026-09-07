@@ -3,7 +3,7 @@
 Local supervisor for coding agents. Start Codex, Claude Code, GLM, Qwen
 Code children as **durable asynchronous jobs** on your own
 machine — with one state store, honest outcome verification, quota
-tracking, multi-step workflows, and three equal access layers: a CLI, an
+tracking, and three equal access layers: a CLI, an
 MCP server, and a Unix-socket JSON-RPC API.
 
 Built for orchestration: one agent (or script, or human) hands out work to
@@ -16,7 +16,7 @@ you / your agent / your app
    CLI ─┼─ MCP (stdio) ─── JSON-RPC (unix socket)      ← three transports,
         │                                                 one tool surface
    AgentService ── SQLite state (durable agents, events,
-        │          transcripts, deliveries, workflows, run stats)
+        │          transcripts, deliveries, run stats)
    adapters + supervisor
         │
    codex · claude · glm · qwen                          ← engine CLIs you
@@ -32,7 +32,7 @@ you / your agent / your app
   (completion sentinels, answer hashes, classified failure kinds) — not
   from an engine's exit code. Error-only replies, stalls, and timeouts are
   classified, not celebrated.
-- **One tool table, three transports.** The same 18 verbs are exposed via
+- **One tool table, three transports.** The same tool surface is exposed via
   CLI, MCP, and the socket API, generated from a single dispatcher; a
   parity test keeps them from drifting.
 - **Isolated children.** Each run gets a generated home: no ambient
@@ -54,7 +54,7 @@ to drive (`codex`, `claude`, `qwen` — any subset).
 
 | Feature | macOS | Linux |
 |---|---:|---:|
-| Core CLI, MCP, socket API, workflows | yes | yes |
+| Core CLI, MCP, socket API | yes | yes |
 | Environment/file-based runtime auth | yes | yes |
 | Keychain auth fallback and launchd helpers | yes | no |
 | Optional codexbar / local OmniRoute capacity sources | when installed | when installed |
@@ -203,9 +203,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 
 The proxy exposes the same tool surface as the resident daemon: `start`,
 `status`, `answer`, `wait`-free async flow, `cancel`, `steer`, `summary`,
-`transcript`, `list_agents`, `models`, `limits`, `capacity_order`, `fast`, `doc`, and
-`workflow_start` / `workflow_status` / `workflow_answer` /
-`workflow_cancel` / `workflow_resume`.
+`transcript`, `list_agents`, `models`, `limits`, `capacity_order`, `fast`, and `doc`.
 
 **Claude Code:**
 
@@ -240,32 +238,15 @@ agent-run api serve          # binds ~/.agent-run/api.sock, chmod 0600
 ```
 
 Plain JSON-RPC 2.0, method = tool name, plus `tools` (schema discovery),
-`ping`, and blocking `wait` / `workflow_wait`. Full integration guide with
+`ping`, and blocking `wait`. Full integration guide with
 a copy-paste Python client: [docs/api.md](docs/api.md).
-
-## Workflows
-
-Multi-step, multi-engine plans run as **durable script workflows**: a
-restricted Python script (no imports, no I/O — just `agent()`,
-`parallel()`, `pipeline()`, `phase()`, `log()`) executed by a detached
-runner, journaled step by step, resumable after failure without re-running
-completed steps.
-
-```bash
-agent-run workflow start review-fan "$(cat plan.wf)"
-agent-run workflow wait wf_...
-```
-
-Script contract and examples: [docs/workflows.md](docs/workflows.md).
-`agent-run batch --file jobs.json` is the degenerate case: one flat
-parallel group without writing a script.
 
 ## What's in the box
 
 | Surface | Command | Notes |
 |---|---|---|
 | CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
-| MCP server | `agent-run mcp` | stdio, 18 tools |
+| MCP server | `agent-run mcp` | stdio, shared tool surface |
 | JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
 | Operator guide | `agent-run doc` | built into the package |
 | Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
@@ -283,7 +264,6 @@ macOS Git bootstrap).
 - [docs/architecture.md](docs/architecture.md) — how the pieces fit
 - [docs/api.md](docs/api.md) — socket API integration guide
 - [docs/delegation-authorization.md](docs/delegation-authorization.md) — owner-adopted delegation and context-transfer authorization
-- [docs/workflows.md](docs/workflows.md) — workflow script contract
 - [docs/tui.md](docs/tui.md) — terminal dashboard (`agent-run-tui`)
 - [docs/releasing.md](docs/releasing.md) — version, CI, and GitHub Release procedure
 - [CHANGELOG.md](CHANGELOG.md) — user-visible changes by version

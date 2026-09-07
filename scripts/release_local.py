@@ -174,10 +174,11 @@ def prepare(runner: Runner, target: Path, wheel: Path, requirements: Path, versi
 
 
 def active(connection: sqlite3.Connection) -> int:
-    """Count every active agent/workflow on caller-owned SQLite connection; read only."""
-    agents = connection.execute("SELECT count(*) FROM agents WHERE status IN ('created','starting','running','cancelling')").fetchone()[0]
-    workflows = connection.execute("SELECT count(*) FROM workflow_runs WHERE status IN ('created','running')").fetchone()[0]
-    return agents + workflows
+    """Count active agents on the caller-owned SQLite connection; read only."""
+
+    return connection.execute(
+        "SELECT count(*) FROM agents WHERE status IN ('created','starting','running','cancelling')"
+    ).fetchone()[0]
 
 
 def database(home: Path) -> sqlite3.Connection:
@@ -378,7 +379,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, requirements: Path, version:
                 connection.close()
             if not count:
                 break
-            runner.pause(f"{count} active agents/workflows to finish")
+            runner.pause(f"{count} active agents to finish")
         backup = standalone / "backups" / f"{time.time_ns()}-{sha}"
         backup.mkdir(parents=True, mode=0o700)
         journal = {"stage": "stopping", "previous": str(previous), "target": str(target),
@@ -386,7 +387,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, requirements: Path, version:
                    "backup": str(backup), "jobs": jobs}
         save_journal(journal_path, journal)
         try:
-            # Start admission and workflow creation reserve this same SQLite writer lock.
+            # Start admission reserves this same SQLite writer lock.
             connection = sqlite3.connect(home / "state.db", timeout=5)
             try:
                 connection.execute("BEGIN IMMEDIATE")

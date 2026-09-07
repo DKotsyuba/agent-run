@@ -1,8 +1,8 @@
-"""Blocking ``wait`` verbs: poll the durable store until a run is terminal.
+"""Blocking ``wait``: poll the durable store until an agent is terminal.
 
-``agent-run wait AGENT_ID`` and ``agent-run workflow wait RUN_ID`` replace the
-hand-rolled ``until agent-run status ...; sleep`` loops orchestrators fall back
-to when the MCP server is unavailable. The polling loop lives here so
+``agent-run wait AGENT_ID`` replaces the hand-rolled
+``until agent-run status ...; sleep`` loop orchestrators fall back to when the
+MCP server is unavailable. The polling loop lives here so
 :mod:`agent_run.cli` only wires parsed arguments to it, and both the sleeper
 and the clock are injectable so tests advance virtual time without really
 sleeping. Every poll goes through the same service facade the other verbs use;
@@ -33,12 +33,6 @@ AGENT_EXIT_CODES: Mapping[str, int] = MappingProxyType(
     {"succeeded": 0, "failed": 2, "lost": 2, "cancelled": 3, "timed_out": 4}
 )
 
-#: Workflow run status -> process exit code; ``lost`` shares the failure code.
-WORKFLOW_EXIT_CODES: Mapping[str, int] = MappingProxyType(
-    {"succeeded": 0, "failed": 2, "lost": 2, "cancelled": 3}
-)
-
-
 @dataclass(frozen=True)
 class WaitOutcome:
     """What a wait verb prints and returns once it stops waiting.
@@ -68,22 +62,6 @@ def _status_name(status: object) -> str:
     if isinstance(status, Enum):
         return str(status.value)
     return str(status)
-
-
-def _workflow_status(report: object) -> str:
-    """Read the run status out of a ``workflow status`` report.
-
-    ``report`` is whatever the facade returned for the run: the durable journal
-    summary nests the row under ``"run"``, and a flat ``{"status": ...}`` report
-    is accepted as well. Anything unreadable reads as ``"unknown"``.
-    """
-
-    if isinstance(report, Mapping):
-        status = report.get("status")
-        if status is None and isinstance(report.get("run"), Mapping):
-            status = report["run"].get("status")
-        return _status_name(status)
-    return "unknown"
 
 
 def _wait_until_terminal(
@@ -163,38 +141,6 @@ def wait_for_agent(
     return _wait_until_terminal(
         poll_once,
         AGENT_EXIT_CODES,
-        timeout=timeout,
-        poll=poll,
-        sleep=sleep,
-        clock=clock,
-    )
-
-
-def wait_for_workflow(
-    service,
-    run_id: str,
-    *,
-    timeout: float = 0.0,
-    poll: float = DEFAULT_POLL_SECONDS,
-    sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-) -> WaitOutcome:
-    """Block until workflow run ``run_id`` reaches a terminal status.
-
-    ``service`` is the workflow facade the ``workflow status`` verb uses; every
-    poll calls ``service.workflow_status(run_id)`` and the printed payload is
-    that same report, so a terminal run prints exactly what ``workflow status``
-    prints. ``lost`` counts as terminal and exits with the failure code. The
-    remaining arguments and the error behaviour match :func:`wait_for_agent`.
-    """
-
-    def poll_once() -> tuple[str, object]:
-        report = service.workflow_status(run_id)
-        return _workflow_status(report), report
-
-    return _wait_until_terminal(
-        poll_once,
-        WORKFLOW_EXIT_CODES,
         timeout=timeout,
         poll=poll,
         sleep=sleep,
