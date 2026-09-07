@@ -1,4 +1,5 @@
 import hashlib
+import os
 import stat
 import sys
 import tempfile
@@ -17,6 +18,30 @@ from agent_run.errors import PathEscapeError, ValidationError
 
 
 class AdapterHomeTests(unittest.TestCase):
+    def test_managed_replace_fsyncs_file_then_parent_directory(self) -> None:
+        """Publish a replacement only after its bytes and directory entry are synced."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            events = []
+            real_replace = os.replace
+
+            def record_fsync(descriptor: int) -> None:
+                """Record whether the synchronized descriptor is a file or directory."""
+
+                events.append("dir" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
+
+            def record_replace(source, destination) -> None:
+                """Record and perform the atomic replacement."""
+
+                events.append("replace")
+                real_replace(source, destination)
+
+            with patch("agent_run.adapters.home.os.fsync", side_effect=record_fsync), patch(
+                "agent_run.adapters.home.os.replace", side_effect=record_replace
+            ):
+                write_managed_file(Path(directory).resolve(), "answer.md", "done")
+            self.assertEqual(events, ["file", "replace", "dir"])
+
     def test_managed_files_are_private_atomic_and_content_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "generated"
