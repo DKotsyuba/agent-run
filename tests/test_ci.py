@@ -77,9 +77,14 @@ class CiRetryTests(unittest.TestCase):
             self.assertLess(wheel_lock, wheel_artifact)
             self.assertLess(wheel_artifact, workflow.index("-m pip check", wheel))
             sdist = workflow.index('python -m venv "$RUNNER_TEMP/sdist-smoke"')
-            self.assertLess(workflow.index("-r dist/build-requirements.lock", sdist), workflow.index("--no-build-isolation --no-deps dist/*.tar.gz", sdist))
+            sdist_lock_install = workflow.index(
+                "-m pip install --require-hashes --only-binary=:all: -r dist/build-requirements.lock",
+                sdist,
+            )
+            self.assertLess(sdist_lock_install, workflow.index("--no-build-isolation --no-deps dist/*.tar.gz", sdist))
         self.assertIn("requirements.lock > SHA256SUMS", release)
         self.assertIn("dist/requirements.lock dist/SHA256SUMS", release)
+        self.assertIn("subject-checksums: dist/SHA256SUMS", release)
 
     @staticmethod
     def _run_tests_block(workflow: str) -> str:
