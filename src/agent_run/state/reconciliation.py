@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from agent_run.domain import ACTIVE, AgentId, AgentStatus, Outcome
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.process_identity import ProcessState, observe_process
 
 from .db import immediate, integer, nonblank, timestamp
 from .workflow import finish_workflow_run
@@ -128,7 +129,8 @@ def reconcile_unowned_starting(
     changed: list[AgentId] = []
     rows = list(
         store.connection.execute(
-            """SELECT id, startup_owner_pid_identity, startup_deadline_at
+            """SELECT id, startup_owner_pid_identity, startup_owner_birth_time,
+                      startup_deadline_at
                FROM agents
                WHERE status = ? AND supervisor_pid IS NULL
                  AND process_group_id IS NULL AND supervisor_identity IS NULL
@@ -144,16 +146,17 @@ def reconcile_unowned_starting(
         if isinstance(deadline, (int, float)) and deadline > checked_at:
             owner = row["startup_owner_pid_identity"]
             if isinstance(owner, str):
-                pid, expected = _split_owner(owner)
-                if pid is not None and expected:
-                    from ..doctor import _probe_process
-
-                    alive, identity, _group_alive = _probe_process(pid, None)
-                    if alive and (
-                        identity is None
-                        or identity == expected
-                        or (isinstance(identity, str) and identity.endswith(f" {expected}"))
-                    ):
+                pid = _owner_pid(owner)
+                if pid is not None:
+                    birth = row["startup_owner_birth_time"]
+                    observation = observe_process(
+                        pid, float(birth) if isinstance(birth, (int, float)) else None
+                    )
+                    if observation.state in {
+                        ProcessState.ALIVE,
+                        ProcessState.UNKNOWN,
+                        ProcessState.DENIED,
+                    }:
                         owner_live = True
         if owner_live:
             continue
@@ -193,9 +196,14 @@ def reconcile_active_agents(
     at: float | None = None,
     limit: int = 100,
 ) -> tuple[AgentId, ...]:
-    """Boundedly converge unowned starts and dead detached supervisors."""
+    """Boundedly converge abandoned starts and proven-dead supervisors.
 
-    from ..process_identity import ProcessState, observe_process
+    ``store`` is the owning state connection, ``at`` is the optional wall-clock
+    proof time, and ``limit`` caps committed rows. Missing birth evidence may
+    prove an absent legacy PID dead, but a present PID remains unknown; matching
+    births stay active, while differing births prove reuse. Returns changed IDs
+    in storage order and never signals any PID or process group.
+    """
 
     changed = list(reconcile_unowned_starting(store, at=at, limit=limit))
     remaining = limit - len(changed)
@@ -217,9 +225,9 @@ def reconcile_active_agents(
             continue
         # The recorded group is never signalled here: it may be reused, foreign,
         # or shared, and orphan reporting stays diagnostic in the doctor.
-        if not isinstance(birth, (int, float)):
-            continue  # legacy rows have no authoritative birth proof
-        observation = observe_process(pid, float(birth))
+        observation = observe_process(
+            pid, float(birth) if isinstance(birth, (int, float)) else None
+        )
         # Time the proof after this row's probe, so a slow probe cannot be judged
         # against a clock captured before the sweep started.
         checked_at = timestamp(at)
@@ -231,7 +239,10 @@ def reconcile_active_agents(
             committed = store.reconcile(
                 str(row["id"]), verdict="dead" if observation.state is ProcessState.DEAD else "identity_mismatch",
                 supervisor_pid=pid, process_group_id=pgid, expected_identity=expected,
-                alive=observation.state is not ProcessState.DEAD, observed_identity=None, checked_at=checked_at,
+                expected_birth_time=float(birth) if isinstance(birth, (int, float)) else None,
+                alive=observation.state is not ProcessState.DEAD,
+                observed_birth_time=observation.create_time,
+                checked_at=checked_at,
                 reason="periodic detached supervisor reconciliation",
             )
         except (ValidationError, StateTransitionError):
@@ -246,41 +257,42 @@ def reconcile_active_agents(
 
 
 def workflow_owner_identity(pid: int, identity: str) -> str:
-    """The owner string a workflow runner records: its pid, then its ps command.
+    """Return a workflow owner's PID plus diagnostic command text.
 
-    ``workflow_runs`` carries a single ownership column, so the pid has to
-    travel inside the identity for reconciliation to have anything to probe;
-    :func:`reconcile_workflow_runs` splits it back off here.
+    The PID remains in the legacy text column for compatibility. Reconciliation
+    uses it only with the separately persisted process birth time; command text
+    is never ownership authority.
     """
 
     integer("pid", pid, minimum=1)
     return f"{pid} {nonblank('identity', identity).strip()}"
 
 
-def _split_owner(owner: str) -> tuple[int | None, str]:
-    head, _, rest = owner.partition(" ")
+def _owner_pid(owner: str) -> int | None:
+    """Return the positive PID encoded by a legacy workflow owner string."""
+
+    head, _, _rest = owner.partition(" ")
     try:
         pid = int(head)
     except ValueError:
-        return None, owner
-    return (pid if pid > 1 else None), rest.strip()
+        return None
+    return pid if pid > 1 else None
 
 
 def reconcile_workflow_runs(store, *, at: float | None = None, limit: int = 100) -> tuple[str, ...]:
     """Flip every run whose owning runner is gone to ``lost``; never resume one.
 
-    Mirrors :func:`reconcile_active_agents`: the identity the runner claimed the
-    run with carries its pid, so the same ps probe settles liveness.  A run no
-    runner has claimed yet is nobody's to lose, and a live owner whose identity
-    cannot be read is unknown rather than dead.
+    Mirrors :func:`reconcile_active_agents`: the owner text carries its PID and
+    the separate birth-time column proves whether that PID is still the same
+    process. A run no runner has claimed yet is nobody's to lose. Missing legacy
+    birth evidence, access denial, and other unavailable observations remain
+    unknown while a confirmed absent or reused owner becomes lost.
     """
-
-    from ..doctor import _probe_process
 
     integer("limit", limit, minimum=1)
     rows = list(
         store.connection.execute(
-            """SELECT id, owner_pid_identity FROM workflow_runs
+            """SELECT id, owner_pid_identity, owner_birth_time FROM workflow_runs
                WHERE status IN ('created', 'running') AND owner_pid_identity IS NOT NULL
                ORDER BY created_at, id LIMIT ?""",
             (limit,),
@@ -291,16 +303,18 @@ def reconcile_workflow_runs(store, *, at: float | None = None, limit: int = 100)
         owner = row["owner_pid_identity"]
         if not isinstance(owner, str):
             continue
-        pid, expected = _split_owner(owner)
-        if pid is None or not expected:
+        pid = _owner_pid(owner)
+        if pid is None:
             continue  # an owner identity that cannot be probed is not a verdict
-        alive, identity, _group_alive = _probe_process(pid, None)
-        if alive and identity is None:
-            continue  # a live owner without identity is unknown, not a verdict
-        matches = identity == expected or (
-            isinstance(identity, str) and identity.endswith(f" {expected}")
+        birth = row["owner_birth_time"]
+        observation = observe_process(
+            pid, float(birth) if isinstance(birth, (int, float)) else None
         )
-        if alive and matches:
+        if observation.state in {
+            ProcessState.ALIVE,
+            ProcessState.UNKNOWN,
+            ProcessState.DENIED,
+        }:
             continue
         try:
             finish_workflow_run(store.connection, str(row["id"]), "lost", at=at)

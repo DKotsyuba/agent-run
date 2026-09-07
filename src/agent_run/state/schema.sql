@@ -51,6 +51,7 @@ CREATE TABLE agents (
   resume_of_runtime_session_id TEXT,
   identity_json TEXT,
   supervisor_birth_time REAL,
+  startup_owner_birth_time REAL,
   UNIQUE (orchestrator_session_id, request_id)
 );
 CREATE UNIQUE INDEX agents_parent_agent_id_unique
@@ -167,7 +168,7 @@ CREATE TABLE workflow_runs (
   plan_json TEXT,
   result_json TEXT,
   orchestrator_session_id TEXT REFERENCES orchestrator_sessions(id)
-);
+, owner_birth_time REAL);
 
 CREATE TABLE workflow_deliveries (
   id TEXT PRIMARY KEY,

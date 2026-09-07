@@ -29,6 +29,7 @@ from .errors import StateTransitionError, ValidationError
 from .lifecycle import ReadyChannel, install_signal_handlers, restore_signal_handlers
 from .logging_setup import configure_logging
 from .paths import state_db_path
+from .process_identity import capture_process_birth
 from .state import step_key, workflow_owner_identity
 from .state.db import nonblank
 from .state.store import StateStore
@@ -111,13 +112,10 @@ class _StopRequest:
 
 
 def runner_identity() -> str:
-    """The durable owner string this process claims its run with.
+    """Return this runner's PID plus diagnostic command text.
 
-    The pid travels with the ps command because ``workflow_runs`` has a single
-    ownership column; :func:`agent_run.state.reconcile_workflow_runs` needs
-    both to decide whether the owner is still alive. If ``ps`` is unavailable,
-    the interpreter argument suffix remains specific to this module and still
-    matches the end of the later process probe.
+    The separately stored process birth time is ownership authority. The command
+    suffix remains useful to operators and preserves the legacy row format.
     """
 
     identity = supervisor_identity()
@@ -132,6 +130,7 @@ def execute_plan(
     steps: Sequence[Mapping[str, object]],
     *,
     identity: str,
+    birth_time: float | None = None,
     ready: ReadyChannel | None = None,
     poll_seconds: float = POLL_SECONDS,
     resume: bool = False,
@@ -143,7 +142,8 @@ def execute_plan(
     A stop signal fails the in-flight step as ``runner_cancelled`` and finishes
     the run ``cancelled``: the journal never shows a step that merely stopped.
 
-    ``resume=True`` re-claims a finished-but-resumable run instead of claiming
+    ``birth_time`` is the optional process-creation proof paired with the PID in
+    ``identity``. ``resume=True`` re-claims a finished-but-resumable run instead of claiming
     a freshly created one (see :func:`agent_run.state.workflow.resume_workflow_run`).
     Either way, a step whose ``step_key`` already has a ``succeeded`` journal
     row is replayed by skipping it rather than re-executed -- this is a no-op
@@ -153,9 +153,9 @@ def execute_plan(
     nonblank("run_id", run_id)
     nonblank("identity", identity)
     if resume:
-        store.resume_workflow_run(run_id, identity)
+        store.resume_workflow_run(run_id, identity, owner_birth_time=birth_time)
     else:
-        store.claim_workflow_run(run_id, identity)
+        store.claim_workflow_run(run_id, identity, owner_birth_time=birth_time)
     _logger.info("run_id=%s claimed resume=%s steps=%d", run_id, resume, len(steps))
     if ready is not None:
         ready.ready()
@@ -227,10 +227,20 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None:
+    """Claim and execute one workflow payload under this runner's birth proof.
+
+    ``payload`` carries a validated run id and either a script or placeholder
+    plan, ``home`` owns the state database and artifacts, and ``ready`` reports
+    only after the durable claim. The store is always closed. Execution and
+    journal errors propagate to :func:`main` for READY failure and exit status.
+    """
+
     run_id = _text(payload, "run_id")
     resume = bool(payload.get("resume", False))
     store = StateStore.open(state_db_path(home))
     try:
+        identity = runner_identity()
+        birth_time = capture_process_birth(os.getpid())
         plan = payload.get("plan")
         if isinstance(plan, Mapping) and set(plan) == {"script"} and isinstance(plan["script"], str):
             from agent_run.cli import _launch_callback
@@ -239,9 +249,13 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
             from agent_run.workflow_script import run_script
 
             if resume:
-                store.resume_workflow_run(run_id, runner_identity())
+                store.resume_workflow_run(
+                    run_id, identity, owner_birth_time=birth_time
+                )
             else:
-                store.claim_workflow_run(run_id, runner_identity())
+                store.claim_workflow_run(
+                    run_id, identity, owner_birth_time=birth_time
+                )
             _logger.info("run_id=%s claimed resume=%s stage=script", run_id, resume)
             ready.ready()
             stop = _StopRequest()
@@ -290,7 +304,13 @@ def _run(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None
             return
         steps = validate_plan(plan)
         execute_plan(
-            store, run_id, steps, identity=runner_identity(), ready=ready, resume=resume
+            store,
+            run_id,
+            steps,
+            identity=identity,
+            birth_time=birth_time,
+            ready=ready,
+            resume=resume,
         )
     finally:
         store.close()

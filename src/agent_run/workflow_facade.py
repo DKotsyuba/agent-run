@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .domain import OrchestratorRef
 from .errors import ValidationError
+from .process_identity import ProcessState, observe_process
 from .state.store import StateStore
 
 _TERMINAL_WORKFLOW_STATUSES = {"succeeded", "failed", "cancelled", "lost"}
@@ -89,14 +90,10 @@ def workflow_cancel(store: StateStore, run_id: str) -> dict[str, object]:
     has been sent.
 
     Fails closed with ``ValidationError`` when the run has already reached a
-    terminal status, when its recorded owner identity is missing or carries no
-    usable pid, and -- before signalling -- when the pid is not currently a live
-    process whose command matches the identity the runner claimed the run with.
-    That last check reuses the same ``ps`` probe reconciliation settles
-    liveness with (:func:`agent_run.doctor._probe_process` and
-    :func:`agent_run.state.reconciliation._split_owner`), so a stale pid, a
-    reused pid now belonging to an unrelated process, and a pid whose command
-    cannot be read are all refusals rather than signals.
+    terminal status, when its recorded owner identity carries no usable PID, or
+    when the stored PID and process birth time do not prove the same live runner.
+    Missing legacy birth evidence, denial, absence, and PID reuse all refuse the
+    signal.
 
     This precheck narrows, but cannot close, the window between the probe and
     the ``os.kill``: the owner may still exit and its pid be reused in between.
@@ -104,8 +101,7 @@ def workflow_cancel(store: StateStore, run_id: str) -> dict[str, object]:
     identity, and nothing here provides that.
     """
 
-    from .doctor import _probe_process
-    from .state.reconciliation import _split_owner
+    from .state.reconciliation import _owner_pid
 
     run = store.workflow_run_status(run_id)["run"]
     if run["status"] in _TERMINAL_WORKFLOW_STATUSES:
@@ -113,13 +109,14 @@ def workflow_cancel(store: StateStore, run_id: str) -> dict[str, object]:
     identity = run["owner_pid_identity"]
     if not isinstance(identity, str):
         raise ValidationError("workflow runner identity is not recorded")
-    pid, expected = _split_owner(identity)
-    if pid is None or not expected:
+    pid = _owner_pid(identity)
+    if pid is None:
         raise ValidationError("workflow runner identity is not recorded")
-    alive, command, _group_alive = _probe_process(pid, None)
-    if not alive or not isinstance(command, str) or not (
-        command == expected or command.endswith(f" {expected}")
-    ):
+    birth = run.get("owner_birth_time")
+    observation = observe_process(
+        pid, float(birth) if isinstance(birth, (int, float)) else None
+    )
+    if observation.state is not ProcessState.ALIVE:
         raise ValidationError(
             "workflow runner process no longer matches the recorded owner identity"
         )

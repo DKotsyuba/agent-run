@@ -18,6 +18,7 @@ from .errors import AgentRunError, SchemaMigrationRequired
 from .launch import launch_detached
 from .launch_evidence import SupervisorBootstrapError
 from .paths import config_path, state_db_path
+from .process_identity import ProcessObservation, ProcessState, observe_process
 from .state import diagnostic_snapshot
 
 _LIMIT = 256
@@ -64,7 +65,10 @@ class DoctorReport:
         return not any(item.severity == "error" for item in self.findings)
 
 
-ProcessProbe = Callable[[int, int | None], tuple[bool, str | None, bool]]
+#: Read-only PID/birth observer returning identity and separate group existence.
+ProcessProbe = Callable[
+    [int, float | None, int | None], tuple[ProcessObservation, bool]
+]
 #: Runs the provider-free canary handshake and returns its duration in
 #: milliseconds, or raises (typically :class:`SupervisorBootstrapError`).
 CanaryRunner = Callable[[], float]
@@ -383,43 +387,45 @@ def _capacity(config: Config, rows, at: float, findings) -> None:
 
 
 def _supervisors(rows, probe: ProcessProbe, findings) -> None:
+    """Append findings for supervisor birth and process-group evidence.
+
+    ``rows`` are diagnostic agent mappings, ``probe`` observes PID/birth plus
+    group existence without signalling, and ``findings`` is mutated in place.
+    Unknown or denied identity is a warning; absence or reuse is an error, with
+    a separate orphan finding when the recorded group still exists.
+    """
+
     for row in rows:
         pid = row.get("supervisor_pid")
         pgid = row.get("process_group_id")
-        expected = row.get("supervisor_identity")
+        birth = row.get("supervisor_birth_time")
         if not isinstance(pid, int):
             if row.get("status") in {"running", "cancelling"}:
                 _add(findings, "dead_supervisor", "error", f"agent:{row['id']}", "missing pid")
             continue
-        alive, identity, group_alive = probe(pid, pgid if isinstance(pgid, int) else None)
-        if alive and identity is None:
-            _add(findings, "supervisor_identity_unavailable", "warning", f"agent:{row['id']}", "process identity unavailable")
-            continue
-        dead = not alive or not isinstance(expected, str) or not (
-            identity == expected or identity.endswith(f" {expected}")
+        observation, group_alive = probe(
+            pid,
+            float(birth) if isinstance(birth, (int, float)) else None,
+            pgid if isinstance(pgid, int) else None,
         )
-        if dead:
-            _add(findings, "dead_supervisor", "error", f"agent:{row['id']}", "dead or identity mismatch")
+        if observation.state in {ProcessState.UNKNOWN, ProcessState.DENIED}:
+            _add(findings, "supervisor_identity_unavailable", "warning", f"agent:{row['id']}", "process birth identity unavailable")
+            continue
+        if observation.state in {ProcessState.DEAD, ProcessState.REUSED}:
+            _add(findings, "dead_supervisor", "error", f"agent:{row['id']}", "dead or reused process identity")
             if group_alive:
                 _add(findings, "suspected_orphan", "error", f"agent:{row['id']}", "engine group remains alive")
 
 
-def _probe_process(pid: int, pgid: int | None) -> tuple[bool, str | None, bool]:
-    alive = _exists(pid)
-    identity = None
-    if alive:
-        try:
-            result = subprocess.run(
-                ["/bin/ps", "-p", str(pid), "-o", "command="],
-                capture_output=True,
-                text=True,
-                timeout=1,
-                env={"PATH": "/usr/bin:/bin"},
-            )
-            identity = result.stdout.strip() or None
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    return alive, identity, False if pgid is None else _exists(pgid, group=True)
+def _probe_process(
+    pid: int, birth_time: float | None, pgid: int | None
+) -> tuple[ProcessObservation, bool]:
+    """Observe one PID/birth pair and separately report group existence."""
+
+    return (
+        observe_process(pid, birth_time),
+        False if pgid is None else _exists(pgid, group=True),
+    )
 
 
 def _exists(value: int, *, group: bool = False) -> bool:

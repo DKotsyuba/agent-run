@@ -106,7 +106,7 @@ def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]
 
 
 def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
-    """Remove migration 013's artifacts so a store looks genuinely pre-v13.
+    """Remove migrations 013 and 014 so a store looks genuinely pre-v13.
 
     The downgrade fixtures below start from the *current* schema and peel
     later versions back off. ``parent_agent_id`` is covered by a partial
@@ -115,7 +115,13 @@ def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
     """
 
     connection.execute("DROP INDEX agents_parent_agent_id_unique")
+    workflow_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(workflow_runs)")
+    }
+    if "owner_birth_time" in workflow_columns:
+        connection.execute("ALTER TABLE workflow_runs DROP COLUMN owner_birth_time")
     for column in (
+        "startup_owner_birth_time",
         "supervisor_birth_time",
         "identity_json",
         "resume_of_runtime_session_id",

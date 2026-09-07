@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.errors import ValidationError
+from agent_run.process_identity import ProcessObservation, ProcessState
 from agent_run.state import (
     StateStore,
     reconcile_active_agents,
@@ -36,7 +37,16 @@ class StateOutboxTests(unittest.TestCase):
             request, task_summary="summary", config_revision="cfg-1", at=at
         ).agent_id
 
-    def supervised(self, pid: int, identity: str, *, pgid=None, created_at=1, heartbeat_at=6):
+    def supervised(
+        self,
+        pid: int,
+        identity: str,
+        *,
+        pgid=None,
+        birth_time: float | None = None,
+        created_at=1,
+        heartbeat_at=6,
+    ):
         """One running row with a complete supervisor identity to sweep."""
 
         agent_id = self.create(at=created_at)
@@ -46,6 +56,7 @@ class StateOutboxTests(unittest.TestCase):
             pid=pid,
             identity=identity,
             process_group_id=pid if pgid is None else pgid,
+            birth_time=birth_time,
             at=heartbeat_at,
         )
         self.store.transition(agent_id, AgentStatus.RUNNING, at=7)
@@ -56,12 +67,12 @@ class StateOutboxTests(unittest.TestCase):
 
         probed: list = []
 
-        def probe(pid, pgid):
-            probed.append((pid, pgid))
+        def probe(pid, birth_time):
+            probed.append((pid, birth_time))
             reply = replies(pid) if callable(replies) else replies[pid]
             return reply
 
-        return mock.patch("agent_run.doctor._probe_process", probe), probed
+        return mock.patch("agent_run.state.reconciliation.observe_process", probe), probed
 
     def forbid_signals(self):
         def refuse(*_args, **_kwargs):
@@ -277,7 +288,8 @@ class StateOutboxTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.store.reconcile(agent_id, verdict="dead")
         self.store.record_supervisor(
-            agent_id, pid=100, identity="pid100:start1", process_group_id=100, at=2
+            agent_id, pid=100, identity="pid100:start1", process_group_id=100,
+            birth_time=20.0, at=2
         )
         with self.assertRaises(ValidationError):
             self.store.record_supervisor(
@@ -287,6 +299,7 @@ class StateOutboxTests(unittest.TestCase):
             "supervisor_pid": 100,
             "process_group_id": 100,
             "expected_identity": "pid100:start1",
+            "expected_birth_time": 20.0,
             "alive": True,
             "checked_at": 3,
         }
@@ -303,7 +316,7 @@ class StateOutboxTests(unittest.TestCase):
             self.store.reconcile(
                 agent_id,
                 verdict="identity_mismatch",
-                observed_identity="pid100:start1",
+                observed_birth_time=20.0,
                 **proof,
             )
         self.assertEqual(self.store.get_agent(agent_id)["status"], "created")
@@ -311,7 +324,7 @@ class StateOutboxTests(unittest.TestCase):
             self.store.reconcile(
                 agent_id,
                 verdict="identity_mismatch",
-                observed_identity="pid100:start2",
+                observed_birth_time=21.0,
                 reason="PID reused",
                 **proof,
             )
@@ -448,31 +461,33 @@ class StateOutboxTests(unittest.TestCase):
         self.store.transition(
             terminal, AgentStatus.FAILED, outcome=Outcome(AgentStatus.FAILED), at=8
         )
-        patch, probed = self.probing(lambda pid: (False, None, True))
+        patch, probed = self.probing(
+            lambda pid: ProcessObservation(ProcessState.DEAD)
+        )
 
         with patch, self.forbid_signals():
             self.assertEqual(
                 reconcile_active_agents(self.store, at=10), (surviving, foreign)
             )
 
-        self.assertEqual(probed, [(100, 4242), (101, 1)])
+        self.assertEqual(probed, [(100, None), (101, None)])
         for agent_id in (surviving, foreign):
             agent = self.store.get_agent(agent_id)
             self.assertEqual(agent["status"], "lost")
             self.assertEqual(agent["failure_kind"], "supervisor_dead")
         self.assertEqual(self.store.get_agent(terminal)["status"], "failed")
 
-    def test_sweep_reconciles_only_a_proven_live_identity_mismatch(self) -> None:
-        exact = self.supervised(200, "agent-run supervisor", created_at=1)
-        boundary = self.supervised(201, "agent-run supervisor", created_at=2)
-        unavailable = self.supervised(202, "agent-run supervisor", created_at=3)
-        mismatch = self.supervised(203, "agent-run supervisor", created_at=4)
+    def test_sweep_reconciles_only_a_proven_reused_pid(self) -> None:
+        exact = self.supervised(200, "agent-run supervisor", birth_time=20.0, created_at=1)
+        boundary = self.supervised(201, "changed diagnostic", birth_time=21.0, created_at=2)
+        unavailable = self.supervised(202, "agent-run supervisor", birth_time=22.0, created_at=3)
+        mismatch = self.supervised(203, "agent-run supervisor", birth_time=23.0, created_at=4)
         patch, probed = self.probing(
             {
-                200: (True, "agent-run supervisor", False),
-                201: (True, "/usr/bin/python3 agent-run supervisor", True),
-                202: (True, None, False),
-                203: (True, "/usr/bin/vim notes.md", False),
+                200: ProcessObservation(ProcessState.ALIVE, 20.0),
+                201: ProcessObservation(ProcessState.ALIVE, 21.0),
+                202: ProcessObservation(ProcessState.DENIED),
+                203: ProcessObservation(ProcessState.REUSED, 24.0),
             }
         )
 
@@ -492,7 +507,9 @@ class StateOutboxTests(unittest.TestCase):
         self.store.record_supervisor(
             stale, pid=300, identity="pid-300", process_group_id=300, at=100
         )
-        patch, probed = self.probing(lambda pid: (False, None, False))
+        patch, probed = self.probing(
+            lambda pid: ProcessObservation(ProcessState.DEAD)
+        )
 
         with patch, self.forbid_signals():
             self.assertEqual(reconcile_active_agents(self.store, at=50), (healthy,))
@@ -514,13 +531,13 @@ class StateOutboxTests(unittest.TestCase):
                     second, pid=401, identity="pid-401", process_group_id=401, at=time.time()
                 )
                 time.sleep(0.01)
-            return False, None, False
+            return ProcessObservation(ProcessState.DEAD)
 
         patch, probed = self.probing(replies)
         with patch, self.forbid_signals():
             self.assertEqual(reconcile_active_agents(self.store), (first, second))
 
-        self.assertEqual(probed, [(400, 400), (401, 401)])
+        self.assertEqual(probed, [(400, None), (401, None)])
         self.assertEqual(self.store.get_agent(second)["status"], "lost")
 
 

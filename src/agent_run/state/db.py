@@ -194,10 +194,21 @@ def checked_supervisor_proof(
     supervisor_pid: int | None,
     process_group_id: int | None,
     expected_identity: str | None,
+    expected_birth_time: float | None,
     alive: bool | None,
     checked_at: float | None,
-    observed_identity: str | None,
+    observed_birth_time: float | None,
 ) -> tuple[float, str | None]:
+    """Validate one reconciliation verdict against immutable stored ownership.
+
+    The PID, group and diagnostic command must still name the selected row.
+    ``dead`` needs an absent PID proof and remains valid for legacy rows without
+    birth evidence. ``identity_mismatch`` requires stored and observed finite
+    birth times that differ, proving PID reuse. Returns the checked timestamp and
+    failure kind, or no failure kind for a live owner; invalid or stale evidence
+    raises :class:`ValidationError` without changing state.
+    """
+
     stored = (
         agent["supervisor_pid"],
         agent["process_group_id"],
@@ -231,11 +242,20 @@ def checked_supervisor_proof(
         return checked, "supervisor_dead"
     if (
         alive is not True
-        or not isinstance(observed_identity, str)
-        or not observed_identity.strip()
-        or observed_identity == expected_identity
+        or isinstance(agent["supervisor_birth_time"], bool)
+        or not isinstance(agent["supervisor_birth_time"], (int, float))
+        or not math.isfinite(float(agent["supervisor_birth_time"]))
+        or isinstance(expected_birth_time, bool)
+        or not isinstance(expected_birth_time, (int, float))
+        or not math.isfinite(float(expected_birth_time))
+        or expected_birth_time != agent["supervisor_birth_time"]
+        or isinstance(observed_birth_time, bool)
+        or not isinstance(observed_birth_time, (int, float))
+        or not math.isfinite(float(observed_birth_time))
+        or observed_birth_time < 0
+        or observed_birth_time == expected_birth_time
     ):
-        raise ValidationError("identity mismatch requires differing live identities")
+        raise ValidationError("identity mismatch requires differing process births")
     return checked, "supervisor_identity_mismatch"
 
 

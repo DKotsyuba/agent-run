@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import uuid
 
@@ -128,18 +129,30 @@ def start_workflow_run(connection: sqlite3.Connection, run_id: str) -> None:
 
 
 def claim_workflow_run(
-    connection: sqlite3.Connection, run_id: str, owner_identity: str
+    connection: sqlite3.Connection,
+    run_id: str,
+    owner_identity: str,
+    *,
+    owner_birth_time: float | None = None,
 ) -> None:
     """Take durable ownership of a created run and start it, in one transaction.
 
     The detached runner may report READY only after this returns: an owner
-    identity that outlives the process is exactly what lets reconciliation flip
-    an abandoned run to ``lost`` instead of silently resuming it.  A run some
-    other identity already owns is refused -- ownership is never stolen.
+    ``owner_birth_time`` proves that the PID embedded in ``owner_identity`` is
+    still the claiming process. Missing birth evidence is retained for legacy
+    rows and remains unknown while that PID exists. A run some other identity
+    already owns is refused -- ownership is never stolen.
     """
 
     nonblank("run_id", run_id)
     nonblank("owner_identity", owner_identity)
+    if owner_birth_time is not None and (
+        isinstance(owner_birth_time, bool)
+        or not isinstance(owner_birth_time, (int, float))
+        or not math.isfinite(owner_birth_time)
+        or owner_birth_time < 0
+    ):
+        raise ValidationError("workflow owner birth time must be finite and nonnegative")
     with immediate(connection):
         run = _run_row(connection, run_id)
         owner = run["owner_pid_identity"]
@@ -150,14 +163,19 @@ def claim_workflow_run(
                 f"workflow run cannot start from status: {run['status']}"
             )
         connection.execute(
-            """UPDATE workflow_runs SET status = 'running', owner_pid_identity = ?
+            """UPDATE workflow_runs SET status = 'running', owner_pid_identity = ?,
+                      owner_birth_time = ?
                WHERE id = ?""",
-            (owner_identity, run_id),
+            (owner_identity, owner_birth_time, run_id),
         )
 
 
 def resume_workflow_run(
-    connection: sqlite3.Connection, run_id: str, owner_identity: str
+    connection: sqlite3.Connection,
+    run_id: str,
+    owner_identity: str,
+    *,
+    owner_birth_time: float | None = None,
 ) -> None:
     """Re-claim a finished-but-resumable run's row for a fresh runner.
 
@@ -167,11 +185,19 @@ def resume_workflow_run(
     the run's own resumability.  The caller
     (:func:`agent_run.workflow_run.resume_workflow`) has already refused a
     ``running`` or ``succeeded`` run before a fresh runner is ever launched, so
-    this only re-checks the row under the write lock against a race.
+    this only re-checks the row under the write lock against a race. The fresh
+    runner replaces both legacy command diagnostics and its birth-time proof.
     """
 
     nonblank("run_id", run_id)
     nonblank("owner_identity", owner_identity)
+    if owner_birth_time is not None and (
+        isinstance(owner_birth_time, bool)
+        or not isinstance(owner_birth_time, (int, float))
+        or not math.isfinite(owner_birth_time)
+        or owner_birth_time < 0
+    ):
+        raise ValidationError("workflow owner birth time must be finite and nonnegative")
     with immediate(connection):
         run = _run_row(connection, run_id)
         if run["status"] not in RUN_RESUMABLE:
@@ -180,9 +206,10 @@ def resume_workflow_run(
             )
         connection.execute(
             """UPDATE workflow_runs
-               SET status = 'running', owner_pid_identity = ?, finished_at = NULL
+               SET status = 'running', owner_pid_identity = ?, owner_birth_time = ?,
+                   finished_at = NULL
                WHERE id = ?""",
-            (owner_identity, run_id),
+            (owner_identity, owner_birth_time, run_id),
         )
 
 

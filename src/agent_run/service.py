@@ -40,6 +40,7 @@ from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
 from . import workflow_facade
 from .profiles import assign_role, load_profile
+from .process_identity import capture_process_birth
 from .resume import (
     identity_snapshot, inherited_request, proven_identity, record_profile_grants,
     replayed_resume,
@@ -434,6 +435,8 @@ class AgentService:
         run used without changing what idempotent replay compares.
         A continuation preserves its parent's completed grant snapshot, which
         the preparation worker compares with the actual loaded profile.
+        The resident coordinator's process birth time is stored with the bounded
+        startup claim so command lookup failures cannot orphan an accepted row.
 
         The native session a resumed child attaches to is read back from the
         row that was just committed, never from the caller: store and adapter
@@ -484,6 +487,7 @@ class AgentService:
             self._store.claim_startup(
                 creation.agent_id,
                 startup_owner,
+                owner_birth_time=capture_process_birth(os.getpid()),
                 at=accepted_at,
             )
             self._starts.submit(

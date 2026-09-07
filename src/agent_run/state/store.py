@@ -571,7 +571,8 @@ class StateStore:
         The first binding for a ``STARTING`` agent must occur before its startup
         lease expires. Once recorded, the same supervisor may refine its process
         group after engine launch even if that lease has elapsed; terminal rows
-        and conflicting identities remain rejected.
+        and conflicting identities remain rejected. ``birth_time`` is optional
+        only for legacy callers; once present it is immutable across heartbeats.
         """
 
         agent_id = validate_agent_id(agent_id)
@@ -584,6 +585,13 @@ class StateStore:
             or process_group_id <= 0
         ):
             raise ValidationError("process ids must be positive integers")
+        if birth_time is not None and (
+            isinstance(birth_time, bool)
+            or not isinstance(birth_time, (int, float))
+            or not math.isfinite(birth_time)
+            or birth_time < 0
+        ):
+            raise ValidationError("supervisor birth time must be finite and nonnegative")
         nonblank("supervisor identity", identity)
         with immediate(self.connection):
             agent = agent_row(self.connection, agent_id)
@@ -597,15 +605,20 @@ class StateStore:
                 and deadline <= timestamp(at)
             ):
                 raise StateTransitionError("expired startup cannot bind a supervisor")
-            fields = ("supervisor_pid", "supervisor_identity", "process_group_id")
+            fields = (
+                "supervisor_pid",
+                "supervisor_identity",
+                "process_group_id",
+                "supervisor_birth_time",
+            )
             stored = tuple(agent[field] for field in fields)
             if any(value is not None for value in stored) and stored != (
-                pid, identity, process_group_id
+                pid, identity, process_group_id, birth_time
             ):
                 # The pre-ready row records the detached supervisor's own group
                 # (it is its own group leader), so refining that one value once to
                 # the verified engine group is the only permitted rewrite.
-                if stored != (pid, identity, pid) or process_group_id == pid:
+                if stored != (pid, identity, pid, birth_time) or process_group_id == pid:
                     raise ValidationError("supervisor identity is immutable")
             self.connection.execute(
                 """UPDATE agents SET supervisor_pid = ?, supervisor_identity = ?,
@@ -618,19 +631,28 @@ class StateStore:
         agent_id: str | AgentId,
         owner_identity: str,
         *,
+        owner_birth_time: float | None = None,
         at: float | None = None,
         deadline_seconds: float = 120.0,
     ) -> None:
         """Durably bind one accepted ``STARTING`` row to its live coordinator owner.
 
-        ``owner_identity`` is a nonblank ``"<pid> <ps command>"`` proof.  The
-        binding is immutable and is valid only until ``deadline_seconds`` after
-        ``at``. A terminal row cannot be claimed. The fixed deadline prevents a
-        live but wedged broker from exempting an abandoned start forever.
+        ``owner_identity`` is a nonblank ``"<pid> <command>"`` diagnostic and
+        ``owner_birth_time`` is the optional process-creation proof. The binding
+        is immutable and is valid only until ``deadline_seconds`` after ``at``.
+        A terminal row cannot be claimed. The fixed deadline prevents a live but
+        wedged broker from exempting an abandoned start forever.
         """
 
         checked = validate_agent_id(agent_id)
         nonblank("startup owner identity", owner_identity)
+        if owner_birth_time is not None and (
+            isinstance(owner_birth_time, bool)
+            or not isinstance(owner_birth_time, (int, float))
+            or not math.isfinite(owner_birth_time)
+            or owner_birth_time < 0
+        ):
+            raise ValidationError("startup owner birth time must be finite and nonnegative")
         if (
             isinstance(deadline_seconds, bool)
             or not isinstance(deadline_seconds, (int, float))
@@ -646,13 +668,21 @@ class StateStore:
             if AgentStatus(agent["status"]) is not AgentStatus.STARTING:
                 raise StateTransitionError("startup owner requires starting agent")
             current = agent["startup_owner_pid_identity"]
-            if current is not None and current != owner_identity:
+            current_birth = agent["startup_owner_birth_time"]
+            if current is not None and (
+                current != owner_identity or current_birth != owner_birth_time
+            ):
                 raise StateTransitionError("startup is already owned")
             if current is None:
                 self.connection.execute(
                     """UPDATE agents SET startup_owner_pid_identity = ?,
-                       startup_deadline_at = ? WHERE id = ?""",
-                    (owner_identity, claimed_at + float(deadline_seconds), checked),
+                       startup_owner_birth_time = ?, startup_deadline_at = ? WHERE id = ?""",
+                    (
+                        owner_identity,
+                        owner_birth_time,
+                        claimed_at + float(deadline_seconds),
+                        checked,
+                    ),
                 )
 
     def begin_supervisor_handoff(
@@ -831,11 +861,22 @@ class StateStore:
         supervisor_pid: int | None = None,
         process_group_id: int | None = None,
         expected_identity: str | None = None,
+        expected_birth_time: float | None = None,
         alive: bool | None = None,
         checked_at: float | None = None,
-        observed_identity: str | None = None,
+        observed_birth_time: float | None = None,
         reason: str | None = None,
     ) -> bool:
+        """Apply an exact liveness or PID-reuse proof to one active agent.
+
+        Stored PID, process group and diagnostic identity select the immutable
+        supervisor row. Dead proofs may cover legacy rows; reuse proofs require
+        matching expected birth evidence plus a different observed birth time.
+        The method returns whether it committed ``LOST`` and never signals a
+        process. Invalid, incomplete, or stale evidence raises
+        :class:`ValidationError`.
+        """
+
         agent_id = validate_agent_id(agent_id)
         if verdict not in {"alive", "dead", "identity_mismatch"}:
             raise ValidationError("invalid reconciliation verdict")
@@ -847,9 +888,10 @@ class StateStore:
                 supervisor_pid=supervisor_pid,
                 process_group_id=process_group_id,
                 expected_identity=expected_identity,
+                expected_birth_time=expected_birth_time,
                 alive=alive,
                 checked_at=checked_at,
-                observed_identity=observed_identity,
+                observed_birth_time=observed_birth_time,
             )
             if AgentStatus(agent["status"]) in TERMINAL:
                 return False
@@ -866,7 +908,7 @@ class StateStore:
                 ),
                 attempt_id=None,
                 kind="reconciled_lost",
-                data={"verdict": verdict, "observed_identity": observed_identity},
+                data={"verdict": verdict, "observed_birth_time": observed_birth_time},
             )
         return True
 
@@ -1306,11 +1348,34 @@ class StateStore:
     def start_workflow_run(self, run_id: str) -> None:
         workflow.start_workflow_run(self.connection, run_id)
 
-    def claim_workflow_run(self, run_id: str, owner_identity: str) -> None:
-        workflow.claim_workflow_run(self.connection, run_id, owner_identity)
+    def claim_workflow_run(
+        self, run_id: str, owner_identity: str, *, owner_birth_time: float | None = None
+    ) -> None:
+        """Claim ``run_id`` with command diagnostics and optional birth proof.
 
-    def resume_workflow_run(self, run_id: str, owner_identity: str) -> None:
-        workflow.resume_workflow_run(self.connection, run_id, owner_identity)
+        The open store delegates validation and the atomic ``created`` to
+        ``running`` transition to the workflow journal. Missing birth evidence
+        creates a conservative legacy owner; conflicts raise the journal's
+        :class:`StateTransitionError`.
+        """
+
+        workflow.claim_workflow_run(
+            self.connection, run_id, owner_identity, owner_birth_time=owner_birth_time
+        )
+
+    def resume_workflow_run(
+        self, run_id: str, owner_identity: str, *, owner_birth_time: float | None = None
+    ) -> None:
+        """Resume ``run_id`` with command diagnostics and optional birth proof.
+
+        The open store delegates validation and replacement of the prior owner
+        evidence to the workflow journal. Only resumable terminal runs are
+        accepted; other states raise :class:`StateTransitionError`.
+        """
+
+        workflow.resume_workflow_run(
+            self.connection, run_id, owner_identity, owner_birth_time=owner_birth_time
+        )
 
     def finish_workflow_run(
         self, run_id: str, status: str, *, result: object = None, at: float | None = None

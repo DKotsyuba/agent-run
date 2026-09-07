@@ -14,6 +14,7 @@ from agent_run.delivery.base import DeliveryReceipt
 from agent_run.delivery.workflow_dispatch import WorkflowDeliveryDispatcher
 from agent_run.domain import OrchestratorRef
 from agent_run.errors import ValidationError
+from agent_run.process_identity import ProcessObservation, ProcessState
 from agent_run.dispatch import TOOLS, Session, call_tool
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
@@ -343,7 +344,7 @@ class WorkflowSurfaceTests(unittest.TestCase):
     def test_cancel_refuses_a_workflow_owner_pid_that_is_not_the_recorded_process(
         self,
     ) -> None:
-        """Never signal a pid whose live command does not match the owner identity."""
+        """Signal only a PID whose persisted birth identity still matches."""
 
         from agent_run import workflow_facade
 
@@ -351,21 +352,28 @@ class WorkflowSurfaceTests(unittest.TestCase):
             store = StateStore.initialize(Path(directory) / "state.db")
             try:
                 run_id = store.create_workflow_run("named", "sha", plan=[])
-                store.claim_workflow_run(run_id, "4242 agent-run workflow runner")
-                probe = "agent_run.doctor._probe_process"
-                for alive, command in (
-                    (False, None),  # the pid is gone
-                    (True, None),  # live, but its command cannot be read
-                    (True, "/bin/some-unrelated-process"),  # the pid was reused
+                store.claim_workflow_run(
+                    run_id,
+                    "4242 agent-run workflow runner",
+                    owner_birth_time=12.5,
+                )
+                probe = "agent_run.workflow_facade.observe_process"
+                for state in (
+                    ProcessState.DEAD,
+                    ProcessState.REUSED,
+                    ProcessState.UNKNOWN,
+                    ProcessState.DENIED,
                 ):
-                    with patch(probe, return_value=(alive, command, False)), \
+                    with patch(
+                        probe, return_value=ProcessObservation(state)
+                    ), \
                             patch("os.kill") as kill:
                         with self.assertRaises(ValidationError):
                             workflow_facade.workflow_cancel(store, run_id)
                         kill.assert_not_called()
 
                 with patch(
-                    probe, return_value=(True, "python agent-run workflow runner", False)
+                    probe, return_value=ProcessObservation(ProcessState.ALIVE, 12.5)
                 ), patch("os.kill") as kill:
                     self.assertEqual(
                         workflow_facade.workflow_cancel(store, run_id),

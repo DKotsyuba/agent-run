@@ -15,7 +15,13 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.launch import launch_detached
 from agent_run.paths import state_db_path
-from agent_run.state import StateStore, step_key, workflow_owner_identity
+from agent_run.process_identity import ProcessObservation, ProcessState
+from agent_run.state import (
+    StateStore,
+    reconcile_workflow_runs,
+    step_key,
+    workflow_owner_identity,
+)
 from agent_run.workflow_run import plan_sha, resume_workflow, start_workflow, validate_plan
 from agent_run.workflow_runner_main import (
     _append_runner_log,
@@ -164,12 +170,20 @@ class RunnerLoopTests(unittest.TestCase):
                 observed.append(dict(store.workflow_run_status(run_id)["run"]))
 
         self.assertEqual(
-            execute_plan(store, run_id, steps, identity="7 runner", ready=_Ready()),
+            execute_plan(
+                store,
+                run_id,
+                steps,
+                identity="7 runner",
+                birth_time=12.5,
+                ready=_Ready(),
+            ),
             "succeeded",
         )
         self.assertEqual(len(observed), 1)
         self.assertEqual(observed[0]["status"], "running")
         self.assertEqual(observed[0]["owner_pid_identity"], "7 runner")
+        self.assertEqual(observed[0]["owner_birth_time"], 12.5)
 
     def test_a_run_another_identity_owns_is_never_taken_over(self) -> None:
         steps = self.plan("only")
@@ -243,6 +257,31 @@ class WorkflowReconciliationTests(unittest.TestCase):
         self.assertEqual(statuses[unclaimed], "created")
         self.assertEqual(statuses[mine], "running")
 
+    def test_reused_owner_is_lost_but_denied_owner_remains_running(self) -> None:
+        """Birth-time reconciliation distinguishes reuse from unavailable proof."""
+
+        store = StateStore.initialize(self.database)
+        self.addCleanup(store.close)
+        reused = store.create_workflow_run("wf", "sha-1", at=1)
+        denied = store.create_workflow_run("wf", "sha-2", at=2)
+        store.claim_workflow_run(
+            reused, "201 runner", owner_birth_time=20.0
+        )
+        store.claim_workflow_run(
+            denied, "202 runner", owner_birth_time=21.0
+        )
+        observations = {
+            201: ProcessObservation(ProcessState.REUSED, 22.0),
+            202: ProcessObservation(ProcessState.DENIED),
+        }
+        with mock.patch(
+            "agent_run.state.reconciliation.observe_process",
+            side_effect=lambda pid, birth: observations[pid],
+        ):
+            self.assertEqual(reconcile_workflow_runs(store, at=3), (reused,))
+        self.assertEqual(store.workflow_run_status(reused)["run"]["status"], "lost")
+        self.assertEqual(store.workflow_run_status(denied)["run"]["status"], "running")
+
 
 @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX only")
 class DetachedWorkflowRunnerTests(unittest.TestCase):
@@ -292,6 +331,7 @@ class DetachedWorkflowRunnerTests(unittest.TestCase):
         self.assertIn(claimed["status"], {"running", "succeeded"})
         owner = str(claimed["owner_pid_identity"])
         self.assertEqual(int(owner.split(" ", 1)[0]), launched[0])
+        self.assertIsInstance(claimed["owner_birth_time"], float)
         self.assertIn("workflow_runner_main", owner)
 
         def finished() -> object:

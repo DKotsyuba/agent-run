@@ -358,6 +358,7 @@ class Supervisor:
             pid=self._pid,
             identity=self._identity,
             process_group_id=self._recorded_group_id,
+            birth_time=self._birth_time,
         )
         self._last_heartbeat = started_at
         # Baseline for the stalled watchdog only. Seeding the sink itself
@@ -493,6 +494,7 @@ class Supervisor:
             pid=self._pid,
             identity=self._identity,
             process_group_id=self._recorded_group_id,
+            birth_time=self._birth_time,
         )
 
     def _warn(
