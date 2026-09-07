@@ -139,7 +139,7 @@ def _probe(
     """Run one bounded read-only Rust command in ``workdir``.
 
     ``command`` contains a lexical executable followed by fixed arguments and
-    ``environment`` is copied for the child. Diagnostics use only the lexical
+    ``environment`` is copied for the child. The operation label uses only the lexical
     executable basename and first fixed operation argument, never full argv,
     child output, or an exception. Returns its text-mode completed process only
     on exit status zero. It starts one subprocess with a five second timeout
