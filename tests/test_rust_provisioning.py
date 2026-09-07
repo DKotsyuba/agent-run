@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.adapters.rust import _probe, rust_environment
+from agent_run.adapters.rust import rust_environment
 from agent_run.config import RuntimeConfig, RustConfig
 from agent_run.errors import ValidationError
 
@@ -110,34 +110,41 @@ class RustProvisioningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "rustup >= 1.28.1"):
             rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
 
-    def test_probe_failures_use_fixed_tool_operation_labels(self) -> None:
-        """Probe failures identify the tool and operation without exposing argv."""
+    def test_probe_failures_use_actual_tool_operation_labels(self) -> None:
+        """Public provisioning diagnostics identify each failing Rust probe."""
 
         cases = (
-            ((self.cargo_bin / "rustup", "--version"), "rustup --version"),
-            ((self.cargo_bin / "rustup", "show", "active-toolchain"), "rustup show"),
-            ((self.cargo_bin / "rustup", "component", "list", "--installed"), "rustup component"),
-            ((self.cargo_bin / "cargo", "--version"), "cargo version"),
-            ((self.cargo_bin / "rustc", "--version"), "rustc version"),
-            ((self.cargo_bin / "rust-analyzer", "--version"), "rust-analyzer version"),
+            ("rustup", "rustup --version", "if [ \"$1\" = --version ]; then exit 1; fi\n"),
+            ("rustup", "rustup show", "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\nif [ \"$1\" = show ]; then exit 1; fi\n"),
+            ("rustup", "rustup component", "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\nif [ \"$1\" = show ]; then echo active; exit 0; fi\nif [ \"$1\" = component ]; then exit 1; fi\n"),
+            ("cargo", "cargo --version", "exit 1\n"),
+            ("rustc", "rustc --version", "exit 1\n"),
+            ("rust-analyzer", "rust-analyzer --version", "exit 1\n"),
         )
-        for command, label in cases:
+        for name, label, failure in cases:
             with self.subTest(label=label):
-                with mock.patch(
-                    "agent_run.adapters.rust.subprocess.run",
-                    return_value=subprocess.CompletedProcess(command, 1, "", "secret output"),
-                ), self.assertRaisesRegex(ValidationError, rf"cannot {label}: secret output"):
-                    _probe(command, {}, self.workdir, label)
+                for executable in ("cargo", "rustc", "rust-analyzer"):
+                    self._proxy(executable, "#!/bin/sh\nexit 0\n")
+                self._proxy(
+                    "rustup",
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\n"
+                    "if [ \"$1\" = show ]; then echo active; exit 0; fi\n"
+                    "printf '%s\\n' rust-src rust-analyzer\n",
+                )
+                self._proxy(name, "#!/bin/sh\n" + failure)
+                with self.assertRaisesRegex(ValidationError, rf"cannot {label}:"):
+                    rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
 
-    def test_probe_timeout_and_oserror_use_fixed_tool_operation_label(self) -> None:
-        """Timeout and spawn failures identify the fixed tool and operation."""
+    def test_probe_timeout_and_oserror_use_actual_tool_operation_label(self) -> None:
+        """Public provisioning maps timeout and spawn failures to fixed labels."""
 
         with mock.patch(
             "agent_run.adapters.rust.subprocess.run",
             side_effect=subprocess.TimeoutExpired(["rustup", "--version"], 5),
         ), self.assertRaisesRegex(ValidationError, r"timed out running rustup --version after 5s"):
-            _probe((self.cargo_bin / "rustup", "--version"), {}, self.workdir, "rustup --version")
+            rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
         with mock.patch(
-            "agent_run.adapters.rust.subprocess.run", side_effect=OSError("secret path")
-        ), self.assertRaisesRegex(ValidationError, r"cannot execute cargo version: secret path"):
-            _probe((self.cargo_bin / "cargo", "--version"), {}, self.workdir, "cargo version")
+            "agent_run.adapters.rust.subprocess.run", side_effect=OSError("spawn failed")
+        ), self.assertRaisesRegex(ValidationError, r"cannot execute rustup --version:"):
+            rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
