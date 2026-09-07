@@ -563,6 +563,7 @@ class StateStore:
         pid: int,
         identity: str,
         process_group_id: int,
+        birth_time: float | None = None,
         at: float | None = None,
     ) -> None:
         """Record the detached supervisor's immutable ownership proof.
@@ -608,8 +609,8 @@ class StateStore:
                     raise ValidationError("supervisor identity is immutable")
             self.connection.execute(
                 """UPDATE agents SET supervisor_pid = ?, supervisor_identity = ?,
-                   process_group_id = ?, heartbeat_at = ? WHERE id = ?""",
-                (pid, identity, process_group_id, timestamp(at), agent_id),
+                   process_group_id = ?, supervisor_birth_time = ?, heartbeat_at = ? WHERE id = ?""",
+                (pid, identity, process_group_id, birth_time, timestamp(at), agent_id),
             )
 
     def claim_startup(

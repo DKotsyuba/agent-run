@@ -45,3 +45,8 @@ def observe_process(pid: int, birth_time: float | None) -> ProcessObservation:
     if observed == birth_time:
         return ProcessObservation(ProcessState.ALIVE, observed)
     return ProcessObservation(ProcessState.REUSED, observed)
+
+
+def capture_process_birth(pid: int) -> float | None:
+    """Return PID creation time when readable, otherwise no birth proof."""
+    return observe_process(pid, None).create_time

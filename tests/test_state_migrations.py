@@ -116,6 +116,7 @@ def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
 
     connection.execute("DROP INDEX agents_parent_agent_id_unique")
     for column in (
+        "supervisor_birth_time",
         "identity_json",
         "resume_of_runtime_session_id",
         "sequence",

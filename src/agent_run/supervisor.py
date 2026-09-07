@@ -28,6 +28,7 @@ from .lifecycle import (
     terminate_process_group,
     verify_process_group,
 )
+from .process_identity import capture_process_birth
 from .state.run_stats import record_run_stats_best_effort
 from .state.store import StateStore
 from .verify import (
@@ -222,6 +223,7 @@ class Supervisor:
         self._ready = ready
         self._identity = identity or supervisor_identity()
         self._pid = os.getpid() if supervisor_pid is None else supervisor_pid
+        self._birth_time = capture_process_birth(self._pid)
         self._sink = StoreEventSink(store, self._agent_id, self._ops)
         self._group: VerifiedProcessGroup | None = None
         self._owned_pid: int | None = None
@@ -268,6 +270,7 @@ class Supervisor:
                 pid=self._pid,
                 identity=self._identity,
                 process_group_id=self._pid,
+                birth_time=self._birth_time,
             )
             if self._ready is not None:
                 self._ready.ready()

@@ -50,6 +50,7 @@ CREATE TABLE agents (
   sequence INTEGER NOT NULL DEFAULT 1 CHECK (sequence >= 1),
   resume_of_runtime_session_id TEXT,
   identity_json TEXT,
+  supervisor_birth_time REAL,
   UNIQUE (orchestrator_session_id, request_id)
 );
 CREATE UNIQUE INDEX agents_parent_agent_id_unique
@@ -262,4 +263,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 13;
+PRAGMA user_version = 14;
