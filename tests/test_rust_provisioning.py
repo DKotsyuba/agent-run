@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.adapters.rust import rust_environment
+from agent_run.adapters.rust import _probe, rust_environment
 from agent_run.config import RuntimeConfig, RustConfig
 from agent_run.errors import ValidationError
 
@@ -107,3 +109,35 @@ class RustProvisioningTests(unittest.TestCase):
         self._proxy("rustup", "#!/bin/sh\necho 'rustup 1.28.0'\n")
         with self.assertRaisesRegex(ValidationError, "rustup >= 1.28.1"):
             rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
+
+    def test_probe_failures_use_fixed_tool_operation_labels(self) -> None:
+        """Probe failures identify the tool and operation without exposing argv."""
+
+        cases = (
+            ((self.cargo_bin / "rustup", "--version"), "rustup --version"),
+            ((self.cargo_bin / "rustup", "show", "active-toolchain"), "rustup show"),
+            ((self.cargo_bin / "rustup", "component", "list", "--installed"), "rustup component"),
+            ((self.cargo_bin / "cargo", "--version"), "cargo version"),
+            ((self.cargo_bin / "rustc", "--version"), "rustc version"),
+            ((self.cargo_bin / "rust-analyzer", "--version"), "rust-analyzer version"),
+        )
+        for command, label in cases:
+            with self.subTest(label=label):
+                with mock.patch(
+                    "agent_run.adapters.rust.subprocess.run",
+                    return_value=subprocess.CompletedProcess(command, 1, "", "secret output"),
+                ), self.assertRaisesRegex(ValidationError, rf"cannot {label}: secret output"):
+                    _probe(command, {}, self.workdir, label)
+
+    def test_probe_timeout_and_oserror_use_fixed_tool_operation_label(self) -> None:
+        """Timeout and spawn failures identify the fixed tool and operation."""
+
+        with mock.patch(
+            "agent_run.adapters.rust.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["rustup", "--version"], 5),
+        ), self.assertRaisesRegex(ValidationError, r"timed out running rustup --version after 5s"):
+            _probe((self.cargo_bin / "rustup", "--version"), {}, self.workdir, "rustup --version")
+        with mock.patch(
+            "agent_run.adapters.rust.subprocess.run", side_effect=OSError("secret path")
+        ), self.assertRaisesRegex(ValidationError, r"cannot execute cargo version: secret path"):
+            _probe((self.cargo_bin / "cargo", "--version"), {}, self.workdir, "cargo version")

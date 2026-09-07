@@ -68,11 +68,18 @@ def rust_environment(
             "PATH": _prepend_path(cargo_bin, result.get("PATH")),
         }
     )
-    _validate_rustup_version(_probe((cargo_bin / "rustup", "--version"), result, resolved_workdir))
-    _probe((cargo_bin / "rustup", "show", "active-toolchain"), result, resolved_workdir)
+    _validate_rustup_version(
+        _probe((cargo_bin / "rustup", "--version"), result, resolved_workdir, "rustup --version")
+    )
+    _probe((cargo_bin / "rustup", "show", "active-toolchain"), result, resolved_workdir, "rustup show")
     for executable in ("cargo", "rustc", "rust-analyzer"):
-        _probe((cargo_bin / executable, "--version"), result, resolved_workdir)
-    components = _probe((cargo_bin / "rustup", "component", "list", "--installed"), result, resolved_workdir)
+        _probe((cargo_bin / executable, "--version"), result, resolved_workdir, f"{executable} version")
+    components = _probe(
+        (cargo_bin / "rustup", "component", "list", "--installed"),
+        result,
+        resolved_workdir,
+        "rustup component",
+    )
     installed = {
         component
         for component in _REQUIRED_COMPONENTS
@@ -125,15 +132,22 @@ def _prepend_path(directory: Path, inherited: str | None) -> str:
     return str(directory) if not inherited else str(directory) + os.pathsep + inherited
 
 
-def _probe(command: tuple[Path | str, ...], environment: Mapping[str, str], workdir: Path) -> subprocess.CompletedProcess[str]:
+def _probe(
+    command: tuple[Path | str, ...],
+    environment: Mapping[str, str],
+    workdir: Path,
+    diagnostic_label: str,
+) -> subprocess.CompletedProcess[str]:
     """Run one bounded read-only Rust command in ``workdir``.
 
     ``command`` contains a lexical executable followed by fixed arguments and
-    ``environment`` is copied for the child. Returns its text-mode completed
-    process only on exit status zero. It starts one subprocess with a five
-    second timeout and captures output without writing configuration; spawn,
-    timeout, or nonzero-exit failures raise ``ValidationError`` with at most
-    1000 final diagnostic characters.
+    ``environment`` is copied for the child. ``diagnostic_label`` is a fixed
+    tool and operation label supplied by the caller, never derived from child
+    output or an exception. Returns its text-mode completed process only on
+    exit status zero. It starts one subprocess with a five second timeout and
+    captures output without writing configuration; spawn, timeout, or
+    nonzero-exit failures raise ``ValidationError`` with at most 1000 final
+    diagnostic characters.
     """
 
     try:
@@ -147,12 +161,14 @@ def _probe(command: tuple[Path | str, ...], environment: Mapping[str, str], work
             check=False,
         )
     except OSError as error:
-        raise ValidationError(f"Rust provisioning cannot execute {command[1]}: {error}") from error
+        raise ValidationError(f"Rust provisioning cannot execute {diagnostic_label}: {error}") from error
     except subprocess.TimeoutExpired as error:
-        raise ValidationError(f"Rust provisioning timed out running {command[1]} after {_PROBE_TIMEOUT_SECONDS}s") from error
+        raise ValidationError(
+            f"Rust provisioning timed out running {diagnostic_label} after {_PROBE_TIMEOUT_SECONDS}s"
+        ) from error
     if completed.returncode:
         detail = _bounded_output(completed.stderr or completed.stdout)
-        raise ValidationError(f"Rust provisioning cannot {command[1]}: {detail or 'rustup failed'}")
+        raise ValidationError(f"Rust provisioning cannot {diagnostic_label}: {detail or 'rustup failed'}")
     return completed
 
 
