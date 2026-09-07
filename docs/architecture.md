@@ -72,9 +72,12 @@ The supervisor enforces:
 
 Current answers store the engine's exact UTF-8 payload without a completion
 sentinel. A directory format marker makes the adjacent versioned proof
-mandatory; the proof binds the payload name, size, and sha256. Historical
-sentinel-framed answers remain readable, and `answer <id>` verifies their
-original stored bytes before stripping the exact terminal frame for display.
+mandatory; the marker, payload, and proof are individually synchronized in that
+order, and the proof binds the payload name, size, and sha256. Historical
+sentinel-framed answers remain readable only with the exact terminal frame.
+`answer <id>` opens owned files without following links, verifies at most 16 MiB
+of original stored bytes, and streams validation when content exceeds the
+separate inline display limit.
 
 Codex raw assistant deltas are journaled as they arrive. Normalized transcript
 chunks retain a final nonblank segment and adjacent whitespace until more text

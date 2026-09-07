@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
@@ -153,6 +156,25 @@ class SealAndProofTests(unittest.TestCase):
         self.assertFalse(inspection.complete)
         self.assertIn("missing", inspection.proof_error or "")
 
+    def test_directory_sync_failure_cannot_leave_false_legacy_completion(self) -> None:
+        """Stop after publishing the format marker when its directory sync fails."""
+
+        self.path.write_bytes(_framed(b"old legacy body"))
+
+        def fail_directory_sync(descriptor: int) -> None:
+            """Fail only the directory fsync that makes one replace durable."""
+
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("directory sync failed")
+
+        with patch("agent_run.adapters.home.os.fsync", side_effect=fail_directory_sync):
+            with self.assertRaisesRegex(OSError, "directory sync failed"):
+                seal_answer(self.path, "new payload")
+        inspection = inspect_answer(self.path)
+        self.assertEqual(inspection.proof_version, ANSWER_FORMAT_PROOF)
+        self.assertFalse(inspection.complete)
+        self.assertIn("missing", inspection.proof_error or "")
+
     def test_metadata_reads_are_bounded_and_reject_symlinks(self) -> None:
         """Reject oversized proof metadata and proof paths that are symlinks."""
 
@@ -165,6 +187,35 @@ class SealAndProofTests(unittest.TestCase):
         target.write_text("{}", encoding="utf-8")
         proof.symlink_to(target)
         self.assertIn("regular file", inspect_answer(self.path).proof_error or "")
+
+    def test_metadata_symlink_swap_cannot_read_an_external_proof(self) -> None:
+        """Reject a proof replaced by a symlink at the descriptor-open boundary."""
+
+        seal_answer(self.path, "bounded")
+        proof = answer_proof_path(self.path)
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "proof.json"
+            outside.write_bytes(proof.read_bytes())
+            real_open = os.open
+            swapped = False
+
+            def swap_then_open(file, flags, mode=0o777, *, dir_fd=None):
+                """Swap the proof immediately before the production open call."""
+
+                nonlocal swapped
+                if not swapped and dir_fd is None and Path(file) == proof:
+                    proof.unlink()
+                    proof.symlink_to(outside)
+                    swapped = True
+                if dir_fd is None:
+                    return real_open(file, flags, mode)
+                return real_open(file, flags, mode, dir_fd=dir_fd)
+
+            with patch("agent_run.verify.os.open", side_effect=swap_then_open):
+                inspection = inspect_answer(self.path)
+        self.assertTrue(swapped)
+        self.assertFalse(inspection.complete)
+        self.assertIn("regular file", inspection.proof_error or "")
 
     def test_corrupted_format_marker_fails_closed(self) -> None:
         """Reject a corrupted durable format marker even with a valid proof."""
@@ -247,6 +298,33 @@ class SealAndProofTests(unittest.TestCase):
             strip_legacy=True,
         )
         self.assertEqual(payload, "legacy body")
+
+    def test_read_answer_payload_can_validate_without_retaining_content(self) -> None:
+        """Hash and UTF-8 validate a payload while discarding presentation text."""
+
+        data = b"valid payload"
+        self.path.write_bytes(data)
+        self.assertIsNone(
+            read_answer_payload(
+                self.path,
+                expected_bytes=len(data),
+                expected_sha256=hashlib.sha256(data).hexdigest(),
+                max_bytes=1 << 20,
+                strip_legacy=False,
+                return_content=False,
+            )
+        )
+        invalid = b"\xff" + data
+        self.path.write_bytes(invalid)
+        with self.assertRaises(AnswerEncodingError):
+            read_answer_payload(
+                self.path,
+                expected_bytes=len(invalid),
+                expected_sha256=hashlib.sha256(invalid).hexdigest(),
+                max_bytes=1 << 20,
+                strip_legacy=False,
+                return_content=False,
+            )
 
 class _Adapter:
     """Minimal runtime adapter satisfying the service's preparation surface."""
@@ -490,6 +568,42 @@ class AnswerServiceFormatTests(_ServiceFixture, unittest.TestCase):
         path.write_bytes(b"y" + payload[1:])
         with self.assertRaises(AnswerTamperedError):
             self.service.answer(agent_id)
+
+    def test_non_inline_payload_still_rejects_invalid_utf8(self) -> None:
+        """Incrementally validate UTF-8 even when content is not returned inline."""
+
+        agent_id = self._start()
+        self._record_answer(agent_id, b"x" * (1024 * 1024 + 1) + b"\xff", seal=False)
+        with self.assertRaises(AnswerEncodingError):
+            self.service.answer(agent_id)
+
+    def test_answer_symlink_swap_cannot_escape_the_agent_directory(self) -> None:
+        """Anchor payload opening to the agent directory across a final-path swap."""
+
+        agent_id = self._start()
+        path, _, _ = self._record_answer(agent_id, b"trusted", seal=True)
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "outside.md"
+            outside.write_bytes(b"trusted")
+            real_open = os.open
+            swapped = False
+
+            def swap_then_open(file, flags, mode=0o777, *, dir_fd=None):
+                """Swap the owned payload immediately before its relative open."""
+
+                nonlocal swapped
+                if not swapped and dir_fd is not None and os.fspath(file) == path.name:
+                    path.unlink()
+                    path.symlink_to(outside)
+                    swapped = True
+                if dir_fd is None:
+                    return real_open(file, flags, mode)
+                return real_open(file, flags, mode, dir_fd=dir_fd)
+
+            with patch("agent_run.verify.os.open", side_effect=swap_then_open):
+                with self.assertRaises(PathEscapeError):
+                    self.service.answer(agent_id)
+        self.assertTrue(swapped)
 
     def test_missing_current_proof_raises_instead_of_becoming_legacy(self) -> None:
         """Require proof when the durable marker identifies a current payload."""

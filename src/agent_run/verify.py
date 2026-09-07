@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import codecs
+import errno
 import hashlib
 import json
 import math
+import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +56,8 @@ MAX_ANSWER_PAYLOAD_BYTES = 16 * 1024 * 1024
 _MAX_ANSWER_METADATA_BYTES = 4096
 """Maximum bytes read from either answer metadata file."""
 
+_LEGACY_FRAME = b"\n" + DEFAULT_SENTINEL.encode("utf-8") + b"\n"
+
 
 class AnswerError(ValidationError):
     """Base class for typed answer-artifact read and proof failures."""
@@ -76,6 +81,54 @@ class AnswerEncodingError(AnswerError):
 
 class AnswerProofError(AnswerError):
     """The versioned proof sidecar is malformed or contradicts the payload."""
+
+
+def _open_regular_descriptor(
+    path: Path, *, owned_root: Path | None = None
+) -> tuple[int, os.stat_result]:
+    """Open ``path`` without following symlinks and return its descriptor state.
+
+    When ``owned_root`` is supplied, every relative directory component is
+    opened from that root with ``O_NOFOLLOW`` before the final regular file.
+    This anchors the open to the owned tree even if names are swapped during
+    validation. The caller owns the returned descriptor. Missing and operating
+    system failures propagate; escapes and non-regular files raise
+    ``PathEscapeError``.
+    """
+
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directories: list[int] = []
+    try:
+        if owned_root is None:
+            descriptor = os.open(path, file_flags)
+        else:
+            if not path.is_absolute() or not owned_root.is_absolute():
+                raise PathEscapeError("owned answer paths must be absolute")
+            try:
+                relative = path.relative_to(owned_root)
+            except ValueError as error:
+                raise PathEscapeError(f"answer artifact escapes owned directory: {path}") from error
+            if not relative.parts or ".." in relative.parts:
+                raise PathEscapeError(f"answer artifact escapes owned directory: {path}")
+            directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+            current = os.open(owned_root, directory_flags)
+            directories.append(current)
+            for part in relative.parts[:-1]:
+                current = os.open(part, directory_flags, dir_fd=current)
+                directories.append(current)
+            descriptor = os.open(relative.name, file_flags, dir_fd=current)
+        try:
+            metadata = os.fstat(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            raise PathEscapeError(f"answer artifact must be a regular file: {path}")
+        return descriptor, metadata
+    finally:
+        for directory in reversed(directories):
+            os.close(directory)
 
 
 @dataclass(frozen=True)
@@ -132,23 +185,34 @@ def answer_format_path(path: str | Path) -> Path:
     return Path(path).parent / ANSWER_FORMAT_FILENAME
 
 
-def _read_answer_metadata(path: Path, label: str) -> bytes | None:
-    """Read one optional regular metadata file within the fixed sidecar bound."""
+def _read_answer_metadata(
+    path: Path, label: str, *, owned_root: Path | None = None
+) -> bytes | None:
+    """Read one optional no-follow metadata file within the sidecar bound.
+
+    ``path`` names the marker or proof and ``label`` supplies its public error
+    name. ``owned_root`` optionally anchors every opened component. Missing
+    metadata returns ``None``; links, special files, oversize data, and I/O
+    failures raise ``AnswerProofError``. Size and bytes come from one descriptor.
+    """
 
     try:
-        metadata = path.lstat()
+        descriptor, metadata = _open_regular_descriptor(path, owned_root=owned_root)
     except FileNotFoundError:
         return None
+    except PathEscapeError:
+        raise AnswerProofError(f"{label} must be a regular file") from None
     except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise AnswerProofError(f"{label} must be a regular file") from error
         raise AnswerProofError(f"{label} is unreadable: {error}") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise AnswerProofError(f"{label} must be a regular file")
     if metadata.st_size > _MAX_ANSWER_METADATA_BYTES:
+        os.close(descriptor)
         raise AnswerProofError(
             f"{label} exceeds the {_MAX_ANSWER_METADATA_BYTES}-byte bound"
         )
     try:
-        with path.open("rb") as stream:
+        with os.fdopen(descriptor, "rb") as stream:
             data = stream.read(_MAX_ANSWER_METADATA_BYTES + 1)
     except OSError as error:
         raise AnswerProofError(f"{label} is unreadable: {error}") from error
@@ -159,50 +223,69 @@ def _read_answer_metadata(path: Path, label: str) -> bytes | None:
     return data
 
 
-def inspect_answer(path: str | Path, *, sentinel: str | None = DEFAULT_SENTINEL) -> AnswerProof:
+def inspect_answer(
+    path: str | Path,
+    *,
+    sentinel: str | None = DEFAULT_SENTINEL,
+    owned_root: Path | None = None,
+) -> AnswerProof:
     """Hash the answer file and establish its completion proof.
 
     A versioned sidecar written by the current sealer proves completion by
     matching the payload's exact size and hash; a malformed or contradicting
     sidecar leaves the answer incomplete and is never downgraded to legacy
     semantics. Without a sidecar the artifact is historical and completion
-    requires the terminal sentinel, whose absence marks an answer cut off
-    during write -- a different failure from no answer at all.
+    requires the exact terminal sentinel frame. ``owned_root`` optionally
+    anchors every file open beneath a trusted directory. Payload reads stop at
+    ``MAX_ANSWER_PAYLOAD_BYTES`` and raise ``AnswerOversizedError`` above it.
     """
 
     if sentinel is not None and (not isinstance(sentinel, str) or not sentinel.strip()):
         raise ValidationError("sentinel must be a nonblank string or None")
     answer = Path(path)
     try:
-        metadata = answer.lstat()
+        descriptor, metadata = _open_regular_descriptor(answer, owned_root=owned_root)
     except FileNotFoundError:
         return AnswerProof(answer, False, 0, None, False)
+    except PathEscapeError:
+        raise
     except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PathEscapeError(f"answer artifact must be a regular file: {answer}") from error
         raise ValidationError(f"cannot inspect answer file: {error}") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise PathEscapeError(f"answer artifact must be a regular file: {answer}")
+    if metadata.st_size > MAX_ANSWER_PAYLOAD_BYTES:
+        os.close(descriptor)
+        raise AnswerOversizedError(
+            f"answer artifact is {metadata.st_size} bytes, above the "
+            f"{MAX_ANSWER_PAYLOAD_BYTES}-byte inspection bound"
+        )
     digest = hashlib.sha256()
     size = 0
     tail = b""
-    marker = None if sentinel is None else sentinel.encode("utf-8")
-    found = sentinel is None
+    frame = None if sentinel is None else b"\n" + sentinel.encode("utf-8") + b"\n"
     try:
-        with answer.open("rb") as handle:
+        with os.fdopen(descriptor, "rb") as handle:
             while True:
                 chunk = handle.read(_CHUNK)
                 if not chunk:
                     break
                 size += len(chunk)
+                if size > MAX_ANSWER_PAYLOAD_BYTES:
+                    raise AnswerOversizedError(
+                        f"answer artifact exceeds the {MAX_ANSWER_PAYLOAD_BYTES}-byte "
+                        "inspection bound"
+                    )
                 digest.update(chunk)
-                if marker is not None and not found:
-                    window = tail + chunk
-                    found = marker in window
-                    tail = window[-(len(marker) - 1) :] if len(marker) > 1 else b""
-    except FileNotFoundError:
-        return AnswerProof(answer, False, 0, None, False)
+                if frame is not None:
+                    tail = (tail + chunk)[-len(frame) :]
+    except AnswerOversizedError:
+        raise
     except OSError as error:
         raise ValidationError(f"cannot read answer file: {error}") from error
-    proof_version, proof_error = _inspect_proof_sidecar(answer, size, digest.hexdigest())
+    found = frame is None or tail == frame
+    proof_version, proof_error = _inspect_proof_sidecar(
+        answer, size, digest.hexdigest(), owned_root=owned_root
+    )
     return AnswerProof(
         answer,
         True,
@@ -214,7 +297,13 @@ def inspect_answer(path: str | Path, *, sentinel: str | None = DEFAULT_SENTINEL)
     )
 
 
-def _inspect_proof_sidecar(answer: Path, size: int, sha256: str) -> tuple[int, str | None]:
+def _inspect_proof_sidecar(
+    answer: Path,
+    size: int,
+    sha256: str,
+    *,
+    owned_root: Path | None = None,
+) -> tuple[int, str | None]:
     """Classify one hashed payload's proof sidecar without raising.
 
     The durable directory marker pins new artifacts to the proof format even
@@ -223,19 +312,27 @@ def _inspect_proof_sidecar(answer: Path, size: int, sha256: str) -> tuple[int, s
     """
 
     try:
-        version, _ = _load_answer_proof(answer, size, sha256)
+        version, _ = _load_answer_proof(answer, size, sha256, owned_root=owned_root)
     except AnswerProofError as error:
         return ANSWER_FORMAT_PROOF, str(error)
     return version, None
 
 
 def _load_answer_proof(
-    answer: Path, size: int, sha256: str
+    answer: Path,
+    size: int,
+    sha256: str,
+    *,
+    owned_root: Path | None = None,
 ) -> tuple[int, dict[str, object] | None]:
-    """Load and verify one proof using the independent durable format marker."""
+    """Load one proof with optional owned-root anchoring and verify its payload."""
 
-    marker = _read_answer_metadata(answer_format_path(answer), "answer format marker")
-    raw = _read_answer_metadata(answer_proof_path(answer), "answer proof sidecar")
+    marker = _read_answer_metadata(
+        answer_format_path(answer), "answer format marker", owned_root=owned_root
+    )
+    raw = _read_answer_metadata(
+        answer_proof_path(answer), "answer proof sidecar", owned_root=owned_root
+    )
     if marker is None and raw is None:
         return ANSWER_FORMAT_LEGACY, None
     if marker is not None and marker != ANSWER_FORMAT_CONTENT:
@@ -295,21 +392,25 @@ def answer_proof_document(answer_name: str, size: int, sha256: str) -> bytes:
 
 
 def load_answer_proof(
-    path: str | Path, *, expected_bytes: int, expected_sha256: str
+    path: str | Path,
+    *,
+    expected_bytes: int,
+    expected_sha256: str,
+    owned_root: Path | None = None,
 ) -> dict | None:
     """Verify the proof sidecar for one stored answer, or ``None`` if legacy.
 
     An agent-directory format marker makes the current proof mandatory. Only
     directories with neither marker nor proof use historical legacy handling.
+    ``owned_root`` optionally anchors all metadata opens beneath a trusted tree.
     Unreadable, oversized, malformed, or contradicting metadata raises
     ``AnswerProofError`` and never silently downgrades a new-format payload.
     """
 
-    _, proof = _load_answer_proof(Path(path), expected_bytes, expected_sha256)
+    _, proof = _load_answer_proof(
+        Path(path), expected_bytes, expected_sha256, owned_root=owned_root
+    )
     return proof
-
-
-_LEGACY_FRAME = b"\n" + DEFAULT_SENTINEL.encode("utf-8") + b"\n"
 
 
 def strip_legacy_frame(data: bytes) -> bytes:
@@ -338,7 +439,9 @@ def read_answer_payload(
     expected_sha256: str,
     max_bytes: int,
     strip_legacy: bool,
-) -> str:
+    owned_root: Path | None = None,
+    return_content: bool = True,
+) -> str | None:
     """Read one owned answer artifact in full against its recorded proof.
 
     The read is bounded by ``max_bytes``, independently of any inline display
@@ -346,7 +449,10 @@ def read_answer_payload(
     validation. ``expected_bytes``/``expected_sha256`` are the durable values
     recorded at seal time; ``strip_legacy`` removes the exact historical
     terminal sentinel frame once for ``ANSWER_FORMAT_LEGACY`` artifacts. The
-    path must be a regular file, never a symlink or special file. Raises
+    path must be a regular file, never a symlink or special file.
+    ``owned_root`` optionally anchors all path components. When
+    ``return_content`` is false, bytes are still hashed and incrementally
+    UTF-8 validated but decoded text is discarded instead of accumulated. Raises
     ``AnswerMissingError``, ``AnswerOversizedError``, ``AnswerTamperedError``,
     ``AnswerEncodingError``, or ``PathEscapeError`` with the failing cause.
     """
@@ -355,40 +461,65 @@ def read_answer_payload(
         raise ValidationError("max_bytes must be a positive integer")
     answer = Path(path)
     try:
-        metadata = answer.lstat()
+        descriptor, metadata = _open_regular_descriptor(answer, owned_root=owned_root)
     except FileNotFoundError:
         raise AnswerMissingError(f"answer artifact is missing: {answer}") from None
+    except PathEscapeError:
+        raise
     except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PathEscapeError(f"answer artifact must be a regular file: {answer}") from error
         raise ValidationError(f"cannot stat answer artifact: {error}") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise PathEscapeError(f"answer artifact must be a regular file: {answer}")
     size = metadata.st_size
     if size != expected_bytes:
+        os.close(descriptor)
         raise AnswerTamperedError("answer artifact size does not match its recorded proof")
     if size > max_bytes:
+        os.close(descriptor)
         raise AnswerOversizedError(
             f"answer artifact is {size} bytes, above the {max_bytes}-byte read bound"
         )
     digest = hashlib.sha256()
-    content = bytearray()
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    decoded: list[str] | None = [] if return_content else None
+    encoding_error: UnicodeDecodeError | None = None
+    seen = 0
     try:
-        with answer.open("rb") as handle:
+        with os.fdopen(descriptor, "rb") as handle:
             while chunk := handle.read(_CHUNK):
+                seen += len(chunk)
                 digest.update(chunk)
-                content.extend(chunk)
-    except FileNotFoundError:
-        raise AnswerMissingError(f"answer artifact is missing: {answer}") from None
+                if encoding_error is None:
+                    try:
+                        text = decoder.decode(chunk, final=False)
+                    except UnicodeDecodeError as error:
+                        encoding_error = error
+                    else:
+                        if decoded is not None:
+                            decoded.append(text)
     except OSError as error:
         raise ValidationError(f"cannot read answer artifact: {error}") from error
+    if seen != expected_bytes:
+        raise AnswerTamperedError("answer artifact size does not match its recorded proof")
     if digest.hexdigest() != expected_sha256:
         raise AnswerTamperedError("answer artifact hash does not match its recorded proof")
-    payload = bytes(content)
-    if strip_legacy:
-        payload = strip_legacy_frame(payload)
-    try:
-        return payload.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise AnswerEncodingError("answer artifact is not valid UTF-8") from error
+    if encoding_error is None:
+        try:
+            final = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as error:
+            encoding_error = error
+        else:
+            if decoded is not None:
+                decoded.append(final)
+    if encoding_error is not None:
+        raise AnswerEncodingError("answer artifact is not valid UTF-8") from encoding_error
+    if decoded is None:
+        return None
+    payload = "".join(decoded)
+    frame = _LEGACY_FRAME.decode("utf-8")
+    if strip_legacy and payload.endswith(frame):
+        payload = payload[: -len(frame)]
+    return payload
 
 
 def silence_seconds(last_progress_at: float | None, now: float) -> float | None:

@@ -54,7 +54,6 @@ from .verify import (
     ANSWER_KIND,
     ANSWER_MEDIA_TYPE,
     MAX_ANSWER_PAYLOAD_BYTES,
-    AnswerMissingError,
     load_answer_proof,
     read_answer_payload,
 )
@@ -1023,6 +1022,9 @@ class AgentService:
         proof format even when their required sidecar is missing or corrupt.
         Historical sentinel-framed payloads keep their stored byte count and
         hash while the exact terminal frame is stripped once for presentation.
+        Every payload and metadata component is opened without following links,
+        relative to the owning agent directory. Payloads above the inline cutoff
+        are streamed for size, hash, and UTF-8 validation without retaining text.
         """
 
         checked = validate_agent_id(agent_id)
@@ -1039,27 +1041,32 @@ class AgentService:
         size = int(row["answer_bytes"])
         expected_sha = str(row["answer_sha256"])
         path = Path(str(row["answer_path"]))
-        if path.is_symlink():
-            raise ValidationError("stored answer path must not be a symlink")
-        try:
-            resolved = path.resolve(strict=True)
-        except FileNotFoundError:
-            raise AnswerMissingError(f"stored answer is missing: {path}") from None
-        except OSError as error:
-            raise ValidationError(f"cannot resolve stored answer: {error}") from error
         root = agent_dir(checked, self._home).resolve()
-        if not resolved.is_relative_to(root) or not resolved.is_file():
+        if not path.is_absolute():
+            raise ValidationError("stored answer path must be absolute")
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
             raise ValidationError("stored answer path is outside the agent directory")
-        proof = load_answer_proof(resolved, expected_bytes=size, expected_sha256=expected_sha)
+        if not relative.parts or ".." in relative.parts:
+            raise ValidationError("stored answer path is outside the agent directory")
+        resolved = root / relative
+        proof = load_answer_proof(
+            resolved,
+            expected_bytes=size,
+            expected_sha256=expected_sha,
+            owned_root=root,
+        )
         proof_version = ANSWER_FORMAT_LEGACY if proof is None else ANSWER_FORMAT_PROOF
-        payload = read_answer_payload(
+        text = read_answer_payload(
             resolved,
             expected_bytes=size,
             expected_sha256=expected_sha,
             max_bytes=MAX_ANSWER_PAYLOAD_BYTES,
             strip_legacy=proof_version == ANSWER_FORMAT_LEGACY,
+            owned_root=root,
+            return_content=size <= self._max_inline_answer_bytes,
         )
-        text = payload if size <= self._max_inline_answer_bytes else None
         _logger.debug("answer agent_id=%s available=True bytes=%d", checked, size)
         return AnswerView(
             checked,

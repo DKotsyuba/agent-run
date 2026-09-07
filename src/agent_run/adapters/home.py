@@ -95,10 +95,32 @@ def _managed_path(home: str | Path, relative_path: str | Path) -> Path:
     return candidate
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist prior directory-entry changes beneath an existing directory.
+
+    ``path`` is opened read-only as a directory and synchronized before the
+    descriptor is closed. ``OSError`` from opening or syncing is propagated so
+    callers cannot claim an ordered durable publish when the platform refused it.
+    """
+
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def write_managed_file(
     home: str | Path, relative_path: str | Path, content: str | bytes
 ) -> str:
-    """Atomically replace one private regular file and return its SHA-256."""
+    """Durably replace one private regular file and return its SHA-256.
+
+    ``home`` owns the generated tree, ``relative_path`` must stay beneath it,
+    and ``content`` supplies the exact UTF-8 or byte payload. The temporary file
+    is synchronized before its atomic replacement, then the parent directory is
+    synchronized so a successful return makes that one publish durable.
+    Validation and path-escape errors are typed; filesystem failures propagate.
+    """
 
     data = content.encode("utf-8") if isinstance(content, str) else content
     digest = content_hash(data)
@@ -119,6 +141,7 @@ def write_managed_file(
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, candidate)
+        _fsync_directory(candidate.parent)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -132,8 +155,10 @@ def seal_answer(path: Path, text: str) -> tuple[int, str]:
     The payload file holds ``text`` encoded as UTF-8 with no appended
     completion marker. The adjacent ``<name>.proof.json`` sidecar records the
     payload's byte count and SHA-256. A directory-level format marker is
-    written first so a crash or deleted proof cannot make a new payload look
-    like a historical sentinel-framed answer. Each file replacement is atomic.
+    durably written first so a crash or deleted proof cannot make a new payload
+    look like a historical sentinel-framed answer. The marker, payload, and
+    proof are separate ordered durable replacements, not one cross-file atomic
+    transaction.
 
     Returns ``(payload_bytes, payload_sha256)`` for the clean payload, the
     values durably recorded with the run's outcome.

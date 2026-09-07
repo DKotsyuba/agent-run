@@ -1204,7 +1204,7 @@ class RunStatsSupervisorTests(unittest.TestCase):
         return None if row is None else dict(row)
 
     def test_a_terminal_commit_writes_the_run_stats_row(self) -> None:
-        self.write_answer(f"done {DEFAULT_SENTINEL}")
+        self.write_answer(f"done\n{DEFAULT_SENTINEL}\n")
         ops = FakeOps()
         session = FakeSession(
             ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
@@ -1225,7 +1225,7 @@ class RunStatsSupervisorTests(unittest.TestCase):
     def test_a_stats_failure_still_returns_the_committed_outcome(self) -> None:
         import agent_run.supervisor as supervisor_module
 
-        self.write_answer(f"done {DEFAULT_SENTINEL}")
+        self.write_answer(f"done\n{DEFAULT_SENTINEL}\n")
         ops = FakeOps()
         session = FakeSession(
             ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
