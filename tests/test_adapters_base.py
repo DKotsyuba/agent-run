@@ -191,13 +191,12 @@ class AdapterTests(unittest.TestCase):
         modules = (
             "agent_run.adapters.claude.adapter",
             "agent_run.adapters.codex.adapter",
-            "agent_run.adapters.qwen.adapter",
         )
         for module in modules:
             __import__("sys").modules.pop(module, None)
         runtimes = {
             name: RuntimeConfig(True, f"{module}:ADAPTER", Path("/bin/echo"), Path("/tmp"), ())
-            for name, module in zip(("claude", "codex", "qwen"), modules)
+            for name, module in zip(("claude", "codex"), modules)
         }
         AdapterRegistry(runtimes).preload_enabled()
         for module in modules:

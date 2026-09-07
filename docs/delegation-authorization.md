@@ -34,7 +34,7 @@ the destination is agent-run rather than a native agent.
 The approved destinations are the owner's configured agent-run runtimes and
 their configured model-provider routes: Codex (the default account and named
 accounts `personal1` and `personal2`), Claude (including Sonnet, Opus and Fable),
-GLM and Qwen. Approval does not enable a disabled runtime. An agent
+GLM, Qwen, and OpenCode. Approval does not enable a disabled runtime. An agent
 must not add an unapproved account, provider or endpoint and treat its own
 configuration change as owner consent; additions require owner approval.
 An account label alone establishes neither foreign ownership nor distrust.

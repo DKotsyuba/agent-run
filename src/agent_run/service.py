@@ -1146,6 +1146,12 @@ class AgentService:
         return label
 
     def _runtime_config(self, name: str) -> RuntimeConfig:
+        """Return a configured runtime or explain OpenCode's removal.
+
+        Legacy OpenCode rows remain readable from the state store, but new
+        launches must fail before adapter resolution with migration guidance.
+        """
+
         if name == "opencode":
             raise ValidationError(
                 "runtime 'opencode' is no longer supported; remove [runtimes.opencode] from config.toml"

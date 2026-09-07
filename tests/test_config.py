@@ -194,6 +194,8 @@ command = ["echo", "done"]
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))
 
     def test_legacy_opencode_runtime_is_ignored(self) -> None:
+        """Ignore legacy OpenCode configuration without importing its adapter."""
+
         config = self.load(
             """schema_version = 1
 [runtimes.opencode]

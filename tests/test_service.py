@@ -180,6 +180,32 @@ class AgentServiceTests(unittest.TestCase):
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
 
+    def test_new_opencode_start_is_rejected_with_migration_guidance(self) -> None:
+        """Reject a removed runtime before creating an agent or loading an adapter."""
+
+        with self.assertRaisesRegex(ValidationError, "no longer supported"):
+            self.service.start(
+                StartRequest(
+                    "opencode", "model", "profile", "task", self.workdir,
+                    timeout_seconds=60,
+                )
+            )
+        self.assertEqual(self.launched, [])
+
+    def test_historical_opencode_row_is_readable_without_adapter(self) -> None:
+        """Read a persisted OpenCode row without resolving its retired adapter."""
+
+        created = self.store.create_agent(
+            StartRequest(
+                "opencode", "model", "profile", "historic", self.workdir,
+                timeout_seconds=60,
+            ),
+            task_summary="historic",
+            config_revision="legacy",
+            at=1,
+        )
+        self.assertEqual(self.service.get(created.agent_id).runtime, "opencode")
+
     def test_account_resolution_uses_sibling_home_and_store_auth(self) -> None:
         runtime = self.config.runtimes["fake"]
         auth_source = self.root / "accounts" / "fake" / "personal2" / "auth.json"
