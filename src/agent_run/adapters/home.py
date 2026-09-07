@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from ..errors import PathEscapeError, ValidationError
-from ..verify import DEFAULT_SENTINEL
+from ..verify import ANSWER_PROOF_SUFFIX, answer_proof_document
 
 
 def content_hash(content: str | bytes) -> str:
@@ -122,13 +122,31 @@ def write_managed_file(
 
 
 def seal_answer(path: Path, text: str) -> tuple[int, str]:
+    """Seal one completed engine answer as exact payload bytes plus a proof.
+
+    The payload file holds ``text`` encoded as UTF-8 with no appended
+    completion marker. Completion and integrity are proven separately by the
+    adjacent ``<name>.proof.json`` sidecar (``ANSWER_FORMAT_PROOF``), which
+    records the payload's byte count and SHA-256. The payload is written
+    first and the proof second, each atomically; there is no cross-file
+    atomicity, so a crash in between leaves an unproven payload that
+    verification treats as incomplete rather than publishing success.
+
+    Returns ``(payload_bytes, payload_sha256)`` for the clean payload, the
+    values durably recorded with the run's outcome.
+    """
+
     if not isinstance(path, Path) or not path.is_absolute():
         raise ValidationError("answer path must be absolute")
     if not isinstance(text, str) or not text.strip():
         raise ValidationError("answer text must be nonblank")
-    separator = "" if text.endswith("\n") else "\n"
-    data = f"{text}{separator}{DEFAULT_SENTINEL}\n".encode("utf-8")
+    data = text.encode("utf-8")
     digest = write_managed_file(path.parent, path.name, data)
+    write_managed_file(
+        path.parent,
+        f"{path.name}{ANSWER_PROOF_SUFFIX}",
+        answer_proof_document(path.name, len(data), digest),
+    )
     return len(data), digest
 
 

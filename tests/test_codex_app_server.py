@@ -1087,7 +1087,7 @@ class CodexAppServerSessionTests(unittest.TestCase):
         import hashlib
 
         from agent_run.adapters.codex.app_server import CodexAppServerSession
-        from agent_run.verify import DEFAULT_SENTINEL
+        from agent_run.verify import ANSWER_FORMAT_PROOF, inspect_answer
 
         with tempfile.TemporaryDirectory() as directory:
             answer = Path(directory).resolve() / "answer.md"
@@ -1111,11 +1111,14 @@ class CodexAppServerSessionTests(unittest.TestCase):
             )
             outcome = session.wait(0)
             data = answer.read_bytes()
+            proof = inspect_answer(answer)
         self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
-        self.assertTrue(data.endswith(f"{DEFAULT_SENTINEL}\n".encode()))
+        self.assertEqual(data, b"final answer")
         self.assertEqual(outcome.answer_path, answer)
         self.assertEqual(outcome.answer_bytes, len(data))
         self.assertEqual(outcome.answer_sha256, hashlib.sha256(data).hexdigest())
+        self.assertTrue(proof.complete)
+        self.assertEqual(proof.proof_version, ANSWER_FORMAT_PROOF)
 
     def test_terminal_statuses_map_to_domain_outcomes(self) -> None:
         for status, expected in (

@@ -49,6 +49,17 @@ from .start_coordinator import StartCoordinator
 from .state.reconciliation import workflow_owner_identity
 from .supervisor import supervisor_identity
 from .state.store import StateStore
+from .verify import (
+    ANSWER_FORMAT_LEGACY,
+    ANSWER_FORMAT_PROOF,
+    ANSWER_KIND,
+    ANSWER_MEDIA_TYPE,
+    AnswerEncodingError,
+    AnswerMissingError,
+    AnswerTamperedError,
+    load_answer_proof,
+    strip_legacy_frame,
+)
 
 
 _logger = logging.getLogger("agent_run.service")
@@ -260,6 +271,19 @@ class TranscriptPage:
 
 @dataclass(frozen=True, slots=True)
 class AnswerView:
+    """Descriptor for one stored answer artifact.
+
+    ``kind`` and ``media_type`` classify the artifact, ``relative_path`` is
+    its owned path beneath the agent directory, and
+    ``size_bytes``/``sha256`` always describe the stored artifact exactly as
+    recorded at seal time -- for historical artifacts that includes the
+    terminal sentinel frame. ``proof_version`` names the explicit on-disk
+    proof format (``ANSWER_FORMAT_LEGACY`` or ``ANSWER_FORMAT_PROOF``).
+    ``content`` is presentation only: at most ``max_inline_answer_bytes`` of
+    decoded payload with any legacy terminal frame stripped once; it is never
+    completion or integrity evidence.
+    """
+
     agent_id: AgentId
     status: AgentStatus
     available: bool
@@ -268,6 +292,10 @@ class AnswerView:
     sha256: str | None
     content: str | None
     inline_complete: bool
+    relative_path: str | None
+    kind: str | None
+    media_type: str | None
+    proof_version: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -991,12 +1019,27 @@ class AgentService:
         )
 
     def answer(self, agent_id: str | AgentId) -> AnswerView:
+        """Return the verified descriptor for one agent's stored answer.
+
+        The artifact's recorded size and hash are always verified against the
+        durable row before any content is returned. A versioned proof sidecar
+        pins the clean ``ANSWER_FORMAT_PROOF`` format; its absence marks the
+        historical sentinel-framed format, whose exact terminal frame is
+        stripped once for inline presentation while the descriptor keeps the
+        original stored byte count and hash. A present but malformed or
+        contradicting sidecar raises ``AnswerProofError`` and never falls
+        back to legacy handling.
+        """
+
         checked = validate_agent_id(agent_id)
         row = self._store.get_agent(checked)
         status = AgentStatus(str(row["status"]))
         if row["answer_path"] is None:
             _logger.debug("answer agent_id=%s available=False", checked)
-            return AnswerView(checked, status, False, None, None, None, None, True)
+            return AnswerView(
+                checked, status, False, None, None, None, None, True,
+                None, None, None, None,
+            )
         if row["answer_bytes"] is None or row["answer_sha256"] is None:
             raise ValidationError("stored answer proof is incomplete")
         size = int(row["answer_bytes"])
@@ -1004,13 +1047,15 @@ class AgentService:
         path = Path(str(row["answer_path"]))
         try:
             resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            raise AnswerMissingError(f"stored answer is missing: {path}") from None
         except OSError as error:
             raise ValidationError(f"cannot resolve stored answer: {error}") from error
         root = agent_dir(checked, self._home).resolve()
         if not resolved.is_relative_to(root) or not resolved.is_file():
             raise ValidationError("stored answer path is outside the agent directory")
         if resolved.stat().st_size != size:
-            raise ValidationError("stored answer size does not match the sealed file")
+            raise AnswerTamperedError("stored answer size does not match the sealed file")
         digest = hashlib.sha256()
         content = bytearray() if size <= self._max_inline_answer_bytes else None
         counted = 0
@@ -1021,14 +1066,24 @@ class AgentService:
                     digest.update(chunk)
                     if content is not None:
                         content.extend(chunk)
+        except FileNotFoundError:
+            raise AnswerMissingError(f"stored answer is missing: {path}") from None
         except OSError as error:
             raise ValidationError(f"cannot read stored answer: {error}") from error
         if counted != size or digest.hexdigest() != expected_sha:
-            raise ValidationError("stored answer hash does not match the sealed file")
-        try:
-            text = None if content is None else bytes(content).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ValidationError("stored answer is not valid UTF-8") from error
+            raise AnswerTamperedError("stored answer hash does not match the sealed file")
+        proof = load_answer_proof(resolved, expected_bytes=size, expected_sha256=expected_sha)
+        proof_version = ANSWER_FORMAT_LEGACY if proof is None else ANSWER_FORMAT_PROOF
+        if content is None:
+            text = None
+        else:
+            raw = bytes(content)
+            if proof_version == ANSWER_FORMAT_LEGACY:
+                raw = strip_legacy_frame(raw)
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise AnswerEncodingError("stored answer is not valid UTF-8") from error
         _logger.debug("answer agent_id=%s available=True bytes=%d", checked, size)
         return AnswerView(
             checked,
@@ -1039,6 +1094,10 @@ class AgentService:
             expected_sha,
             text,
             content is not None,
+            str(resolved.relative_to(root)),
+            ANSWER_KIND,
+            ANSWER_MEDIA_TYPE,
+            proof_version,
         )
 
     def summary(
