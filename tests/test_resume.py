@@ -39,6 +39,8 @@ class ResumableAdapter:
         self.materialize_calls = 0
         self.prepare_calls = 0
         self.prepare_homes = []
+        self.prepare_resume_ids = []
+        self.prepare_tasks = []
         self.prepare_materialize_revision = None
 
     def describe(self) -> RuntimeInfo:
@@ -84,6 +86,8 @@ class ResumableAdapter:
 
         self.prepare_calls += 1
         self.prepare_homes.append(Path(home))
+        self.prepare_resume_ids.append(resume_session_id)
+        self.prepare_tasks.append(request.task)
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task,
             agent_dir / "runtime.jsonl", {}, agent_dir / "answer.md",
@@ -538,6 +542,28 @@ class ResumeTests(unittest.TestCase):
         self.assertIs(view.status, AgentStatus.FAILED)
         self.assertIn("must not rematerialize", view.failure_text)
         self.assertEqual(len(self.launched), 1)
+
+    def test_legacy_shared_home_resume_rematerializes_before_native_attach(self) -> None:
+        """Legacy parents refresh current role state before exact session attach."""
+
+        first = self._parent(session="session-1", task="first role")
+        second = self._parent(session="session-2", task="second role")
+        self.store.connection.execute(
+            "UPDATE agents SET config_revision = 'legacy' WHERE id IN (?, ?)",
+            (first, second),
+        )
+        self.store.connection.commit()
+
+        child = self.service.resume(first, "resume first role")
+        plan = self._wait(3)
+
+        self.assertIsNone(ADAPTER.prepare_resume_ids[-1])
+        self.assertEqual(ADAPTER.prepare_tasks[-1], "resume first role")
+        self.assertEqual(ADAPTER.materialize_calls, 3)
+        self.assertEqual(plan.resume_session_id, "session-1")
+        self.assertEqual(
+            self.store.get_agent(child.agent_id)["config_revision"], "cfg-1"
+        )
 
     def test_same_request_id_replays_the_same_child_even_when_stale(self) -> None:
         parent = self._parent()

@@ -1,4 +1,4 @@
-"""Frozen runtime adapter API version 1."""
+"""Frozen runtime adapter API version 2."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from ..errors import ValidationError
 from ..profiles import AgentProfile
 
 
-ADAPTER_API_VERSION = 1
+ADAPTER_API_VERSION = 2
 
 
 class Capability(str, Enum):

@@ -153,8 +153,9 @@ class AdapterTests(unittest.TestCase):
                 load_adapter("fake_module:ADAPTER", {Capability.WRITE})
 
         for module, message in (
-            (self.module(ADAPTER_API_VERSION=2), "API version"),
+            (self.module(ADAPTER_API_VERSION=1), "API version"),
             (self.module(ADAPTER_API_VERSION=1.0), "API version"),
+            (self.module(ADAPTER=FakeAdapter(1)), "reports API version"),
             (self.module(ADAPTER=FakeAdapter(1.0)), "reports API version"),
             (self.module(ADAPTER=object()), "missing callable"),
         ):

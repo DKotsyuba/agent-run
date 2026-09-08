@@ -857,6 +857,7 @@ class AgentService:
                 )
             stage = "prepare"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
+            prepare_resume_id = resume_session_id if snapshot_resume else None
             plan = adapter.prepare(
                 request,
                 profile,
@@ -864,10 +865,12 @@ class AgentService:
                 effective_home,
                 candidate_dir,
                 mcp_servers=mcp_servers,
-                resume_session_id=resume_session_id,
+                resume_session_id=prepare_resume_id,
             )
-            if plan.resume_session_id != resume_session_id:
+            if plan.resume_session_id != prepare_resume_id:
                 raise ValidationError("adapter returned a mismatched resume session")
+            if resume_session_id is not None and not snapshot_resume:
+                plan = replace(plan, resume_session_id=resume_session_id)
             if snapshot_resume:
                 assert stored_snapshot is not None
                 if plan.materialize_revision is not None:
