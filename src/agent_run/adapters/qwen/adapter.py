@@ -25,11 +25,7 @@ from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.launch_io import abort_launch
 from agent_run.adapters.command_policy import materialize_refusal_commands, render_qwen_denials
 from agent_run.adapters.continuation import cli_resume_plan
-from agent_run.adapters.developer_environment import (
-    configured_environment_keys,
-    developer_environment,
-    environment_digest,
-)
+from agent_run.adapters.environment import host_environment
 from agent_run.adapters.home import content_hash, write_managed_file
 from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
@@ -72,11 +68,6 @@ _API_ERROR_PREFIX = "[API Error:"
 #: line of Qwen's ``[API Error: ...]`` payload carries no secrets, and the
 #: cap keeps pathological provider payloads out of the durable store.
 _MAX_FAILURE_LINE = 500
-# Bypass macOS' /usr/bin/git Xcode shim inside Qwen's seatbelt sandbox. Only
-# the legacy no-preset path uses it; a declared developer environment supplies
-# every PATH entry from owner configuration instead.
-_XCODE_GIT_DIRECTORY = Path("/Applications/Xcode.app/Contents/Developer/usr/bin")
-
 #: Managed HOME-relative directory holding this runtime's PATH refusal shims.
 #: It lives beside ``.qwen/settings.json`` so a rebuilt home rebuilds the
 #: policy, and it is prepended to the child PATH ahead of the declared entries.
@@ -123,8 +114,8 @@ def _mcp_document(
 
     :param names: Owner-configured ``runtimes.qwen.mcp`` entries, in order.
     :param servers: Caller-resolved definitions keyed by the same names.
-    :param environment_keys: Declared developer-environment variable names
-        from :func:`configured_environment_keys` to forward to every server.
+    :param environment_keys: Selected MCP environment variable names to forward
+        to every server.
         Each is rendered as a ``${NAME}`` reference, which Qwen 0.22.2 expands
         from its own already isolated process environment, so the declared
         toolchain reaches an MCP subprocess without embedding a value in the
@@ -242,10 +233,7 @@ class QwenAdapter:
             resolve native denial aliases against. Direct callers omit it and
             use the selected preset paths.
         :returns: A content hash covering the rendered settings document,
-            every delivered skill's content, every installed plugin file, and
-            :func:`environment_digest`, so a changed skill, plugin selection,
-            or developer-environment declaration is reflected in the revision
-            and a stale home is not reused.
+            every delivered skill's content, and every installed plugin file.
 
         Owner-declared ``denied_commands`` are materialized twice, by design:
         as PATH refusal shims under :func:`command_policy_directory` (ordinary
@@ -272,9 +260,24 @@ class QwenAdapter:
                 () if selected is None else selected.path
             ),
         )
+        selected_mcp = []
+        for name in config.mcp:
+            server = mcp_servers.get(name)
+            if server is None:
+                raise ValidationError(
+                    f"no resolved MCP definition for runtimes.qwen.mcp entry: {name}"
+                )
+            selected_mcp.append(server)
+        mcp_environment_names = tuple(
+            dict.fromkeys(
+                env_name for server in selected_mcp for env_name in server.env_from
+            )
+        )
         document: dict[str, object] = {
             "context": {"fileName": str(context_path)},
-            "mcpServers": _mcp_document(config.mcp, mcp_servers, configured_environment_keys(config)),
+            "mcpServers": _mcp_document(
+                config.mcp, mcp_servers, mcp_environment_names
+            ),
             "tools": {"sandbox": True},
             "security": {"auth": {"selectedType": _SELECTED_AUTH_TYPE}},
         }
@@ -294,7 +297,6 @@ class QwenAdapter:
                 text,
                 *(f"{name}:{digest}" for name, digest in sorted(skill_hashes.items())),
                 plugin_digest,
-                environment_digest(config),
             ]
         )
         revision = content_hash(fingerprint)
@@ -369,16 +371,22 @@ class QwenAdapter:
             write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
         elif not (Path(home) / ".qwen/settings.json").is_file():
             raise ValidationError("qwen resume requires a verified materialized home")
-        environment: dict[str, str] = {"HOME": str(home), "OPENAI_MODEL": request.model}
-        # Keep the narrow PATH baseline Qwen needs for its launcher and native
-        # utilities; a selected preset still leads it and no other ambient
-        # variables cross into the child.
-        parent_path = os.environ.get("PATH")
-        if parent_path:
-            if (_XCODE_GIT_DIRECTORY / "git").is_file():
-                parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
-            environment["PATH"] = parent_path
-        environment = developer_environment(environment, config, Path(request.workdir))
+        selected_secret_names = tuple(
+            dict.fromkeys(
+                (
+                    *(config.auth.names if config.auth is not None else ()),
+                    *(
+                        env_name
+                        for name in config.mcp
+                        for env_name in mcp_servers[name].env_from
+                    ),
+                )
+            )
+        )
+        environment = host_environment(
+            {"HOME": str(home), "OPENAI_MODEL": request.model},
+            allowed_secret_names=selected_secret_names,
+        )
         materialize_revision = None
         if resume_session_id is None:
             materialize_revision = self.materialize(

@@ -1,8 +1,4 @@
-"""Claude Code runtime adapter: strict isolation, no live auth/quota calls.
-
-Generated assets use only declared configuration, profiles, and skills. An
-existing uv managed-Python root is the sole ambient exception for offline hooks.
-"""
+"""Claude Code runtime adapter with generated config and inherited host tools."""
 
 from __future__ import annotations
 
@@ -18,7 +14,8 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
-from ..home import content_hash, managed_uv_python_environment
+from ..environment import host_environment
+from ..home import content_hash
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -32,14 +29,8 @@ from ..base import (
 )
 from ..command_policy import materialize_refusal_commands, render_claude_denials
 from ..continuation import cli_resume_plan
-from ..developer_environment import (
-    configured_environment_keys,
-    developer_environment,
-    environment_digest,
-)
 from ..version import observe_binary_version
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
-from ..rust import RUST_ENVIRONMENT_NAMES
 from ..snapshots import finalize_runtime_snapshots
 from .auth import auth_environment, claude_config_dir
 from .constants import (
@@ -115,11 +106,9 @@ class ClaudeAdapter:
         A configured but unresolved MCP name fails closed rather than
         emitting a non-functional entry.
 
-        The returned newline-delimited digest includes declared Rust roots when
-        provisioning is enabled and a selected developer-environment preset's
-        declared paths, variables, and command policy, so materialization
-        revision evidence changes with the launch environment without storing
-        credentials.
+        The returned newline-delimited digest covers only generated runtime
+        assets. Host environment values and credentials remain process-memory
+        launch inputs and never affect the stored revision.
         """
 
         settings_digest = render_settings(home, config.hooks)
@@ -134,9 +123,6 @@ class ClaudeAdapter:
             home, config.plugins, snapshot_assets
         )
         digests = [settings_digest, mcp_digest, plugin_digest, declared_digest]
-        if config.rust is not None:
-            digests.append(content_hash(f"{config.rust.rustup_home}\0{config.rust.cargo_bin}"))
-        digests.append(environment_digest(config))
         revision = "\n".join(digests)
         managed_files = (
             "settings.json",
@@ -305,16 +291,30 @@ class ClaudeAdapter:
         argv += ["--session-id", session_id]
 
         scoped_config_dir = str(claude_config_dir(config))
-        environment: dict[str, str] = {
-            "HOME": str(home),
-            "CLAUDE_CONFIG_DIR": scoped_config_dir,
-            **managed_uv_python_environment(),
-        }
-        path_value = os.environ.get("PATH")
-        if path_value:
-            environment["PATH"] = path_value
-        environment = developer_environment(environment, config, request.workdir)
-        environment["CLAUDE_CONFIG_DIR"] = scoped_config_dir
+        selected_mcp = []
+        for name in config.mcp:
+            server = mcp_servers.get(name)
+            if server is None:
+                raise ValidationError(
+                    f"no resolved MCP definition for runtimes.claude.mcp entry: {name}"
+                )
+            selected_mcp.append(server)
+        allowed_secret_names = tuple(
+            dict.fromkeys(
+                (
+                    *(config.auth.names if config.auth is not None else ()),
+                    *(
+                        env_name
+                        for server in selected_mcp
+                        for env_name in server.env_from
+                    ),
+                )
+            )
+        )
+        environment = host_environment(
+            {"HOME": str(home), "CLAUDE_CONFIG_DIR": scoped_config_dir},
+            allowed_secret_names=allowed_secret_names,
+        )
 
         selected_environment = config.environment
         if selected_environment is not None and selected_environment.denied_commands:
@@ -347,39 +347,19 @@ class ClaudeAdapter:
                 name for name in injected if is_secret_env_name(name)
             )
 
-        configured_keys = configured_environment_keys(config)
         mcp_env_names: list[str] = []
-        for name in config.mcp:
-            server = mcp_servers.get(name)
-            if server is None:
-                raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
+        for name, server in zip(config.mcp, selected_mcp, strict=True):
             for env_name in server.env_from:
                 if env_name == "CLAUDE_CONFIG_DIR":
                     value = scoped_config_dir
-                elif env_name in configured_keys or (
-                    config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES
-                ):
-                    value = environment.get(env_name)
                 else:
-                    value = os.environ.get(env_name)
+                    value = environment.get(env_name)
                 if not value:
-                    detail = (
-                        "Rust provisioning does not permit RUSTUP_TOOLCHAIN; use rust-toolchain files"
-                        if config.rust is not None and env_name == "RUSTUP_TOOLCHAIN"
-                        else f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
-                    )
                     raise ValidationError(
-                        detail
+                        f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
                     )
                 environment[env_name] = value
                 mcp_env_names.append(env_name)
-
-        mcp_environment = {
-            name: environment[name] for name in configured_keys if name in environment
-        }
-        if config.mcp and mcp_environment:
-            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=mcp_environment)
-            argv[argv.index("--mcp-config") + 1] = str(agent_dir / "mcp" / "mcp-config.json")
 
         initial_input = (
             json.dumps(

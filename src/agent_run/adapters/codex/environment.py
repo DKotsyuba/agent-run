@@ -19,8 +19,8 @@ from pathlib import Path
 from ...config import McpConfig, RuntimeConfig
 from ...errors import ValidationError
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
-from ..developer_environment import developer_environment
-from ..home import managed_uv_python_environment, write_managed_file
+from ..environment import host_environment
+from ..home import write_managed_file
 
 
 def resolved_directory(value: object, label: str) -> Path:
@@ -67,25 +67,15 @@ def require_resolved_mcp(
             raise ValidationError(f"codex mcp reference is not resolved: {name}")
 
 
-def build_environment(binary: Path, home: Path) -> dict[str, str]:
-    """Return the fully replaced environment for one Codex child process.
+def build_environment(
+    binary: Path, home: Path, *, allowed_secret_names: tuple[str, ...] = ()
+) -> dict[str, str]:
+    """Return the inherited host environment for one Codex child process.
 
-    ``binary`` is the configured Codex executable and must be absolute, so a
-    child never depends on the collector's working directory; its parent
-    directory is prefixed to ``PATH`` verbatim, without resolving symlinks, so
-    a version-managed layout (nvm, Homebrew Cellar) keeps working without this
-    module hard-coding a Node or package version.  ``home`` is the runtime home
-    that owns the child's state -- either the base runtime home or one
-    account-specific home -- and both ``HOME`` and ``CODEX_HOME`` point at it;
-    no other variable is copied from the collector, except uv's existing
-    managed-install root when present, so managed Python remains discoverable
-    after ``HOME`` is replaced.
-
-    ``PATH`` preserves the inherited entries in their original order and
-    deduplicates them, so repeated launches cannot inflate the value, and it
-    never contains an empty entry, which ``exec`` would read as the current
-    directory. Nonempty ``os.defpath`` entries follow as fallback paths;
-    a missing or blank inherited ``PATH`` contributes no entries.
+    ``binary`` must be absolute. ``home`` replaces only ``HOME`` and
+    ``CODEX_HOME`` so generated Codex configuration stays separate. PATH,
+    locales, SDKs and toolchains come from the service host. Credential-shaped
+    variables are inherited only when ``allowed_secret_names`` selected them.
 
     Raises:
         ValidationError: If ``binary`` is not an absolute path.
@@ -95,24 +85,21 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
     if not executable.is_absolute():
         raise ValidationError(f"codex binary must be an absolute path: {binary}")
     home_text = str(home)
-    return {
-        "CODEX_HOME": home_text,
-        "HOME": home_text,
-        "PATH": _child_path(str(executable.parent)),
-        **managed_uv_python_environment(),
-    }
-
-
-def developer_config_lines(config: RuntimeConfig) -> tuple[str, ...]:
-    """Return native config lines needed by a selected developer environment."""
-
-    return ("allow_login_shell = false", "") if config.environment is not None else ()
+    return host_environment(
+        {"CODEX_HOME": home_text, "HOME": home_text},
+        allowed_secret_names=allowed_secret_names,
+    )
 
 
 def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, str | None]:
-    """Return the retained-review policy for a write-capable developer run."""
+    """Return approval settings for the effective write grant.
 
-    if write and config.environment is not None:
+    ``config`` remains in the signature until the canonical role compiler owns
+    this decision; legacy environment declarations no longer affect it.
+    """
+
+    del config
+    if write:
         return {"approval_policy": "on-request", "approvals_reviewer": "auto_review"}
     return {"approval_policy": "never", "approvals_reviewer": None}
 
@@ -123,17 +110,31 @@ def prepared_environment(
     config: RuntimeConfig,
     workdir: Path,
     *,
+    mcp_servers: Mapping[str, McpConfig],
     refresh: bool = True,
 ) -> dict[str, str]:
     """Return the Codex child environment with its managed command policy.
 
-    The selected developer environment augments the isolated Codex baseline.
-    Private refusal shims lead ``PATH`` for normal shell lookup, while native
-    ``.rules`` also deny each bare command and resolved executable path.
+    ``mcp_servers`` supplies the selected environment-variable names whose
+    values may cross the credential filter. The host environment is inherited.
+    Legacy command denials remain active until the canonical role compiler
+    replaces their configuration source.
     """
 
-    environment = developer_environment(build_environment(binary, home), config, workdir)
+    del workdir
+    allowed_secret_names = tuple(
+        dict.fromkeys(
+            env_name
+            for name in config.mcp
+            for env_name in mcp_servers[name].env_from
+        )
+    )
+    environment = build_environment(
+        binary, home, allowed_secret_names=allowed_secret_names
+    )
     denied_commands = config.environment.denied_commands if config.environment is not None else ()
+    if not denied_commands:
+        return environment
     policy_directory = home / "command-refusals"
     if refresh:
         command_policy = materialize_refusal_commands(
@@ -184,21 +185,3 @@ def thread_grant_params(
     if approvals_reviewer is not None:
         params["approvalsReviewer"] = approvals_reviewer
     return params
-
-
-def _child_path(launcher_directory: str) -> str:
-    """Return the child ``PATH`` with ``launcher_directory`` leading.
-
-    Inherited ``PATH`` entries follow in first-seen order, then the nonempty
-    ``os.defpath`` entries as fallback paths.
-    Duplicate and empty entries are dropped; the launcher directory is kept
-    even when the inherited path already contains it, so the executable's own
-    package always wins resolution order.
-    """
-
-    entries: list[str] = []
-    for candidate in (launcher_directory, os.environ.get("PATH"), os.defpath):
-        for entry in (candidate or "").split(os.pathsep):
-            if entry and entry not in entries:
-                entries.append(entry)
-    return os.pathsep.join(entries)

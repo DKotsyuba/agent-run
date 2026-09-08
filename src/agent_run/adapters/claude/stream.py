@@ -8,32 +8,12 @@ metadata, without ever forwarding a value that looks like a credential.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
 from ...domain import Message, MessageRole
-
-
-_SECRET_KEY = re.compile(r"(key|token|secret|password|credential)", re.IGNORECASE)
-
-
-def is_secret_env_name(name: str) -> bool:
-    """Report whether an environment variable name is credential-shaped.
-
-    Applies the same key-name test :func:`sanitize_line` uses structurally, so
-    an adapter registering the variables it actually injected redacts exactly
-    the ones the JSON pass would already redact.
-
-    :param name: Environment variable name, e.g. ``ANTHROPIC_AUTH_TOKEN``.
-    :returns: ``True`` when the name contains ``key``, ``token``, ``secret``,
-        ``password``, or ``credential`` in any case; ``False`` otherwise, so a
-        public companion value such as ``ANTHROPIC_BASE_URL`` is not registered
-        as a literal secret and does not blank out endpoint URLs in the log.
-    """
-
-    return _SECRET_KEY.search(name) is not None
+from ..environment import is_secret_env_name
 
 
 def _redact(value: object) -> object:
@@ -46,7 +26,7 @@ def _redact(value: object) -> object:
     if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
-            if isinstance(item, str) and _SECRET_KEY.search(str(key)):
+            if isinstance(item, str) and is_secret_env_name(str(key)):
                 result[key] = "<redacted>"
             else:
                 result[key] = _redact(item)

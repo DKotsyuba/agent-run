@@ -35,7 +35,6 @@ from ..base import (
     RuntimeInfo,
     RuntimeSession,
 )
-from ..developer_environment import configured_environment_keys, environment_digest
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
@@ -46,7 +45,6 @@ from .environment import (
     bridge_points_at_source,
     build_environment,
     developer_approval_fields,
-    developer_config_lines,
     prepared_environment,
     require_resolved_mcp,
     resolved_directory,
@@ -309,9 +307,7 @@ class CodexAdapter:
             mcp_lines.append(f"[mcp_servers.{name}]")
             mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
             mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
-            mcp_environment = tuple(
-                dict.fromkeys((*mcp_def.env_from, *configured_environment_keys(config)))
-            )
+            mcp_environment = mcp_def.env_from
             if mcp_environment:
                 mcp_lines.append(f"env_vars = {_toml_array(mcp_environment)}")
             mcp_lines.append("")
@@ -355,7 +351,6 @@ class CodexAdapter:
             "model_auto_compact_token_limit = 780000",
             'model_auto_compact_token_limit_scope = "total"',
             "",
-            *developer_config_lines(config),
             *mcp_lines,
             *hook_lines,
             *trust_lines,
@@ -377,13 +372,14 @@ class CodexAdapter:
             Path(home) / "command-refusals",
             environment=policy_environment,
         )
+        policy_text = render_codex_denial_rules(
+            denied_commands,
+            command_paths=tuple(command_policy.resolved_commands.values()),
+        )
         write_managed_file(
             home,
             "rules/agent-run-command-policy.rules",
-            render_codex_denial_rules(
-                denied_commands,
-                command_paths=tuple(command_policy.resolved_commands.values()),
-            ),
+            policy_text,
         )
 
         auth_digest = ""
@@ -403,7 +399,7 @@ class CodexAdapter:
                 *hook_digests,
                 plugin_digest,
                 auth_digest,
-                environment_digest(config),
+                content_hash(policy_text),
             ]
         )
         revision = content_hash(fingerprint)
@@ -627,6 +623,7 @@ class CodexAdapter:
             home_path,
             config,
             workdir,
+            mcp_servers=mcp_servers,
             refresh=resume_session_id is None,
         )
         if config.plugins and not effective_write:

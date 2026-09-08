@@ -18,7 +18,6 @@ from agent_run.config import (
     RuntimeAuthConfig,
     RuntimeConfig,
     RuntimeHookConfig,
-    RustConfig,
 )
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
@@ -688,8 +687,8 @@ class ClaudeAdapterTests(unittest.TestCase):
             roots, tuple(sorted(roots, key=lambda value: (len(Path(value).parts), value)))
         )
 
-    def test_prepare_sets_isolated_home_and_copies_only_declared_environment(self) -> None:
-        """Verify preparation resolves the managed Python directory from the child environment."""
+    def test_prepare_inherits_host_environment_with_runtime_home(self) -> None:
+        """Inherit host tooling while replacing homes and filtering unrelated secrets."""
         managed_python = self.root / "managed-uv-python"
         managed_python.mkdir()
         ambient = {
@@ -707,16 +706,16 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.home,
                 self.agent_dir,
             )
+        self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(
-            dict(plan.environment),
-            {
-                "HOME": str(self.home),
-                "CLAUDE_CONFIG_DIR": str(self.home / "claude-config"),
-                "PATH": "/usr/bin",
-                "ANTHROPIC_API_KEY": "sk-test",
-                "UV_PYTHON_INSTALL_DIR": str(managed_python),
-            },
+            plan.environment["CLAUDE_CONFIG_DIR"], str(self.home / "claude-config")
         )
+        self.assertEqual(plan.environment["PATH"], "/usr/bin")
+        self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-test")
+        self.assertEqual(
+            plan.environment["UV_PYTHON_INSTALL_DIR"], str(managed_python)
+        )
+        self.assertNotIn("UNRELATED_SECRET", plan.environment)
         self.assertNotIn("/ambient", " ".join(plan.argv))
 
     def test_prepare_adds_dirs_and_mcp_flags_and_never_leaks_secrets_into_argv(self) -> None:
@@ -755,28 +754,10 @@ class ClaudeAdapterTests(unittest.TestCase):
                     self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
                 )
 
-    def test_prepare_provisions_rust_for_read_only_mcp_without_ambient_overrides(self) -> None:
-        """Configured Rust works for a read-only plan and supplies the same values to MCP."""
+    def test_prepare_inherits_host_toolchain_for_read_only_mcp(self) -> None:
+        """Pass host Rust paths to the runtime and selected MCP without probing them."""
 
-        rustup_home = self.root / "rustup"
-        rustup_home.mkdir()
-        cargo_bin = self.root / "cargo-bin"
-        cargo_bin.mkdir()
-        for name, text in {
-            "cargo": "#!/bin/sh\nexit 0\n",
-            "rustc": "#!/bin/sh\nexit 0\n",
-            "rust-analyzer": "#!/bin/sh\nexit 0\n",
-            "rustup": (
-                "#!/bin/sh\n"
-                "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\n"
-                "if [ \"$1\" = show ]; then echo active; exit 0; fi\n"
-                "printf '%s\\n' rust-src rust-analyzer\n"
-            ),
-        }.items():
-            proxy = cargo_bin / name
-            proxy.write_text(text, encoding="utf-8")
-            proxy.chmod(0o755)
-        config = self.runtime_config(mcp=("rust_lsp",), rust=RustConfig(rustup_home, cargo_bin))
+        config = self.runtime_config(mcp=("rust_lsp",))
         servers = {
             "rust_lsp": McpConfig(
                 "stdio", Path("/bin/agent-lsp"), (), ("RUSTUP_HOME", "CARGO_HOME", "PATH")
@@ -784,36 +765,22 @@ class ClaudeAdapterTests(unittest.TestCase):
         }
         with patch.dict(
             "os.environ",
-            {"ANTHROPIC_API_KEY": "sk-test", "RUSTUP_HOME": "/stale", "PATH": "/ambient/bin"},
+            {
+                "ANTHROPIC_API_KEY": "sk-test",
+                "RUSTUP_HOME": "/host/rustup",
+                "CARGO_HOME": "/host/cargo",
+                "PATH": "/ambient/bin",
+            },
             clear=False,
         ):
             plan = self.prepare(
                 self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
             )
-        self.assertEqual(plan.environment["RUSTUP_HOME"], str(rustup_home))
-        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
-        self.assertTrue(plan.environment["PATH"].startswith(str(cargo_bin) + os.pathsep))
-        self.assertEqual(plan.environment["RUSTUP_AUTO_INSTALL"], "0")
+        self.assertEqual(plan.environment["RUSTUP_HOME"], "/host/rustup")
+        self.assertEqual(plan.environment["CARGO_HOME"], "/host/cargo")
+        self.assertEqual(plan.environment["PATH"], "/ambient/bin")
         self.assertFalse((self.workdir / ".cargo-home").exists())
-        descriptor = json.loads((self.agent_dir / "mcp" / "mcp-config.json").read_text())
-        mcp_environment = descriptor["mcpServers"]["rust_lsp"]["env"]
-        self.assertEqual(mcp_environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
-        self.assertEqual(set(mcp_environment), {"PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"})
-        self.assertNotIn("ANTHROPIC_API_KEY", json.dumps(descriptor))
-        other_workdir = self.root / "other-work"
-        other_workdir.mkdir()
-        other_agent_dir = self.root / "agents" / "ag-2"
-        other_agent_dir.mkdir()
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "PATH": "/ambient/bin"}, clear=False):
-            self.prepare(
-                self.request(workdir=other_workdir), self.profile(), config, self.home, other_agent_dir,
-                mcp_servers=servers,
-            )
-        other_descriptor = json.loads((other_agent_dir / "mcp" / "mcp-config.json").read_text())
-        self.assertEqual(
-            other_descriptor["mcpServers"]["rust_lsp"]["env"]["CARGO_HOME"],
-            str(other_workdir / ".cargo-home"),
-        )
+        self.assertNotIn("ANTHROPIC_API_KEY", " ".join(plan.argv))
 
     def test_prepare_exposes_the_skill_tool_only_when_skills_are_configured(self) -> None:
         # --plugin-dir registers the skills, but the child can neither see

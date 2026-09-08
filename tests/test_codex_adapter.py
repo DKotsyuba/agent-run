@@ -20,12 +20,11 @@ from agent_run.adapters.codex import adapter as codex_adapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
-from agent_run.adapters.developer_environment import configured_environment_keys
 from agent_run.adapters.snapshots import (
     inspect_runtime_snapshots,
     runtime_snapshot_index_sha256,
 )
-from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
+from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
 from agent_run.profiles import AgentProfile
@@ -125,30 +124,26 @@ env_from = ["PATH"]
         with self.assertRaisesRegex(ValidationError, "file_link auth bridge"):
             ADAPTER.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("TOKEN",))))
 
-    def test_declared_rust_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
-        """Codex keeps isolated homes while declared Rust reaches both child boundaries."""
+    def test_host_toolchain_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
+        """Codex inherits host toolchains without running provisioning probes."""
         import tomllib
 
-        rust = RustConfig(Path("/rustup"), Path("/cargo-bin"))
-        config = self.runtime_config(rust=rust, mcp=("agent_lsp",))
+        config = self.runtime_config(mcp=("agent_lsp",))
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(
             generated["mcp_servers"]["agent_lsp"]["env_vars"],
-            list(configured_environment_keys(config)),
+            ["PATH"],
         )
         profile = AgentProfile("review", "body", False, (self.workdir,))
-        with patch.dict(
-            codex_environment.prepared_environment.__globals__,
-            {"developer_environment": lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}},
-        ):
+        with patch.dict(os.environ, {"CARGO_HOME": "/host/cargo"}, clear=False):
             plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
-        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
+        self.assertEqual(plan.environment["CARGO_HOME"], "/host/cargo")
 
-    def test_developer_preset_reaches_shell_mcp_and_native_denial_rules(self) -> None:
-        """Codex forwards only declared preset keys and denies configured commands."""
+    def test_legacy_environment_only_retains_native_denial_rules(self) -> None:
+        """Ignore legacy path/variables while retaining command denials."""
         tools = Path(self._mkdtemp())
         for name in ("git", "gh"):
             command = tools / name
@@ -163,8 +158,8 @@ env_from = ["PATH"]
         config = self.runtime_config(environment=preset, mcp=("agent_lsp",))
         digest = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
-        self.assertIs(generated["allow_login_shell"], False)
-        self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH", "PROJECT"])
+        self.assertNotIn("allow_login_shell", generated)
+        self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH"])
         self.assertNotEqual(
             digest,
             ADAPTER.materialize(
@@ -175,8 +170,12 @@ env_from = ["PATH"]
         )
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         profile = AgentProfile("review", "body", True, (self.workdir,))
-        plan = self.prepare(self.start_request(write=True), profile, config, mcp_servers=self.resolved_mcp())
-        self.assertEqual(plan.environment["PROJECT"], str(self.workdir / "project"))
+        with patch.dict(os.environ, {"PATH": f"{tools}:/usr/bin:/bin"}, clear=False):
+            plan = self.prepare(
+                self.start_request(write=True), profile, config,
+                mcp_servers=self.resolved_mcp(),
+            )
+        self.assertNotIn("PROJECT", plan.environment)
         self.assertEqual(plan.adapter_state["approval_policy"], "on-request")
         self.assertEqual(plan.adapter_state["approvals_reviewer"], "auto_review")
         self.assertEqual(
@@ -191,13 +190,15 @@ env_from = ["PATH"]
         self.assertIn('"gh"', rules)
         self.assertIn(str(tools / "gh"), rules)
 
-    def test_developer_preset_fails_closed_when_a_required_command_is_missing(self) -> None:
-        """An unavailable required command prevents Codex from receiving a launch plan."""
+    def test_legacy_required_command_does_not_probe_during_prepare(self) -> None:
+        """Do not require a legacy environment command on the start path."""
         config = self.runtime_config(environment=EnvironmentConfig(required_commands=("missing",)))
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         profile = AgentProfile("review", "body", False, (self.workdir,))
-        with self.assertRaisesRegex(ValidationError, "missing executable: missing"):
-            self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+        plan = self.prepare(
+            self.start_request(), profile, config, mcp_servers=self.resolved_mcp()
+        )
+        self.assertEqual(plan.environment["HOME"], str(self.home))
 
     # -- materialize ----------------------------------------------------------
 
@@ -972,10 +973,8 @@ env_from = ["PATH"]
         self.assertIsInstance(plan, LaunchPlan)
         self.assertEqual(plan.argv, (str(config.binary), "app-server"))
         self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(
-            set(plan.environment),
-            {"CODEX_HOME", "HOME", "PATH", "UV_PYTHON_INSTALL_DIR"},
-        )
+        self.assertIn("PATH", plan.environment)
+        self.assertNotIn("UNRELATED_TOKEN", plan.environment)
         self.assertEqual(plan.environment["UV_PYTHON_INSTALL_DIR"], str(managed_python))
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(plan.adapter_state["writable_roots"], ())
