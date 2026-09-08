@@ -88,6 +88,7 @@ class GlmAdapterTests(unittest.TestCase):
         request, profile, config, home, agent_dir = args
         request = replace(
             request,
+            profile=profile.name,
             read_roots=normalize_read_roots(
                 (*profile.read_roots, *request.read_roots)
             ),

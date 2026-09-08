@@ -523,6 +523,46 @@ class ResumeTests(unittest.TestCase):
             f"snapshot:v1:{digest}",
         )
 
+    def test_canonical_role_payload_from_7bbd43b_remains_resumable(self) -> None:
+        """Accept the exact canonical role payload emitted by the M047 base."""
+
+        skills = self.root / "skills"
+        skill = skills / "code-reading"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+        (self.profiles / "profile.md").write_text(
+            """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = []
+required_constraints = []
++++
+Review.
+""",
+            encoding="utf-8",
+        )
+        self.service = self._service(
+            replace(self.config, skills_directory=skills)
+        )
+        parent = self._parent()
+        snapshot = json.loads(
+            (self.root / "agents" / parent / "config-snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected = json.loads(
+            (Path(__file__).parent / "fixtures" / "role_plan_7bbd43b.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(snapshot["profile"], expected)
+        child = self.service.resume(parent, "continue")
+        self.assertEqual(self._wait(2).resume_session_id, "sess-1")
+        self.assertEqual(child.agent.status, AgentStatus.STARTING)
+
     def test_resume_inherits_explicit_policy_requirements(self) -> None:
         """A continuation retains the parent's admitted policy requirements."""
 

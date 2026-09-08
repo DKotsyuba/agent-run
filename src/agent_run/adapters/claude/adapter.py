@@ -210,6 +210,8 @@ class ClaudeAdapter:
 
         if not isinstance(role, ResolvedRolePlan):
             raise ValidationError("prepare requires a ResolvedRolePlan")
+        if request.profile != role.role_name:
+            raise ValidationError("claude request profile does not match the resolved role")
         if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
             server.id for server in role.mcp
         ):

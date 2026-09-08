@@ -561,6 +561,8 @@ class CodexAdapter:
             raise ValidationError("prepare requires a StartRequest")
         if not isinstance(role, ResolvedRolePlan):
             raise ValidationError("prepare requires a ResolvedRolePlan")
+        if request.profile != role.role_name:
+            raise ValidationError("codex request profile does not match the resolved role")
         self.validate(config)
         if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
             server.id for server in role.mcp
@@ -575,8 +577,10 @@ class CodexAdapter:
         if request.output_schema is not None:
             raise ValidationError("codex runtime does not support output_schema")
         if request.model == "gpt-6-astra":
-            if role.role_name not in ("architect", "review"):
-                raise ValidationError("gpt-6-astra is limited to architect and review roles")
+            if role.role_name not in ("role-architect", "role-review"):
+                raise ValidationError(
+                    "gpt-6-astra is limited to role-architect and role-review"
+                )
             if role.write:
                 raise ValidationError("gpt-6-astra does not permit write-capable launches")
 

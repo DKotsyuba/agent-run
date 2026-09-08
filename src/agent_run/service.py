@@ -562,12 +562,6 @@ class AgentService:
             )
         runtime = self._runtime_config(request.runtime)
         profile = self._effective_profile(request, runtime)
-        if profile.canonical:
-            request = replace(
-                request,
-                write=profile.write,
-                required_constraints=profile.required_constraints,
-            )
         label = self.resolve_account(request.runtime, request.account)
         runtime, role_plan, skills_root = self._runtime_for_profile(
             runtime,
@@ -575,6 +569,12 @@ class AgentService:
             label,
             request.required_constraints,
             request.runtime,
+        )
+        request = replace(
+            request,
+            write=role_plan.write,
+            read_roots=role_plan.read_roots,
+            required_constraints=role_plan.required_constraints,
         )
         if label is not None:
             claude_state = runtime.adapter in {
@@ -1167,12 +1167,12 @@ class AgentService:
             request.required_constraints,
             request.runtime,
         )
-        if profile.canonical:
-            request = replace(
-                request,
-                write=profile.write,
-                required_constraints=profile.required_constraints,
-            )
+        request = replace(
+            request,
+            write=role_plan.write,
+            read_roots=role_plan.read_roots,
+            required_constraints=role_plan.required_constraints,
+        )
         _logger.info(
             "resume parent_agent_id=%s runtime=%s request_id=%s",
             parent_id, runtime_name, request_id,

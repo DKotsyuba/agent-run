@@ -455,6 +455,23 @@ Review the requested work.
         self.assertEqual(len(snapshot["profile"]["config_revision"]), 64)
         service.close()
 
+    def test_start_persists_the_role_normalized_read_root_antichain(self) -> None:
+        """Collapse nested request roots before persistence and adapter preparation."""
+
+        parent = self.root / "read-root"
+        nested = parent / "nested"
+        nested.mkdir(parents=True)
+        result = self.service.start(
+            replace(
+                self.request(request_id="normalized-roots"),
+                read_roots=(parent, nested),
+            )
+        )
+        self.wait_until(lambda: bool(self.launched))
+        stored = json.loads(self.store.get_agent(result.agent_id)["request_json"])
+        self.assertEqual(stored["read_roots"], [str(parent)])
+        self.assertEqual(ADAPTER.prepare_profiles[-1].read_roots, (parent,))
+
     def test_canonical_role_rejects_legacy_runtime_asset_lists(self) -> None:
         """Fail before admission instead of merging role and runtime assets."""
 

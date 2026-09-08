@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -119,6 +120,7 @@ class QwenAdapterTests(unittest.TestCase):
         """Prepare an explicit fixture through the resolved-role contract."""
 
         servers = {} if mcp_servers is None else mcp_servers
+        request = replace(request, profile=profile.name)
         return self.adapter.prepare(
             request,
             resolved_role(request, profile, config, servers),

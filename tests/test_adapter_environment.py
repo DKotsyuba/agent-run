@@ -30,6 +30,12 @@ class HostEnvironmentTests(unittest.TestCase):
             "AWS_PROFILE": "production",
             "NPM_CONFIG_USERCONFIG": "/home/user/.npmrc",
             "SDKROOT": "/host/sdk",
+            "CARGO_HOME": "/host/cargo",
+            "ANDROID_HOME": "/host/android",
+            "DOTNET_ROOT": "/host/dotnet",
+            "GEM_HOME": "/host/gems",
+            "SSL_CERT_FILE": "/host/ca.pem",
+            "PROJECT_BUILD_MODE": "release",
         }
         with patch.dict(os.environ, parent, clear=True):
             environment = host_environment(
@@ -40,6 +46,11 @@ class HostEnvironmentTests(unittest.TestCase):
         self.assertEqual(environment["PATH"], "/host/bin")
         self.assertEqual(environment["RUSTUP_HOME"], "/host/rustup")
         self.assertEqual(environment["SDKROOT"], "/host/sdk")
+        for name in (
+            "CARGO_HOME", "ANDROID_HOME", "DOTNET_ROOT", "GEM_HOME",
+            "SSL_CERT_FILE", "PROJECT_BUILD_MODE",
+        ):
+            self.assertEqual(environment[name], parent[name])
         self.assertEqual(environment["HOME"], "/generated/home")
         self.assertEqual(environment["SELECTED_API_KEY"], "keep-me")
         self.assertNotIn("UNRELATED_TOKEN", environment)

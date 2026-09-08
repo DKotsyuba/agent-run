@@ -970,6 +970,7 @@ env_from = ["PATH"]
         servers = {} if mcp_servers is self._UNSET else mcp_servers
         request = replace(
             request,
+            profile=profile.name,
             read_roots=normalize_read_roots(
                 (*profile.read_roots, *request.read_roots)
             ),
@@ -1152,19 +1153,19 @@ env_from = ["PATH"]
         """Keep GPT-6 launches restricted to read-only architecture and review."""
         config = self.materialized(models=("gpt-5.6-sol", "gpt-6-astra"))
         self.write_model_cache('{"models": [{"id": "gpt-6-astra"}]}')
-        with self.assertRaisesRegex(ValidationError, "architect and review"):
+        with self.assertRaisesRegex(ValidationError, "role-architect and role-review"):
             self.prepare(
                 self.start_request(model="gpt-6-astra"),
-                AgentProfile("implement", "body", True, (self.auth_source_dir,)),
+                AgentProfile("role-implement", "body", True, (self.auth_source_dir,)),
                 config,
             )
         with self.assertRaisesRegex(ValidationError, "does not permit write-capable"):
             self.prepare(
                 self.start_request(model="gpt-6-astra", write=True),
-                AgentProfile("architect", "body", True, (self.auth_source_dir,)),
+                AgentProfile("role-architect", "body", True, (self.auth_source_dir,)),
                 config,
             )
-        for role in ("architect", "review"):
+        for role in ("role-architect", "role-review"):
             with self.subTest(role=role):
                 plan = self.prepare(
                     self.start_request(model="gpt-6-astra"),
@@ -1174,6 +1175,22 @@ env_from = ["PATH"]
                 self.assertEqual(plan.adapter_state["model"], "gpt-6-astra")
                 self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
                 self.assertEqual(plan.adapter_state["writable_roots"], ())
+
+    def test_prepare_requires_request_profile_to_match_resolved_role(self) -> None:
+        """Reject a role payload substituted under a different public profile id."""
+
+        config = self.materialized()
+        request = replace(
+            self.start_request(), read_roots=(self.auth_source_dir,)
+        )
+        role = resolved_role(
+            request,
+            AgentProfile("role-review", "body", False, (self.auth_source_dir,)),
+            config,
+            {},
+        )
+        with self.assertRaisesRegex(ValidationError, "profile does not match"):
+            ADAPTER.prepare(request, role, config, self.home, self.workdir)
 
     def test_prepare_refuses_output_schema(self) -> None:
         config = self.materialized()

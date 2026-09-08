@@ -352,6 +352,8 @@ class QwenAdapter:
             raise ValidationError("qwen runtime does not support fast mode")
         if not isinstance(role, ResolvedRolePlan):
             raise ValidationError("prepare requires a ResolvedRolePlan")
+        if request.profile != role.role_name:
+            raise ValidationError("qwen request profile does not match the resolved role")
         if role.network:
             raise ValidationError("qwen runtime does not support network profiles")
         if request.model not in config.models:
