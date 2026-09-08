@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import os
+import site
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,21 @@ def _framework_python() -> str | None:
         if suffix == "14" and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def _dependency_pythonpath() -> str:
+    """Return repo imports plus this test interpreter's installed dependencies.
+
+    A macOS Framework interpreter is deliberately used as the detached
+    executable below, outside the project's virtual environment. It is the same
+    supported CPython ABI but does not discover the environment's site-packages,
+    so this explicit path preserves the re-exec identity hazard while letting
+    the supervisor import the already-installed project dependency closure.
+    """
+
+    return os.pathsep.join(
+        dict.fromkeys((child_pythonpath(), *site.getsitepackages()))
+    )
 
 
 @unittest.skipUnless(hasattr(os, "fork") and hasattr(os, "setsid"), "POSIX only")
@@ -190,6 +206,7 @@ class SupervisorMainTests(unittest.TestCase):
         agent_id, directory, plan = self.create_agent(sleep_seconds=1.5)
         symlink = Path(self.temporary.name) / "python-symlink"
         symlink.symlink_to(framework_python)
+        self.environment["PYTHONPATH"] = _dependency_pythonpath()
         pid = self.launch(self.payload(agent_id, directory, plan), executable=str(symlink))
         self.wait_for(lambda: self.status(agent_id) is AgentStatus.RUNNING)
 
