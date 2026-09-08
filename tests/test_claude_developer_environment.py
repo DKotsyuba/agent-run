@@ -1,4 +1,4 @@
-"""Focused regressions for Claude's developer-environment/command-policy integration."""
+"""Compatibility checks for ignored Claude environment presets."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.claude.adapter import ADAPTER, ClaudeAdapter
 from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import StartRequest
-from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
 
 
@@ -28,7 +27,7 @@ def _executable(path: Path, body: str = "exit 0") -> None:
 
 
 class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
-    """Verify the preset/command-policy seams added to ``ClaudeAdapter``."""
+    """Verify host inheritance while retaining legacy command denials."""
 
     def setUp(self) -> None:
         """Create one isolated home, agent directory, workdir, and environment."""
@@ -77,8 +76,8 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         values.update(overrides)
         return StartRequest(**values)
 
-    def test_prepare_shares_preset_path_and_variables_with_mcp_subprocess(self) -> None:
-        """A selected preset's PATH and variables reach both the child and its MCP env, not ambient."""
+    def test_prepare_ignores_preset_and_inherits_host_values_for_mcp(self) -> None:
+        """Use host PATH/variables and the already materialized MCP descriptor."""
 
         tools = self.root / "tools"
         tools.mkdir()
@@ -90,29 +89,32 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
             mcp=("agent_lsp",),
         )
         servers = {"agent_lsp": McpConfig("stdio", Path("/bin/agent-lsp"), (), ("PATH", "PROJECT"))}
+        self.adapter.materialize(
+            config,
+            self.home,
+            mcp_servers=servers,
+            skills_root=self.root / "skills" / "claude",
+        )
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "PROJECT": "must-not-copy"}, clear=False):
             plan = self.adapter.prepare(
                 self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
             )
-        descriptor_path = self.agent_dir / "mcp" / "mcp-config.json"
+        descriptor_path = self.home / "mcp" / "mcp-config.json"
         self.assertEqual(plan.argv[plan.argv.index("--mcp-config") + 1], str(descriptor_path))
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
-        mcp_environment = descriptor["mcpServers"]["agent_lsp"]["env"]
-        self.assertEqual(
-            mcp_environment,
-            {"PATH": plan.environment["PATH"], "PROJECT": str(self.workdir)},
-        )
-        self.assertNotIn("ANTHROPIC_API_KEY", mcp_environment)
+        self.assertNotIn("env", descriptor["mcpServers"]["agent_lsp"])
+        self.assertEqual(plan.environment["PROJECT"], "must-not-copy")
+        self.assertEqual(plan.environment["PATH"], "/usr/bin")
 
-    def test_prepare_fails_closed_when_required_command_is_missing(self) -> None:
-        """A required preset command absent from PATH raises before launch."""
+    def test_prepare_does_not_probe_legacy_required_commands(self) -> None:
+        """Ignore legacy required commands instead of gating runtime start."""
 
         config = self.runtime_config(environment=EnvironmentConfig(required_commands=("definitely-missing",)))
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}, clear=False):
-            with self.assertRaisesRegex(ValidationError, "missing executable: definitely-missing"):
-                self.adapter.prepare(
-                    self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={}
-                )
+            plan = self.adapter.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={}
+            )
+        self.assertEqual(plan.environment["PATH"], "/usr/bin")
 
     def test_prepare_denies_gh_bare_and_absolute_while_git_remains_permitted(self) -> None:
         """A denied command is refused bare and by absolute path; Git stays permitted."""
@@ -134,19 +136,19 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         disallowed = plan.argv[plan.argv.index("--disallowedTools") + 1]
         self.assertIn("Bash(gh)", disallowed)
         self.assertIn("Bash(gh *)", disallowed)
-        self.assertIn(f"Bash({host / 'gh'})", disallowed)
+        self.assertNotIn(f"Bash({host / 'gh'})", disallowed)
         self.assertNotIn("Bash(git)", disallowed)
         self.assertNotIn("Bash(git *)", disallowed)
 
-    def test_materialize_revision_changes_when_preset_changes(self) -> None:
-        """Materialization digest changes when the selected preset's declaration changes."""
+    def test_materialize_revision_ignores_legacy_preset_changes(self) -> None:
+        """Do not bind unused legacy environment declarations into new assets."""
 
         skills_root = self.root / "skills" / "claude"
         base = self.runtime_config(environment=EnvironmentConfig(variables=MappingProxyType({"A": "1"})))
         changed = self.runtime_config(environment=EnvironmentConfig(variables=MappingProxyType({"A": "2"})))
         digest_base = self.adapter.materialize(base, self.home, mcp_servers={}, skills_root=skills_root)
         digest_changed = self.adapter.materialize(changed, self.home, mcp_servers={}, skills_root=skills_root)
-        self.assertNotEqual(digest_base, digest_changed)
+        self.assertEqual(digest_base, digest_changed)
 
 
 if __name__ == "__main__":
