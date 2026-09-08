@@ -169,6 +169,9 @@ def _open_managed_parent(
             child = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
+    except FileNotFoundError:
+        os.close(descriptor)
+        raise
     except PathEscapeError:
         os.close(descriptor)
         raise
@@ -178,6 +181,37 @@ def _open_managed_parent(
             f"managed path parent is not a real directory: {relative_path}"
         ) from error
     return root / relative.parent, relative.name, descriptor
+
+
+def managed_entry_type(home: str | Path, relative_path: str | Path) -> str:
+    """Classify one final managed entry without following any path symlink.
+
+    Returns ``missing``, ``file``, ``directory``, ``symlink``, or ``special``.
+    A missing intermediate parent also returns ``missing``; an intermediate
+    symlink raises ``PathEscapeError`` before any target metadata is inspected.
+    The retained parent descriptor is closed on every result and failure.
+    """
+
+    try:
+        _, name, parent_fd = _open_managed_parent(
+            home, relative_path, create=False
+        )
+    except FileNotFoundError:
+        return "missing"
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "missing"
+        if stat.S_ISREG(metadata.st_mode):
+            return "file"
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink"
+        return "special"
+    finally:
+        os.close(parent_fd)
 
 
 def read_managed_symlink(home: str | Path, relative_path: str | Path) -> str | None:

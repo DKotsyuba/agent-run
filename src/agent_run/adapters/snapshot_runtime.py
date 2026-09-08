@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from ..errors import PathEscapeError, ValidationError
-from .home import content_hash, read_managed_symlink, write_managed_file
+from .home import (
+    content_hash,
+    managed_entry_type,
+    read_managed_symlink,
+    write_managed_file,
+)
 from .snapshot_tree import (
     RUNTIME_SNAPSHOT_INDEX,
     SNAPSHOT_MANIFEST,
@@ -229,11 +234,16 @@ def inspect_runtime_snapshots(
             actual = next(entry for entry in entries if entry["path"] == path)
         except ValidationError:
             try:
-                (Path(home) / path).lstat()
-            except FileNotFoundError:
-                missing.append(path)
-            else:
+                entry_type = managed_entry_type(home, path)
+            except ValidationError:
                 type_mismatches.append(path)
+            else:
+                if entry_type == "missing":
+                    missing.append(path)
+                elif entry_type == "file":
+                    hash_mismatches.append(path)
+                else:
+                    type_mismatches.append(path)
         except StopIteration:
             missing.append(path)
         else:

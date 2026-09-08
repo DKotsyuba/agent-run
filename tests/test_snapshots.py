@@ -298,6 +298,32 @@ class ManagedSnapshotTests(unittest.TestCase):
             "skills/demo/.agent-run-snapshot.json", inspection.missing
         )
 
+    def test_flat_file_classification_never_follows_an_intermediate_symlink(self) -> None:
+        """Classify the managed parent itself without touching outside metadata."""
+
+        nested = self.home / "nested"
+        nested.mkdir(parents=True)
+        (nested / "settings.json").write_text("{}", encoding="utf-8")
+        index_sha256 = finalize_runtime_snapshots(
+            self.home, "files-1", ("nested/settings.json",)
+        )
+        retained = self.home / "nested.retained"
+        nested.rename(retained)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "settings.json").write_text("outside", encoding="utf-8")
+        nested.symlink_to(outside, target_is_directory=True)
+
+        with patch(
+            "agent_run.adapters.snapshot_runtime.Path.lstat",
+            side_effect=AssertionError("outside pathname metadata inspected"),
+        ):
+            inspection = inspect_runtime_snapshots(
+                self.home, "files-1", expected_sha256=index_sha256
+            )
+        self.assertIn("nested/settings.json", inspection.type_mismatches)
+        self.assertNotIn("nested/settings.json", inspection.missing)
+
     def test_runtime_hash_reader_rejects_incomplete_index_shape(self) -> None:
         """Require canonical complete producer evidence before returning its hash."""
 
