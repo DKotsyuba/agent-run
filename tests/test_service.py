@@ -331,6 +331,42 @@ class AgentServiceTests(unittest.TestCase):
             (self.root / "agents" / str(agent["id"]) / "config-snapshot.json").is_file()
         )
 
+    def test_claude_environment_account_uses_its_sibling_credential_home(self) -> None:
+        """Claude labels need no file bridge but retain isolated durable state."""
+
+        runtime = RuntimeConfig(
+            True,
+            "agent_run.adapters.claude.adapter:ADAPTER",
+            Path("/bin/true"),
+            self.runtime_home,
+            ("model",),
+            auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+            accounts=("personal",),
+            default_account="personal",
+        )
+        self.service = AgentService(
+            replace(self.config, runtimes={"claude": runtime}),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        request = replace(self.request(request_id="claude-account"), runtime="claude")
+        with patch("agent_run.service.AdapterRegistry.load", return_value=ADAPTER):
+            self.service.start(request)
+            self.wait_until(lambda: bool(ADAPTER.materialize_homes))
+            self.wait_until(
+                lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
+                    "snapshot:v1:"
+                )
+            )
+        effective = ADAPTER.materialize_configs[-1]
+        self.assertEqual(
+            effective.credential_state_home,
+            account_runtime_home(runtime.home, "personal"),
+        )
+        self.assertEqual(effective.auth, runtime.auth)
+
     def test_prepare_final_materialize_revision_is_the_persisted_snapshot(self) -> None:
         """Request-dependent prepare output replaces the initial home revision."""
 

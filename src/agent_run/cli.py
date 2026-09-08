@@ -798,6 +798,23 @@ def _initialize(home: Path):
 
 
 def _auth(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, object] | int:
+    """Run the legacy labelled-login command for Codex or Claude.
+
+    ``home`` supplies the active configuration, ``args.label`` must be a
+    configured account of ``args.runtime``, and ``stderr`` receives only fixed
+    failure diagnostics. Claude delegates to its scoped CLI login helper;
+    Codex retains its existing account-store flow. Unknown/disabled runtimes,
+    undeclared labels, and unsupported adapters raise ``ValidationError``.
+    Provider login or status failures return their nonzero exit code without
+    rendering provider output or credential values.
+
+    :param home: Agent-run home containing ``config.toml``.
+    :param args: Parsed ``auth <label> <runtime>`` command arguments.
+    :param stderr: User-facing diagnostic stream.
+    :returns: Secret-free success data or the provider CLI's nonzero exit code.
+    :raises ValidationError: If the declared runtime/account cannot be used.
+    """
+
     config = load_config(config_path(home))
     runtime = config.runtimes.get(args.runtime)
     if runtime is None or not runtime.enabled:

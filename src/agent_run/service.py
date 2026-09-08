@@ -542,6 +542,9 @@ class AgentService:
         Validation, replay, capacity admission, row creation, and ``STARTING``
         transition are synchronous. Materialization, authentication, prepare,
         detached spawn, and READY run on a thread-isolated coordinator worker.
+        Labelled file-link runtimes require their configured bridge; labelled
+        Claude environment-auth runtimes instead use their private sibling
+        credential home and are admitted without a bridge file.
         """
 
         if not isinstance(request, StartRequest):
@@ -559,7 +562,14 @@ class AgentService:
         runtime = self._runtime_config(request.runtime)
         label = self.resolve_account(request.runtime, request.account)
         if label is not None:
-            if runtime.auth is None or runtime.auth.target is None:
+            claude_environment_account = (
+                runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER"
+                and runtime.auth is not None
+                and runtime.auth.kind == "environment"
+            )
+            if not claude_environment_account and (
+                runtime.auth is None or runtime.auth.target is None
+            ):
                 raise ValidationError(f"runtime {request.runtime} account auth is not configured")
         adapter = self._registry.load(
             request.runtime, self._required_capabilities(request, runtime)

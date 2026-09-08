@@ -146,7 +146,16 @@ class ClaudeAdapter:
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
-        """Report local health with a fresh bounded configured-binary version."""
+        """Report binary health without reading durable Claude credentials.
+
+        ``config`` provides declared explicit auth variable names and ``home``
+        locates only generated runtime assets for the bounded version probe.
+        A present declared environment value reports authenticated; otherwise
+        authentication is ``None`` because the account-scoped CLI state is
+        opaque and must never be replaced by a global Keychain read. No network
+        call, OAuth refresh, credential-file read, or durable-store mutation is
+        performed. A missing executable yields an unavailable result.
+        """
 
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
         authenticated: bool | None = None
