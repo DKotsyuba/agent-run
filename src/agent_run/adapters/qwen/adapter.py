@@ -298,7 +298,17 @@ class QwenAdapter:
             ]
         )
         revision = content_hash(fingerprint)
-        finalize_runtime_snapshots(Path(home), revision, (".qwen/settings.json",))
+        managed_files = [".qwen/settings.json"]
+        if (Path(home) / "agent-run-context.md").is_file():
+            managed_files.append("agent-run-context.md")
+        if denied:
+            managed_files.append(
+                f"{_COMMAND_POLICY_DIRECTORY}/.agent-run-command-policy.json"
+            )
+            managed_files.extend(
+                f"{_COMMAND_POLICY_DIRECTORY}/{command}" for command in sorted(denied)
+            )
+        finalize_runtime_snapshots(Path(home), revision, tuple(managed_files))
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
@@ -334,6 +344,7 @@ class QwenAdapter:
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build a sandboxed one-shot invocation and isolated environment."""
         if request.fast:
@@ -354,7 +365,10 @@ class QwenAdapter:
         if request.output_schema is not None:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
         role_text += skills_context_note(Path(home), config.skills)
-        write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
+        if resume_session_id is None:
+            write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
+        elif not (Path(home) / ".qwen/settings.json").is_file():
+            raise ValidationError("qwen resume requires a verified materialized home")
         environment: dict[str, str] = {"HOME": str(home), "OPENAI_MODEL": request.model}
         # Keep the narrow PATH baseline Qwen needs for its launcher and native
         # utilities; a selected preset still leads it and no other ambient
@@ -365,19 +379,24 @@ class QwenAdapter:
                 parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
             environment["PATH"] = parent_path
         environment = developer_environment(environment, config, Path(request.workdir))
-        self.materialize(
-            config,
-            Path(home),
-            mcp_servers=mcp_servers,
-            command_search_paths=tuple(
-                entry for entry in environment.get("PATH", "").split(os.pathsep) if entry
-            ),
-        )
+        if resume_session_id is None:
+            self.materialize(
+                config,
+                Path(home),
+                mcp_servers=mcp_servers,
+                command_search_paths=tuple(
+                    entry
+                    for entry in environment.get("PATH", "").split(os.pathsep)
+                    if entry
+                ),
+            )
         # The refusal shims must win ordinary PATH lookup, so they are
         # prepended after required_commands were checked against the real
         # declared PATH. This is ordinary-lookup refusal, not OS confinement.
         if config.environment is not None and config.environment.denied_commands:
             policy_directory = command_policy_directory(Path(home))
+            if resume_session_id is not None and not policy_directory.is_dir():
+                raise ValidationError("qwen resume command policy is missing")
             environment["PATH"] = os.pathsep.join(
                 entry for entry in (str(policy_directory), environment.get("PATH", "")) if entry
             )
@@ -420,6 +439,7 @@ class QwenAdapter:
             runtime_stream_path=agent_dir / "runtime.jsonl",
             adapter_state=state,
             answer_path=agent_dir / "answer.md",
+            resume_session_id=resume_session_id,
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> QwenSession:

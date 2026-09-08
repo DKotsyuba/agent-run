@@ -105,21 +105,24 @@ def render_declared_plugin_snapshots(
     ``declarations`` is keyed by configured plugin basename. Missing declarations
     preserve the legacy live-plugin path and are fingerprinted as unsupported
     mutability. Declared assets use the shared no-follow selected-path snapshot;
-    unknown names or duplicate configured basenames fail closed.
+    Unknown names and duplicate basenames selected by a declaration fail closed;
+    duplicate undeclared live plugins retain their legacy behavior.
     """
 
-    roots: dict[str, Path] = {}
+    roots: dict[str, list[Path]] = {}
     for plugin in plugins:
-        if plugin.name in roots:
-            raise ValidationError(f"claude plugin name is declared twice: {plugin.name}")
-        roots[plugin.name] = plugin
+        roots.setdefault(plugin.name, []).append(plugin)
     unknown = sorted(set(declarations) - set(roots))
     if unknown:
         raise ValidationError(
             "claude plugin snapshot names are not configured: " + ", ".join(unknown)
         )
     fingerprints: list[str] = []
-    for name, plugin in roots.items():
+    for name in declarations:
+        if len(roots[name]) != 1:
+            raise ValidationError(f"claude plugin snapshot name is ambiguous: {name}")
+    for plugin in plugins:
+        name = plugin.name
         assets = declarations.get(name)
         if assets is None:
             fingerprints.append(f"{name}:live:{plugin}")

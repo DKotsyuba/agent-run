@@ -191,6 +191,7 @@ class ClaudeAdapter:
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build the isolated launch plan for one start request.
 
@@ -296,7 +297,7 @@ class ClaudeAdapter:
         if selected_environment is not None and selected_environment.denied_commands:
             policy = materialize_refusal_commands(
                 selected_environment.denied_commands,
-                home / "command-policy",
+                agent_dir / "command-policy",
                 search_paths=tuple(
                     part for part in environment.get("PATH", "").split(os.pathsep) if part
                 ),
@@ -384,6 +385,7 @@ class ClaudeAdapter:
                 }
             ),
             answer_path=agent_dir / "answer.md",
+            resume_session_id=resume_session_id,
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> "ClaudeSession":

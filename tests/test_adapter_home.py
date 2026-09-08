@@ -31,11 +31,11 @@ class AdapterHomeTests(unittest.TestCase):
 
                 events.append("dir" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
 
-            def record_replace(source, destination) -> None:
+            def record_replace(source, destination, **kwargs) -> None:
                 """Record and perform the atomic replacement."""
 
                 events.append("replace")
-                real_replace(source, destination)
+                real_replace(source, destination, **kwargs)
 
             with patch("agent_run.adapters.home.os.fsync", side_effect=record_fsync), patch(
                 "agent_run.adapters.home.os.replace", side_effect=record_replace
@@ -55,11 +55,11 @@ class AdapterHomeTests(unittest.TestCase):
 
                 events.append("dir" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
 
-            def record_replace(source, destination) -> None:
+            def record_replace(source, destination, **kwargs) -> None:
                 """Record and perform the atomic replacement."""
 
                 events.append("replace")
-                real_replace(source, destination)
+                real_replace(source, destination, **kwargs)
 
             with patch("agent_run.adapters.home.os.fsync", side_effect=record_fsync), patch(
                 "agent_run.adapters.home.os.replace", side_effect=record_replace
@@ -99,6 +99,32 @@ class AdapterHomeTests(unittest.TestCase):
                     write_managed_file(home, "settings/config.toml", "replacement")
             self.assertEqual(target.read_text(encoding="utf-8"), "original")
             self.assertEqual(list(target.parent.glob(".*.tmp")), [])
+
+    def test_parent_swap_cannot_redirect_managed_replace(self) -> None:
+        """Keep publication on its retained parent descriptor during a path swap."""
+
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            home = Path(directory).resolve()
+            parent = home / "settings"
+            parent.mkdir()
+            retained = home / "retained-settings"
+            real_replace = os.replace
+
+            def swap_then_replace(source, destination, **kwargs) -> None:
+                """Swap the lexical parent immediately before descriptor-relative replace."""
+
+                parent.rename(retained)
+                parent.symlink_to(outside, target_is_directory=True)
+                real_replace(source, destination, **kwargs)
+
+            with patch(
+                "agent_run.adapters.home.os.replace", side_effect=swap_then_replace
+            ):
+                write_managed_file(home, "settings/config.toml", "retained")
+            self.assertEqual(
+                (retained / "config.toml").read_text(encoding="utf-8"), "retained"
+            )
+            self.assertFalse((Path(outside) / "config.toml").exists())
 
     def test_failed_file_sync_publishes_nothing_and_cleans_its_temp(self) -> None:
         """Leave no target or owned temporary when payload synchronization fails."""

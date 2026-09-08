@@ -20,6 +20,10 @@ from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
 from agent_run.adapters.developer_environment import configured_environment_keys
+from agent_run.adapters.snapshots import (
+    inspect_runtime_snapshots,
+    runtime_snapshot_index_sha256,
+)
 from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
@@ -513,7 +517,8 @@ env_from = ["PATH"]
 
     def test_probe_refuses_a_bridge_pointing_away_from_the_configured_source(self) -> None:
         config = self.runtime_config()
-        ADAPTER.materialize(config, self.home, mcp_servers={})
+        revision = ADAPTER.materialize(config, self.home, mcp_servers={})
+        index_sha256 = runtime_snapshot_index_sha256(self.home, revision)
         impostor = self.auth_source_dir / "other-auth.json"
         impostor.write_text("{}", encoding="utf-8")
         bridge = self.home / "auth.json"
@@ -522,6 +527,11 @@ env_from = ["PATH"]
 
         health = ADAPTER.probe(config, self.home)
         self.assertFalse(health.authenticated)
+        inspection = inspect_runtime_snapshots(
+            self.home, revision, expected_sha256=index_sha256
+        )
+        self.assertFalse(inspection.verified)
+        self.assertIn("auth.json", inspection.hash_mismatches)
 
     def test_probe_refuses_a_regular_file_in_place_of_the_bridge(self) -> None:
         config = self.runtime_config()

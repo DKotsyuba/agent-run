@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from agent_run.adapters.snapshots import (
     inspect_config_snapshot,
     inspect_managed_snapshot,
     inspect_runtime_snapshots,
+    runtime_snapshot_index_sha256,
     snapshot_managed_tree,
     snapshot_selected_assets,
 )
@@ -195,6 +197,9 @@ class ManagedSnapshotTests(unittest.TestCase):
         self.assertNotEqual(first.sha256, declared_assets.sha256)
         self.assertNotEqual(first.sha256, observed_version.sha256)
         self.assertNotIn(secret.encode(), first.document)
+        runtime_document = json.loads(first.document)["runtime_config"]
+        self.assertEqual(runtime_document["models"], ["sonnet"])
+        self.assertIn("TOKEN_LIKE", runtime_document["environment"]["variable_sha256"])
         candidate = self.root / "candidate"
         candidate.mkdir()
         (candidate / CONFIG_SNAPSHOT_FILENAME).write_bytes(observed_version.document)
@@ -227,6 +232,15 @@ class ManagedSnapshotTests(unittest.TestCase):
             self.home, "files-1", expected_sha256=index_sha256
         )
         self.assertIn("settings.json", changed.mismatched)
+        self.assertIn("settings.json", changed.hash_mismatches)
+        settings.write_text("{}", encoding="utf-8")
+        settings.unlink()
+        settings.symlink_to(self.source / "SKILL.md")
+        wrong_type = inspect_runtime_snapshots(
+            self.home, "files-1", expected_sha256=index_sha256
+        )
+        self.assertIn("settings.json", wrong_type.type_mismatches)
+        settings.unlink()
         settings.write_text("{}", encoding="utf-8")
         (self.home / "skills/demo").rename(self.home / "skills/demo.gone")
         inspection = inspect_runtime_snapshots(
@@ -239,10 +253,35 @@ class ManagedSnapshotTests(unittest.TestCase):
             '"roots":[],"snapshot_index_version":1}\n',
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ValidationError, "hash"):
-            inspect_runtime_snapshots(
-                self.home, "files-1", expected_sha256=index_sha256
-            )
+        with self.assertRaisesRegex(ValidationError, "malformed"):
+            runtime_snapshot_index_sha256(self.home, "files-1")
+
+    def test_runtime_index_binds_each_root_manifest_revision(self) -> None:
+        """Reject an internally consistent tree replaced after index finalization."""
+
+        snapshot_managed_tree(self.home, "skills/demo", self.source)
+        index_sha256 = finalize_runtime_snapshots(self.home, "files-1")
+        finalized = (self.home / RUNTIME_SNAPSHOT_INDEX).read_bytes()
+        (self.source / "SKILL.md").write_text("replacement", encoding="utf-8")
+        snapshot_managed_tree(self.home, "skills/demo", self.source)
+        (self.home / RUNTIME_SNAPSHOT_INDEX).write_bytes(finalized)
+        inspection = inspect_runtime_snapshots(
+            self.home, "files-1", expected_sha256=index_sha256
+        )
+        self.assertFalse(inspection.verified)
+        self.assertIn(
+            "skills/demo/.agent-run-snapshot.json", inspection.hash_mismatches
+        )
+
+    def test_runtime_hash_reader_rejects_incomplete_index_shape(self) -> None:
+        """Require canonical complete producer evidence before returning its hash."""
+
+        self.home.mkdir()
+        (self.home / RUNTIME_SNAPSHOT_INDEX).write_text(
+            '{"materialize_revision":"files-1"}\n', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValidationError, "malformed"):
+            runtime_snapshot_index_sha256(self.home, "files-1")
 
 
 if __name__ == "__main__":

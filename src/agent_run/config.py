@@ -385,7 +385,7 @@ def _plugin_snapshot_assets(
                 or candidate.is_absolute()
                 or not candidate.parts
                 or any(part in {".", ".."} for part in candidate.parts)
-                or any(character in asset for character in "*?[]")
+                or any(character in asset for character in "*?[]{}")
             ):
                 raise ValidationError(
                     f"{path}.{plugin_name}[{index}] must be a relative POSIX path without dot traversal or glob syntax"

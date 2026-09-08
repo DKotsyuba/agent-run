@@ -129,9 +129,16 @@ class GlmAdapter(ClaudeAdapter):
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan:
         plan = super().prepare(
-            request, profile, config, home, agent_dir, mcp_servers=mcp_servers
+            request,
+            profile,
+            config,
+            home,
+            agent_dir,
+            mcp_servers=mcp_servers,
+            resume_session_id=resume_session_id,
         )
         cli_model = request.model
         argv = plan.argv

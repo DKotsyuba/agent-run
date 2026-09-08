@@ -135,8 +135,9 @@ def build_config_snapshot(
         not isinstance(runtime_version, str) or not runtime_version.strip()
     ):
         raise ValidationError("snapshot runtime_version must be nonblank or None")
+    runtime_document = _runtime_document(config)
     runtime_bytes = json.dumps(
-        _runtime_document(config), sort_keys=True, separators=(",", ":")
+        runtime_document, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     document = (
         json.dumps(
@@ -147,6 +148,7 @@ def build_config_snapshot(
                 "adapter_api_version": adapter_api_version,
                 "config_schema_version": schema_version,
                 "runtime_config_sha256": content_hash(runtime_bytes),
+                "runtime_config": runtime_document,
                 "materialize_revision": materialize_revision,
                 "snapshot_index_sha256": snapshot_index_sha256,
                 "profile": _profile_document(profile),
@@ -195,6 +197,7 @@ def inspect_config_snapshot(candidate_dir: Path, expected_sha256: str) -> Config
         "adapter_api_version",
         "config_schema_version",
         "runtime_config_sha256",
+        "runtime_config",
         "materialize_revision",
         "snapshot_index_sha256",
         "profile",
@@ -204,6 +207,12 @@ def inspect_config_snapshot(candidate_dir: Path, expected_sha256: str) -> Config
         raise ValidationError("config snapshot shape is unsupported")
     if raw != canonical:
         raise ValidationError("config snapshot is not canonical")
+    runtime_document = document["runtime_config"]
+    runtime_bytes = json.dumps(
+        runtime_document, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if content_hash(runtime_bytes) != document["runtime_config_sha256"]:
+        raise ValidationError("config snapshot runtime declaration hash is invalid")
     index_sha256 = document["snapshot_index_sha256"]
     if not _valid_sha256(index_sha256):
         raise ValidationError("config snapshot index sha256 is invalid")

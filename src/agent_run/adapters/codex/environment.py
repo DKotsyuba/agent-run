@@ -73,7 +73,12 @@ def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, s
 
 
 def prepared_environment(
-    binary: Path, home: Path, config: RuntimeConfig, workdir: Path
+    binary: Path,
+    home: Path,
+    config: RuntimeConfig,
+    workdir: Path,
+    *,
+    refresh: bool = True,
 ) -> dict[str, str]:
     """Return the Codex child environment with its managed command policy.
 
@@ -84,20 +89,27 @@ def prepared_environment(
 
     environment = developer_environment(build_environment(binary, home), config, workdir)
     denied_commands = config.environment.denied_commands if config.environment is not None else ()
-    command_policy = materialize_refusal_commands(
-        denied_commands,
-        home / "command-refusals",
-        environment=environment,
-    )
-    environment["PATH"] = os.pathsep.join((str(command_policy.directory), environment["PATH"]))
-    write_managed_file(
-        home,
-        "rules/agent-run-command-policy.rules",
-        render_codex_denial_rules(
+    policy_directory = home / "command-refusals"
+    if refresh:
+        command_policy = materialize_refusal_commands(
             denied_commands,
-            command_paths=tuple(command_policy.resolved_commands.values()),
-        ),
-    )
+            policy_directory,
+            environment=environment,
+        )
+        write_managed_file(
+            home,
+            "rules/agent-run-command-policy.rules",
+            render_codex_denial_rules(
+                denied_commands,
+                command_paths=tuple(command_policy.resolved_commands.values()),
+            ),
+        )
+    elif not policy_directory.is_dir() or any(
+        not (policy_directory / name).is_file()
+        for name in (".agent-run-command-policy.json", *denied_commands)
+    ):
+        raise ValidationError("codex resume command policy is missing")
+    environment["PATH"] = os.pathsep.join((str(policy_directory), environment["PATH"]))
     return environment
 
 

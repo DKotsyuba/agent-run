@@ -395,6 +395,7 @@ plugins = ["{plugin}"]
                 ('plugin_snapshot_assets = { compressor = ["/absolute"] }', "relative POSIX"),
                 ('plugin_snapshot_assets = { compressor = ["../escape"] }', "relative POSIX"),
                 ('plugin_snapshot_assets = { compressor = ["assets/*.json"] }', "relative POSIX"),
+                ('plugin_snapshot_assets = { compressor = ["assets/{name}.json"] }', "relative POSIX"),
                 ('plugin_snapshot_assets = { compressor = "manifest.json" }', "array of strings"),
             )
             for declaration, message in invalid:

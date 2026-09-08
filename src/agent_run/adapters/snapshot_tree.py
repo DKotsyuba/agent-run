@@ -50,6 +50,8 @@ class SnapshotInspection:
     orphans: tuple[str, ...]
     referenced_missing: tuple[str, ...]
     mismatched: tuple[str, ...]
+    type_mismatches: tuple[str, ...] = ()
+    hash_mismatches: tuple[str, ...] = ()
 
 
 def _relative(value: str | Path, label: str) -> Path:
@@ -65,7 +67,10 @@ def _relative(value: str | Path, label: str) -> Path:
 
 
 def _read_tree(
-    source: Path, selected: tuple[PurePosixPath, ...] | None = None
+    source: Path,
+    selected: tuple[PurePosixPath, ...] | None = None,
+    *,
+    allow_special: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, bytes]]:
     """Read path/type/content evidence through no-follow descriptors.
 
@@ -73,6 +78,8 @@ def _read_tree(
     the exact relative files/directories to traverse; their parent directories
     are retained for a self-contained layout. Selected descendants may only be
     real directories or regular files, so links and special files fail closed.
+    ``allow_special`` is inspection-only: it records an unexpected symlink or
+    special entry's type without following or reading it.
     """
 
     if not isinstance(source, Path) or not source.is_absolute():
@@ -119,6 +126,16 @@ def _read_tree(
                     os.close(child)
                 continue
             if not stat.S_ISREG(metadata.st_mode):
+                if allow_special:
+                    entries.append(
+                        {
+                            "path": portable,
+                            "type": "symlink"
+                            if stat.S_ISLNK(metadata.st_mode)
+                            else "special",
+                        }
+                    )
+                    continue
                 raise ValidationError(f"snapshot entry must be regular: {portable}")
             try:
                 opened = os.open(
@@ -285,7 +302,7 @@ def inspect_managed_snapshot(home: Path, relative_root: str | Path) -> SnapshotI
     if root.is_symlink() or not root.is_dir():
         raise ValidationError("snapshot destination must be a real directory")
     expected_entries = _load_manifest(root / SNAPSHOT_MANIFEST)
-    actual_entries, _ = _read_tree(root)
+    actual_entries, _ = _read_tree(root, allow_special=True)
     actual: dict[str, dict[str, object]] = {}
     owned_temps: list[str] = []
     for entry in actual_entries:
@@ -304,12 +321,25 @@ def inspect_managed_snapshot(home: Path, relative_root: str | Path) -> SnapshotI
     expected = _entry_map(expected_entries)
     missing = tuple(sorted(set(expected) - set(actual)))
     orphans = tuple(sorted(set(actual) - set(expected)))
-    mismatched = tuple(
-        path for path in sorted(set(expected) & set(actual)) if expected[path] != actual[path]
+    shared = sorted(set(expected) & set(actual))
+    type_mismatches = tuple(
+        path for path in shared if expected[path].get("type") != actual[path].get("type")
     )
+    hash_mismatches = tuple(
+        path
+        for path in shared
+        if path not in type_mismatches and expected[path] != actual[path]
+    )
+    mismatched = tuple(sorted((*type_mismatches, *hash_mismatches)))
     temps = tuple(sorted(owned_temps))
     return SnapshotInspection(
-        not (temps or missing or orphans or mismatched), temps, orphans, missing, mismatched
+        not (temps or missing or orphans or mismatched),
+        temps,
+        orphans,
+        missing,
+        mismatched,
+        type_mismatches,
+        hash_mismatches,
     )
 
 

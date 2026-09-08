@@ -240,6 +240,7 @@ class RuntimeAdapter(Protocol):
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan: ...
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession: ...

@@ -551,6 +551,23 @@ class ClaudeAdapterTests(unittest.TestCase):
         # generated home, so no plugin file is materialized for them.
         self.assertFalse((self.home / "plugins" / "compressor").exists())
 
+    def test_duplicate_live_plugin_names_are_legacy_compatible(self) -> None:
+        """Require basename uniqueness only when selecting immutable assets."""
+
+        first = self.root / "first" / "shared"
+        second = self.root / "second" / "shared"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        config = self.runtime_config(plugins=(first, second))
+        self.materialize(config, self.home)
+        object.__setattr__(
+            config,
+            "plugin_snapshot_assets",
+            MappingProxyType({"shared": ("manifest.json",)}),
+        )
+        with self.assertRaisesRegex(ValidationError, "ambiguous"):
+            self.materialize(config, self.home)
+
     def test_declared_plugin_assets_use_the_managed_snapshot_path(self) -> None:
         """Load only explicitly selected plugin assets from the immutable home copy."""
 

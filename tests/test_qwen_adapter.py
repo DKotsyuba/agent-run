@@ -193,6 +193,37 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertEqual(context.read_text(encoding="utf-8"), "ROLE CONTRACT\n")
         self.assertTrue(context.is_relative_to(self.home))
 
+    def test_resume_prepare_keeps_verified_runtime_home_read_only(self) -> None:
+        """Reuse request-dependent Qwen assets without rewriting lineage HOME."""
+
+        self.prepare()
+        before = {
+            path.relative_to(self.home): path.read_bytes()
+            for path in self.home.rglob("*")
+            if path.is_file()
+        }
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "secret",
+            "OPENAI_BASE_URL": "https://provider/v1",
+        }):
+            plan = self.adapter.prepare(
+                self.request(),
+                self.profile(),
+                self.config(),
+                self.home,
+                self.agent_dir,
+                mcp_servers={},
+                resume_session_id="session-1",
+            )
+        after = {
+            path.relative_to(self.home): path.read_bytes()
+            for path in self.home.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(plan.resume_session_id, "session-1")
+
     def test_network_profile_is_refused(self) -> None:
         """Reject network profiles because this adapter grants no Qwen web tools."""
         with patch.dict(os.environ, {"OPENAI_API_KEY": "x", "OPENAI_BASE_URL": "https://p/v1"}):

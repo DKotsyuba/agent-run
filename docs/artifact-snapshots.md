@@ -52,17 +52,18 @@ fsync is used when the filesystem supports it.
 
 `build_config_snapshot()` produces canonical attempt metadata binding the
 materialized file revision to the runtime name, adapter API version, config
-schema version, complete runtime declaration, and effective profile body and
-grants. Configured environment values are represented by hashes, so content-only
+schema version, sanitized complete runtime declaration plus its hash, and
+effective profile body and grants. Configured environment values are represented by hashes, so content-only
 edits change the revision without copying credential-like values into metadata.
 An already-known native runtime version is recorded when available; snapshot
 creation does not run an additional version probe.
 
 Each published tree is also recorded in the generated home's snapshot index.
 Resume checks that index, so deleting an entire skill directory cannot hide its
-missing manifest. The finalized index also binds adapter-known flat config files
-and the materialization revision; resume requires both its stored SHA-256 and
-revision to match. `inspect_config_snapshot()` likewise reads the attempt's
+missing manifest. The finalized index binds each root's manifest SHA-256,
+adapter-known flat config files, declared credential-link paths and targets,
+and the materialization revision; resume requires its stored SHA-256, revision,
+and every referenced artifact to match. `inspect_config_snapshot()` likewise reads the attempt's
 configuration metadata as a no-follow regular file, checks its recorded hash,
 and requires canonical version-one JSON before reuse.
 
