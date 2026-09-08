@@ -21,6 +21,7 @@ from agent_run.adapters.base import (
     RuntimeInfo,
 )
 from agent_run.adapters.home import seal_answer
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.domain import TERMINAL, AgentStatus, Outcome, StartRequest
 from agent_run.errors import PathEscapeError
@@ -345,8 +346,9 @@ class _Adapter:
         return None
 
     def materialize(self, config, home, *, mcp_servers, skills_root):
-        """Return the fixed fixture configuration revision without writing files."""
+        """Finalize empty runtime evidence and return its fixture revision."""
 
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def probe(self, config, home):

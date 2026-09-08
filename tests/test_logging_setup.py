@@ -21,6 +21,7 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.domain import StartRequest
 from agent_run.service import AgentService
@@ -40,6 +41,7 @@ class _FakeAdapter:
         pass
 
     def materialize(self, config, home, *, mcp_servers, skills_root):
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def models(self, config, home):
@@ -188,7 +190,7 @@ class ServiceLoggingTests(unittest.TestCase):
         joined = "\n".join(captured.output)
         self.assertIn("start runtime=fake model=model", joined)
         self.assertIn("gate=capabilities ok", joined)
-        self.assertIn("materialized runtime=fake revision=cfg-1", joined)
+        self.assertIn("materialized runtime=fake revision=snapshot:v1:", joined)
         self.assertIn("created=True", joined)
         self.assertIn("done", joined)
 
