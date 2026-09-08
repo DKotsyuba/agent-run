@@ -68,6 +68,42 @@ class PublicationTests(unittest.TestCase):
             )
             self.assertEqual(tools, [{"name": "status"}])
 
+    def test_mcp_smoke_bounds_partial_frames(self):
+        """A readable partial frame cannot turn the handshake timeout into a hang."""
+        with tempfile.TemporaryDirectory() as directory:
+            child = Path(directory) / "partial_mcp.py"
+            child.write_text(
+                "import sys, time\n"
+                "[sys.stdin.readline() for _ in range(3)]\n"
+                "sys.stdout.write('{\"jsonrpc\":'); sys.stdout.flush()\n"
+                "time.sleep(2)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(release.ReleaseError, "tools/list"):
+                local.mcp_tools(
+                    release.Runner(0.2, 0.01),
+                    [sys.executable, str(child)],
+                    subprocess.DEVNULL,
+                )
+
+    def test_mcp_smoke_rejects_initialization_errors(self):
+        """A tools result cannot hide a failed MCP initialization response."""
+        with tempfile.TemporaryDirectory() as directory:
+            child = Path(directory) / "failed_init_mcp.py"
+            child.write_text(
+                "import json, sys\n"
+                "[sys.stdin.readline() for _ in range(3)]\n"
+                "print(json.dumps({'jsonrpc':'2.0','id':1,'error':{'code':-1}}), flush=True)\n"
+                "print(json.dumps({'jsonrpc':'2.0','id':2,'result':{'tools':[{'name':'status'}]}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(release.ReleaseError, "protocol error"):
+                local.mcp_tools(
+                    release.Runner(5, 0.01),
+                    [sys.executable, str(child)],
+                    subprocess.DEVNULL,
+                )
+
     def test_cli_uses_shared_exception_identity_and_restores_every_job(self):
         """Real __main__ loading catches local failures and attempts all three restarts."""
         calls = []

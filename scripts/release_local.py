@@ -105,7 +105,7 @@ def mcp_tools(runner: Runner, command: list[str], stderr: object) -> list[object
     """
     process = subprocess.Popen(
         command + ["mcp"], env=environment(), stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1,
+        stdout=subprocess.PIPE, stderr=stderr,
     )
     try:
         if process.stdin is None or process.stdout is None:
@@ -117,31 +117,47 @@ def mcp_tools(runner: Runner, command: list[str], stderr: object) -> list[object
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
-        process.stdin.write("".join(json.dumps(request) + "\n" for request in requests))
+        process.stdin.write("".join(json.dumps(request) + "\n" for request in requests).encode())
         process.stdin.flush()
         deadline = min(runner.deadline, time.monotonic() + 10)
+        buffer = bytearray()
+        initialized = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            ready, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
             if not ready:
                 break
-            line = process.stdout.readline(1024 * 1024 + 1)
-            if not line or len(line) > 1024 * 1024:
+            chunk = os.read(process.stdout.fileno(), 8192)
+            if not chunk:
                 break
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ReleaseError("Isolated MCP returned malformed JSON") from error
-            if not isinstance(message, dict):
-                raise ReleaseError("Isolated MCP returned malformed JSON")
-            if message.get("id") == 2:
-                result = message.get("result")
-                tools = result.get("tools") if isinstance(result, dict) else None
-                if not isinstance(tools, list) or not tools:
-                    raise ReleaseError("Isolated MCP tools/list smoke failed")
-                return tools
+            buffer.extend(chunk)
+            while b"\n" in buffer:
+                frame, _, tail = buffer.partition(b"\n")
+                buffer = bytearray(tail)
+                if len(frame) > 1024 * 1024:
+                    raise ReleaseError("Isolated MCP returned an oversized frame")
+                try:
+                    message = json.loads(frame)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ReleaseError("Isolated MCP returned malformed JSON") from error
+                if not isinstance(message, dict):
+                    raise ReleaseError("Isolated MCP returned malformed JSON")
+                if "error" in message:
+                    raise ReleaseError("Isolated MCP returned a protocol error")
+                if message.get("id") == 1:
+                    if not isinstance(message.get("result"), dict):
+                        raise ReleaseError("Isolated MCP initialization failed")
+                    initialized = True
+                elif message.get("id") == 2:
+                    result = message.get("result")
+                    tools = result.get("tools") if isinstance(result, dict) else None
+                    if not initialized or not isinstance(tools, list) or not tools:
+                        raise ReleaseError("Isolated MCP tools/list smoke failed")
+                    return tools
+            if len(buffer) > 1024 * 1024:
+                raise ReleaseError("Isolated MCP returned an oversized frame")
         raise ReleaseError("Isolated MCP tools/list smoke failed")
     finally:
         if process.stdin is not None:
