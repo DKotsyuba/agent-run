@@ -281,10 +281,13 @@ class QwenAdapterTests(unittest.TestCase):
     def test_probe_observes_the_configured_binary_version(self) -> None:
         """Probe reports a fresh local ``--version`` observation."""
 
+        binary = self.root / "version-runtime"
+        binary.write_text("#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n", encoding="utf-8")
+        binary.chmod(0o700)
         with patch.dict(os.environ, {"OPENAI_API_KEY": "x", "OPENAI_BASE_URL": "x"}):
-            health = self.adapter.probe(self.config(binary=Path("/bin/echo")), self.home)
+            health = self.adapter.probe(self.config(binary=binary), self.home)
         self.assertTrue(health.available)
-        self.assertEqual(health.version, "--version")
+        self.assertEqual(health.version, "runtime 1.2.3")
 
     def test_skills_capability_is_declared(self) -> None:
         """Qwen has no Skill tool, but the capability still advertises delivery."""

@@ -295,11 +295,14 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertFalse(health.available)
         self.assertFalse(health.authenticated)
 
-        available = self.runtime_config(binary=Path("/bin/echo"))
+        binary = self.root / "version-runtime"
+        binary.write_text("#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n", encoding="utf-8")
+        binary.chmod(0o700)
+        available = self.runtime_config(binary=binary)
         health = self.adapter.probe(available, self.home)
         self.assertTrue(health.available)
         self.assertFalse(health.authenticated)
-        self.assertEqual(health.version, "--version")
+        self.assertEqual(health.version, "runtime 1.2.3")
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
             health = self.adapter.probe(available, self.home)
             self.assertTrue(health.authenticated)

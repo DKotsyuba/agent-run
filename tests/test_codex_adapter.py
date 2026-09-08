@@ -504,12 +504,15 @@ env_from = ["PATH"]
     # -- probe ------------------------------------------------------------
 
     def test_probe_reports_health_without_live_calls(self) -> None:
-        config = self.runtime_config()
+        binary = self.agent_run_root / "version-runtime"
+        binary.write_text("#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n", encoding="utf-8")
+        binary.chmod(0o700)
+        config = self.runtime_config(binary=binary)
         ADAPTER.materialize(config, self.home, mcp_servers={})
         health = ADAPTER.probe(config, self.home)
         self.assertTrue(health.available)
         self.assertTrue(health.authenticated)
-        self.assertEqual(health.version, "--version")
+        self.assertEqual(health.version, "runtime 1.2.3")
 
         missing_binary = self.runtime_config(binary=Path("/no/such/codex-binary"))
         unhealthy = ADAPTER.probe(missing_binary, self.home)
