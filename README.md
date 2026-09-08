@@ -125,7 +125,7 @@ short-lived local app-server process. Standard and model-specific buckets
 account failure does not erase fresh evidence from the others.
 
 **Multiple accounts** (codex): declare labels on the runtime —
-`accounts = ["personal1", "personal2"]` (optionally `default_account`) —
+`accounts = ["personal1", "personal2"]` —
 then log each one in via the engine's own OAuth flow:
 
 ```bash
@@ -133,7 +133,8 @@ agent-run auth personal2 codex     # opens the browser login once
 agent-run start --runtime codex --account personal2 ...
 ```
 
-Credentials live in `<home>/accounts/codex/<label>/`, each account gets
+Omitting `--account` uses the native global Codex account. Labelled credentials
+live in `<home>/accounts/codex/<label>/`; each account gets
 its own child-home lineage, and `--account` works identically over MCP
 and the socket API. With no accounts declared, nothing changes in account
 selection. A configured model is launchable only when the selected account's
@@ -142,17 +143,15 @@ app-server roster reports it. `gpt-6-astra` permits only read-only
 high-demand model for the hardest architecture and review decisions; coding
 and routine work use other models.
 
-Claude uses its own isolated CLI credential state. Authenticate an unlabelled
-Claude runtime once with:
+Claude uses its native global CLI credential state when no label is supplied:
 
 ```bash
 agent-run login claude
 ```
 
-When Claude declares `accounts`, use its configured `default_account` or select
-one explicitly: `agent-run login claude --account personal`. This runs
-`claude auth login` with the same private `CLAUDE_CONFIG_DIR` the child launch
-uses; it never copies the global Claude configuration or prints credentials.
+When Claude declares `accounts`, select one explicitly with
+`agent-run login claude --account personal`. Labelled runs use private
+`CLAUDE_CONFIG_DIR` state; unlabelled runs use the native global directory.
 
 The built-in operator guide documents every section:
 

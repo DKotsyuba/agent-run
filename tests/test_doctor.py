@@ -23,6 +23,64 @@ from tests.test_launch import child_pythonpath
 
 
 class DoctorTests(unittest.TestCase):
+    def test_canonical_role_readiness_uses_shared_catalog_without_runtime_home(self) -> None:
+        """Validate role assets and reject legacy runtime lists outside start."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            profiles = home / "profiles"
+            profiles.mkdir()
+            skills = home / "skills"
+            skill = skills / "code-reading"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+            (profiles / "review.md").write_text(
+                """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = ["codegraph"]
+required_constraints = []
++++
+Review.
+""",
+                encoding="utf-8",
+            )
+            base = f'''schema_version = 1
+[profiles]
+directory = "{profiles}"
+[skills]
+directory = "{skills}"
+[mcp.codegraph]
+transport = "stdio"
+command = "/bin/echo"
+[runtimes.fake]
+enabled = true
+adapter = "example:ADAPTER"
+binary = "/bin/echo"
+home = "{home / 'not-materialized'}"
+models = ["model"]
+'''
+            (home / "config.toml").write_text(base, encoding="utf-8")
+            StateStore.initialize(home / "state.db").close()
+            report = run_doctor(
+                home, at=1, canary_runner=lambda: 1, mcp_process_lister=lambda: []
+            )
+            codes = {finding.code for finding in report.findings}
+            self.assertNotIn("role_invalid", codes)
+            self.assertNotIn("runtime_home_missing", codes)
+
+            (home / "config.toml").write_text(
+                base.replace('models = ["model"]', 'models = ["model"]\nskills = ["legacy"]'),
+                encoding="utf-8",
+            )
+            mixed = run_doctor(
+                home, at=1, canary_runner=lambda: 1, mcp_process_lister=lambda: []
+            )
+            self.assertIn("mixed_role_assets", {item.code for item in mixed.findings})
+
     def test_reports_bounded_metadata_without_mutating_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
@@ -30,7 +88,9 @@ class DoctorTests(unittest.TestCase):
             runtime_home.mkdir()
             config = home / "config.toml"
             config.write_text(
-                f'''schema_version = 1
+                    f'''schema_version = 1
+[profiles]
+directory = "{home / 'missing-profiles'}"
 [mcp.missing]
 transport = "stdio"
 command = "{home / 'missing-mcp'}"
@@ -96,8 +156,7 @@ models = ["model"]
                 {
                     "mcp_executable_missing",
                     "runtime_binary_missing",
-                    "runtime_home_missing",
-                    "runtime_home_unsupported",
+                    "profile_directory_missing",
                     "runtime_skill_missing",
                     "hook_executable_missing",
                     "hook_untrusted",
@@ -106,7 +165,8 @@ models = ["model"]
                     "capacity_stale",
                     "dead_supervisor",
                     "suspected_orphan",
-                }.issubset(codes)
+                }.issubset(codes),
+                codes,
             )
             self.assertFalse(report.ok)
             self.assertEqual(before, (database.stat().st_mtime_ns, database.stat().st_mode))

@@ -870,7 +870,7 @@ def _claude_login(
         exit code.
     """
 
-    state_home = runtime.home if label is None else account_runtime_home(runtime.home, label)
+    state_home = None if label is None else account_runtime_home(runtime.home, label)
     scoped_runtime = replace(runtime, credential_state_home=state_home)
     environment = claude_login_environment(scoped_runtime)
     login = subprocess.run([str(runtime.binary), "auth", "login"], env=environment)
@@ -893,11 +893,9 @@ def _claude_login(
 def _login(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, object] | int:
     """Dispatch the convenience login syntax while preserving account isolation.
 
-    ``args.runtime`` must name enabled Claude and ``args.account`` optionally
-    picks one declared label. A runtime with declared labels uses its configured
-    default when present; without one it is rejected with the exact accepted
-    syntax instead of silently choosing an account. Other engines retain the
-    established ``agent-run auth <label> <runtime>`` interface.
+    ``args.runtime`` must name enabled Claude. An omitted account selects the
+    native global CLI state; an explicit declared label selects isolated state.
+    Other engines retain ``agent-run auth <label> <runtime>``.
 
     :param Path home: Agent-run home containing the active configuration.
     :param argparse.Namespace args: Parsed ``login`` command arguments.
@@ -916,13 +914,9 @@ def _login(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, ob
         raise ValidationError(
             f"login supports Claude only; use agent-run auth <label> {args.runtime}"
         )
-    label = args.account if args.account is not None else runtime.default_account
+    label = args.account
     if args.account is not None and args.account not in runtime.accounts:
         raise ValidationError(f"account {args.account!r} is not declared for runtime claude")
-    if runtime.accounts and label is None:
-        raise ValidationError(
-            "Claude account is required; use agent-run login claude --account <label>"
-        )
     return _claude_login(runtime, label, stderr)
 
 

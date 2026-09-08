@@ -315,8 +315,8 @@ target = "auth.json"
         self.assertEqual(calls[1][0], [binary, "login", "status"])
         self.assertEqual(Path(calls[0][1]["env"]["CODEX_HOME"]).resolve(), home.resolve() / "accounts" / "codex" / "personal2")
 
-    def test_login_claude_uses_the_launch_scoped_config_directory(self):
-        """The convenience command authenticates only the private Claude state."""
+    def test_login_claude_uses_the_native_global_config_directory(self):
+        """An omitted account authenticates the host Claude CLI state."""
 
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -359,9 +359,8 @@ names = ["CLAUDE_CODE_OAUTH_TOKEN"]
         self.assertEqual(calls[0][0], ["/bin/claude", "auth", "login"])
         self.assertEqual(calls[1][0], ["/bin/claude", "auth", "status", "--json"])
         environment = calls[0][1]["env"]
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str((runtime_home / "claude-config").resolve()))
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], "/ambient")
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
-        self.assertNotIn("/ambient", environment["CLAUDE_CONFIG_DIR"])
 
     def test_login_claude_account_and_status_failure_are_scoped_and_safe(self):
         """Selected accounts get distinct config state and status output stays private."""
@@ -408,8 +407,8 @@ names = ["CLAUDE_CODE_OAUTH_TOKEN"]
             str(Path("/tmp/claude@personal/claude-config").resolve()),
         )
 
-    def test_login_claude_rejects_ambiguous_or_unsupported_syntax(self):
-        """The command gives the exact supported syntax instead of choosing an account."""
+    def test_login_claude_defaults_global_and_rejects_unsupported_runtime(self):
+        """Use native global Claude state and keep other runtime syntax explicit."""
 
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -449,10 +448,12 @@ target = "auth.json"
                     stderr.getvalue(),
                 )
 
-            ambiguous = command(["--home", str(home), "login", "claude"])
-            unsupported = command(["--home", str(home), "login", "codex"])
-        self.assertEqual(ambiguous[0], 2)
-        self.assertIn("agent-run login claude --account <label>", ambiguous[2])
+            result = type("Result", (), {"returncode": 0, "stdout": "{}"})()
+            with patch("agent_run.cli.subprocess.run", return_value=result):
+                global_login = command(["--home", str(home), "login", "claude"])
+                unsupported = command(["--home", str(home), "login", "codex"])
+        self.assertEqual(global_login[0], 0)
+        self.assertEqual(json.loads(global_login[1])["account"], None)
         self.assertEqual(unsupported[0], 2)
         self.assertIn("agent-run auth <label> codex", unsupported[2])
 
