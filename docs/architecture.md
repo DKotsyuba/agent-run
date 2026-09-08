@@ -232,12 +232,14 @@ the inconvenient member from the mean. Its quota query detects overflow of the
 64-row bound rather than silently returning a truncated, apparently healthy
 pool. Upstream snapshot timestamps and the source's shelf life remain intact.
 
-For Claude's native usage source, a usable Keychain token is read without a
-refresh. Missing or expired credentials trigger the adapter's existing Claude
-CLI renewal once, bounded to 60 seconds, followed by a validated Keychain
-reread. Failure stays an explicit collection failure. A declared, explicitly
-exported OAuth token remains authoritative and is never replaced by this
-renewal path; API keys are not treated as OAuth credentials.
+Claude owns OAuth refresh state in an account-scoped `CLAUDE_CONFIG_DIR` below
+its configured runtime home. `agent-run login claude` runs `claude auth login`
+and verifies `claude auth status --json` in exactly that private directory;
+agent launches reuse it without reading Keychain credentials or borrowing a
+global Claude configuration. Native usage collection uses only a declared,
+explicitly exported OAuth token; otherwise its capacity is reported unavailable
+rather than inspecting the scoped credential state. API keys are not OAuth
+tokens.
 
 Account labels are opaque: a labelled account cannot collide with the absent
 account even when its label is `base`, `default`, or `shared`. Provider-scoped

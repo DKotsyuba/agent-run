@@ -15,7 +15,13 @@ from pathlib import Path
 
 from ...config import RuntimeConfig
 
-__all__ = ["AUTH_ENV_NAMES", "TOKEN_ENV_NAME", "auth_environment", "claude_config_dir"]
+__all__ = [
+    "AUTH_ENV_NAMES",
+    "TOKEN_ENV_NAME",
+    "auth_environment",
+    "claude_config_dir",
+    "claude_login_environment",
+]
 
 TOKEN_ENV_NAME = "CLAUDE_CODE_OAUTH_TOKEN"
 
@@ -63,3 +69,25 @@ def auth_environment(auth_names: tuple[str, ...]) -> dict[str, str]:
     """
 
     return {name: value for name in auth_names if (value := os.environ.get(name))}
+
+
+def claude_login_environment(config: RuntimeConfig) -> dict[str, str]:
+    """Build the minimal interactive-login environment for one scoped runtime.
+
+    ``config`` must carry the selected durable credential-state home, normally
+    installed by the service or CLI with ``credential_state_home``. Only
+    ``PATH`` and ``HOME`` needed to locate the configured Claude executable and
+    launch its browser flow are retained from the parent; all explicit Claude
+    credential variables are omitted. ``CLAUDE_CONFIG_DIR`` is always the
+    private directory returned by :func:`claude_config_dir`, so the interactive
+    login and a later agent child share one account state without consulting a
+    global Claude configuration.
+
+    :param config: Effective Claude runtime configuration for one account.
+    :returns: Private environment for ``claude auth login`` and status.
+    :raises OSError: If the durable scoped config directory cannot be prepared.
+    """
+
+    environment = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
+    environment["CLAUDE_CONFIG_DIR"] = str(claude_config_dir(config))
+    return environment

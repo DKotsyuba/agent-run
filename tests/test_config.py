@@ -285,6 +285,26 @@ accounts = ["personal"]
                 + '[runtimes.fake.auth]\nkind = "file_link"\nsource = "/tmp/auth"\ntarget = "auth.json"\n'
             )
 
+    def test_claude_accounts_accept_its_scoped_environment_auth(self) -> None:
+        """Claude labels select private CLI config state rather than file links."""
+
+        config = self.load(
+            '''schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/claude"
+home = "/tmp/claude"
+models = ["sonnet"]
+accounts = ["personal"]
+default_account = "personal"
+[runtimes.claude.auth]
+kind = "environment"
+names = ["CLAUDE_CODE_OAUTH_TOKEN"]
+'''
+        )
+        self.assertEqual(config.runtimes["claude"].default_account, "personal")
+
     def test_limits_source_defaults_to_native_and_is_validated(self) -> None:
         self.assertIsNone(self.runtime_with_limits_source().runtimes["fake"].limits_source)
         for source in ("native", "omniroute", "codexbar", "none"):

@@ -12,12 +12,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TextIO
 
-from .accounts import account_store_dir
+from .accounts import account_runtime_home, account_store_dir
+from .adapters.claude.auth import claude_login_environment
 from .api_launchd import argv as api_launchd_argv
 from .api_launchd import build_job as build_api_launchd_job
 from .api_launchd import render_plist as render_api_launchd_plist
@@ -25,7 +26,7 @@ from .broker_client import BrokerClient
 from .capacity.collect import collect_once
 from .capacity.launchd import argv as launchd_argv
 from .capacity.launchd import build_configured_job, render_plist
-from .config import load_config
+from .config import RuntimeConfig, load_config
 from .delivery.claude_uds import TRANSPORT_NAME as CLAUDE_UDS_TRANSPORT_NAME
 from .delivery.claude_uds import ClaudeSessionSender, ClaudeUdsTransport
 from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueTransport
@@ -119,6 +120,10 @@ def _parser() -> argparse.ArgumentParser:
     auth = commands.add_parser("auth")
     auth.add_argument("label")
     auth.add_argument("runtime")
+
+    login = commands.add_parser("login")
+    login.add_argument("runtime")
+    login.add_argument("--account")
 
     bind = commands.add_parser("bind")
     bind.add_argument("agent_id")
@@ -801,6 +806,8 @@ def _auth(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, obj
         raise ValidationError(
             f"account {args.label!r} is not declared for runtime {args.runtime}"
         )
+    if runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER":
+        return _claude_login(runtime, args.label, stderr)
     if "adapters.codex" not in runtime.adapter:
         raise ValidationError(f"auth login not supported for runtime {args.runtime} yet")
     store = account_store_dir(home, args.runtime, args.label)
@@ -822,6 +829,80 @@ def _auth(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, obj
         stderr.write(f"auth login status failed for {args.label} {args.runtime} (exit {status.returncode})\n")
         return status.returncode
     return {"account": args.label, "runtime": args.runtime, "status": "ok"}
+
+
+def _claude_login(
+    runtime: RuntimeConfig, label: str | None, stderr: TextIO
+) -> dict[str, object] | int:
+    """Run interactive Claude auth in the selected private account directory.
+
+    ``runtime`` is an enabled Claude configuration and ``label`` is either a
+    declared account name or ``None`` for its base scoped state. The real CLI
+    receives only :func:`claude_login_environment` and is first allowed to run
+    its interactive ``auth login`` flow; a successful exit is verified by its
+    JSON status exit code without rendering status output. Invalid labels and
+    nonzero provider exits return explicit safe errors without copying or
+    inspecting credentials.
+
+    :param runtime: Configured Claude runtime selected by the outer command.
+    :param label: Optional selected account label.
+    :param stderr: User-facing diagnostic stream for safe fixed failure text.
+    :returns: Success data or the Claude CLI's nonzero exit code.
+    """
+
+    state_home = runtime.home if label is None else account_runtime_home(runtime.home, label)
+    scoped_runtime = replace(runtime, credential_state_home=state_home)
+    environment = claude_login_environment(scoped_runtime)
+    login = subprocess.run([str(runtime.binary), "auth", "login"], env=environment)
+    account = "default" if label is None else label
+    if login.returncode:
+        stderr.write(f"auth login failed for {account} claude (exit {login.returncode})\n")
+        return login.returncode
+    status = subprocess.run(
+        [str(runtime.binary), "auth", "status", "--json"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode:
+        stderr.write(f"auth login status failed for {account} claude (exit {status.returncode})\n")
+        return status.returncode
+    return {"account": label, "runtime": "claude", "status": "ok"}
+
+
+def _login(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, object] | int:
+    """Dispatch the convenience login syntax while preserving account isolation.
+
+    ``args.runtime`` must name enabled Claude and ``args.account`` optionally
+    picks one declared label. A runtime with declared labels uses its configured
+    default when present; without one it is rejected with the exact accepted
+    syntax instead of silently choosing an account. Other engines retain the
+    established ``agent-run auth <label> <runtime>`` interface.
+
+    :param home: Agent-run home containing the active configuration.
+    :param args: Parsed ``login`` command arguments.
+    :param stderr: User-facing diagnostic stream for safe CLI failures.
+    :returns: Login success data or a nonzero Claude CLI exit code.
+    :raises ValidationError: For unavailable runtime, unsupported syntax, or an
+        undeclared/missing Claude account selection.
+    """
+
+    config = load_config(config_path(home))
+    runtime = config.runtimes.get(args.runtime)
+    if runtime is None or not runtime.enabled:
+        raise ValidationError(f"runtime is not configured or not enabled: {args.runtime}")
+    if runtime.adapter != "agent_run.adapters.claude.adapter:ADAPTER":
+        raise ValidationError(
+            f"login supports Claude only; use agent-run auth <label> {args.runtime}"
+        )
+    label = args.account if args.account is not None else runtime.default_account
+    if args.account is not None and args.account not in runtime.accounts:
+        raise ValidationError(f"account {args.account!r} is not declared for runtime claude")
+    if runtime.accounts and label is None:
+        raise ValidationError(
+            "Claude account is required; use agent-run login claude --account <label>"
+        )
+    return _claude_login(runtime, label, stderr)
 
 
 def _doctor(home: Path):
@@ -906,6 +987,10 @@ def main(
             result = _initialize(home)
         elif service is None and args.command == "auth":
             result = _auth(home, args, stderr)
+            if isinstance(result, int):
+                return result
+        elif service is None and args.command == "login":
+            result = _login(home, args, stderr)
             if isinstance(result, int):
                 return result
         elif service is None and args.command == "doctor":

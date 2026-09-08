@@ -53,7 +53,10 @@ remain OmniRoute route aliases.
 - `limits_source` — `native`, `codex_appserver`, `codexbar`, `omniroute`,
   or `none`; controls how quota evidence is collected.
 - `accounts` / `default_account` — path-safe labels for configured account
-  homes when the runtime supports multi-account launches.
+  homes when the runtime supports multi-account launches. Claude may use these
+  with environment auth: `agent-run login claude [--account LABEL]` stores its
+  CLI refresh state in the selected private home; other runtimes require a
+  file-link auth bridge.
 - `priority_multiplier` — positive finite number, default `1.0`; multiplies
   this runtime's nonnegative capacity-order score. It cannot make an exhausted
   route usable and does not affect role/model suitability.

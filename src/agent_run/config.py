@@ -707,7 +707,14 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             if default_account not in account_names:
                 raise ValidationError(f"{path}.default_account must be declared in accounts")
         parsed_auth = None if auth is None else _parse_auth(auth, f"{path}.auth")
-        if account_names and (parsed_auth is None or parsed_auth.kind != "file_link"):
+        claude_environment_accounts = (
+            adapter == "agent_run.adapters.claude.adapter:ADAPTER"
+            and parsed_auth is not None
+            and parsed_auth.kind == "environment"
+        )
+        if account_names and not claude_environment_accounts and (
+            parsed_auth is None or parsed_auth.kind != "file_link"
+        ):
             raise ValidationError(f"{path}.accounts requires file_link auth")
         priority_multiplier = table.get("priority_multiplier", 1.0)
         if (

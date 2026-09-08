@@ -142,6 +142,18 @@ app-server roster reports it. `gpt-6-astra` permits only read-only
 high-demand model for the hardest architecture and review decisions; coding
 and routine work use other models.
 
+Claude uses its own isolated CLI credential state. Authenticate an unlabelled
+Claude runtime once with:
+
+```bash
+agent-run login claude
+```
+
+When Claude declares `accounts`, use its configured `default_account` or select
+one explicitly: `agent-run login claude --account personal`. This runs
+`claude auth login` with the same private `CLAUDE_CONFIG_DIR` the child launch
+uses; it never copies the global Claude configuration or prints credentials.
+
 The built-in operator guide documents every section:
 
 ```bash

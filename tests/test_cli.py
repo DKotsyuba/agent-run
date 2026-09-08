@@ -315,6 +315,147 @@ target = "auth.json"
         self.assertEqual(calls[1][0], [binary, "login", "status"])
         self.assertEqual(Path(calls[0][1]["env"]["CODEX_HOME"]).resolve(), home.resolve() / "accounts" / "codex" / "personal2")
 
+    def test_login_claude_uses_the_launch_scoped_config_directory(self):
+        """The convenience command authenticates only the private Claude state."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            runtime_home = home / "runtime-claude"
+            (home / "config.toml").write_text(
+                f'''schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/claude"
+home = "{runtime_home}"
+models = ["sonnet"]
+[runtimes.claude.auth]
+kind = "environment"
+names = ["CLAUDE_CODE_OAUTH_TOKEN"]
+''',
+                encoding="utf-8",
+            )
+            calls = []
+
+            def run(argv, **kwargs):
+                """Capture the CLI calls without starting a browser flow."""
+
+                calls.append((argv, kwargs))
+                return type("Result", (), {"returncode": 0, "stdout": "{}"})()
+
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/ambient", "CLAUDE_CODE_OAUTH_TOKEN": "secret"}), patch(
+                "agent_run.cli.subprocess.run", side_effect=run
+            ):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                code = cli.main(
+                    ["--home", str(home), "login", "claude"],
+                    service=None,
+                    stdin=io.StringIO(),
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"account": None, "runtime": "claude", "status": "ok"})
+        self.assertEqual(calls[0][0], ["/bin/claude", "auth", "login"])
+        self.assertEqual(calls[1][0], ["/bin/claude", "auth", "status", "--json"])
+        environment = calls[0][1]["env"]
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str((runtime_home / "claude-config").resolve()))
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+        self.assertNotIn("/ambient", environment["CLAUDE_CONFIG_DIR"])
+
+    def test_login_claude_account_and_status_failure_are_scoped_and_safe(self):
+        """Selected accounts get distinct config state and status output stays private."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text(
+                '''schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/claude"
+home = "/tmp/claude"
+models = ["sonnet"]
+accounts = ["personal"]
+[runtimes.claude.auth]
+kind = "environment"
+names = ["CLAUDE_CODE_OAUTH_TOKEN"]
+''',
+                encoding="utf-8",
+            )
+            calls = []
+
+            def run(argv, **kwargs):
+                """Return an authenticated login followed by a rejected status."""
+
+                calls.append((argv, kwargs))
+                return type("Result", (), {"returncode": 0 if len(calls) == 1 else 17, "stdout": "secret status"})()
+
+            with patch("agent_run.cli.subprocess.run", side_effect=run):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                code = cli.main(
+                    ["--home", str(home), "login", "claude", "--account", "personal"],
+                    service=None,
+                    stdin=io.StringIO(),
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+        self.assertEqual(code, 17)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "auth login status failed for personal claude (exit 17)\n")
+        self.assertEqual(
+            calls[0][1]["env"]["CLAUDE_CONFIG_DIR"],
+            str(Path("/tmp/claude@personal/claude-config").resolve()),
+        )
+
+    def test_login_claude_rejects_ambiguous_or_unsupported_syntax(self):
+        """The command gives the exact supported syntax instead of choosing an account."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text(
+                '''schema_version = 1
+[runtimes.claude]
+enabled = true
+adapter = "agent_run.adapters.claude.adapter:ADAPTER"
+binary = "/bin/claude"
+home = "/tmp/claude"
+models = ["sonnet"]
+accounts = ["personal"]
+[runtimes.claude.auth]
+kind = "environment"
+names = ["CLAUDE_CODE_OAUTH_TOKEN"]
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/codex"
+home = "/tmp/codex"
+models = ["gpt"]
+accounts = ["personal"]
+[runtimes.codex.auth]
+kind = "file_link"
+source = "/tmp/auth"
+target = "auth.json"
+''',
+                encoding="utf-8",
+            )
+            def command(argv):
+                """Run a standalone login command and capture its public result."""
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                return (
+                    cli.main(argv, service=None, stdin=io.StringIO(), stdout=stdout, stderr=stderr),
+                    stdout.getvalue(),
+                    stderr.getvalue(),
+                )
+
+            ambiguous = command(["--home", str(home), "login", "claude"])
+            unsupported = command(["--home", str(home), "login", "codex"])
+        self.assertEqual(ambiguous[0], 2)
+        self.assertIn("agent-run login claude --account <label>", ambiguous[2])
+        self.assertEqual(unsupported[0], 2)
+        self.assertIn("agent-run auth <label> codex", unsupported[2])
+
     def test_start_account_flag_reaches_request(self):
         with tempfile.TemporaryDirectory() as directory:
             service = FakeService()

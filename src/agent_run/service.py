@@ -717,7 +717,9 @@ class AgentService:
         ``parent_agent_id`` additionally selects snapshot-v1 lineage state: a
         new-format continuation verifies and reuses its parent's runtime home
         without rematerializing; an unprefixed historical parent retains the
-        shared-home compatibility path.
+        shared-home compatibility path. A labelled Claude environment-auth
+        runtime uses its account sibling as durable credential state without a
+        file bridge; other labelled runtimes retain the file-link requirement.
         """
 
         failure_kind = "prepare_failed"
@@ -731,20 +733,28 @@ class AgentService:
             configured_home = runtime.home
             effective_auth = runtime.auth
             if account_label is not None:
-                if runtime.auth is None or runtime.auth.target is None:
+                claude_environment_account = (
+                    runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER"
+                    and runtime.auth is not None
+                    and runtime.auth.kind == "environment"
+                )
+                if claude_environment_account:
+                    configured_home = account_runtime_home(runtime.home, account_label)
+                elif runtime.auth is None or runtime.auth.target is None:
                     raise ValidationError(
                         f"runtime {request.runtime} account auth is not configured"
                     )
-                effective_source = account_auth_source(
-                    self._home, request.runtime, account_label, runtime.auth.target
-                )
-                if not effective_source.is_file():
-                    raise ValidationError(
-                        f"account {account_label!r} is not authenticated; "
-                        f"run agent-run auth {account_label} {request.runtime}"
+                else:
+                    effective_source = account_auth_source(
+                        self._home, request.runtime, account_label, runtime.auth.target
                     )
-                configured_home = account_runtime_home(runtime.home, account_label)
-                effective_auth = replace(runtime.auth, source=effective_source)
+                    if not effective_source.is_file():
+                        raise ValidationError(
+                            f"account {account_label!r} is not authenticated; "
+                            f"run agent-run auth {account_label} {request.runtime}"
+                        )
+                    configured_home = account_runtime_home(runtime.home, account_label)
+                    effective_auth = replace(runtime.auth, source=effective_source)
 
             parent_revision = None
             snapshot_resume = False
