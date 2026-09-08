@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.10.1] - 2026-09-08
+
+- Fix bounded MCP release smoke (#27)
+
 ## [0.10.0] - 2026-09-08
 
 - Stabilize core execution and recovery (#25)
