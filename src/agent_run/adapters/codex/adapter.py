@@ -42,7 +42,15 @@ from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
 from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
-from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
+from .environment import (
+    bridge_points_at_source,
+    build_environment,
+    developer_approval_fields,
+    developer_config_lines,
+    prepared_environment,
+    require_resolved_mcp,
+    resolved_directory,
+)
 from .skills import prune_skills
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
@@ -212,43 +220,6 @@ def _rollout_limits(
     return ()
 
 
-def _resolved_directory(value: object, label: str) -> Path:
-    try:
-        resolved = Path(value).expanduser().resolve(strict=True)
-    except (TypeError, OSError, RuntimeError) as error:
-        raise ValidationError(f"{label} must be an existing directory: {value}") from error
-    if not resolved.is_dir():
-        raise ValidationError(f"{label} must be an existing directory: {value}")
-    return resolved
-
-
-def _bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
-    """The bridge is authenticated only if it canonically resolves to the configured source."""
-
-    if source is None or not bridge.is_symlink():
-        return False
-    try:
-        return bridge.resolve(strict=True) == Path(source).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError):
-        return False
-
-
-def _require_resolved_mcp(
-    config: RuntimeConfig, mcp_servers: Mapping[str, McpConfig], where: str
-) -> None:
-    """Every selected MCP must come from the caller-resolved mapping, not ambient config."""
-
-    if not isinstance(mcp_servers, Mapping):
-        raise ValidationError(f"codex {where} requires a resolved mcp_servers mapping")
-    for name in config.mcp:
-        try:
-            definition = mcp_servers[name]
-        except (KeyError, TypeError) as error:
-            raise ValidationError(f"codex mcp reference is not configured: {name}") from error
-        if not isinstance(definition, McpConfig):
-            raise ValidationError(f"codex mcp reference is not resolved: {name}")
-
-
 class CodexAdapter:
     def describe(self) -> RuntimeInfo:
         return RuntimeInfo(
@@ -312,7 +283,7 @@ class CodexAdapter:
         propagate.
         """
         self.validate(config)
-        _require_resolved_mcp(config, mcp_servers, "materialize")
+        require_resolved_mcp(config, mcp_servers, "materialize")
         if skills_root is None:
             skills_root = Path(home).parents[2] / "skills" / "codex"
         if not isinstance(skills_root, Path) or not skills_root.is_absolute():
@@ -461,7 +432,7 @@ class CodexAdapter:
         home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
         auth_ok = None
         if config.auth is not None and config.auth.kind == "file_link":
-            auth_ok = _bridge_points_at_source(home_path / config.auth.target, config.auth.source)
+            auth_ok = bridge_points_at_source(home_path / config.auth.target, config.auth.source)
         version, version_reason = observe_binary_version(config.binary, home_path)
         available = bool(binary_ok and home_ok and (auth_ok is not False))
         reason = (
@@ -593,7 +564,7 @@ class CodexAdapter:
         if not isinstance(profile, AgentProfile):
             raise ValidationError("prepare requires an AgentProfile")
         self.validate(config)
-        _require_resolved_mcp(config, mcp_servers, "prepare")
+        require_resolved_mcp(config, mcp_servers, "prepare")
         if request.runtime != "codex":
             raise ValidationError(f"codex adapter cannot prepare runtime {request.runtime!r}")
         if request.model not in config.models:
@@ -627,7 +598,7 @@ class CodexAdapter:
         if not (home_path / _CONFIG_REL).is_file():
             raise ValidationError(f"codex home is not materialized: {home_path}")
 
-        workdir = _resolved_directory(request.workdir, "workdir")
+        workdir = resolved_directory(request.workdir, "workdir")
         roots = tuple(
             str(root)
             for root in normalize_read_roots(

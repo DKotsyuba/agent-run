@@ -13,13 +13,58 @@ here rather than taken from the invoking process alone.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
-from ...config import RuntimeConfig
+from ...config import McpConfig, RuntimeConfig
 from ...errors import ValidationError
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
 from ..developer_environment import developer_environment
 from ..home import managed_uv_python_environment, write_managed_file
+
+
+def resolved_directory(value: object, label: str) -> Path:
+    """Return an existing directory resolved from ``value``.
+
+    ``label`` identifies the configuration field in the typed validation error.
+    Invalid path values, resolution failures, and non-directory targets raise
+    ``ValidationError`` without changing filesystem state.
+    """
+
+    try:
+        resolved = Path(value).expanduser().resolve(strict=True)
+    except (TypeError, OSError, RuntimeError) as error:
+        raise ValidationError(f"{label} must be an existing directory: {value}") from error
+    if not resolved.is_dir():
+        raise ValidationError(f"{label} must be an existing directory: {value}")
+    return resolved
+
+
+def bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
+    """Return whether ``bridge`` resolves to the configured canonical source."""
+
+    if source is None or not bridge.is_symlink():
+        return False
+    try:
+        return bridge.resolve(strict=True) == Path(source).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+
+def require_resolved_mcp(
+    config: RuntimeConfig, mcp_servers: Mapping[str, McpConfig], where: str
+) -> None:
+    """Require every selected MCP to have one caller-resolved definition."""
+
+    if not isinstance(mcp_servers, Mapping):
+        raise ValidationError(f"codex {where} requires a resolved mcp_servers mapping")
+    for name in config.mcp:
+        try:
+            definition = mcp_servers[name]
+        except (KeyError, TypeError) as error:
+            raise ValidationError(f"codex mcp reference is not configured: {name}") from error
+        if not isinstance(definition, McpConfig):
+            raise ValidationError(f"codex mcp reference is not resolved: {name}")
 
 
 def build_environment(binary: Path, home: Path) -> dict[str, str]:
