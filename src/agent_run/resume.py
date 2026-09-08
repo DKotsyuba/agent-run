@@ -28,6 +28,7 @@ from .accounts import account_runtime_home
 from .config import RuntimeConfig
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import ValidationError
+from .effective_policy import Constraint
 from .profiles import AgentProfile
 from .state.db import agent_row, idempotent_agent, immediate, nonblank, positive_number
 
@@ -251,6 +252,7 @@ def inherited_request(
     overrides the parent's when not ``None`` and inherits it when ``None``, and
     ``request_id`` and ``orchestrator`` belong to *this* call -- the new agent's
     notifications bind to the resuming caller, never to the original one.
+    Explicit policy constraints are inherited unchanged from the parent request.
 
     Raise :class:`ValidationError` -- through :class:`StartRequest` validation
     -- when the inherited workdir or a read root no longer exists. Such a
@@ -259,6 +261,12 @@ def inherited_request(
     """
 
     stored = json.loads(str(row["request_json"]))
+    try:
+        required_constraints = frozenset(
+            Constraint(value) for value in stored.get("required_constraints", ())
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError("invalid inherited policy constraints") from error
     return StartRequest(
         runtime=str(row["runtime"]),
         model=str(row["model"]),
@@ -278,4 +286,5 @@ def inherited_request(
         request_id=request_id,
         fast=bool(snapshot.get("fast", False)),
         account=label,
+        required_constraints=required_constraints,
     )

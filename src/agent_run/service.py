@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -40,12 +41,21 @@ from .domain import (
     validate_agent_id,
 )
 from .errors import AuthError, StateTransitionError, ValidationError
+from .effective_policy import (
+    Constraint,
+    ConstraintEvidence,
+    DeclaredCapability,
+    EffectivePolicy,
+    Enforcement,
+    admission_decision,
+    effective_policy,
+)
 from .delivery.base import DeliveryAttemptEvidence
 from .delivery.dispatch import _effort_from_request_json
 from .launch import DEFAULT_STARTUP_HANDOFF_SECONDS, launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
-from .profiles import assign_role, load_profile
+from .profiles import AgentProfile, assign_role, load_profile
 from .process_identity import capture_process_birth
 from .resume import (
     identity_snapshot, inherited_request, proven_identity, record_profile_grants,
@@ -114,6 +124,102 @@ def _failure_text(error: BaseException) -> str:
     return (str(error).strip() or type(error).__name__)[:_FAILURE_TEXT_CHARS]
 
 
+def _policy_payload(policy: EffectivePolicy) -> dict[str, object]:
+    """Serialize one trusted effective policy for immutable identity storage."""
+
+    return {
+        "runtime_name": policy.runtime_name,
+        "platform": policy.platform,
+        "constraints": [
+            {
+                "constraint": item.constraint.value,
+                "enforcement": item.enforcement.value,
+                "supported": item.supported,
+                "required": item.required,
+                "scope": item.scope,
+                "platform": item.platform,
+                "reason": item.reason,
+            }
+            for item in policy.constraints
+        ],
+    }
+
+
+def _policy_from_identity(value: object) -> EffectivePolicy | None:
+    """Restore stored policy evidence or return None for historical rows.
+
+    The value is the agent row's canonical identity JSON. A present policy must
+    have the exact emitted shape and typed enum/scalar values; malformed
+    evidence raises ValidationError rather than producing a partial claim.
+    """
+
+    if value is None:
+        return None
+    try:
+        identity = json.loads(str(value))
+        raw = identity.get("effective_policy")
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValidationError("invalid effective-policy identity evidence") from error
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "runtime_name",
+        "platform",
+        "constraints",
+    }:
+        raise ValidationError("invalid effective-policy identity evidence")
+    items = raw["constraints"]
+    if not isinstance(items, list):
+        raise ValidationError("invalid effective-policy identity evidence")
+    constraints = []
+    expected = {
+        "constraint",
+        "enforcement",
+        "supported",
+        "required",
+        "scope",
+        "platform",
+        "reason",
+    }
+    try:
+        for item in items:
+            if not isinstance(item, dict) or set(item) != expected:
+                raise ValidationError("invalid effective-policy identity evidence")
+            if (
+                type(item["supported"]) is not bool
+                or type(item["required"]) is not bool
+                or any(
+                    not isinstance(item[name], str) or not item[name].strip()
+                    for name in ("scope", "platform", "reason")
+                )
+            ):
+                raise ValidationError("invalid effective-policy identity evidence")
+            constraints.append(
+                ConstraintEvidence(
+                    Constraint(item["constraint"]),
+                    Enforcement(item["enforcement"]),
+                    item["supported"],
+                    item["required"],
+                    item["scope"],
+                    item["platform"],
+                    item["reason"],
+                )
+            )
+    except (TypeError, ValueError) as error:
+        raise ValidationError("invalid effective-policy identity evidence") from error
+    if tuple(item.constraint for item in constraints) != tuple(Constraint):
+        raise ValidationError("invalid effective-policy identity evidence")
+    runtime_name, platform = raw["runtime_name"], raw["platform"]
+    if (
+        not isinstance(runtime_name, str)
+        or not runtime_name.strip()
+        or not isinstance(platform, str)
+        or not platform.strip()
+    ):
+        raise ValidationError("invalid effective-policy identity evidence")
+    return EffectivePolicy(runtime_name, platform, tuple(constraints))
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryView:
     """Current delivery state plus the latest bounded subprocess evidence."""
@@ -150,11 +256,13 @@ class CleanupView:
 
 @dataclass(frozen=True, slots=True)
 class AgentView:
-    """One agent's read-only status, plus its place in a resume chain.
+    """One agent's read-only status, lineage, and admitted policy evidence.
 
     ``parent_agent_id`` is the agent this one resumed (``None`` for a fresh
     run), ``root_agent_id`` the chain's first agent (itself when it has no
-    parent), and ``sequence`` its 1-based position in that chain.
+    parent), and ``sequence`` its 1-based position in that chain. ``policy``
+    is the immutable effective enforcement snapshot accepted for this run, or
+    ``None`` for historical rows.
     """
 
     agent_id: AgentId
@@ -181,6 +289,7 @@ class AgentView:
     root_agent_id: AgentId | None = None
     sequence: int = 1
     cleanup: CleanupView | None = None
+    policy: EffectivePolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,7 +574,8 @@ class AgentService:
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
-        return self._admit(request, runtime, label)
+        policy = self._admission_policy(request, runtime)
+        return self._admit(request, runtime, label, policy=policy)
 
     def _admit(
         self,
@@ -474,12 +584,15 @@ class AgentService:
         label: str | None,
         *,
         parent_agent_id: AgentId | None = None,
+        policy: EffectivePolicy,
     ) -> StartResult:
         """Durably accept one already validated start and hand it to a worker.
 
         Shared by :meth:`start` and :meth:`resume`; everything runtime- and
         model-specific has been checked by the caller. ``parent_agent_id`` is
         set only for a resume, and joins the parent's chain atomically.
+        ``policy`` is the already-admitted effective enforcement evidence;
+        it is copied into immutable identity JSON in the same admission write.
 
         The effective identity this start resolved to (``label``, runtime home,
         auth target, granted permissions, ``fast``) is persisted alongside the
@@ -503,6 +616,18 @@ class AgentService:
             os.getpid(), supervisor_identity()
         )
         startup_birth = capture_process_birth(os.getpid())
+        identity = (
+            identity_snapshot(request.runtime, runtime, label, request)
+            if parent_agent_id is None
+            else self._store.get_agent(parent_agent_id)["identity_json"]
+        )
+        try:
+            identity_payload = json.loads(str(identity))
+        except (TypeError, ValueError) as error:
+            raise ValidationError("invalid effective-identity snapshot") from error
+        if not isinstance(identity_payload, dict):
+            raise ValidationError("invalid effective-identity snapshot")
+        identity_payload["effective_policy"] = _policy_payload(policy)
         creation = self._store.create_agent_limited(
             request,
             task_summary=self._task_summary(request.task),
@@ -512,10 +637,11 @@ class AgentService:
             agent_id=candidate,
             at=accepted_at,
             parent_agent_id=parent_agent_id,
-            identity_json=(
-                identity_snapshot(request.runtime, runtime, label, request)
-                if parent_agent_id is None
-                else self._store.get_agent(parent_agent_id)["identity_json"]
+            identity_json=json.dumps(
+                identity_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
             ),
             startup_owner_identity=startup_owner,
             startup_owner_birth_time=startup_birth,
@@ -661,16 +787,8 @@ class AgentService:
             adapter.validate(effective_runtime)
             stage = "profile"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
-            profile = assign_role(
-                load_profile(
-                    self._config.profiles,
-                    request.profile,
-                    requested_write=request.write,
-                    read_roots=request.read_roots,
-                ),
-                request.runtime,
-                effective_runtime.skills,
-            )
+            profile = self._effective_profile(request, effective_runtime)
+            self._policy_for_profile(request, effective_runtime, profile)
             record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
             if snapshot_resume:
@@ -730,6 +848,9 @@ class AgentService:
                     snapshot_index_sha256 = runtime_snapshot_index_sha256(
                         effective_home, materialize_revision
                     )
+                    runtime_version = adapter.probe(
+                        effective_runtime, effective_home
+                    ).version
                     config_snapshot = build_config_snapshot(
                         runtime=request.runtime,
                         adapter_api_version=adapter.describe().adapter_api_version,
@@ -738,6 +859,7 @@ class AgentService:
                         snapshot_index_sha256=snapshot_index_sha256,
                         config=effective_runtime,
                         profile=profile,
+                        runtime_version=runtime_version,
                     )
                     write_managed_file(
                         candidate_dir,
@@ -963,7 +1085,14 @@ class AgentService:
                 f"model is no longer configured for runtime {request.runtime}: "
                 f"{request.model}"
             )
-        return self._admit(request, runtime, label, parent_agent_id=parent_id)
+        policy = self._admission_policy(request, runtime)
+        return self._admit(
+            request,
+            runtime,
+            label,
+            parent_agent_id=parent_id,
+            policy=policy,
+        )
 
     def chain(
         self,
@@ -1313,6 +1442,80 @@ class AgentService:
                 f"runtime references unknown MCP server: {error.args[0]}"
             ) from error
 
+    def _effective_profile(
+        self, request: StartRequest, runtime: RuntimeConfig
+    ) -> AgentProfile:
+        """Load and role-assign the exact profile used for policy and launch."""
+
+        return assign_role(
+            load_profile(
+                self._config.profiles,
+                request.profile,
+                requested_write=request.write,
+                read_roots=request.read_roots,
+            ),
+            request.runtime,
+            runtime.skills,
+        )
+
+    @staticmethod
+    def _policy_capabilities(
+        runtime_name: str, runtime: RuntimeConfig
+    ) -> Mapping[Constraint, DeclaredCapability]:
+        """Return only enforcement claims proved by current materialization."""
+
+        plugins = tuple(runtime.plugins)
+        fully_snapshotted = not plugins or (
+            runtime_name in {"claude", "glm"}
+            and all(plugin.name in runtime.plugin_snapshot_assets for plugin in plugins)
+        )
+        if not fully_snapshotted:
+            return MappingProxyType({})
+        scope = (
+            "no configured plugin assets"
+            if not plugins
+            else "all explicitly declared assets of configured plugins"
+        )
+        return MappingProxyType(
+            {
+                Constraint.PLUGIN_IMMUTABILITY: DeclaredCapability(
+                    Enforcement.RUNTIME_ENFORCED,
+                    scope,
+                    "attempt materialization publishes and verifies selected plugin snapshots",
+                )
+            }
+        )
+
+    def _policy_for_profile(
+        self,
+        request: StartRequest,
+        runtime: RuntimeConfig,
+        profile: AgentProfile,
+    ) -> EffectivePolicy:
+        """Resolve and enforce one request's explicit policy requirements."""
+
+        policy = effective_policy(
+            profile,
+            request.runtime,
+            sys.platform,
+            self._policy_capabilities(request.runtime, runtime),
+            required=request.required_constraints,
+        )
+        decision = admission_decision(policy)
+        if not decision.allowed:
+            names = ", ".join(item.value for item in decision.unsupported_required)
+            raise ValidationError(f"required policy constraints are not enforced: {names}")
+        return policy
+
+    def _admission_policy(
+        self, request: StartRequest, runtime: RuntimeConfig
+    ) -> EffectivePolicy:
+        """Validate required policy synchronously before durable admission."""
+
+        return self._policy_for_profile(
+            request, runtime, self._effective_profile(request, runtime)
+        )
+
     @staticmethod
     def _required_capabilities(
         request: StartRequest, runtime: RuntimeConfig
@@ -1425,6 +1628,7 @@ class AgentService:
             AgentId(str(row["root_agent_id"] or agent_id)),
             int(row["sequence"]),
             cleanup,
+            _policy_from_identity(row["identity_json"]),
         )
 
     def _delivery_view(
@@ -1501,6 +1705,11 @@ class AgentService:
                     type(payload["process_group_id"]) is not int
                     or payload["process_group_id"] <= 0
                 )
+            )
+            or payload["confirmed"]
+            != (
+                payload["group_gone"]
+                and payload["descendants_gone"] is True
             )
         ):
             raise ValidationError("invalid stored process cleanup evidence")

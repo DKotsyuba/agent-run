@@ -9,6 +9,7 @@ from unittest.mock import patch
 from agent_run.broker_client import BrokerClient
 from agent_run.domain import StartRequest
 from agent_run.errors import AgentRunError, BrokerUnavailable, ValidationError
+from agent_run.effective_policy import Constraint
 
 
 class FakeSocketApi:
@@ -92,13 +93,26 @@ class BrokerClientTests(unittest.TestCase):
         self.addCleanup(server.close)
         client = BrokerClient(self.path)
         self.addCleanup(client.close)
-        request = StartRequest("codex", "model", "review", "task", Path(self.tempdir.name))
+        request = StartRequest(
+            "codex",
+            "model",
+            "review",
+            "task",
+            Path(self.tempdir.name),
+            required_constraints=frozenset(
+                {Constraint.EXTERNAL_NETWORK_ISOLATION}
+            ),
+        )
 
         result = client.start(request)
 
         self.assertEqual((result.agent_id, result.created), ("ag-test", True))
         self.assertEqual(seen[0]["method"], "start")
         self.assertEqual(seen[0]["params"]["workdir"], str(request.workdir))
+        self.assertEqual(
+            seen[0]["params"]["required_constraints"],
+            ["external_network_isolation"],
+        )
         with self.assertRaisesRegex(AgentRunError, "invalid start result"):
             client.start(request)
         with self.assertRaisesRegex(ValidationError, "request must be a StartRequest"):

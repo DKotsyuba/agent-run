@@ -29,6 +29,12 @@ whose lineage directory, config document, runtime index, or indexed root is
 missing fails closed instead of being reclassified as historical. Unprefixed
 rows alone use the shared-home compatibility path.
 
+A fresh snapshot may record the runtime version returned by the adapter's
+bounded local probe. This is provenance observed during materialization.
+Continuations preserve it without probing again; it does not claim that the
+configured binary itself is pinned or unchanged at resume time. Adapters without
+trustworthy current version evidence record `null`.
+
 Executable contract scenarios live in `tests/test_snapshots.py`:
 
 1. Copy a skill containing a manifest, script, and empty directory; changing

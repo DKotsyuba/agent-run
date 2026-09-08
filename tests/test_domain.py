@@ -22,6 +22,7 @@ from agent_run.domain import (
     validate_transition,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.effective_policy import Constraint
 from agent_run.state.db import request_json
 
 
@@ -107,6 +108,29 @@ class DomainTests(unittest.TestCase):
             second = StartRequest("codex", "model", "profile", "task", root, account="work")
             self.assertEqual(json.loads(request_json(first))["account"], "personal2")
             self.assertNotEqual(request_json(first), request_json(second))
+            required = StartRequest(
+                "codex",
+                "model",
+                "profile",
+                "task",
+                root,
+                required_constraints=frozenset(
+                    {Constraint.EXTERNAL_NETWORK_ISOLATION}
+                ),
+            )
+            self.assertEqual(
+                json.loads(request_json(required))["required_constraints"],
+                ["external_network_isolation"],
+            )
+            with self.assertRaisesRegex(ValidationError, "frozenset"):
+                StartRequest(
+                    "codex",
+                    "model",
+                    "profile",
+                    "task",
+                    root,
+                    required_constraints={Constraint.EXTERNAL_NETWORK_ISOLATION},
+                )
 
     def test_message_and_outcome_validation(self) -> None:
         self.assertEqual(Message(0, MessageRole.USER, "hello").content, "hello")

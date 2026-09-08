@@ -9,6 +9,7 @@ from agent_run.delivery.completion_notice_contract import completion_notice_cont
 from agent_run.doc import topic_text
 from agent_run.mcp import serve
 from agent_run.errors import ValidationError
+from agent_run.effective_policy import Constraint
 from agent_run.config import RuntimeConfig
 from agent_run.service import AgentService
 
@@ -46,6 +47,31 @@ def test_start_accepts_account() -> None:
     )
     assert isinstance(result, StartRequest)
     assert result.account == "personal2"
+
+
+def test_start_accepts_only_unique_known_policy_requirements() -> None:
+    """Dispatch converts explicit names to typed immutable constraints."""
+
+    service = _Service()
+    result = _start(
+        service,
+        Session(),
+        required_constraints=["external_network_isolation"],
+    )
+    assert result.required_constraints == frozenset(
+        {Constraint.EXTERNAL_NETWORK_ISOLATION}
+    )
+    for invalid in (
+        ["unknown"],
+        ["external_network_isolation", "external_network_isolation"],
+        "external_network_isolation",
+    ):
+        try:
+            _start(service, Session(), required_constraints=invalid)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("invalid required_constraints accepted")
 
 
 def test_start_description_includes_completion_contract_text() -> None:

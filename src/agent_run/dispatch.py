@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import IO, Mapping
 
 from .domain import OrchestratorRef, StartRequest
+from .effective_policy import Constraint
 from .errors import ValidationError
 from .service import AgentQuery, AgentService
 from .delivery.completion_notice_contract import completion_notice_contract_text
@@ -29,6 +30,11 @@ def _schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
 
 
 _ID = {"type": "string"}
+_REQUIRED_CONSTRAINTS = {
+    "type": "array",
+    "items": {"type": "string", "enum": [item.value for item in Constraint]},
+    "uniqueItems": True,
+}
 _ORCHESTRATOR = _schema(
     {
         "transport": {"type": "string"},
@@ -80,6 +86,7 @@ TOOLS = (
                 "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
                 "request_id": {"type": ["string", "null"]},
                 "account": {"type": ["string", "null"]},
+                "required_constraints": _REQUIRED_CONSTRAINTS,
             },
             ("runtime", "model", "profile", "task", "workdir"),
         ),
@@ -242,6 +249,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 "runtime", "model", "profile", "task", "workdir", "write",
                 "effort", "timeout_seconds", "read_roots", "output_schema",
                 "orchestrator", "request_id", "fast", "account",
+                "required_constraints",
             },
             {"runtime", "model", "profile", "task", "workdir"},
         )
@@ -261,6 +269,21 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
         schema = args.get("output_schema")
         if schema is not None and not isinstance(schema, dict):
             raise ValidationError("output_schema must be an object or null")
+        required_values = args.get("required_constraints", [])
+        if (
+            not isinstance(required_values, list)
+            or any(not isinstance(item, str) for item in required_values)
+            or len(set(required_values)) != len(required_values)
+        ):
+            raise ValidationError(
+                "required_constraints must be an array of unique constraint names"
+            )
+        try:
+            required_constraints = frozenset(
+                Constraint(item) for item in required_values
+            )
+        except ValueError as error:
+            raise ValidationError("required_constraints contains an unknown name") from error
         timeout = (
             {}
             if "timeout_seconds" not in args
@@ -282,6 +305,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 orchestrator=_optional_orchestrator(args.get("orchestrator")),
                 request_id=_optional_string(args, "request_id"),
                 account=account,
+                required_constraints=required_constraints,
             )
         )
     if name in {"cancel", "status", "answer"}:

@@ -29,6 +29,7 @@ from agent_run.domain import (
     StartRequest,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.effective_policy import Constraint, Enforcement
 from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
@@ -196,6 +197,68 @@ class AgentServiceTests(unittest.TestCase):
                 )
             )
         self.assertEqual(self.launched, [])
+
+    def test_required_unsupported_policy_is_refused_before_admission(self) -> None:
+        """Explicit isolation requirements fail before any durable agent row."""
+
+        request = replace(
+            self.request(request_id="required-network"),
+            required_constraints=frozenset(
+                {Constraint.EXTERNAL_NETWORK_ISOLATION}
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "external_network_isolation"
+        ):
+            self.service.start(request)
+        self.assertEqual(self.store.list_agents(), [])
+        self.assertEqual(ADAPTER.materialize_calls, 0)
+
+    def test_supported_policy_is_persisted_and_public(self) -> None:
+        """A satisfied explicit requirement is immutable public run evidence."""
+
+        request = replace(
+            self.request(request_id="required-plugin"),
+            required_constraints=frozenset({Constraint.PLUGIN_IMMUTABILITY}),
+        )
+        result = self.service.start(request)
+        policy = result.agent.policy
+        self.assertIsNotNone(policy)
+        plugin = next(
+            item
+            for item in policy.constraints
+            if item.constraint is Constraint.PLUGIN_IMMUTABILITY
+        )
+        self.assertTrue(plugin.required)
+        self.assertTrue(plugin.supported)
+        self.assertIs(plugin.enforcement, Enforcement.RUNTIME_ENFORCED)
+        self.assertEqual(self.service.get(result.agent_id).policy, policy)
+
+    def test_required_plugin_immutability_rejects_live_plugin_inputs(self) -> None:
+        """A configured plugin without declared snapshots cannot satisfy required."""
+
+        plugin = self.root / "plugin"
+        plugin.mkdir()
+        runtime = replace(
+            self.config.runtimes["fake"],
+            plugins=(plugin,),
+            plugin_snapshot_assets={},
+        )
+        self.service = AgentService(
+            replace(self.config, runtimes={"fake": runtime}),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        request = replace(
+            self.request(request_id="live-plugin-required"),
+            required_constraints=frozenset({Constraint.PLUGIN_IMMUTABILITY}),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "plugin_immutability"):
+            self.service.start(request)
+        self.assertEqual(self.store.list_agents(), [])
 
     def test_historical_opencode_row_is_readable_without_adapter(self) -> None:
         """Read a persisted OpenCode row without resolving its retired adapter."""

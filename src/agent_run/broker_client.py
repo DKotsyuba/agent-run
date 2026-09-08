@@ -203,7 +203,8 @@ class BrokerClient:
         """Serialize and submit ``request`` to the resident broker asynchronously.
 
         Converts paths and the optional orchestrator reference to JSON-safe
-        values, returns ``agent_id`` and ``created``, and leaves execution
+        values, including sorted policy requirements, returns ``agent_id`` and
+        ``created``, and leaves execution
         owned by the broker after this client closes. Raises ``ValidationError``
         for invalid input, ``AgentRunError`` for malformed results or domain
         failures, and ``BrokerUnavailable`` when the broker cannot be reached.
@@ -224,6 +225,9 @@ class BrokerClient:
             }),
             "request_id": request.request_id, "fast": request.fast,
             "account": request.account,
+            "required_constraints": sorted(
+                constraint.value for constraint in request.required_constraints
+            ),
         }
         result = self.call("start", params)
         if (

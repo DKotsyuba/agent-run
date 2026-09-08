@@ -166,17 +166,21 @@ def request_json(request: StartRequest) -> str:
             "request_id": request.request_id,
             "fast": request.fast,
             "account": request.account,
+            "required_constraints": sorted(
+                constraint.value for constraint in request.required_constraints
+            ),
         }
     )
 
 
 def request_json_matches(stored: str, current: str) -> bool:
-    """Compare canonical request JSON with the pre-``fast`` legacy default.
+    """Compare canonical request JSON with legacy false/empty defaults.
 
     ``stored`` is immutable historical evidence and ``current`` is newly
-    serialized canonical JSON. A historical object missing only ``fast`` is
-    interpreted as ``False`` without rewriting it. Malformed or non-object JSON
-    never matches and both inputs otherwise require exact semantic equality.
+    serialized canonical JSON. Historical objects missing ``fast`` or
+    ``required_constraints`` are interpreted as ``False`` and empty without
+    rewriting them. Malformed or non-object JSON never matches and both inputs
+    otherwise require exact semantic equality.
     """
 
     try:
@@ -187,6 +191,7 @@ def request_json_matches(stored: str, current: str) -> bool:
     if not isinstance(previous, dict) or not isinstance(candidate, dict):
         return False
     previous.setdefault("fast", False)
+    previous.setdefault("required_constraints", [])
     return previous == candidate
 
 

@@ -101,6 +101,12 @@ See [continuations](continuations.md) for native-context `resume` and chronologi
 override, which wins over the runtime default; an omitted account uses the
 runtime's configured default account.
 
+`start.required_constraints` is an optional array of unique policy constraint
+names from tool discovery. Omission means no additional requirement. A named
+constraint must have enforcement strong enough for that boundary before any
+agent row is admitted; advisory evidence and unrelated tool filtering do not
+satisfy isolation requirements. Unknown or duplicate names are invalid.
+
 `request_id` replay is scoped to the caller namespace in the original request.
 A later PostToolUse notification binding does not change that identity. Clients
 that omit `orchestrator` share the unbound namespace across fresh connections.
@@ -125,6 +131,10 @@ nullable `descendants_gone`, `confirmed`, and nullable `process_group_id`.
 Confirmation requires the original group and the readable pre-signal owned set
 to be gone. Page projections resolve progress, warnings, delivery evidence and
 cleanup in one batched state query.
+
+New rows also expose immutable `policy` evidence with the runtime/platform and
+one entry for every known constraint: actual enforcement, support, whether the
+caller required it, exact scope, and reason. Historical rows return `null`.
 
 `capacity_order` takes no parameters. It returns fresh non-exhausted physical
 quota routes in descending priority, plus deferred evidence, exhausted

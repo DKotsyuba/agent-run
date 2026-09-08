@@ -20,6 +20,7 @@ from agent_run.domain import (
     StartRequest,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.effective_policy import Constraint
 from agent_run.state import StateStore
 from agent_run.state.db import request_json
 from agent_run.state.start import AgentCreation
@@ -95,8 +96,8 @@ class StateStoreTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
 
-    def test_request_json_covers_fields_and_legacy_fast_replay_is_exact(self) -> None:
-        """Every request field participates while missing legacy fast means false."""
+    def test_request_json_covers_fields_and_legacy_defaults_replay_exactly(self) -> None:
+        """Every field participates while missing legacy policy and fast stay empty."""
 
         request = self.request(request_id="legacy-fast")
         self.assertEqual(
@@ -106,6 +107,7 @@ class StateStoreTests(unittest.TestCase):
         first = self.admit(request)
         stored = json.loads(self.store.get_agent(first.agent_id)["request_json"])
         stored.pop("fast")
+        stored.pop("required_constraints")
         legacy = json.dumps(stored, sort_keys=True, separators=(",", ":"))
         self.store.connection.execute(
             "UPDATE agents SET request_json = ? WHERE id = ?", (legacy, first.agent_id)
@@ -135,6 +137,7 @@ class StateStoreTests(unittest.TestCase):
             "output_schema": {"type": "object"},
             "fast": True,
             "account": "other-account",
+            "required_constraints": frozenset({Constraint.UNIX_IPC_ISOLATION}),
         }
         self.assertEqual(
             set(variants) | {"request_id", "orchestrator"},

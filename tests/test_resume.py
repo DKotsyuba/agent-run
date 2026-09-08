@@ -26,6 +26,7 @@ from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
+from agent_run.effective_policy import Constraint
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
@@ -206,13 +207,27 @@ class ResumeTests(unittest.TestCase):
             at=102.0,
         )
 
-    def _parent(self, *, session="sess-1", request_id=None, task="do work"):
-        """Start one agent, wait for its launch, and finish it as a source."""
+    def _parent(
+        self,
+        *,
+        session: str = "sess-1",
+        request_id: str | None = None,
+        task: str = "do work",
+        required_constraints: frozenset[Constraint] = frozenset(),
+    ) -> str:
+        """Start and finish a resumable source with supplied identity fields.
+
+        Session is the recorded native session, optional request_id the replay
+        key, task the prompt, and required_constraints the typed admission set.
+        Returns the new parent agent ID after its fake launch and successful
+        terminal transition.
+        """
 
         target = len(self.launched) + 1
         result = self.service.start(
             StartRequest("fake", "model", "profile", task, self.workdir,
-                         request_id=request_id)
+                         request_id=request_id,
+                         required_constraints=required_constraints)
         )
         self._wait(target)
         self._finish(result.agent_id, session=session)
@@ -452,6 +467,25 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(
             self.store.get_agent(third.agent_id)["config_revision"], revision
         )
+
+    def test_resume_inherits_explicit_policy_requirements(self) -> None:
+        """A continuation retains the parent's admitted policy requirements."""
+
+        parent = self._parent(
+            required_constraints=frozenset({Constraint.PLUGIN_IMMUTABILITY})
+        )
+        child = self.service.resume(parent, "continue")
+        self._wait(2)
+
+        stored = json.loads(self.store.get_agent(child.agent_id)["request_json"])
+        self.assertEqual(stored["required_constraints"], ["plugin_immutability"])
+        plugin = next(
+            item
+            for item in self.service.get(child.agent_id).policy.constraints
+            if item.constraint is Constraint.PLUGIN_IMMUTABILITY
+        )
+        self.assertTrue(plugin.required)
+        self.assertTrue(plugin.supported)
 
     def test_missing_new_lineage_home_never_falls_back_to_legacy(self) -> None:
         """A prefixed parent fails closed when its authoritative HOME is absent."""
