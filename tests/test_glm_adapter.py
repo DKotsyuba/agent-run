@@ -97,14 +97,15 @@ class GlmAdapterTests(unittest.TestCase):
     # -- validate -------------------------------------------------------
 
     def test_validate_accepts_the_glm_auth_names(self) -> None:
+        """Accept native GLM keychain auth and selected environment names."""
+
+        self.adapter.validate(self.runtime_config(auth=None))
         self.adapter.validate(self.runtime_config())
         self.adapter.validate(
             self.runtime_config(auth=RuntimeAuthConfig("environment", names=("ANTHROPIC_AUTH_TOKEN",)))
         )
 
     def test_validate_rejects_foreign_auth_names_and_kinds(self) -> None:
-        with self.assertRaisesRegex(ValidationError, "requires an auth bridge"):
-            self.adapter.validate(self.runtime_config(auth=None))
         with self.assertRaisesRegex(ValidationError, "auth.kind must be"):
             self.adapter.validate(
                 self.runtime_config(

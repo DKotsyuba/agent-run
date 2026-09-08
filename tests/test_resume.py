@@ -232,11 +232,13 @@ class ResumeTests(unittest.TestCase):
         request_id: str | None = None,
         task: str = "do work",
         required_constraints: frozenset[Constraint] = frozenset(),
+        account: str | None = None,
     ) -> str:
         """Start and finish a resumable source with supplied identity fields.
 
         Session is the recorded native session, optional request_id the replay
-        key, task the prompt, and required_constraints the typed admission set.
+        key, task the prompt, required_constraints the typed admission set, and
+        account an explicit multi-account label.
         Returns the new parent agent ID after its fake launch and successful
         terminal transition.
         """
@@ -245,6 +247,7 @@ class ResumeTests(unittest.TestCase):
         result = self.service.start(
             StartRequest("fake", "model", "profile", task, self.workdir,
                          request_id=request_id,
+                         account=account,
                          required_constraints=required_constraints)
         )
         self._wait(target)
@@ -404,7 +407,7 @@ class ResumeTests(unittest.TestCase):
             self._accounted(accounts=("work", "other"), default="work")
         )
         self._authenticate("work")
-        parent = self._parent()
+        parent = self._parent(account="work")
 
         self.service = self._service(
             self._accounted(accounts=("work", "other"), default="other")
@@ -423,7 +426,7 @@ class ResumeTests(unittest.TestCase):
             self._accounted(accounts=("work",), default="work")
         )
         self._authenticate("work")
-        parent = self._parent()
+        parent = self._parent(account="work")
 
         self.service = self._service(
             self._accounted(accounts=("other",), default="other")
@@ -494,7 +497,11 @@ class ResumeTests(unittest.TestCase):
         parent persisted before this field was introduced.
         """
 
-        parent = self._parent(session="sess-1")
+        self.service = self._service(
+            self._accounted(accounts=("work",), default="work")
+        )
+        self._authenticate("work")
+        parent = self._parent(session="sess-1", account="work")
         snapshot_path = self.root / "agents" / parent / "config-snapshot.json"
         document = json.loads(snapshot_path.read_text(encoding="utf-8"))
         document["runtime_config"].pop("credential_state_home")

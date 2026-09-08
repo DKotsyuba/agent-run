@@ -84,11 +84,11 @@ class GlmAdapter(ClaudeAdapter):
         # defaulted base URL), so the auth checks are glm's own; the
         # remaining semantics -- whole-plugin skill listing,
         # known hook events -- mirror the claude adapter verbatim.
-        if config.auth is None:
-            raise ValidationError("glm runtime requires an auth bridge")
-        if config.auth.kind != "environment":
+        if config.auth is not None and config.auth.kind != "environment":
             raise ValidationError("glm runtime auth.kind must be 'environment'")
-        unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
+        unknown = sorted(
+            set(config.auth.names if config.auth is not None else ()) - _AUTH_NAMES
+        )
         if unknown:
             raise ValidationError(
                 f"glm runtime auth.names has unsupported entries: {', '.join(unknown)}"

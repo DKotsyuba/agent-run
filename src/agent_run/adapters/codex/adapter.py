@@ -62,6 +62,14 @@ _ROLLOUT_TAIL_BYTES = 262_144
 _ROLLOUT_TAIL_LINES = 2_048
 
 
+def _native_auth_source() -> Path:
+    """Return the host Codex account file without reading its contents."""
+
+    configured = os.environ.get("CODEX_HOME")
+    root = Path(configured).expanduser() if configured else Path.home() / ".codex"
+    return root / "auth.json"
+
+
 def _read_json(path: Path) -> object | None:
     """Read one isolated cache file; unreadable, non-UTF-8 or invalid JSON is no evidence."""
 
@@ -243,14 +251,14 @@ class CodexAdapter:
     def validate(self, config: RuntimeConfig) -> None:
         """Validate Codex configuration accepted by the isolated adapter.
 
-        ``config`` must be a ``RuntimeConfig`` with Codex's file-link auth and
-        at least one model. A declared Rust table is applied only to the
-        per-launch child environment.
+        ``config`` must be a ``RuntimeConfig`` with at least one model. Auth may
+        be absent to use the host Codex account or an explicit file-link for a
+        separate account.
         """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
-        if config.auth is None or config.auth.kind != "file_link":
-            raise ValidationError("codex runtime requires a file_link auth bridge")
+        if config.auth is not None and config.auth.kind != "file_link":
+            raise ValidationError("codex runtime auth must be a file_link bridge")
         if not config.models:
             raise ValidationError("codex runtime requires at least one configured model")
 
@@ -384,13 +392,24 @@ class CodexAdapter:
 
         auth_digest = ""
         managed_links: tuple[tuple[str, str], ...] = ()
-        if config.auth is not None and config.auth.kind == "file_link":
-            if config.auth.source is None:
+        auth = config.auth
+        if auth is None:
+            source = _native_auth_source()
+            target = "auth.json"
+            if source.is_file():
+                auth_target = str(source.expanduser().resolve(strict=True))
+                create_symlink_bridge(home, target, source)
+                auth_digest = auth_target
+                managed_links = ((target, auth_target),)
+        elif auth.kind == "file_link":
+            if auth.source is None:
                 raise ValidationError("codex file_link auth source is missing")
-            auth_target = str(config.auth.source.expanduser().resolve(strict=True))
-            create_symlink_bridge(home, config.auth.target, config.auth.source)
+            if auth.target is None:
+                raise ValidationError("codex file_link auth target is missing")
+            auth_target = str(auth.source.expanduser().resolve(strict=True))
+            create_symlink_bridge(home, auth.target, auth.source)
             auth_digest = auth_target
-            managed_links = ((config.auth.target, auth_target),)
+            managed_links = ((auth.target, auth_target),)
 
         fingerprint = "\n".join(
             [
@@ -428,7 +447,13 @@ class CodexAdapter:
         home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
         auth_ok = None
         if config.auth is not None and config.auth.kind == "file_link":
-            auth_ok = bridge_points_at_source(home_path / config.auth.target, config.auth.source)
+            if config.auth.target is not None:
+                auth_ok = bridge_points_at_source(
+                    home_path / config.auth.target, config.auth.source
+                )
+        elif config.auth is None:
+            source = _native_auth_source()
+            auth_ok = bridge_points_at_source(home_path / "auth.json", source)
         version, version_reason = observe_binary_version(config.binary, home_path)
         available = bool(binary_ok and home_ok and (auth_ok is not False))
         reason = (

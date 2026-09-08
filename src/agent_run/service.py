@@ -28,7 +28,7 @@ from .capacity.advice import CapacityAdvice, build_advice
 from .capacity.forecast import build_forecasts
 from .capacity.history import load_series
 from .capacity.ranking import CapacityOrder
-from .config import Config, McpConfig, RuntimeConfig, load_config
+from .config import Config, McpConfig, RuntimeAuthConfig, RuntimeConfig, load_config
 from .domain import (
     ACTIVE,
     TERMINAL,
@@ -562,7 +562,6 @@ class AgentService:
             )
         runtime = self._runtime_config(request.runtime)
         profile = self._effective_profile(request, runtime)
-        runtime = self._runtime_for_profile(runtime, profile)
         if profile.canonical:
             request = replace(
                 request,
@@ -570,16 +569,18 @@ class AgentService:
                 required_constraints=profile.required_constraints,
             )
         label = self.resolve_account(request.runtime, request.account)
+        runtime = self._runtime_for_profile(runtime, profile, label)
         if label is not None:
-            claude_environment_account = (
-                runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER"
-                and runtime.auth is not None
-                and runtime.auth.kind == "environment"
-            )
-            if not claude_environment_account and (
-                runtime.auth is None or runtime.auth.target is None
-            ):
-                raise ValidationError(f"runtime {request.runtime} account auth is not configured")
+            claude_state = runtime.adapter in {
+                "agent_run.adapters.claude:ADAPTER",
+                "agent_run.adapters.claude.adapter:ADAPTER",
+            }
+            file_state = runtime.auth is not None and runtime.auth.target is not None
+            codex_state = request.runtime == "codex"
+            if not (claude_state or file_state or codex_state):
+                raise ValidationError(
+                    f"runtime {request.runtime} does not support separate accounts"
+                )
         adapter = self._registry.load(
             request.runtime, self._required_capabilities(request, runtime)
         )
@@ -755,20 +756,19 @@ class AgentService:
             configured_home = runtime.home
             effective_auth = runtime.auth
             if account_label is not None:
-                claude_environment_account = (
-                    runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER"
-                    and runtime.auth is not None
-                    and runtime.auth.kind == "environment"
-                )
-                if claude_environment_account:
+                if runtime.adapter in {
+                    "agent_run.adapters.claude:ADAPTER",
+                    "agent_run.adapters.claude.adapter:ADAPTER",
+                }:
                     configured_home = account_runtime_home(runtime.home, account_label)
-                elif runtime.auth is None or runtime.auth.target is None:
-                    raise ValidationError(
-                        f"runtime {request.runtime} account auth is not configured"
-                    )
                 else:
+                    target = (
+                        runtime.auth.target
+                        if runtime.auth is not None and runtime.auth.target is not None
+                        else "auth.json"
+                    )
                     effective_source = account_auth_source(
-                        self._home, request.runtime, account_label, runtime.auth.target
+                        self._home, request.runtime, account_label, target
                     )
                     if not effective_source.is_file():
                         raise ValidationError(
@@ -776,7 +776,9 @@ class AgentService:
                             f"run agent-run auth {account_label} {request.runtime}"
                         )
                     configured_home = account_runtime_home(runtime.home, account_label)
-                    effective_auth = replace(runtime.auth, source=effective_source)
+                    effective_auth = RuntimeAuthConfig(
+                        "file_link", source=effective_source, target=target
+                    )
 
             parent_revision = None
             snapshot_resume = False
@@ -805,8 +807,10 @@ class AgentService:
                 runtime,
                 home=effective_home,
                 auth=effective_auth,
-                default_account=account_label,
-                credential_state_home=configured_home,
+                default_account=None,
+                credential_state_home=(
+                    configured_home if account_label is not None else None
+                ),
             )
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
@@ -1146,7 +1150,7 @@ class AgentService:
             row, snapshot, label, task, timeout_seconds, request_id, orchestrator
         )
         profile = self._effective_profile(request, runtime)
-        runtime = self._runtime_for_profile(runtime, profile)
+        runtime = self._runtime_for_profile(runtime, profile, label)
         if profile.canonical:
             request = replace(
                 request,
@@ -1480,17 +1484,15 @@ class AgentService:
         return build_capacity_order(self._store, self._config, now=self._now())
 
     def resolve_account(self, runtime: str, account: str | None) -> str | None:
-        """Return a configured account label (str), or None for an unlabelled run.
+        """Return an explicit account label or ``None`` for native global auth.
 
-        ``runtime`` is a configured runtime-name str; ``account`` is an explicit
-        label str or None to use its configured default. Raise ValidationError
-        for an unknown runtime, undeclared explicit label, or invalid default.
-        This lookup performs no I/O and does not mutate configuration.
+        ``default_account`` is ignored as a readable legacy declaration. An
+        explicit label must remain declared; lookup performs no credential I/O.
         """
         config = self._runtime_config(runtime)
         if account is not None and not config.accounts:
             raise ValidationError(f"runtime {runtime} declares no accounts")
-        label = account if account is not None else config.default_account
+        label = account
         if label is not None and label not in config.accounts:
             known = ", ".join(config.accounts) or "none"
             raise ValidationError(
@@ -1538,7 +1540,10 @@ class AgentService:
         )
 
     def _runtime_for_profile(
-        self, runtime: RuntimeConfig, profile: AgentProfile
+        self,
+        runtime: RuntimeConfig,
+        profile: AgentProfile,
+        account_label: str | None,
     ) -> RuntimeConfig:
         """Bridge a canonical role's assets through the legacy adapter config.
 
@@ -1558,6 +1563,8 @@ class AgentService:
             profile,
             skills_root=self._config.skills.directory,
             mcp_catalog=self._config.mcp,
+            auth_mode="global" if account_label is None else "account",
+            auth_reference=account_label,
         )
         return replace(runtime, skills=profile.skills, mcp=profile.mcp)
 

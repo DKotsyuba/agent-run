@@ -103,10 +103,11 @@ class ClaudeAdapterTests(unittest.TestCase):
 
     # -- validate -------------------------------------------------------
 
-    def test_validate_requires_environment_auth_from_the_known_names(self) -> None:
+    def test_validate_accepts_global_or_known_environment_auth(self) -> None:
+        """Use native Claude state or a selected environment credential."""
+
         self.adapter.validate(self.runtime_config())
-        with self.assertRaisesRegex(ValidationError, "requires an auth bridge"):
-            self.adapter.validate(self.runtime_config(auth=None))
+        self.adapter.validate(self.runtime_config(auth=None))
         with self.assertRaisesRegex(ValidationError, "auth.kind must be"):
             self.adapter.validate(
                 self.runtime_config(auth=RuntimeAuthConfig("file_link", source=Path("/tmp"), target="a"))
@@ -708,7 +709,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             )
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(
-            plan.environment["CLAUDE_CONFIG_DIR"], str(self.home / "claude-config")
+            plan.environment["CLAUDE_CONFIG_DIR"], "/ambient/claude"
         )
         self.assertEqual(plan.environment["PATH"], "/usr/bin")
         self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-test")
@@ -806,6 +807,25 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertNotIn("Skill", bare.argv[bare.argv.index("--allowedTools") + 1].split(","))
 
     # -- scoped Claude CLI credentials --------------------------------------
+
+    def test_prepare_uses_native_global_claude_state_by_default(self) -> None:
+        """Point an unlabelled run at the host CLI state without copying it."""
+
+        native = self.root / "native-claude"
+        with patch.dict(
+            os.environ,
+            {"CLAUDE_CONFIG_DIR": str(native), "ANTHROPIC_API_KEY": "sk-test"},
+            clear=False,
+        ):
+            plan = self.prepare(
+                self.request(),
+                self.profile(),
+                self.runtime_config(auth=None),
+                self.home,
+                self.agent_dir,
+            )
+        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
+        self.assertFalse(native.exists())
 
     def test_prepare_scopes_cli_state_without_injecting_an_oauth_token(self) -> None:
         """A bare launch leaves refresh ownership to a durable private CLI home."""

@@ -64,16 +64,15 @@ class ClaudeAdapter:
     def validate(self, config: RuntimeConfig) -> None:
         """Validate Claude-specific runtime configuration before materialization.
 
-        ``config`` must provide environment auth, supported hooks, and complete
-        plugin skill declarations. Rust provisioning is accepted here and
-        applied only by ``prepare``; invalid auth, plugins, or hooks raise
+        ``config`` may omit auth to use Claude's native global account or name
+        selected environment variables. Invalid auth, plugins, or hooks raise
         ``ValidationError`` without touching the filesystem.
         """
-        if config.auth is None:
-            raise ValidationError("claude runtime requires an auth bridge")
-        if config.auth.kind != "environment":
+        if config.auth is not None and config.auth.kind != "environment":
             raise ValidationError("claude runtime auth.kind must be 'environment'")
-        unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
+        unknown = sorted(
+            set(config.auth.names if config.auth is not None else ()) - _AUTH_NAMES
+        )
         if unknown:
             raise ValidationError(
                 f"claude runtime auth.names has unsupported entries: {', '.join(unknown)}"

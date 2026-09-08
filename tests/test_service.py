@@ -310,7 +310,9 @@ class AgentServiceTests(unittest.TestCase):
             )}),
             self.store, self.root, launch=lambda *args: self.launched.append(args), now=lambda: 100.0,
         )
-        self.service.start(self.request(request_id="account"))
+        self.service.start(
+            replace(self.request(request_id="account"), account="personal2")
+        )
         self.wait_until(lambda: bool(ADAPTER.materialize_homes))
         self.wait_until(
             lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
@@ -330,6 +332,27 @@ class AgentServiceTests(unittest.TestCase):
         self.assertTrue(
             (self.root / "agents" / str(agent["id"]) / "config-snapshot.json").is_file()
         )
+
+    def test_omitted_account_uses_global_auth_despite_legacy_default(self) -> None:
+        """Do not redirect an unlabelled start through ``default_account``."""
+
+        runtime = replace(
+            self.config.runtimes["fake"],
+            accounts=("legacy",),
+            default_account="legacy",
+        )
+        self.service = AgentService(
+            replace(self.config, runtimes={"fake": runtime}),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        self.service.start(self.request(request_id="global-account"))
+        self.wait_until(lambda: bool(ADAPTER.materialize_configs))
+        effective = ADAPTER.materialize_configs[-1]
+        self.assertIsNone(effective.credential_state_home)
+        self.assertIn('"account":null', str(self.store.list_agents()[0]["identity_json"]))
 
     def test_claude_environment_account_uses_its_sibling_credential_home(self) -> None:
         """Claude labels need no file bridge but retain isolated durable state."""
@@ -351,7 +374,11 @@ class AgentServiceTests(unittest.TestCase):
             launch=lambda *args: self.launched.append(args),
             now=lambda: 100.0,
         )
-        request = replace(self.request(request_id="claude-account"), runtime="claude")
+        request = replace(
+            self.request(request_id="claude-account"),
+            runtime="claude",
+            account="personal",
+        )
         with patch("agent_run.service.AdapterRegistry.load", return_value=ADAPTER):
             self.service.start(request)
             self.wait_until(lambda: bool(ADAPTER.materialize_homes))

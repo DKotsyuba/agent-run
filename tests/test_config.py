@@ -269,7 +269,9 @@ target = "auth.json"
 '''
                 )
 
-    def test_accounts_require_file_link_and_default_must_be_declared(self) -> None:
+    def test_accounts_require_supported_adapter_and_legacy_default_is_declared(self) -> None:
+        """Reject unsupported account state and malformed legacy defaults."""
+
         base = '''schema_version = 1
 [runtimes.fake]
 enabled = true
@@ -279,13 +281,18 @@ home = "/tmp/runtime-home"
 models = ["test"]
 accounts = ["personal"]
 '''
-        with self.assertRaisesRegex(ValidationError, "requires file_link"):
+        with self.assertRaisesRegex(ValidationError, "supported only"):
             self.load(base)
+        codex = base.replace(
+            "[runtimes.fake]", "[runtimes.codex]"
+        ).replace(
+            'adapter = "example.adapter:ADAPTER"',
+            'adapter = "agent_run.adapters.codex:ADAPTER"',
+        )
         with self.assertRaisesRegex(ValidationError, "default_account"):
             self.load(
-                base
+                codex
                 + 'default_account = "missing"\n'
-                + '[runtimes.fake.auth]\nkind = "file_link"\nsource = "/tmp/auth"\ntarget = "auth.json"\n'
             )
 
     def test_claude_accounts_accept_its_scoped_environment_auth(self) -> None:

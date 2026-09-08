@@ -119,10 +119,31 @@ env_from = ["PATH"]
         with self.assertRaises(TypeError):
             ADAPTER.materialize(self.runtime_config(), self.home)
 
-    def test_validate_requires_file_link_auth(self) -> None:
+    def test_validate_accepts_global_or_file_link_auth(self) -> None:
+        """Use native global auth or an explicit account bridge."""
+
         ADAPTER.validate(self.runtime_config())
-        with self.assertRaisesRegex(ValidationError, "file_link auth bridge"):
+        ADAPTER.validate(self.runtime_config(auth=None))
+        with self.assertRaisesRegex(ValidationError, "file_link bridge"):
             ADAPTER.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("TOKEN",))))
+
+    def test_materialize_links_native_global_auth_without_copying_bytes(self) -> None:
+        """Bridge the host account by reference while keeping its bytes outside HOME."""
+
+        native_home = Path(self._mkdtemp()).resolve()
+        source = native_home / "auth.json"
+        source.write_text('{"token":"native-secret"}', encoding="utf-8")
+        config = self.runtime_config(auth=None)
+        with patch.dict(os.environ, {"CODEX_HOME": str(native_home)}, clear=False):
+            ADAPTER.materialize(config, self.home, mcp_servers={})
+
+        bridge = self.home / "auth.json"
+        self.assertTrue(bridge.is_symlink())
+        self.assertEqual(bridge.resolve(strict=True), source)
+        self.assertNotIn(
+            "native-secret",
+            (self.home / "config.toml").read_text(encoding="utf-8"),
+        )
 
     def test_host_toolchain_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
         """Codex inherits host toolchains without running provisioning probes."""

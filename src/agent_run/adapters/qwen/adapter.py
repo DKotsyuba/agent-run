@@ -207,9 +207,11 @@ class QwenAdapter:
         provisioned by the shared developer-environment provider, so it is no
         longer rejected here.
         """
-        if config.auth is None or config.auth.kind != "environment":
+        if config.auth is not None and config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
-        unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
+        unknown = sorted(
+            set(config.auth.names if config.auth is not None else ()) - _AUTH_NAMES
+        )
         if unknown:
             raise ValidationError(f"qwen runtime auth.names has unsupported entries: {', '.join(unknown)}")
 
@@ -317,7 +319,12 @@ class QwenAdapter:
         """Report local health with a fresh bounded configured-binary version."""
 
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
-        authenticated = bool(config.auth and all(_auth_value(name) for name in config.auth.names))
+        auth_names = (
+            config.auth.names
+            if config.auth is not None
+            else tuple(sorted(_AUTH_NAMES))
+        )
+        authenticated = all(_auth_value(name) for name in auth_names)
         version, version_reason = observe_binary_version(config.binary, Path(home))
         reason = version_reason if available else f"qwen binary not executable: {config.binary}"
         return RuntimeHealth(available, version, authenticated, reason)
@@ -410,8 +417,12 @@ class QwenAdapter:
                 entry for entry in (str(policy_directory), environment.get("PATH", "")) if entry
             )
         secret_names: list[str] = []
-        assert config.auth is not None
-        for name in config.auth.names:
+        auth_names = (
+            config.auth.names
+            if config.auth is not None
+            else tuple(sorted(_AUTH_NAMES))
+        )
+        for name in auth_names:
             value = _auth_value(name)
             if not value:
                 raise ValidationError(f"qwen requires environment variable {name}, which is not set")

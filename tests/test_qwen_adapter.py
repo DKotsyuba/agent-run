@@ -110,6 +110,40 @@ class QwenAdapterTests(unittest.TestCase):
             self.assertEqual(plan.adapter_state["approval_mode"], expected)
             self.assertTrue(plan.adapter_state["sandbox"])
 
+    def test_validate_accepts_native_or_selected_environment_auth(self) -> None:
+        """Allow global provider defaults and reject foreign auth kinds."""
+
+        self.adapter.validate(self.config(auth=None))
+        self.adapter.validate(self.config())
+        with self.assertRaisesRegex(ValidationError, "auth.kind"):
+            self.adapter.validate(
+                self.config(
+                    auth=RuntimeAuthConfig(
+                        "file_link", source=Path("/tmp/auth"), target="auth.json"
+                    )
+                )
+            )
+
+    def test_prepare_uses_native_provider_environment_without_auth_config(self) -> None:
+        """Resolve Qwen's global provider values when no auth block is declared."""
+
+        config = self.config(auth=None)
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "OPENAI_API_KEY": "global-secret",
+                "OPENAI_BASE_URL": "https://provider/v1",
+            },
+            clear=True,
+        ):
+            plan = self.adapter.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir,
+                mcp_servers={},
+            )
+        self.assertEqual(plan.environment["OPENAI_API_KEY"], "global-secret")
+        self.assertNotIn("global-secret", " ".join(plan.argv))
+
     def test_child_path_matches_the_host_path(self) -> None:
         """Keep the host PATH unchanged for every platform."""
         plan = self.prepare(path="/usr/bin:/bin")
