@@ -73,6 +73,13 @@ class ProfilesConfig:
 
 
 @dataclass(frozen=True)
+class SkillsConfig:
+    """Canonical owner-managed skill catalog directory."""
+
+    directory: Path = Path("~/.agent-run/skills")
+
+
+@dataclass(frozen=True)
 class McpConfig:
     transport: str
     command: Path
@@ -169,6 +176,7 @@ class Config:
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     profiles: ProfilesConfig = field(default_factory=ProfilesConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
     mcp: Mapping[str, McpConfig] = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -517,6 +525,16 @@ def _parse_profiles(value: object) -> ProfilesConfig:
     return ProfilesConfig(_path(table.get("directory", "~/.agent-run/profiles"), "profiles.directory"))
 
 
+def _parse_skills(value: object) -> SkillsConfig:
+    """Parse the one canonical skill catalog location."""
+
+    table = _table(value, "skills")
+    _reject_unknown(table, {"directory"}, "skills")
+    return SkillsConfig(
+        _path(table.get("directory", "~/.agent-run/skills"), "skills.directory")
+    )
+
+
 def _parse_mcp(value: object) -> Mapping[str, McpConfig]:
     result: dict[str, McpConfig] = {}
     for name, table in _named_table(value, "mcp").items():
@@ -784,7 +802,7 @@ def load_config(path: str | Path) -> Config:
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValidationError(f"cannot load config {path}: {error}") from error
-    _reject_unknown(raw, {"schema_version", "core", "capacity", "delivery", "profiles", "mcp", "environments", "runtimes"}, "")
+    _reject_unknown(raw, {"schema_version", "core", "capacity", "delivery", "profiles", "skills", "mcp", "environments", "runtimes"}, "")
     version = raw.get("schema_version")
     if type(version) is not int or version != 1:
         raise ValidationError(f"unsupported schema_version: {version!r}")
@@ -803,6 +821,7 @@ def load_config(path: str | Path) -> Config:
         capacity=_parse_capacity(raw.get("capacity", {})),
         delivery=_parse_delivery(raw.get("delivery", {})),
         profiles=_parse_profiles(raw.get("profiles", {})),
+        skills=_parse_skills(raw.get("skills", {})),
         mcp=mcp,
         environments=environments,
         runtimes=runtimes,

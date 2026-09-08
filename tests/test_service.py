@@ -22,7 +22,7 @@ from agent_run.adapters.snapshots import (
     finalize_runtime_snapshots,
     inspect_config_snapshot,
 )
-from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
+from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig, SkillsConfig
 from agent_run.domain import (
     AgentStatus,
     Message,
@@ -381,33 +381,80 @@ class AgentServiceTests(unittest.TestCase):
 
         self.assertEqual(snapshot.materialize_revision, "cfg-2")
 
-    def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
-        """The profile is where agent-run assigns the shared role contract.
+    def test_start_resolves_canonical_role_assets_from_one_catalog(self) -> None:
+        """Use the role prompt and shared skill selection without assignment glue."""
 
-        The adapters only inject ``profile.body``, so if this wiring were
-        dropped every runtime would silently stop assigning roles.
-        """
+        skills = self.root / "skills"
+        skill = skills / "code-reading"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+        (self.profiles / "profile.md").write_text(
+            """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = []
+required_constraints = []
++++
+Review the requested work.
+""",
+            encoding="utf-8",
+        )
+        service = AgentService(
+            replace(self.config, skills=SkillsConfig(skills)),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        service.start(self.request(request_id="canonical-role", write=True))
+        self.wait_until(lambda: bool(ADAPTER.prepare_profiles))
+        self.assertEqual(
+            ADAPTER.prepare_profiles[-1].body, "Review the requested work."
+        )
+        self.assertFalse(ADAPTER.prepare_profiles[-1].write)
+        self.assertEqual(ADAPTER.materialize_configs[-1].skills, ("code-reading",))
+        self.assertEqual(ADAPTER.skills_roots[-1], skills)
+        service.close()
 
-        runtime = self.config.runtimes["fake"]
+    def test_canonical_role_rejects_legacy_runtime_asset_lists(self) -> None:
+        """Fail before admission instead of merging role and runtime assets."""
+
+        skills = self.root / "skills"
+        skill = skills / "code-reading"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+        (self.profiles / "profile.md").write_text(
+            """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = []
+required_constraints = []
++++
+Review.
+""",
+            encoding="utf-8",
+        )
+        runtime = replace(self.config.runtimes["fake"], skills=("legacy",))
         service = AgentService(
             replace(
                 self.config,
-                runtimes={"fake": replace(runtime, skills=("role-profile",))},
+                skills=SkillsConfig(skills),
+                runtimes={"fake": runtime},
             ),
             self.store,
             self.root,
             launch=lambda *args: self.launched.append(args),
             now=lambda: 100.0,
         )
-        service.start(self.request(request_id="assigned"))
-        self.wait_until(lambda: bool(ADAPTER.prepare_profiles))
-        body = ADAPTER.prepare_profiles[-1].body
-        self.assertTrue(body.startswith("Do the requested work."))
-        self.assertIn("Your assigned role is role-profile.", body)
-
-        # No matching skill shipped: the same start leaves the body alone.
-        self.start("unassigned")
-        self.assertEqual(ADAPTER.prepare_profiles[-1].body, "Do the requested work.")
+        with self.assertRaisesRegex(ValidationError, "cannot be mixed"):
+            service.start(self.request(request_id="mixed-role"))
+        self.assertEqual(self.store.list_agents(), [])
         service.close()
 
     def test_complete_refusal_happens_before_agent_row(self) -> None:

@@ -8,7 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.errors import PathEscapeError, ValidationError
 from agent_run.profiles import (
     AgentProfile,
-    assign_role,
     load_profile,
     normalize_read_roots,
     profile_path,
@@ -66,30 +65,57 @@ class ProfileTests(unittest.TestCase):
                 normalize_read_roots((root / "missing",))
 
 
-class RoleAssignmentTests(unittest.TestCase):
-    """The profile is the runtime adapter that assigns a ``role-*`` contract."""
+    def test_canonical_role_owns_every_grant_and_asset_selection(self) -> None:
+        """Load a complete revisioned role without runtime-specific assignment."""
 
-    def test_a_shipped_role_is_assigned_and_the_body_is_kept(self) -> None:
-        profile = AgentProfile("review", "Review carefully.", False, ())
-        assigned = assign_role(profile, "claude", ("code-reading", "role-review"))
-        self.assertTrue(assigned.body.startswith("Review carefully."))
-        self.assertIn("Your assigned role is role-review.", assigned.body)
-        self.assertIn("Load the role-review skill now", assigned.body)
-        # Permissions are the profile's business; assignment never touches them.
-        self.assertEqual((assigned.name, assigned.write), (profile.name, profile.write))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "implement.md").write_text(
+                """+++
+revision = "1"
+write = true
+network = false
+allow_external_read_roots = true
+skills = ["lsp-first", "document-code"]
+mcp = ["agent-lsp"]
+required_constraints = ["plugin_immutability"]
++++
+Implement and verify the requested change.
+""",
+                encoding="utf-8",
+            )
+            profile = load_profile(
+                root, "implement", requested_write=False, read_roots=(root,)
+            )
 
-    def test_no_matching_skill_leaves_the_profile_untouched(self) -> None:
-        profile = AgentProfile("review", "Review carefully.", False, ())
-        # An unshipped role must never be named: the contract is explicit-only,
-        # and pointing at a skill the child cannot load is a broken instruction.
-        self.assertIs(assign_role(profile, "claude", ("code-reading",)), profile)
-        self.assertIs(assign_role(profile, "unsupported", ()), profile)
-
-    def test_codex_assigns_the_research_role_when_shipped(self) -> None:
-        profile = AgentProfile("research", "Research.", False, ())
-        self.assertIn(
-            "role-research", assign_role(profile, "codex", ("role-research",)).body
+        self.assertTrue(profile.canonical)
+        self.assertTrue(profile.write)
+        self.assertEqual(profile.revision, "1")
+        self.assertEqual(profile.skills, ("lsp-first", "document-code"))
+        self.assertEqual(profile.mcp, ("agent-lsp",))
+        self.assertEqual(
+            {item.value for item in profile.required_constraints},
+            {"plugin_immutability"},
         )
+
+    def test_incomplete_or_unrevisioned_canonical_role_is_rejected(self) -> None:
+        """Fail closed instead of mixing legacy and canonical declarations."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "mixed.md").write_text(
+                "+++\nwrite = false\nskills = [\"code-reading\"]\n+++\nReview.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValidationError, "require a revision"):
+                load_profile(root, "mixed")
+
+            (root / "partial.md").write_text(
+                "+++\nrevision = \"1\"\nwrite = false\n+++\nReview.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValidationError, "incomplete"):
+                load_profile(root, "partial")
 
 
 if __name__ == "__main__":

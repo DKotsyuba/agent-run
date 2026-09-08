@@ -55,7 +55,8 @@ from .delivery.dispatch import _effort_from_request_json
 from .launch import DEFAULT_STARTUP_HANDOFF_SECONDS, launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
-from .profiles import AgentProfile, assign_role, load_profile
+from .profiles import AgentProfile, load_profile
+from .role_plan import resolve_role_plan
 from .process_identity import capture_process_birth
 from .resume import (
     identity_snapshot, inherited_request, proven_identity, record_profile_grants,
@@ -560,6 +561,14 @@ class AgentService:
                 timeout_seconds=self._config.core.default_timeout_seconds,
             )
         runtime = self._runtime_config(request.runtime)
+        profile = self._effective_profile(request, runtime)
+        runtime = self._runtime_for_profile(runtime, profile)
+        if profile.canonical:
+            request = replace(
+                request,
+                write=profile.write,
+                required_constraints=profile.required_constraints,
+            )
         label = self.resolve_account(request.runtime, request.account)
         if label is not None:
             claude_environment_account = (
@@ -584,7 +593,7 @@ class AgentService:
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
-        policy = self._admission_policy(request, runtime)
+        policy = self._policy_for_profile(request, runtime, profile)
         return self._admit(request, runtime, label, policy=policy)
 
     def _admit(
@@ -873,7 +882,11 @@ class AgentService:
                     effective_runtime,
                     effective_home,
                     mcp_servers=mcp_servers,
-                    skills_root=runtime_skills_dir(request.runtime, self._home),
+                    skills_root=(
+                        self._config.skills.directory
+                        if profile.canonical
+                        else runtime_skills_dir(request.runtime, self._home)
+                    ),
                 )
                 revision = materialize_revision
             if self._cancel_accepted_start(store, cancelled, agent_id):
@@ -1132,6 +1145,14 @@ class AgentService:
         request = inherited_request(
             row, snapshot, label, task, timeout_seconds, request_id, orchestrator
         )
+        profile = self._effective_profile(request, runtime)
+        runtime = self._runtime_for_profile(runtime, profile)
+        if profile.canonical:
+            request = replace(
+                request,
+                write=profile.write,
+                required_constraints=profile.required_constraints,
+            )
         _logger.info(
             "resume parent_agent_id=%s runtime=%s request_id=%s",
             parent_id, runtime_name, request_id,
@@ -1146,7 +1167,7 @@ class AgentService:
                 f"model is no longer configured for runtime {request.runtime}: "
                 f"{request.model}"
             )
-        policy = self._admission_policy(request, runtime)
+        policy = self._policy_for_profile(request, runtime, profile)
         return self._admit(
             request,
             runtime,
@@ -1506,18 +1527,39 @@ class AgentService:
     def _effective_profile(
         self, request: StartRequest, runtime: RuntimeConfig
     ) -> AgentProfile:
-        """Load and role-assign the exact profile used for policy and launch."""
+        """Load the exact complete role or legacy compatibility profile."""
 
-        return assign_role(
-            load_profile(
-                self._config.profiles,
-                request.profile,
-                requested_write=request.write,
-                read_roots=request.read_roots,
-            ),
-            request.runtime,
-            runtime.skills,
+        del runtime
+        return load_profile(
+            self._config.profiles,
+            request.profile,
+            requested_write=request.write,
+            read_roots=request.read_roots,
         )
+
+    def _runtime_for_profile(
+        self, runtime: RuntimeConfig, profile: AgentProfile
+    ) -> RuntimeConfig:
+        """Bridge a canonical role's assets through the legacy adapter config.
+
+        Legacy profiles keep their runtime-owned skill/MCP lists. A revisioned
+        role must not coexist with either list; its complete selections resolve
+        against the shared catalogs before admission and then replace the two
+        legacy fields for the current adapter boundary.
+        """
+
+        if not profile.canonical:
+            return runtime
+        if runtime.skills or runtime.mcp:
+            raise ValidationError(
+                "canonical role cannot be mixed with runtime skills or MCP declarations"
+            )
+        resolve_role_plan(
+            profile,
+            skills_root=self._config.skills.directory,
+            mcp_catalog=self._config.mcp,
+        )
+        return replace(runtime, skills=profile.skills, mcp=profile.mcp)
 
     @staticmethod
     def _policy_capabilities(
@@ -1560,7 +1602,11 @@ class AgentService:
             request.runtime,
             sys.platform,
             self._policy_capabilities(request.runtime, runtime),
-            required=request.required_constraints,
+            required=(
+                profile.required_constraints
+                if profile.canonical
+                else request.required_constraints
+            ),
         )
         decision = admission_decision(policy)
         if not decision.allowed:

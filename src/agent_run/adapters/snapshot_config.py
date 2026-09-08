@@ -107,15 +107,27 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
 
 
 def _profile_document(profile: AgentProfile) -> dict[str, object]:
-    """Return the effective profile bytes and every current grant field."""
+    """Return the effective role contract as deterministic JSON-safe values."""
 
+    legacy = {
+        "name": profile.name,
+        "body": profile.body,
+        "write": profile.write,
+        "read_roots": [str(path) for path in profile.read_roots],
+        "network": profile.network,
+    }
+    if not profile.canonical:
+        return legacy
     return {
-        name: (
-            [str(item) for item in value]
-            if isinstance(value, tuple) and all(isinstance(item, Path) for item in value)
-            else value
-        )
-        for name, value in vars(profile).items()
+        **legacy,
+        "revision": profile.revision,
+        "allow_external_read_roots": profile.allow_external_read_roots,
+        "skills": list(profile.skills),
+        "mcp": list(profile.mcp),
+        "required_constraints": sorted(
+            constraint.value for constraint in profile.required_constraints
+        ),
+        "canonical": profile.canonical,
     }
 
 
