@@ -35,6 +35,8 @@ from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
 from agent_run.adapters.qwen.auth import DEFAULT_BASE_URL, keychain_omniroute_api_key
 from agent_run.adapters.qwen.skills import materialize_skills, skills_context_note
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
+from agent_run.adapters.version import observe_binary_version
 from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
@@ -208,14 +210,12 @@ class QwenAdapter:
     def validate(self, config: RuntimeConfig) -> None:
         """Validate Qwen's environment-auth and one-shot-only configuration.
 
-        ``config`` must use supported environment auth and no service mode.
+        ``config`` must use supported environment auth.
         A declared ``rust`` table -- legacy ``runtimes.qwen.rust`` or the
         ``rust`` of a selected ``environment`` preset -- is supported and is
         provisioned by the shared developer-environment provider, so it is no
         longer rejected here.
         """
-        if config.service_mode is not None:
-            raise ValidationError("qwen runtime does not support service_mode")
         if config.auth is None or config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
         unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
@@ -297,15 +297,28 @@ class QwenAdapter:
                 environment_digest(config),
             ]
         )
-        return content_hash(fingerprint)
+        revision = content_hash(fingerprint)
+        managed_files = [".qwen/settings.json"]
+        if (Path(home) / "agent-run-context.md").is_file():
+            managed_files.append("agent-run-context.md")
+        if denied:
+            managed_files.append(
+                f"{_COMMAND_POLICY_DIRECTORY}/.agent-run-command-policy.json"
+            )
+            managed_files.extend(
+                f"{_COMMAND_POLICY_DIRECTORY}/{command}" for command in sorted(denied)
+            )
+        finalize_runtime_snapshots(Path(home), revision, tuple(managed_files))
+        return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
-        """Report local binary and declared authentication availability only."""
-        del home
+        """Report local health with a fresh bounded configured-binary version."""
+
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
         authenticated = bool(config.auth and all(_auth_value(name) for name in config.auth.names))
-        reason = None if available else f"qwen binary not executable: {config.binary}"
-        return RuntimeHealth(available, "0.22.2" if available else None, authenticated, reason)
+        version, version_reason = observe_binary_version(config.binary, Path(home))
+        reason = version_reason if available else f"qwen binary not executable: {config.binary}"
+        return RuntimeHealth(available, version, authenticated, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
         """Return the configured model roster without a live provider call."""
@@ -316,7 +329,7 @@ class QwenAdapter:
         """Report the OmniRoute account pool this runtime is served from.
 
         Every qwen model here routes through OmniRoute out of the same
-        ``opencode-go`` account pool opencode uses, so the pool's quota is
+        ``opencode-go`` account pool, so the pool's quota is
         this runtime's quota. See :mod:`agent_run.adapters.omniroute`.
         """
         del config, home
@@ -331,6 +344,7 @@ class QwenAdapter:
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build a sandboxed one-shot invocation and isolated environment."""
         if request.fast:
@@ -351,7 +365,10 @@ class QwenAdapter:
         if request.output_schema is not None:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
         role_text += skills_context_note(Path(home), config.skills)
-        write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
+        if resume_session_id is None:
+            write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
+        elif not (Path(home) / ".qwen/settings.json").is_file():
+            raise ValidationError("qwen resume requires a verified materialized home")
         environment: dict[str, str] = {"HOME": str(home), "OPENAI_MODEL": request.model}
         # Keep the narrow PATH baseline Qwen needs for its launcher and native
         # utilities; a selected preset still leads it and no other ambient
@@ -362,19 +379,25 @@ class QwenAdapter:
                 parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
             environment["PATH"] = parent_path
         environment = developer_environment(environment, config, Path(request.workdir))
-        self.materialize(
-            config,
-            Path(home),
-            mcp_servers=mcp_servers,
-            command_search_paths=tuple(
-                entry for entry in environment.get("PATH", "").split(os.pathsep) if entry
-            ),
-        )
+        materialize_revision = None
+        if resume_session_id is None:
+            materialize_revision = self.materialize(
+                config,
+                Path(home),
+                mcp_servers=mcp_servers,
+                command_search_paths=tuple(
+                    entry
+                    for entry in environment.get("PATH", "").split(os.pathsep)
+                    if entry
+                ),
+            )
         # The refusal shims must win ordinary PATH lookup, so they are
         # prepended after required_commands were checked against the real
         # declared PATH. This is ordinary-lookup refusal, not OS confinement.
         if config.environment is not None and config.environment.denied_commands:
             policy_directory = command_policy_directory(Path(home))
+            if resume_session_id is not None and not policy_directory.is_dir():
+                raise ValidationError("qwen resume command policy is missing")
             environment["PATH"] = os.pathsep.join(
                 entry for entry in (str(policy_directory), environment.get("PATH", "")) if entry
             )
@@ -417,6 +440,8 @@ class QwenAdapter:
             runtime_stream_path=agent_dir / "runtime.jsonl",
             adapter_state=state,
             answer_path=agent_dir / "answer.md",
+            resume_session_id=resume_session_id,
+            materialize_revision=materialize_revision,
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> QwenSession:

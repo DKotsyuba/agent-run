@@ -1,8 +1,6 @@
-"""Codex ``app-server`` protocol: initialize/thread/turn/steer/completion.
-
-``ProcessTransport`` owns the real subprocess, its JSON-RPC pipes, and bounded
-secret-safe startup diagnostics. Protocol transformations remain testable
-through the ``AppServerTransport`` fake without launching Codex.
+"""Codex app-server protocol transformations and session control.
+ProcessTransport owns subprocess/pipes and bounded secret-safe diagnostics;
+AppServerTransport keeps protocol transformations testable without Codex.
 """
 
 from __future__ import annotations
@@ -24,6 +22,7 @@ from .process_transport import ProcessTransport
 # Startup is outside the agent deadline: default to 30s, cap production at 120s.
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 _MAX_STARTUP_TIMEOUT_SECONDS = 120.0
+_PENDING_DRAIN_LIMIT, _PENDING_DRAIN_SECONDS = 64, 0.05
 class VerificationError(ValidationError):
     """Effective app-server parameters do not match the requested launch plan."""
 
@@ -343,7 +342,6 @@ class CodexAppServerSession:
     def cancel(self, grace_seconds: float) -> None:
         if isinstance(grace_seconds, bool) or not isinstance(grace_seconds, (int, float)) or grace_seconds < 0:
             raise ValidationError("grace_seconds must be a nonnegative number")
-        self._drain_pending()
         self._transport.request(
             "turn/interrupt",
             {"threadId": self._thread_id, "turnId": self._turn_id},
@@ -357,9 +355,11 @@ class CodexAppServerSession:
             self._transport.close()
 
     def _drain_pending(self) -> None:
-        while True:
+        """Handle a bounded pending-event slice before lower-priority steering."""
+        deadline = time.monotonic() + _PENDING_DRAIN_SECONDS
+        for _ in range(_PENDING_DRAIN_LIMIT):
             event = self._next_raw(0)
-            if event is None:
+            if event is None or time.monotonic() >= deadline:
                 return
             self._handle_event(event)
 

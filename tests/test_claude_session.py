@@ -1,21 +1,27 @@
 import contextlib
+import io
 import json
 import os
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
+import psutil
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import LaunchPlan
 from agent_run.adapters.claude import adapter as claude_adapter_module
 from agent_run.adapters.claude.adapter import ADAPTER
+from agent_run.adapters.claude.stderr import StderrTail
 from agent_run.domain import AgentStatus, MessageRole
 
 
@@ -67,9 +73,11 @@ class ClaudeSessionTests(unittest.TestCase):
     # -- success / empty result -----------------------------------------
 
     def test_nonblank_result_succeeds_with_content_and_bounded_metadata_event(self) -> None:
+        """Seal a successful Claude result as a clean, proven answer payload."""
+
         import hashlib
 
-        from agent_run.verify import DEFAULT_SENTINEL
+        from agent_run.verify import ANSWER_FORMAT_PROOF, inspect_answer
 
         script = (
             "import sys, json\n"
@@ -89,10 +97,13 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertEqual(outcome.runtime_session_id, "sess-1")
         answer = self.agent_dir / "answer.md"
         data = answer.read_bytes()
-        self.assertTrue(data.endswith(f"{DEFAULT_SENTINEL}\n".encode()))
+        proof = inspect_answer(answer)
+        self.assertEqual(data, b"the answer")
         self.assertEqual(outcome.answer_path, answer)
         self.assertEqual(outcome.answer_bytes, len(data))
         self.assertEqual(outcome.answer_sha256, hashlib.sha256(data).hexdigest())
+        self.assertTrue(proof.complete)
+        self.assertEqual(proof.proof_version, ANSWER_FORMAT_PROOF)
         self.assertTrue(sink.sessions and set(sink.sessions) == {"sess-1"})
         self.assertTrue(any(m.role == MessageRole.ASSISTANT and m.content == "hi there" for m in sink.messages))
         result_events = [data for kind, data in sink.events if kind == "runtime_result"]
@@ -146,6 +157,20 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertIn("<redacted>", failure_text)
         self.assertLessEqual(len(failure_text.encode("utf-8")), 4096)
         self.assertEqual(self.log_path.read_bytes(), b"")
+
+    def test_newline_free_stderr_is_chunked_and_redacts_boundary_secret(self) -> None:
+        """A huge unterminated line retains bounded secret-safe trailing bytes."""
+
+        secret = "boundary-secret-token"
+        stream = io.StringIO("x" * (4096 * 256 - 5) + secret + " tail")
+        capture = StderrTail(stream, (secret,))
+
+        capture.drain()
+
+        text = capture.text() or ""
+        self.assertNotIn(secret, text)
+        self.assertIn("<redacted>", text)
+        self.assertLessEqual(len(text.encode("utf-8")), 4096)
 
     def test_engine_error_labelled_success_never_becomes_failure_kind_success(self) -> None:
         # Shaped byte-for-byte like the live regression (canary agent
@@ -410,10 +435,192 @@ class ClaudeSessionTests(unittest.TestCase):
             "print(json.dumps({'type': 'result', 'is_error': False, 'subtype': 'success', 'result': 'late'}))\n"
         )
         session = ADAPTER.launch(self.plan(script), FakeSink())
-        session.cancel(grace_seconds=2)
+        with patch(
+            "agent_run.adapters.claude.session.time.time",
+            side_effect=AssertionError("wall clock used for cancel budget"),
+        ):
+            session.cancel(grace_seconds=2)
         outcome = session.wait(timeout_seconds=5)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+
+    def test_cancel_interrupts_owned_group_before_leader_exits(self) -> None:
+        """Native cancel kills a spawned child that explicitly ignores SIGINT."""
+
+        child_path = self.root / "child.pid"
+        ready_path = self.root / "child.ready"
+        child_code = (
+            "import signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            f"Path({str(ready_path)!r}).write_text('ready')\n"
+            "time.sleep(30)\n"
+        )
+        script = (
+            "import subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"open({str(child_path)!r}, 'w').write(str(child.pid))\n"
+            "sys.stdin.readline()\n"
+            "time.sleep(30)\n"
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        deadline = time.monotonic() + 2
+        while not (child_path.exists() and ready_path.exists()):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        child_pid = int(child_path.read_text(encoding="utf-8"))
+
+        try:
+            started = time.monotonic()
+            session.cancel(grace_seconds=0.1)
+            self.assertLess(time.monotonic() - started, 1)
+            outcome = session.wait(timeout_seconds=5)
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+            for _ in range(100):
+                try:
+                    status = psutil.Process(child_pid).status()
+                except psutil.NoSuchProcess:
+                    break
+                if status == psutil.STATUS_ZOMBIE:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("owned cancellation left the spawned child alive")
+        finally:
+            try:
+                child = psutil.Process(child_pid)
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    child.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+    def test_cancel_keeps_zombie_leader_fence_until_group_is_killed(self) -> None:
+        """An exited leader still fences PGID while its SIGINT-ignoring child dies."""
+
+        child_path = self.root / "exited-leader-child.pid"
+        ready_path = self.root / "exited-leader-child.ready"
+        child_code = (
+            "import signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            f"Path({str(ready_path)!r}).write_text('ready')\n"
+            "time.sleep(30)\n"
+        )
+        script = (
+            "import subprocess, sys\n"
+            "sys.stdin.readline()\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"open({str(child_path)!r}, 'w').write(str(child.pid))\n"
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        leader_pid = session.pid
+        deadline = time.monotonic() + 2
+        while not (child_path.exists() and ready_path.exists()):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        child_pid = int(child_path.read_text(encoding="utf-8"))
+        while psutil.Process(leader_pid).status() != psutil.STATUS_ZOMBIE:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        try:
+            session.cancel(grace_seconds=0.1)
+            outcome = session.wait(timeout_seconds=5)
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+            for _ in range(100):
+                try:
+                    status = psutil.Process(child_pid).status()
+                except psutil.NoSuchProcess:
+                    break
+                if status == psutil.STATUS_ZOMBIE:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("zombie leader cancellation left its child alive")
+        finally:
+            try:
+                child = psutil.Process(child_pid)
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    child.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+    def test_stdout_larger_than_pipe_capacity_is_drained_before_initial_input(self) -> None:
+        """A child may fill stdout before it starts reading the prompt."""
+
+        script = (
+            "import json, sys\n"
+            "sys.stdout.write('not-json\\n' * 20000)\n"
+            "sys.stdout.flush()\n"
+            "sys.stdin.readline()\n"
+            "print(json.dumps({'type': 'result', 'session_id': 'sess-1', "
+            "'subtype': 'success', 'is_error': False, 'result': 'drained'}), flush=True)\n"
+        )
+
+        outcome = ADAPTER.launch(self.plan(script), FakeSink()).wait(timeout_seconds=10)
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertGreater(self.log_path.stat().st_size, 65536)
+
+    def test_nonreading_child_cannot_hold_large_initial_input(self) -> None:
+        """Initial-input backpressure fails and reaps the owned child promptly."""
+
+        plan = self.plan("import time; time.sleep(30)")
+        plan = LaunchPlan(
+            plan.argv,
+            plan.cwd,
+            plan.environment,
+            "x" * 1_048_576,
+            plan.runtime_stream_path,
+            plan.adapter_state,
+        )
+        captured: dict[str, subprocess.Popen] = {}
+        original_popen = claude_adapter_module.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            """Record the fixture child while preserving real ``Popen`` behavior."""
+
+            process = original_popen(*args, **kwargs)
+            captured["process"] = process
+            return process
+
+        started = time.monotonic()
+        with patch.object(claude_adapter_module.subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(TimeoutError, "timed out writing initial input"):
+                ADAPTER.launch(plan, FakeSink())
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIsNotNone(captured["process"].poll())
+
+    def test_stalled_steer_write_is_bounded_and_cancel_interrupts_it(self) -> None:
+        """A child that stops reading stdin cannot trap a control writer."""
+
+        script = "import sys, time\nsys.stdin.readline()\ntime.sleep(30)\n"
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        self.addCleanup(self._force_kill, session)
+        errors: list[BaseException] = []
+
+        def steer() -> None:
+            """Attempt one deliberately oversized steer and capture its failure."""
+
+            try:
+                session.steer("x" * 1_048_576)
+            except BaseException as error:
+                errors.append(error)
+
+        writer = threading.Thread(target=steer)
+        writer.start()
+        time.sleep(0.1)
+        session.cancel(grace_seconds=0.1)
+        writer.join(timeout=3)
+
+        self.assertFalse(writer.is_alive())
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], (InterruptedError, ConnectionError))
+        self.assertIsNotNone(session._process.poll())
 
     # -- settling on stream content instead of process exit ----------------
     #

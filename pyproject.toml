@@ -21,11 +21,15 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-dependencies = []
+dependencies = [
+    "psutil>=7.2.2,<8",
+    "anyio>=4.15.1,<5",
+    "mcp==2.1.1",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0", "hypothesis>=6.167.1,<7"]
-release = ["build>=1.2", "twine>=5.0"]
+release = ["build>=1.2", "setuptools>=77", "twine>=5.0", "wheel"]
 
 [project.scripts]
 agent-run = "agent_run.cli:main"

@@ -85,9 +85,8 @@ def _validate_raw_ref(raw_ref: str) -> None:
 
 def _spool_oversized_message(agent_directory: Path, content: str) -> tuple[str, str]:
     """Spool content over the inline limit to a raw file directly under the
-    agent's own directory (same mkstemp-in-place convention as
-    adapters/opencode/http.py:_capture, so its bare filename is already a
-    normalized raw_ref) and return a bounded inline stub plus that raw_ref.
+    agent's own directory, so its bare filename is already a normalized
+    ``raw_ref`` and return a bounded inline stub plus that raw reference.
     """
 
     agent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -137,6 +136,13 @@ def json_text(value: object) -> str:
 
 
 def request_json(request: StartRequest) -> str:
+    """Return canonical JSON for every launch-affecting request field.
+
+    Every :class:`StartRequest` field is included. Resolved identity snapshots,
+    normalized task summaries and resume parents live outside ``StartRequest``
+    and are deliberately compared or persisted separately by admission.
+    """
+
     orchestrator = request.orchestrator
     return json_text(
         {
@@ -158,9 +164,35 @@ def request_json(request: StartRequest) -> str:
                 "external_turn_id": orchestrator.external_turn_id,
             },
             "request_id": request.request_id,
+            "fast": request.fast,
             "account": request.account,
+            "required_constraints": sorted(
+                constraint.value for constraint in request.required_constraints
+            ),
         }
     )
+
+
+def request_json_matches(stored: str, current: str) -> bool:
+    """Compare canonical request JSON with legacy false/empty defaults.
+
+    ``stored`` is immutable historical evidence and ``current`` is newly
+    serialized canonical JSON. Historical objects missing ``fast`` or
+    ``required_constraints`` are interpreted as ``False`` and empty without
+    rewriting them. Malformed or non-object JSON never matches and both inputs
+    otherwise require exact semantic equality.
+    """
+
+    try:
+        previous = json.loads(stored)
+        candidate = json.loads(current)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(previous, dict) or not isinstance(candidate, dict):
+        return False
+    previous.setdefault("fast", False)
+    previous.setdefault("required_constraints", [])
+    return previous == candidate
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, object] | None:
@@ -195,10 +227,21 @@ def checked_supervisor_proof(
     supervisor_pid: int | None,
     process_group_id: int | None,
     expected_identity: str | None,
+    expected_birth_time: float | None,
     alive: bool | None,
     checked_at: float | None,
-    observed_identity: str | None,
+    observed_birth_time: float | None,
 ) -> tuple[float, str | None]:
+    """Validate one reconciliation verdict against immutable stored ownership.
+
+    The PID, group and diagnostic command must still name the selected row.
+    ``dead`` needs an absent PID proof and remains valid for legacy rows without
+    birth evidence. ``identity_mismatch`` requires stored and observed finite
+    birth times that differ, proving PID reuse. Returns the checked timestamp and
+    failure kind, or no failure kind for a live owner; invalid or stale evidence
+    raises :class:`ValidationError` without changing state.
+    """
+
     stored = (
         agent["supervisor_pid"],
         agent["process_group_id"],
@@ -232,23 +275,70 @@ def checked_supervisor_proof(
         return checked, "supervisor_dead"
     if (
         alive is not True
-        or not isinstance(observed_identity, str)
-        or not observed_identity.strip()
-        or observed_identity == expected_identity
+        or isinstance(agent["supervisor_birth_time"], bool)
+        or not isinstance(agent["supervisor_birth_time"], (int, float))
+        or not math.isfinite(float(agent["supervisor_birth_time"]))
+        or isinstance(expected_birth_time, bool)
+        or not isinstance(expected_birth_time, (int, float))
+        or not math.isfinite(float(expected_birth_time))
+        or expected_birth_time != agent["supervisor_birth_time"]
+        or isinstance(observed_birth_time, bool)
+        or not isinstance(observed_birth_time, (int, float))
+        or not math.isfinite(float(observed_birth_time))
+        or observed_birth_time < 0
+        or observed_birth_time == expected_birth_time
     ):
-        raise ValidationError("identity mismatch requires differing live identities")
+        raise ValidationError("identity mismatch requires differing process births")
     return checked, "supervisor_identity_mismatch"
 
 
 def idempotent_agent(
-    connection: sqlite3.Connection, request_id: str
+    connection: sqlite3.Connection,
+    request_id: str,
+    orchestrator: OrchestratorRef | None,
 ) -> sqlite3.Row | None:
-    return connection.execute(
+    """Return the earliest replay from the immutable request namespace.
+
+    ``orchestrator`` identifies the original caller by transport and external
+    session; ``None`` is the shared unbound namespace. The later notification
+    binding in ``agents.orchestrator_session_id`` is deliberately ignored.
+    The request's mutable turn and every other semantic field remain subject to
+    the caller's full canonical JSON comparison. Malformed historical evidence
+    cannot establish a namespace and is skipped. The caller's immediate
+    transaction serializes lookup and insertion, including nullable namespaces.
+    """
+
+    expected = (
+        None
+        if orchestrator is None
+        else (orchestrator.transport, orchestrator.external_session_id)
+    )
+    rows = connection.execute(
         """SELECT id, request_json, task_summary, config_revision,
                   parent_agent_id FROM agents
-           WHERE request_id = ?""",
+           WHERE request_id = ? ORDER BY created_at, id""",
         (request_id,),
-    ).fetchone()
+    )
+    for row in rows:
+        try:
+            payload = json.loads(row["request_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        original = payload.get("orchestrator")
+        if original is None:
+            namespace = None
+        elif isinstance(original, dict):
+            namespace = (
+                original.get("transport"),
+                original.get("external_session_id"),
+            )
+        else:
+            continue
+        if namespace == expected:
+            return row
+    return None
 
 
 def require_attempt(

@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -108,9 +109,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unsupported entries"):
             self.adapter.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("ROGUE_VAR",))))
 
-    def test_validate_refuses_service_mode_and_unknown_hook_events(self) -> None:
-        with self.assertRaisesRegex(ValidationError, "service_mode"):
-            self.adapter.validate(self.runtime_config(service_mode="managed"))
+    def test_validate_refuses_unknown_hook_events(self) -> None:
         with self.assertRaisesRegex(ValidationError, "not a known Claude hook event"):
             self.adapter.validate(
                 self.runtime_config(hooks=(RuntimeHookConfig("BogusEvent", ("echo",)),))
@@ -296,10 +295,14 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertFalse(health.available)
         self.assertFalse(health.authenticated)
 
-        available = self.runtime_config(binary=Path("/bin/echo"))
+        binary = self.root / "version-runtime"
+        binary.write_text("#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n", encoding="utf-8")
+        binary.chmod(0o700)
+        available = self.runtime_config(binary=binary)
         health = self.adapter.probe(available, self.home)
         self.assertTrue(health.available)
         self.assertFalse(health.authenticated)
+        self.assertEqual(health.version, "runtime 1.2.3")
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
             health = self.adapter.probe(available, self.home)
             self.assertTrue(health.authenticated)
@@ -355,13 +358,31 @@ class ClaudeAdapterTests(unittest.TestCase):
         config = self.runtime_config(skills=("delegate",))
         self.materialize(config, self.home)
         plugin_manifest = self.home / "plugins" / "delegate" / ".claude-plugin" / "plugin.json"
-        skill_link = self.home / "plugins" / "delegate" / "skills" / "delegate" / "SKILL.md"
-        scripts_link = self.home / "plugins" / "delegate" / "skills" / "delegate" / "scripts"
+        skill_copy = self.home / "plugins" / "delegate" / "skills" / "delegate" / "SKILL.md"
+        scripts_copy = self.home / "plugins" / "delegate" / "skills" / "delegate" / "scripts"
         self.assertTrue(plugin_manifest.is_file())
-        self.assertTrue(skill_link.is_symlink())
-        self.assertEqual(skill_link.read_text(encoding="utf-8"), "Delegate work.")
-        self.assertTrue(scripts_link.is_symlink())
-        self.assertEqual((scripts_link / "run.sh").read_text(encoding="utf-8"), "#!/bin/sh\necho hi\n")
+        self.assertTrue(skill_copy.is_file())
+        self.assertFalse(skill_copy.is_symlink())
+        self.assertEqual(skill_copy.read_text(encoding="utf-8"), "Delegate work.")
+        self.assertTrue(scripts_copy.is_dir())
+        self.assertFalse(scripts_copy.is_symlink())
+        self.assertEqual((scripts_copy / "run.sh").read_text(encoding="utf-8"), "#!/bin/sh\necho hi\n")
+
+        first = self.materialize(config, self.root / "first-home")
+        (scripts_dir / "run.sh").write_text("#!/bin/sh\necho changed\n", encoding="utf-8")
+        second = self.materialize(config, self.root / "second-home")
+        self.assertNotEqual(first, second)
+
+    def test_materialize_rejects_linked_skill_content(self) -> None:
+        """Reject source links instead of exposing mutable content to a running child."""
+
+        skill_dir = self.root / "skills" / "claude" / "delegate"
+        skill_dir.mkdir(parents=True)
+        target = self.root / "outside.md"
+        target.write_text("outside", encoding="utf-8")
+        (skill_dir / "SKILL.md").symlink_to(target)
+        with self.assertRaisesRegex(ValidationError, "regular"):
+            self.materialize(self.runtime_config(skills=("delegate",)), self.home)
 
     def test_materialize_uses_only_each_explicit_service_skill_root(self) -> None:
         config = self.runtime_config(skills=("delegate",))
@@ -532,6 +553,57 @@ class ClaudeAdapterTests(unittest.TestCase):
         # Plugins are loaded from their own directory, never copied into the
         # generated home, so no plugin file is materialized for them.
         self.assertFalse((self.home / "plugins" / "compressor").exists())
+
+    def test_duplicate_live_plugin_names_are_legacy_compatible(self) -> None:
+        """Require basename uniqueness only when selecting immutable assets."""
+
+        first = self.root / "first" / "shared"
+        second = self.root / "second" / "shared"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        config = self.runtime_config(plugins=(first, second))
+        self.materialize(config, self.home)
+        object.__setattr__(
+            config,
+            "plugin_snapshot_assets",
+            MappingProxyType({"shared": ("manifest.json",)}),
+        )
+        with self.assertRaisesRegex(ValidationError, "ambiguous"):
+            self.materialize(config, self.home)
+
+    def test_declared_plugin_assets_use_the_managed_snapshot_path(self) -> None:
+        """Load only explicitly selected plugin assets from the immutable home copy."""
+
+        plugin = self.root / "compressor"
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        (plugin / "hooks").mkdir()
+        (plugin / ".claude-plugin/plugin.json").write_text('{"name":"compressor"}')
+        (plugin / "hooks/hooks.json").write_text('{"hooks":{}}')
+        (plugin / "hooks/run.py").write_text("print('safe')\n")
+        (plugin / "credential.txt").write_text("must not copy")
+        assets = (
+            ".claude-plugin/plugin.json",
+            "hooks/hooks.json",
+            "hooks/run.py",
+        )
+        config = self.runtime_config(plugins=(plugin,))
+        object.__setattr__(
+            config,
+            "plugin_snapshot_assets",
+            MappingProxyType({"compressor": assets}),
+        )
+
+        self.materialize(config, self.home)
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir
+            )
+
+        managed = self.home / "declared-plugins/compressor"
+        argv = list(plan.argv)
+        self.assertEqual(argv[argv.index("--plugin-dir") + 1], str(managed))
+        self.assertTrue((managed / "hooks/run.py").is_file())
+        self.assertFalse((managed / "credential.txt").exists())
 
     def test_request_can_narrow_but_not_widen_profile_write(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):

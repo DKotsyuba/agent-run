@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -1087,7 +1088,7 @@ class CodexAppServerSessionTests(unittest.TestCase):
         import hashlib
 
         from agent_run.adapters.codex.app_server import CodexAppServerSession
-        from agent_run.verify import DEFAULT_SENTINEL
+        from agent_run.verify import ANSWER_FORMAT_PROOF, inspect_answer
 
         with tempfile.TemporaryDirectory() as directory:
             answer = Path(directory).resolve() / "answer.md"
@@ -1111,11 +1112,14 @@ class CodexAppServerSessionTests(unittest.TestCase):
             )
             outcome = session.wait(0)
             data = answer.read_bytes()
+            proof = inspect_answer(answer)
         self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
-        self.assertTrue(data.endswith(f"{DEFAULT_SENTINEL}\n".encode()))
+        self.assertEqual(data, b"final answer")
         self.assertEqual(outcome.answer_path, answer)
         self.assertEqual(outcome.answer_bytes, len(data))
         self.assertEqual(outcome.answer_sha256, hashlib.sha256(data).hexdigest())
+        self.assertTrue(proof.complete)
+        self.assertEqual(proof.proof_version, ANSWER_FORMAT_PROOF)
 
     def test_terminal_statuses_map_to_domain_outcomes(self) -> None:
         for status, expected in (
@@ -1229,6 +1233,36 @@ class CodexAppServerSessionTests(unittest.TestCase):
         )
         with self.assertRaises(ValidationError):
             session.cancel(-1)
+
+    def test_notification_flood_is_bounded_and_interrupt_has_priority(self) -> None:
+        """Endless notifications cannot delay steer forever or precede cancel."""
+
+        class FloodTransport(FakeTransport):
+            """Return a valid current-turn notification on every poll."""
+
+            def __init__(self) -> None:
+                """Initialize request and poll evidence."""
+
+                super().__init__()
+                self.polls = 0
+
+            def poll_event(self, timeout):
+                """Return one notification forever while recording the poll."""
+
+                self.polls += 1
+                return notification("turn/started", {"threadId": "th_1"})
+
+        transport = FloodTransport()
+        session = CodexAppServerSession(
+            transport, FakeSink(), "th_1", turn_id="turn_1"
+        )
+        session.cancel(1)
+        self.assertEqual(transport.polls, 0)
+        self.assertEqual(transport.requests[-1][0], "turn/interrupt")
+
+        session.steer("bounded")
+        self.assertLessEqual(transport.polls, 64)
+        self.assertEqual(transport.requests[-1][0], "turn/steer")
 
     def test_malformed_assistant_item_is_reported_without_losing_the_outcome(self) -> None:
         session, _transport, sink = self.start(
@@ -1363,6 +1397,69 @@ print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
         self.assertLess(time.monotonic() - started, 0.3)
         transport.terminate(0.1)
         self.assertIsNotNone(transport._process.poll())
+
+    def test_control_ack_deadline_is_capped_for_lifecycle_fairness(self) -> None:
+        """A silent steer acknowledgement cannot consume the caller's 30 seconds."""
+
+        transport = self.transport(
+            "import sys, time; sys.stdin.readline(); time.sleep(30)"
+        )
+        started = time.monotonic()
+
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for turn/steer"):
+            transport.request("turn/steer", {}, timeout_seconds=30)
+
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_terminate_interrupts_a_backpressured_writer(self) -> None:
+        """Transport cleanup wakes a writer even when the child never reads."""
+
+        transport = self.transport(_SLEEPING_SERVER)
+        errors: list[BaseException] = []
+
+        def write() -> None:
+            """Attempt one oversized request and capture its terminal error."""
+
+            try:
+                transport.request(
+                    "initialize", {"text": "x" * 1_048_576}, timeout_seconds=30
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        time.sleep(0.1)
+        transport.terminate(0.1)
+        writer.join(timeout=3)
+
+        self.assertFalse(writer.is_alive())
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], ConnectionError)
+
+    def test_owned_transport_open_close_is_clean_for_one_hundred_cycles(self) -> None:
+        """Repeated local app-server sessions reap children and reader threads."""
+
+        script = """
+import json
+import sys
+request = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}), flush=True)
+sys.stdin.read()
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            for _ in range(100):
+                transport = ProcessTransport(transport_plan(script, directory))
+                try:
+                    self.assertEqual(transport.request("initialize", {}), {"ok": True})
+                    transport.close()
+                    self.assertEqual(transport._process.wait(timeout=3), 0)
+                    transport._reader.join(timeout=1)
+                    transport._stderr_reader.join(timeout=1)
+                    self.assertFalse(transport._reader.is_alive())
+                    self.assertFalse(transport._stderr_reader.is_alive())
+                finally:
+                    transport.terminate(0.1)
 
 
     def test_request_deadline_holds_while_notifications_keep_arriving(self) -> None:

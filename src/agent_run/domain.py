@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Final, Mapping, NewType
 
 from .errors import StateTransitionError, ValidationError
+from .effective_policy import Constraint
 
 
 AgentId = NewType("AgentId", str)
@@ -151,6 +152,17 @@ class OrchestratorRef:
 
 @dataclass(frozen=True)
 class StartRequest:
+    """One validated launch request and its explicit policy requirements.
+
+    Runtime/model/profile/task/workdir select execution; write, effort, timeout,
+    read roots, output schema, fast mode and account refine it. Orchestrator and
+    request ID provide notification and replay identity. Required constraints
+    are an immutable typed set of policy boundaries admission must prove; the
+    empty default preserves legacy behavior. Paths resolve at construction,
+    while invalid scalar, collection, policy, or filesystem inputs raise
+    ValidationError before persistence.
+    """
+
     runtime: str
     model: str
     profile: str
@@ -165,6 +177,7 @@ class StartRequest:
     request_id: str | None = None
     fast: bool = False
     account: str | None = None
+    required_constraints: frozenset[Constraint] = frozenset()
 
     def __post_init__(self) -> None:
         for name in ("runtime", "model", "profile", "task"):
@@ -173,6 +186,12 @@ class StartRequest:
             raise ValidationError("fast must be a boolean")
         if self.account is not None:
             _nonblank("account", self.account)
+        if not isinstance(self.required_constraints, frozenset) or any(
+            not isinstance(item, Constraint) for item in self.required_constraints
+        ):
+            raise ValidationError(
+                "required_constraints must be a frozenset of Constraint values"
+            )
         if self.timeout_seconds is not None:
             if isinstance(self.timeout_seconds, bool) or not isinstance(
                 self.timeout_seconds, (int, float)

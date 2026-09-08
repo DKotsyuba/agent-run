@@ -13,7 +13,6 @@ from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.glm.adapter import ADAPTER as GLM
 from agent_run.adapters.qwen.adapter import ADAPTER as QWEN
-from agent_run.adapters.opencode.adapter import ADAPTER as OPENCODE
 from agent_run.dispatch import Session, call_tool
 from agent_run.domain import AgentStatus
 from agent_run.errors import ValidationError
@@ -22,10 +21,6 @@ from test_claude_session import FakeSink
 
 class ArgumentsTests(unittest.TestCase):
     """Verify that native selectors cannot accidentally request a fresh session."""
-
-    def test_opencode_does_not_advertise_resume(self):
-        """The unsupported runtime must be rejected before continuation admission."""
-        self.assertNotIn(Capability.RESUME, OPENCODE.describe().capabilities)
 
     def test_resume_arguments_preserve_other_settings(self):
         """Both CLI families target an exact ID without changing prompt or answer path."""
@@ -50,15 +45,17 @@ class ArgumentsTests(unittest.TestCase):
 
     def test_adapters_pass_exact_native_resume_selector_to_process(self):
         """Exercise each real CLI adapter's launch wiring without contacting a provider."""
-        for adapter, module, session_type, argv in (
-            (CLAUDE, "claude", "ClaudeSession", ("claude", "--session-id", "fresh")),
-            (GLM, "claude", "ClaudeSession", ("claude", "--session-id", "fresh")),
-            (QWEN, "qwen", "QwenSession", ("qwen", "-p", "task")),
+        for adapter, session_type, argv in (
+            (CLAUDE, "ClaudeSession", ("claude", "--session-id", "fresh")),
+            (GLM, "ClaudeSession", ("claude", "--session-id", "fresh")),
+            (QWEN, "QwenSession", ("qwen", "-p", "task")),
         ):
             with self.subTest(adapter=adapter.describe().name):
                 plan = LaunchPlan(argv, Path("/tmp"), {}, "task", Path("/tmp/log"), {}, resume_session_id="saved")
-                namespace = "agent_run.adapters." + module + ".adapter."
-                with patch(namespace + "subprocess.Popen") as popen, patch(namespace + session_type):
+                launch_globals = adapter.launch.__func__.__globals__
+                with patch.object(launch_globals["subprocess"], "Popen") as popen, patch.dict(
+                    launch_globals, {session_type: Mock()}
+                ):
                     adapter.launch(plan, Mock())
                 self.assertEqual(popen.call_args.args[0][-2:], ["--resume", "saved"])
                 self.assertNotIn("--session-id", popen.call_args.args[0])
@@ -66,6 +63,30 @@ class ArgumentsTests(unittest.TestCase):
 
 class StreamIdentityTests(unittest.TestCase):
     """Exercise the actual stream decoder with a lightweight process double."""
+
+    def test_descriptorless_injected_stdin_accepts_initial_input(self):
+        """In-memory process doubles retain the initial-input contract without ``fileno``."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = {
+                "type": "result", "subtype": "success", "is_error": False,
+                "result": "answer", "usage": {},
+            }
+            process = Mock()
+            process.stdout = io.StringIO(json.dumps(result) + "\n")
+            process.stderr = io.StringIO()
+            process.stdin = io.StringIO()
+            process.wait.return_value = 0
+            plan = LaunchPlan(
+                ("engine",), root, {}, "initial\n", root / "runtime.jsonl", {}, root / "answer.md"
+            )
+
+            session = ClaudeSession(process, plan, FakeSink())
+
+            self.assertEqual(process.stdin.getvalue(), "initial\n")
+            self.assertEqual(session.wait(3).status, AgentStatus.SUCCEEDED)
 
     def test_resume_refuses_missing_or_wrong_stream_identity(self):
         """An otherwise successful result cannot certify a different native context."""

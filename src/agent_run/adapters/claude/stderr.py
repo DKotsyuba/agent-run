@@ -8,6 +8,7 @@ from typing import IO
 from .stream import sanitize_line
 
 _DEFAULT_TAIL_BYTES = 4096
+_READ_CHARS = 4096
 
 
 class StderrTail:
@@ -37,21 +38,41 @@ class StderrTail:
         self._tail = bytearray()
 
     def drain(self) -> None:
-        """Read stderr to EOF and retain only the bounded redacted tail."""
+        """Read bounded chunks to EOF and retain only the redacted byte tail.
+
+        Complete lines use structural JSON redaction. A newline-free suffix is
+        capped to the output limit plus the longest literal-secret overlap, so a
+        secret split across read boundaries is still replaced without buffering
+        an unbounded child write.
+        """
 
         if self._stream is None:
             return
+        pending = ""
+        overlap = max((len(secret) for secret in self._secrets), default=0)
+        pending_limit = self._limit_bytes + overlap + _READ_CHARS
         try:
-            for raw_line in self._stream:
-                self._tail.extend(
-                    sanitize_line(raw_line, self._secrets).encode(
-                        "utf-8", errors="replace"
-                    )
-                )
-                if len(self._tail) > self._limit_bytes:
-                    del self._tail[:-self._limit_bytes]
+            while True:
+                chunk = self._stream.read(_READ_CHARS)
+                if not chunk:
+                    break
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    self._retain(sanitize_line(line + "\n", self._secrets))
+                if len(pending) > pending_limit:
+                    pending = pending[-pending_limit:]
+            if pending:
+                self._retain(sanitize_line(pending, self._secrets))
         except (OSError, ValueError):
             return
+
+    def _retain(self, text: str) -> None:
+        """Append sanitized text while keeping at most the configured bytes."""
+
+        self._tail.extend(text.encode("utf-8", errors="replace"))
+        if len(self._tail) > self._limit_bytes:
+            del self._tail[:-self._limit_bytes]
 
     def text(self) -> str | None:
         """Return the stripped redacted stderr tail, or ``None`` when empty."""

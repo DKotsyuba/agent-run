@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -106,4 +108,43 @@ class RustProvisioningTests(unittest.TestCase):
 
         self._proxy("rustup", "#!/bin/sh\necho 'rustup 1.28.0'\n")
         with self.assertRaisesRegex(ValidationError, "rustup >= 1.28.1"):
+            rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
+
+    def test_probe_failures_use_actual_tool_operation_labels(self) -> None:
+        """Public provisioning diagnostics identify each failing Rust probe."""
+
+        cases = (
+            ("rustup", "rustup --version", "if [ \"$1\" = --version ]; then exit 1; fi\n"),
+            ("rustup", "rustup show", "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\nif [ \"$1\" = show ]; then exit 1; fi\n"),
+            ("rustup", "rustup component", "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\nif [ \"$1\" = show ]; then echo active; exit 0; fi\nif [ \"$1\" = component ]; then exit 1; fi\n"),
+            ("cargo", "cargo --version", "exit 1\n"),
+            ("rustc", "rustc --version", "exit 1\n"),
+            ("rust-analyzer", "rust-analyzer --version", "exit 1\n"),
+        )
+        for name, label, failure in cases:
+            with self.subTest(label=label):
+                for executable in ("cargo", "rustc", "rust-analyzer"):
+                    self._proxy(executable, "#!/bin/sh\nexit 0\n")
+                self._proxy(
+                    "rustup",
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\n"
+                    "if [ \"$1\" = show ]; then echo active; exit 0; fi\n"
+                    "printf '%s\\n' rust-src rust-analyzer\n",
+                )
+                self._proxy(name, "#!/bin/sh\n" + failure)
+                with self.assertRaisesRegex(ValidationError, rf"cannot {label}:"):
+                    rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
+
+    def test_probe_timeout_and_oserror_use_actual_tool_operation_label(self) -> None:
+        """Public provisioning maps timeout and spawn failures to fixed labels."""
+
+        with mock.patch(
+            "agent_run.adapters.rust.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(["rustup", "--version"], 5),
+        ), self.assertRaisesRegex(ValidationError, r"timed out running rustup --version after 5s"):
+            rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)
+        with mock.patch(
+            "agent_run.adapters.rust.subprocess.run", side_effect=OSError("spawn failed")
+        ), self.assertRaisesRegex(ValidationError, r"cannot execute rustup --version:"):
             rust_environment({}, self.config(RustConfig(self.rustup_home, self.cargo_bin)), self.workdir)

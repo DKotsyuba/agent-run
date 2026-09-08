@@ -193,6 +193,17 @@ command = ["echo", "done"]
         self.assertEqual(config.runtimes["fake"].models, ("test",))
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))
 
+    def test_legacy_opencode_runtime_is_ignored(self) -> None:
+        """Ignore legacy OpenCode configuration without importing its adapter."""
+
+        config = self.load(
+            """schema_version = 1
+[runtimes.opencode]
+unexpected_legacy_field = "retired"
+"""
+        )
+        self.assertNotIn("opencode", config.runtimes)
+
     def test_delivery_queue_binary_is_optional_and_absolute(self) -> None:
         self.assertIsNone(self.load("schema_version = 1\n").delivery.codex_queue_bin)
         configured = self.load(
@@ -312,6 +323,8 @@ plugins = {value}
         )
 
     def test_runtime_plugins_default_to_none_and_must_be_existing_directories(self) -> None:
+        """Plugin roots stay optional and accept only unique existing directories."""
+
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw).resolve()
             plugin = directory / "compressor"
@@ -334,6 +347,70 @@ plugins = {value}
                 self.runtime_with_plugins(f'"{plugin}"', directory)
             with self.assertRaisesRegex(ValidationError, "declared twice"):
                 self.runtime_with_plugins(f'["{plugin}", "{plugin}"]', directory)
+
+    def test_plugin_snapshot_assets_are_explicit_relative_and_immutable(self) -> None:
+        """A unique configured plugin accepts only explicit safe relative assets."""
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            plugin = root / "compressor"
+            plugin.mkdir()
+            config = self.load(
+                f'''schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "{root}"
+models = ["test"]
+plugins = ["{plugin}"]
+plugin_snapshot_assets = {{ compressor = ["manifest.json", "skills/SKILL.md"] }}
+'''
+            )
+            assets = config.runtimes["fake"].plugin_snapshot_assets
+            self.assertEqual(assets, {"compressor": ("manifest.json", "skills/SKILL.md")})
+            with self.assertRaises(TypeError):
+                cast(dict[str, tuple[str, ...]], assets)["compressor"] = ("other",)
+
+    def test_plugin_snapshot_assets_reject_ambiguous_or_unsafe_declarations(self) -> None:
+        """Reject unknown, ambiguous, empty, duplicate, absolute, dot, and glob assets."""
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            plugin = root / "compressor"
+            plugin.mkdir()
+            prefix = f'''schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example.adapter:ADAPTER"
+binary = "/bin/echo"
+home = "{root}"
+models = ["test"]
+plugins = ["{plugin}"]
+'''
+            invalid = (
+                ('plugin_snapshot_assets = { missing = ["manifest.json"] }', "unknown plugin"),
+                ('plugin_snapshot_assets = { compressor = [] }', "must not be empty"),
+                ('plugin_snapshot_assets = { compressor = ["x", "x"] }', "duplicates"),
+                ('plugin_snapshot_assets = { compressor = ["/absolute"] }', "relative POSIX"),
+                ('plugin_snapshot_assets = { compressor = ["../escape"] }', "relative POSIX"),
+                ('plugin_snapshot_assets = { compressor = ["assets/*.json"] }', "relative POSIX"),
+                ('plugin_snapshot_assets = { compressor = ["assets/{name}.json"] }', "relative POSIX"),
+                ('plugin_snapshot_assets = { compressor = "manifest.json" }', "array of strings"),
+            )
+            for declaration, message in invalid:
+                with self.subTest(declaration=declaration), self.assertRaisesRegex(
+                    ValidationError, message
+                ):
+                    self.load(prefix + declaration + "\n")
+
+            other = root / "other" / "compressor"
+            other.mkdir(parents=True)
+            with self.assertRaisesRegex(ValidationError, "match one configured plugin"):
+                self.load(
+                    prefix.replace(f'plugins = ["{plugin}"]', f'plugins = ["{plugin}", "{other}"]')
+                    + 'plugin_snapshot_assets = { compressor = ["manifest.json"] }\n'
+                )
 
     def test_core_and_capacity_bounds_fail_during_load(self) -> None:
         invalid = (
@@ -398,6 +475,18 @@ adapter = "example:ADAPTER"
 binary = "/bin/echo"
 home = "/tmp/home"
 models = ["test"]
+service_mode = "managed"
+""",
+                "runtimes.fake.service_mode",
+            ),
+            (
+                """schema_version = 1
+[runtimes.fake]
+enabled = true
+adapter = "example:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/home"
+models = ["test"]
 [[runtimes.fake.hooks]]
 event = "x"
 command = ["x"]
@@ -409,6 +498,14 @@ extra = true
         for text, field in cases:
             with self.subTest(field=field), self.assertRaisesRegex(ValidationError, field.replace("[", r"\[").replace("]", r"\]")):
                 self.load(text)
+
+    def test_validation_errors_do_not_echo_rejected_values(self) -> None:
+        """Strict Pydantic failures expose field paths without raw configured values."""
+
+        secret = "sk-super-secret-value"
+        with self.assertRaises(ValidationError) as caught:
+            self.load(f'schema_version = 1\n[core]\nextra = "{secret}"\n')
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_unsupported_versions_and_secret_literals_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValidationError, "schema_version"):

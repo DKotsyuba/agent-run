@@ -20,7 +20,6 @@ TOPICS: tuple[str, ...] = (
     "mcp-servers",
     "plugins",
     "models",
-    "service",
     "releases",
     "migrations",
     "troubleshoot",

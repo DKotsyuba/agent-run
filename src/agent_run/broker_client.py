@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,28 +55,67 @@ class BrokerClient:
         self._socket: socket.socket | None = None
         self._stream = None
         self._next_id = 1
+        self._lock = threading.Lock()
+        self._aborted = threading.Event()
 
     def _connect(self, timeout: float) -> None:
+        """Open one abortable Unix-socket connection within ``timeout`` seconds.
+
+        The socket is published before ``connect`` blocks so another thread may
+        interrupt it through ``abort``. Cancellation raises ``ConnectionError``
+        and leaves no reusable socket or stream.
+        """
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
+        with self._lock:
+            if self._aborted.is_set():
+                sock.close()
+                raise ConnectionError("broker call cancelled")
+            self._socket = sock
         try:
             sock.connect(str(self.socket_path))
-            self._socket = sock
-            self._stream = sock.makefile("rb")
+            with self._lock:
+                if self._aborted.is_set() or self._socket is not sock:
+                    raise ConnectionError("broker call cancelled")
+                self._stream = sock.makefile("rb")
         except OSError:
+            with self._lock:
+                if self._socket is sock:
+                    self._socket = None
             sock.close()
             raise
 
     def _close(self) -> None:
-        stream, sock = self._stream, self._socket
-        self._stream = None
-        self._socket = None
+        with self._lock:
+            stream, sock = self._stream, self._socket
+            self._stream = None
+            self._socket = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         if stream is not None:
             stream.close()
         if sock is not None:
             sock.close()
 
+    def abort(self) -> None:
+        """Interrupt this caller's connect or response wait without cancelling broker work."""
+        self._aborted.set()
+        with self._lock:
+            sock = self._socket
+            self._socket = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
     def _request(self, method: str, params: dict | None, timeout: float) -> object:
+        """Send one bounded frame and validate its matching response envelope."""
+
         if self._socket is None or self._stream is None:
             self._connect(timeout)
         request_id = self._next_id
@@ -99,6 +140,8 @@ class BrokerClient:
             raise ConnectionError("broker returned invalid JSON") from error
         if not isinstance(response, dict):
             raise ConnectionError("broker returned an invalid response")
+        if response.get("id") != request_id:
+            raise ConnectionError("broker returned a mismatched response id")
         if "error" in response:
             error = response["error"]
             if not isinstance(error, dict):
@@ -120,28 +163,48 @@ class BrokerClient:
         return response["result"]
 
     def call(self, method: str, params: dict | None = None, timeout: float = _DEFAULT_TIMEOUT) -> object:
-        """Forward one API request, retrying once after a connection failure."""
+        """Forward one API request within a positive finite response deadline.
+
+        ``method`` is nonblank, ``params`` is an optional object, and ``timeout``
+        bounds connect, write, and response reads for each of at most two
+        connection attempts. Validation errors are never retried; transport
+        exhaustion raises :class:`BrokerUnavailable`.
+        """
+
         if not isinstance(method, str) or not method:
             raise ValidationError("method must be a nonblank string")
         if params is not None and not isinstance(params, dict):
             raise ValidationError("params must be an object or null")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValidationError("timeout must be positive and finite")
+        timeout = float(timeout)
         for attempt in range(2):
             try:
                 return self._request(method, params, timeout)
             except (OSError, ConnectionError, TimeoutError):
                 self._close()
+                if self._aborted.is_set():
+                    raise ConnectionError("broker call cancelled") from None
                 if attempt == 0:
                     continue
                 raise BrokerUnavailable(_BROKER_MESSAGE)
 
     def ping(self) -> bool:
+        """Return whether the broker answered the protocol ping."""
+
         return self.call("ping") == {"ok": True}
 
     def start(self, request: StartRequest) -> SimpleNamespace:
         """Serialize and submit ``request`` to the resident broker asynchronously.
 
         Converts paths and the optional orchestrator reference to JSON-safe
-        values, returns ``agent_id`` and ``created``, and leaves execution
+        values, including sorted policy requirements, returns ``agent_id`` and
+        ``created``, and leaves execution
         owned by the broker after this client closes. Raises ``ValidationError``
         for invalid input, ``AgentRunError`` for malformed results or domain
         failures, and ``BrokerUnavailable`` when the broker cannot be reached.
@@ -162,6 +225,9 @@ class BrokerClient:
             }),
             "request_id": request.request_id, "fast": request.fast,
             "account": request.account,
+            "required_constraints": sorted(
+                constraint.value for constraint in request.required_constraints
+            ),
         }
         result = self.call("start", params)
         if (

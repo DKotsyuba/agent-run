@@ -65,8 +65,21 @@ session ids, argv/environment values, and credentials are never persisted.
 
 One connection may send many requests; on a single connection they are
 answered in order. Open several connections for parallelism — dispatch is
-serialized server-side, so calls are cheap-interleaved, not truly parallel
-(`wait` methods are the exception, see below).
+serialized within two bounded owner lanes. Durable start/resume/cancel/steer
+admission uses the control lane; status, answer, model probing and other reads
+use a separate lane, so a slow read cannot starve cancellation. The server caps
+connections and queued calls, reserves one connection slot for parsed control
+methods, rejects ordinary overload with JSON-RPC code `-32001`, and
+returns `-32002` when its request deadline expires. Input frames remain limited
+to 1 MiB; idle reads and response writes also have finite deadlines. A client
+holding the reserved slot without completing its first frame is disconnected
+within 0.5 seconds.
+
+The socket path is fenced by a lifetime native file lock. A pre-existing socket
+is reclaimed only when connecting returns `ECONNREFUSED` and the inode is still
+the one inspected. A slow or malformed ping is never evidence that an owner is
+dead. Shutdown rejects submissions, resolves queued calls, closes active
+connections, and closes each thread-affine service in its owner context.
 
 ## Method surface
 
@@ -77,11 +90,10 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-The tool set (19 at the time of writing, same names as the MCP server):
+The tool set (same names as the MCP server):
 `start`, `resume`, `chain`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
 `list_agents`, `list_orchestrators`, `models`, `limits`, `capacity_order`,
-`fast`, `doc`, and the workflow verbs `workflow_start`, `workflow_status`,
-`workflow_answer`, `workflow_cancel`, `workflow_resume`.
+`fast`, and `doc`.
 
 See [continuations](continuations.md) for native-context `resume` and chronological
 `chain` pages, including inherited authority, idempotency and history availability.
@@ -91,6 +103,16 @@ See [continuations](continuations.md) for native-context `resume` and chronologi
 `account` for one account. In `start`, explicit `fast` wins over an account
 override, which wins over the runtime default; an omitted account uses the
 runtime's configured default account.
+
+`start.required_constraints` is an optional array of unique policy constraint
+names from tool discovery. Omission means no additional requirement. A named
+constraint must have enforcement strong enough for that boundary before any
+agent row is admitted; advisory evidence and unrelated tool filtering do not
+satisfy isolation requirements. Unknown or duplicate names are invalid.
+
+`request_id` replay is scoped to the caller namespace in the original request.
+A later PostToolUse notification binding does not change that identity. Clients
+that omit `orchestrator` share the unbound namespace across fresh connections.
 
 `list_orchestrators` (optional `limit`, default 100, max 1000) is a read-only
 view of the orchestrator sessions that launched agents. Each item carries
@@ -105,6 +127,17 @@ The page reports `total` (exact number of items available) and `complete`.
 Agent views returned by `status`, `list_agents`, and `summary` include
 `effort` — the reasoning effort requested at launch, or `null` when the
 request did not set one.
+
+Those views also include nullable `cleanup` evidence from the latest owned
+process cleanup observation: attempted `signals`, `scope`, `group_gone`,
+nullable `descendants_gone`, `confirmed`, and nullable `process_group_id`.
+Confirmation requires the original group and the readable pre-signal owned set
+to be gone. Page projections resolve progress, warnings, delivery evidence and
+cleanup in one batched state query.
+
+New rows also expose immutable `policy` evidence with the runtime/platform and
+one entry for every known constraint: actual enforcement, support, whether the
+caller required it, exact scope, and reason. Historical rows return `null`.
 
 `capacity_order` takes no parameters. It returns fresh non-exhausted physical
 quota routes in descending priority, plus deferred evidence, exhausted
@@ -133,8 +166,6 @@ Two extra methods exist only on this transport:
   `answer` tool). If the watcher timeout expires first, the result is a
   normal reply carrying `"timed_out": true` and the current status — not
   a JSON-RPC error.
-- `workflow_wait` — same contract with `run_id` for workflow runs.
-
 A pending `wait` does not block other requests: run it on its own
 connection and keep issuing calls on another.
 

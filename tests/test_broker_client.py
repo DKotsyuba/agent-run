@@ -4,10 +4,12 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_run.broker_client import BrokerClient
 from agent_run.domain import StartRequest
 from agent_run.errors import AgentRunError, BrokerUnavailable, ValidationError
+from agent_run.effective_policy import Constraint
 
 
 class FakeSocketApi:
@@ -91,13 +93,26 @@ class BrokerClientTests(unittest.TestCase):
         self.addCleanup(server.close)
         client = BrokerClient(self.path)
         self.addCleanup(client.close)
-        request = StartRequest("codex", "model", "review", "task", Path(self.tempdir.name))
+        request = StartRequest(
+            "codex",
+            "model",
+            "review",
+            "task",
+            Path(self.tempdir.name),
+            required_constraints=frozenset(
+                {Constraint.EXTERNAL_NETWORK_ISOLATION}
+            ),
+        )
 
         result = client.start(request)
 
         self.assertEqual((result.agent_id, result.created), ("ag-test", True))
         self.assertEqual(seen[0]["method"], "start")
         self.assertEqual(seen[0]["params"]["workdir"], str(request.workdir))
+        self.assertEqual(
+            seen[0]["params"]["required_constraints"],
+            ["external_network_isolation"],
+        )
         with self.assertRaisesRegex(AgentRunError, "invalid start result"):
             client.start(request)
         with self.assertRaisesRegex(ValidationError, "request must be a StartRequest"):
@@ -119,6 +134,17 @@ class BrokerClientTests(unittest.TestCase):
     def test_unavailable_has_actionable_message(self):
         with self.assertRaisesRegex(BrokerUnavailable, "agent-run broker is not running"):
             BrokerClient(self.path).call("limits")
+
+    def test_invalid_deadlines_are_rejected_before_socket_creation(self) -> None:
+        """Nonpositive and nonfinite client deadlines never reach transport."""
+
+        for value in (0, -1, True, "1", float("inf"), float("nan")):
+            with self.subTest(value=value), patch(
+                "agent_run.broker_client.socket.socket"
+            ) as socket_factory:
+                with self.assertRaisesRegex(ValidationError, "positive and finite"):
+                    BrokerClient(self.path).call("limits", timeout=value)
+                socket_factory.assert_not_called()
 
     def test_validation_error_mapping(self):
         server = FakeSocketApi(self.path, lambda request: {
@@ -142,6 +168,73 @@ class BrokerClientTests(unittest.TestCase):
             BrokerClient(self.path).call("limits")
         self.assertEqual(str(context.exception), "domain failure")
         self.assertEqual(context.exception.broker_error_code, "AuthError")
+
+    def test_abort_interrupts_each_connect_without_retry_or_worker_leak(self):
+        """Cancel repeated blocking connects and release every socket and worker."""
+
+        for _ in range(8):
+            entered = threading.Event()
+            closed = threading.Event()
+            sockets = []
+            failures = []
+
+            class ConnectingSocket:
+                """Controlled socket whose connect blocks until abort closes it."""
+
+                def __init__(self, *_args):
+                    """Record this single connection attempt."""
+                    sockets.append(self)
+
+                def settimeout(self, _timeout):
+                    """Accept the client timeout without changing controlled timing."""
+
+                def connect(self, _path):
+                    """Block like an in-progress connect until another thread aborts it."""
+                    entered.set()
+                    if not closed.wait(1):
+                        raise TimeoutError("abort did not interrupt connect")
+                    raise OSError("connect interrupted")
+
+                def shutdown(self, _how):
+                    """Wake the controlled connect operation."""
+                    closed.set()
+
+                def close(self):
+                    """Release the controlled socket and wake its connect operation."""
+                    closed.set()
+
+            client = BrokerClient(self.path)
+
+            def call():
+                """Capture the terminal cancellation raised by the client worker."""
+                try:
+                    client.call("limits")
+                except BaseException as error:
+                    failures.append(error)
+
+            with patch("agent_run.broker_client.socket.socket", ConnectingSocket):
+                worker = threading.Thread(target=call)
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                client.abort()
+                worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(sockets), 1, "an aborted connect must not retry")
+            self.assertTrue(closed.is_set())
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], ConnectionError)
+
+        entered = threading.Event()
+        closed = threading.Event()
+        sockets = []
+        client = BrokerClient(self.path)
+        client.abort()
+        with patch("agent_run.broker_client.socket.socket", ConnectingSocket):
+            with self.assertRaisesRegex(ConnectionError, "cancelled"):
+                client.call("limits")
+        self.assertFalse(entered.is_set(), "pre-cancelled clients must not call connect")
+        self.assertEqual(len(sockets), 1)
+        self.assertTrue(closed.is_set())
 
 
 if __name__ == "__main__":

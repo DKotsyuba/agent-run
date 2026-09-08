@@ -22,6 +22,12 @@ from ..claude.stderr import StderrTail
 _STREAM_CLOSED = object()
 #: Environment names whose literal values must never survive stderr capture.
 _SENSITIVE_ENV = re.compile(r"(?:AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)", re.I)
+#: Control requests may not delay supervisor lifecycle checks beyond one second.
+_CONTROL_TIMEOUT_SECONDS = 1.0
+#: Methods whose acknowledgements are advisory before supervisor enforcement.
+_CONTROL_METHODS = frozenset({"turn/steer", "turn/interrupt"})
+#: Maximum interval before a blocked write notices transport cancellation.
+_WRITE_POLL_SECONDS = 0.05
 
 
 def _environment_secrets(environment: Mapping[str, str]) -> tuple[str, ...]:
@@ -67,6 +73,7 @@ class ProcessTransport:
         if self._process.stdin is not None:
             os.set_blocking(self._process.stdin.fileno(), False)
         self._next_id = 1
+        self._closing = threading.Event()
         self._incoming: queue.Queue = queue.Queue()
         self._notifications: deque = deque()
         self._stream_closed = False
@@ -149,15 +156,19 @@ class ProcessTransport:
             raise self._closed_error(method, deadline) from error
         sent = 0
         while sent < len(frame):
+            if self._closing.is_set():
+                raise self._closed_error(method, deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"codex app-server timed out writing {method}")
             try:
-                _, writable, _ = select.select([], [fd], [], remaining)
+                _, writable, _ = select.select(
+                    [], [fd], [], min(remaining, _WRITE_POLL_SECONDS)
+                )
             except (OSError, ValueError) as error:
                 raise self._closed_error(method, deadline) from error
             if not writable:
-                raise TimeoutError(f"codex app-server timed out writing {method}")
+                continue
             try:
                 count = os.write(fd, frame[sent:])
             except BlockingIOError:
@@ -178,10 +189,12 @@ class ProcessTransport:
         """Send one JSON-RPC request or raise with bounded early-exit stderr.
 
         ``method`` is the app-server method and ``params`` its object payload.
-        ``timeout_seconds`` is a positive finite deadline. A valid response
-        mapping is returned; protocol errors raise ``ValidationError``, a live
-        timeout raises ``TimeoutError``, and early process exit raises
-        ``ConnectionError`` with exit/signal evidence and redacted stderr.
+        ``timeout_seconds`` is a positive finite deadline; steer and interrupt
+        controls are capped at one second so lifecycle checks cannot starve. A
+        valid response mapping is returned; protocol errors raise
+        ``ValidationError``, a live timeout raises ``TimeoutError``, and early
+        process exit raises ``ConnectionError`` with exit/signal evidence and
+        redacted stderr.
         """
 
         if (
@@ -190,7 +203,12 @@ class ProcessTransport:
             or not 0 < timeout_seconds < float("inf")
         ):
             raise ValidationError("timeout_seconds must be positive and finite")
-        deadline = time.monotonic() + float(timeout_seconds)
+        budget = (
+            min(float(timeout_seconds), _CONTROL_TIMEOUT_SECONDS)
+            if method in _CONTROL_METHODS
+            else float(timeout_seconds)
+        )
+        deadline = time.monotonic() + budget
         request_id = self._next_id
         self._next_id += 1
         self._write(
@@ -262,6 +280,7 @@ class ProcessTransport:
         SIGTERM, then SIGKILL when the nonnegative grace period expires.
         """
 
+        self._closing.set()
         try:
             if self._process.poll() is None:
                 self._process.terminate()
@@ -277,6 +296,7 @@ class ProcessTransport:
     def close(self) -> None:
         """Close request input without terminating the owned child process."""
 
+        self._closing.set()
         if self._process.stdin:
             self._process.stdin.close()
 

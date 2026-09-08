@@ -1,112 +1,349 @@
+"""Integration coverage for the official MCP SDK stdio transport."""
+
+from __future__ import annotations
+
 import json
+import os
+import socket
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
-from unittest import mock
+from unittest.mock import patch
 
+import anyio
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+from agent_run.broker_client import MAX_LINE_BYTES, BrokerClient
+from agent_run.mcp import _BoundedInput, serve
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+_SERVER = """
+from agent_run.errors import AgentRunError
+from agent_run.mcp import serve
+
+class Broker:
+    \"\"\"Controlled resident-broker fixture for one SDK stdio process.\"\"\"
+
+    def call(self, method, params=None, timeout=600.0):
+        \"\"\"Return one deterministic result or one typed domain failure.\"\"\"
+        if method == "limits":
+            raise AgentRunError("controlled broker failure")
+        return {"method": method, "arguments": params or {}}
+
+serve(lambda: Broker())
+"""
+
+
+class McpSdkTests(unittest.TestCase):
+    """Exercise a real official MCP client against the official SDK stdio server."""
+
+    def test_official_client_negotiates_lists_and_calls_over_stdio(self) -> None:
+        """Verify the SDK owns handshake and wire parsing while the broker stays thin."""
+
+        async def exercise() -> None:
+            """Connect one official client and assert discovery plus structured tool output."""
+            environment = {**os.environ, "PYTHONPATH": str(_ROOT / "src")}
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-c", _SERVER],
+                env=environment,
+                cwd=_ROOT,
+            )
+            with anyio.fail_after(10):
+                async with stdio_client(parameters) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        initialized = await session.initialize()
+                        self.assertEqual(initialized.server_info.name, "agent-run")
+                        tools = await session.list_tools()
+                        self.assertIn("models", {tool.name for tool in tools.tools})
+                        result = await session.call_tool(
+                            "models", {"orchestrator": {"id": "root", "name": "root"}}
+                        )
+            self.assertFalse(result.is_error)
+            self.assertEqual(result.structured_content["method"], "models")
+            self.assertEqual(
+                result.structured_content["arguments"]["orchestrator"]["id"], "root"
+            )
+
+        anyio.run(exercise)
+
+    def test_domain_error_is_an_official_tool_error_result(self) -> None:
+        """Keep broker domain failures in MCP tool results instead of raw JSON-RPC errors."""
+
+        async def exercise() -> None:
+            """Call the controlled failing broker method through the official SDK client."""
+            environment = {**os.environ, "PYTHONPATH": str(_ROOT / "src")}
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-c", _SERVER],
+                env=environment,
+                cwd=_ROOT,
+            )
+            with anyio.fail_after(10):
+                async with stdio_client(parameters) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        result = await session.call_tool("limits")
+            self.assertTrue(result.is_error)
+            self.assertEqual(result.structured_content["error"]["message"], "controlled broker failure")
+
+        anyio.run(exercise)
+
+    def test_cancelled_caller_does_not_cancel_admitted_broker_call(self) -> None:
+        """Abort the real client worker while server-owned admitted work continues."""
+
+        temporary = tempfile.TemporaryDirectory()
+        socket_path = Path(temporary.name) / "broker.sock"
+        done_path = Path(temporary.name) / "worker.done"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen()
+        listener.settimeout(0.05)
+        admitted = threading.Event()
+        release = threading.Event()
+        stop = threading.Event()
+        connections = []
+        handlers = []
+
+        def handle(client: socket.socket) -> None:
+            """Own admitted work until release even after its caller disconnects."""
+            with client:
+                request = json.loads(client.makefile("rb").readline())
+                admitted.set()
+                if not release.wait(3):
+                    return
+                response = {"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
+                try:
+                    client.sendall(json.dumps(response).encode() + b"\n")
+                except OSError:
+                    pass
+
+        def accept() -> None:
+            """Accept every client connection so a forbidden retry is observable."""
+            while not stop.is_set():
+                try:
+                    client, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    return
+                connections.append(client)
+                handler = threading.Thread(target=handle, args=(client,), daemon=True)
+                handlers.append(handler)
+                handler.start()
+
+        accept_thread = threading.Thread(target=accept, daemon=True)
+        accept_thread.start()
+        server_code = """
+import os
+from pathlib import Path
 from agent_run.broker_client import BrokerClient
-from agent_run.dispatch import TOOLS
-from agent_run.errors import AgentRunError, BrokerUnavailable, ValidationError
-from agent_run.mcp import MAX_LINE_BYTES, serve
+from agent_run.mcp import serve
 
+class ObservedBrokerClient(BrokerClient):
+    \"\"\"Signal when the actual callback worker has left BrokerClient.call.\"\"\"
 
-class FakeBroker:
-    def __init__(self, result=None, error=None) -> None:
-        self.calls = []
-        self.result = result if result is not None else {"ok": True}
-        self.error = error
+    def call(self, method, params=None, timeout=600.0):
+        \"\"\"Run the real broker call and publish its worker-finally marker.\"\"\"
+        try:
+            return super().call(method, params, timeout)
+        finally:
+            Path(os.environ[\"AGENT_RUN_TEST_DONE\"]).touch()
 
-    def call(self, method, params=None, timeout=600):
-        self.calls.append((method, params))
-        if self.error is not None:
-            raise self.error
-        return self.result
+serve(lambda: ObservedBrokerClient(Path(os.environ[\"AGENT_RUN_TEST_SOCKET\"])))
+"""
 
+        async def exercise() -> None:
+            """Cancel one official MCP request and observe real broker resources."""
+            environment = {
+                **os.environ,
+                "PYTHONPATH": str(_ROOT / "src"),
+                "AGENT_RUN_TEST_SOCKET": str(socket_path),
+                "AGENT_RUN_TEST_DONE": str(done_path),
+            }
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-c", server_code],
+                env=environment,
+                cwd=_ROOT,
+            )
+            with anyio.fail_after(10):
+                async with stdio_client(parameters) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        scope = anyio.CancelScope()
+                        finished = anyio.Event()
 
-class McpTests(unittest.TestCase):
-    def run_server(self, lines, broker=None):
-        source = StringIO("".join(
-            line if isinstance(line, str) else json.dumps(line) + "\n"
-            for line in lines
-        ))
-        output = StringIO()
-        selected = broker or FakeBroker()
-        self.assertEqual(serve(selected, source, output), 0)
-        responses = [json.loads(line) for line in output.getvalue().splitlines()]
-        return selected, responses
+                        async def call() -> None:
+                            """Run one cancellable request through the official client."""
+                            try:
+                                with scope:
+                                    await session.call_tool("models")
+                            finally:
+                                finished.set()
 
-    def test_initialize_and_tools_list_are_local_without_broker(self) -> None:
-        _, responses = self.run_server(
-            [
-                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "test-version"}},
-                {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-            ],
-            broker=None,
-        )
-        self.assertEqual(len(responses), 2)
-        self.assertEqual(responses[0]["result"]["protocolVersion"], "test-version")
-        self.assertEqual(responses[0]["result"]["capabilities"], {"tools": {"listChanged": False}})
-        self.assertEqual(responses[1]["result"]["tools"], list(TOOLS))
+                        async with anyio.create_task_group() as group:
+                            group.start_soon(call)
+                            self.assertTrue(await anyio.to_thread.run_sync(admitted.wait, 2))
+                            scope.cancel()
+                            await finished.wait()
+                            while not done_path.exists():
+                                await anyio.sleep(0.01)
+                            await anyio.sleep(0.1)
+                            self.assertFalse(release.is_set())
+                            self.assertEqual(len(connections), 1, "aborted calls must not retry")
+                            release.set()
+                            group.cancel_scope.cancel()
 
-    def test_tools_call_forwards_name_and_arguments_verbatim(self) -> None:
-        broker = FakeBroker({"answer": 42})
-        arguments = {"agent_id": "ag-1", "nested": {"items": [1, True]}}
-        _, responses = self.run_server([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "limits", "arguments": arguments, "_meta": {"x": 1}}},
-        ], broker)
-        self.assertEqual(broker.calls, [("limits", arguments)])
-        self.assertEqual(responses[0]["result"], {
-            "content": [{"type": "text", "text": "result in structuredContent"}],
-            "structuredContent": {"answer": 42},
-            "isError": False,
-        })
+        try:
+            anyio.run(exercise)
+        finally:
+            release.set()
+            stop.set()
+            listener.close()
+            accept_thread.join(timeout=1)
+            for handler in handlers:
+                handler.join(timeout=1)
+            temporary.cleanup()
 
-    def test_broker_validation_error_uses_mcp_error_envelope(self) -> None:
-        _, responses = self.run_server(
-            [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "status", "arguments": {}}}],
-            FakeBroker(error=ValidationError("missing arguments: ['agent_id']")),
-        )
-        result = responses[0]["result"]
-        self.assertTrue(result["isError"])
-        self.assertEqual(result["structuredContent"]["error"], {
-            "code": "ValidationError", "message": "missing arguments: ['agent_id']"
-        })
+    def test_oversized_stdio_frame_stays_bounded_and_uses_sdk_error_path(self) -> None:
+        """Reject a frame above the former one-MiB ceiling without manual MCP parsing."""
 
-    def test_broker_down_is_tool_error_but_tools_list_still_works(self) -> None:
-        broker = FakeBroker(error=BrokerUnavailable(
-            "agent-run broker is not running; start it with `agent-run api serve` or its launchd job (agent-run doc service)"
-        ))
-        _, responses = self.run_server([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "limits", "arguments": {}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        ], broker)
-        self.assertTrue(responses[0]["result"]["isError"])
-        self.assertIn("agent-run broker is not running", responses[0]["result"]["structuredContent"]["error"]["message"])
-        self.assertFalse("error" in responses[1])
-        self.assertEqual(responses[1]["result"]["tools"], list(TOOLS))
+        class Broker:
+            """Fixture that is never reached when the bounded input rejects a frame."""
 
-    def test_unknown_tool_is_rejected_before_broker_call(self) -> None:
-        broker = FakeBroker()
-        _, responses = self.run_server([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "not-a-tool", "arguments": {}}},
-        ], broker)
-        self.assertEqual(broker.calls, [])
-        self.assertEqual(responses[0]["result"]["structuredContent"]["error"]["code"], "unknown_tool")
+            def call(self, method: str, params: dict | None = None, timeout: float = 600.0) -> object:
+                """Fail if an oversized protocol frame reaches the broker boundary."""
+                raise AssertionError("oversized frame reached broker")
 
-    def test_protocol_errors_and_size_limit_remain_bounded(self) -> None:
-        oversized = "x" * (MAX_LINE_BYTES + 1) + "\n"
-        broker, responses = self.run_server([
-            "{bad json\n",
-            oversized,
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": []},
-        ])
-        self.assertEqual([response["error"]["code"] for response in responses], [-32700, -32700, -32602])
-        self.assertEqual(broker.calls, [])
+        stdout = StringIO()
+        self.assertEqual(MAX_LINE_BYTES, 1024 * 1024)
+        with patch("agent_run.mcp.MAX_LINE_BYTES", 64):
+            self.assertEqual(serve(lambda: Broker(), StringIO("x" * 65 + "\n"), stdout), 0)
+        self.assertEqual(stdout.getvalue(), "")
 
+    def test_pipe_reader_preserves_a_split_utf8_frame(self) -> None:
+        """Keep reading when an incremental UTF-8 decoder needs the next pipe chunk."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
 
+        def write_split_frame() -> None:
+            """Write one JSON frame with the two bytes of é separated by a delay."""
+            os.write(write_fd, b'{"text":"\xc3')
+            time.sleep(0.05)
+            os.write(write_fd, b'\xa9"}\n')
+            os.close(write_fd)
 
+        async def consume() -> list[str]:
+            """Collect the bounded reader's complete SDK input frames."""
+            return [line async for line in _BoundedInput(reader)]
 
-if __name__ == "__main__":
-    unittest.main()
+        writer = threading.Thread(target=write_split_frame)
+        writer.start()
+        try:
+            self.assertEqual(anyio.run(consume), ['{"text":"é"}'])
+        finally:
+            writer.join(timeout=1)
+            reader.close()
+
+    def test_full_one_mib_frame_completes_within_bounded_deadline(self) -> None:
+        """Read the exact protocol ceiling without truncation or pathological delay."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        payload = b"x" * MAX_LINE_BYTES + b"\n"
+
+        def write_frame() -> None:
+            """Feed the ceiling-sized frame through a real bounded pipe."""
+            try:
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(write_fd, view) :]
+            finally:
+                os.close(write_fd)
+
+        async def consume() -> list[str]:
+            """Collect one ceiling-sized frame under a sane five-second deadline."""
+            with anyio.fail_after(5):
+                return [line async for line in _BoundedInput(reader)]
+
+        writer = threading.Thread(target=write_frame)
+        writer.start()
+        try:
+            frames = anyio.run(consume)
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(len(frames[0]), MAX_LINE_BYTES)
+        finally:
+            writer.join(timeout=1)
+            reader.close()
+
+    def test_idle_pipe_cancellation_releases_the_raw_read_worker(self) -> None:
+        """Cancel an idle pipe read without starting a blocking worker or closing the fd."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+
+        async def consume() -> None:
+            """Block on an idle bounded input until the enclosing lifecycle cancels it."""
+            async for _ in _BoundedInput(reader):
+                pass
+
+        async def cancel_reader() -> None:
+            """Cancel the server-side reader under a bounded parent deadline."""
+            with anyio.fail_after(1):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(consume)
+                    await anyio.sleep(0.05)
+                    group.cancel_scope.cancel()
+
+        try:
+            with patch(
+                "agent_run.mcp.anyio.to_thread.run_sync",
+                side_effect=AssertionError("pipe reads must not use worker threads"),
+            ):
+                anyio.run(cancel_reader)
+            os.fstat(read_fd)
+        finally:
+            os.close(write_fd)
+            reader.close()
+
+    def test_endless_oversized_frame_remains_cancellable(self) -> None:
+        """Yield to cancellation while dropping an endless frame without a newline."""
+        read_fd, write_fd = os.pipe()
+        reader = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        stop = threading.Event()
+
+        def write_forever() -> None:
+            """Keep the pipe readable until cancellation closes the test resources."""
+            try:
+                while not stop.is_set():
+                    os.write(write_fd, b"x" * 8192)
+            except OSError:
+                pass
+
+        async def consume() -> None:
+            """Cancel the oversized reader under a bounded parent deadline."""
+            with anyio.fail_after(1):
+                async with anyio.create_task_group() as group:
+                    group.start_soon(_consume)
+                    await anyio.sleep(0.05)
+                    group.cancel_scope.cancel()
+
+        async def _consume() -> None:
+            """Drain frames until the enclosing cancellation scope stops the reader."""
+            async for _ in _BoundedInput(reader):
+                pass
+
+        writer = threading.Thread(target=write_forever, daemon=True)
+        writer.start()
+        try:
+            anyio.run(consume)
+        finally:
+            stop.set()
+            reader.close()
+            os.close(write_fd)
+            writer.join(timeout=1)

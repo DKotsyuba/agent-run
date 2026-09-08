@@ -50,10 +50,14 @@ CREATE TABLE agents (
   sequence INTEGER NOT NULL DEFAULT 1 CHECK (sequence >= 1),
   resume_of_runtime_session_id TEXT,
   identity_json TEXT,
+  supervisor_birth_time REAL,
+  startup_owner_birth_time REAL,
   UNIQUE (orchestrator_session_id, request_id)
 );
 CREATE UNIQUE INDEX agents_parent_agent_id_unique
   ON agents(parent_agent_id) WHERE parent_agent_id IS NOT NULL;
+CREATE INDEX idx_agents_request_id
+  ON agents(request_id) WHERE request_id IS NOT NULL;
 
 CREATE TABLE attempts (
   id TEXT PRIMARY KEY,
@@ -151,6 +155,12 @@ CREATE TABLE context_receipts (
   injected_at REAL NOT NULL
 );
 
+CREATE TABLE reconciliation_cursors (
+  name TEXT PRIMARY KEY,
+  created_at REAL NOT NULL,
+  agent_id TEXT NOT NULL
+);
+
 CREATE TABLE workflow_runs (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -166,7 +176,7 @@ CREATE TABLE workflow_runs (
   plan_json TEXT,
   result_json TEXT,
   orchestrator_session_id TEXT REFERENCES orchestrator_sessions(id)
-);
+, owner_birth_time REAL);
 
 CREATE TABLE workflow_deliveries (
   id TEXT PRIMARY KEY,
@@ -262,4 +272,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 13;
+PRAGMA user_version = 16;

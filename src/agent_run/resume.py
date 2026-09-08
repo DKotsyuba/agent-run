@@ -28,6 +28,7 @@ from .accounts import account_runtime_home
 from .config import RuntimeConfig
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import ValidationError
+from .effective_policy import Constraint
 from .profiles import AgentProfile
 from .state.db import agent_row, idempotent_agent, immediate, nonblank, positive_number
 
@@ -73,9 +74,11 @@ def replayed_resume(
     """Return an accepted matching resume before inspecting mutable resources.
 
     Validate the caller-controlled task, timeout and notification reference.
-    A known request ID must match its immutable parent, prompt, effective timeout
-    and caller; conflicts raise ValidationError. Unknown or absent IDs return
-    None and normal admission still performs its atomic replay/race check.
+    A request ID known within the same caller namespace must match its immutable
+    parent, prompt and effective timeout; conflicts raise ValidationError. A
+    different caller namespace is a distinct request and proceeds to the normal
+    one-child admission guard. Unknown or absent IDs return None and normal
+    admission still performs its atomic replay/race check.
     This read-only lookup never resolves filesystem paths or current config.
     """
     nonblank("task", task)
@@ -87,7 +90,7 @@ def replayed_resume(
     if request_id is None:
         return None
     nonblank("request_id", request_id)
-    existing = idempotent_agent(connection, request_id)
+    existing = idempotent_agent(connection, request_id, orchestrator)
     if existing is None:
         return None
     stored = json.loads(existing["request_json"])
@@ -249,6 +252,7 @@ def inherited_request(
     overrides the parent's when not ``None`` and inherits it when ``None``, and
     ``request_id`` and ``orchestrator`` belong to *this* call -- the new agent's
     notifications bind to the resuming caller, never to the original one.
+    Explicit policy constraints are inherited unchanged from the parent request.
 
     Raise :class:`ValidationError` -- through :class:`StartRequest` validation
     -- when the inherited workdir or a read root no longer exists. Such a
@@ -257,6 +261,12 @@ def inherited_request(
     """
 
     stored = json.loads(str(row["request_json"]))
+    try:
+        required_constraints = frozenset(
+            Constraint(value) for value in stored.get("required_constraints", ())
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError("invalid inherited policy constraints") from error
     return StartRequest(
         runtime=str(row["runtime"]),
         model=str(row["model"]),
@@ -276,4 +286,5 @@ def inherited_request(
         request_id=request_id,
         fast=bool(snapshot.get("fast", False)),
         account=label,
+        required_constraints=required_constraints,
     )

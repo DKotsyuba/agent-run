@@ -6,6 +6,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import unittest
 from dataclasses import dataclass
@@ -507,6 +508,13 @@ target = "auth.json"
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(output), {"agent_id": "x"})
 
+    def test_removed_workflow_commands_are_not_parsed(self):
+        """Legacy workflow and batch entry points are absent from the CLI."""
+
+        for command in (["workflow", "status", "wf_old"], ["batch", "--file", "-"]):
+            with self.subTest(command=command), self.assertRaises(ValidationError):
+                cli._parser().parse_args(command)
+
     def test_capacity_launchd_renders_config_without_state_or_collection(self):
         import plistlib
 
@@ -673,78 +681,6 @@ target = "auth.json"
             )
             self.assertEqual(config.stat().st_ino, before)
 
-    def test_service_start_renders_the_proven_descriptor_without_secrets(self):
-        from agent_run.adapters.opencode import service as opencode_service
-
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory).resolve()
-            runtime_home = home / "runtimes" / "opencode" / "home"
-            runtime_home.mkdir(parents=True)
-            binary = home / "opencode2"
-            binary.write_text("#!/bin/sh\n", encoding="utf-8")
-            (home / "config.toml").write_text(
-                "schema_version = 1\n"
-                "[runtimes.opencode]\n"
-                "enabled = true\n"
-                'adapter = "agent_run.adapters.opencode.adapter:ADAPTER"\n'
-                f'binary = "{binary}"\n'
-                f'home = "{runtime_home}"\n'
-                'models = ["omniroute/deepseek-v4-pro"]\n'
-                'service_mode = "managed"\n',
-                encoding="utf-8",
-            )
-            started = opencode_service.ServiceStart(
-                opencode_service.ServiceDescriptor(
-                    host="127.0.0.1",
-                    port=41999,
-                    config_home=runtime_home / "xdg" / "config",
-                    data_home=runtime_home / "xdg" / "data",
-                    pid=4242,
-                    config_hash="a" * 64,
-                    version="2.1.0",
-                ),
-                False,
-            )
-
-            def run(argv):
-                stdout = io.StringIO()
-                stderr = io.StringIO()
-                code = cli.main(
-                    ["--home", str(home), "service", *argv],
-                    stdin=io.StringIO(),
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-                return code, stdout.getvalue(), stderr.getvalue()
-
-            with patch.object(
-                opencode_service, "start_service", return_value=started
-            ) as start:
-                code, output, error = run(["start", "--runtime", "opencode"])
-            self.assertEqual((code, error), (0, ""))
-            payload = json.loads(output)
-            self.assertEqual(payload["runtime"], "opencode")
-            self.assertFalse(payload["reused"])
-            self.assertEqual(payload["service"]["port"], 41999)
-            self.assertEqual(payload["service"]["pid"], 4242)
-            self.assertEqual(payload["service"]["version"], "2.1.0")
-            self.assertNotIn("password", output.lower())
-            runtime, passed_home = start.call_args.args
-            self.assertEqual((passed_home, runtime.binary), (runtime_home, binary))
-            self.assertIsNone(start.call_args.kwargs["port"])
-
-            with patch.object(
-                opencode_service, "start_service", return_value=started
-            ) as explicit:
-                code, _output, error = run(
-                    ["start", "--runtime", "opencode", "--port", "41999"]
-                )
-            self.assertEqual((code, error), (0, ""))
-            self.assertEqual(explicit.call_args.kwargs["port"], 41999)
-
-            code, _output, error = run(["start", "--runtime", "codex"])
-            self.assertEqual(code, 2)
-            self.assertIn("opencode", json.loads(error)["error"]["message"])
 
     def test_doctor_delegates_to_the_structured_read_only_seam(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1059,11 +995,35 @@ target = "auth.json"
         self.assertNotIn("agent_run.mcp", sys.modules)
 
     def test_mcp_uses_injected_stdio_for_initialize_and_tools_list(self):
+        """Keep the injected SDK stream alive until its concurrent list reply lands."""
+
+        class _DelayedEofInput(io.StringIO):
+            """Delay EOF briefly after all injected protocol frames are consumed."""
+
+            def read(self, size=-1):
+                """Return buffered frames, then hold EOF for pending SDK callbacks."""
+                value = super().read(size)
+                if not value:
+                    time.sleep(0.2)
+                return value
+
         requests = (
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            },
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
         )
-        stdin = io.StringIO("".join(json.dumps(request) + "\n" for request in requests))
+        stdin = _DelayedEofInput(
+            "".join(json.dumps(request) + "\n" for request in requests)
+        )
         stdout = io.StringIO()
         stderr = io.StringIO()
         code = cli.main(
@@ -1082,8 +1042,7 @@ target = "auth.json"
                 "capacity_order", "start", "fast", "cancel", "steer", "status", "list_agents",
                 "list_orchestrators",
                 "summary", "transcript", "answer", "models", "limits", "doc",
-                "workflow_start", "workflow_status", "workflow_cancel", "workflow_answer",
-                "workflow_resume", "resume", "chain",
+                "resume", "chain",
             ],
         )
 

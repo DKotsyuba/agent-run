@@ -69,11 +69,15 @@ Options: `--publish-only` skips local deployment; `--home` defaults to
 `~/.agent-run`; `--python` defaults to `python3.14`; `--launchd-prefix` defaults
 to `com.<login>.agent-run`; `--timeout` and `--poll` are positive seconds,
 defaulting to 3600 and 10. Publication itself can run on other operating systems.
-Timeouts stop waiting; they do not cancel a remote workflow or active agent.
+Timeouts stop waiting; they do not cancel a remote CI run or active agent.
 
-Local deployment installs only the verified wheel, verifies or reuses a sealed
-release, and runs isolated init/doctor/API/MCP checks. It waits for every active
-agent and workflow, reserves the SQLite writer while stopping API admission and
+Local deployment verifies the wheel and `requirements.lock`, installs the
+hash-pinned dependency closure, installs the wheel without re-resolving it, and
+runs `pip check` before it seals the release. A release missing the lock is
+refused. It then verifies or reuses the sealed release and runs isolated
+init/doctor/API/MCP checks. It waits for every active
+agent and any birth-verified writer from an archived workflow runtime, reserves
+the SQLite writer while stopping API admission and
 loaded periodic jobs, then rechecks quiescence. Before migration it backs up
 SQLite with its backup API, saves configuration and the previous pointer under
 `<home>/standalone/backups/`, and records a private deployment journal. Migration
@@ -93,6 +97,10 @@ needs to wait for SQLite, it has an independent 120-second allowance. An already
 migrated target is reused without running migration again. If recovery itself
 fails, the error identifies the journal and backup and explicitly warns that
 services may remain stopped. Preserve those files and resume the same version.
+
+Release builds generate `dist/requirements.lock` from the committed graph with
+`uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock`.
+The lock is checksummed, attested, and uploaded with the wheel and source archive.
 Incomplete candidate directories are preserved under an `.incomplete-<time>`
 suffix before rebuilding; a corrupt or incomplete current release is refused.
 Reconnect existing MCP clients after the update; application hosts are not killed.
@@ -128,7 +136,9 @@ gh attestation verify agent_run-0.1.0-py3-none-any.whl \
 ## Distribution boundary
 
 GitHub Releases is the only public distribution channel. Each release carries
-the Python wheel, source archive, checksums, and GitHub provenance attestation.
+the Python wheel, source archive, hash-pinned `requirements.lock`, checksums,
+and GitHub provenance attestation. The version PR regenerates `uv.lock` and
+checks it before staging the package version, changelog, and lock together.
 The project does not publish to PyPI, GitHub Packages, Docker, or GHCR.
 
 ## Repository settings

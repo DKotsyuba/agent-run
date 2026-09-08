@@ -12,6 +12,8 @@ from agent_run.verify import (
     ANSWER_INCOMPLETE,
     ANSWER_PRESENT,
     DEFAULT_SENTINEL,
+    MAX_ANSWER_PAYLOAD_BYTES,
+    AnswerOversizedError,
     ENGINE_VANISHED,
     GROUP_SURVIVED,
     NO_ANSWER,
@@ -61,9 +63,26 @@ class InspectAnswerTests(unittest.TestCase):
         self.assertEqual(proof.sha256, hashlib.sha256(body.encode("utf-8")).hexdigest())
 
     def test_sentinel_split_across_a_read_boundary_is_found(self) -> None:
-        head = "x" * (65536 - len(DEFAULT_SENTINEL) // 2)
-        proof = inspect_answer(self.write(head + DEFAULT_SENTINEL + "tail"))
+        frame = f"\n{DEFAULT_SENTINEL}\n"
+        head = "x" * (65536 - len(frame) // 2)
+        proof = inspect_answer(self.write(head + frame))
         self.assertTrue(proof.sentinel_found)
+
+    def test_sentinel_mentioned_in_truncated_prose_is_incomplete(self) -> None:
+        """Do not accept marker text unless it is the exact terminal frame."""
+
+        proof = inspect_answer(self.write(f"mentioned {DEFAULT_SENTINEL} then cut off"))
+        self.assertFalse(proof.complete)
+        self.assertFalse(proof.sentinel_found)
+
+    def test_oversized_answer_is_rejected_before_streaming(self) -> None:
+        """Reject a sparse oversized payload from its opened descriptor size."""
+
+        path = self.root / "answer.md"
+        with path.open("wb") as stream:
+            stream.truncate(MAX_ANSWER_PAYLOAD_BYTES + 1)
+        with self.assertRaises(AnswerOversizedError):
+            inspect_answer(path)
 
     def test_no_sentinel_required_accepts_any_nonempty_answer(self) -> None:
         proof = inspect_answer(self.write("free form"), sentinel=None)
@@ -102,7 +121,7 @@ class VerifyCompletionTests(unittest.TestCase):
         outcome = verify_completion(
             session_outcome=Outcome(AgentStatus.SUCCEEDED),
             stop_reason=None,
-            answer=self.proof(f"ok {DEFAULT_SENTINEL}"),
+            answer=self.proof(f"ok\n{DEFAULT_SENTINEL}\n"),
             group_gone=False,
         )
         self.assertIs(outcome.status, AgentStatus.FAILED)
@@ -124,7 +143,7 @@ class VerifyCompletionTests(unittest.TestCase):
         self.assertEqual(outcome.failure_text, "silence=3.0s/active")
 
     def test_cancel_and_timeout_preserve_a_complete_answer(self) -> None:
-        body = f"usable partial result\n{DEFAULT_SENTINEL}"
+        body = f"usable partial result\n{DEFAULT_SENTINEL}\n"
         proof = self.proof(body)
         for reason, status in (
             ("cancel", AgentStatus.CANCELLED),
@@ -183,7 +202,7 @@ class VerifyCompletionTests(unittest.TestCase):
         self.assertEqual(outcome.exit_code, 0)
 
     def test_success_with_a_complete_answer_carries_the_proof(self) -> None:
-        body = f"the answer\n{DEFAULT_SENTINEL}"
+        body = f"the answer\n{DEFAULT_SENTINEL}\n"
         proof = self.proof(body)
         outcome = verify_completion(
             session_outcome=Outcome(

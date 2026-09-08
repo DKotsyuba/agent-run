@@ -10,7 +10,7 @@ from threading import Barrier
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run.domain import OrchestratorRef
+from agent_run.domain import StartRequest
 from agent_run.doctor import run_doctor
 from agent_run.errors import SchemaMigrationRequired, ValidationError
 from agent_run.state import (
@@ -106,16 +106,25 @@ def _schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]
 
 
 def _strip_v13_lineage(connection: sqlite3.Connection) -> None:
-    """Remove migration 013's artifacts so a store looks genuinely pre-v13.
+    """Remove migrations 013 through 016 so a store looks genuinely pre-v13.
 
     The downgrade fixtures below start from the *current* schema and peel
-    later versions back off. ``parent_agent_id`` is covered by a partial
-    unique index, and SQLite refuses to drop an indexed column, so the index
-    goes first. ``connection`` is left uncommitted for the caller.
+    later versions back off. The post-v12 agent indexes must go before their
+    columns or version stamp are removed. ``connection`` is left uncommitted
+    for the caller.
     """
 
+    connection.execute("DROP TABLE reconciliation_cursors")
+    connection.execute("DROP INDEX idx_agents_request_id")
     connection.execute("DROP INDEX agents_parent_agent_id_unique")
+    workflow_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(workflow_runs)")
+    }
+    if "owner_birth_time" in workflow_columns:
+        connection.execute("ALTER TABLE workflow_runs DROP COLUMN owner_birth_time")
     for column in (
+        "startup_owner_birth_time",
+        "supervisor_birth_time",
         "identity_json",
         "resume_of_runtime_session_id",
         "sequence",
@@ -213,14 +222,31 @@ class MigrationRegistryTests(unittest.TestCase):
         database = Path(directory.name) / "state.db"
         store = StateStore.initialize(database)
         try:
-            session = OrchestratorRef("stub", "session")
-            kept = store.create_workflow_run("kept", "sha", plan=[], orchestrator=session)
-            store.start_workflow_run(kept)
-            store.finish_workflow_run(kept, "failed", result={"attempt": 1})
-            retired = store.create_workflow_run("retired", "sha", plan=[], orchestrator=session)
-            store.start_workflow_run(retired)
-            store.finish_workflow_run(retired, "failed")
-            store.resume_workflow_run(retired, "1 runner")
+            kept = "wf_kept"
+            retired = "wf_retired"
+            store.connection.execute(
+                """INSERT INTO orchestrator_sessions
+                   (id, transport, external_session_id, created_at, last_seen_at)
+                   VALUES ('os_test', 'stub', 'session', 1, 1)"""
+            )
+            store.connection.executemany(
+                """INSERT INTO workflow_runs
+                   (id, name, script_sha, status, created_at, result_json,
+                    orchestrator_session_id)
+                   VALUES (?, ?, 'sha', ?, 1, ?, 'os_test')""",
+                (
+                    (kept, "kept", "failed", '{"attempt":1}'),
+                    (retired, "retired", "running", None),
+                ),
+            )
+            store.connection.executemany(
+                """INSERT INTO workflow_deliveries
+                   (id, run_id, orchestrator_session_id, state, next_attempt_at,
+                    run_status)
+                   VALUES (?, ?, 'os_test', 'pending', 1, 'failed')""",
+                (("wd_kept", kept), ("wd_retired", retired)),
+            )
+            store.connection.commit()
         finally:
             store.close()
 
@@ -318,7 +344,9 @@ class MigrationRegistryTests(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_open_repairs_poisoned_v5_store_before_reconciliation(self) -> None:
+    def test_open_repairs_poisoned_v5_store_and_preserves_history(self) -> None:
+        """Old workflow rows survive while the current agent store remains usable."""
+
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.db"
             run_id = "wf_poisoned"
@@ -330,8 +358,21 @@ class MigrationRegistryTests(unittest.TestCase):
                     store.connection.execute(
                         "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
                     ).fetchone()[0],
-                    "lost",
+                    "running",
                 )
+                created = store.create_agent(
+                    StartRequest(
+                        "codex",
+                        "model",
+                        "profile",
+                        "task",
+                        Path(directory),
+                        timeout_seconds=60,
+                    ),
+                    task_summary="summary",
+                    config_revision="cfg",
+                )
+                self.assertEqual(store.get_agent(created.agent_id)["status"], "created")
                 store.connection.execute(
                     """INSERT INTO workflow_steps
                        (run_id, step_key, spec_json, status)

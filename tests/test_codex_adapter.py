@@ -16,10 +16,15 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
+from agent_run.adapters.codex import adapter as codex_adapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
 from agent_run.adapters.developer_environment import configured_environment_keys
+from agent_run.adapters.snapshots import (
+    inspect_runtime_snapshots,
+    runtime_snapshot_index_sha256,
+)
 from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
@@ -115,12 +120,10 @@ env_from = ["PATH"]
         with self.assertRaises(TypeError):
             ADAPTER.materialize(self.runtime_config(), self.home)
 
-    def test_validate_requires_file_link_auth_and_no_service_mode(self) -> None:
+    def test_validate_requires_file_link_auth(self) -> None:
         ADAPTER.validate(self.runtime_config())
         with self.assertRaisesRegex(ValidationError, "file_link auth bridge"):
             ADAPTER.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("TOKEN",))))
-        with self.assertRaisesRegex(ValidationError, "service_mode"):
-            ADAPTER.validate(self.runtime_config(service_mode="managed"))
 
     def test_declared_rust_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
         """Codex keeps isolated homes while declared Rust reaches both child boundaries."""
@@ -203,9 +206,22 @@ env_from = ["PATH"]
         import tomllib
 
         config = self.runtime_config(mcp=("agent_lsp",))
+        source_script = self.agent_run_root / "skills" / "codex" / "demo" / "scripts" / "run.sh"
+        source_script.parent.mkdir()
+        source_script.write_text("#!/bin/sh\necho snapshot\n", encoding="utf-8")
         digest_one = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
 
         self.assertEqual((self.home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "demo skill")
+        another_home = self.agent_run_root / "another-home"
+        ADAPTER.materialize(
+            config,
+            another_home,
+            mcp_servers=self.resolved_mcp(),
+            skills_root=self.agent_run_root / "skills" / "codex",
+        )
+        copied_script = another_home / "skills" / "demo" / "scripts" / "run.sh"
+        self.assertEqual(copied_script.read_text(encoding="utf-8"), "#!/bin/sh\necho snapshot\n")
+        self.assertFalse(copied_script.is_symlink())
         generated = (self.home / "config.toml").read_text(encoding="utf-8")
         self.assertNotIn("allow_login_shell", generated)
         self.assertNotIn("skills =", generated)
@@ -488,11 +504,15 @@ env_from = ["PATH"]
     # -- probe ------------------------------------------------------------
 
     def test_probe_reports_health_without_live_calls(self) -> None:
-        config = self.runtime_config()
+        binary = self.agent_run_root / "version-runtime"
+        binary.write_text("#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n", encoding="utf-8")
+        binary.chmod(0o700)
+        config = self.runtime_config(binary=binary)
         ADAPTER.materialize(config, self.home, mcp_servers={})
         health = ADAPTER.probe(config, self.home)
         self.assertTrue(health.available)
         self.assertTrue(health.authenticated)
+        self.assertEqual(health.version, "runtime 1.2.3")
 
         missing_binary = self.runtime_config(binary=Path("/no/such/codex-binary"))
         unhealthy = ADAPTER.probe(missing_binary, self.home)
@@ -501,7 +521,8 @@ env_from = ["PATH"]
 
     def test_probe_refuses_a_bridge_pointing_away_from_the_configured_source(self) -> None:
         config = self.runtime_config()
-        ADAPTER.materialize(config, self.home, mcp_servers={})
+        revision = ADAPTER.materialize(config, self.home, mcp_servers={})
+        index_sha256 = runtime_snapshot_index_sha256(self.home, revision)
         impostor = self.auth_source_dir / "other-auth.json"
         impostor.write_text("{}", encoding="utf-8")
         bridge = self.home / "auth.json"
@@ -510,6 +531,33 @@ env_from = ["PATH"]
 
         health = ADAPTER.probe(config, self.home)
         self.assertFalse(health.authenticated)
+        inspection = inspect_runtime_snapshots(
+            self.home, revision, expected_sha256=index_sha256
+        )
+        self.assertFalse(inspection.verified)
+        self.assertIn("auth.json", inspection.hash_mismatches)
+
+    def test_materialize_never_blesses_a_swapped_auth_bridge_target(self) -> None:
+        """Derive expected auth identity before publishing the mutable bridge path."""
+
+        config = self.runtime_config()
+        impostor = self.auth_source_dir / "other-auth.json"
+        impostor.write_text("{}", encoding="utf-8")
+        real_create = codex_adapter.create_symlink_bridge
+
+        def create_then_swap(home, relative, source):
+            """Retarget the bridge immediately after the real atomic publication."""
+
+            bridge = real_create(home, relative, source)
+            bridge.unlink()
+            bridge.symlink_to(impostor)
+            return bridge
+
+        with patch.object(
+            codex_adapter, "create_symlink_bridge", side_effect=create_then_swap
+        ):
+            with self.assertRaisesRegex(ValidationError, "target does not match"):
+                ADAPTER.materialize(config, self.home, mcp_servers={})
 
     def test_probe_refuses_a_regular_file_in_place_of_the_bridge(self) -> None:
         config = self.runtime_config()

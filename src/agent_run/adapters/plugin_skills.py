@@ -2,9 +2,8 @@
 
 agent-run ships owner-authored skill copies below ``<home>/skills/<runtime>/``
 and can also declare plugins that carry skills of their own. When both offer
-the same name the child sees the skill twice -- claude loads two plugin dirs
-exporting one name, opencode logs ``duplicate skill name`` and drops one of
-them, and neither host says which copy won. So a declared plugin that ships
+the same name the child sees the skill twice; neither host says which copy
+won. So a declared plugin that ships
 ``skills/<name>/SKILL.md`` owns that name outright, and the copy below the
 runtime skills root is simply not read.
 

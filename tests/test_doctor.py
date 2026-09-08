@@ -16,6 +16,7 @@ from agent_run.config import Config, RuntimeAuthConfig, RuntimeConfig, RuntimeHo
 from agent_run.doctor import run_doctor
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.launch_evidence import FAILURE_KIND_EXECUTABLE_MISSING
+from agent_run.process_identity import ProcessObservation, ProcessState
 from agent_run.state import StateStore
 
 from tests.test_launch import child_pythonpath
@@ -84,7 +85,10 @@ models = ["model"]
             report = run_doctor(
                 home,
                 at=1_000,
-                process_probe=lambda pid, pgid: (False, None, True),
+                process_probe=lambda pid, birth, pgid: (
+                    ProcessObservation(ProcessState.DEAD),
+                    True,
+                ),
             )
 
             codes = {finding.code for finding in report.findings}
@@ -542,4 +546,3 @@ class CapacityStalenessTests(unittest.TestCase):
         rows = [self._row("aged", 100, None), self._row("recent", 900, None)]
 
         self.assertEqual(self._lanes(rows), ["aged"])
-

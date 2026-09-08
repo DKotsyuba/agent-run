@@ -2,10 +2,9 @@
 
 Qwen Code authenticates through ``OPENAI_API_KEY`` and talks to an
 OpenAI-compatible endpoint named by ``OPENAI_BASE_URL``. A child launched
-without those exported into the process environment falls back to the same
-managed OmniRoute keychain item the OpenCode server password helper reads
-(mirrors :mod:`agent_run.adapters.opencode.password`), so the operator does
-not have to export a secret by hand into every shell that starts a qwen
+without those exported into the process environment falls back to the managed
+OmniRoute keychain item, so the operator does not have to export a secret by
+hand into every shell that starts a qwen
 child. The process environment always wins when both a value and a keychain
 entry exist.
 """

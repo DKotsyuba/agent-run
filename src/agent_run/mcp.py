@@ -1,126 +1,238 @@
-"""Minimal bounded JSON-RPC 2.0 stdio transport over the resident broker."""
+"""Official MCP SDK stdio transport over the resident broker boundary."""
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
+import os
+import stat
 import sys
 import time
-from typing import IO, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from typing import IO, Protocol, cast
 
-from .broker_client import BrokerClient
-from .dispatch import TOOL_NAMES, TOOLS, _bounded, _emit, _error, _jsonable, _valid_id
+import anyio
+import mcp.types as mcp_types
+from mcp.server.lowlevel import Server
+from mcp.server.stdio import stdio_server
+
+from .broker_client import MAX_LINE_BYTES, BrokerClient
+from .dispatch import TOOL_NAMES, TOOLS, _bounded, _jsonable
 from .errors import AgentRunError
 from .launch_evidence import bootstrap_error_fields
 
-
 _logger = logging.getLogger("agent_run.mcp")
 
-MAX_LINE_BYTES = 1024 * 1024
-_PROTOCOL_VERSION = "2025-06-18"
-_MISSING = object()
-#: Never log a full task; a truncated preview is still useful for a timeline
-#: and never long enough to be the sensitive payload itself.
-_TASK_LOG_CHARS = 120
+
+class _Broker(Protocol):
+    """Describe the narrow broker operation exercised by one MCP tool callback."""
+
+    def call(self, method: str, params: dict | None = None, timeout: float = 600.0) -> object:
+        """Forward one validated tool call and return its JSON-compatible result."""
+
+
+class _BoundedInput:
+    """Feed complete text frames to the SDK without buffering an unbounded stdin line."""
+
+    def __init__(self, stream: IO[str]) -> None:
+        """Bind one stream and classify whether its file descriptor can be polled."""
+        self._stream = stream
+        try:
+            self._fd = stream.fileno()
+        except (AttributeError, OSError):
+            self._fd = None
+        self._pollable = self._fd is not None and not stat.S_ISREG(
+            os.fstat(self._fd).st_mode
+        )
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    async def _read_chunk(self) -> str | None:
+        """Read one bounded chunk, using cancellable readiness for pipes and sockets."""
+        if self._fd is None or not self._pollable:
+            return await anyio.to_thread.run_sync(self._stream.read, 8192) or None
+        await anyio.wait_readable(self._fd)
+        data = os.read(self._fd, 8192)
+        if not data:
+            return self._decoder.decode(b"", final=True) or None
+        return self._decoder.decode(data)
+
+    async def __aiter__(self) -> AsyncIterator[str]:
+        """Yield complete frames up to one MiB and turn oversized frames into SDK parse errors."""
+        parts: list[str] = []
+        byte_count = 0
+        dropping = False
+        while True:
+            chunk = await self._read_chunk()
+            if chunk is None:
+                break
+            if not chunk:
+                continue
+            for character in chunk:
+                if character == "\n":
+                    yield "{" if dropping else "".join(parts)
+                    parts.clear()
+                    byte_count = 0
+                    dropping = False
+                    continue
+                if dropping:
+                    continue
+                byte_count += len(character.encode("utf-8"))
+                if byte_count > MAX_LINE_BYTES:
+                    parts.clear()
+                    dropping = True
+                else:
+                    parts.append(character)
+        if dropping:
+            yield "{"
+        elif parts:
+            yield "".join(parts)
 
 
 def serve(
-    broker: BrokerClient,
-    stdin: IO[str] = sys.stdin,
-    stdout: IO[str] = sys.stdout,
+    broker: BrokerClient | Callable[[], _Broker],
+    stdin: IO[str] | None = None,
+    stdout: IO[str] | None = None,
 ) -> int:
-    """Serve bounded MCP stdio until EOF; the optional Node parent owns its relay."""
-    while True:
-        line = stdin.readline(MAX_LINE_BYTES + 1)
-        if line == "":
-            return 0
-        if len(line) > MAX_LINE_BYTES:
-            while line and not line.endswith("\n"):
-                line = stdin.readline(MAX_LINE_BYTES + 1)
-            _emit(stdout, _error(None, -32700, "request exceeds maximum size"))
-            continue
-        try:
-            encoded = line.encode("utf-8")
-        except UnicodeEncodeError:
-            _emit(stdout, _error(None, -32700, "request is not valid UTF-8"))
-            continue
-        if len(encoded) > MAX_LINE_BYTES:
-            _emit(stdout, _error(None, -32700, "request exceeds maximum size"))
-            continue
-        try:
-            request = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            _emit(stdout, _error(None, -32700, "parse error"))
-            continue
-        response = _handle(broker, request)
-        if response is not None:
-            _emit(stdout, response)
+    """Serve MCP over the process stdio streams until the SDK observes EOF.
+
+    Args:
+        broker: Broker client used only to derive a new client per tool callback, or
+            a controlled factory used by integration tests.
+        stdin: Optional injected input stream for the CLI's testable stdio boundary.
+        stdout: Optional injected output stream paired with ``stdin``.
+
+    Returns:
+        Zero after the official SDK ends its stdio session.
+
+    Side Effects:
+        Runs the official MCP server lifecycle, including protocol negotiation,
+        cancellation notifications, invalid-request handling, and EOF cleanup.
+    """
+    anyio.run(
+        _serve,
+        broker if callable(broker) else _broker_factory(broker),
+        sys.stdin if stdin is None else stdin,
+        sys.stdout if stdout is None else stdout,
+    )
+    return 0
 
 
-def _handle(broker: BrokerClient, request: object) -> dict | None:
-    if not isinstance(request, dict):
-        return _error(None, -32600, "invalid request")
-    request_id = request.get("id", _MISSING)
-    if request_id is not _MISSING and not _valid_id(request_id):
-        return _error(None, -32600, "invalid request id")
-    if request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
-        return _error(None if request_id is _MISSING else request_id, -32600, "invalid request")
-    method = request["method"]
-    params = request.get("params", {})
-    if not isinstance(params, dict):
-        if request_id is _MISSING:
-            return None
-        return _error(request_id, -32602, "params must be an object")
-    if request_id is _MISSING:
-        return None
-    try:
-        if method == "initialize":
-            version = params.get("protocolVersion", _PROTOCOL_VERSION)
-            if not isinstance(version, str) or not version.strip():
-                return _error(request_id, -32602, "protocolVersion must be a string")
-            result = {
-                "protocolVersion": version,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "agent-run", "version": "1"},
-            }
-        elif method == "notifications/initialized":
-            result = {}
-        elif method == "tools/list":
-            # Pagination params (e.g. cursor) are spec-legal but irrelevant: we
-            # always serve the single, complete page.
-            result = {"tools": list(TOOLS)}
-        elif method == "tools/call":
-            return _tool_call(broker, request_id, params)
-        else:
-            return _error(request_id, -32601, "method not found")
-    except Exception as error:
-        return _error(request_id, -32603, f"internal error: {type(error).__name__}")
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+def _broker_factory(broker: BrokerClient) -> Callable[[], _Broker]:
+    """Create independent broker clients so concurrent callbacks share no connection.
+
+    Args:
+        broker: CLI-created client whose socket path identifies the resident broker.
+
+    Returns:
+        A zero-argument factory that creates one fresh client for each callback.
+    """
+    return lambda: BrokerClient(broker.socket_path)
 
 
-def _tool_call(broker: BrokerClient, request_id: object, params: dict) -> dict:
-    name = params.get("name")
-    arguments = params.get("arguments", {})
-    if not isinstance(name, str) or not isinstance(arguments, dict):
-        return _error(request_id, -32602, "tools/call requires name and object arguments")
-    # Tolerate standard extra fields (e.g. _meta) per JSON-RPC/MCP robustness;
-    # only name/arguments carry tool-call semantics and stay strictly checked.
+async def _serve(
+    broker_factory: Callable[[], _Broker], stdin: IO[str], stdout: IO[str]
+) -> None:
+    """Run one official low-level MCP server with an isolated broker factory.
+
+    Args:
+        broker_factory: Creates a callback-owned broker client or controlled test fake.
+        stdin: Text stream passed to the official SDK stdio adapter.
+        stdout: Text stream passed to the official SDK stdio adapter.
+    """
+    server = _make_server(broker_factory)
+    async with stdio_server(
+        cast(anyio.AsyncFile[str], _BoundedInput(stdin)),
+        anyio.wrap_file(stdout),
+    ) as (
+        read_stream,
+        write_stream,
+    ):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options(),
+            raise_exceptions=False,
+        )
+
+
+def _make_server(broker_factory: Callable[[], _Broker]) -> Server[object]:
+    """Build the official server around the shared dispatch tool definitions.
+
+    Args:
+        broker_factory: Creates one broker client for a single tool callback.
+
+    Returns:
+        A low-level SDK server whose tool list and call handlers use the one dispatch
+        tool table and the resident-broker boundary.
+    """
+
+    async def list_tools(
+        _context: object, _params: mcp_types.PaginatedRequestParams | None
+    ) -> mcp_types.ListToolsResult:
+        """Expose the complete, unpaginated shared dispatch tool table."""
+        return mcp_types.ListToolsResult(
+            tools=[mcp_types.Tool.model_validate(tool) for tool in TOOLS]
+        )
+
+    async def call_tool(
+        _context: object, params: mcp_types.CallToolRequestParams
+    ) -> mcp_types.CallToolResult:
+        """Invoke one tool without sharing a mutable broker client across callbacks."""
+        arguments = params.arguments or {}
+        return await _call_tool(broker_factory, params.name, arguments)
+
+    return Server(
+        "agent-run",
+        version="1",
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )
+
+
+async def _call_tool(
+    broker_factory: Callable[[], _Broker], name: str, arguments: dict[str, object]
+) -> mcp_types.CallToolResult:
+    """Run a broker call in a disposable worker thread and map domain errors to MCP.
+
+    Args:
+        broker_factory: Produces a connection owned solely by this tool callback.
+        name: Dispatch tool name selected by the official SDK.
+        arguments: SDK-validated object arguments, including any product orchestrator
+            binding carried within the tool arguments.
+
+    Returns:
+        Official SDK content containing either structured success data or a bounded
+        domain-error result.
+
+    Side Effects:
+        A disconnected or cancelled MCP caller abandons its wait while the already
+        admitted broker operation continues; it is never cancelled by this transport.
+    """
     agent_id = arguments.get("agent_id")
-    if not isinstance(agent_id, str):
-        agent_id = None
-    task = arguments.get("task")
     _logger.info(
-        "tool_call in name=%s request_id=%s agent_id=%s%s",
-        name, request_id, agent_id,
-        "" if not isinstance(task, str) else f" task={task[:_TASK_LOG_CHARS]!r}",
+        "tool_call in name=%s agent_id=%s",
+        name,
+        agent_id if isinstance(agent_id, str) else None,
     )
     started = time.monotonic()
     if name not in TOOL_NAMES:
         result = _tool_error("unknown_tool", f"unknown tool: {name}")
         outcome = "unknown_tool"
     else:
+        broker = broker_factory()
         try:
-            value = broker.call(name, arguments)
+            try:
+                value = await anyio.to_thread.run_sync(
+                    _invoke_broker,
+                    broker,
+                    name,
+                    arguments,
+                    abandon_on_cancel=True,
+                )
+            except BaseException:
+                _abort_broker(broker)
+                raise
             result = _tool_result(value)
             outcome = "ok"
         except AgentRunError as error:
@@ -134,15 +246,44 @@ def _tool_call(broker: BrokerClient, request_id: object, params: dict) -> dict:
             result = _tool_error("internal_error", f"internal error: {type(error).__name__}")
             outcome = "internal_error"
     duration_ms = (time.monotonic() - started) * 1000
-    log = _logger.info if outcome == "ok" else _logger.warning
-    log(
-        "tool_call out name=%s request_id=%s agent_id=%s outcome=%s duration_ms=%.1f",
-        name, request_id, agent_id, outcome, duration_ms,
+    (_logger.info if outcome == "ok" else _logger.warning)(
+        "tool_call out name=%s agent_id=%s outcome=%s duration_ms=%.1f",
+        name,
+        agent_id if isinstance(agent_id, str) else None,
+        outcome,
+        duration_ms,
     )
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+    return mcp_types.CallToolResult.model_validate(result)
 
 
-def _tool_result(value: object) -> dict:
+def _invoke_broker(broker: _Broker, name: str, arguments: dict[str, object]) -> object:
+    """Call one callback-owned broker client and close it only after completion.
+
+    Args:
+        broker: Connection owned by this worker and its cancelling MCP callback.
+        name: Shared dispatch tool name.
+        arguments: Tool argument object forwarded unchanged to the broker dispatcher.
+
+    Returns:
+        Broker result for conversion to MCP structured content.
+    """
+    try:
+        return broker.call(name, arguments)
+    finally:
+        close = getattr(broker, "close", None)
+        if callable(close):
+            close()
+
+
+def _abort_broker(broker: _Broker) -> None:
+    """Interrupt one caller-owned broker socket without issuing a broker cancellation."""
+    abort = getattr(broker, "abort", None)
+    if callable(abort):
+        abort()
+
+
+def _tool_result(value: object) -> dict[str, object]:
+    """Convert a broker result into the repository's structured MCP success shape."""
     data = _jsonable(value)
     return {
         "content": [{"type": "text", "text": "result in structuredContent"}],
@@ -151,7 +292,10 @@ def _tool_result(value: object) -> dict:
     }
 
 
-def _tool_error(code: str, message: str, *, extra: Mapping[str, object] | None = None) -> dict:
+def _tool_error(
+    code: str, message: str, *, extra: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    """Convert a domain failure into an SDK-recognized MCP tool-error result."""
     data = {"error": {"code": code, "message": _bounded(message), **(extra or {})}}
     return {
         "content": [{"type": "text", "text": json.dumps(data, separators=(",", ":"))}],

@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -21,6 +22,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import psutil
 
 from release import ReleaseError, Runner
 
@@ -126,12 +129,24 @@ def smoke(runner: Runner, release: Path) -> None:
                     process.wait(timeout=10)
 
 
-def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable: str) -> int:
-    """Reuse or build Path target from verified wheel; return supported schema int.
+def install_locked_dependencies(runner: Runner, release: Path, requirements: Path) -> None:
+    """Install the hash-pinned dependency closure into a sealed release venv.
+
+    Requirements must enumerate every runtime dependency as a binary wheel with
+    hashes. Pip rejects incomplete or altered closures before the application
+    wheel is installed.
+    """
+    runner.run(str(release / "venv/bin/python"), "-I", "-m", "pip", "install",
+               "--require-hashes", "--only-binary=:all:", "-r", str(requirements), env=environment())
+
+
+def prepare(runner: Runner, target: Path, wheel: Path, requirements: Path, version: str, executable: str) -> int:
+    """Reuse or build Path target from verified wheel and locked requirements.
 
     String executable must be Python 3.14. Incomplete candidates are preserved
     under timestamped names before rebuilding; corrupt COMPLETE candidates fail.
-    COMPLETE is written only after isolated smoke.
+    COMPLETE is written only after isolated smoke and ``pip check`` confirms
+    that the installed wheel's runtime dependencies are present.
     """
     if target.exists() and not (target / "COMPLETE").exists():
         target.rename(target.with_name(f"{target.name}.incomplete-{time.time_ns()}"))
@@ -143,7 +158,9 @@ def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable:
             raise ReleaseError("Local releases require Python 3.14")
         target.mkdir(parents=True)
         runner.run(executable, "-m", "venv", str(target / "venv"))
+        install_locked_dependencies(runner, target, requirements)
         runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-deps", str(wheel), env=environment())
+        runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "check", env=environment())
         if identity(runner, target)[0] != version:
             raise ReleaseError("Installed wheel version mismatch")
         smoke(runner, target)
@@ -159,11 +176,64 @@ def prepare(runner: Runner, target: Path, wheel: Path, version: str, executable:
     return schema
 
 
+def _legacy_writer_may_be_live(owner: object, birth: object) -> bool:
+    """Return false only when an archived writer is provably gone or reused.
+
+    ``owner`` begins with the historical writer PID and ``birth`` is its
+    optional psutil creation time. Missing birth evidence can prove only PID
+    absence; malformed identity, access denial, and other observation failures
+    stay conservative and block migration.
+    """
+
+    try:
+        pid = int(str(owner).partition(" ")[0])
+        if pid <= 1:
+            return True
+    except (ValueError, TypeError):
+        return True
+    try:
+        process = psutil.Process(pid)
+        if birth is not None:
+            expected_birth = float(birth)
+            if expected_birth < 0 or not math.isfinite(expected_birth):
+                return True
+            if process.create_time() != expected_birth:
+                return False
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False
+        return process.is_running()
+    except psutil.NoSuchProcess:
+        return False
+    except (PermissionError, ValueError, TypeError, psutil.Error):
+        return True
+
+
 def active(connection: sqlite3.Connection) -> int:
-    """Count every active agent/workflow on caller-owned SQLite connection; read only."""
-    agents = connection.execute("SELECT count(*) FROM agents WHERE status IN ('created','starting','running','cancelling')").fetchone()[0]
-    workflows = connection.execute("SELECT count(*) FROM workflow_runs WHERE status IN ('created','running')").fetchone()[0]
-    return agents + workflows
+    """Count active agents and plausibly live archived workflow writers.
+
+    Historical rows with no owner or a proven dead/reused process do not block.
+    A matching writer, missing birth evidence, or unobservable process does,
+    preventing schema migration while an old runtime may still write.
+    """
+
+    agents = connection.execute(
+        "SELECT count(*) FROM agents WHERE status IN ('created','starting','running','cancelling')"
+    ).fetchone()[0]
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(workflow_runs)")
+    }
+    if not {"status", "owner_pid_identity"} <= columns:
+        return agents
+    birth = "owner_birth_time" if "owner_birth_time" in columns else "NULL"
+    rows = connection.execute(
+        f"""SELECT owner_pid_identity, {birth} FROM workflow_runs
+            WHERE status IN ('created', 'running')
+              AND owner_pid_identity IS NOT NULL"""
+    )
+    return agents + sum(
+        _legacy_writer_may_be_live(owner, observed_birth)
+        for owner, observed_birth in rows
+    )
 
 
 def database(home: Path) -> sqlite3.Connection:
@@ -298,9 +368,9 @@ def recover(runner: Runner, home: Path, journal: dict) -> None:
     restart(runner, journal["jobs"])
 
 
-def deploy(runner: Runner, home: Path, wheel: Path, version: str, sha: str,
+def deploy(runner: Runner, home: Path, wheel: Path, requirements: Path, version: str, sha: str,
            executable: str, prefix: str) -> None:
-    """Deploy verified wheel Path at SHA/version strings into existing Path home.
+    """Deploy verified wheel and hash-locked requirements into existing Path home.
 
     A nonblocking flock serializes deploys. Wait read-only for active work, then
     hold a short SQLite write reservation while stopping API admission and the
@@ -332,7 +402,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, version: str, sha: str,
         verify_complete(previous)
         _, previous_schema = identity(runner, previous)
         print(f"Preparing verified local release {version}", flush=True)
-        target_schema = prepare(runner, target, wheel, version, executable)
+        target_schema = prepare(runner, target, wheel, requirements, version, executable)
         live_schema = schema_version(home, runner)
         if live_schema > target_schema:
             raise ReleaseError("Refusing runtime/schema downgrade")
@@ -364,7 +434,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, version: str, sha: str,
                 connection.close()
             if not count:
                 break
-            runner.pause(f"{count} active agents/workflows to finish")
+            runner.pause(f"{count} active agents to finish")
         backup = standalone / "backups" / f"{time.time_ns()}-{sha}"
         backup.mkdir(parents=True, mode=0o700)
         journal = {"stage": "stopping", "previous": str(previous), "target": str(target),
@@ -372,7 +442,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, version: str, sha: str,
                    "backup": str(backup), "jobs": jobs}
         save_journal(journal_path, journal)
         try:
-            # Start admission and workflow creation reserve this same SQLite writer lock.
+            # Start admission reserves this same SQLite writer lock.
             connection = sqlite3.connect(home / "state.db", timeout=5)
             try:
                 connection.execute("BEGIN IMMEDIATE")

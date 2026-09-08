@@ -33,7 +33,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install test environment
-        run: python -m pip install "setuptools>=77" wheel ".[test]"
+        run: |
+          python -m pip install uv==0.11.1
+          uv lock --check
+          uv sync --locked --extra test --extra release --no-install-project --no-build
+          uv pip install --python "$GITHUB_WORKSPACE/.venv/bin/python" --no-build-isolation --no-deps --editable .
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run tests
         shell: bash
         run: |
@@ -41,10 +46,15 @@ jobs:
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             pytest_filter=(-k "not test_delivery_queue_binary_is_optional_and_absolute and not test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute")
           fi
-          if ! python -m pytest -q --rootdir . tests "${pytest_filter[@]}"; then
-            python -m pytest -q --rootdir . tests/test_launch.py
-            python -m pytest -q --rootdir . tests "${pytest_filter[@]}"
+          first_test_status=0
+          if python -m pytest -q --rootdir . tests "${pytest_filter[@]}"; then
+            :
+          else
+            first_test_status=$?
+            python -m pytest -q --rootdir . tests/test_launch.py || true
+            python -m pytest -q --rootdir . tests "${pytest_filter[@]}" || true
           fi
+          exit "$first_test_status"
       - name: Verify Linux path canonicalization
         if: runner.os == 'Linux'
         shell: bash
@@ -82,21 +92,31 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install release tools
-        run: python -m pip install ".[release]"
+        run: |
+          python -m pip install uv==0.11.1
+          uv lock --check
+          uv sync --locked --extra release --no-install-project --no-build
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Build and check metadata
         run: |
-          python -m build
+          python -m build --no-isolation
           python -m twine check dist/*
+          uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock
+          uv export --frozen --extra release --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/build-requirements.lock
       - name: Smoke wheel and source installs
         shell: bash
         run: |
           version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           python -m venv "$RUNNER_TEMP/wheel-smoke"
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --require-hashes --only-binary=:all: -r dist/requirements.lock
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip install --no-deps dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip check
           test "$("$RUNNER_TEMP/wheel-smoke/bin/python" -c 'from importlib.metadata import version; print(version("agent-run"))')" = "$version"
           AGENT_RUN_HOME="$RUNNER_TEMP/wheel-home" "$RUNNER_TEMP/wheel-smoke/bin/agent-run" init
           AGENT_RUN_HOME="$RUNNER_TEMP/wheel-home" "$RUNNER_TEMP/wheel-smoke/bin/agent-run" doc releases
           python -m venv "$RUNNER_TEMP/sdist-smoke"
-          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --no-deps dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --require-hashes --only-binary=:all: -r dist/build-requirements.lock
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --no-build-isolation --no-deps dist/*.tar.gz
+          "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip check
           test "$("$RUNNER_TEMP/sdist-smoke/bin/python" -c 'from importlib.metadata import version; print(version("agent-run"))')" = "$version"
           AGENT_RUN_HOME="$RUNNER_TEMP/sdist-home" "$RUNNER_TEMP/sdist-smoke/bin/agent-run" init

@@ -158,7 +158,7 @@ class DispatchTests(unittest.TestCase):
 
         with mock.patch.object(omniroute, "pool_samples", return_value=(sample,)):
             result = sources.collect_samples(
-                "opencode", _runtime_config(limits_source="omniroute"), CapacityConfig(), load
+                "qwen", _runtime_config(limits_source="omniroute"), CapacityConfig(), load
             )
         self.assertEqual(result, (sample,))
 
@@ -167,7 +167,7 @@ class DispatchTests(unittest.TestCase):
         with self.assertLogs("agent_run.capacity", level="WARNING"):
             self.assertIsNone(
                 sources.collect_samples(
-                    "opencode",
+                    "unsupported",
                     _runtime_config(limits_source="codexbar"),
                     CapacityConfig(),
                     None,

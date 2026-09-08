@@ -2,9 +2,9 @@
 
 ## Central log
 
-Every entrypoint (`mcp`, other CLI verbs, the detached supervisor, the
-workflow runner) writes dense, rotating logs to `<home>/logs/<component>.log`
-(`mcp.log`, `cli.log`, `supervisor.log`, `workflow-runner.log`). Logging
+Every entrypoint (`mcp`, other CLI verbs, and the detached supervisor) writes
+dense, rotating logs to `<home>/logs/<component>.log`
+(`mcp.log`, `cli.log`, `supervisor.log`). Logging
 defaults to `DEBUG` so a postmortem has everything; set `AGENT_RUN_LOG_LEVEL`
 (e.g. `INFO`) in the environment to quiet it down once a system is stable.
 A log directory that cannot be created never blocks a command — the process
@@ -42,9 +42,6 @@ Known kinds include `auth_failed`, `permission_rejected`,
 Match on `failure_kind` first, then read `failure_text` for the specific
 detail — don't parse `failure_text` to decide behavior.
 
-`permission_rejected` on an opencode child usually means the child tried to
-read a path outside its workdir without that path declared in
-`read_roots` — check the `start` request's `read_roots` before assuming a
 permissions bug elsewhere.
 
 ## limits: honest-unknown, not always-fresh
@@ -53,8 +50,6 @@ Capacity/limits data is only as fresh as its source last reported:
 
 - claude and codex sources appear for about 15 minutes after their most
   recent run, then age out to unknown rather than showing stale numbers.
-- opencode's limits need the OmniRoute quota sync to be alive; if that
-  sync has stopped, opencode limits go unknown, not wrong.
 
 An "unknown" limit is the system being honest about missing data, not a
 bug to chase.

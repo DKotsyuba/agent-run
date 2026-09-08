@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from io import StringIO
 from pathlib import Path
 
+from mcp.types import LATEST_PROTOCOL_VERSION
+
 from agent_run.adapters.base import Capability
+from agent_run.api_socket import ApiServer
+from agent_run.broker_client import BrokerClient
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.delivery.base import DeliveryReceipt
 from agent_run.delivery.dispatch import DeliveryDispatcher
@@ -87,30 +92,73 @@ class M008IntegrationTests(unittest.TestCase):
         )
 
     def mcp_call(self, service, request_id, name, arguments):
-        """Invoke one shared MCP dispatch call and decode its result envelope."""
+        """Invoke one MCP tool through initialization and the real Unix broker."""
 
-        class Broker:
-            def __init__(self, target):
-                self.target = target
-                self.session = Session()
+        class _DelayedEofInput(StringIO):
+            """Keep the official server alive until its concurrent tool call completes."""
 
-            def call(self, method, params=None, timeout=600):
-                return call_tool(self.target, method, params or {}, self.session)
+            def read(self, size=-1):
+                """Return buffered frames, then delay the EOF that stops the SDK runner."""
+                value = super().read(size)
+                if not value:
+                    time.sleep(0.2)
+                return value
 
-        source = StringIO(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": "tools/call",
-                    "params": {"name": name, "arguments": arguments},
-                }
+        socket_path = self.root / f"mcp-{request_id}-{time.time_ns()}.sock"
+        store_path = service._store.path()
+        config = service._config
+        home = service._home
+        launch = service._launch
+        now = service._now
+
+        def service_factory():
+            """Create the broker-owned service and SQLite connection on its owner thread."""
+            return AgentService(
+                config,
+                StateStore.initialize(store_path),
+                home,
+                launch=launch,
+                now=now,
             )
-            + "\n"
+
+        server = ApiServer(socket_path, service_factory)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test-m008", "version": "1"},
+            },
+        }
+        source = _DelayedEofInput(
+            "".join(
+                json.dumps(frame) + "\n"
+                for frame in [
+                    initialize,
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments},
+                    },
+                ]
+            )
         )
         output = StringIO()
-        self.assertEqual(serve(Broker(service), source, output), 0)
-        return json.loads(output.getvalue())["result"]
+        try:
+            self.assertEqual(serve(BrokerClient(socket_path), source, output), 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server.release_socket_path()
+            server_thread.join(timeout=1)
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        return next(response["result"] for response in responses if response.get("id") == request_id)
 
     def wait_until(self, predicate, *, timeout: float = 2.0) -> None:
         """Wait boundedly for an asynchronous integration condition."""

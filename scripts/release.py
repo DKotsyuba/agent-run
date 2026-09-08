@@ -149,8 +149,8 @@ def prepare_pr(runner: Runner, version: str) -> dict:
     """Reuse/create deterministic version-only branch and PR; return PR metadata.
 
     Require clean checkout on origin/main before new publication. Persist a
-    dedicated worktree under .git for interrupted commits/pushes; never stage
-    anything except pyproject.toml and CHANGELOG.md.
+    dedicated worktree under .git for interrupted commits/pushes; stage the
+    package version, changelog, and regenerated authoritative uv.lock together.
     """
     if runner.run("git", "status", "--porcelain", "--untracked-files=all").stdout:
         raise ReleaseError("New publication requires a clean committed checkout")
@@ -183,6 +183,8 @@ def prepare_pr(runner: Runner, version: str) -> dict:
         if tuple(map(int, version.split("."))) <= tuple(map(int, current.split("."))):
             raise ReleaseError("New version must increase the package version")
         package.write_text(re.sub(r'^version = "[^"]+"$', f'version = "{version}"', old, count=1, flags=re.M))
+        runner.run("uv", "lock", cwd=work)
+    runner.run("uv", "lock", "--check", cwd=work)
     changelog = work / "CHANGELOG.md"
     history = changelog.read_text()
     if f"## [{version}]" not in history:
@@ -194,9 +196,9 @@ def prepare_pr(runner: Runner, version: str) -> dict:
         index = history.find("## [")
         changelog.write_text(history[:index] + insertion + history[index:] if index >= 0 else history + "\n" + insertion)
     if runner.run("git", "status", "--porcelain", cwd=work).stdout:
-        runner.run("git", "add", "--", "pyproject.toml", "CHANGELOG.md", cwd=work)
+        runner.run("git", "add", "--", "pyproject.toml", "CHANGELOG.md", "uv.lock", cwd=work)
         staged = runner.run("git", "diff", "--cached", "--name-only", cwd=work).stdout.splitlines()
-        if set(staged) - {"pyproject.toml", "CHANGELOG.md"}:
+        if set(staged) - {"pyproject.toml", "CHANGELOG.md", "uv.lock"}:
             raise ReleaseError("Unexpected staged files in release worktree")
         runner.run("git", "commit", "-m", f"chore: release {version}", cwd=work)
     runner.run("git", "push", "origin", branch, cwd=work)
@@ -253,15 +255,16 @@ def publish(runner: Runner, version: str) -> str:
         runner.pause("public GitHub Release")
 
 
-def verify_assets(runner: Runner, version: str, sha: str, directory: Path) -> Path:
-    """Download distributions into Path directory and verify hashes/provenance.
+def verify_assets(runner: Runner, version: str, sha: str, directory: Path) -> tuple[Path, Path]:
+    """Download release wheel/lock assets into Path directory and verify evidence.
 
-    Return verified wheel Path. Reject malformed checksums or an attestation
-    whose signed subject, source commit/ref, repository or workflow differ.
+    Return the verified wheel and hash-pinned requirements lock. Reject malformed
+    checksums or an attestation whose signed subject, source commit/ref,
+    repository or workflow differ.
     """
-    names = [f"agent_run-{version}-py3-none-any.whl", f"agent_run-{version}.tar.gz"]
+    names = [f"agent_run-{version}-py3-none-any.whl", f"agent_run-{version}.tar.gz", "requirements.lock"]
     runner.run("gh", "release", "download", f"v{version}", "--repo", REPOSITORY,
-               "--dir", str(directory), "--pattern", names[0], "--pattern", names[1], "--pattern", "SHA256SUMS")
+               "--dir", str(directory), "--pattern", names[0], "--pattern", names[1], "--pattern", names[2], "--pattern", "SHA256SUMS")
     expected = {}
     for line in (directory / "SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
@@ -272,6 +275,8 @@ def verify_assets(runner: Runner, version: str, sha: str, directory: Path) -> Pa
         raise ReleaseError("Missing distribution checksums")
     for name in names:
         path = directory / name
+        if not path.is_file():
+            raise ReleaseError(f"Missing release asset: {name}")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != expected[name]:
             raise ReleaseError(f"Checksum mismatch: {name}")
@@ -288,7 +293,7 @@ def verify_assets(runner: Runner, version: str, sha: str, directory: Path) -> Pa
                       and any(s.get("name") == name and s.get("digest", {}).get("sha256") == digest for s in subject))
         if not valid:
             raise ReleaseError(f"Provenance identity mismatch: {name}")
-    return directory / names[0]
+    return directory / names[0], directory / names[2]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -310,10 +315,10 @@ def main(argv: list[str] | None = None) -> int:
         runner = Runner(args.timeout, args.poll)
         sha = publish(runner, args.version)
         with tempfile.TemporaryDirectory(prefix="agent-run-release-") as temporary:
-            wheel = verify_assets(runner, args.version, sha, Path(temporary))
+            wheel, requirements = verify_assets(runner, args.version, sha, Path(temporary))
             if not args.publish_only:
                 from release_local import deploy
-                deploy(runner, args.home.expanduser().resolve(), wheel, args.version, sha,
+                deploy(runner, args.home.expanduser().resolve(), wheel, requirements, args.version, sha,
                        args.python, args.launchd_prefix)
         print(f"Done: v{args.version} published" + (" and local runtime updated. Reconnect existing MCP clients." if not args.publish_only else "."))
         return 0

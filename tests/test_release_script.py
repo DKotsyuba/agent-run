@@ -7,6 +7,7 @@ import argparse
 from contextlib import ExitStack
 import hashlib
 import importlib
+import os
 from pathlib import Path
 import plistlib
 import runpy
@@ -15,7 +16,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import Mock, patch
+
+import psutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import release
@@ -42,7 +46,7 @@ class PublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "release"
             with self.assertRaisesRegex(release.ReleaseError, "Python 3.14"):
-                local.prepare(runner, target, Path(directory) / "wheel.whl", "1.2.3", "python3.13")
+                local.prepare(runner, target, Path(directory) / "wheel.whl", Path(directory) / "requirements.lock", "1.2.3", "python3.13")
             self.assertFalse(target.exists())
 
     def test_cli_uses_shared_exception_identity_and_restores_every_job(self):
@@ -53,7 +57,7 @@ class PublicationTests(unittest.TestCase):
             """Configure the temporary runpy module at parsing, returning Namespace options."""
             script = sys.modules["release"]
             vars(script)["publish"] = Mock(return_value="head")
-            vars(script)["verify_assets"] = Mock(return_value=Path("wheel.whl"))
+            vars(script)["verify_assets"] = Mock(return_value=(Path("wheel.whl"), Path("requirements.lock")))
             deployment = importlib.import_module("release_local")
             self.assertIs(deployment.ReleaseError, script.ReleaseError)
 
@@ -139,6 +143,39 @@ class PublicationTests(unittest.TestCase):
             release.prepare_pr(runner, "1.2.3")
         self.assertEqual(runner.run.call_count, 1)
 
+    def test_version_pr_updates_and_checks_lock_with_package_version(self):
+        """A version PR stages its regenerated lock atomically with package metadata."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / ".git/release-worktrees/1.0.1"
+            work.mkdir(parents=True)
+            (work / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n')
+            (work / "uv.lock").write_text("version = 1\n")
+            (work / "CHANGELOG.md").write_text("## [1.0.0]\n")
+            runner = Mock()
+            runner.json.side_effect = [[], {"number": 1, "state": "OPEN", "headRefOid": "head", "mergeCommit": None, "baseRefName": "main"}]
+
+            def run(*args, cwd=None, check=True, **_kwargs):
+                """Return deterministic Git/uv results while recording the release contract."""
+                if args == ("git", "rev-parse", "--absolute-git-dir"):
+                    return subprocess.CompletedProcess(args, 0, str(Path(directory) / ".git") + "\n", "")
+                if args in (("git", "rev-parse", "HEAD"), ("git", "rev-parse", "origin/main")):
+                    return subprocess.CompletedProcess(args, 0, "head\n", "")
+                if args == ("git", "status", "--porcelain") and cwd == work:
+                    return subprocess.CompletedProcess(args, 0, " M pyproject.toml\n", "")
+                if args in (("git", "status", "--porcelain", "--untracked-files=all"), ("git", "status", "--porcelain")):
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args == ("git", "diff", "--cached", "--name-only"):
+                    return subprocess.CompletedProcess(args, 0, "pyproject.toml\nCHANGELOG.md\nuv.lock\n", "")
+                if args == ("git", "describe", "--tags", "--abbrev=0"):
+                    return subprocess.CompletedProcess(args, 1, "", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            runner.run.side_effect = run
+            release.prepare_pr(runner, "1.0.1")
+            runner.run.assert_any_call("uv", "lock", cwd=work)
+            runner.run.assert_any_call("uv", "lock", "--check", cwd=work)
+            runner.run.assert_any_call("git", "add", "--", "pyproject.toml", "CHANGELOG.md", "uv.lock", cwd=work)
+
     def test_new_publication_gates_exact_heads_before_annotated_tag(self):
         """PR/main CI gates precede immutable tagging and the existing release workflow."""
         runner = Mock()
@@ -160,7 +197,7 @@ class PublicationTests(unittest.TestCase):
         """Hash corruption and signed identity drift are rejected despite verifier exit 0."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            names = ["agent_run-1.2.3-py3-none-any.whl", "agent_run-1.2.3.tar.gz"]
+            names = ["agent_run-1.2.3-py3-none-any.whl", "agent_run-1.2.3.tar.gz", "requirements.lock"]
             digest = hashlib.sha256(b"artifact").hexdigest()
             for name in names:
                 (root / name).write_bytes(b"artifact")
@@ -171,12 +208,47 @@ class PublicationTests(unittest.TestCase):
                 "statement": {"subject": [{"name": name, "digest": {"sha256": digest}} for name in names]}}}]
             runner = Mock()
             runner.json.return_value = evidence
-            self.assertEqual(release.verify_assets(runner, "1.2.3", "head", root), root / names[0])
+            self.assertEqual(release.verify_assets(runner, "1.2.3", "head", root), (root / names[0], root / names[2]))
             with self.assertRaisesRegex(release.ReleaseError, "Provenance"):
                 release.verify_assets(runner, "1.2.3", "wrong", root)
             (root / names[0]).write_bytes(b"corrupted")
             with self.assertRaisesRegex(release.ReleaseError, "Checksum"):
                 release.verify_assets(runner, "1.2.3", "head", root)
+            (root / names[0]).write_bytes(b"artifact")
+            (root / names[2]).unlink()
+            with self.assertRaisesRegex(release.ReleaseError, "Missing release asset: requirements.lock"):
+                release.verify_assets(runner, "1.2.3", "head", root)
+
+    def test_locked_install_requires_complete_transitive_closure(self):
+        """A missing transitive wheel fails offline; the complete hashed closure installs."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = {}
+            for name, requirement in (("leaf", ""), ("middle", "Requires-Dist: leaf == 1\n"),
+                                      ("application", "Requires-Dist: middle == 1\n")):
+                wheel = root / f"{name}-1-py3-none-any.whl"
+                with zipfile.ZipFile(wheel, "w") as archive:
+                    archive.writestr(f"{name}/__init__.py", "")
+                    archive.writestr(f"{name}-1.dist-info/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: 1\n{requirement}")
+                    archive.writestr(f"{name}-1.dist-info/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+                    archive.writestr(f"{name}-1.dist-info/RECORD", "")
+                wheels[name] = wheel
+            digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            missing = root / "missing.lock"
+            missing.write_text(f"--no-index\n{wheels['middle'].as_uri()} --hash=sha256:{digest(wheels['middle'])}\n")
+            complete = root / "requirements.lock"
+            complete.write_text("--no-index\n" + "".join(
+                f"{wheels[name].as_uri()} --hash=sha256:{digest(wheels[name])}\n" for name in ("leaf", "middle")))
+            runner = release.Runner(30, 0.01)
+            failed = root / "failed"
+            runner.run(sys.executable, "-m", "venv", str(failed / "venv"))
+            with self.assertRaises(release.ReleaseError):
+                local.install_locked_dependencies(runner, failed, missing)
+            target = root / "release"
+            runner.run(sys.executable, "-m", "venv", str(target / "venv"))
+            local.install_locked_dependencies(runner, target, complete)
+            runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-deps", str(wheels["application"]))
+            runner.run(str(target / "venv/bin/python"), "-I", "-m", "pip", "check")
 
 
 class LocalTests(unittest.TestCase):
@@ -195,7 +267,13 @@ class LocalTests(unittest.TestCase):
         self.current.symlink_to(self.old)
         self.home.joinpath("config.toml").write_text("schema_version=1\n")
         with sqlite3.connect(self.home / "state.db") as connection:
-            connection.executescript("CREATE TABLE agents(status TEXT); CREATE TABLE workflow_runs(status TEXT); PRAGMA user_version=10;")
+            connection.executescript(
+                """CREATE TABLE agents(status TEXT);
+                   CREATE TABLE workflow_runs(
+                     status TEXT, owner_pid_identity TEXT, owner_birth_time REAL
+                   );
+                   PRAGMA user_version=10;"""
+            )
         self.plists = self.user / "Library/LaunchAgents"
         self.plists.mkdir(parents=True)
         for suffix in ("api", "capacity", "delivery"):
@@ -223,7 +301,7 @@ class LocalTests(unittest.TestCase):
 
     def deploy(self):
         """Call local deployment with fixture home and a non-installed dummy wheel path."""
-        local.deploy(self.runner, self.home, self.user / "wheel.whl", "1.2.3", "new", "python3.14", "com.test.agent-run")
+        local.deploy(self.runner, self.home, self.user / "wheel.whl", self.user / "requirements.lock", "1.2.3", "new", "python3.14", "com.test.agent-run")
 
     def migrate(self, runner, target, home):
         """Fake installed migration, asserting backup-before-migration and all shutdowns."""
@@ -257,11 +335,14 @@ class LocalTests(unittest.TestCase):
         self.runner.run.assert_not_called()
 
     def test_active_work_waits_and_shutdown_race_refuses_migration(self):
-        """Count agents/workflows and catch work admitted just before the reservation."""
+        """Count agents, ignore legacy workflow rows, and catch admission races."""
         with sqlite3.connect(self.home / "state.db") as connection:
-            connection.executescript("INSERT INTO agents VALUES('running'); INSERT INTO workflow_runs VALUES('created');")
+            connection.executescript(
+                """INSERT INTO agents VALUES('running');
+                   INSERT INTO workflow_runs(status) VALUES('created');"""
+            )
         with local.database(self.home) as connection:
-            self.assertEqual(local.active(connection), 2)
+            self.assertEqual(local.active(connection), 1)
         self.runner.pause.side_effect = release.ReleaseError("still active")
         with self.patches(), self.assertRaisesRegex(release.ReleaseError, "still active"):
             self.deploy()
@@ -271,6 +352,88 @@ class LocalTests(unittest.TestCase):
             self.deploy()
         migrate.assert_not_called()
         restart.assert_called_once()
+
+    def test_live_birth_verified_legacy_writer_blocks_release(self):
+        """Only an exact live old writer adds to deployment quiescence."""
+
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (status, owner_pid_identity, owner_birth_time)
+                   VALUES ('running', ?, ?)""",
+                (f"{os.getpid()} fixture", psutil.Process().create_time()),
+            )
+        with local.database(self.home) as connection:
+            self.assertEqual(local.active(connection), 1)
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                "UPDATE workflow_runs SET owner_birth_time = owner_birth_time - 1"
+            )
+        with local.database(self.home) as connection:
+            self.assertEqual(local.active(connection), 0)
+
+    def test_schema_without_birth_still_blocks_a_live_archived_writer(self):
+        """An older schema can prove PID absence but cannot dismiss a live PID."""
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.executescript(
+            """CREATE TABLE agents(status TEXT);
+               CREATE TABLE workflow_runs(status TEXT, owner_pid_identity TEXT);
+               INSERT INTO workflow_runs VALUES('running', '999999 missing');"""
+        )
+        self.assertEqual(local.active(connection), 0)
+        connection.execute(
+            "UPDATE workflow_runs SET owner_pid_identity = ?",
+            (f"{os.getpid()} fixture",),
+        )
+        self.assertEqual(local.active(connection), 1)
+
+    def test_unobservable_archived_writer_blocks_release(self):
+        """Access denial is uncertainty, never evidence that a writer is dead."""
+
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (status, owner_pid_identity, owner_birth_time)
+                   VALUES ('running', '4242 fixture', 1)"""
+            )
+        with local.database(self.home) as connection, patch.object(
+            local.psutil, "Process", side_effect=psutil.AccessDenied(pid=4242)
+        ):
+            self.assertEqual(local.active(connection), 1)
+
+    def test_birth_verified_zombie_writer_does_not_block_release(self) -> None:
+        """A matching zombie PID cannot write even though psutil calls it running."""
+
+        process = Mock()
+        process.create_time.return_value = 12.5
+        process.status.return_value = psutil.STATUS_ZOMBIE
+        process.is_running.return_value = True
+        with patch.object(local.psutil, "Process", return_value=process):
+            self.assertFalse(local._legacy_writer_may_be_live("4242 writer", 12.5))
+            self.assertTrue(local._legacy_writer_may_be_live("4242 writer", None))
+
+    def test_malformed_archived_writer_birth_blocks_release(self):
+        """Non-finite or negative birth evidence cannot prove PID reuse."""
+
+        with sqlite3.connect(self.home / "state.db") as connection:
+            connection.execute(
+                """INSERT INTO workflow_runs
+                   (status, owner_pid_identity, owner_birth_time)
+                   VALUES ('running', ?, 1)""",
+                (f"{os.getpid()} fixture",),
+            )
+        for birth in (float("nan"), float("inf"), -1.0):
+            with self.subTest(birth=birth), sqlite3.connect(
+                self.home / "state.db"
+            ) as connection:
+                connection.execute(
+                    "UPDATE workflow_runs SET owner_birth_time = ?", (birth,)
+                )
+                connection.commit()
+                with local.database(self.home) as observed:
+                    self.assertEqual(local.active(observed), 1)
 
     def test_failed_migration_restores_old_only_when_schema_is_unchanged(self):
         """A pre-migration exception restarts old compatible services and retains journal."""

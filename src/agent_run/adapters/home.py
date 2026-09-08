@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import secrets
-import tempfile
+import stat
 from pathlib import Path
 
 from ..errors import PathEscapeError, ValidationError
-from ..verify import DEFAULT_SENTINEL
+from ..verify import (
+    ANSWER_FORMAT_CONTENT,
+    ANSWER_FORMAT_FILENAME,
+    ANSWER_PROOF_SUFFIX,
+    answer_proof_document,
+)
+
+MANAGED_TEMP_PREFIX = ".agent-run-tmp-"
+"""Reserved prefix identifying temporary files owned by managed publication."""
 
 
 def content_hash(content: str | bytes) -> str:
@@ -79,7 +88,11 @@ def _managed_path(home: str | Path, relative_path: str | Path) -> Path:
         if parent.is_symlink():
             raise PathEscapeError(f"managed path crosses a symlink: {relative_path}")
         try:
-            parent.mkdir(mode=0o700, exist_ok=True)
+            parent.mkdir(mode=0o700)
+            _fsync_directory(parent.parent)
+        except FileExistsError:
+            if not parent.is_dir():
+                raise ValidationError(f"managed path parent is not a directory: {relative_path}")
         except OSError as error:
             raise ValidationError(f"cannot create managed directory {parent}: {error}") from error
         if not parent.resolve(strict=True).is_relative_to(root):
@@ -90,45 +103,252 @@ def _managed_path(home: str | Path, relative_path: str | Path) -> Path:
     return candidate
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist prior directory-entry changes beneath an existing directory.
+
+    ``path`` is opened read-only as a directory and synchronized before the
+    descriptor is closed. Filesystems that report directory fsync as unsupported
+    are tolerated; other ``OSError`` failures propagate so callers cannot claim
+    an ordered durable publish when an available sync operation failed.
+    """
+
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _fsync_directory_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_descriptor(descriptor: int) -> None:
+    """Synchronize one retained directory descriptor when supported."""
+
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if error.errno not in {errno.EINVAL, errno.ENOTSUP}:
+            raise
+
+
+def _open_managed_parent(
+    home: str | Path, relative_path: str | Path, *, create: bool = True
+) -> tuple[Path, str, int]:
+    """Open and retain the no-follow parent of one managed relative path.
+
+    The returned descriptor owns the parent directory until the caller closes
+    it. Each descendant is opened relative to its already verified parent, so
+    concurrent pathname replacement cannot redirect later writes or reads.
+    Missing parents are created only when ``create`` is true and every created
+    directory entry is synchronized before traversal continues.
+    """
+
+    root = _root(home)
+    try:
+        relative = Path(relative_path)
+    except TypeError as error:
+        raise PathEscapeError(f"invalid managed path: {relative_path!r}") from error
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise PathEscapeError(f"managed path escapes generated home: {relative_path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                metadata = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                raise PathEscapeError(
+                    f"managed path crosses a symlink: {relative_path}"
+                )
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    _fsync_directory_descriptor(descriptor)
+                except FileExistsError:
+                    pass
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except FileNotFoundError:
+        os.close(descriptor)
+        raise
+    except PathEscapeError:
+        os.close(descriptor)
+        raise
+    except OSError as error:
+        os.close(descriptor)
+        raise ValidationError(
+            f"managed path parent is not a real directory: {relative_path}"
+        ) from error
+    return root / relative.parent, relative.name, descriptor
+
+
+def managed_entry_type(home: str | Path, relative_path: str | Path) -> str:
+    """Classify one final managed entry without following any path symlink.
+
+    Returns ``missing``, ``file``, ``directory``, ``symlink``, or ``special``.
+    A missing intermediate parent also returns ``missing``; an intermediate
+    symlink raises ``PathEscapeError`` before any target metadata is inspected.
+    The retained parent descriptor is closed on every result and failure.
+    """
+
+    try:
+        _, name, parent_fd = _open_managed_parent(
+            home, relative_path, create=False
+        )
+    except FileNotFoundError:
+        return "missing"
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "missing"
+        if stat.S_ISREG(metadata.st_mode):
+            return "file"
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink"
+        return "special"
+    finally:
+        os.close(parent_fd)
+
+
+def read_managed_symlink(home: str | Path, relative_path: str | Path) -> str | None:
+    """Return an exact managed symlink target through retained parent descriptors.
+
+    ``None`` means the final entry is absent. A present regular, directory, or
+    special entry raises ``ValidationError``; parent symlinks and traversal are
+    rejected by :func:`_open_managed_parent` without following their targets.
+    """
+
+    _, name, parent_fd = _open_managed_parent(home, relative_path, create=False)
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(f"managed link is not a symlink: {relative_path}")
+        return os.readlink(name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def ensure_managed_directory(home: str | Path, relative_path: str | Path) -> Path:
+    """Create and return one validated private directory below ``home``.
+
+    The nonempty ``relative_path`` must remain beneath the generated home.
+    Newly created parent entries are synchronized and symlink crossings or
+    non-directory conflicts raise typed validation errors.
+    """
+
+    try:
+        relative = Path(relative_path)
+    except TypeError as error:
+        raise PathEscapeError(f"invalid managed directory: {relative_path!r}") from error
+    if not relative.parts or relative == Path("."):
+        raise PathEscapeError("managed directory path must be nonempty")
+    return _managed_path(home, relative / ".agent-run-directory").parent
+
+
 def write_managed_file(
-    home: str | Path, relative_path: str | Path, content: str | bytes
+    home: str | Path,
+    relative_path: str | Path,
+    content: str | bytes,
+    *,
+    mode: int = 0o600,
 ) -> str:
-    """Atomically replace one private regular file and return its SHA-256."""
+    """Durably replace one private regular file and return its SHA-256.
+
+    ``home`` owns the generated tree, ``relative_path`` must stay beneath it,
+    and ``content`` supplies the exact UTF-8 or byte payload. ``mode`` is either
+    private data ``0600`` or private executable ``0700``. The temporary file
+    is synchronized before its atomic replacement, then the parent directory is
+    synchronized so a successful return makes that one publish durable.
+    Validation and path-escape errors are typed; filesystem failures propagate.
+    """
 
     data = content.encode("utf-8") if isinstance(content, str) else content
+    if mode not in {0o600, 0o700}:
+        raise ValidationError("managed file mode must be 0600 or 0700")
     digest = content_hash(data)
-    candidate = _managed_path(home, relative_path)
-    if candidate.is_symlink():
-        raise PathEscapeError(f"managed file must not replace a symlink: {relative_path}")
-    if candidate.exists() and not candidate.is_file():
-        raise ValidationError(f"managed path is not a file: {relative_path}")
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=candidate.parent, prefix=f".{candidate.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
+    _, name, parent_fd = _open_managed_parent(home, relative_path)
+    descriptor = -1
+    temporary_name: str | None = None
     try:
-        os.fchmod(descriptor, 0o600)
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+            raise PathEscapeError(
+                f"managed file must not replace a symlink: {relative_path}"
+            )
+        if metadata is not None and not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError(f"managed path is not a file: {relative_path}")
+        temporary_name = f"{MANAGED_TEMP_PREFIX}{name}.{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, candidate)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        _fsync_directory_descriptor(parent_fd)
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            try:
+                if temporary_name is not None:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(parent_fd)
     return digest
 
 
 def seal_answer(path: Path, text: str) -> tuple[int, str]:
+    """Seal one completed engine answer as exact payload bytes plus a proof.
+
+    The payload file holds ``text`` encoded as UTF-8 with no appended
+    completion marker. The adjacent ``<name>.proof.json`` sidecar records the
+    payload's byte count and SHA-256. A directory-level format marker is
+    durably written first so a crash or deleted proof cannot make a new payload
+    look like a historical sentinel-framed answer. The marker, payload, and
+    proof are separate ordered durable replacements, not one cross-file atomic
+    transaction.
+
+    Returns ``(payload_bytes, payload_sha256)`` for the clean payload, the
+    values durably recorded with the run's outcome.
+    """
+
     if not isinstance(path, Path) or not path.is_absolute():
         raise ValidationError("answer path must be absolute")
     if not isinstance(text, str) or not text.strip():
         raise ValidationError("answer text must be nonblank")
-    separator = "" if text.endswith("\n") else "\n"
-    data = f"{text}{separator}{DEFAULT_SENTINEL}\n".encode("utf-8")
+    data = text.encode("utf-8")
+    write_managed_file(path.parent, ANSWER_FORMAT_FILENAME, ANSWER_FORMAT_CONTENT)
     digest = write_managed_file(path.parent, path.name, data)
+    write_managed_file(
+        path.parent,
+        f"{path.name}{ANSWER_PROOF_SUFFIX}",
+        answer_proof_document(path.name, len(data), digest),
+    )
     return len(data), digest
 
 
@@ -147,13 +367,32 @@ def create_symlink_bridge(
         source_path = source_path.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise ValidationError("symlink bridge source must be an absolute existing path") from error
-    candidate = _managed_path(home, relative_path)
-    if candidate.exists() and not candidate.is_symlink():
-        raise ValidationError(f"symlink bridge would replace a managed file: {relative_path}")
-    temporary = candidate.parent / f".{candidate.name}.{secrets.token_hex(8)}.link.tmp"
+    parent, name, parent_fd = _open_managed_parent(home, relative_path)
+    temporary: str | None = None
     try:
-        temporary.symlink_to(source_path, target_is_directory=source_path.is_dir())
-        os.replace(temporary, candidate)
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and not stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(
+                f"symlink bridge would replace a managed file: {relative_path}"
+            )
+        temporary = f".{name}.{secrets.token_hex(8)}.link.tmp"
+        os.symlink(
+            str(source_path),
+            temporary,
+            target_is_directory=source_path.is_dir(),
+            dir_fd=parent_fd,
+        )
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _fsync_directory_descriptor(parent_fd)
     finally:
-        temporary.unlink(missing_ok=True)
-    return candidate
+        try:
+            if temporary is not None:
+                os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(parent_fd)
+    return parent / name

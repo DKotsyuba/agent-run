@@ -14,12 +14,12 @@ presence alone does not grant authority over a different owner's data.
 
 ## Ground rules
 
-- **Python 3.14+, small deliberate dependency set.** The runtime currently
-  has zero dependencies (`pyproject.toml`) and ships as a sealed venv release.
-  Add a runtime dependency only when it replaces concrete fragile code and
-  passes the supported-platform package checks. Prefer existing code and the
-  standard library when they satisfy the contract. `pytest` and `Hypothesis`
-  provide example-based and stateful regression checks.
+- **Python 3.14+, small deliberate dependency set.** Runtime dependencies are
+  declared in `pyproject.toml` and resolved in committed `uv.lock`; release
+  artifacts install a hash-verified closure into the sealed venv. Add one only
+  when it replaces concrete fragile code and passes supported-platform checks.
+  Prefer existing code and the standard library when they satisfy the contract.
+  `pytest` and `Hypothesis` provide example-based and stateful regression checks.
 - **No monolithic modules.** Keep files focused; a module drifting past
   a few hundred lines is a design smell here, not a habit to copy.
 - **Engines are driven only through adapters + the supervisor.** Never
@@ -88,7 +88,6 @@ presence alone does not grant authority over a different owner's data.
 | `src/agent_run/supervisor*.py` | detached child supervision: timeouts, stall watchdog, outcomes |
 | `src/agent_run/state/` | SQLite store, schema, migrations, reconciliation |
 | `src/agent_run/wait.py` | blocking watchdog logic shared by CLI and socket API |
-| `src/agent_run/workflow*` | the multi-step workflow engine and its runner |
 | `src/agent_run/capacity/` | limits collection (per-runtime sources) and risk advisory |
 | `src/agent_run/doctor.py` | self-diagnosis; keep it free of false alarms |
 | `src/agent_run/operator_guide/` | the pages `agent-run doc` serves |

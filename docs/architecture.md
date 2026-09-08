@@ -1,8 +1,7 @@
 # agent-run architecture
 
 How the pieces fit, as shipped today. For the operator's how-to see
-`agent-run doc`; for API integration see [api.md](api.md); for workflow
-scripts see [workflows.md](workflows.md).
+`agent-run doc`; for API integration see [api.md](api.md).
 
 ## Managed Codex context
 
@@ -25,7 +24,7 @@ domain facade                     service.py (AgentService)
 durable state              state/  (versioned SQLite schema, migrations)
                                         │
 engine drivers          adapters/  ──  supervisor  ──  detached children
-                     codex · claude · glm · qwen · opencode
+                     codex · claude · glm · qwen
 ```
 
 MCP is a thin stdio proxy forwarding `tools/call` to the resident Unix-socket
@@ -70,8 +69,14 @@ The supervisor enforces:
   recorded evidence (result payloads, completion sentinels, error-only
   answer detection), never from exit code alone.
 
-Answers are stored with size and sha256; `answer <id>` re-serves the
-verified envelope indefinitely.
+Current answers store the engine's exact UTF-8 payload without a completion
+sentinel. A directory format marker makes the adjacent versioned proof
+mandatory; the marker, payload, and proof are individually synchronized in that
+order, and the proof binds the payload name, size, and sha256. Historical
+sentinel-framed answers remain readable only with the exact terminal frame.
+`answer <id>` opens owned files without following links, verifies at most 16 MiB
+of original stored bytes, and streams validation when content exceeds the
+separate inline display limit.
 
 Codex raw assistant deltas are journaled as they arrive. Normalized transcript
 chunks retain a final nonblank segment and adjacent whitespace until more text
@@ -103,7 +108,6 @@ child. What the adapters drive:
 | `claude` | `claude` CLI headless | `--setting-sources ""`, per-run plugin dirs |
 | `glm` | `claude` CLI pointed at Z.ai's Anthropic-compatible endpoint | subclass of the claude adapter; auth via env/keychain, base URL pinned in the adapter |
 | `qwen` | `qwen -p … --output-format stream-json --sandbox` | headless one-shot; approval mode maps to write/read-only; macOS uses Xcode's real Git binary instead of the sandbox-hostile `/usr/bin` shim |
-| `opencode` | managed long-lived `opencode serve` HTTP service | the only runtime with a managed service (`agent-run service start`) |
 
 Auth is declared per runtime as env-var **names** or file links — secret
 values never appear in config. On macOS, adapters fall back to Keychain
@@ -115,9 +119,9 @@ Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 10`.
 Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
 `commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
 `deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
-`capacity_route_snapshots`,
-`workflow_runs` / `workflow_steps` / `workflow_deliveries`, `run_stats`,
-`context_receipts`.
+`capacity_route_snapshots`, `run_stats`, and `context_receipts`. Legacy
+`workflow_runs`, `workflow_steps`, and `workflow_deliveries` tables remain so
+upgrades preserve historical rows; no current product path reads or writes them.
 
 Schema changes ship as numbered migrations (`state/migrations/`) with a
 pre-migration backup; components version-check and refuse to run against a
@@ -166,7 +170,7 @@ the same contract, exposed by the MCP `start` description and `agent-run doc
 completion`; they are not repeated in each notice. The contract explains
 asynchronous launch, bound delivery, result retrieval, and why a completion
 notice is neither a new task nor user approval. Host-added trust warnings remain
-under the host's control. Workflow notices keep their separate format.
+under the host's control.
 The local relay protocol accepts strict legacy v1 requests, selector-bearing v2,
 and failure-aware v3. A current host advertises `ar-cdx-v3-*.sock`; clients
 prefer v3, then v2, and use legacy requests for older hosts. Old clients send
@@ -181,16 +185,6 @@ retryable; unknown acceptance after transmission remains ambiguous and
 retryable. Relay discovery has a ten-second total budget and the host call
 has an eight-second budget, within the existing thirty-second lease.
 The Node wrapper preserves MCP stdio and removes its socket on child exit.
-
-## Workflows
-
-A restricted Python script (AST-guarded: five names, no imports/IO) runs
-in a detached runner; every `agent()` step goes through the same
-`AgentService.start`, so limits, profiles, and permissions apply
-unchanged. Steps are journaled with their spec hash; `workflow resume`
-replays a failed/lost run under the same id, serving completed steps from
-the journal cache and re-running only the broken tail. `batch` generates
-the one-phase parallel script for you.
 
 ## Capacity and limits
 
@@ -296,5 +290,6 @@ Details: `agent-run doc releases`.
 3. Evidence over optimism: terminal states are derived from recorded
    facts; fabricated success must be structurally impossible.
 4. One dispatcher, many transports; parity is tested, not promised.
-5. Standard library only; the supervisor of other people's agents should
-   not have a supply chain of its own.
+5. Use maintained dependencies for commodity protocols and utilities when
+   they replace concrete handwritten code. Lock and verify their dependency
+   graph; keep durable ownership and outcome guarantees explicit and tested.

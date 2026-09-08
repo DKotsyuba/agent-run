@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import os
-import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +28,7 @@ from .lifecycle import (
     terminate_process_group,
     verify_process_group,
 )
+from .process_identity import capture_process_birth
 from .state.run_stats import record_run_stats_best_effort
 from .state.store import StateStore
 from .verify import (
@@ -53,26 +54,16 @@ DEFAULT_WARNING_TEXT = (
 
 
 def supervisor_identity() -> str:
-    """The full command identity reconciliation compares against.
+    """Return a nonblank command diagnostic for the current process.
 
-    Derived from `ps -o command=` on this process's own pid -- the same
-    probe reconciliation and doctor run later -- because argv[0] as passed
-    to exec can diverge from what ps reports (a venv python symlink
-    resolves to the real framework binary on macOS).
+    ``sys.orig_argv`` describes the interpreter invocation without spawning an
+    external probe. PID birth time remains the ownership authority; this text is
+    persisted only for operators. An unusually empty argv falls back to a label
+    containing this process's PID so callers always receive a nonblank value.
     """
 
-    try:
-        result = subprocess.run(
-            ["/bin/ps", "-p", str(os.getpid()), "-o", "command="],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            env={"PATH": "/usr/bin:/bin"},
-        )
-        identity = result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        identity = ""
-    return identity or "agent-run-supervisor"
+    identity = " ".join(sys.orig_argv).strip()
+    return identity or f"pid:{os.getpid()}"
 
 
 def _error_text(error: BaseException) -> str:
@@ -81,6 +72,13 @@ def _error_text(error: BaseException) -> str:
 
 @dataclass(frozen=True)
 class SupervisorSettings:
+    """Validated timing and work bounds for one supervisor lifecycle.
+
+    Durations are seconds. ``command_limit`` and ``command_seconds`` bound one
+    running command-drain tick so engine polling, heartbeat, and deadline checks
+    regain control even while commands keep arriving.
+    """
+
     heartbeat_seconds: float = 5.0
     poll_seconds: float = 0.25
     grace_seconds: float = 10.0
@@ -90,14 +88,19 @@ class SupervisorSettings:
     warning_text: str = DEFAULT_WARNING_TEXT
     silence_threshold_seconds: float = 60.0
     stalled_after_seconds: float = 900.0
+    command_limit: int = 16
+    command_seconds: float = 1.0
     sentinel: str | None = DEFAULT_SENTINEL
 
     def __post_init__(self) -> None:
+        """Reject unsafe or non-finite supervisor settings before launch."""
+
         for name in (
             "heartbeat_seconds",
             "poll_seconds",
             "grace_seconds",
             "kill_grace_seconds",
+            "command_seconds",
         ):
             value = getattr(self, name)
             if (
@@ -130,6 +133,12 @@ class SupervisorSettings:
             raise ValidationError("warning_fraction must be strictly between 0 and 1")
         if not isinstance(self.warning_text, str) or not self.warning_text.strip():
             raise ValidationError("warning_text must be a nonblank string")
+        if (
+            isinstance(self.command_limit, bool)
+            or not isinstance(self.command_limit, int)
+            or not 1 <= self.command_limit <= 1_000
+        ):
+            raise ValidationError("command_limit must be an integer from 1 to 1000")
         if self.sentinel is not None and (
             not isinstance(self.sentinel, str) or not self.sentinel.strip()
         ):
@@ -222,6 +231,7 @@ class Supervisor:
         self._ready = ready
         self._identity = identity or supervisor_identity()
         self._pid = os.getpid() if supervisor_pid is None else supervisor_pid
+        self._birth_time = capture_process_birth(self._pid)
         self._sink = StoreEventSink(store, self._agent_id, self._ops)
         self._group: VerifiedProcessGroup | None = None
         self._owned_pid: int | None = None
@@ -268,6 +278,7 @@ class Supervisor:
                 pid=self._pid,
                 identity=self._identity,
                 process_group_id=self._pid,
+                birth_time=self._birth_time,
             )
             if self._ready is not None:
                 self._ready.ready()
@@ -355,6 +366,7 @@ class Supervisor:
             pid=self._pid,
             identity=self._identity,
             process_group_id=self._recorded_group_id,
+            birth_time=self._birth_time,
         )
         self._last_heartbeat = started_at
         # Baseline for the stalled watchdog only. Seeding the sink itself
@@ -490,6 +502,7 @@ class Supervisor:
             pid=self._pid,
             identity=self._identity,
             process_group_id=self._recorded_group_id,
+            birth_time=self._birth_time,
         )
 
     def _warn(
@@ -517,7 +530,17 @@ class Supervisor:
         )
 
     def _drain_commands(self, session: RuntimeSession, steerable: bool) -> None:
-        while True:
+        """Handle a bounded command page, returning immediately after cancel.
+
+        The store supplies cancellation-first ordering. This loop caps both
+        claimed rows and elapsed monotonic seconds so a sustained producer
+        cannot starve engine polling, heartbeat writes, or deadline checks.
+        """
+
+        started = self._ops.monotonic()
+        for _ in range(self._settings.command_limit):
+            if self._ops.monotonic() - started >= self._settings.command_seconds:
+                return
             command = self._store.claim_command(self._agent_id)
             if command is None:
                 return
@@ -531,6 +554,8 @@ class Supervisor:
             else:
                 result = {"accepted": False, "reason": "unsupported_command"}
             self._store.complete_command(int(command["id"]), self._agent_id, result)
+            if kind == CANCEL_COMMAND:
+                return
 
     @staticmethod
     def _payload(command: Mapping[str, object]) -> dict[str, object]:
@@ -663,16 +688,23 @@ class Supervisor:
         return committed
 
     def _record_termination(self, termination, *, best_effort: bool = False) -> None:
-        if self._group is None or not (termination.signals or not termination.group_gone):
+        """Persist one scoped cleanup verdict for an owned process session."""
+
+        if not self._owns_process_group:
             return
         try:
             self._store.append_event(
                 self._agent_id,
-                "process_group_terminated",
+                "process_cleanup",
                 data={
                     "signals": list(termination.signals),
+                    "scope": termination.scope,
                     "group_gone": termination.group_gone,
-                    "process_group_id": self._group.pgid,
+                    "descendants_gone": termination.descendants_gone,
+                    "confirmed": termination.confirmed,
+                    "process_group_id": (
+                        None if self._group is None else self._group.pgid
+                    ),
                 },
             )
         except Exception:
@@ -730,6 +762,20 @@ class Supervisor:
             self._store.transition(
                 self._agent_id, outcome.status, outcome=outcome, kind="terminal"
             )
+            committed_status = AgentStatus(
+                str(self._store.get_agent(self._agent_id)["status"])
+            )
+            if committed_status is not outcome.status:
+                outcome = Outcome(
+                    committed_status,
+                    exit_code=outcome.exit_code,
+                    failure_kind=outcome.failure_kind,
+                    failure_text=outcome.failure_text,
+                    runtime_session_id=outcome.runtime_session_id,
+                    answer_path=outcome.answer_path,
+                    answer_bytes=outcome.answer_bytes,
+                    answer_sha256=outcome.answer_sha256,
+                )
             _logger.info(
                 "agent_id=%s stage=terminal status=%s failure_kind=%s",
                 self._agent_id, outcome.status.value, outcome.failure_kind,

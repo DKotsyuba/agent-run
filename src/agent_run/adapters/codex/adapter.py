@@ -1,10 +1,10 @@
 """Codex runtime adapter: isolated home, app-server launch, models/limits.
 
-No live ``codex`` calls happen anywhere in this module. Model rosters and
-capacity limits are read from an isolated on-disk cache/evidence file below
-the generated ``CODEX_HOME`` (populated by a live probe out of this task's
-scope); this adapter only intersects that cache with the configured
-allowlist and marks missing/stale evidence ``unknown``.
+Only the bounded ``--version`` health observation invokes ``codex`` here.
+Model rosters and capacity limits are read from an isolated on-disk
+cache/evidence file below the generated ``CODEX_HOME``; this adapter only
+intersects that cache with the configured allowlist and marks missing/stale
+evidence ``unknown``.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Mapping
 
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
-from ...errors import PathEscapeError, ValidationError
+from ...errors import ValidationError
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -36,11 +36,22 @@ from ..base import (
     RuntimeSession,
 )
 from ..developer_environment import configured_environment_keys, environment_digest
-from ..command_policy import render_codex_denial_rules
+from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
+from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
+from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
-from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
+from .environment import (
+    bridge_points_at_source,
+    build_environment,
+    developer_approval_fields,
+    developer_config_lines,
+    prepared_environment,
+    require_resolved_mcp,
+    resolved_directory,
+)
+from .skills import prune_skills
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
@@ -209,69 +220,6 @@ def _rollout_limits(
     return ()
 
 
-def _resolved_directory(value: object, label: str) -> Path:
-    try:
-        resolved = Path(value).expanduser().resolve(strict=True)
-    except (TypeError, OSError, RuntimeError) as error:
-        raise ValidationError(f"{label} must be an existing directory: {value}") from error
-    if not resolved.is_dir():
-        raise ValidationError(f"{label} must be an existing directory: {value}")
-    return resolved
-
-
-def _prune_skills(home: Path, selected: frozenset[str]) -> None:
-    """Drop adapter-owned skill directories that are no longer selected.
-
-    Only direct children below ``skills/`` that carry a managed ``SKILL.md``
-    are touched, so runtime-owned state below the generated home survives.
-    """
-
-    skills_root = home / "skills"
-    if skills_root.is_symlink():
-        raise PathEscapeError(f"codex skills root must not be a symlink: {skills_root}")
-    if not skills_root.is_dir():
-        return
-    for child in sorted(skills_root.iterdir()):
-        if child.name in selected or child.is_symlink() or not child.is_dir():
-            continue
-        managed = child / "SKILL.md"
-        if managed.is_symlink() or not managed.is_file():
-            continue
-        managed.unlink()
-        try:
-            child.rmdir()
-        except OSError:
-            # The runtime kept unrelated files below this skill; leave them.
-            pass
-
-
-def _bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
-    """The bridge is authenticated only if it canonically resolves to the configured source."""
-
-    if source is None or not bridge.is_symlink():
-        return False
-    try:
-        return bridge.resolve(strict=True) == Path(source).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError):
-        return False
-
-
-def _require_resolved_mcp(
-    config: RuntimeConfig, mcp_servers: Mapping[str, McpConfig], where: str
-) -> None:
-    """Every selected MCP must come from the caller-resolved mapping, not ambient config."""
-
-    if not isinstance(mcp_servers, Mapping):
-        raise ValidationError(f"codex {where} requires a resolved mcp_servers mapping")
-    for name in config.mcp:
-        try:
-            definition = mcp_servers[name]
-        except (KeyError, TypeError) as error:
-            raise ValidationError(f"codex mcp reference is not configured: {name}") from error
-        if not isinstance(definition, McpConfig):
-            raise ValidationError(f"codex mcp reference is not resolved: {name}")
-
-
 class CodexAdapter:
     def describe(self) -> RuntimeInfo:
         return RuntimeInfo(
@@ -303,8 +251,6 @@ class CodexAdapter:
         """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
-        if config.service_mode is not None:
-            raise ValidationError("codex runtime does not use service_mode")
         if config.auth is None or config.auth.kind != "file_link":
             raise ValidationError("codex runtime requires a file_link auth bridge")
         if not config.models:
@@ -337,7 +283,7 @@ class CodexAdapter:
         propagate.
         """
         self.validate(config)
-        _require_resolved_mcp(config, mcp_servers, "materialize")
+        require_resolved_mcp(config, mcp_servers, "materialize")
         if skills_root is None:
             skills_root = Path(home).parents[2] / "skills" / "codex"
         if not isinstance(skills_root, Path) or not skills_root.is_absolute():
@@ -348,13 +294,14 @@ class CodexAdapter:
         sources = skill_dirs(config.plugins, skills_root, config.skills)
         skill_hashes: dict[str, str] = {}
         for name in config.skills:
-            source = sources[name] / "SKILL.md"
             try:
-                text = source.read_text(encoding="utf-8")
-            except OSError as error:
+                snapshot = snapshot_managed_tree(
+                    Path(home), f"skills/{name}", sources[name]
+                )
+            except ValidationError as error:
                 raise ValidationError(f"codex skill is not available: {name}: {error}") from error
-            skill_hashes[name] = write_managed_file(home, f"skills/{name}/SKILL.md", text)
-        _prune_skills(Path(home), frozenset(config.skills))
+            skill_hashes[name] = snapshot.sha256
+        prune_skills(Path(home), frozenset(config.skills))
 
         mcp_lines: list[str] = []
         for name in sorted(config.mcp):
@@ -417,13 +364,37 @@ class CodexAdapter:
         generated_config = "\n".join(body_lines).rstrip() + "\n"
         write_managed_file(home, _CONFIG_REL, generated_config)
         denied_commands = config.environment.denied_commands if config.environment is not None else ()
-        denial_rules = render_codex_denial_rules(denied_commands)
-        write_managed_file(home, "rules/agent-run-command-policy.rules", denial_rules)
+        policy_environment = build_environment(config.binary, Path(home))
+        if config.environment is not None and config.environment.path:
+            policy_environment["PATH"] = os.pathsep.join(
+                (
+                    *(str(path) for path in config.environment.path),
+                    policy_environment["PATH"],
+                )
+            )
+        command_policy = materialize_refusal_commands(
+            denied_commands,
+            Path(home) / "command-refusals",
+            environment=policy_environment,
+        )
+        write_managed_file(
+            home,
+            "rules/agent-run-command-policy.rules",
+            render_codex_denial_rules(
+                denied_commands,
+                command_paths=tuple(command_policy.resolved_commands.values()),
+            ),
+        )
 
         auth_digest = ""
+        managed_links: tuple[tuple[str, str], ...] = ()
         if config.auth is not None and config.auth.kind == "file_link":
-            bridge = create_symlink_bridge(home, config.auth.target, config.auth.source)
-            auth_digest = str(bridge.resolve(strict=True))
+            if config.auth.source is None:
+                raise ValidationError("codex file_link auth source is missing")
+            auth_target = str(config.auth.source.expanduser().resolve(strict=True))
+            create_symlink_bridge(home, config.auth.target, config.auth.source)
+            auth_digest = auth_target
+            managed_links = ((config.auth.target, auth_target),)
 
         fingerprint = "\n".join(
             [
@@ -435,9 +406,23 @@ class CodexAdapter:
                 environment_digest(config),
             ]
         )
-        return content_hash(fingerprint)
+        revision = content_hash(fingerprint)
+        finalize_runtime_snapshots(
+            Path(home),
+            revision,
+            (
+                "config.toml",
+                "rules/agent-run-command-policy.rules",
+                "command-refusals/.agent-run-command-policy.json",
+                *(f"command-refusals/{command}" for command in sorted(denied_commands)),
+            ),
+            managed_links,
+        )
+        return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
+        """Report health with a fresh bounded configured-binary version observation."""
+
         try:
             self.validate(config)
         except ValidationError as error:
@@ -447,12 +432,15 @@ class CodexAdapter:
         home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
         auth_ok = None
         if config.auth is not None and config.auth.kind == "file_link":
-            auth_ok = _bridge_points_at_source(home_path / config.auth.target, config.auth.source)
-        cache = _read_json(home_path / _MODEL_CACHE_REL)
-        version = cache.get("codex_version") if isinstance(cache, dict) else None
+            auth_ok = bridge_points_at_source(home_path / config.auth.target, config.auth.source)
+        version, version_reason = observe_binary_version(config.binary, home_path)
         available = bool(binary_ok and home_ok and (auth_ok is not False))
-        reason = None if available else "codex binary, generated home, or auth bridge is missing"
-        return RuntimeHealth(available, version if isinstance(version, str) else None, auth_ok, reason)
+        reason = (
+            version_reason
+            if available
+            else "codex binary, generated home, or auth bridge is missing"
+        )
+        return RuntimeHealth(available, version, auth_ok, reason)
 
     def models(self, config: RuntimeConfig, home: Path) -> tuple[ModelInfo, ...]:
         cache_path = Path(home) / _MODEL_CACHE_REL
@@ -559,6 +547,7 @@ class CodexAdapter:
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build an isolated Codex launch plan for an authorized request.
 
@@ -575,7 +564,7 @@ class CodexAdapter:
         if not isinstance(profile, AgentProfile):
             raise ValidationError("prepare requires an AgentProfile")
         self.validate(config)
-        _require_resolved_mcp(config, mcp_servers, "prepare")
+        require_resolved_mcp(config, mcp_servers, "prepare")
         if request.runtime != "codex":
             raise ValidationError(f"codex adapter cannot prepare runtime {request.runtime!r}")
         if request.model not in config.models:
@@ -609,7 +598,7 @@ class CodexAdapter:
         if not (home_path / _CONFIG_REL).is_file():
             raise ValidationError(f"codex home is not materialized: {home_path}")
 
-        workdir = _resolved_directory(request.workdir, "workdir")
+        workdir = resolved_directory(request.workdir, "workdir")
         roots = tuple(
             str(root)
             for root in normalize_read_roots(
@@ -633,7 +622,13 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
-        environment = prepared_environment(config.binary, home_path, config, workdir)
+        environment = prepared_environment(
+            config.binary,
+            home_path,
+            config,
+            workdir,
+            refresh=resume_session_id is None,
+        )
         if config.plugins and not effective_write:
             # A read-only sandbox cannot write the raw spool the plugin's
             # pre-execution wrapper needs, so that wrapper fails open to the
@@ -682,6 +677,7 @@ class CodexAdapter:
             runtime_stream_path=Path(agent_dir) / "runtime.jsonl",
             adapter_state=MappingProxyType(adapter_state),
             answer_path=Path(agent_dir) / "answer.md",
+            resume_session_id=resume_session_id,
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession:

@@ -29,7 +29,7 @@ from agent_run.errors import StateTransitionError, ValidationError
 if TYPE_CHECKING:
     from agent_run.delivery.base import DeliveryAttemptEvidence
 
-from . import capacity, delivery, workflow
+from . import capacity, delivery
 from .db import (
     _upsert_context_receipt,
     agent_row,
@@ -85,22 +85,10 @@ class StateStore:
 
     @classmethod
     def open(cls, database: str | Path) -> StateStore:
-        """Open an existing state database, sweeping abandoned workflow runs.
-
-        Only a live process can notice that a detached workflow runner is gone,
-        so every open pays for one bounded reconciliation pass. An abandoned run
-        is flipped to ``lost`` there -- it is never silently resumed.
-        """
-
-        from .reconciliation import reconcile_workflow_runs
+        """Open and return an existing migrated state database."""
 
         store = cls(open_database(database))
         _logger.debug("db=%s open", database)
-        try:
-            reconcile_workflow_runs(store)
-        except BaseException:
-            store.close()
-            raise
         return store
 
     def close(self) -> None:
@@ -147,12 +135,18 @@ class StateStore:
         at: float | None = None,
         parent_agent_id: str | AgentId | None = None,
         identity_json: str | None = None,
+        startup_owner_identity: str | None = None,
+        startup_owner_birth_time: float | None = None,
+        startup_deadline_seconds: float | None = None,
     ) -> AgentCreation:
         """Admit one capped agent. See :func:`agent_run.state.start.create_agent`.
 
         ``parent_agent_id`` is the agent this start resumes, or ``None`` for a
         fresh run; it is validated and claimed inside the same transaction.
         ``identity_json`` is the effective-identity snapshot for this run.
+        Supplying startup owner identity, optional birth proof, and a finite
+        deadline atomically persists service admission as ``STARTING``.
+        Omitting all three retains low-level ``CREATED`` fixture behavior.
         """
 
         if isinstance(request, StartRequest) and request.timeout_seconds is None:
@@ -168,6 +162,9 @@ class StateStore:
             at=at,
             parent_agent_id=parent_agent_id,
             identity_json=identity_json,
+            startup_owner_identity=startup_owner_identity,
+            startup_owner_birth_time=startup_owner_birth_time,
+            startup_deadline_seconds=startup_deadline_seconds,
         )
 
     def resume_chain(
@@ -430,6 +427,77 @@ class StateStore:
         )
         return [dict(row) for row in rows]
 
+    def agent_projection(
+        self, agent_ids: Iterable[str | AgentId]
+    ) -> dict[str, dict[str, object]]:
+        """Return batched read metadata for the exact distinct ``agent_ids``.
+
+        Progress time, deadline warning, latest delivery and attempt evidence,
+        and latest process-cleanup event are resolved in one SQL statement.
+        Input order is irrelevant; unknown IDs are omitted, duplicates collapse,
+        and an empty iterable performs no query. Stored JSON remains raw for the
+        service boundary to validate into its public typed views.
+        """
+
+        selected = tuple(dict.fromkeys(str(validate_agent_id(value)) for value in agent_ids))
+        if not selected:
+            return {}
+        values = ",".join("(?)" for _ in selected)
+        rows = self.connection.execute(
+            f"""WITH selected(id) AS (VALUES {values}),
+                progress AS (
+                    SELECT agent_id, MAX(at) AS last_progress_at
+                    FROM messages WHERE agent_id IN (SELECT id FROM selected)
+                    GROUP BY agent_id
+                ), warnings AS (
+                    SELECT DISTINCT agent_id, 1 AS deadline_warned
+                    FROM events WHERE agent_id IN (SELECT id FROM selected)
+                      AND kind = 'deadline_warning'
+                ), delivery_seq AS (
+                    SELECT agent_id, MAX(terminal_event_seq) AS terminal_event_seq
+                    FROM deliveries WHERE agent_id IN (SELECT id FROM selected)
+                    GROUP BY agent_id
+                ), latest_delivery AS (
+                    SELECT deliveries.* FROM deliveries
+                    JOIN delivery_seq USING (agent_id, terminal_event_seq)
+                ), evidence_attempt AS (
+                    SELECT delivery_id, MAX(attempt) AS attempt
+                    FROM delivery_attempt_evidence
+                    WHERE delivery_id IN (SELECT id FROM latest_delivery)
+                    GROUP BY delivery_id
+                ), latest_evidence AS (
+                    SELECT evidence.delivery_id, evidence.evidence_json
+                    FROM delivery_attempt_evidence AS evidence
+                    JOIN evidence_attempt USING (delivery_id, attempt)
+                ), cleanup_seq AS (
+                    SELECT agent_id, MAX(seq) AS seq
+                    FROM events WHERE agent_id IN (SELECT id FROM selected)
+                      AND kind = 'process_cleanup'
+                    GROUP BY agent_id
+                ), latest_cleanup AS (
+                    SELECT events.agent_id, events.data_json AS cleanup_json
+                    FROM events JOIN cleanup_seq USING (agent_id, seq)
+                )
+                SELECT selected.id, progress.last_progress_at,
+                       COALESCE(warnings.deadline_warned, 0) AS deadline_warned,
+                       latest_delivery.id AS delivery_id,
+                       latest_delivery.state AS delivery_state,
+                       latest_delivery.attempts AS delivery_attempts,
+                       latest_delivery.ambiguous_result AS delivery_ambiguous,
+                       latest_delivery.last_error AS delivery_last_error,
+                       latest_evidence.evidence_json,
+                       latest_cleanup.cleanup_json
+                FROM selected
+                LEFT JOIN progress ON progress.agent_id = selected.id
+                LEFT JOIN warnings ON warnings.agent_id = selected.id
+                LEFT JOIN latest_delivery ON latest_delivery.agent_id = selected.id
+                LEFT JOIN latest_evidence
+                  ON latest_evidence.delivery_id = latest_delivery.id
+                LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id""",
+            selected,
+        )
+        return {str(row["id"]): dict(row) for row in rows}
+
     def active_count(self) -> int:
         values = tuple(status.value for status in ACTIVE)
         return count_agents(self.connection, values)
@@ -563,6 +631,7 @@ class StateStore:
         pid: int,
         identity: str,
         process_group_id: int,
+        birth_time: float | None = None,
         at: float | None = None,
     ) -> None:
         """Record the detached supervisor's immutable ownership proof.
@@ -570,7 +639,8 @@ class StateStore:
         The first binding for a ``STARTING`` agent must occur before its startup
         lease expires. Once recorded, the same supervisor may refine its process
         group after engine launch even if that lease has elapsed; terminal rows
-        and conflicting identities remain rejected.
+        and conflicting identities remain rejected. ``birth_time`` is optional
+        only for legacy callers; once present it is immutable across heartbeats.
         """
 
         agent_id = validate_agent_id(agent_id)
@@ -583,6 +653,13 @@ class StateStore:
             or process_group_id <= 0
         ):
             raise ValidationError("process ids must be positive integers")
+        if birth_time is not None and (
+            isinstance(birth_time, bool)
+            or not isinstance(birth_time, (int, float))
+            or not math.isfinite(birth_time)
+            or birth_time < 0
+        ):
+            raise ValidationError("supervisor birth time must be finite and nonnegative")
         nonblank("supervisor identity", identity)
         with immediate(self.connection):
             agent = agent_row(self.connection, agent_id)
@@ -596,20 +673,25 @@ class StateStore:
                 and deadline <= timestamp(at)
             ):
                 raise StateTransitionError("expired startup cannot bind a supervisor")
-            fields = ("supervisor_pid", "supervisor_identity", "process_group_id")
+            fields = (
+                "supervisor_pid",
+                "supervisor_identity",
+                "process_group_id",
+                "supervisor_birth_time",
+            )
             stored = tuple(agent[field] for field in fields)
             if any(value is not None for value in stored) and stored != (
-                pid, identity, process_group_id
+                pid, identity, process_group_id, birth_time
             ):
                 # The pre-ready row records the detached supervisor's own group
                 # (it is its own group leader), so refining that one value once to
                 # the verified engine group is the only permitted rewrite.
-                if stored != (pid, identity, pid) or process_group_id == pid:
+                if stored != (pid, identity, pid, birth_time) or process_group_id == pid:
                     raise ValidationError("supervisor identity is immutable")
             self.connection.execute(
                 """UPDATE agents SET supervisor_pid = ?, supervisor_identity = ?,
-                   process_group_id = ?, heartbeat_at = ? WHERE id = ?""",
-                (pid, identity, process_group_id, timestamp(at), agent_id),
+                   process_group_id = ?, supervisor_birth_time = ?, heartbeat_at = ? WHERE id = ?""",
+                (pid, identity, process_group_id, birth_time, timestamp(at), agent_id),
             )
 
     def claim_startup(
@@ -617,19 +699,28 @@ class StateStore:
         agent_id: str | AgentId,
         owner_identity: str,
         *,
+        owner_birth_time: float | None = None,
         at: float | None = None,
         deadline_seconds: float = 120.0,
     ) -> None:
         """Durably bind one accepted ``STARTING`` row to its live coordinator owner.
 
-        ``owner_identity`` is a nonblank ``"<pid> <ps command>"`` proof.  The
-        binding is immutable and is valid only until ``deadline_seconds`` after
-        ``at``. A terminal row cannot be claimed. The fixed deadline prevents a
-        live but wedged broker from exempting an abandoned start forever.
+        ``owner_identity`` is a nonblank ``"<pid> <command>"`` diagnostic and
+        ``owner_birth_time`` is the optional process-creation proof. The binding
+        is immutable and is valid only until ``deadline_seconds`` after ``at``.
+        A terminal row cannot be claimed. The fixed deadline prevents a live but
+        wedged broker from exempting an abandoned start forever.
         """
 
         checked = validate_agent_id(agent_id)
         nonblank("startup owner identity", owner_identity)
+        if owner_birth_time is not None and (
+            isinstance(owner_birth_time, bool)
+            or not isinstance(owner_birth_time, (int, float))
+            or not math.isfinite(owner_birth_time)
+            or owner_birth_time < 0
+        ):
+            raise ValidationError("startup owner birth time must be finite and nonnegative")
         if (
             isinstance(deadline_seconds, bool)
             or not isinstance(deadline_seconds, (int, float))
@@ -645,13 +736,21 @@ class StateStore:
             if AgentStatus(agent["status"]) is not AgentStatus.STARTING:
                 raise StateTransitionError("startup owner requires starting agent")
             current = agent["startup_owner_pid_identity"]
-            if current is not None and current != owner_identity:
+            current_birth = agent["startup_owner_birth_time"]
+            if current is not None and (
+                current != owner_identity or current_birth != owner_birth_time
+            ):
                 raise StateTransitionError("startup is already owned")
             if current is None:
                 self.connection.execute(
                     """UPDATE agents SET startup_owner_pid_identity = ?,
-                       startup_deadline_at = ? WHERE id = ?""",
-                    (owner_identity, claimed_at + float(deadline_seconds), checked),
+                       startup_owner_birth_time = ?, startup_deadline_at = ? WHERE id = ?""",
+                    (
+                        owner_identity,
+                        owner_birth_time,
+                        claimed_at + float(deadline_seconds),
+                        checked,
+                    ),
                 )
 
     def begin_supervisor_handoff(
@@ -726,6 +825,53 @@ class StateStore:
             raise ValidationError("target must be an AgentStatus")
         changed_at = timestamp(at)
         with immediate(self.connection):
+            if target in {AgentStatus.SUCCEEDED, AgentStatus.TIMED_OUT}:
+                current = AgentStatus(agent_row(self.connection, agent_id)["status"])
+                pending_cancel = self.connection.execute(
+                    """SELECT id FROM commands
+                       WHERE agent_id = ? AND kind = 'cancel' AND state = 'pending'
+                       ORDER BY id LIMIT 1""",
+                    (agent_id,),
+                ).fetchone()
+                if current is AgentStatus.RUNNING and pending_cancel is not None:
+                    self._transition(
+                        agent_id,
+                        AgentStatus.CANCELLING,
+                        changed_at,
+                        outcome=None,
+                        attempt_id=attempt_id,
+                        kind="cancelling",
+                        data={"source": "pending_cancel"},
+                    )
+                    original = outcome or Outcome(target)
+                    target = AgentStatus.CANCELLED
+                    outcome = Outcome(
+                        target,
+                        exit_code=original.exit_code,
+                        failure_kind=original.failure_kind,
+                        failure_text=original.failure_text,
+                        runtime_session_id=original.runtime_session_id,
+                        answer_path=original.answer_path,
+                        answer_bytes=original.answer_bytes,
+                        answer_sha256=original.answer_sha256,
+                    )
+                    self.connection.execute(
+                        """UPDATE commands
+                           SET state = 'completed', claimed_at = ?,
+                               completed_at = ?, result_json = ?
+                           WHERE id = ? AND state = 'pending'""",
+                        (
+                            changed_at,
+                            changed_at,
+                            json_text(
+                                {
+                                    "accepted": True,
+                                    "reason": "terminal_cancel",
+                                }
+                            ),
+                            pending_cancel["id"],
+                        ),
+                    )
             return self._transition(
                 agent_id,
                 target,
@@ -830,11 +976,22 @@ class StateStore:
         supervisor_pid: int | None = None,
         process_group_id: int | None = None,
         expected_identity: str | None = None,
+        expected_birth_time: float | None = None,
         alive: bool | None = None,
         checked_at: float | None = None,
-        observed_identity: str | None = None,
+        observed_birth_time: float | None = None,
         reason: str | None = None,
     ) -> bool:
+        """Apply an exact liveness or PID-reuse proof to one active agent.
+
+        Stored PID, process group and diagnostic identity select the immutable
+        supervisor row. Dead proofs may cover legacy rows; reuse proofs require
+        matching expected birth evidence plus a different observed birth time.
+        The method returns whether it committed ``LOST`` and never signals a
+        process. Invalid, incomplete, or stale evidence raises
+        :class:`ValidationError`.
+        """
+
         agent_id = validate_agent_id(agent_id)
         if verdict not in {"alive", "dead", "identity_mismatch"}:
             raise ValidationError("invalid reconciliation verdict")
@@ -846,9 +1003,10 @@ class StateStore:
                 supervisor_pid=supervisor_pid,
                 process_group_id=process_group_id,
                 expected_identity=expected_identity,
+                expected_birth_time=expected_birth_time,
                 alive=alive,
                 checked_at=checked_at,
-                observed_identity=observed_identity,
+                observed_birth_time=observed_birth_time,
             )
             if AgentStatus(agent["status"]) in TERMINAL:
                 return False
@@ -865,7 +1023,7 @@ class StateStore:
                 ),
                 attempt_id=None,
                 kind="reconciled_lost",
-                data={"verdict": verdict, "observed_identity": observed_identity},
+                data={"verdict": verdict, "observed_birth_time": observed_birth_time},
             )
         return True
 
@@ -934,7 +1092,9 @@ class StateStore:
             agent_row(self.connection, agent_id)
             row = self.connection.execute(
                 """SELECT * FROM commands
-                   WHERE agent_id = ? AND state = 'pending' ORDER BY id LIMIT 1""",
+                   WHERE agent_id = ? AND state = 'pending'
+                   ORDER BY CASE kind WHEN 'cancel' THEN 0 ELSE 1 END, id
+                   LIMIT 1""",
                 (agent_id,),
             ).fetchone()
             if row is None:
@@ -1149,220 +1309,3 @@ class StateStore:
 
     def cancel_delivery(self, delivery_id: str) -> bool:
         return delivery.cancel_delivery(self.connection, delivery_id)
-
-    def claim_workflow_delivery(
-        self, owner: str, *, at: float | None = None, lease_seconds: float = 30
-    ) -> dict[str, object] | None:
-        """Claim one due workflow notice for an owner until its lease expires.
-
-        ``owner`` is the dispatcher's lease identity, ``at`` overrides the
-        current time, and ``lease_seconds`` bounds how long the claim holds.
-        Returns the claimed row joined with its orchestrator session as a plain
-        dict, or ``None`` when nothing is due.  ``run_status`` on the returned
-        row is the notice's own immutable snapshot of the terminal transition it
-        was created for, *not* the current ``workflow_runs`` status: a notice
-        queued for a failed attempt announces that failure even after the run
-        has been resumed and has succeeded.
-
-        A notice is only due while it is the newest ``attempt_generation`` for
-        its run: a row a later terminal transition superseded is never claimed,
-        including one that had already reached ``retry_wait`` from a lease taken
-        before the new transition was committed. An expired ``sending`` row of
-        the latest generation is reclaimed with the same id and an incremented
-        attempt count, so a dispatcher crash cannot strand it. See
-        :func:`agent_run.state.workflow.finish_workflow_run` for the generation
-        contract.
-        """
-
-        nonblank("lease owner", owner)
-        now = timestamp(at)
-        with immediate(self.connection):
-            row = self.connection.execute(
-                """SELECT wd.*, os.transport,
-                          os.external_session_id, os.external_turn_id
-                   FROM workflow_deliveries wd
-                   JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
-                   WHERE (
-                         (wd.state IN ('pending', 'retry_wait')
-                          AND wd.next_attempt_at <= ?
-                          AND (wd.lease_until IS NULL OR wd.lease_until <= ?))
-                         OR (wd.state = 'sending' AND wd.lease_until <= ?)
-                     )
-                     AND NOT EXISTS (
-                           SELECT 1 FROM workflow_deliveries newer
-                           WHERE newer.run_id = wd.run_id
-                             AND newer.attempt_generation > wd.attempt_generation
-                     )
-                   ORDER BY wd.next_attempt_at, wd.id LIMIT 1""",
-                (now, now, now),
-            ).fetchone()
-            if row is None:
-                return None
-            updated = self.connection.execute(
-                """UPDATE workflow_deliveries
-                   SET state = 'sending', lease_owner = ?, lease_until = ?,
-                       attempts = attempts + 1
-                   WHERE id = ? AND (
-                         state IN ('pending', 'retry_wait')
-                         OR (state = 'sending' AND lease_until <= ?)
-                   )""",
-                (owner, now + lease_seconds, row["id"], now),
-            ).rowcount
-            if updated != 1:
-                return None
-            row = self.connection.execute(
-                """SELECT wd.*, os.transport,
-                          os.external_session_id, os.external_turn_id
-                   FROM workflow_deliveries wd
-                   JOIN orchestrator_sessions os ON os.id = wd.orchestrator_session_id
-                   WHERE wd.id = ?""",
-                (row["id"],),
-            ).fetchone()
-        return dict(row)
-
-    def complete_workflow_delivery(
-        self, delivery_id: str, owner: str, *, remote_message_id: str | None = None,
-        at: float | None = None,
-    ) -> None:
-        """Complete a workflow delivery only under the caller's live lease."""
-
-        now = timestamp(at)
-        with immediate(self.connection):
-            updated = self.connection.execute(
-                """UPDATE workflow_deliveries SET state = 'delivered', lease_owner = NULL,
-                       lease_until = NULL, remote_message_id = ?
-                   WHERE id = ? AND state = 'sending' AND lease_owner = ?
-                     AND lease_until > ?""",
-                (remote_message_id, delivery_id, owner, now),
-            ).rowcount
-            if updated != 1:
-                raise ValidationError("workflow delivery lease is not owned by caller")
-
-    def retry_workflow_delivery(
-        self, delivery_id: str, owner: str, error: str, *, at: float | None = None,
-        base_delay: float = 1, max_delay: float = 300,
-    ) -> float:
-        """Release a live owned workflow lease with capped exponential delay."""
-
-        now = timestamp(at)
-        with immediate(self.connection):
-            row = self.connection.execute(
-                """SELECT attempts FROM workflow_deliveries
-                   WHERE id = ? AND state = 'sending' AND lease_owner = ?
-                     AND lease_until > ?""",
-                (delivery_id, owner, now),
-            ).fetchone()
-            if row is None:
-                raise ValidationError("workflow delivery lease is not owned by caller")
-            delay = min(max_delay, base_delay * (2 ** min(int(row["attempts"]) - 1, 20)))
-            next_attempt = now + delay
-            self.connection.execute(
-                """UPDATE workflow_deliveries SET state = 'retry_wait', lease_owner = NULL,
-                       lease_until = NULL, last_error = ?, next_attempt_at = ? WHERE id = ?""",
-                (error, next_attempt, delivery_id),
-            )
-        return next_attempt
-
-    def fail_workflow_delivery(
-        self, delivery_id: str, owner: str, error: str, *, at: float | None = None
-    ) -> None:
-        """Permanently fail a workflow notice under the caller's live lease."""
-
-        now = timestamp(at)
-        with immediate(self.connection):
-            updated = self.connection.execute(
-                """UPDATE workflow_deliveries SET state = 'failed', lease_owner = NULL,
-                       lease_until = NULL, last_error = ?
-                   WHERE id = ? AND state = 'sending' AND lease_owner = ?
-                     AND lease_until > ?""",
-                (error, delivery_id, owner, now),
-            ).rowcount
-            if updated != 1:
-                raise ValidationError("workflow delivery lease is not owned by caller")
-
-    def create_workflow_run(
-        self,
-        name: str,
-        script_sha: str,
-        *,
-        owner_identity: str | None = None,
-        run_id: str | None = None,
-        at: float | None = None,
-        plan: object = None,
-        orchestrator: object = None,
-    ) -> str:
-        return workflow.create_workflow_run(
-            self.connection,
-            name,
-            script_sha,
-            owner_identity=owner_identity,
-            run_id=run_id,
-            at=at,
-            plan=plan,
-            orchestrator=orchestrator,
-        )
-
-    def start_workflow_run(self, run_id: str) -> None:
-        workflow.start_workflow_run(self.connection, run_id)
-
-    def claim_workflow_run(self, run_id: str, owner_identity: str) -> None:
-        workflow.claim_workflow_run(self.connection, run_id, owner_identity)
-
-    def resume_workflow_run(self, run_id: str, owner_identity: str) -> None:
-        workflow.resume_workflow_run(self.connection, run_id, owner_identity)
-
-    def finish_workflow_run(
-        self, run_id: str, status: str, *, result: object = None, at: float | None = None
-    ) -> None:
-        """Persist a terminal workflow status and optional JSON-safe result."""
-
-        workflow.finish_workflow_run(
-            self.connection, run_id, status, result=result, at=at
-        )
-
-    def record_step_start(
-        self,
-        run_id: str,
-        step_key: str,
-        spec: object,
-        *,
-        agent_id: str | None = None,
-    ) -> None:
-        workflow.record_step_start(
-            self.connection, run_id, step_key, spec, agent_id=agent_id
-        )
-
-    def finish_step(
-        self,
-        run_id: str,
-        step_key: str,
-        status: str,
-        *,
-        result: object = None,
-        failure_kind: str | None = None,
-        failure_params: object = None,
-    ) -> None:
-        workflow.finish_step(
-            self.connection,
-            run_id,
-            step_key,
-            status,
-            result=result,
-            failure_kind=failure_kind,
-            failure_params=failure_params,
-        )
-
-    def cached_step_result(self, run_id: str, step_key: str) -> object | None:
-        return workflow.cached_step_result(self.connection, run_id, step_key)
-
-    def workflow_run_status(
-        self, run_id: str, *, step_limit: int = 100
-    ) -> dict[str, object]:
-        return workflow.workflow_run_status(self.connection, run_id, step_limit=step_limit)
-
-    def list_workflow_runs(
-        self, *, active_only: bool = False, limit: int = 100, offset: int = 0
-    ) -> list[dict[str, object]]:
-        return workflow.list_workflow_runs(
-            self.connection, active_only=active_only, limit=limit, offset=offset
-        )

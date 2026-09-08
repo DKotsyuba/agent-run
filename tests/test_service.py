@@ -18,6 +18,10 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from agent_run.adapters.snapshots import (
+    finalize_runtime_snapshots,
+    inspect_config_snapshot,
+)
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import (
     AgentStatus,
@@ -28,7 +32,9 @@ from agent_run.domain import (
     StartRequest,
 )
 from agent_run.errors import StateTransitionError, ValidationError
+from agent_run.effective_policy import Constraint, Enforcement
 from agent_run.delivery.base import DeliveryAttemptEvidence
+from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService, _log_start_preparation_stage
@@ -57,6 +63,7 @@ class FakeAdapter:
         self.prepare_dirs = []
         self.prepare_profiles = []
         self.prepare_error = None
+        self.prepare_materialize_revision = None
 
     def describe(self):
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
@@ -65,10 +72,13 @@ class FakeAdapter:
         self.validate_calls += 1
 
     def materialize(self, config, home, *, mcp_servers, skills_root):
+        """Finalize an empty managed index and return its fixed revision."""
+
         self.materialize_calls += 1
         self.materialize_configs.append(config)
         self.materialize_homes.append(home)
         self.skills_roots.append(skills_root)
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def probe(self, config, home):
@@ -82,15 +92,33 @@ class FakeAdapter:
         self.limits_calls += 1
         raise AssertionError("service limits must use stored samples")
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+    def prepare(
+        self,
+        request,
+        profile,
+        config,
+        home,
+        agent_dir,
+        *,
+        mcp_servers,
+        resume_session_id=None,
+    ):
+        """Return one plan carrying the supplied optional resume identity."""
+
         self.prepare_calls += 1
         self.prepare_dirs.append(agent_dir)
         self.prepare_profiles.append(profile)
         if self.prepare_error is not None:
             raise self.prepare_error
+        if self.prepare_materialize_revision is not None:
+            finalize_runtime_snapshots(
+                Path(home), self.prepare_materialize_revision
+            )
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task, agent_dir / "runtime.jsonl", {},
             agent_dir / "answer.md",
+            resume_session_id,
+            self.prepare_materialize_revision,
         )
 
     def launch(self, plan, sink):
@@ -180,6 +208,94 @@ class AgentServiceTests(unittest.TestCase):
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
 
+    def test_new_opencode_start_is_rejected_with_migration_guidance(self) -> None:
+        """Reject a removed runtime before creating an agent or loading an adapter."""
+
+        with self.assertRaisesRegex(ValidationError, "no longer supported"):
+            self.service.start(
+                StartRequest(
+                    "opencode", "model", "profile", "task", self.workdir,
+                    timeout_seconds=60,
+                )
+            )
+        self.assertEqual(self.launched, [])
+
+    def test_required_unsupported_policy_is_refused_before_admission(self) -> None:
+        """Explicit isolation requirements fail before any durable agent row."""
+
+        request = replace(
+            self.request(request_id="required-network"),
+            required_constraints=frozenset(
+                {Constraint.EXTERNAL_NETWORK_ISOLATION}
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValidationError, "external_network_isolation"
+        ):
+            self.service.start(request)
+        self.assertEqual(self.store.list_agents(), [])
+        self.assertEqual(ADAPTER.materialize_calls, 0)
+
+    def test_supported_policy_is_persisted_and_public(self) -> None:
+        """A satisfied explicit requirement is immutable public run evidence."""
+
+        request = replace(
+            self.request(request_id="required-plugin"),
+            required_constraints=frozenset({Constraint.PLUGIN_IMMUTABILITY}),
+        )
+        result = self.service.start(request)
+        policy = result.agent.policy
+        self.assertIsNotNone(policy)
+        plugin = next(
+            item
+            for item in policy.constraints
+            if item.constraint is Constraint.PLUGIN_IMMUTABILITY
+        )
+        self.assertTrue(plugin.required)
+        self.assertTrue(plugin.supported)
+        self.assertIs(plugin.enforcement, Enforcement.RUNTIME_ENFORCED)
+        self.assertEqual(self.service.get(result.agent_id).policy, policy)
+
+    def test_required_plugin_immutability_rejects_live_plugin_inputs(self) -> None:
+        """A configured plugin without declared snapshots cannot satisfy required."""
+
+        plugin = self.root / "plugin"
+        plugin.mkdir()
+        runtime = replace(
+            self.config.runtimes["fake"],
+            plugins=(plugin,),
+            plugin_snapshot_assets={},
+        )
+        self.service = AgentService(
+            replace(self.config, runtimes={"fake": runtime}),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        request = replace(
+            self.request(request_id="live-plugin-required"),
+            required_constraints=frozenset({Constraint.PLUGIN_IMMUTABILITY}),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "plugin_immutability"):
+            self.service.start(request)
+        self.assertEqual(self.store.list_agents(), [])
+
+    def test_historical_opencode_row_is_readable_without_adapter(self) -> None:
+        """Read a persisted OpenCode row without resolving its retired adapter."""
+
+        created = self.store.create_agent(
+            StartRequest(
+                "opencode", "model", "profile", "historic", self.workdir,
+                timeout_seconds=60,
+            ),
+            task_summary="historic",
+            config_revision="legacy",
+            at=1,
+        )
+        self.assertEqual(self.service.get(created.agent_id).runtime, "opencode")
+
     def test_account_resolution_uses_sibling_home_and_store_auth(self) -> None:
         runtime = self.config.runtimes["fake"]
         auth_source = self.root / "accounts" / "fake" / "personal2" / "auth.json"
@@ -196,9 +312,34 @@ class AgentServiceTests(unittest.TestCase):
         )
         self.service.start(self.request(request_id="account"))
         self.wait_until(lambda: bool(ADAPTER.materialize_homes))
-        self.assertEqual(ADAPTER.materialize_homes[-1], self.runtime_home.with_name("runtime@personal2"))
+        self.wait_until(
+            lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
+                "snapshot:v1:"
+            )
+        )
+        agent = self.store.list_agents()[0]
+        attempt_home = self.root / "agents" / str(agent["id"]) / "runtime-home"
+        self.assertEqual(ADAPTER.materialize_homes[-1], attempt_home)
         self.assertEqual(ADAPTER.materialize_configs[-1].auth.source, auth_source)
-        self.assertEqual((self.runtime_home.with_name("runtime@personal2")).is_dir(), True)
+        self.assertTrue(attempt_home.is_dir())
+        self.assertTrue(str(agent["config_revision"]).startswith("snapshot:v1:"))
+        self.assertTrue(
+            (self.root / "agents" / str(agent["id"]) / "config-snapshot.json").is_file()
+        )
+
+    def test_prepare_final_materialize_revision_is_the_persisted_snapshot(self) -> None:
+        """Request-dependent prepare output replaces the initial home revision."""
+
+        ADAPTER.prepare_materialize_revision = "cfg-2"
+        result = self.start("prepare-revision")
+        row = self.store.get_agent(result.agent_id)
+        expected_sha256 = str(row["config_revision"]).removeprefix("snapshot:v1:")
+        snapshot = inspect_config_snapshot(
+            self.root / "agents" / result.agent_id,
+            expected_sha256,
+        )
+
+        self.assertEqual(snapshot.materialize_revision, "cfg-2")
 
     def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
         """The profile is where agent-run assigns the shared role contract.
@@ -385,6 +526,103 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(launched[0], first.agent_id)
         self.assertIs(launched[2], ADAPTER)
         self.assertIsInstance(launched[3], LaunchPlan)
+
+    def test_list_projection_is_batched_and_exposes_cleanup_evidence(self) -> None:
+        """One page uses fixed SQL count and returns validated cleanup evidence."""
+
+        agent_ids = [
+            self.store.create_agent(
+                replace(
+                    self.request(request_id=f"projection-{index}"),
+                    timeout_seconds=480,
+                ),
+                task_summary=f"agent {index}",
+                config_revision="cfg-1",
+                at=index,
+            ).agent_id
+            for index in range(25)
+        ]
+        self.store.append_event(
+            agent_ids[-1],
+            "process_cleanup",
+            data={
+                "signals": ["SIGTERM", "SIGKILL"],
+                "scope": "verified_descendants",
+                "group_gone": True,
+                "descendants_gone": True,
+                "confirmed": True,
+                "process_group_id": 123,
+            },
+            at=30,
+        )
+        statements: list[str] = []
+        self.store.connection.set_trace_callback(statements.append)
+        try:
+            page = self.service.list(AgentQuery(limit=100))
+        finally:
+            self.store.connection.set_trace_callback(None)
+
+        selects = [statement for statement in statements if statement.startswith("SELECT") or statement.startswith("WITH")]
+        self.assertLessEqual(len(selects), 3)
+        self.assertEqual(page.total, 25)
+        cleanup = next(
+            item.cleanup for item in page.items if item.agent_id == agent_ids[-1]
+        )
+        self.assertEqual(cleanup.scope, "verified_descendants")
+        self.assertTrue(cleanup.confirmed)
+
+    def test_post_tool_binding_survives_fresh_service_replay(self) -> None:
+        """Late notification binding must not change the original replay namespace."""
+
+        request = self.request(request_id="post-tool-replay")
+        first = self.start("post-tool-replay")
+        run_hook(
+            self.store,
+            {
+                "agent_id": first.agent_id,
+                "transport": "codex_queue",
+                "external_session_id": "session-1",
+                "external_turn_id": "turn-1",
+            },
+            at=101,
+        )
+        self.service.close()
+        self.store = StateStore.open(self.root / "state.db")
+        self.service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 102.0,
+        )
+
+        replay = self.service.start(request)
+
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.agent_id, first.agent_id)
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len(self.store.list_agents()), 1)
+
+    def test_crash_before_worker_registration_leaves_owned_starting_row(self) -> None:
+        """A process-level interruption cannot expose ownerless ``CREATED`` state."""
+
+        with patch.object(
+            self.service._starts,
+            "submit",
+            side_effect=KeyboardInterrupt("coordinator crashed"),
+        ), self.assertRaisesRegex(KeyboardInterrupt, "coordinator crashed"):
+            self.service.start(self.request(request_id="registration-crash"))
+
+        row = self.store.list_agents()[0]
+        self.assertEqual(row["status"], AgentStatus.STARTING.value)
+        self.assertIsInstance(row["startup_owner_pid_identity"], str)
+        self.assertIsInstance(row["startup_owner_birth_time"], float)
+        self.assertEqual(row["startup_deadline_at"], 220.0)
+        events = self.store.connection.execute(
+            "SELECT kind FROM events WHERE agent_id = ? ORDER BY seq", (row["id"],)
+        ).fetchall()
+        self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
+        self.assertEqual(self.launched, [])
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""

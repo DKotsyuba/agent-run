@@ -14,9 +14,15 @@ from typing import Mapping
 
 from ...config import McpConfig, RuntimeHookConfig
 from ...errors import ValidationError
-from ..home import content_hash, create_symlink_bridge, write_managed_file
+from ..home import content_hash, write_managed_file
+from ..snapshots import snapshot_managed_tree, snapshot_selected_assets
 
-__all__ = ["render_mcp_config", "render_plugin_dirs", "render_settings"]
+__all__ = [
+    "render_declared_plugin_snapshots",
+    "render_mcp_config",
+    "render_plugin_dirs",
+    "render_settings",
+]
 
 
 def render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
@@ -67,10 +73,10 @@ def render_mcp_config(
 def render_plugin_dirs(home: Path, skills_root: Path, names: tuple[str, ...]) -> str:
     """Generate one plugin directory per selected skill.
 
-    Every top-level child of the owner-authored skill directory (SKILL.md,
-    plus any scripts/, references/, assets/, or other sibling) is bridged
-    into the generated plugin's skill directory through the same validated
-    symlink bridge, not just the manifest file.
+    Every directory and regular file in the owner-authored skill is copied into
+    the generated plugin through the shared immutable snapshot contract. Source
+    symlinks and special files fail closed; the returned revision covers paths,
+    types, and bytes rather than names alone.
     """
 
     digests = []
@@ -82,9 +88,47 @@ def render_plugin_dirs(home: Path, skills_root: Path, names: tuple[str, ...]) ->
         manifest_digest = write_managed_file(
             home, f"plugins/{name}/.claude-plugin/plugin.json", json.dumps({"name": name}, sort_keys=True)
         )
-        children = []
-        for child in sorted(skill_dir.iterdir()):
-            create_symlink_bridge(home, f"plugins/{name}/skills/{name}/{child.name}", child)
-            children.append(child.name)
-        digests.append(f"{name}:{manifest_digest}:{','.join(children)}")
+        snapshot = snapshot_managed_tree(
+            home, f"plugins/{name}/skills/{name}", skill_dir
+        )
+        digests.append(f"{name}:{manifest_digest}:{snapshot.sha256}")
     return content_hash(",".join(digests)) if digests else content_hash("no_skills")
+
+
+def render_declared_plugin_snapshots(
+    home: Path,
+    plugins: tuple[Path, ...],
+    declarations: Mapping[str, tuple[str, ...]],
+) -> str:
+    """Snapshot only explicitly declared plugin assets and return their revision.
+
+    ``declarations`` is keyed by configured plugin basename. Missing declarations
+    preserve the legacy live-plugin path and are fingerprinted as unsupported
+    mutability. Declared assets use the shared no-follow selected-path snapshot;
+    Unknown names and duplicate basenames selected by a declaration fail closed;
+    duplicate undeclared live plugins retain their legacy behavior.
+    """
+
+    roots: dict[str, list[Path]] = {}
+    for plugin in plugins:
+        roots.setdefault(plugin.name, []).append(plugin)
+    unknown = sorted(set(declarations) - set(roots))
+    if unknown:
+        raise ValidationError(
+            "claude plugin snapshot names are not configured: " + ", ".join(unknown)
+        )
+    fingerprints: list[str] = []
+    for name in declarations:
+        if len(roots[name]) != 1:
+            raise ValidationError(f"claude plugin snapshot name is ambiguous: {name}")
+    for plugin in plugins:
+        name = plugin.name
+        assets = declarations.get(name)
+        if assets is None:
+            fingerprints.append(f"{name}:live:{plugin}")
+            continue
+        snapshot = snapshot_selected_assets(
+            home, f"declared-plugins/{name}", plugin, assets
+        )
+        fingerprints.append(f"{name}:snapshot:{snapshot.sha256}")
+    return content_hash("\n".join(fingerprints)) if fingerprints else content_hash("no_plugins")

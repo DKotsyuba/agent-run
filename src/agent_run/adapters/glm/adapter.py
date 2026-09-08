@@ -82,10 +82,8 @@ class GlmAdapter(ClaudeAdapter):
     def validate(self, config: RuntimeConfig) -> None:
         # Auth contract differs from claude's (a keychain-backed token plus a
         # defaulted base URL), so the auth checks are glm's own; the
-        # remaining semantics -- service mode, whole-plugin skill listing,
+        # remaining semantics -- whole-plugin skill listing,
         # known hook events -- mirror the claude adapter verbatim.
-        if config.service_mode is not None:
-            raise ValidationError("glm runtime does not support service_mode")
         if config.auth is None:
             raise ValidationError("glm runtime requires an auth bridge")
         if config.auth.kind != "environment":
@@ -131,9 +129,16 @@ class GlmAdapter(ClaudeAdapter):
         agent_dir: Path,
         *,
         mcp_servers: Mapping[str, McpConfig],
+        resume_session_id: str | None = None,
     ) -> LaunchPlan:
         plan = super().prepare(
-            request, profile, config, home, agent_dir, mcp_servers=mcp_servers
+            request,
+            profile,
+            config,
+            home,
+            agent_dir,
+            mcp_servers=mcp_servers,
+            resume_session_id=resume_session_id,
         )
         cli_model = request.model
         argv = plan.argv

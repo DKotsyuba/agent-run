@@ -125,19 +125,6 @@ def render_qwen_denials(
     return _bash_denials(_native_command_patterns(commands, command_paths))
 
 
-def render_opencode_denials(
-    commands: Sequence[str], *, command_paths: Sequence[Path | str] = ()
-) -> dict[str, str]:
-    """Return native OpenCode bash-deny patterns without changing defaults.
-
-    The caller appends these exact and argument-bearing patterns after its
-    existing coding-mode default. Read-only modes must keep bash denied.
-    """
-
-    return {pattern: "deny" for command in _native_command_patterns(commands, command_paths)
-            for pattern in (command, f"{command} *")}
-
-
 def _prepare_directory(directory: Path) -> None:
     """Create a private managed directory or verify its ownership marker."""
 

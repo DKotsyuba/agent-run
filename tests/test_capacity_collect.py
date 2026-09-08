@@ -94,14 +94,14 @@ class CapacityCollectTests(unittest.TestCase):
                 capabilities=frozenset({Capability.LIVE_LIMITS}),
                 limits_error=RuntimeError("provider unreachable"),
             ),
-            "opencode": FakeAdapter(capabilities=frozenset()),
+            "unsupported": FakeAdapter(capabilities=frozenset()),
         }
         config = Config(
             schema_version=1,
             runtimes={
                 "codex": _runtime_config(),
                 "claude": _runtime_config(limits_source="native"),
-                "opencode": _runtime_config(),
+                "unsupported": _runtime_config(),
                 "disabled_rt": _runtime_config(enabled=False),
             },
         )
@@ -117,12 +117,12 @@ class CapacityCollectTests(unittest.TestCase):
             )
 
         by_runtime = {result.runtime: result for result in report.results}
-        self.assertEqual(set(by_runtime), {"codex", "claude", "opencode"})
+        self.assertEqual(set(by_runtime), {"codex", "claude", "unsupported"})
         self.assertEqual(by_runtime["codex"].status, STATUS_COLLECTED)
         self.assertEqual(by_runtime["codex"].sample_count, 2)
         self.assertEqual(by_runtime["claude"].status, STATUS_FAILED)
         self.assertEqual(by_runtime["claude"].error, "RuntimeError")
-        self.assertEqual(by_runtime["opencode"].status, STATUS_UNSUPPORTED)
+        self.assertEqual(by_runtime["unsupported"].status, STATUS_UNSUPPORTED)
 
         stored = self.store.recent_capacity_samples(at=0.0, limit=100)
         self.assertEqual(len(stored), 2)

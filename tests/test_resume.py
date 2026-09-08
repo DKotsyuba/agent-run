@@ -22,9 +22,11 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
+from agent_run.effective_policy import Constraint
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
@@ -34,7 +36,12 @@ class ResumableAdapter:
 
     def __init__(self) -> None:
         self.capabilities = frozenset(Capability)
+        self.materialize_calls = 0
         self.prepare_calls = 0
+        self.prepare_homes = []
+        self.prepare_resume_ids = []
+        self.prepare_tasks = []
+        self.prepare_materialize_revision = None
 
     def describe(self) -> RuntimeInfo:
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
@@ -43,8 +50,10 @@ class ResumableAdapter:
         """Accept any configuration; capability gating is the service's job."""
 
     def materialize(self, config, home, *, mcp_servers, skills_root) -> str:
-        """Return a fixed configuration revision without touching disk."""
+        """Finalize an empty managed index and return its fixed revision."""
 
+        self.materialize_calls += 1
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def probe(self, config, home) -> RuntimeHealth:
@@ -62,13 +71,28 @@ class ResumableAdapter:
 
         raise AssertionError("service limits must use stored samples")
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
-        """Build a plan with no resume identity, as a real adapter would."""
+    def prepare(
+        self,
+        request,
+        profile,
+        config,
+        home,
+        agent_dir,
+        *,
+        mcp_servers,
+        resume_session_id=None,
+    ):
+        """Build a plan carrying the Service-supplied resume identity."""
 
         self.prepare_calls += 1
+        self.prepare_homes.append(Path(home))
+        self.prepare_resume_ids.append(resume_session_id)
+        self.prepare_tasks.append(request.task)
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task,
             agent_dir / "runtime.jsonl", {}, agent_dir / "answer.md",
+            resume_session_id,
+            self.prepare_materialize_revision,
         )
 
     def launch(self, plan, sink):
@@ -103,7 +127,7 @@ class ResumeTests(unittest.TestCase):
         self._wait(2)
         again = self.service.resume(parent, "continue", request_id="caller-replay", orchestrator=caller)
         self.assertEqual(first.agent_id, again.agent_id)
-        with self.assertRaisesRegex(ValidationError, "request_id"):
+        with self.assertRaisesRegex(ValidationError, "already been resumed"):
             self.service.resume(parent, "continue", request_id="caller-replay")
         with self.assertRaises(ValidationError):
             self.service.resume(parent, "continue", request_id="caller-replay", timeout_seconds=True)
@@ -200,13 +224,27 @@ class ResumeTests(unittest.TestCase):
             at=102.0,
         )
 
-    def _parent(self, *, session="sess-1", request_id=None, task="do work"):
-        """Start one agent, wait for its launch, and finish it as a source."""
+    def _parent(
+        self,
+        *,
+        session: str = "sess-1",
+        request_id: str | None = None,
+        task: str = "do work",
+        required_constraints: frozenset[Constraint] = frozenset(),
+    ) -> str:
+        """Start and finish a resumable source with supplied identity fields.
+
+        Session is the recorded native session, optional request_id the replay
+        key, task the prompt, and required_constraints the typed admission set.
+        Returns the new parent agent ID after its fake launch and successful
+        terminal transition.
+        """
 
         target = len(self.launched) + 1
         result = self.service.start(
             StartRequest("fake", "model", "profile", task, self.workdir,
-                         request_id=request_id)
+                         request_id=request_id,
+                         required_constraints=required_constraints)
         )
         self._wait(target)
         self._finish(result.agent_id, session=session)
@@ -420,6 +458,112 @@ class ResumeTests(unittest.TestCase):
             self.service.resume(parent, "keep going")
 
     # -- idempotency, races, chains --------------------------------------
+
+    def test_snapshot_resume_reuses_root_home_without_rematerializing(self) -> None:
+        """Every continuation verifies and reuses its root lineage runtime home."""
+
+        parent = self._parent(session="sess-1")
+        root_home = self.root / "agents" / parent / "runtime-home"
+        revision = self.store.get_agent(parent)["config_revision"]
+        self.assertTrue(str(revision).startswith("snapshot:v1:"))
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+
+        second = self.service.resume(parent, "second")
+        self._wait(2)
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(ADAPTER.prepare_homes[-1], root_home)
+        self.assertEqual(
+            self.store.get_agent(second.agent_id)["config_revision"], revision
+        )
+        self._finish(second.agent_id, session="sess-2")
+
+        third = self.service.resume(second.agent_id, "third")
+        self._wait(3)
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(ADAPTER.prepare_homes[-1], root_home)
+        self.assertEqual(
+            self.store.get_agent(third.agent_id)["config_revision"], revision
+        )
+
+    def test_resume_inherits_explicit_policy_requirements(self) -> None:
+        """A continuation retains the parent's admitted policy requirements."""
+
+        parent = self._parent(
+            required_constraints=frozenset({Constraint.PLUGIN_IMMUTABILITY})
+        )
+        child = self.service.resume(parent, "continue")
+        self._wait(2)
+
+        stored = json.loads(self.store.get_agent(child.agent_id)["request_json"])
+        self.assertEqual(stored["required_constraints"], ["plugin_immutability"])
+        plugin = next(
+            item
+            for item in self.service.get(child.agent_id).policy.constraints
+            if item.constraint is Constraint.PLUGIN_IMMUTABILITY
+        )
+        self.assertTrue(plugin.required)
+        self.assertTrue(plugin.supported)
+
+    def test_missing_new_lineage_home_never_falls_back_to_legacy(self) -> None:
+        """A prefixed parent fails closed when its authoritative HOME is absent."""
+
+        parent = self._parent()
+        runtime_home = self.root / "agents" / parent / "runtime-home"
+        runtime_home.rename(runtime_home.with_name("runtime-home-missing"))
+
+        child = self.service.resume(parent, "continue")
+        deadline = time.monotonic() + 2
+        while self.service.get(child.agent_id).status not in {
+            AgentStatus.FAILED,
+            AgentStatus.CANCELLED,
+        }:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        view = self.service.get(child.agent_id)
+        self.assertIs(view.status, AgentStatus.FAILED)
+        self.assertIn("snapshot", view.failure_text)
+        self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(len(self.launched), 1)
+
+    def test_snapshot_resume_rejects_prepare_rematerialization(self) -> None:
+        """A resume plan cannot report mutation of its verified lineage HOME."""
+
+        parent = self._parent()
+        ADAPTER.prepare_materialize_revision = "cfg-2"
+
+        child = self.service.resume(parent, "continue")
+        deadline = time.monotonic() + 2
+        while self.service.get(child.agent_id).status is AgentStatus.STARTING:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        view = self.service.get(child.agent_id)
+        self.assertIs(view.status, AgentStatus.FAILED)
+        self.assertIn("must not rematerialize", view.failure_text)
+        self.assertEqual(len(self.launched), 1)
+
+    def test_legacy_shared_home_resume_rematerializes_before_native_attach(self) -> None:
+        """Legacy parents refresh current role state before exact session attach."""
+
+        first = self._parent(session="session-1", task="first role")
+        second = self._parent(session="session-2", task="second role")
+        self.store.connection.execute(
+            "UPDATE agents SET config_revision = 'legacy' WHERE id IN (?, ?)",
+            (first, second),
+        )
+        self.store.connection.commit()
+
+        child = self.service.resume(first, "resume first role")
+        plan = self._wait(3)
+
+        self.assertIsNone(ADAPTER.prepare_resume_ids[-1])
+        self.assertEqual(ADAPTER.prepare_tasks[-1], "resume first role")
+        self.assertEqual(ADAPTER.materialize_calls, 3)
+        self.assertEqual(plan.resume_session_id, "session-1")
+        self.assertEqual(
+            self.store.get_agent(child.agent_id)["config_revision"], "cfg-1"
+        )
 
     def test_same_request_id_replays_the_same_child_even_when_stale(self) -> None:
         parent = self._parent()

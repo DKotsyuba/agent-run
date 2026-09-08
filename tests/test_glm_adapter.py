@@ -122,9 +122,7 @@ class GlmAdapterTests(unittest.TestCase):
                 )
             )
 
-    def test_validate_keeps_claude_service_mode_and_hook_semantics(self) -> None:
-        with self.assertRaisesRegex(ValidationError, "service_mode"):
-            self.adapter.validate(self.runtime_config(service_mode="managed"))
+    def test_validate_keeps_claude_hook_semantics(self) -> None:
         with self.assertRaisesRegex(ValidationError, "not a known Claude hook event"):
             self.adapter.validate(
                 self.runtime_config(hooks=(RuntimeHookConfig("BogusEvent", ("echo",)),))

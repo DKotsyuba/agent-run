@@ -1,6 +1,7 @@
 import inspect
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -114,6 +115,19 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "resume session id"):
             LaunchPlan.from_payload({**payload, "resume_session_id": 7})
 
+        revised = replace(plan, materialize_revision="revision-2")
+        revised_payload = revised.to_payload()
+        self.assertEqual(
+            LaunchPlan.from_payload(revised_payload).materialize_revision,
+            "revision-2",
+        )
+        del revised_payload["materialize_revision"]
+        self.assertIsNone(
+            LaunchPlan.from_payload(revised_payload).materialize_revision
+        )
+        with self.assertRaisesRegex(ValidationError, "materialize revision"):
+            LaunchPlan.from_payload({**payload, "materialize_revision": " "})
+
     def module(self, **changes):
         values = {"ADAPTER_API_VERSION": ADAPTER_API_VERSION, "ADAPTER": FakeAdapter()}
         values.update(changes)
@@ -139,8 +153,9 @@ class AdapterTests(unittest.TestCase):
                 load_adapter("fake_module:ADAPTER", {Capability.WRITE})
 
         for module, message in (
-            (self.module(ADAPTER_API_VERSION=2), "API version"),
+            (self.module(ADAPTER_API_VERSION=1), "API version"),
             (self.module(ADAPTER_API_VERSION=1.0), "API version"),
+            (self.module(ADAPTER=FakeAdapter(1)), "reports API version"),
             (self.module(ADAPTER=FakeAdapter(1.0)), "reports API version"),
             (self.module(ADAPTER=object()), "missing callable"),
         ):
@@ -191,13 +206,12 @@ class AdapterTests(unittest.TestCase):
         modules = (
             "agent_run.adapters.claude.adapter",
             "agent_run.adapters.codex.adapter",
-            "agent_run.adapters.opencode.adapter",
         )
         for module in modules:
             __import__("sys").modules.pop(module, None)
         runtimes = {
             name: RuntimeConfig(True, f"{module}:ADAPTER", Path("/bin/echo"), Path("/tmp"), ())
-            for name, module in zip(("claude", "codex", "opencode"), modules)
+            for name, module in zip(("claude", "codex"), modules)
         }
         AdapterRegistry(runtimes).preload_enabled()
         for module in modules:
@@ -217,7 +231,7 @@ class AdapterTests(unittest.TestCase):
         """
 
         root = Path(__file__).parents[1] / "src" / "agent_run" / "adapters"
-        for family in ("claude", "codex", "opencode"):
+        for family in ("claude", "codex", "glm", "qwen"):
             paths = sorted((root / family).glob("*.py"))
             self.assertTrue(paths, f"no adapter sources found for {family}")
             for path in paths:

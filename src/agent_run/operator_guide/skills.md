@@ -21,9 +21,6 @@ seen at the next materialization.
 
 1. Edit config.toml (see `config` for the safe-edit discipline).
 2. Rematerialize the affected runtime homes.
-3. Restart the opencode service if opencode's skill list changed — its
-   generated config embeds skills paths directly, so a running service
-   keeps serving the old list until restarted.
 4. claude and codex pick up the new skill list at their next agent start;
    no running claude/codex process needs to be restarted.
 

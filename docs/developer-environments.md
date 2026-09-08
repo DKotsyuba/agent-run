@@ -13,7 +13,7 @@ The Codex, Claude, GLM, and Qwen adapters consume these presets. See the
 [Codex](codex-developer-environment.md),
 [Claude/GLM](claude-developer-environment.md), and
 [Qwen](qwen-developer-environment.md) integration notes for native command and
-MCP behavior. OpenCode does not support developer environment presets.
+MCP behavior.
 
 `agent_run.adapters.developer_environment` is the shared pure provider. It
 copies an already isolated baseline, adds declared paths and variables, allows

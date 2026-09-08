@@ -6,12 +6,21 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from hypothesis import given, settings, strategies as st
 
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
-from agent_run.state.reconciliation import reconcile_unowned_starting
+from agent_run.process_identity import (
+    ProcessObservation,
+    ProcessState,
+    capture_process_birth,
+)
+from agent_run.state.reconciliation import (
+    reconcile_active_agents,
+    reconcile_unowned_starting,
+)
 from agent_run.state.store import StateStore
 from agent_run.supervisor import supervisor_identity
 
@@ -116,12 +125,13 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         self.assertTrue(admitted.created)
 
     def test_live_owner_is_bounded_by_startup_deadline(self) -> None:
-        """A live broker protects preparation only before its fixed deadline."""
+        """Birth identity ignores command drift but remains deadline bounded."""
 
         agent_id = self.starting("owned-startup", at=10)
         self.store.claim_startup(
             agent_id,
-            f"{os.getpid()} {supervisor_identity()}",
+            f"{os.getpid()} deliberately-wrong-command",
+            owner_birth_time=capture_process_birth(os.getpid()),
             at=10,
             deadline_seconds=120,
         )
@@ -133,6 +143,30 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
             reconcile_unowned_starting(self.store, at=131, grace_seconds=30),
             (agent_id,),
         )
+
+    def test_unavailable_startup_birth_proof_is_not_death_before_deadline(self) -> None:
+        """Unknown and denied observations preserve a bounded startup claim."""
+
+        for state in (ProcessState.UNKNOWN, ProcessState.DENIED):
+            with self.subTest(state=state):
+                agent_id = self.starting(f"owner-{state}", at=10)
+                self.store.claim_startup(
+                    agent_id,
+                    f"{os.getpid()} diagnostic",
+                    owner_birth_time=12.5,
+                    at=10,
+                    deadline_seconds=120,
+                )
+                with patch(
+                    "agent_run.state.reconciliation.observe_process",
+                    return_value=ProcessObservation(state),
+                ):
+                    self.assertEqual(
+                        reconcile_unowned_starting(
+                            self.store, at=100, grace_seconds=30
+                        ),
+                        (),
+                    )
 
     def test_handoff_renews_deadline_until_late_supervisor_proof(self) -> None:
         """Atomic handoff prevents reconciliation between spawn and late READY."""
@@ -287,6 +321,42 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         self.store.record_supervisor(
             agent_id, pid=123, identity="identity", process_group_id=456, at=12
         )
+
+    def test_active_sweep_cursor_reaches_a_late_dead_supervisor(self) -> None:
+        """Repeated bounded sweeps advance past live rows and persist wrap order."""
+
+        agent_ids = [self.starting(f"fair-{index}", at=index) for index in range(5)]
+        for index, agent_id in enumerate(agent_ids):
+            self.store.record_supervisor(
+                agent_id,
+                pid=100 + index,
+                identity=f"owner-{index}",
+                process_group_id=100 + index,
+                birth_time=1.0,
+                at=10,
+            )
+
+        def observe(pid: int, _birth: float | None) -> ProcessObservation:
+            """Report only the final supervisor dead for deterministic fairness."""
+
+            return ProcessObservation(
+                ProcessState.DEAD if pid == 104 else ProcessState.ALIVE,
+                None if pid == 104 else 1.0,
+            )
+
+        with patch("agent_run.state.reconciliation.observe_process", side_effect=observe):
+            self.assertEqual(reconcile_active_agents(self.store, at=20, limit=2), ())
+            self.assertEqual(reconcile_active_agents(self.store, at=21, limit=2), ())
+            self.assertEqual(
+                reconcile_active_agents(self.store, at=22, limit=2),
+                (agent_ids[-1],),
+            )
+
+        cursor = self.store.connection.execute(
+            """SELECT created_at, agent_id FROM reconciliation_cursors
+               WHERE name = 'active_supervisors'"""
+        ).fetchone()
+        self.assertEqual((cursor["created_at"], cursor["agent_id"]), (0.0, agent_ids[0]))
 
 
 if __name__ == "__main__":
