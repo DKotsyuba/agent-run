@@ -45,15 +45,17 @@ class ArgumentsTests(unittest.TestCase):
 
     def test_adapters_pass_exact_native_resume_selector_to_process(self):
         """Exercise each real CLI adapter's launch wiring without contacting a provider."""
-        for adapter, module, session_type, argv in (
-            (CLAUDE, "claude", "ClaudeSession", ("claude", "--session-id", "fresh")),
-            (GLM, "claude", "ClaudeSession", ("claude", "--session-id", "fresh")),
-            (QWEN, "qwen", "QwenSession", ("qwen", "-p", "task")),
+        for adapter, session_type, argv in (
+            (CLAUDE, "ClaudeSession", ("claude", "--session-id", "fresh")),
+            (GLM, "ClaudeSession", ("claude", "--session-id", "fresh")),
+            (QWEN, "QwenSession", ("qwen", "-p", "task")),
         ):
             with self.subTest(adapter=adapter.describe().name):
                 plan = LaunchPlan(argv, Path("/tmp"), {}, "task", Path("/tmp/log"), {}, resume_session_id="saved")
-                namespace = "agent_run.adapters." + module + ".adapter."
-                with patch(namespace + "subprocess.Popen") as popen, patch(namespace + session_type):
+                launch_globals = adapter.launch.__func__.__globals__
+                with patch.object(launch_globals["subprocess"], "Popen") as popen, patch.dict(
+                    launch_globals, {session_type: Mock()}
+                ):
                     adapter.launch(plan, Mock())
                 self.assertEqual(popen.call_args.args[0][-2:], ["--resume", "saved"])
                 self.assertNotIn("--session-id", popen.call_args.args[0])
