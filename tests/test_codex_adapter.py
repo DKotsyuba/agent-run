@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import Capability, LaunchPlan, RuntimeAdapter
+from agent_run.adapters.codex import adapter as codex_adapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
@@ -532,6 +533,28 @@ env_from = ["PATH"]
         )
         self.assertFalse(inspection.verified)
         self.assertIn("auth.json", inspection.hash_mismatches)
+
+    def test_materialize_never_blesses_a_swapped_auth_bridge_target(self) -> None:
+        """Derive expected auth identity before publishing the mutable bridge path."""
+
+        config = self.runtime_config()
+        impostor = self.auth_source_dir / "other-auth.json"
+        impostor.write_text("{}", encoding="utf-8")
+        real_create = codex_adapter.create_symlink_bridge
+
+        def create_then_swap(home, relative, source):
+            """Retarget the bridge immediately after the real atomic publication."""
+
+            bridge = real_create(home, relative, source)
+            bridge.unlink()
+            bridge.symlink_to(impostor)
+            return bridge
+
+        with patch.object(
+            codex_adapter, "create_symlink_bridge", side_effect=create_then_swap
+        ):
+            with self.assertRaisesRegex(ValidationError, "target does not match"):
+                ADAPTER.materialize(config, self.home, mcp_servers={})
 
     def test_probe_refuses_a_regular_file_in_place_of_the_bridge(self) -> None:
         config = self.runtime_config()

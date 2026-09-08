@@ -235,6 +235,13 @@ class ManagedSnapshotTests(unittest.TestCase):
         self.assertIn("settings.json", changed.hash_mismatches)
         settings.write_text("{}", encoding="utf-8")
         settings.unlink()
+        missing_file = inspect_runtime_snapshots(
+            self.home, "files-1", expected_sha256=index_sha256
+        )
+        self.assertIn("settings.json", missing_file.missing)
+        self.assertNotIn("settings.json", missing_file.type_mismatches)
+        settings.write_text("{}", encoding="utf-8")
+        settings.unlink()
         settings.symlink_to(self.source / "SKILL.md")
         wrong_type = inspect_runtime_snapshots(
             self.home, "files-1", expected_sha256=index_sha256
@@ -271,6 +278,24 @@ class ManagedSnapshotTests(unittest.TestCase):
         self.assertFalse(inspection.verified)
         self.assertIn(
             "skills/demo/.agent-run-snapshot.json", inspection.hash_mismatches
+        )
+
+    def test_symlinked_manifest_is_a_type_mismatch(self) -> None:
+        """Classify a manifest symlink as wrong type without following it."""
+
+        snapshot_managed_tree(self.home, "skills/demo", self.source)
+        index_sha256 = finalize_runtime_snapshots(self.home, "files-1")
+        manifest = self.home / "skills/demo" / SNAPSHOT_MANIFEST
+        manifest.unlink()
+        manifest.symlink_to(self.source / "SKILL.md")
+        inspection = inspect_runtime_snapshots(
+            self.home, "files-1", expected_sha256=index_sha256
+        )
+        self.assertIn(
+            "skills/demo/.agent-run-snapshot.json", inspection.type_mismatches
+        )
+        self.assertNotIn(
+            "skills/demo/.agent-run-snapshot.json", inspection.missing
         )
 
     def test_runtime_hash_reader_rejects_incomplete_index_shape(self) -> None:

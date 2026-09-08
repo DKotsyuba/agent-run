@@ -418,8 +418,10 @@ class CodexAdapter:
         auth_digest = ""
         managed_links: tuple[tuple[str, str], ...] = ()
         if config.auth is not None and config.auth.kind == "file_link":
-            bridge = create_symlink_bridge(home, config.auth.target, config.auth.source)
-            auth_target = str(bridge.resolve(strict=True))
+            if config.auth.source is None:
+                raise ValidationError("codex file_link auth source is missing")
+            auth_target = str(config.auth.source.expanduser().resolve(strict=True))
+            create_symlink_bridge(home, config.auth.target, config.auth.source)
             auth_digest = auth_target
             managed_links = ((config.auth.target, auth_target),)
 

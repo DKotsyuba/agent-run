@@ -201,8 +201,10 @@ def inspect_runtime_snapshots(
             actual_manifest = content_hash(
                 _read_metadata(Path(home) / root, SNAPSHOT_MANIFEST)
             )
-        except (FileNotFoundError, ValidationError):
+        except FileNotFoundError:
             missing.append(manifest_path)
+        except (OSError, ValidationError):
+            type_mismatches.append(manifest_path)
         else:
             if actual_manifest != manifests[root]:
                 hash_mismatches.append(manifest_path)
@@ -226,7 +228,12 @@ def inspect_runtime_snapshots(
             entries, _ = _read_tree(home, (PurePosixPath(path),))
             actual = next(entry for entry in entries if entry["path"] == path)
         except ValidationError:
-            type_mismatches.append(path)
+            try:
+                (Path(home) / path).lstat()
+            except FileNotFoundError:
+                missing.append(path)
+            else:
+                type_mismatches.append(path)
         except StopIteration:
             missing.append(path)
         else:

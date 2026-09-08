@@ -89,6 +89,33 @@ class AdapterHomeTests(unittest.TestCase):
             with self.assertRaises(PathEscapeError):
                 write_managed_file(home, "linked/outside", "no")
 
+    def test_rejected_parent_and_temp_creation_close_every_descriptor(self) -> None:
+        """Keep descriptor count stable across repeated early publication failures."""
+
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            home = Path(directory).resolve()
+            (home / "linked").symlink_to(outside, target_is_directory=True)
+            baseline = len(os.listdir("/dev/fd"))
+            for _ in range(20):
+                with self.assertRaises(PathEscapeError):
+                    write_managed_file(home, "linked/file", "no")
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
+            real_open = os.open
+
+            def reject_temp(path, flags, *args, **kwargs):
+                """Fail only creation of the managed temporary regular file."""
+
+                if flags & os.O_CREAT:
+                    raise OSError("temp create failed")
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch("agent_run.adapters.home.os.open", side_effect=reject_temp):
+                for _ in range(20):
+                    with self.assertRaisesRegex(OSError, "temp create failed"):
+                        write_managed_file(home, "file", "no")
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
     def test_failed_atomic_replace_preserves_existing_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()

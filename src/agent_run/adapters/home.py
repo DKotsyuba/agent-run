@@ -169,6 +169,9 @@ def _open_managed_parent(
             child = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
+    except PathEscapeError:
+        os.close(descriptor)
+        raise
     except OSError as error:
         os.close(descriptor)
         raise ValidationError(
@@ -236,25 +239,27 @@ def write_managed_file(
     if mode not in {0o600, 0o700}:
         raise ValidationError("managed file mode must be 0600 or 0700")
     digest = content_hash(data)
-    parent, name, parent_fd = _open_managed_parent(home, relative_path)
+    _, name, parent_fd = _open_managed_parent(home, relative_path)
+    descriptor = -1
+    temporary_name: str | None = None
     try:
-        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        metadata = None
-    if metadata is not None and stat.S_ISLNK(metadata.st_mode):
-        os.close(parent_fd)
-        raise PathEscapeError(f"managed file must not replace a symlink: {relative_path}")
-    if metadata is not None and not stat.S_ISREG(metadata.st_mode):
-        os.close(parent_fd)
-        raise ValidationError(f"managed path is not a file: {relative_path}")
-    temporary_name = f"{MANAGED_TEMP_PREFIX}{name}.{secrets.token_hex(8)}.tmp"
-    descriptor = os.open(
-        temporary_name,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        mode,
-        dir_fd=parent_fd,
-    )
-    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+            raise PathEscapeError(
+                f"managed file must not replace a symlink: {relative_path}"
+            )
+        if metadata is not None and not stat.S_ISREG(metadata.st_mode):
+            raise ValidationError(f"managed path is not a file: {relative_path}")
+        temporary_name = f"{MANAGED_TEMP_PREFIX}{name}.{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent_fd,
+        )
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
@@ -269,13 +274,17 @@ def write_managed_file(
         )
         _fsync_directory_descriptor(parent_fd)
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
         try:
-            os.unlink(temporary_name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            pass
-        os.close(parent_fd)
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            try:
+                if temporary_name is not None:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(parent_fd)
     return digest
 
 
@@ -325,15 +334,17 @@ def create_symlink_bridge(
     except (OSError, RuntimeError) as error:
         raise ValidationError("symlink bridge source must be an absolute existing path") from error
     parent, name, parent_fd = _open_managed_parent(home, relative_path)
+    temporary: str | None = None
     try:
-        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        metadata = None
-    if metadata is not None and not stat.S_ISLNK(metadata.st_mode):
-        os.close(parent_fd)
-        raise ValidationError(f"symlink bridge would replace a managed file: {relative_path}")
-    temporary = f".{name}.{secrets.token_hex(8)}.link.tmp"
-    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and not stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(
+                f"symlink bridge would replace a managed file: {relative_path}"
+            )
+        temporary = f".{name}.{secrets.token_hex(8)}.link.tmp"
         os.symlink(
             str(source_path),
             temporary,
@@ -344,8 +355,10 @@ def create_symlink_bridge(
         _fsync_directory_descriptor(parent_fd)
     finally:
         try:
-            os.unlink(temporary, dir_fd=parent_fd)
+            if temporary is not None:
+                os.unlink(temporary, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
-        os.close(parent_fd)
+        finally:
+            os.close(parent_fd)
     return parent / name
