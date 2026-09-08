@@ -157,7 +157,6 @@ class M008IntegrationTests(unittest.TestCase):
             server.server_close()
             server.release_socket_path()
             server_thread.join(timeout=1)
-            server.dispatcher._thread.join(timeout=1)
         responses = [json.loads(line) for line in output.getvalue().splitlines()]
         return next(response["result"] for response in responses if response.get("id") == request_id)
 
