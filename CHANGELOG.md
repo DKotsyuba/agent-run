@@ -2,6 +2,14 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.10.2] - 2026-09-08
+
+- fix(snapshots): preserve legacy resume compatibility
+- fix(claude): protect scoped credential config
+- fix(claude): preserve scoped credential state
+- feat(claude): add scoped CLI login
+- fix(claude): scope CLI credential refresh state
+
 ## [0.10.1] - 2026-09-08
 
 - Fix bounded MCP release smoke (#27)
