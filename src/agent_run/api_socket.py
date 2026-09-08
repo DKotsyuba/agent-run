@@ -324,14 +324,15 @@ class _Handler(socketserver.StreamRequestHandler):
 
         session = Session()
         writer = _SocketWriter(self.wfile)
-        self.request.settimeout(
-            min(self.server.idle_timeout, CONTROL_FRAME_DEADLINE_SECONDS)
-            if self.server.control_connection_only(self.request)
-            else self.server.idle_timeout
-        )
+        control_only = self.server.control_connection_only(self.request)
+        self.request.settimeout(self.server.idle_timeout)
         while True:
             try:
-                line = self.rfile.readline(MAX_LINE_BYTES + 1)
+                line = (
+                    self._control_frame()
+                    if control_only
+                    else self.rfile.readline(MAX_LINE_BYTES + 1)
+                )
             except (OSError, TimeoutError):
                 return
             if not line:
@@ -344,6 +345,8 @@ class _Handler(socketserver.StreamRequestHandler):
                     _emit(writer, _rpc_error(None, -32700, "request exceeds maximum size"))
                 except (OSError, TimeoutError):
                     return
+                if control_only:
+                    return
                 self.request.settimeout(self.server.idle_timeout)
                 continue
             try:
@@ -354,9 +357,11 @@ class _Handler(socketserver.StreamRequestHandler):
                     _emit(writer, _rpc_error(None, -32700, "parse error"))
                 except (OSError, TimeoutError):
                     return
+                if control_only:
+                    return
                 self.request.settimeout(self.server.idle_timeout)
                 continue
-            if self.server.control_connection_only(self.request) and (
+            if control_only and (
                 not isinstance(request, dict)
                 or request.get("method") not in _CONTROL_METHODS
             ):
@@ -381,9 +386,29 @@ class _Handler(socketserver.StreamRequestHandler):
                     _emit(writer, response)
                 except (OSError, TimeoutError):
                     return
-            if self.server.control_connection_only(self.request):
+            if control_only:
                 return
             self.request.settimeout(self.server.idle_timeout)
+
+    def _control_frame(self) -> bytes:
+        """Read one reserved-slot frame under one absolute monotonic deadline."""
+
+        deadline = time.monotonic() + CONTROL_FRAME_DEADLINE_SECONDS
+        frame = bytearray()
+        while not frame.endswith(b"\n"):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("reserved control frame deadline exceeded")
+            self.request.settimeout(remaining)
+            chunk = self.request.recv(
+                min(4096, MAX_LINE_BYTES + 1 - len(frame))
+            )
+            if not chunk:
+                break
+            frame.extend(chunk)
+            if len(frame) > MAX_LINE_BYTES:
+                break
+        return bytes(frame)
 
 
 def _startup_lock(path: Path) -> int:

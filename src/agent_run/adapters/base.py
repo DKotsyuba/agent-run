@@ -78,7 +78,9 @@ class LaunchPlan:
     evidence, while ``adapter_state`` carries JSON-safe adapter metadata.
     ``resume_session_id`` carries the exact source-runtime session identity an
     adapter with :attr:`Capability.RESUME` should resume instead of starting a
-    fresh session; ``None`` means a fresh start.
+    fresh session; ``None`` means a fresh start. ``materialize_revision`` is
+    the optional final managed-home revision produced during prepare; absent
+    means the caller's earlier materialization revision remains final.
     """
 
     argv: tuple[str, ...]
@@ -89,6 +91,7 @@ class LaunchPlan:
     adapter_state: Mapping[str, object]
     answer_path: Path | None = None
     resume_session_id: str | None = None
+    materialize_revision: str | None = None
 
     def to_payload(self) -> dict[str, object]:
         """JSON form handed to the exec'd supervisor over a private pipe.
@@ -106,6 +109,7 @@ class LaunchPlan:
             "adapter_state": dict(self.adapter_state),
             "answer_path": None if self.answer_path is None else str(self.answer_path),
             "resume_session_id": self.resume_session_id,
+            "materialize_revision": self.materialize_revision,
         }
 
     @classmethod
@@ -129,6 +133,7 @@ class LaunchPlan:
             adapter_state = payload["adapter_state"]
             answer_path = payload["answer_path"]
             resume_session_id = payload.get("resume_session_id")
+            materialize_revision = payload.get("materialize_revision")
         except KeyError as error:
             raise ValidationError(f"malformed launch plan payload: {error}") from error
         if not isinstance(argv, list) or not all(
@@ -160,6 +165,13 @@ class LaunchPlan:
             raise ValidationError(
                 "launch plan resume session id must be a string or null"
             )
+        if materialize_revision is not None and (
+            not isinstance(materialize_revision, str)
+            or not materialize_revision.strip()
+        ):
+            raise ValidationError(
+                "launch plan materialize revision must be a nonblank string or null"
+            )
         try:
             return cls(
                 tuple(argv),
@@ -170,6 +182,7 @@ class LaunchPlan:
                 dict(adapter_state),
                 None if answer_path is None else Path(answer_path),
                 resume_session_id,
+                materialize_revision,
             )
         except (TypeError, ValueError, UnicodeError, binascii.Error) as error:
             raise ValidationError(f"malformed launch plan payload: {error}") from error

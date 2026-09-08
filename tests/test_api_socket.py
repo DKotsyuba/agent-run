@@ -247,6 +247,47 @@ class ApiSocketTests(unittest.TestCase):
             for client in blocked:
                 client.close()
 
+    def test_slow_bytes_cannot_extend_reserved_first_frame_deadline(self) -> None:
+        """A slowloris loses the reserve, letting a later cancel finish boundedly."""
+
+        self.replace_server(
+            lambda: self.service, max_connections=2, idle_timeout=2
+        )
+        ordinary = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ordinary.connect(str(self.path))
+        ordinary.sendall(b"{")
+        slow.connect(str(self.path))
+
+        def drip() -> None:
+            """Send bytes below the per-recv timeout until the server closes."""
+
+            for _ in range(10):
+                try:
+                    slow.sendall(b"{")
+                except OSError:
+                    return
+                time.sleep(0.1)
+
+        worker = threading.Thread(target=drip)
+        worker.start()
+        time.sleep(0.7)
+        started = time.monotonic()
+        response = self.request(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "cancel",
+                "params": {"agent_id": "ag-20260826-120000-0123456789"},
+            }
+        )
+        elapsed = time.monotonic() - started
+        ordinary.close()
+        slow.close()
+        worker.join(timeout=1)
+        self.assertEqual(response["result"]["status"], "cancelling")
+        self.assertLess(elapsed, 1.0)
+
     def test_live_slow_socket_is_never_reclaimed_as_stale(self) -> None:
         """A successful connect proves ownership even when no ping reply arrives."""
 

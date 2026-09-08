@@ -18,7 +18,10 @@ from agent_run.adapters.base import (
     RuntimeHealth,
     RuntimeInfo,
 )
-from agent_run.adapters.snapshots import finalize_runtime_snapshots
+from agent_run.adapters.snapshots import (
+    finalize_runtime_snapshots,
+    inspect_config_snapshot,
+)
 from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import (
     AgentStatus,
@@ -60,6 +63,7 @@ class FakeAdapter:
         self.prepare_dirs = []
         self.prepare_profiles = []
         self.prepare_error = None
+        self.prepare_materialize_revision = None
 
     def describe(self):
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
@@ -88,15 +92,33 @@ class FakeAdapter:
         self.limits_calls += 1
         raise AssertionError("service limits must use stored samples")
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+    def prepare(
+        self,
+        request,
+        profile,
+        config,
+        home,
+        agent_dir,
+        *,
+        mcp_servers,
+        resume_session_id=None,
+    ):
+        """Return one plan carrying the supplied optional resume identity."""
+
         self.prepare_calls += 1
         self.prepare_dirs.append(agent_dir)
         self.prepare_profiles.append(profile)
         if self.prepare_error is not None:
             raise self.prepare_error
+        if self.prepare_materialize_revision is not None:
+            finalize_runtime_snapshots(
+                Path(home), self.prepare_materialize_revision
+            )
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task, agent_dir / "runtime.jsonl", {},
             agent_dir / "answer.md",
+            resume_session_id,
+            self.prepare_materialize_revision,
         )
 
     def launch(self, plan, sink):
@@ -304,6 +326,20 @@ class AgentServiceTests(unittest.TestCase):
         self.assertTrue(
             (self.root / "agents" / str(agent["id"]) / "config-snapshot.json").is_file()
         )
+
+    def test_prepare_final_materialize_revision_is_the_persisted_snapshot(self) -> None:
+        """Request-dependent prepare output replaces the initial home revision."""
+
+        ADAPTER.prepare_materialize_revision = "cfg-2"
+        result = self.start("prepare-revision")
+        row = self.store.get_agent(result.agent_id)
+        expected_sha256 = str(row["config_revision"]).removeprefix("snapshot:v1:")
+        snapshot = inspect_config_snapshot(
+            self.root / "agents" / result.agent_id,
+            expected_sha256,
+        )
+
+        self.assertEqual(snapshot.materialize_revision, "cfg-2")
 
     def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
         """The profile is where agent-run assigns the shared role contract.

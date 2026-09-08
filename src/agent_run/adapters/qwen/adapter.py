@@ -379,8 +379,9 @@ class QwenAdapter:
                 parent_path = f"{_XCODE_GIT_DIRECTORY}{os.pathsep}{parent_path}"
             environment["PATH"] = parent_path
         environment = developer_environment(environment, config, Path(request.workdir))
+        materialize_revision = None
         if resume_session_id is None:
-            self.materialize(
+            materialize_revision = self.materialize(
                 config,
                 Path(home),
                 mcp_servers=mcp_servers,
@@ -440,6 +441,7 @@ class QwenAdapter:
             adapter_state=state,
             answer_path=agent_dir / "answer.md",
             resume_session_id=resume_session_id,
+            materialize_revision=materialize_revision,
         )
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> QwenSession:

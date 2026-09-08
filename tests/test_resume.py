@@ -39,6 +39,7 @@ class ResumableAdapter:
         self.materialize_calls = 0
         self.prepare_calls = 0
         self.prepare_homes = []
+        self.prepare_materialize_revision = None
 
     def describe(self) -> RuntimeInfo:
         return RuntimeInfo("fake", ADAPTER_API_VERSION, self.capabilities)
@@ -68,14 +69,26 @@ class ResumableAdapter:
 
         raise AssertionError("service limits must use stored samples")
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
-        """Build a plan with no resume identity, as a real adapter would."""
+    def prepare(
+        self,
+        request,
+        profile,
+        config,
+        home,
+        agent_dir,
+        *,
+        mcp_servers,
+        resume_session_id=None,
+    ):
+        """Build a plan carrying the Service-supplied resume identity."""
 
         self.prepare_calls += 1
         self.prepare_homes.append(Path(home))
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task,
             agent_dir / "runtime.jsonl", {}, agent_dir / "answer.md",
+            resume_session_id,
+            self.prepare_materialize_revision,
         )
 
     def launch(self, plan, sink):
@@ -507,6 +520,23 @@ class ResumeTests(unittest.TestCase):
         self.assertIs(view.status, AgentStatus.FAILED)
         self.assertIn("snapshot", view.failure_text)
         self.assertEqual(ADAPTER.materialize_calls, 1)
+        self.assertEqual(len(self.launched), 1)
+
+    def test_snapshot_resume_rejects_prepare_rematerialization(self) -> None:
+        """A resume plan cannot report mutation of its verified lineage HOME."""
+
+        parent = self._parent()
+        ADAPTER.prepare_materialize_revision = "cfg-2"
+
+        child = self.service.resume(parent, "continue")
+        deadline = time.monotonic() + 2
+        while self.service.get(child.agent_id).status is AgentStatus.STARTING:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        view = self.service.get(child.agent_id)
+        self.assertIs(view.status, AgentStatus.FAILED)
+        self.assertIn("must not rematerialize", view.failure_text)
         self.assertEqual(len(self.launched), 1)
 
     def test_same_request_id_replays_the_same_child_even_when_stale(self) -> None:

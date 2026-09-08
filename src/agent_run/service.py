@@ -791,6 +791,7 @@ class AgentService:
             self._policy_for_profile(request, effective_runtime, profile)
             record_profile_grants(store.connection, agent_id, profile)
             mcp_servers = self._mcp_servers(effective_runtime)
+            stored_snapshot = None
             if snapshot_resume:
                 assert lineage_agent_id is not None and parent_revision is not None
                 expected_sha256 = parent_revision.removeprefix(
@@ -844,40 +845,6 @@ class AgentService:
                     skills_root=runtime_skills_dir(request.runtime, self._home),
                 )
                 revision = materialize_revision
-                if parent_agent_id is None:
-                    snapshot_index_sha256 = runtime_snapshot_index_sha256(
-                        effective_home, materialize_revision
-                    )
-                    runtime_version = adapter.probe(
-                        effective_runtime, effective_home
-                    ).version
-                    config_snapshot = build_config_snapshot(
-                        runtime=request.runtime,
-                        adapter_api_version=adapter.describe().adapter_api_version,
-                        schema_version=self._config.schema_version,
-                        materialize_revision=materialize_revision,
-                        snapshot_index_sha256=snapshot_index_sha256,
-                        config=effective_runtime,
-                        profile=profile,
-                        runtime_version=runtime_version,
-                    )
-                    write_managed_file(
-                        candidate_dir,
-                        CONFIG_SNAPSHOT_FILENAME,
-                        config_snapshot.document,
-                    )
-                    revision = _SNAPSHOT_CONFIG_REVISION + config_snapshot.sha256
-            stage = "config_revision"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            store.replace_config_revision(
-                agent_id, _PENDING_CONFIG_REVISION, revision
-            )
-            _logger.info(
-                "start materialized runtime=%s revision=%s",
-                request.runtime,
-                revision,
-            )
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
 
@@ -897,9 +864,69 @@ class AgentService:
                 effective_home,
                 candidate_dir,
                 mcp_servers=mcp_servers,
+                resume_session_id=resume_session_id,
             )
-            if resume_session_id is not None:
-                plan = replace(plan, resume_session_id=resume_session_id)
+            if plan.resume_session_id != resume_session_id:
+                raise ValidationError("adapter returned a mismatched resume session")
+            if snapshot_resume:
+                assert stored_snapshot is not None
+                if plan.materialize_revision is not None:
+                    raise ValidationError(
+                        "snapshot resume must not rematerialize its runtime home"
+                    )
+                runtime_snapshot = inspect_runtime_snapshots(
+                    effective_home,
+                    stored_snapshot.materialize_revision,
+                    expected_sha256=stored_snapshot.snapshot_index_sha256,
+                )
+                if not runtime_snapshot.verified:
+                    raise ValidationError(
+                        "adapter prepare changed the verified runtime snapshot"
+                    )
+            else:
+                revision = plan.materialize_revision or revision
+            if parent_agent_id is None:
+                snapshot_index_sha256 = runtime_snapshot_index_sha256(
+                    effective_home, revision
+                )
+                runtime_snapshot = inspect_runtime_snapshots(
+                    effective_home,
+                    revision,
+                    expected_sha256=snapshot_index_sha256,
+                )
+                if not runtime_snapshot.verified:
+                    raise ValidationError(
+                        "fresh runtime snapshot is incomplete after prepare"
+                    )
+                runtime_version = adapter.probe(
+                    effective_runtime, effective_home
+                ).version
+                config_snapshot = build_config_snapshot(
+                    runtime=request.runtime,
+                    adapter_api_version=adapter.describe().adapter_api_version,
+                    schema_version=self._config.schema_version,
+                    materialize_revision=revision,
+                    snapshot_index_sha256=snapshot_index_sha256,
+                    config=effective_runtime,
+                    profile=profile,
+                    runtime_version=runtime_version,
+                )
+                write_managed_file(
+                    candidate_dir,
+                    CONFIG_SNAPSHOT_FILENAME,
+                    config_snapshot.document,
+                )
+                revision = _SNAPSHOT_CONFIG_REVISION + config_snapshot.sha256
+            stage = "config_revision"
+            _log_start_preparation_stage(agent_id, stage, preparation_started)
+            store.replace_config_revision(
+                agent_id, _PENDING_CONFIG_REVISION, revision
+            )
+            _logger.info(
+                "start materialized runtime=%s revision=%s",
+                request.runtime,
+                revision,
+            )
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return
             with launch_cancellation(

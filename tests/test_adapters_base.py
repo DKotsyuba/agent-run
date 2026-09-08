@@ -1,6 +1,7 @@
 import inspect
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -113,6 +114,19 @@ class AdapterTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValidationError, "resume session id"):
             LaunchPlan.from_payload({**payload, "resume_session_id": 7})
+
+        revised = replace(plan, materialize_revision="revision-2")
+        revised_payload = revised.to_payload()
+        self.assertEqual(
+            LaunchPlan.from_payload(revised_payload).materialize_revision,
+            "revision-2",
+        )
+        del revised_payload["materialize_revision"]
+        self.assertIsNone(
+            LaunchPlan.from_payload(revised_payload).materialize_revision
+        )
+        with self.assertRaisesRegex(ValidationError, "materialize revision"):
+            LaunchPlan.from_payload({**payload, "materialize_revision": " "})
 
     def module(self, **changes):
         values = {"ADAPTER_API_VERSION": ADAPTER_API_VERSION, "ADAPTER": FakeAdapter()}
