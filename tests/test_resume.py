@@ -132,18 +132,6 @@ class ResumeTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.service.resume(parent, "continue", request_id="caller-replay", timeout_seconds=True)
 
-    def test_profile_drift_after_admission_does_not_change_resolved_role(self) -> None:
-        """Launch the immutable admitted role without rereading changed profile files."""
-        parent = self._parent()
-        with patch.object(self.service._starts, "submit") as submit:
-            child = self.service.resume(parent, "continue")
-        (self.profiles / "profile.md").write_text(
-            "+++\nwrite = true\nnetwork = true\n+++\nDo the requested work.\n"
-        )
-        submit.call_args.args[1](self.store, Event())
-        self.assertEqual(self.service.get(child.agent_id).status, AgentStatus.STARTING)
-        self.assertEqual(len(self.launched), 2)
-
     def test_unchanged_network_grants_are_preserved(self) -> None:
         """A legitimately network-enabled parent remains resumable with the same grants."""
         (self.profiles / "profile.md").write_text(

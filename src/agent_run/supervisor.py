@@ -70,6 +70,36 @@ def _error_text(error: BaseException) -> str:
     return str(error).strip() or type(error).__name__
 
 
+def report_ready(
+    store: StateStore,
+    agent_id: str | AgentId,
+    ready: ReadyChannel | None,
+    *,
+    pid: int | None = None,
+    identity: str | None = None,
+) -> None:
+    """Persist supervisor ownership before emitting technical READY."""
+
+    checked = validate_agent_id(agent_id)
+    owner_pid = os.getpid() if pid is None else pid
+    owner_identity = identity or supervisor_identity()
+    status = AgentStatus(str(store.get_agent(checked)["status"]))
+    if status is AgentStatus.CREATED:
+        store.transition(checked, AgentStatus.STARTING, kind="supervisor_starting")
+    elif status not in {AgentStatus.STARTING, AgentStatus.CANCELLING}:
+        store.transition(checked, AgentStatus.STARTING, kind="supervisor_starting")
+    store.record_supervisor(
+        checked,
+        pid=owner_pid,
+        identity=owner_identity,
+        process_group_id=owner_pid,
+        birth_time=capture_process_birth(owner_pid),
+    )
+    if ready is not None:
+        ready.ready()
+    _logger.info("agent_id=%s stage=READY pid=%d", checked, owner_pid)
+
+
 @dataclass(frozen=True)
 class SupervisorSettings:
     """Validated timing and work bounds for one supervisor lifecycle.
@@ -219,6 +249,7 @@ class Supervisor:
         ready: ReadyChannel | None = None,
         identity: str | None = None,
         supervisor_pid: int | None = None,
+        ownership_recorded: bool = False,
     ):
         self._store = store
         self._agent_id = validate_agent_id(agent_id)
@@ -231,6 +262,7 @@ class Supervisor:
         self._ready = ready
         self._identity = identity or supervisor_identity()
         self._pid = os.getpid() if supervisor_pid is None else supervisor_pid
+        self._ownership_recorded = ownership_recorded
         self._birth_time = capture_process_birth(self._pid)
         self._sink = StoreEventSink(store, self._agent_id, self._ops)
         self._group: VerifiedProcessGroup | None = None
@@ -248,7 +280,8 @@ class Supervisor:
 
         previous = install_signal_handlers(self._on_signal)
         try:
-            self._report_ready()
+            if not self._ownership_recorded:
+                self._report_ready()
             return self._launch_and_supervise()
         finally:
             restore_signal_handlers(previous)
@@ -262,27 +295,13 @@ class Supervisor:
         """
 
         try:
-            status = AgentStatus(str(self._store.get_agent(self._agent_id)["status"]))
-            if status is AgentStatus.CREATED:
-                self._store.transition(
-                    self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
-                )
-            elif status not in {AgentStatus.STARTING, AgentStatus.CANCELLING}:
-                self._store.transition(
-                    self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
-                )
-            # Persist pid and identity before ready so every ready row can later
-            # be converged by reconciliation, even if launch never returns.
-            self._store.record_supervisor(
+            report_ready(
+                self._store,
                 self._agent_id,
+                self._ready,
                 pid=self._pid,
                 identity=self._identity,
-                process_group_id=self._pid,
-                birth_time=self._birth_time,
             )
-            if self._ready is not None:
-                self._ready.ready()
-            _logger.info("agent_id=%s stage=READY pid=%d", self._agent_id, self._pid)
         except Exception as error:
             _logger.warning(
                 "agent_id=%s stage=READY failed error_kind=%s", self._agent_id, type(error).__name__

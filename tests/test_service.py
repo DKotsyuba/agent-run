@@ -38,7 +38,7 @@ from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
-from agent_run.service import AgentQuery, AgentService, _log_start_preparation_stage
+from agent_run.service import AgentQuery, AgentService
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
 
@@ -577,81 +577,6 @@ Review.
             release.set()
             self.wait_until(lambda: len(self.launched) == 2)
 
-    def test_cancel_during_prepare_prevents_launch(self) -> None:
-        """Durable cancellation during prepare must stop before spawn."""
-
-        entered = threading.Event()
-        release = threading.Event()
-        original = ADAPTER.prepare
-
-        def blocked_prepare(*args, **kwargs):
-            """Expose the cancellation window inside adapter preparation."""
-
-            entered.set()
-            release.wait(2)
-            return original(*args, **kwargs)
-
-        with patch.object(ADAPTER, "prepare", side_effect=blocked_prepare):
-            accepted = self.service.start(self.request(request_id="cancel-prepare"))
-            self.assertTrue(entered.wait(1))
-            self.service.cancel(accepted.agent_id)
-            release.set()
-            self.wait_until(
-                lambda: self.store.get_agent(accepted.agent_id)["status"]
-                == AgentStatus.CANCELLED.value
-            )
-        self.assertEqual(self.launched, [])
-
-    def test_expired_prepare_cannot_launch_after_reconciliation(self) -> None:
-        """A released worker cannot revive a start lost after its lease expires."""
-
-        entered = threading.Event()
-        release = threading.Event()
-        finished = threading.Event()
-        original = ADAPTER.prepare
-        original_continue = self.service._continue_start
-        clock = [100.0]
-        self.service = AgentService(
-            self.config, self.store, self.root,
-            launch=lambda *args: self.launched.append(args), now=lambda: clock[0],
-        )
-
-        def blocked_prepare(*args, **kwargs):
-            """Hold preparation until the durable lease is reconciled lost."""
-
-            entered.set()
-            release.wait(2)
-            return original(*args, **kwargs)
-
-        def tracked_continue(*args, **kwargs):
-            """Expose completion of the worker that resumed after expiry."""
-
-            try:
-                return original_continue(*args, **kwargs)
-            finally:
-                finished.set()
-
-        with (
-            patch.object(ADAPTER, "prepare", side_effect=blocked_prepare),
-            patch.object(self.service, "_continue_start", side_effect=tracked_continue),
-            patch("agent_run.service._log_start_preparation_stage", wraps=_log_start_preparation_stage) as stages,
-            self.assertLogs("agent_run.service", "INFO") as logs,
-        ):
-            accepted = self.service.start(self.request(request_id="expired-prepare"))
-            self.assertTrue(entered.wait(1))
-            self.assertTrue(any("stage=prepare " in message for message in logs.output))
-            clock[0] = 221.0
-            self.assertEqual(
-                reconcile_unowned_starting(self.store, at=clock[0]),
-                (accepted.agent_id,),
-            )
-            release.set()
-            self.assertTrue(finished.wait(1))
-        self.assertEqual(
-            self.store.get_agent(accepted.agent_id)["status"], AgentStatus.LOST.value
-        )
-        self.assertEqual(self.launched, [])
-
     def test_request_id_returns_one_agent_and_launches_once(self) -> None:
         first = self.start("same-request", task="  do   work  ")
         second = self.start("same-request", task="  do   work  ")
@@ -664,8 +589,32 @@ Review.
         self.assertEqual(first.agent.task_summary, "do work")
         launched = self.launched[0]
         self.assertEqual(launched[0], first.agent_id)
-        self.assertIs(launched[2], ADAPTER)
-        self.assertIsInstance(launched[3], LaunchPlan)
+        self.assertEqual(launched[1].task, "do work")
+        self.assertEqual(launched[2].role_name, "profile")
+
+    def test_start_launches_immediately_after_atomic_admission(self) -> None:
+        """Expose only a broker-owned STARTING row at the launch boundary."""
+
+        observed = []
+
+        def launch(agent_id, request, role) -> None:
+            """Capture the durable row before the supervisor callback returns."""
+
+            observed.append((self.store.get_agent(agent_id), request, role))
+
+        service = AgentService(
+            self.config, self.store, self.root, launch=launch, now=lambda: 100.0
+        )
+        try:
+            result = service.start(self.request(request_id="immediate-supervisor"))
+        finally:
+            service.close()
+        row, request, role = observed[0]
+        self.assertTrue(result.created)
+        self.assertEqual(row["status"], AgentStatus.STARTING.value)
+        self.assertIsNotNone(row["startup_owner_pid_identity"])
+        self.assertIsNone(row["supervisor_pid"])
+        self.assertEqual(request.profile, role.role_name)
 
     def test_list_projection_is_batched_and_exposes_cleanup_evidence(self) -> None:
         """One page uses fixed SQL count and returns validated cleanup evidence."""
@@ -742,27 +691,6 @@ Review.
         self.assertEqual(replay.agent_id, first.agent_id)
         self.assertEqual(len(self.launched), 1)
         self.assertEqual(len(self.store.list_agents()), 1)
-
-    def test_crash_before_worker_registration_leaves_owned_starting_row(self) -> None:
-        """A process-level interruption cannot expose ownerless ``CREATED`` state."""
-
-        with patch.object(
-            self.service._starts,
-            "submit",
-            side_effect=KeyboardInterrupt("coordinator crashed"),
-        ), self.assertRaisesRegex(KeyboardInterrupt, "coordinator crashed"):
-            self.service.start(self.request(request_id="registration-crash"))
-
-        row = self.store.list_agents()[0]
-        self.assertEqual(row["status"], AgentStatus.STARTING.value)
-        self.assertIsInstance(row["startup_owner_pid_identity"], str)
-        self.assertIsInstance(row["startup_owner_birth_time"], float)
-        self.assertEqual(row["startup_deadline_at"], 220.0)
-        events = self.store.connection.execute(
-            "SELECT kind FROM events WHERE agent_id = ? ORDER BY seq", (row["id"],)
-        ).fetchall()
-        self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
-        self.assertEqual(self.launched, [])
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""

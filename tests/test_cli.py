@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run import cli
 from agent_run.domain import AgentId, AgentStatus, StartRequest
 from agent_run.errors import ValidationError
+from agent_run.preparation import request_payload
+from agent_run.role_plan import ResolvedRolePlan
 from agent_run.service import MessageView, TranscriptPage
 
 
@@ -1387,8 +1389,11 @@ target = "auth.json"
                 timeout_seconds=480,
             )
             store = Mock()
-            plan = Mock()
-            plan.to_payload.return_value = {"argv": ["engine"], "environment": {"T": "s"}}
+            role = ResolvedRolePlan.from_payload(
+                json.loads(
+                    (Path(__file__).parent / "fixtures" / "role_plan_7bbd43b.json").read_text()
+                )
+            )
             events = []
             captured = {}
             store.close.side_effect = lambda: events.append("store_closed")
@@ -1405,14 +1410,12 @@ target = "auth.json"
                 return 123
 
             with patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
-                cli, "load_config", return_value=SimpleNamespace(core=SimpleNamespace(warning_fraction=0.9, stalled_after_seconds=900.0))
-            ), patch.object(
                 cli, "launch_detached", side_effect=detached
             ), patch.object(
                 cli, "reconcile_reaped_agent", side_effect=reconciled
             ):
                 cli._launch_callback(home)(
-                    AgentId(AGENT_ID), request, object(), plan, home / "agents" / AGENT_ID
+                    AgentId(AGENT_ID), request, role
                 )
 
         # The supervisor now runs in an exec'd interpreter, so the parent must
@@ -1426,13 +1429,8 @@ target = "auth.json"
             {
                 "agent_id": AGENT_ID,
                 "home": str(home),
-                "runtime": "codex",
-                "timeout_seconds": 480,
-                "answer_path": str(home / "agents" / AGENT_ID / "answer.md"),
-                "agent_dir": str(home / "agents" / AGENT_ID),
-                "warning_fraction": 0.9,
-                "stalled_after_seconds": 900.0,
-                "plan": {"argv": ["engine"], "environment": {"T": "s"}},
+                "request": request_payload(request),
+                "role": role.to_payload(),
             },
         )
 

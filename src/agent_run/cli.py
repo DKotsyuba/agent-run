@@ -40,6 +40,8 @@ from .launch import ChildReaper, launch_detached
 from .launch_evidence import bootstrap_error_fields
 from .logging_setup import configure_logging
 from .paths import agent_run_home, config_path, state_db_path
+from .preparation import request_payload
+from .role_plan import ResolvedRolePlan
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
 from .state.run_stats import backfill_run_stats
@@ -636,9 +638,7 @@ def _launch_callback(home: Path, *, child_reaper: ChildReaper | None = None):
     def launch(
         agent_id: AgentId,
         request: StartRequest,
-        _adapter,
-        plan,
-        candidate_dir: Path,
+        role: ResolvedRolePlan,
     ) -> None:
         def post_reap(pid: int, _wait_status: int) -> None:
             store = StateStore.open(state_db_path(home))
@@ -647,19 +647,11 @@ def _launch_callback(home: Path, *, child_reaper: ChildReaper | None = None):
             finally:
                 store.close()
 
-        # The exec'd supervisor reloads config and adapter itself; only the plan
-        # travels, because its environment carries live secrets.
-        core = load_config(config_path(home)).core
         payload = {
             "agent_id": str(agent_id),
             "home": str(home),
-            "runtime": request.runtime,
-            "timeout_seconds": request.timeout_seconds,
-            "answer_path": str(candidate_dir / "answer.md"),
-            "agent_dir": str(candidate_dir),
-            "warning_fraction": core.warning_fraction,
-            "stalled_after_seconds": core.stalled_after_seconds,
-            "plan": plan.to_payload(),
+            "request": request_payload(request),
+            "role": role.to_payload(),
         }
         if child_reaper is None:
             launch_detached(
