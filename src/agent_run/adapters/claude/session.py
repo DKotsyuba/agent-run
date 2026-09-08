@@ -44,9 +44,19 @@ class ClaudeSession:
         secret names. ``sink`` receives decoded events. Wiring or initial-input
         failures close the runtime log and propagate so the caller can stop the
         child. The process must expose text streams; in-memory test streams may
-        omit a file descriptor.
+        omit a file descriptor. A real freshly launched process whose PID is
+        also its process-group ID records that group for native cancellation.
         """
         self._process = process
+        self._owned_process_group: int | None = None
+        if type(process.pid) is int and process.pid > 1:
+            try:
+                process_group = os.getpgid(process.pid)
+            except OSError:
+                pass
+            else:
+                if process_group == process.pid:
+                    self._owned_process_group = process_group
         self._plan = plan
         self._sink = sink
         self._decoder = StreamDecoder()
@@ -210,13 +220,24 @@ class ClaudeSession:
         self._write_input(line, "steer")
 
     def cancel(self, grace_seconds: float) -> None:
-        """Interrupt the child and prevent subsequent writes during ``grace_seconds``."""
+        """Interrupt the owned process group and bound the leader's exit wait.
+
+        Grace seconds is a nonnegative wait budget after SIGINT. A real adapter
+        launch records its freshly created PID-equals-PGID group during
+        construction and interrupts the whole group before the leader can leave
+        descendants behind. Injected processes without that proof retain the
+        leader-only fallback. Signal failures return without weakening the
+        supervisor's later independent PID/birth verification.
+        """
         self._cancelled = True
         self._write_cancelled.set()
         if self._process.poll() is not None:
             return
         try:
-            self._process.send_signal(signal.SIGINT)
+            if self._owned_process_group is None:
+                self._process.send_signal(signal.SIGINT)
+            else:
+                os.killpg(self._owned_process_group, signal.SIGINT)
         except OSError:
             return
         deadline = time.monotonic() + max(grace_seconds, 0.0)

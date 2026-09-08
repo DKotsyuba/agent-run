@@ -14,6 +14,8 @@ from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
+import psutil
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import LaunchPlan
@@ -441,6 +443,47 @@ class ClaudeSessionTests(unittest.TestCase):
         outcome = session.wait(timeout_seconds=5)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+
+    def test_cancel_interrupts_owned_group_before_leader_exits(self) -> None:
+        """Native cancel reaches a spawned child instead of orphaning the group."""
+
+        child_path = self.root / "child.pid"
+        script = (
+            "import subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(child_path)!r}, 'w').write(str(child.pid))\n"
+            "sys.stdin.readline()\n"
+            "time.sleep(30)\n"
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        deadline = time.monotonic() + 2
+        while not child_path.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        child_pid = int(child_path.read_text(encoding="utf-8"))
+
+        try:
+            session.cancel(grace_seconds=2)
+            outcome = session.wait(timeout_seconds=5)
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+            for _ in range(100):
+                try:
+                    status = psutil.Process(child_pid).status()
+                except psutil.NoSuchProcess:
+                    break
+                if status == psutil.STATUS_ZOMBIE:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("owned cancellation left the spawned child alive")
+        finally:
+            try:
+                child = psutil.Process(child_pid)
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    child.kill()
+            except psutil.NoSuchProcess:
+                pass
 
     def test_stdout_larger_than_pipe_capacity_is_drained_before_initial_input(self) -> None:
         """A child may fill stdout before it starts reading the prompt."""
