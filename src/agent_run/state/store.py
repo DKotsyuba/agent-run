@@ -825,6 +825,53 @@ class StateStore:
             raise ValidationError("target must be an AgentStatus")
         changed_at = timestamp(at)
         with immediate(self.connection):
+            if target in {AgentStatus.SUCCEEDED, AgentStatus.TIMED_OUT}:
+                current = AgentStatus(agent_row(self.connection, agent_id)["status"])
+                pending_cancel = self.connection.execute(
+                    """SELECT id FROM commands
+                       WHERE agent_id = ? AND kind = 'cancel' AND state = 'pending'
+                       ORDER BY id LIMIT 1""",
+                    (agent_id,),
+                ).fetchone()
+                if current is AgentStatus.RUNNING and pending_cancel is not None:
+                    self._transition(
+                        agent_id,
+                        AgentStatus.CANCELLING,
+                        changed_at,
+                        outcome=None,
+                        attempt_id=attempt_id,
+                        kind="cancelling",
+                        data={"source": "pending_cancel"},
+                    )
+                    original = outcome or Outcome(target)
+                    target = AgentStatus.CANCELLED
+                    outcome = Outcome(
+                        target,
+                        exit_code=original.exit_code,
+                        failure_kind=original.failure_kind,
+                        failure_text=original.failure_text,
+                        runtime_session_id=original.runtime_session_id,
+                        answer_path=original.answer_path,
+                        answer_bytes=original.answer_bytes,
+                        answer_sha256=original.answer_sha256,
+                    )
+                    self.connection.execute(
+                        """UPDATE commands
+                           SET state = 'completed', claimed_at = ?,
+                               completed_at = ?, result_json = ?
+                           WHERE id = ? AND state = 'pending'""",
+                        (
+                            changed_at,
+                            changed_at,
+                            json_text(
+                                {
+                                    "accepted": True,
+                                    "reason": "terminal_cancel",
+                                }
+                            ),
+                            pending_cancel["id"],
+                        ),
+                    )
             return self._transition(
                 agent_id,
                 target,

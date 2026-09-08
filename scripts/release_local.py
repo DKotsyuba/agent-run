@@ -199,6 +199,8 @@ def _legacy_writer_may_be_live(owner: object, birth: object) -> bool:
                 return True
             if process.create_time() != expected_birth:
                 return False
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return False
         return process.is_running()
     except psutil.NoSuchProcess:
         return False

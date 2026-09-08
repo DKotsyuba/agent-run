@@ -68,9 +68,12 @@ answered in order. Open several connections for parallelism — dispatch is
 serialized within two bounded owner lanes. Durable start/resume/cancel/steer
 admission uses the control lane; status, answer, model probing and other reads
 use a separate lane, so a slow read cannot starve cancellation. The server caps
-connections and queued calls, rejects overload with JSON-RPC code `-32001`, and
+connections and queued calls, reserves one connection slot for parsed control
+methods, rejects ordinary overload with JSON-RPC code `-32001`, and
 returns `-32002` when its request deadline expires. Input frames remain limited
-to 1 MiB; idle reads and response writes also have finite deadlines.
+to 1 MiB; idle reads and response writes also have finite deadlines. A client
+holding the reserved slot without completing its first frame is disconnected
+within 0.5 seconds.
 
 The socket path is fenced by a lifetime native file lock. A pre-existing socket
 is reclaimed only when connecting returns `ECONNREFUSED` and the inode is still

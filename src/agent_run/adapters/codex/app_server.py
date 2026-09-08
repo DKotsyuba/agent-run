@@ -24,6 +24,8 @@ from .process_transport import ProcessTransport
 # Startup is outside the agent deadline: default to 30s, cap production at 120s.
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 _MAX_STARTUP_TIMEOUT_SECONDS = 120.0
+_PENDING_DRAIN_LIMIT = 64
+_PENDING_DRAIN_SECONDS = 0.05
 class VerificationError(ValidationError):
     """Effective app-server parameters do not match the requested launch plan."""
 
@@ -343,7 +345,6 @@ class CodexAppServerSession:
     def cancel(self, grace_seconds: float) -> None:
         if isinstance(grace_seconds, bool) or not isinstance(grace_seconds, (int, float)) or grace_seconds < 0:
             raise ValidationError("grace_seconds must be a nonnegative number")
-        self._drain_pending()
         self._transport.request(
             "turn/interrupt",
             {"threadId": self._thread_id, "turnId": self._turn_id},
@@ -357,7 +358,12 @@ class CodexAppServerSession:
             self._transport.close()
 
     def _drain_pending(self) -> None:
-        while True:
+        """Handle a bounded pending-event slice before lower-priority steering."""
+
+        deadline = time.monotonic() + _PENDING_DRAIN_SECONDS
+        for _ in range(_PENDING_DRAIN_LIMIT):
+            if time.monotonic() >= deadline:
+                return
             event = self._next_raw(0)
             if event is None:
                 return

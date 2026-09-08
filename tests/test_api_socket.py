@@ -8,9 +8,15 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_run.api_socket import ApiServer, MAX_LINE_BYTES, METHOD_NAMES
+from agent_run.api_socket import (
+    ApiServer,
+    MAX_LINE_BYTES,
+    METHOD_NAMES,
+    _Dispatcher,
+    _DispatcherClosed,
+)
 from agent_run.domain import AgentStatus
-from agent_run.dispatch import TOOL_NAMES, TOOLS
+from agent_run.dispatch import TOOL_NAMES, TOOLS, Session
 from agent_run.errors import ValidationError
 
 
@@ -24,6 +30,11 @@ class StubService:
         self.calls.append("limits")
         self.call_threads.append(threading.get_ident())
         return {"ok": True}
+
+    def cancel(self, agent_id):
+        """Return an immediate durable-control substitute for the agent."""
+
+        return {"agent_id": agent_id, "status": "cancelling"}
 
     def list_orchestrators(self, *, limit=100):
         """Return a deterministic response used to prove socket dispatch."""
@@ -76,6 +87,41 @@ class _Factory:
         """Return the next service in ApiServer construction/call order."""
 
         return self.services.pop(0)
+
+
+class DispatcherShutdownTests(unittest.TestCase):
+    """Deterministic owner-queue shutdown races without a Unix socket."""
+
+    def test_close_and_submit_cannot_cross_the_shutdown_sentinel(self) -> None:
+        """A submit queued behind close fails immediately rather than timing out."""
+
+        dispatcher = _Dispatcher(
+            lambda: StubService(), max_pending=1, request_timeout=1
+        )
+        errors = []
+        dispatcher._close_lock.acquire()
+        closer = threading.Thread(target=lambda: dispatcher.close(1))
+        caller = threading.Thread(
+            target=lambda: self._capture_call_error(dispatcher, errors)
+        )
+        closer.start()
+        time.sleep(0.01)
+        caller.start()
+        dispatcher._close_lock.release()
+        closer.join(timeout=1)
+        caller.join(timeout=1)
+        self.assertFalse(closer.is_alive() or caller.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], _DispatcherClosed)
+
+    @staticmethod
+    def _capture_call_error(dispatcher, errors) -> None:
+        """Append the exception from one call racing dispatcher shutdown."""
+
+        try:
+            dispatcher.call("limits", {}, Session())
+        except BaseException as error:
+            errors.append(error)
 
 
 class ApiSocketTests(unittest.TestCase):
@@ -174,6 +220,32 @@ class ApiSocketTests(unittest.TestCase):
                 client.connect(str(self.path))
                 response = json.loads(client.makefile("rb").readline())
         self.assertEqual(response["error"]["code"], -32001)
+
+    def test_control_slot_survives_saturated_long_read_connections(self) -> None:
+        """Reserved bounded capacity admits cancel while ordinary reads are full."""
+
+        self.replace_server(
+            lambda: self.service, max_connections=4, idle_timeout=2
+        )
+        blocked = []
+        try:
+            for _ in range(3):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.connect(str(self.path))
+                client.sendall(b"{")
+                blocked.append(client)
+            response = self.request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "cancel",
+                    "params": {"agent_id": "ag-20260826-120000-0123456789"},
+                }
+            )
+            self.assertEqual(response["result"]["status"], "cancelling")
+        finally:
+            for client in blocked:
+                client.close()
 
     def test_live_slow_socket_is_never_reclaimed_as_stale(self) -> None:
         """A successful connect proves ownership even when no ping reply arrives."""
@@ -454,6 +526,34 @@ class ApiSocketTests(unittest.TestCase):
         self.assertTrue(
             all(service.closed_in == [service.created_in] for service in services)
         )
+
+    def test_second_owner_boot_failure_closes_the_first_owner(self) -> None:
+        """A partial two-lane startup closes the service already constructed."""
+
+        closed = threading.Event()
+        calls = 0
+
+        class FirstService(StubService):
+            """Record owner-context cleanup after the second factory call fails."""
+
+            def close(self) -> None:
+                """Expose cleanup of the first successfully created service."""
+
+                closed.set()
+
+        def factory():
+            """Return one service, then fail the second owner construction."""
+
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("second owner failed")
+            return FirstService()
+
+        path = Path(self.tempdir.name) / "boot-failure.sock"
+        with self.assertRaisesRegex(RuntimeError, "second owner failed"):
+            ApiServer(path, factory)
+        self.assertTrue(closed.wait(1))
 
     def test_all_dispatch_runs_on_the_service_owning_thread(self):
         # SQLite connections are thread-affine: every tool call must execute

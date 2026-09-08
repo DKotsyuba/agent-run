@@ -403,6 +403,17 @@ class LocalTests(unittest.TestCase):
         ):
             self.assertEqual(local.active(connection), 1)
 
+    def test_birth_verified_zombie_writer_does_not_block_release(self) -> None:
+        """A matching zombie PID cannot write even though psutil calls it running."""
+
+        process = Mock()
+        process.create_time.return_value = 12.5
+        process.status.return_value = psutil.STATUS_ZOMBIE
+        process.is_running.return_value = True
+        with patch.object(local.psutil, "Process", return_value=process):
+            self.assertFalse(local._legacy_writer_may_be_live("4242 writer", 12.5))
+            self.assertTrue(local._legacy_writer_may_be_live("4242 writer", None))
+
     def test_malformed_archived_writer_birth_blocks_release(self):
         """Non-finite or negative birth evidence cannot prove PID reuse."""
 

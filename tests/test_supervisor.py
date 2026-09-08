@@ -202,6 +202,7 @@ class CountingStore(StateStore):
         self.fail_starting_once = False
         self.fail_running_once = False
         self.reject_terminal = False
+        self.before_terminal = None
         self.starting_error: Exception | None = None
         self.fail_event_kind: str | None = None
 
@@ -223,6 +224,9 @@ class CountingStore(StateStore):
             raise RuntimeError("running write failed")
         if target in TERMINAL and self.reject_terminal:
             raise StateTransitionError("terminal write rejected")
+        if target in TERMINAL and self.before_terminal is not None:
+            callback, self.before_terminal = self.before_terminal, None
+            callback()
         return super().transition(agent_id, target, **kwargs)
 
     def record_supervisor(self, agent_id, **kwargs) -> None:
@@ -1012,6 +1016,35 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("already_stopping", rows[1]["result_json"])
         self.assertIn("agent_terminal", rows[2]["result_json"])
         self.assertIn("agent_terminal", rows[3]["result_json"])
+
+    def test_cancel_accepted_at_terminal_barrier_cannot_be_lost(self) -> None:
+        """A cancel after the final drain atomically changes success to cancelled."""
+
+        ops = FakeOps(members=())
+        session = FakeSession(
+            ops,
+            outcome=Outcome(
+                AgentStatus.SUCCEEDED,
+                exit_code=0,
+                runtime_session_id="s-1",
+            ),
+            exit_after_polls=1,
+        )
+        self.write_answer(f"answer\n{DEFAULT_SENTINEL}\n")
+        self.store.before_terminal = lambda: self.store.enqueue_command(
+            self.agent_id, "cancel", {}
+        )
+
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+
+        self.assertIs(outcome.status, AgentStatus.CANCELLED)
+        self.assertEqual(self.agent()["status"], "cancelled")
+        command = self.store.connection.execute(
+            "SELECT state, result_json FROM commands WHERE agent_id = ?",
+            (self.agent_id,),
+        ).fetchone()
+        self.assertEqual(command["state"], "completed")
+        self.assertIn("terminal_cancel", command["result_json"])
 
     def test_startup_failure_reports_ready_failure_without_launch(self) -> None:
         self.store.fail_starting_once = True

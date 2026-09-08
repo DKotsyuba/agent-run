@@ -1234,6 +1234,36 @@ class CodexAppServerSessionTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             session.cancel(-1)
 
+    def test_notification_flood_is_bounded_and_interrupt_has_priority(self) -> None:
+        """Endless notifications cannot delay steer forever or precede cancel."""
+
+        class FloodTransport(FakeTransport):
+            """Return a valid current-turn notification on every poll."""
+
+            def __init__(self) -> None:
+                """Initialize request and poll evidence."""
+
+                super().__init__()
+                self.polls = 0
+
+            def poll_event(self, timeout):
+                """Return one notification forever while recording the poll."""
+
+                self.polls += 1
+                return notification("turn/started", {"threadId": "th_1"})
+
+        transport = FloodTransport()
+        session = CodexAppServerSession(
+            transport, FakeSink(), "th_1", turn_id="turn_1"
+        )
+        session.cancel(1)
+        self.assertEqual(transport.polls, 0)
+        self.assertEqual(transport.requests[-1][0], "turn/interrupt")
+
+        session.steer("bounded")
+        self.assertLessEqual(transport.polls, 64)
+        self.assertEqual(transport.requests[-1][0], "turn/steer")
+
     def test_malformed_assistant_item_is_reported_without_losing_the_outcome(self) -> None:
         session, _transport, sink = self.start(
             events=[

@@ -52,6 +52,7 @@ REQUEST_DEADLINE_SECONDS = 30.0
 IDLE_DEADLINE_SECONDS = 30.0
 WRITE_DEADLINE_SECONDS = 5.0
 SHUTDOWN_DEADLINE_SECONDS = 5.0
+CONTROL_FRAME_DEADLINE_SECONDS = 0.5
 _MISSING = object()
 _DEFAULT_SOCKET = ".agent-run/api.sock"
 METHOD_NAMES = TOOL_NAMES | {"tools", "ping", "wait"}
@@ -133,13 +134,14 @@ class _Dispatcher:
     def call(self, method: str, params: dict, session: Session) -> object:
         """Submit one call or raise an explicit overload/deadline/closed error."""
 
-        if self._closed.is_set():
-            raise _DispatcherClosed("API dispatcher is shutting down")
         future: Future = Future()
-        try:
-            self._queue.put_nowait((method, params, session, future))
-        except queue.Full as error:
-            raise _Overloaded("API request queue is full") from error
+        with self._close_lock:
+            if self._closed.is_set():
+                raise _DispatcherClosed("API dispatcher is shutting down")
+            try:
+                self._queue.put_nowait((method, params, session, future))
+            except queue.Full as error:
+                raise _Overloaded("API request queue is full") from error
         try:
             return future.result(timeout=self._request_timeout)
         except FutureTimeout as error:
@@ -322,7 +324,11 @@ class _Handler(socketserver.StreamRequestHandler):
 
         session = Session()
         writer = _SocketWriter(self.wfile)
-        self.request.settimeout(self.server.idle_timeout)
+        self.request.settimeout(
+            min(self.server.idle_timeout, CONTROL_FRAME_DEADLINE_SECONDS)
+            if self.server.control_connection_only(self.request)
+            else self.server.idle_timeout
+        )
         while True:
             try:
                 line = self.rfile.readline(MAX_LINE_BYTES + 1)
@@ -350,6 +356,24 @@ class _Handler(socketserver.StreamRequestHandler):
                     return
                 self.request.settimeout(self.server.idle_timeout)
                 continue
+            if self.server.control_connection_only(self.request) and (
+                not isinstance(request, dict)
+                or request.get("method") not in _CONTROL_METHODS
+            ):
+                request_id = request.get("id") if isinstance(request, dict) else None
+                self.request.settimeout(self.server.write_timeout)
+                try:
+                    _emit(
+                        writer,
+                        _rpc_error(
+                            request_id,
+                            -32001,
+                            "API capacity is reserved for control requests",
+                        ),
+                    )
+                except (OSError, TimeoutError):
+                    pass
+                return
             response = _handle(self.server, request, session)
             if response is not None:
                 self.request.settimeout(self.server.write_timeout)
@@ -357,6 +381,8 @@ class _Handler(socketserver.StreamRequestHandler):
                     _emit(writer, response)
                 except (OSError, TimeoutError):
                     return
+            if self.server.control_connection_only(self.request):
+                return
             self.request.settimeout(self.server.idle_timeout)
 
 
@@ -482,20 +508,28 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
         self.write_timeout = float(write_timeout)
         self.shutdown_timeout = float(shutdown_timeout)
         self.shutdown_event = threading.Event()
-        self._connection_slots = threading.BoundedSemaphore(max_connections)
+        self._control_connection_slots = threading.BoundedSemaphore(
+            1 if max_connections > 1 else 0
+        )
+        self._connection_slots = threading.BoundedSemaphore(
+            max_connections - (1 if max_connections > 1 else 0)
+        )
         self._connections: set[socket.socket] = set()
+        self._control_connections: set[socket.socket] = set()
         self._connections_lock = threading.Lock()
         self._closed = False
         self._startup_lock_fd: int | None = _startup_lock(path)
-        self._dispatchers: tuple[_Dispatcher, _Dispatcher] = ()
+        self._dispatchers: tuple[_Dispatcher, ...] = ()
         try:
             _reclaim_stale_socket(path)
-            self._dispatchers = (
+            self._dispatchers += (
                 _Dispatcher(
                     service_factory,
                     max_pending=max_pending_requests,
                     request_timeout=float(request_timeout),
                 ),
+            )
+            self._dispatchers += (
                 _Dispatcher(
                     service_factory,
                     max_pending=max_pending_requests,
@@ -522,7 +556,11 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
     def process_request(self, request: socket.socket, client_address: object) -> None:
         """Start a handler only when a bounded connection slot is available."""
 
-        if not self._connection_slots.acquire(blocking=False):
+        regular_slot = self._connection_slots.acquire(blocking=False)
+        control_slot = False
+        if not regular_slot:
+            control_slot = self._control_connection_slots.acquire(blocking=False)
+        if not regular_slot and not control_slot:
             try:
                 request.settimeout(self.write_timeout)
                 request.sendall(
@@ -540,13 +578,26 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
             return
         with self._connections_lock:
             self._connections.add(request)
+            if control_slot:
+                self._control_connections.add(request)
         try:
             super().process_request(request, client_address)
         except BaseException:
             with self._connections_lock:
                 self._connections.discard(request)
-            self._connection_slots.release()
+                self._control_connections.discard(request)
+            (
+                self._control_connection_slots
+                if control_slot
+                else self._connection_slots
+            ).release()
             raise
+
+    def control_connection_only(self, request: socket.socket) -> bool:
+        """Return whether the request occupies the reserved control slot."""
+
+        with self._connections_lock:
+            return request in self._control_connections
 
     def process_request_thread(
         self, request: socket.socket, client_address: object
@@ -558,7 +609,13 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
         finally:
             with self._connections_lock:
                 self._connections.discard(request)
-            self._connection_slots.release()
+                control_slot = request in self._control_connections
+                self._control_connections.discard(request)
+            (
+                self._control_connection_slots
+                if control_slot
+                else self._connection_slots
+            ).release()
 
     def release_socket_path(self) -> bool:
         """Unlink this server's socket path without deleting a replacement."""

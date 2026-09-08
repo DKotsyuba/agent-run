@@ -695,6 +695,29 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.claim_command(agent_id, at=22)["id"], cancel_id)
         self.assertEqual(self.store.claim_command(agent_id, at=23)["id"], steer_ids[0])
 
+    def test_pending_cancel_atomically_overrides_successful_terminal_commit(self) -> None:
+        """A cancel committed before terminalization cannot be lost after drain."""
+
+        agent_id = self.create()
+        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
+        self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
+        cancel_id = self.store.enqueue_command(agent_id, "cancel", {}, at=4)
+
+        self.store.transition(
+            agent_id,
+            AgentStatus.SUCCEEDED,
+            outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0),
+            at=5,
+        )
+
+        self.assertEqual(self.store.get_agent(agent_id)["status"], "cancelled")
+        command = self.store.connection.execute(
+            "SELECT state, result_json FROM commands WHERE id = ?", (cancel_id,)
+        ).fetchone()
+        self.assertEqual(command["state"], "completed")
+        self.assertIn("terminal_cancel", command["result_json"])
+        self.assertIsNone(self.store.claim_command(agent_id, at=6))
+
     def test_message_storage_stores_small_content_inline_and_spools_oversized_content(
         self,
     ) -> None:

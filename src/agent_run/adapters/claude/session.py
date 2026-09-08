@@ -219,8 +219,8 @@ class ClaudeSession:
             self._process.send_signal(signal.SIGINT)
         except OSError:
             return
-        deadline = time.time() + max(grace_seconds, 0.0)
-        while time.time() < deadline and self._process.poll() is None:
+        deadline = time.monotonic() + max(grace_seconds, 0.0)
+        while time.monotonic() < deadline and self._process.poll() is None:
             time.sleep(0.05)
 
     def _stop_process(self) -> None:

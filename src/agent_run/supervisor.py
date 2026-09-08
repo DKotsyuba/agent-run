@@ -762,6 +762,20 @@ class Supervisor:
             self._store.transition(
                 self._agent_id, outcome.status, outcome=outcome, kind="terminal"
             )
+            committed_status = AgentStatus(
+                str(self._store.get_agent(self._agent_id)["status"])
+            )
+            if committed_status is not outcome.status:
+                outcome = Outcome(
+                    committed_status,
+                    exit_code=outcome.exit_code,
+                    failure_kind=outcome.failure_kind,
+                    failure_text=outcome.failure_text,
+                    runtime_session_id=outcome.runtime_session_id,
+                    answer_path=outcome.answer_path,
+                    answer_bytes=outcome.answer_bytes,
+                    answer_sha256=outcome.answer_sha256,
+                )
             _logger.info(
                 "agent_id=%s stage=terminal status=%s failure_kind=%s",
                 self._agent_id, outcome.status.value, outcome.failure_kind,

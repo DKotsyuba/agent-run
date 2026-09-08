@@ -1,4 +1,5 @@
 import contextlib
+import io
 import json
 import os
 import signal
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import LaunchPlan
 from agent_run.adapters.claude import adapter as claude_adapter_module
 from agent_run.adapters.claude.adapter import ADAPTER
+from agent_run.adapters.claude.stderr import StderrTail
 from agent_run.domain import AgentStatus, MessageRole
 
 
@@ -153,6 +155,20 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertIn("<redacted>", failure_text)
         self.assertLessEqual(len(failure_text.encode("utf-8")), 4096)
         self.assertEqual(self.log_path.read_bytes(), b"")
+
+    def test_newline_free_stderr_is_chunked_and_redacts_boundary_secret(self) -> None:
+        """A huge unterminated line retains bounded secret-safe trailing bytes."""
+
+        secret = "boundary-secret-token"
+        stream = io.StringIO("x" * (4096 * 256 - 5) + secret + " tail")
+        capture = StderrTail(stream, (secret,))
+
+        capture.drain()
+
+        text = capture.text() or ""
+        self.assertNotIn(secret, text)
+        self.assertIn("<redacted>", text)
+        self.assertLessEqual(len(text.encode("utf-8")), 4096)
 
     def test_engine_error_labelled_success_never_becomes_failure_kind_success(self) -> None:
         # Shaped byte-for-byte like the live regression (canary agent
@@ -417,7 +433,11 @@ class ClaudeSessionTests(unittest.TestCase):
             "print(json.dumps({'type': 'result', 'is_error': False, 'subtype': 'success', 'result': 'late'}))\n"
         )
         session = ADAPTER.launch(self.plan(script), FakeSink())
-        session.cancel(grace_seconds=2)
+        with patch(
+            "agent_run.adapters.claude.session.time.time",
+            side_effect=AssertionError("wall clock used for cancel budget"),
+        ):
+            session.cancel(grace_seconds=2)
         outcome = session.wait(timeout_seconds=5)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
