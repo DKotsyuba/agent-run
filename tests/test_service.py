@@ -23,7 +23,7 @@ from agent_run.adapters.snapshots import (
     finalize_runtime_snapshots,
     inspect_config_snapshot,
 )
-from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig, SkillsConfig
+from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import (
     AgentStatus,
     Message,
@@ -96,19 +96,18 @@ class FakeAdapter:
     def prepare(
         self,
         request,
-        profile,
+        role,
         config,
         home,
         agent_dir,
         *,
-        mcp_servers,
         resume_session_id=None,
     ):
         """Return one plan carrying the supplied optional resume identity."""
 
         self.prepare_calls += 1
         self.prepare_dirs.append(agent_dir)
-        self.prepare_profiles.append(profile)
+        self.prepare_profiles.append(role)
         if self.prepare_error is not None:
             raise self.prepare_error
         if self.prepare_materialize_revision is not None:
@@ -393,7 +392,7 @@ class AgentServiceTests(unittest.TestCase):
             effective.credential_state_home,
             account_runtime_home(runtime.home, "personal"),
         )
-        self.assertEqual(effective.auth, runtime.auth)
+        self.assertIsNone(effective.auth)
 
     def test_prepare_final_materialize_revision_is_the_persisted_snapshot(self) -> None:
         """Request-dependent prepare output replaces the initial home revision."""
@@ -431,7 +430,7 @@ Review the requested work.
             encoding="utf-8",
         )
         service = AgentService(
-            replace(self.config, skills=SkillsConfig(skills)),
+            replace(self.config, skills_directory=skills),
             self.store,
             self.root,
             launch=lambda *args: self.launched.append(args),
@@ -440,7 +439,7 @@ Review the requested work.
         service.start(self.request(request_id="canonical-role", write=True))
         self.wait_until(lambda: bool(ADAPTER.prepare_profiles))
         self.assertEqual(
-            ADAPTER.prepare_profiles[-1].body, "Review the requested work."
+            ADAPTER.prepare_profiles[-1].prompt, "Review the requested work."
         )
         self.assertFalse(ADAPTER.prepare_profiles[-1].write)
         self.assertEqual(ADAPTER.materialize_configs[-1].skills, ("code-reading",))
@@ -481,7 +480,7 @@ Review.
         service = AgentService(
             replace(
                 self.config,
-                skills=SkillsConfig(skills),
+                skills_directory=skills,
                 runtimes={"fake": runtime},
             ),
             self.store,

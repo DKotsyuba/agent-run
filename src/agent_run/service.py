@@ -13,7 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeAlias
 
-from .adapters.base import Capability, LaunchPlan, ModelInfo, RuntimeAdapter, compile_role
+from .adapters.base import Capability, LaunchPlan, ModelInfo, RuntimeAdapter
 from .adapters.registry import AdapterRegistry
 from .adapters.home import write_managed_file
 from .adapters.snapshots import (
@@ -569,7 +569,13 @@ class AgentService:
                 required_constraints=profile.required_constraints,
             )
         label = self.resolve_account(request.runtime, request.account)
-        runtime, role_plan = self._runtime_for_profile(runtime, profile, label)
+        runtime, role_plan, skills_root = self._runtime_for_profile(
+            runtime,
+            profile,
+            label,
+            request.required_constraints,
+            request.runtime,
+        )
         if label is not None:
             claude_state = runtime.adapter in {
                 "agent_run.adapters.claude:ADAPTER",
@@ -596,7 +602,8 @@ class AgentService:
             )
         policy = self._policy_for_profile(request, runtime, profile)
         return self._admit(
-            request, runtime, label, policy=policy, role_plan=role_plan
+            request, runtime, label, policy=policy, role_plan=role_plan,
+            skills_root=skills_root,
         )
 
     def _admit(
@@ -607,7 +614,8 @@ class AgentService:
         *,
         parent_agent_id: AgentId | None = None,
         policy: EffectivePolicy,
-        role_plan: ResolvedRolePlan | None = None,
+        role_plan: ResolvedRolePlan,
+        skills_root: Path,
     ) -> StartResult:
         """Durably accept one already validated start and hand it to a worker.
 
@@ -693,6 +701,7 @@ class AgentService:
                     request,
                     runtime,
                     role_plan,
+                    skills_root,
                     label,
                     startup_owner,
                     None if resume_session_id is None else str(resume_session_id),
@@ -719,7 +728,8 @@ class AgentService:
         agent_id: AgentId,
         request: StartRequest,
         runtime: RuntimeConfig,
-        role_plan: ResolvedRolePlan | None,
+        role_plan: ResolvedRolePlan,
+        skills_root: Path,
         account_label: str | None,
         startup_owner: str,
         resume_session_id: str | None = None,
@@ -766,6 +776,7 @@ class AgentService:
                     "agent_run.adapters.claude.adapter:ADAPTER",
                 }:
                     configured_home = account_runtime_home(runtime.home, account_label)
+                    effective_auth = None
                 else:
                     target = (
                         runtime.auth.target
@@ -829,18 +840,8 @@ class AgentService:
             adapter.validate(effective_runtime)
             stage = "profile"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
-            profile = (
-                role_plan.to_profile()
-                if role_plan is not None
-                else self._effective_profile(request, effective_runtime)
-            )
-            self._policy_for_profile(request, effective_runtime, profile)
-            record_profile_grants(store.connection, agent_id, profile)
-            mcp_servers = (
-                role_plan.mcp_configs()
-                if role_plan is not None
-                else self._mcp_servers(effective_runtime)
-            )
+            record_profile_grants(store.connection, agent_id, role_plan)
+            mcp_servers = self._mcp_servers(effective_runtime)
             stored_snapshot = None
             if snapshot_resume:
                 assert lineage_agent_id is not None and parent_revision is not None
@@ -877,8 +878,9 @@ class AgentService:
                     materialize_revision=stored_snapshot.materialize_revision,
                     snapshot_index_sha256=stored_snapshot.snapshot_index_sha256,
                     config=comparison_runtime,
-                    profile=role_plan or profile,
+                    profile=role_plan,
                     runtime_version=stored_snapshot.runtime_version,
+                    legacy_profile_shape=not stored_snapshot.role_plan_bound,
                 )
                 if current_snapshot.sha256 != expected_sha256:
                     raise ValidationError(
@@ -899,11 +901,7 @@ class AgentService:
                     effective_runtime,
                     effective_home,
                     mcp_servers=mcp_servers,
-                    skills_root=(
-                        self._config.skills.directory
-                        if profile.canonical
-                        else runtime_skills_dir(request.runtime, self._home)
-                    ),
+                    skills_root=skills_root,
                 )
                 revision = materialize_revision
             if self._cancel_accepted_start(store, cancelled, agent_id):
@@ -919,26 +917,13 @@ class AgentService:
             stage = "prepare"
             _log_start_preparation_stage(agent_id, stage, preparation_started)
             prepare_resume_id = resume_session_id if snapshot_resume else None
-            plan = (
-                compile_role(
-                    adapter,
-                    request,
-                    role_plan,
-                    effective_runtime,
-                    effective_home,
-                    candidate_dir,
-                    resume_session_id=prepare_resume_id,
-                )
-                if role_plan is not None
-                else adapter.prepare(
-                    request,
-                    profile,
-                    effective_runtime,
-                    effective_home,
-                    candidate_dir,
-                    mcp_servers=mcp_servers,
-                    resume_session_id=prepare_resume_id,
-                )
+            plan = adapter.prepare(
+                request,
+                role_plan,
+                effective_runtime,
+                effective_home,
+                candidate_dir,
+                resume_session_id=prepare_resume_id,
             )
             if plan.resume_session_id != prepare_resume_id:
                 raise ValidationError("adapter returned a mismatched resume session")
@@ -984,7 +969,7 @@ class AgentService:
                     materialize_revision=revision,
                     snapshot_index_sha256=snapshot_index_sha256,
                     config=effective_runtime,
-                    profile=role_plan or profile,
+                    profile=role_plan,
                     runtime_version=runtime_version,
                 )
                 write_managed_file(
@@ -1175,7 +1160,13 @@ class AgentService:
             row, snapshot, label, task, timeout_seconds, request_id, orchestrator
         )
         profile = self._effective_profile(request, runtime)
-        runtime, role_plan = self._runtime_for_profile(runtime, profile, label)
+        runtime, role_plan, skills_root = self._runtime_for_profile(
+            runtime,
+            profile,
+            label,
+            request.required_constraints,
+            request.runtime,
+        )
         if profile.canonical:
             request = replace(
                 request,
@@ -1204,6 +1195,7 @@ class AgentService:
             parent_agent_id=parent_id,
             policy=policy,
             role_plan=role_plan,
+            skills_root=skills_root,
         )
 
     def chain(
@@ -1570,29 +1562,38 @@ class AgentService:
         runtime: RuntimeConfig,
         profile: AgentProfile,
         account_label: str | None,
-    ) -> tuple[RuntimeConfig, ResolvedRolePlan | None]:
-        """Bridge a canonical role's assets through the legacy adapter config.
+        required_constraints: frozenset[Constraint],
+        runtime_name: str,
+    ) -> tuple[RuntimeConfig, ResolvedRolePlan, Path]:
+        """Resolve legacy or canonical input once into one adapter role plan."""
 
-        Legacy profiles keep their runtime-owned skill/MCP lists. A revisioned
-        role must not coexist with either list; its complete selections resolve
-        against the shared catalogs before admission and then replace the two
-        legacy fields for the current adapter boundary.
-        """
-
-        if not profile.canonical:
-            return runtime, None
-        if runtime.skills or runtime.mcp:
+        skills_root = self._config.skills_directory
+        if profile.canonical and (runtime.skills or runtime.mcp):
             raise ValidationError(
                 "canonical role cannot be mixed with runtime skills or MCP declarations"
             )
+        if not profile.canonical:
+            skills_root = runtime_skills_dir(runtime_name, self._home)
+            profile = replace(
+                profile,
+                revision="legacy",
+                skills=runtime.skills,
+                mcp=runtime.mcp,
+                required_constraints=required_constraints,
+                canonical=True,
+            )
         role_plan = resolve_role_plan(
             profile,
-            skills_root=self._config.skills.directory,
+            skills_root=skills_root,
             mcp_catalog=self._config.mcp,
             auth_mode="global" if account_label is None else "account",
             auth_reference=account_label,
         )
-        return replace(runtime, skills=profile.skills, mcp=profile.mcp), role_plan
+        return (
+            replace(runtime, skills=profile.skills, mcp=profile.mcp),
+            role_plan,
+            skills_root,
+        )
 
     @staticmethod
     def _policy_capabilities(

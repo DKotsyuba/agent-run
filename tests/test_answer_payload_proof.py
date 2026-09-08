@@ -369,12 +369,11 @@ class _Adapter:
     def prepare(
         self,
         request,
-        profile,
+        role,
         config,
         home,
         agent_dir,
         *,
-        mcp_servers,
         resume_session_id=None,
     ):
         """Build the minimal launch plan required to create a stored agent row."""

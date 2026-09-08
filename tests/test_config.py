@@ -191,7 +191,7 @@ command = ["echo", "done"]
 """
         )
         self.assertEqual(config.core.max_active_agents, 2)
-        self.assertEqual(config.skills.directory, Path("/tmp/skills").resolve())
+        self.assertEqual(config.skills_directory, Path("/tmp/skills").resolve())
         self.assertEqual(config.mcp["agent_lsp"].env_from, ("PATH",))
         self.assertEqual(config.runtimes["fake"].models, ("test",))
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))

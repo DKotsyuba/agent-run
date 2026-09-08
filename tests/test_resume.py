@@ -75,12 +75,11 @@ class ResumableAdapter:
     def prepare(
         self,
         request,
-        profile,
+        role,
         config,
         home,
         agent_dir,
         *,
-        mcp_servers,
         resume_session_id=None,
     ):
         """Build a plan carrying the Service-supplied resume identity."""
@@ -133,8 +132,8 @@ class ResumeTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.service.resume(parent, "continue", request_id="caller-replay", timeout_seconds=True)
 
-    def test_profile_drift_between_admission_and_preparation_cannot_launch(self) -> None:
-        """The worker checks actual grants after loading a concurrently changed profile."""
+    def test_profile_drift_after_admission_does_not_change_resolved_role(self) -> None:
+        """Launch the immutable admitted role without rereading changed profile files."""
         parent = self._parent()
         with patch.object(self.service._starts, "submit") as submit:
             child = self.service.resume(parent, "continue")
@@ -142,9 +141,8 @@ class ResumeTests(unittest.TestCase):
             "+++\nwrite = true\nnetwork = true\n+++\nDo the requested work.\n"
         )
         submit.call_args.args[1](self.store, Event())
-        self.assertEqual(self.service.get(child.agent_id).status, AgentStatus.FAILED)
-        self.assertIn("profile grants", self.service.get(child.agent_id).failure_text)
-        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(self.service.get(child.agent_id).status, AgentStatus.STARTING)
+        self.assertEqual(len(self.launched), 2)
 
     def test_unchanged_network_grants_are_preserved(self) -> None:
         """A legitimately network-enabled parent remains resumable with the same grants."""

@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import TYPE_CHECKING, Mapping, Protocol
 
 from ..config import McpConfig, RuntimeConfig
 from ..domain import Message, Outcome, StartRequest
 from ..errors import ValidationError
-from ..profiles import AgentProfile
-from ..role_plan import ResolvedRolePlan
+
+if TYPE_CHECKING:
+    from ..role_plan import ResolvedRolePlan
 
 
 ADAPTER_API_VERSION = 2
@@ -248,45 +249,12 @@ class RuntimeAdapter(Protocol):
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan: ...
 
     def launch(self, plan: LaunchPlan, sink: EventSink) -> RuntimeSession: ...
-
-
-def compile_role(
-    adapter: RuntimeAdapter,
-    request: StartRequest,
-    role: ResolvedRolePlan,
-    config: RuntimeConfig,
-    home: Path,
-    agent_dir: Path,
-    *,
-    resume_session_id: str | None = None,
-) -> LaunchPlan:
-    """Compile one resolved role through an adapter's native translator.
-
-    The effective runtime's compatibility asset fields must exactly match the
-    role. Native argv, config, and grant translation remains in ``prepare``.
-    This function launches no process and retains no credential value.
-    """
-
-    if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
-        server.id for server in role.mcp
-    ):
-        raise ValidationError("runtime assets do not match the resolved role")
-    return adapter.prepare(
-        request,
-        role.to_profile(),
-        config,
-        home,
-        agent_dir,
-        mcp_servers=role.mcp_configs(),
-        resume_session_id=resume_session_id,
-    )

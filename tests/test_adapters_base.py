@@ -15,13 +15,10 @@ from agent_run.adapters.base import (
     RuntimeAdapter,
     RuntimeHealth,
     RuntimeInfo,
-    compile_role,
 )
 from agent_run.adapters.registry import AdapterRegistry, load_adapter
 from agent_run.config import McpConfig, RuntimeConfig
 from agent_run.errors import ValidationError
-from agent_run.domain import StartRequest
-from agent_run.role_plan import ResolvedMcp, ResolvedRolePlan, ResolvedSkill
 
 
 class FakeAdapter:
@@ -46,7 +43,7 @@ class FakeAdapter:
     def limits(self, config, home):
         return ()
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+    def prepare(self, request, role, config, home, agent_dir, *, resume_session_id=None):
         raise AssertionError("not called while loading")
 
     def launch(self, plan, sink):
@@ -64,37 +61,6 @@ class LegacyAdapter(FakeAdapter):
 
 
 class AdapterTests(unittest.TestCase):
-    def test_compile_role_passes_only_resolved_inputs_to_native_prepare(self) -> None:
-        """Bridge one immutable role to the existing adapter translator."""
-
-        role = ResolvedRolePlan(
-            "review", "1", "Review.", False, False, True, (),
-            (ResolvedSkill("code-reading", "a" * 64),),
-            (ResolvedMcp("codegraph", "stdio", "/bin/echo", (), ("PATH",)),),
-            frozenset(), "global", None, "b" * 64,
-        )
-        config = replace(
-            self.runtime(), skills=("code-reading",), mcp=("codegraph",)
-        )
-        request = StartRequest(
-            "fake", "test", "review", "Review.", Path("/tmp")
-        )
-        result = LaunchPlan(
-            ("fake",), Path("/tmp"), {}, None, Path("/tmp/runtime.jsonl"), {}
-        )
-        adapter = FakeAdapter()
-        with patch.object(adapter, "prepare", return_value=result) as prepare:
-            self.assertIs(
-                compile_role(
-                    adapter, request, role, config, Path("/tmp/home"), Path("/tmp/agent")
-                ),
-                result,
-            )
-        self.assertEqual(prepare.call_args.args[1].body, "Review.")
-        self.assertEqual(
-            tuple(prepare.call_args.kwargs["mcp_servers"]), ("codegraph",)
-        )
-
     def test_launch_plan_payload_preserves_bytes_and_rejects_shape_coercion(self) -> None:
         """Private launch payloads round-trip bytes and reject ambiguous JSON shapes."""
 
@@ -199,35 +165,26 @@ class AdapterTests(unittest.TestCase):
             ), self.assertRaisesRegex(ValidationError, message):
                 load_adapter("fake_module:ADAPTER")
 
-    def test_materialize_and_prepare_require_resolved_mcp_servers(self) -> None:
+    def test_materialize_requires_mcp_mapping_and_prepare_requires_role(self) -> None:
+        """Keep materialization explicit while making prepare consume one role."""
+
         config = self.runtime()
         home = Path("/tmp/fake-home")
         servers = {"docs": McpConfig("stdio", Path("/bin/echo"))}
-        arguments = {
-            "materialize": (config, home),
-            "prepare": (object(), object(), config, home, home / "agent"),
-        }
-        for method, args in arguments.items():
-            with self.subTest(method=method):
-                contract = inspect.signature(getattr(RuntimeAdapter, method))
-                parameter = contract.parameters["mcp_servers"]
-                self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
-                self.assertIs(parameter.default, inspect.Parameter.empty)
-                self.assertEqual(parameter.annotation, "Mapping[str, McpConfig]")
-                kwargs = {"mcp_servers": servers}
-                if method == "materialize":
-                    skills = contract.parameters["skills_root"]
-                    self.assertIs(skills.kind, inspect.Parameter.KEYWORD_ONLY)
-                    self.assertIs(skills.default, inspect.Parameter.empty)
-                    kwargs["skills_root"] = home / "skills"
-                with self.assertRaises(TypeError):
-                    contract.bind(FakeAdapter(), *args)
-                contract.bind(FakeAdapter(), *args, **kwargs)
-                current = inspect.signature(getattr(FakeAdapter(), method))
-                current.bind(*args, **kwargs)
-                legacy = inspect.signature(getattr(LegacyAdapter(), method))
-                with self.assertRaises(TypeError):
-                    legacy.bind(*args, **kwargs)
+        materialize = inspect.signature(RuntimeAdapter.materialize)
+        with self.assertRaises(TypeError):
+            materialize.bind(FakeAdapter(), config, home)
+        materialize.bind(
+            FakeAdapter(), config, home,
+            mcp_servers=servers, skills_root=home / "skills",
+        )
+        prepare = inspect.signature(RuntimeAdapter.prepare)
+        self.assertEqual(prepare.parameters["role"].annotation, "ResolvedRolePlan")
+        self.assertNotIn("mcp_servers", prepare.parameters)
+        self.assertEqual(
+            list(inspect.signature(FakeAdapter.prepare).parameters)[1:6],
+            ["request", "role", "config", "home", "agent_dir"],
+        )
 
     def test_registry_refuses_unknown_and_disabled_runtimes(self) -> None:
         registry = AdapterRegistry({"fake": self.runtime(enabled=False)})

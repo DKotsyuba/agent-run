@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Mapping
 
+from .adapters.home import content_hash
+from .adapters.snapshot_tree import tree_revision
 from .config import McpConfig
 from .domain import Constraint
 from .errors import ValidationError
@@ -17,33 +17,6 @@ from .profiles import AgentProfile, normalize_read_roots
 
 
 _CATALOG_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
-
-
-def _content_hash(value: str | bytes) -> str:
-    """Return a SHA-256 hex digest for canonical role bytes."""
-
-    payload = value.encode("utf-8") if isinstance(value, str) else value
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _skill_revision(source: Path) -> str:
-    """Hash one canonical real skill tree without following links."""
-
-    if source.is_symlink() or not source.is_dir():
-        raise ValidationError(f"canonical skill must be a real directory: {source.name}")
-    entries = []
-    for path in sorted(source.rglob("*")):
-        relative = path.relative_to(source).as_posix()
-        if path.is_symlink():
-            raise ValidationError(f"canonical skill contains a symlink: {source.name}/{relative}")
-        if path.is_dir():
-            entries.append([relative, "directory"])
-        elif path.is_file():
-            payload = path.read_bytes()
-            entries.append([relative, "file", len(payload), _content_hash(payload)])
-        else:
-            raise ValidationError(f"canonical skill contains a special file: {source.name}/{relative}")
-    return _content_hash(json.dumps(entries, separators=(",", ":")))
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,39 +99,6 @@ class ResolvedRolePlan:
             "config_revision": self.config_revision,
         }
 
-    def to_profile(self) -> AgentProfile:
-        """Return the compatibility profile consumed by native translators."""
-
-        return AgentProfile(
-            name=self.role_name,
-            body=self.prompt,
-            write=self.write,
-            read_roots=self.read_roots,
-            network=self.network,
-            revision=self.role_revision,
-            allow_external_read_roots=self.allow_external_read_roots,
-            skills=tuple(skill.id for skill in self.skills),
-            mcp=tuple(server.id for server in self.mcp),
-            required_constraints=self.required_constraints,
-            canonical=True,
-        )
-
-    def mcp_configs(self) -> Mapping[str, McpConfig]:
-        """Return immutable typed MCP definitions for adapter translation."""
-
-        return MappingProxyType(
-            {
-                server.id: McpConfig(
-                    server.transport,
-                    Path(server.command),
-                    server.args,
-                    server.env_from,
-                )
-                for server in self.mcp
-            }
-        )
-
-
 def resolve_role_plan(
     profile: AgentProfile,
     *,
@@ -166,6 +106,7 @@ def resolve_role_plan(
     mcp_catalog: Mapping[str, McpConfig],
     auth_mode: str = "global",
     auth_reference: str | None = None,
+    skill_revision_cache: dict[Path, str] | None = None,
 ) -> ResolvedRolePlan:
     """Resolve one canonical profile against shared skill and MCP catalogs.
 
@@ -199,7 +140,12 @@ def resolve_role_plan(
             raise ValidationError(f"skill escapes canonical catalog: {name}") from error
         if not (source / "SKILL.md").is_file():
             raise ValidationError(f"canonical skill is not available: {name}")
-        skills.append(ResolvedSkill(name, _skill_revision(source)))
+        revision = None if skill_revision_cache is None else skill_revision_cache.get(source)
+        if revision is None:
+            revision = tree_revision(source)
+            if skill_revision_cache is not None:
+                skill_revision_cache[source] = revision
+        skills.append(ResolvedSkill(name, revision))
 
     servers = []
     for name in profile.mcp:
@@ -248,7 +194,7 @@ def resolve_role_plan(
         ),
         "auth": {"mode": auth_mode, "reference": auth_reference},
     }
-    revision = _content_hash(
+    revision = content_hash(
         json.dumps(seed, sort_keys=True, separators=(",", ":"))
     )
     return ResolvedRolePlan(

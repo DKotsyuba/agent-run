@@ -17,6 +17,7 @@ from agent_run.adapters.claude.adapter import ADAPTER, ClaudeAdapter
 from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig
 from agent_run.domain import StartRequest
 from agent_run.profiles import AgentProfile
+from role_helpers import resolved_role
 
 
 def _executable(path: Path, body: str = "exit 0") -> None:
@@ -76,6 +77,23 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         values.update(overrides)
         return StartRequest(**values)
 
+    def prepare(
+        self,
+        request: StartRequest,
+        profile: AgentProfile,
+        config: RuntimeConfig,
+        mcp_servers: dict[str, McpConfig],
+    ):
+        """Prepare through the direct resolved-role adapter contract."""
+
+        return self.adapter.prepare(
+            request,
+            resolved_role(request, profile, config, mcp_servers),
+            config,
+            self.home,
+            self.agent_dir,
+        )
+
     def test_prepare_ignores_preset_and_inherits_host_values_for_mcp(self) -> None:
         """Use host PATH/variables and the already materialized MCP descriptor."""
 
@@ -96,9 +114,7 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
             skills_root=self.root / "skills" / "claude",
         )
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "PROJECT": "must-not-copy"}, clear=False):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
-            )
+            plan = self.prepare(self.request(), self.profile(), config, servers)
         descriptor_path = self.home / "mcp" / "mcp-config.json"
         self.assertEqual(plan.argv[plan.argv.index("--mcp-config") + 1], str(descriptor_path))
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
@@ -111,9 +127,7 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
 
         config = self.runtime_config(environment=EnvironmentConfig(required_commands=("definitely-missing",)))
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}, clear=False):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={}
-            )
+            plan = self.prepare(self.request(), self.profile(), config, {})
         self.assertEqual(plan.environment["PATH"], "/usr/bin")
 
     def test_prepare_denies_gh_bare_and_absolute_while_git_remains_permitted(self) -> None:
@@ -125,13 +139,11 @@ class ClaudeDeveloperEnvironmentTests(unittest.TestCase):
         _executable(host / "git")
         config = self.runtime_config(environment=EnvironmentConfig(path=(host,), denied_commands=("gh",)))
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}, clear=False):
-            plan = self.adapter.prepare(
+            plan = self.prepare(
                 self.request(write=True),
                 self.profile(write=True, network=True),
                 config,
-                self.home,
-                self.agent_dir,
-                mcp_servers={},
+                {},
             )
         disallowed = plan.argv[plan.argv.index("--disallowedTools") + 1]
         self.assertIn("Bash(gh)", disallowed)

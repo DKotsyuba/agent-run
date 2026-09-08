@@ -27,7 +27,8 @@ from agent_run.adapters.snapshots import (
 from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
-from agent_run.profiles import AgentProfile
+from agent_run.profiles import AgentProfile, normalize_read_roots
+from role_helpers import resolved_role
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -110,12 +111,12 @@ env_from = ["PATH"]
             with self.subTest(method=name):
                 current = inspect.signature(getattr(ADAPTER, name))
                 contract = inspect.signature(getattr(RuntimeAdapter, name))
-                parameter = current.parameters["mcp_servers"]
-                self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
-                self.assertIs(parameter.default, inspect.Parameter.empty)
                 self.assertEqual(
                     list(current.parameters), list(contract.parameters)[1:]  # minus self
                 )
+                if name == "prepare":
+                    self.assertIn("role", current.parameters)
+                    self.assertNotIn("mcp_servers", current.parameters)
         with self.assertRaises(TypeError):
             ADAPTER.materialize(self.runtime_config(), self.home)
 
@@ -157,11 +158,11 @@ env_from = ["PATH"]
             ["PATH"],
         )
         profile = AgentProfile("review", "body", False, (self.workdir,))
-        with patch.dict(os.environ, {"CARGO_HOME": "/host/cargo"}, clear=False):
+        with patch.dict(os.environ, {"RUSTUP_HOME": "/host/rustup"}, clear=False):
             plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
-        self.assertEqual(plan.environment["CARGO_HOME"], "/host/cargo")
+        self.assertEqual(plan.environment["RUSTUP_HOME"], "/host/rustup")
 
     def test_legacy_environment_only_retains_native_denial_rules(self) -> None:
         """Ignore legacy path/variables while retaining command denials."""
@@ -966,13 +967,19 @@ env_from = ["PATH"]
 
     def prepare(self, request, profile, config=None, mcp_servers=_UNSET):
         runtime = self.runtime_config() if config is None else config
+        servers = {} if mcp_servers is self._UNSET else mcp_servers
+        request = replace(
+            request,
+            read_roots=normalize_read_roots(
+                (*profile.read_roots, *request.read_roots)
+            ),
+        )
         return ADAPTER.prepare(
             request,
-            profile,
+            resolved_role(request, profile, runtime, servers),
             runtime,
             self.home,
             self.workdir,
-            mcp_servers={} if mcp_servers is self._UNSET else mcp_servers,
         )
 
     def materialized(self, **overrides) -> RuntimeConfig:
@@ -1120,13 +1127,8 @@ env_from = ["PATH"]
         with self.assertRaisesRegex(
             ValidationError, "cannot grant external read roots"
         ):
-            ADAPTER.prepare(
-                self.start_request(workdir=work, write=True),
-                profile,
-                config,
-                self.home,
-                self.workdir,
-                mcp_servers={},
+            self.prepare(
+                self.start_request(workdir=work, write=True), profile, config
             )
 
     def test_prepare_refuses_unknown_model(self) -> None:
@@ -1150,19 +1152,19 @@ env_from = ["PATH"]
         """Keep GPT-6 launches restricted to read-only architecture and review."""
         config = self.materialized(models=("gpt-5.6-sol", "gpt-6-astra"))
         self.write_model_cache('{"models": [{"id": "gpt-6-astra"}]}')
-        with self.assertRaisesRegex(ValidationError, "role-architect and role-review"):
+        with self.assertRaisesRegex(ValidationError, "architect and review"):
             self.prepare(
                 self.start_request(model="gpt-6-astra"),
-                AgentProfile("role-implement", "body", True, (self.auth_source_dir,)),
+                AgentProfile("implement", "body", True, (self.auth_source_dir,)),
                 config,
             )
         with self.assertRaisesRegex(ValidationError, "does not permit write-capable"):
             self.prepare(
                 self.start_request(model="gpt-6-astra", write=True),
-                AgentProfile("role-architect", "body", True, (self.auth_source_dir,)),
+                AgentProfile("architect", "body", True, (self.auth_source_dir,)),
                 config,
             )
-        for role in ("role-architect", "role-review"):
+        for role in ("architect", "review"):
             with self.subTest(role=role):
                 plan = self.prepare(
                     self.start_request(model="gpt-6-astra"),
@@ -1209,14 +1211,16 @@ env_from = ["PATH"]
     def test_prepare_refuses_write_beyond_profile_grant(self) -> None:
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
-        with self.assertRaisesRegex(ValidationError, "does not grant write"):
+        with self.assertRaisesRegex(ValidationError, "grants do not match"):
             self.prepare(self.start_request(write=True), profile, config)
 
-    def test_prepare_refuses_no_filesystem_profile(self) -> None:
+    def test_prepare_read_only_role_always_receives_its_workdir(self) -> None:
+        """Treat the task workdir as the minimal read scope for every role."""
+
         config = self.materialized()
         profile = AgentProfile("blank", "body", False, ())
-        with self.assertRaisesRegex(ValidationError, "no-filesystem profile"):
-            self.prepare(self.start_request(), profile, config)
+        plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(plan.adapter_state["roots"], (str(self.workdir),))
 
     def test_prepare_accepts_a_request_read_root_as_the_only_filesystem_grant(self) -> None:
         config = self.materialized()
@@ -1229,7 +1233,7 @@ env_from = ["PATH"]
     def test_prepare_refuses_unresolved_mcp_servers(self) -> None:
         config = self.materialized(mcp=("agent_lsp",))
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
-        with self.assertRaisesRegex(ValidationError, "codex mcp reference is not configured"):
+        with self.assertRaisesRegex(ValidationError, "no resolved MCP definition"):
             self.prepare(self.start_request(), profile, config, mcp_servers={})
         with self.assertRaisesRegex(ValidationError, "resolved mcp_servers mapping"):
             self.prepare(self.start_request(), profile, config, mcp_servers=None)

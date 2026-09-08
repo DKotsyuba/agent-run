@@ -21,6 +21,7 @@ from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, Ru
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
+from role_helpers import resolved_role
 
 
 class QwenAdapterTests(unittest.TestCase):
@@ -94,10 +95,38 @@ class QwenAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "PATH": path, "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }):
+            request = self.request(write=write)
             return self.adapter.prepare(
-                self.request(write=write), self.profile(write=write), config, self.home,
-                self.agent_dir, mcp_servers=servers if mcp else {},
+                request,
+                resolved_role(
+                    request, self.profile(write=write), config,
+                    servers if mcp else {},
+                ),
+                config,
+                self.home,
+                self.agent_dir,
             )
+
+    def direct_prepare(
+        self,
+        request: StartRequest,
+        profile: AgentProfile,
+        config: RuntimeConfig,
+        *,
+        mcp_servers: dict[str, McpConfig] | None = None,
+        resume_session_id: str | None = None,
+    ):
+        """Prepare an explicit fixture through the resolved-role contract."""
+
+        servers = {} if mcp_servers is None else mcp_servers
+        return self.adapter.prepare(
+            request,
+            resolved_role(request, profile, config, servers),
+            config,
+            self.home,
+            self.agent_dir,
+            resume_session_id=resume_session_id,
+        )
 
     def test_read_only_and_write_modes_are_explicit_and_sandboxed(self) -> None:
         """Map read-only to plan and writes to yolo (live shell) without dropping sandbox."""
@@ -137,10 +166,7 @@ class QwenAdapterTests(unittest.TestCase):
             },
             clear=True,
         ):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir,
-                mcp_servers={},
-            )
+            plan = self.direct_prepare(self.request(), self.profile(), config)
         self.assertEqual(plan.environment["OPENAI_API_KEY"], "global-secret")
         self.assertNotIn("global-secret", " ".join(plan.argv))
 
@@ -170,8 +196,8 @@ class QwenAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "PATH": "/bin", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }, clear=True):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers,
+            plan = self.direct_prepare(
+                self.request(), self.profile(), config, mcp_servers=servers
             )
         settings = json.loads((self.home / ".qwen" / "settings.json").read_text(encoding="utf-8"))
         denied = settings["permissions"]["deny"]
@@ -193,9 +219,7 @@ class QwenAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "PATH": "", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }, clear=True):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={},
-            )
+            plan = self.direct_prepare(self.request(), self.profile(), config)
         self.assertEqual(plan.environment["PATH"], "")
         self.assertTrue((self.home / ".qwen" / "settings.json").exists())
 
@@ -225,13 +249,8 @@ class QwenAdapterTests(unittest.TestCase):
             "OPENAI_API_KEY": "secret",
             "OPENAI_BASE_URL": "https://provider/v1",
         }):
-            plan = self.adapter.prepare(
-                self.request(),
-                self.profile(),
-                self.config(),
-                self.home,
-                self.agent_dir,
-                mcp_servers={},
+            plan = self.direct_prepare(
+                self.request(), self.profile(), self.config(),
                 resume_session_id="session-1",
             )
         after = {
@@ -246,9 +265,8 @@ class QwenAdapterTests(unittest.TestCase):
         """Reject network profiles because this adapter grants no Qwen web tools."""
         with patch.dict(os.environ, {"OPENAI_API_KEY": "x", "OPENAI_BASE_URL": "https://p/v1"}):
             with self.assertRaisesRegex(ValidationError, "network profiles"):
-                self.adapter.prepare(
-                    self.request(), self.profile(network=True), self.config(), self.home,
-                    self.agent_dir, mcp_servers={},
+                self.direct_prepare(
+                    self.request(), self.profile(network=True), self.config()
                 )
 
     def test_process_env_credentials_win_over_keychain_and_default_base_url(self) -> None:
@@ -267,9 +285,8 @@ class QwenAdapterTests(unittest.TestCase):
             "agent_run.adapters.qwen.adapter.keychain_omniroute_api_key",
             return_value="kc-secret",
         ) as spy:
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), self.config(), self.home,
-                self.agent_dir, mcp_servers={},
+            plan = self.direct_prepare(
+                self.request(), self.profile(), self.config()
             )
         spy.assert_called_once_with()
         self.assertEqual(plan.environment["OPENAI_API_KEY"], "kc-secret")
@@ -282,9 +299,8 @@ class QwenAdapterTests(unittest.TestCase):
             return_value=None,
         ):
             with self.assertRaisesRegex(ValidationError, "OPENAI_API_KEY"):
-                self.adapter.prepare(
-                    self.request(), self.profile(), self.config(), self.home,
-                    self.agent_dir, mcp_servers={},
+                self.direct_prepare(
+                    self.request(), self.profile(), self.config()
                 )
 
     def test_probe_reports_authenticated_via_keychain_fallback(self) -> None:

@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from agent_run import doctor
+from agent_run import role_plan
 from agent_run.config import Config, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.doctor import run_doctor
 from agent_run.domain import AgentStatus, StartRequest
@@ -48,6 +49,10 @@ Review.
 """,
                 encoding="utf-8",
             )
+            (profiles / "inspect.md").write_text(
+                (profiles / "review.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             base = f'''schema_version = 1
 [profiles]
 directory = "{profiles}"
@@ -65,9 +70,14 @@ models = ["model"]
 '''
             (home / "config.toml").write_text(base, encoding="utf-8")
             StateStore.initialize(home / "state.db").close()
-            report = run_doctor(
-                home, at=1, canary_runner=lambda: 1, mcp_process_lister=lambda: []
-            )
+            with mock.patch(
+                "agent_run.role_plan.tree_revision",
+                wraps=role_plan.tree_revision,
+            ) as revision:
+                report = run_doctor(
+                    home, at=1, canary_runner=lambda: 1, mcp_process_lister=lambda: []
+                )
+            self.assertEqual(revision.call_count, 1)
             codes = {finding.code for finding in report.findings}
             self.assertNotIn("role_invalid", codes)
             self.assertNotIn("runtime_home_missing", codes)

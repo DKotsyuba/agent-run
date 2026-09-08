@@ -16,7 +16,8 @@ from ...domain import StartRequest
 from ...errors import ValidationError
 from ..environment import host_environment
 from ..home import content_hash
-from ...profiles import AgentProfile, normalize_read_roots
+from ...profiles import normalize_read_roots
+from ...role_plan import ResolvedRolePlan
 from ..base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -184,22 +185,18 @@ class ClaudeAdapter:
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build the isolated launch plan for one start request.
 
         Public model ids remain on the plan boundary; only child argv aliases
-        ``fable``. Presets add declared paths, variables, Rust, and command
-        denials to the isolated environment; invalid inputs raise before launch.
-        The adapter reasserts its scoped ``CLAUDE_CONFIG_DIR`` after preset
-        assembly and treats it as engine-owned for MCP requirements, so neither
-        path can redirect Claude's durable credential state.
+        ``fable``. Request grants and runtime assets must match ``role``.
+        Optional legacy command denials remain active during config migration.
         """
 
         if request.fast:
@@ -211,13 +208,16 @@ class ClaudeAdapter:
                 f"claude runtime effort must be one of {sorted(_SUPPORTED_EFFORTS)}: {request.effort!r}"
             )
 
-        if request.write and not profile.write:
-            raise ValidationError("claude profile does not allow requested write access")
-        allow_write = request.write and profile.write
-        declared_roots = tuple(
-            normalize_read_roots((root,))[0]
-            for root in (*profile.read_roots, *request.read_roots)
-        )
+        if not isinstance(role, ResolvedRolePlan):
+            raise ValidationError("prepare requires a ResolvedRolePlan")
+        if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
+            server.id for server in role.mcp
+        ):
+            raise ValidationError("claude runtime assets do not match the resolved role")
+        if request.write != role.write or request.read_roots != role.read_roots:
+            raise ValidationError("claude request grants do not match the resolved role")
+        allow_write = role.write
+        declared_roots = role.read_roots
         roots = normalize_read_roots((request.workdir, *declared_roots))
         if allow_write:
             for root in declared_roots:
@@ -229,19 +229,19 @@ class ClaudeAdapter:
 
         skill_tools = _SKILL_TOOLS if config.skills else ()
         shell_tools = _SHELL_TOOLS if allow_write else ()
-        network_tools = _NETWORK_TOOLS if profile.network else ()
+        network_tools = _NETWORK_TOOLS if role.network else ()
         base_tools = (
             _READ_TOOLS + skill_tools + (_WRITE_TOOLS if allow_write else ()) + shell_tools + network_tools
         )
         write_scope = tuple(f"{tool}({request.workdir}/**)" for tool in _WRITE_TOOLS) if allow_write else ()
         allowed_tools = (
             _READ_TOOLS + skill_tools + write_scope + shell_tools + network_tools
-            + tuple(f"mcp__{name}" for name in config.mcp)
+            + tuple(f"mcp__{server.id}" for server in role.mcp)
         )
-        disallowed_tools = () if profile.network else _ALWAYS_DISALLOWED
+        disallowed_tools = () if role.network else _ALWAYS_DISALLOWED
         permission_mode = "acceptEdits" if allow_write else "default"
 
-        system_prompt_parts = [profile.body]
+        system_prompt_parts = [role.prompt]
         if request.output_schema is not None:
             schema_text = json.dumps(request.output_schema, sort_keys=True)
             system_prompt_parts.append(
@@ -269,7 +269,7 @@ class ClaudeAdapter:
             "--settings",
             str(home / "settings.json"),
         ]
-        if config.mcp:
+        if role.mcp:
             argv += ["--mcp-config", str(home / "mcp" / "mcp-config.json")]
         for name in local_skill_names(config.plugins, config.skills):
             argv += ["--plugin-dir", str(home / "plugins" / name)]
@@ -290,14 +290,7 @@ class ClaudeAdapter:
         argv += ["--session-id", session_id]
 
         scoped_config_dir = str(claude_config_dir(config))
-        selected_mcp = []
-        for name in config.mcp:
-            server = mcp_servers.get(name)
-            if server is None:
-                raise ValidationError(
-                    f"no resolved MCP definition for runtimes.claude.mcp entry: {name}"
-                )
-            selected_mcp.append(server)
+        selected_mcp = role.mcp
         allowed_secret_names = tuple(
             dict.fromkeys(
                 (
@@ -347,7 +340,7 @@ class ClaudeAdapter:
             )
 
         mcp_env_names: list[str] = []
-        for name, server in zip(config.mcp, selected_mcp, strict=True):
+        for server in selected_mcp:
             for env_name in server.env_from:
                 if env_name == "CLAUDE_CONFIG_DIR":
                     value = scoped_config_dir
@@ -355,7 +348,7 @@ class ClaudeAdapter:
                     value = environment.get(env_name)
                 if not value:
                     raise ValidationError(
-                        f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
+                        f"claude mcp {server.id!r} requires environment variable {env_name}, which is not set"
                     )
                 environment[env_name] = value
                 mcp_env_names.append(env_name)

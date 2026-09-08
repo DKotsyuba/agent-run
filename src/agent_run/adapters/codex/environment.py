@@ -111,14 +111,9 @@ def build_environment(
     )
 
 
-def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, str | None]:
-    """Return approval settings for the effective write grant.
+def approval_fields(write: bool) -> dict[str, str | None]:
+    """Return approval settings for the effective write grant."""
 
-    ``config`` remains in the signature until the canonical role compiler owns
-    this decision; legacy environment declarations no longer affect it.
-    """
-
-    del config
     if write:
         return {"approval_policy": "on-request", "approvals_reviewer": "auto_review"}
     return {"approval_policy": "never", "approvals_reviewer": None}
@@ -127,32 +122,20 @@ def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, s
 def prepared_environment(
     binary: Path,
     home: Path,
-    config: RuntimeConfig,
-    workdir: Path,
     *,
-    mcp_servers: Mapping[str, McpConfig],
+    mcp_environment_names: tuple[str, ...] = (),
+    denied_commands: tuple[str, ...] = (),
     refresh: bool = True,
 ) -> dict[str, str]:
     """Return the Codex child environment with its managed command policy.
 
-    ``mcp_servers`` supplies the selected environment-variable names whose
-    values may cross the credential filter. The host environment is inherited.
-    Legacy command denials remain active until the canonical role compiler
-    replaces their configuration source.
+    ``mcp_environment_names`` may cross the credential filter. Optional legacy
+    command denials remain active during config migration.
     """
 
-    del workdir
-    allowed_secret_names = tuple(
-        dict.fromkeys(
-            env_name
-            for name in config.mcp
-            for env_name in mcp_servers[name].env_from
-        )
-    )
     environment = build_environment(
-        binary, home, allowed_secret_names=allowed_secret_names
+        binary, home, allowed_secret_names=mcp_environment_names
     )
-    denied_commands = config.environment.denied_commands if config.environment is not None else ()
     if not denied_commands:
         return environment
     policy_directory = home / "command-refusals"

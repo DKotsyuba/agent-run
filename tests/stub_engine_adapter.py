@@ -65,7 +65,9 @@ class StubEngineAdapter:
     def limits(self, config, home):
         return ()
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+    def prepare(self, request, role, config, home, agent_dir, *, resume_session_id=None):
+        """Reject preparation because supervisor tests provide a completed plan."""
+
         raise AssertionError("the detached supervisor never prepares a plan")
 
     def launch(self, plan: LaunchPlan, sink) -> StubEngineSession:

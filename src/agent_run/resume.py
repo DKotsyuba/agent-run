@@ -29,14 +29,14 @@ from .config import RuntimeConfig
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import ValidationError
 from .effective_policy import Constraint
-from .profiles import AgentProfile
+from .role_plan import ResolvedRolePlan
 from .state.db import agent_row, idempotent_agent, immediate, nonblank, positive_number
 
 
 def record_profile_grants(
-    connection: sqlite3.Connection, agent_id: AgentId, profile: AgentProfile
+    connection: sqlite3.Connection, agent_id: AgentId, role: ResolvedRolePlan
 ) -> None:
-    """Pin the loaded profile's effective grants before any native launch.
+    """Pin the resolved role's effective grants before any native launch.
 
     The connection belongs to the preparation worker. Fresh runs record their
     actual write, network and read-root grants; continuations must exactly match
@@ -45,9 +45,9 @@ def record_profile_grants(
     The single transaction updates only this run's secret-free identity JSON.
     """
     grants = {
-        "write": profile.write,
-        "network": profile.network,
-        "read_roots": sorted(str(path) for path in profile.read_roots),
+        "write": role.write,
+        "network": role.network,
+        "read_roots": sorted(str(path) for path in role.read_roots),
     }
     with immediate(connection):
         row = agent_row(connection, agent_id)

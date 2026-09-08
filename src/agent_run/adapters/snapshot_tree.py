@@ -54,6 +54,13 @@ class SnapshotInspection:
     hash_mismatches: tuple[str, ...] = ()
 
 
+def tree_revision(source: Path) -> str:
+    """Return a no-follow canonical content revision for one source tree."""
+
+    entries, _files = _read_tree(source)
+    return content_hash(_manifest(entries))
+
+
 def _relative(value: str | Path, label: str) -> Path:
     """Return a nonempty managed relative path or raise ``PathEscapeError``."""
 

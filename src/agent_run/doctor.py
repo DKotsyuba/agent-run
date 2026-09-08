@@ -205,6 +205,7 @@ def _roles(config: Config, findings: list[DoctorFinding]) -> bool:
         return False
     canonical = False
     legacy = False
+    skill_revisions: dict[Path, str] = {}
     for path in paths:
         try:
             profile = load_profile(config.profiles, path.stem)
@@ -212,8 +213,9 @@ def _roles(config: Config, findings: list[DoctorFinding]) -> bool:
                 canonical = True
                 resolve_role_plan(
                     profile,
-                    skills_root=config.skills.directory,
+                    skills_root=config.skills_directory,
                     mcp_catalog=config.mcp,
+                    skill_revision_cache=skill_revisions,
                 )
             else:
                 legacy = True

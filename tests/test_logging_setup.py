@@ -56,12 +56,11 @@ class _FakeAdapter:
     def prepare(
         self,
         request,
-        profile,
+        role,
         config,
         home,
         agent_dir,
         *,
-        mcp_servers,
         resume_session_id=None,
     ):
         """Build a minimal plan carrying the optional native resume identity."""

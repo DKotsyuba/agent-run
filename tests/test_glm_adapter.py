@@ -18,7 +18,8 @@ from agent_run.adapters.glm.auth import DEFAULT_BASE_URL, KEYCHAIN_ACCOUNT, KEYC
 from agent_run.config import RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
-from agent_run.profiles import AgentProfile
+from agent_run.profiles import AgentProfile, normalize_read_roots
+from role_helpers import resolved_role
 
 
 class GlmAdapterTests(unittest.TestCase):
@@ -84,7 +85,21 @@ class GlmAdapterTests(unittest.TestCase):
         return StartRequest(**values)
 
     def prepare(self, *args, mcp_servers: dict = {}, **kwargs):
-        return self.adapter.prepare(*args, mcp_servers=mcp_servers, **kwargs)
+        request, profile, config, home, agent_dir = args
+        request = replace(
+            request,
+            read_roots=normalize_read_roots(
+                (*profile.read_roots, *request.read_roots)
+            ),
+        )
+        return self.adapter.prepare(
+            request,
+            resolved_role(request, profile, config, mcp_servers),
+            config,
+            home,
+            agent_dir,
+            **kwargs,
+        )
 
     # -- describe -----------------------------------------------------
 

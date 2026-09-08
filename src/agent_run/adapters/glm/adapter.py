@@ -22,10 +22,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
-from ...config import McpConfig, RuntimeConfig
+from ...config import RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
-from ...profiles import AgentProfile
+from ...role_plan import ResolvedRolePlan
 from ..base import ADAPTER_API_VERSION, LaunchPlan, RuntimeHealth, RuntimeInfo
 from ..claude.adapter import _KNOWN_HOOK_EVENTS, ClaudeAdapter
 from ..plugin_skills import unlisted_plugin_skills
@@ -123,21 +123,19 @@ class GlmAdapter(ClaudeAdapter):
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan:
         plan = super().prepare(
             request,
-            profile,
+            role,
             config,
             home,
             agent_dir,
-            mcp_servers=mcp_servers,
             resume_session_id=resume_session_id,
         )
         cli_model = request.model

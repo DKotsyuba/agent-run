@@ -8,7 +8,6 @@ from pathlib import Path
 
 from ..config import EnvironmentConfig, RuntimeConfig
 from ..errors import ValidationError
-from ..profiles import AgentProfile
 from ..role_plan import ResolvedRolePlan
 from .home import content_hash
 from .snapshot_runtime import _valid_sha256
@@ -29,7 +28,8 @@ class ConfigSnapshot:
     version evidence. ``credential_state_home_bound`` (``bool``) distinguishes
     current snapshots from version-one snapshots written before that runtime
     declaration existed, so resume can retain their exact compatibility
-    contract.
+    contract. ``role_plan_bound`` distinguishes current role snapshots from
+    historical profile documents.
     """
 
     document: bytes
@@ -38,6 +38,7 @@ class ConfigSnapshot:
     materialize_revision: str
     runtime_version: str | None
     credential_state_home_bound: bool
+    role_plan_bound: bool
 
 def _environment_document(environment: EnvironmentConfig | None) -> object:
     """Return deterministic environment evidence without raw variable values."""
@@ -107,32 +108,17 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
     return document
 
 
-def _profile_document(
-    profile: AgentProfile | ResolvedRolePlan,
-) -> dict[str, object]:
-    """Return the effective role contract as deterministic JSON-safe values."""
+def _role_document(role: ResolvedRolePlan, legacy: bool) -> dict[str, object]:
+    """Return a current role payload or historical profile compatibility shape."""
 
-    if isinstance(profile, ResolvedRolePlan):
-        return profile.to_payload()
-    legacy = {
-        "name": profile.name,
-        "body": profile.body,
-        "write": profile.write,
-        "read_roots": [str(path) for path in profile.read_roots],
-        "network": profile.network,
-    }
-    if not profile.canonical:
-        return legacy
+    if not legacy:
+        return role.to_payload()
     return {
-        **legacy,
-        "revision": profile.revision,
-        "allow_external_read_roots": profile.allow_external_read_roots,
-        "skills": list(profile.skills),
-        "mcp": list(profile.mcp),
-        "required_constraints": sorted(
-            constraint.value for constraint in profile.required_constraints
-        ),
-        "canonical": profile.canonical,
+        "name": role.role_name,
+        "body": role.prompt,
+        "write": role.write,
+        "read_roots": [str(path) for path in role.read_roots],
+        "network": role.network,
     }
 
 
@@ -144,8 +130,9 @@ def build_config_snapshot(
     materialize_revision: str,
     snapshot_index_sha256: str,
     config: RuntimeConfig,
-    profile: AgentProfile | ResolvedRolePlan,
+    profile: ResolvedRolePlan,
     runtime_version: str | None = None,
+    legacy_profile_shape: bool = False,
 ) -> ConfigSnapshot:
     """Build canonical effective configuration evidence for one attempt.
 
@@ -167,12 +154,8 @@ def build_config_snapshot(
         raise ValidationError("snapshot materialize_revision must be nonblank")
     if not _valid_sha256(snapshot_index_sha256):
         raise ValidationError("snapshot index sha256 must be 64 hexadecimal characters")
-    if not isinstance(config, RuntimeConfig) or not isinstance(
-        profile, (AgentProfile, ResolvedRolePlan)
-    ):
-        raise ValidationError(
-            "snapshot requires RuntimeConfig and a profile or resolved role"
-        )
+    if not isinstance(config, RuntimeConfig) or not isinstance(profile, ResolvedRolePlan):
+        raise ValidationError("snapshot requires RuntimeConfig and ResolvedRolePlan")
     if runtime_version is not None and (
         not isinstance(runtime_version, str) or not runtime_version.strip()
     ):
@@ -193,7 +176,7 @@ def build_config_snapshot(
                 "runtime_config": runtime_document,
                 "materialize_revision": materialize_revision,
                 "snapshot_index_sha256": snapshot_index_sha256,
-                "profile": _profile_document(profile),
+                "profile": _role_document(profile, legacy_profile_shape),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -209,6 +192,7 @@ def build_config_snapshot(
         materialize_revision,
         runtime_version,
         "credential_state_home" in runtime_document,
+        not legacy_profile_shape,
     )
 
 
@@ -263,6 +247,7 @@ def inspect_config_snapshot(candidate_dir: Path, expected_sha256: str) -> Config
         raise ValidationError("config snapshot index sha256 is invalid")
     materialize_revision = document["materialize_revision"]
     runtime_version = document["runtime_version"]
+    profile_document = document["profile"]
     if not isinstance(materialize_revision, str) or not materialize_revision.strip():
         raise ValidationError("config snapshot materialize revision is invalid")
     if runtime_version is not None and (
@@ -276,4 +261,7 @@ def inspect_config_snapshot(candidate_dir: Path, expected_sha256: str) -> Config
         materialize_revision,
         runtime_version,
         "credential_state_home" in runtime_document,
+        isinstance(profile_document, dict)
+        and "config_revision" in profile_document
+        and "role_name" in profile_document,
     )

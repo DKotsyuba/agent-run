@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
@@ -21,7 +22,8 @@ from agent_run.config import (
 )
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
-from agent_run.profiles import AgentProfile
+from agent_run.profiles import AgentProfile, normalize_read_roots
+from role_helpers import resolved_role
 
 
 class ClaudeAdapterTests(unittest.TestCase):
@@ -79,7 +81,21 @@ class ClaudeAdapterTests(unittest.TestCase):
         return StartRequest(**values)
 
     def prepare(self, *args, mcp_servers: dict = {}, **kwargs):
-        return self.adapter.prepare(*args, mcp_servers=mcp_servers, **kwargs)
+        request, profile, config, home, agent_dir = args
+        request = replace(
+            request,
+            read_roots=normalize_read_roots(
+                (*profile.read_roots, *request.read_roots)
+            ),
+        )
+        return self.adapter.prepare(
+            request,
+            resolved_role(request, profile, config, mcp_servers),
+            config,
+            home,
+            agent_dir,
+            **kwargs,
+        )
 
     def materialize(self, *args, mcp_servers: dict = {}, **kwargs):
         skills_root = kwargs.pop(
@@ -315,11 +331,13 @@ class ClaudeAdapterTests(unittest.TestCase):
 
     # -- mcp_servers is required --------------------------------------------
 
-    def test_materialize_and_prepare_require_the_mcp_servers_keyword(self) -> None:
+    def test_materialize_requires_mcp_mapping_and_prepare_requires_role(self) -> None:
+        """Keep asset resolution explicit and reject an unresolved profile object."""
+
         config = self.runtime_config()
         with self.assertRaises(TypeError):
             self.adapter.materialize(config, self.home)
-        with self.assertRaises(TypeError):
+        with self.assertRaisesRegex(ValidationError, "ResolvedRolePlan"):
             self.adapter.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
 
     # -- materialize ---------------------------------------------------------
@@ -623,7 +641,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.home,
                 self.agent_dir,
             )
-            with self.assertRaisesRegex(ValidationError, "does not allow requested write"):
+            with self.assertRaisesRegex(ValidationError, "grants do not match"):
                 self.prepare(
                     self.request(write=True),
                     self.profile(write=False),
@@ -840,6 +858,29 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(config_dir))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", plan.environment)
         self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_labelled_state_drops_ambient_global_credentials(self) -> None:
+        """Keep global Claude tokens out of an explicitly scoped account plan."""
+
+        state_home = self.root / "labelled-home"
+        config = self.runtime_config(auth=None, credential_state_home=state_home)
+        with patch.dict(
+            os.environ,
+            {
+                "CLAUDE_CODE_OAUTH_TOKEN": "global-oauth",
+                "ANTHROPIC_API_KEY": "global-api-key",
+            },
+            clear=False,
+        ):
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir
+            )
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", plan.environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", plan.environment)
+        self.assertEqual(
+            plan.environment["CLAUDE_CONFIG_DIR"],
+            str(state_home / "claude-config"),
+        )
 
     def test_prepare_reasserts_scoped_state_after_a_developer_preset(self) -> None:
         """A preset cannot redirect the Claude credential store it inherits."""

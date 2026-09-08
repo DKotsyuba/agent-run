@@ -22,7 +22,8 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
-from ...profiles import AgentProfile, normalize_read_roots
+from ...profiles import normalize_read_roots
+from ...role_plan import ResolvedRolePlan
 from ..base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -45,7 +46,7 @@ from .environment import (
     auth_bridge,
     bridge_points_at_source,
     build_environment,
-    developer_approval_fields,
+    approval_fields,
     prepared_environment,
     require_resolved_mcp,
     resolved_directory,
@@ -540,19 +541,17 @@ class CodexAdapter:
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build an isolated Codex launch plan for an authorized request.
 
-        Validates ``request`` against ``profile`` and ``config``. Network
-        profiles receive app-server's tagged sandbox request form; other
-        profiles retain the legacy string sandbox mode. Workspace-write
+        Validates request grants and runtime assets against ``role``. Network
+        roles receive app-server's tagged sandbox request form. Workspace-write
         threads cannot grant external read roots in the pinned app-server
         contract. ``gpt-6-astra`` is limited to read-only architecture and
         review roles. Raises ``ValidationError`` when an authorization or
@@ -560,10 +559,15 @@ class CodexAdapter:
         """
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
-        if not isinstance(profile, AgentProfile):
-            raise ValidationError("prepare requires an AgentProfile")
+        if not isinstance(role, ResolvedRolePlan):
+            raise ValidationError("prepare requires a ResolvedRolePlan")
         self.validate(config)
-        require_resolved_mcp(config, mcp_servers, "prepare")
+        if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
+            server.id for server in role.mcp
+        ):
+            raise ValidationError("codex runtime assets do not match the resolved role")
+        if request.write != role.write or request.read_roots != role.read_roots:
+            raise ValidationError("codex request grants do not match the resolved role")
         if request.runtime != "codex":
             raise ValidationError(f"codex adapter cannot prepare runtime {request.runtime!r}")
         if request.model not in config.models:
@@ -571,9 +575,9 @@ class CodexAdapter:
         if request.output_schema is not None:
             raise ValidationError("codex runtime does not support output_schema")
         if request.model == "gpt-6-astra":
-            if profile.name not in ("role-architect", "role-review"):
-                raise ValidationError("gpt-6-astra is limited to role-architect and role-review")
-            if request.write:
+            if role.role_name not in ("architect", "review"):
+                raise ValidationError("gpt-6-astra is limited to architect and review roles")
+            if role.write:
                 raise ValidationError("gpt-6-astra does not permit write-capable launches")
 
         discovered = {info.id: info for info in self.models(config, home)}
@@ -586,13 +590,7 @@ class CodexAdapter:
             raise ValidationError(
                 f"effort {request.effort!r} is not offered for model {request.model!r}"
             )
-        if request.write and not profile.write:
-            raise ValidationError("profile does not grant write access for this request")
-        effective_write = bool(request.write and profile.write)
-        if not profile.write and not profile.read_roots and not request.read_roots:
-            raise ValidationError(
-                "codex refuses a no-filesystem profile: grant write or at least one read root"
-            )
+        effective_write = role.write
         home_path = Path(home)
         if not (home_path / _CONFIG_REL).is_file():
             raise ValidationError(f"codex home is not materialized: {home_path}")
@@ -601,7 +599,7 @@ class CodexAdapter:
         roots = tuple(
             str(root)
             for root in normalize_read_roots(
-                (workdir, *profile.read_roots, *request.read_roots)
+                (workdir, *role.read_roots)
             )
         )
         # The writable grant never widens beyond the workdir, even when a read
@@ -621,12 +619,18 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
+        denied_commands = (
+            config.environment.denied_commands if config.environment is not None else ()
+        )
         environment = prepared_environment(
             config.binary,
             home_path,
-            config,
-            workdir,
-            mcp_servers=mcp_servers,
+            mcp_environment_names=tuple(
+                dict.fromkeys(
+                    env_name for server in role.mcp for env_name in server.env_from
+                )
+            ),
+            denied_commands=denied_commands,
             refresh=resume_session_id is None,
         )
         if config.plugins and not effective_write:
@@ -641,15 +645,15 @@ class CodexAdapter:
             "model": request.model,
             "effort": request.effort,
             "sandbox_mode": sandbox_mode,
-            **developer_approval_fields(config, effective_write),
+            **approval_fields(effective_write),
             "roots": roots,
             "writable_roots": writable_roots,
-            "mcp": tuple(config.mcp),
-            "skills": tuple(config.skills),
-            "profile": profile.name,
+            "mcp": tuple(server.id for server in role.mcp),
+            "skills": tuple(skill.id for skill in role.skills),
+            "profile": role.role_name,
             "request_timeout_seconds": request.timeout_seconds,
         }
-        if profile.network:
+        if role.network:
             # The app-server's read-only sandbox is a unit variant: it takes
             # no parameters, so network access cannot be granted without also
             # granting workspace writes. Refuse rather than widen the sandbox
@@ -668,12 +672,8 @@ class CodexAdapter:
             argv=tuple(argv),
             cwd=workdir,
             environment=MappingProxyType(environment),
-            # The profile preamble reaches this engine only here: codex
-            # app-server takes no system-prompt argument, and the generated
-            # home carries no instructions file. Without this the child ran
-            # the task with the profile's permissions but none of its wording
-            # -- including the role assignment a ``role-*`` contract requires.
-            initial_input=f"{profile.body}\n\n{request.task}",
+            # app-server has no system-prompt argument, so prepend the role.
+            initial_input=f"{role.prompt}\n\n{request.task}",
             runtime_stream_path=Path(agent_dir) / "runtime.jsonl",
             adapter_state=MappingProxyType(adapter_state),
             answer_path=Path(agent_dir) / "answer.md",

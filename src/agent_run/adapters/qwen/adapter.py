@@ -36,7 +36,7 @@ from agent_run.adapters.version import observe_binary_version
 from agent_run.config import McpConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
-from agent_run.profiles import AgentProfile
+from agent_run.role_plan import ResolvedRolePlan
 
 __all__ = ["ADAPTER", "QwenAdapter"]
 
@@ -199,14 +199,7 @@ class QwenAdapter:
         return RuntimeInfo("qwen", ADAPTER_API_VERSION, _CAPABILITIES)
 
     def validate(self, config: RuntimeConfig) -> None:
-        """Validate Qwen's environment-auth and one-shot-only configuration.
-
-        ``config`` must use supported environment auth.
-        A declared ``rust`` table -- legacy ``runtimes.qwen.rust`` or the
-        ``rust`` of a selected ``environment`` preset -- is supported and is
-        provisioned by the shared developer-environment provider, so it is no
-        longer rejected here.
-        """
+        """Validate Qwen's optional environment-auth declaration."""
         if config.auth is not None and config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
         unknown = sorted(
@@ -347,33 +340,40 @@ class QwenAdapter:
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build a sandboxed one-shot invocation and isolated environment."""
         if request.fast:
             raise ValidationError("qwen runtime does not support fast mode")
-        if profile.network:
+        if not isinstance(role, ResolvedRolePlan):
+            raise ValidationError("prepare requires a ResolvedRolePlan")
+        if role.network:
             raise ValidationError("qwen runtime does not support network profiles")
         if request.model not in config.models:
             raise ValidationError(f"model is not in the configured roster: {request.model}")
-        if request.write and not profile.write:
-            raise ValidationError("qwen profile does not allow requested write access")
-        allow_write = request.write and profile.write
+        if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
+            server.id for server in role.mcp
+        ):
+            raise ValidationError("qwen runtime assets do not match the resolved role")
+        if request.write != role.write or request.read_roots != role.read_roots:
+            raise ValidationError("qwen request grants do not match the resolved role")
+        allow_write = role.write
         # yolo auto-approves the shell tool that auto-edit leaves dead in a
         # one-shot run; the seatbelt sandbox and the worktree stay the fence.
         # Probed live on qwen-code 0.22.2 (2026-08-29): plan/auto-edit deny
         # run_shell_command, yolo executes it inside the sandbox.
         approval_mode = "yolo" if allow_write else "plan"
-        role_text = profile.body
+        role_text = role.prompt
         if request.output_schema is not None:
             role_text += "\n\nRespond only with JSON matching: " + json.dumps(request.output_schema, sort_keys=True)
-        role_text += skills_context_note(Path(home), config.skills)
+        role_text += skills_context_note(
+            Path(home), tuple(skill.id for skill in role.skills)
+        )
         if resume_session_id is None:
             write_managed_file(Path(home), "agent-run-context.md", role_text + "\n")
         elif not (Path(home) / ".qwen/settings.json").is_file():
@@ -384,8 +384,8 @@ class QwenAdapter:
                     *(config.auth.names if config.auth is not None else ()),
                     *(
                         env_name
-                        for name in config.mcp
-                        for env_name in mcp_servers[name].env_from
+                        for server in role.mcp
+                        for env_name in server.env_from
                     ),
                 )
             )
@@ -396,6 +396,15 @@ class QwenAdapter:
         )
         materialize_revision = None
         if resume_session_id is None:
+            mcp_servers = {
+                server.id: McpConfig(
+                    server.transport,
+                    Path(server.command),
+                    server.args,
+                    server.env_from,
+                )
+                for server in role.mcp
+            }
             materialize_revision = self.materialize(
                 config,
                 Path(home),
@@ -428,14 +437,13 @@ class QwenAdapter:
                 raise ValidationError(f"qwen requires environment variable {name}, which is not set")
             environment[name] = value
             secret_names.append(name)
-        for name in config.mcp:
-            server = mcp_servers.get(name)
-            if server is None:
-                raise ValidationError(f"no resolved MCP definition for runtimes.qwen.mcp entry: {name}")
+        for server in role.mcp:
             for env_name in server.env_from:
                 value = os.environ.get(env_name)
                 if not value:
-                    raise ValidationError(f"qwen MCP {name!r} requires environment variable {env_name}")
+                    raise ValidationError(
+                        f"qwen MCP {server.id!r} requires environment variable {env_name}"
+                    )
                 environment[env_name] = value
                 secret_names.append(env_name)
 
