@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import sqlite3
 import tempfile
 import time
@@ -483,6 +484,38 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(ADAPTER.prepare_homes[-1], root_home)
         self.assertEqual(
             self.store.get_agent(third.agent_id)["config_revision"], revision
+        )
+
+    def test_pre_credential_state_snapshot_remains_resumable(self) -> None:
+        """A v1 parent without the later credential-state key still resumes.
+
+        The fixture rewrites a valid current snapshot to its exact
+        pre-credential-state shape and updates its durable digest, modelling a
+        parent persisted before this field was introduced.
+        """
+
+        parent = self._parent(session="sess-1")
+        snapshot_path = self.root / "agents" / parent / "config-snapshot.json"
+        document = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        document["runtime_config"].pop("credential_state_home")
+        runtime_bytes = json.dumps(
+            document["runtime_config"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        document["runtime_config_sha256"] = hashlib.sha256(runtime_bytes).hexdigest()
+        raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        digest = hashlib.sha256(raw).hexdigest()
+        snapshot_path.write_bytes(raw)
+        self.store.connection.execute(
+            "UPDATE agents SET config_revision = ? WHERE id = ?",
+            (f"snapshot:v1:{digest}", parent),
+        )
+        self.store.connection.commit()
+
+        child = self.service.resume(parent, "continue")
+        self.assertEqual(self._wait(2).resume_session_id, "sess-1")
+        self.assertEqual(
+            self.store.get_agent(child.agent_id)["config_revision"],
+            f"snapshot:v1:{digest}",
         )
 
     def test_resume_inherits_explicit_policy_requirements(self) -> None:

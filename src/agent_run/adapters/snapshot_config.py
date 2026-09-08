@@ -19,13 +19,24 @@ CONFIG_SNAPSHOT_FILENAME = "config-snapshot.json"
 
 @dataclass(frozen=True, slots=True)
 class ConfigSnapshot:
-    """Configuration bytes, their SHA-256, and the bound runtime-index hash."""
+    """Configuration evidence and whether it binds the credential-state path.
+
+    ``document`` (``bytes``) and ``sha256`` (``str``) are the canonical
+    persisted bytes and their digest. ``snapshot_index_sha256`` (``str``) binds
+    the materialized runtime index, ``materialize_revision`` (``str``) names
+    its revision, and ``runtime_version`` (``str | None``) is observed native
+    version evidence. ``credential_state_home_bound`` (``bool``) distinguishes
+    current snapshots from version-one snapshots written before that runtime
+    declaration existed, so resume can retain their exact compatibility
+    contract.
+    """
 
     document: bytes
     sha256: str
     snapshot_index_sha256: str
     materialize_revision: str
     runtime_version: str | None
+    credential_state_home_bound: bool
 
 def _environment_document(environment: EnvironmentConfig | None) -> object:
     """Return deterministic environment evidence without raw variable values."""
@@ -46,7 +57,14 @@ def _environment_document(environment: EnvironmentConfig | None) -> object:
 
 
 def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
-    """Return complete deterministic runtime declarations without credential bytes."""
+    """Return deterministic runtime declarations without credential bytes.
+
+    ``config`` (``RuntimeConfig``) supplies every runtime declaration. The
+    returned ``dict[str, object]`` contains only deterministic credential-free
+    values. An explicitly bound ``credential_state_home`` is recorded; its
+    absence preserves the canonical shape of version-one snapshots created
+    before that optional declaration existed.
+    """
 
     auth = None
     if config.auth is not None:
@@ -56,16 +74,11 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
             "target": config.auth.target,
             "names": list(config.auth.names),
         }
-    return {
+    document = {
         "enabled": config.enabled,
         "adapter": config.adapter,
         "binary": str(config.binary),
         "home": str(config.home),
-        "credential_state_home": (
-            None
-            if config.credential_state_home is None
-            else str(config.credential_state_home)
-        ),
         "models": list(config.models),
         "skills": list(config.skills),
         "mcp": list(config.mcp),
@@ -88,6 +101,9 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
         else [str(config.rust.rustup_home), str(config.rust.cargo_bin)],
         "environment": _environment_document(config.environment),
     }
+    if config.credential_state_home is not None:
+        document["credential_state_home"] = str(config.credential_state_home)
+    return document
 
 
 def _profile_document(profile: AgentProfile) -> dict[str, object]:
@@ -171,6 +187,7 @@ def build_config_snapshot(
         snapshot_index_sha256,
         materialize_revision,
         runtime_version,
+        "credential_state_home" in runtime_document,
     )
 
 
@@ -213,6 +230,8 @@ def inspect_config_snapshot(candidate_dir: Path, expected_sha256: str) -> Config
     if raw != canonical:
         raise ValidationError("config snapshot is not canonical")
     runtime_document = document["runtime_config"]
+    if not isinstance(runtime_document, dict):
+        raise ValidationError("config snapshot runtime declaration is invalid")
     runtime_bytes = json.dumps(
         runtime_document, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -235,4 +254,5 @@ def inspect_config_snapshot(candidate_dir: Path, expected_sha256: str) -> Config
         index_sha256,
         materialize_revision,
         runtime_version,
+        "credential_state_home" in runtime_document,
     )

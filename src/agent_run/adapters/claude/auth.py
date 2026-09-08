@@ -28,6 +28,7 @@ TOKEN_ENV_NAME = "CLAUDE_CODE_OAUTH_TOKEN"
 #: Explicit caller credentials remain authoritative. When none is declared
 #: and exported, Claude Code reads and refreshes only its scoped config state.
 AUTH_ENV_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+#: ``str`` leaf directory name beneath each durable Claude credential-state home.
 _CONFIG_DIR_NAME = "claude-config"
 
 
@@ -42,9 +43,10 @@ def claude_config_dir(config: RuntimeConfig) -> Path:
     ``0700``), persists refresh state between launches, and is never derived
     from ambient ``CLAUDE_CONFIG_DIR`` or ``HOME``.
 
-    :param config: Effective runtime configuration with an optional durable
-        credential-state home.
-    :returns: The existing private config directory for the real Claude child.
+    :param RuntimeConfig config: Effective runtime configuration with an
+        optional durable credential-state home.
+    :returns Path: The existing private config directory for the real Claude
+        child.
     :raises OSError: If the durable directory cannot be created or protected.
     """
 
@@ -63,9 +65,10 @@ def auth_environment(auth_names: tuple[str, ...]) -> dict[str, str]:
     CLI is responsible for reading, refreshing, or rejecting its own scoped
     credential state. Undeclared ambient values are never copied.
 
-    :param auth_names: Configured environment variable names allowed into the
-        child.
-    :returns: The nonempty explicitly exported subset of ``auth_names``.
+    :param tuple[str, ...] auth_names: Configured environment variable names
+        allowed into the child.
+    :returns dict[str, str]: The nonempty explicitly exported subset of
+        ``auth_names``.
     """
 
     return {name: value for name in auth_names if (value := os.environ.get(name))}
@@ -83,8 +86,10 @@ def claude_login_environment(config: RuntimeConfig) -> dict[str, str]:
     login and a later agent child share one account state without consulting a
     global Claude configuration.
 
-    :param config: Effective Claude runtime configuration for one account.
-    :returns: Private environment for ``claude auth login`` and status.
+    :param RuntimeConfig config: Effective Claude runtime configuration for one
+        account.
+    :returns dict[str, str]: Private environment for ``claude auth login`` and
+        status.
     :raises OSError: If the durable scoped config directory cannot be prepared.
     """
 

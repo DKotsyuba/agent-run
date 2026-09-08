@@ -861,10 +861,13 @@ def _claude_login(
     nonzero provider exits return explicit safe errors without copying or
     inspecting credentials.
 
-    :param runtime: Configured Claude runtime selected by the outer command.
-    :param label: Optional selected account label.
-    :param stderr: User-facing diagnostic stream for safe fixed failure text.
-    :returns: Success data or the Claude CLI's nonzero exit code.
+    :param RuntimeConfig runtime: Configured Claude runtime selected by the
+        outer command.
+    :param str | None label: Optional selected account label.
+    :param TextIO stderr: User-facing diagnostic stream for safe fixed failure
+        text.
+    :returns dict[str, object] | int: Success data or the Claude CLI's nonzero
+        exit code.
     """
 
     state_home = runtime.home if label is None else account_runtime_home(runtime.home, label)
@@ -896,10 +899,11 @@ def _login(home: Path, args: argparse.Namespace, stderr: TextIO) -> dict[str, ob
     syntax instead of silently choosing an account. Other engines retain the
     established ``agent-run auth <label> <runtime>`` interface.
 
-    :param home: Agent-run home containing the active configuration.
-    :param args: Parsed ``login`` command arguments.
-    :param stderr: User-facing diagnostic stream for safe CLI failures.
-    :returns: Login success data or a nonzero Claude CLI exit code.
+    :param Path home: Agent-run home containing the active configuration.
+    :param argparse.Namespace args: Parsed ``login`` command arguments.
+    :param TextIO stderr: User-facing diagnostic stream for safe CLI failures.
+    :returns dict[str, object] | int: Login success data or a nonzero Claude
+        CLI exit code.
     :raises ValidationError: For unavailable runtime, unsupported syntax, or an
         undeclared/missing Claude account selection.
     """

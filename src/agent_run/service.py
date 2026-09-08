@@ -730,6 +730,9 @@ class AgentService:
         shared-home compatibility path. A labelled Claude environment-auth
         runtime uses its account sibling as durable credential state without a
         file bridge; other labelled runtimes retain the file-link requirement.
+        A predecessor snapshot that predates the optional credential-state
+        declaration is compared using its original runtime-document shape,
+        while current snapshots bind that path.
         """
 
         failure_kind = "prepare_failed"
@@ -834,13 +837,20 @@ class AgentService:
                         f"temps={len(runtime_snapshot.owned_temps)} "
                         f"orphans={len(runtime_snapshot.orphans)}"
                     )
+                comparison_runtime = effective_runtime
+                if not stored_snapshot.credential_state_home_bound:
+                    # v1 snapshots created before credential_state_home must
+                    # retain their original declaration during resume checks.
+                    comparison_runtime = replace(
+                        effective_runtime, credential_state_home=None
+                    )
                 current_snapshot = build_config_snapshot(
                     runtime=request.runtime,
                     adapter_api_version=adapter.describe().adapter_api_version,
                     schema_version=self._config.schema_version,
                     materialize_revision=stored_snapshot.materialize_revision,
                     snapshot_index_sha256=stored_snapshot.snapshot_index_sha256,
-                    config=effective_runtime,
+                    config=comparison_runtime,
                     profile=profile,
                     runtime_version=stored_snapshot.runtime_version,
                 )
