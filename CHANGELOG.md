@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.10.0] - 2026-09-08
+
+- Stabilize core execution and recovery (#25)
+
 ## [0.9.0] - 2026-09-07
 
 - feat(codex): review developer write escalations
