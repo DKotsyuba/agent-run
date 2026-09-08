@@ -366,12 +366,23 @@ class _Adapter:
 
         raise AssertionError("service limits must use stored samples")
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+    def prepare(
+        self,
+        request,
+        profile,
+        config,
+        home,
+        agent_dir,
+        *,
+        mcp_servers,
+        resume_session_id=None,
+    ):
         """Build the minimal launch plan required to create a stored agent row."""
 
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task,
             agent_dir / "runtime.jsonl", {}, agent_dir / "answer.md",
+            resume_session_id,
         )
 
     def launch(self, plan, sink):

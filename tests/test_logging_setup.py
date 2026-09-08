@@ -53,10 +53,22 @@ class _FakeAdapter:
     def limits(self, config, home):
         return ()
 
-    def prepare(self, request, profile, config, home, agent_dir, *, mcp_servers):
+    def prepare(
+        self,
+        request,
+        profile,
+        config,
+        home,
+        agent_dir,
+        *,
+        mcp_servers,
+        resume_session_id=None,
+    ):
+        """Build a minimal plan carrying the optional native resume identity."""
+
         return LaunchPlan(
             ("fake",), request.workdir, {}, request.task, agent_dir / "runtime.jsonl", {},
-            agent_dir / "answer.md",
+            agent_dir / "answer.md", resume_session_id,
         )
 
     def launch(self, plan, sink):
