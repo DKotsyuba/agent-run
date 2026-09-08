@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import select
 import shutil
 import socket
 import sqlite3
@@ -93,6 +94,88 @@ def rpc(home: Path, method: str) -> object:
         return response["result"]
 
 
+def mcp_tools(runner: Runner, command: list[str], stderr: object) -> list[object]:
+    """Return MCP tools while keeping child stdin open until the reply arrives.
+
+    ``runner`` supplies the release deadline, ``command`` is the isolated
+    agent-run argv prefix, and ``stderr`` receives child diagnostics. The
+    handshake is capped at ten seconds and rejects EOF, oversized or malformed
+    frames, protocol errors, and empty inventories. The owned child is always
+    terminated and reaped before returning or raising.
+    """
+    process = subprocess.Popen(
+        command + ["mcp"], env=environment(), stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=stderr,
+    )
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise ReleaseError("Isolated MCP stdio is unavailable")
+        requests = (
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "release-smoke", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        process.stdin.write("".join(json.dumps(request) + "\n" for request in requests).encode())
+        process.stdin.flush()
+        deadline = min(runner.deadline, time.monotonic() + 10)
+        buffer = bytearray()
+        initialized = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(process.stdout.fileno(), 8192)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while b"\n" in buffer:
+                frame, _, tail = buffer.partition(b"\n")
+                buffer = bytearray(tail)
+                if len(frame) > 1024 * 1024:
+                    raise ReleaseError("Isolated MCP returned an oversized frame")
+                try:
+                    message = json.loads(frame)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ReleaseError("Isolated MCP returned malformed JSON") from error
+                if not isinstance(message, dict):
+                    raise ReleaseError("Isolated MCP returned malformed JSON")
+                if "error" in message:
+                    raise ReleaseError("Isolated MCP returned a protocol error")
+                if message.get("id") == 1:
+                    if not isinstance(message.get("result"), dict):
+                        raise ReleaseError("Isolated MCP initialization failed")
+                    initialized = True
+                elif message.get("id") == 2:
+                    result = message.get("result")
+                    tools = result.get("tools") if isinstance(result, dict) else None
+                    if not initialized or not isinstance(tools, list) or not tools:
+                        raise ReleaseError("Isolated MCP tools/list smoke failed")
+                    return tools
+            if len(buffer) > 1024 * 1024:
+                raise ReleaseError("Isolated MCP returned an oversized frame")
+        raise ReleaseError("Isolated MCP tools/list smoke failed")
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        if process.stdout is not None:
+            process.stdout.close()
+
+
 def smoke(runner: Runner, release: Path) -> None:
     """Test sealed Path release with isolated init/doctor/API/MCP; stop only owned API."""
     with tempfile.TemporaryDirectory(prefix="ar-smoke-", dir="/tmp") as directory:
@@ -112,14 +195,7 @@ def smoke(runner: Runner, release: Path) -> None:
                         break
                     except (OSError, ValueError):
                         runner.pause("isolated API readiness")
-                request = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-                    "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "release-smoke", "version": "1"}}}) + "\n"
-                    + json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
-                    + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + "\n")
-                output = runner.run(*command, "mcp", input=request, env=environment()).stdout
-                messages = [json.loads(line) for line in output.splitlines() if line.strip()]
-                if not any(m.get("id") == 2 and m.get("result", {}).get("tools") for m in messages):
-                    raise ReleaseError("Isolated MCP tools/list smoke failed")
+                mcp_tools(runner, command, log)
             finally:
                 process.terminate()
                 try:
