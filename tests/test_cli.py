@@ -1439,7 +1439,7 @@ class PackagingTests(unittest.TestCase):
     def test_console_script_and_schema_are_present_in_sdist(self):
         root = Path(__file__).resolve().parents[1]
         config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(config["project"]["scripts"]["agent-run"], "agent_run.cli:main")
+        self.assertEqual(config["project"]["scripts"], {"agent-run": "agent_run.cli:main"})
         self.assertIn("schema.sql", config["tool"]["setuptools"]["package-data"]["agent_run.state"])
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1468,6 +1468,7 @@ class PackagingTests(unittest.TestCase):
                 entry = next(name for name in names if name.endswith(".egg-info/entry_points.txt"))
                 metadata = bundle.extractfile(entry).read().decode("utf-8")
         self.assertIn("agent-run = agent_run.cli:main", metadata)
+        self.assertNotIn("agent-run-tui", metadata)
 
 
 if __name__ == "__main__":
