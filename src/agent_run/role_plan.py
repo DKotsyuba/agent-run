@@ -38,13 +38,15 @@ def _text(value: object, path: str, *, blank: bool = False) -> str:
     return value
 
 
-def _strings(value: object, path: str) -> tuple[str, ...]:
-    """Return a duplicate-free list of NUL-free JSON strings."""
+def _strings(
+    value: object, path: str, *, unique: bool = True
+) -> tuple[str, ...]:
+    """Return NUL-free JSON strings, rejecting duplicates when requested."""
 
     if not isinstance(value, list):
         raise ValidationError(f"{path} must be a list of strings")
     items = tuple(_text(item, f"{path}[]", blank=True) for item in value)
-    if len(set(items)) != len(items):
+    if unique and len(set(items)) != len(items):
         raise ValidationError(f"{path} must not contain duplicates")
     return items
 
@@ -165,12 +167,20 @@ class ResolvedRolePlan:
             server_id = _text(item["id"], f"resolved role mcp[{index}].id")
             transport = _text(item["transport"], f"resolved role mcp[{index}].transport")
             command = _text(item["command"], f"resolved role mcp[{index}].command")
-            args = _strings(item["args"], f"resolved role mcp[{index}].args")
+            args = _strings(
+                item["args"], f"resolved role mcp[{index}].args", unique=False
+            )
             env_from = _strings(item["env_from"], f"resolved role mcp[{index}].env_from")
+            try:
+                canonical_command = str(Path(command).expanduser().resolve())
+            except (OSError, RuntimeError) as error:
+                raise ValidationError(
+                    f"resolved role mcp[{index}].command is invalid"
+                ) from error
             if (
                 _CATALOG_ID.fullmatch(server_id) is None
                 or transport != "stdio"
-                or not Path(command).is_absolute()
+                or command != canonical_command
                 or any(_ENV_NAME.fullmatch(name) is None for name in env_from)
             ):
                 raise ValidationError(f"resolved role mcp[{index}] is invalid")

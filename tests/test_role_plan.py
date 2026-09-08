@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import copy
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -139,6 +140,42 @@ Review the assigned change.
         for malformed in cases:
             with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
                 ResolvedRolePlan.from_payload(malformed)
+
+    def test_from_payload_keeps_duplicate_args_and_rejects_command_drift(self) -> None:
+        """Preserve argv repetition while requiring a canonical absolute command."""
+
+        payload = json.loads(
+            (Path(__file__).parent / "fixtures" / "role_plan_7bbd43b.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        def reseal(document: dict[str, object]) -> None:
+            """Replace the derived revision after a fixture mutation."""
+
+            seed = {key: value for key, value in document.items() if key != "config_revision"}
+            raw = json.dumps(seed, sort_keys=True, separators=(",", ":")).encode()
+            document["config_revision"] = hashlib.sha256(raw).hexdigest()
+
+        command = str(Path("/bin/echo").resolve())
+        payload["mcp"] = [
+            {
+                "id": "tool",
+                "transport": "stdio",
+                "command": command,
+                "args": ["--flag", "--flag"],
+                "env_from": [],
+            }
+        ]
+        reseal(payload)
+        plan = ResolvedRolePlan.from_payload(payload)
+        self.assertEqual(plan.mcp[0].args, ("--flag", "--flag"))
+
+        drifted = copy.deepcopy(payload)
+        drifted["mcp"][0]["command"] = f"{Path(command).parent}/nested/../{Path(command).name}"
+        reseal(drifted)
+        with self.assertRaisesRegex(ValidationError, r"mcp\[0\].*invalid"):
+            ResolvedRolePlan.from_payload(drifted)
 
     def test_missing_skill_or_mcp_fails_closed(self) -> None:
         """Reject incomplete catalogs before any adapter sees the role."""

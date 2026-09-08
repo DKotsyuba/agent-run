@@ -29,6 +29,8 @@ class HostEnvironmentTests(unittest.TestCase):
             "KUBECONFIG": "/home/user/.kube/config",
             "AWS_PROFILE": "production",
             "NPM_CONFIG_USERCONFIG": "/home/user/.npmrc",
+            "KRB5CCNAME": "FILE:/tmp/krb5cc",
+            "GNUPGHOME": "/home/user/.gnupg",
             "SDKROOT": "/host/sdk",
             "CARGO_HOME": "/host/cargo",
             "ANDROID_HOME": "/host/android",
@@ -55,18 +57,19 @@ class HostEnvironmentTests(unittest.TestCase):
         self.assertEqual(environment["SELECTED_API_KEY"], "keep-me")
         self.assertNotIn("UNRELATED_TOKEN", environment)
         for carrier in (
-            "SSH_AUTH_SOCK", "KUBECONFIG", "AWS_PROFILE", "NPM_CONFIG_USERCONFIG"
+            "SSH_AUTH_SOCK", "KUBECONFIG", "AWS_PROFILE", "NPM_CONFIG_USERCONFIG",
+            "KRB5CCNAME", "GNUPGHOME",
         ):
             self.assertNotIn(carrier, environment)
 
     def test_selected_credential_carrier_is_forwarded(self) -> None:
         """Allow an otherwise filtered carrier only when the contract names it."""
 
-        with patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/selected.sock"}, clear=True):
+        with patch.dict(os.environ, {"KRB5CCNAME": "FILE:/tmp/selected"}, clear=True):
             environment = host_environment(
-                {}, allowed_secret_names=("SSH_AUTH_SOCK",)
+                {}, allowed_secret_names=("KRB5CCNAME",)
             )
-        self.assertEqual(environment["SSH_AUTH_SOCK"], "/tmp/selected.sock")
+        self.assertEqual(environment["KRB5CCNAME"], "FILE:/tmp/selected")
 
 
 if __name__ == "__main__":

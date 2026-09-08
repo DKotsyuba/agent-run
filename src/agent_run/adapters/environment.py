@@ -22,6 +22,8 @@ _CREDENTIAL_CARRIERS = frozenset(
         "GIT_ASKPASS",
         "GIT_CONFIG_GLOBAL",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "GNUPGHOME",
+        "KRB5CCNAME",
         "KUBECONFIG",
         "NETRC",
         "NPM_CONFIG_USERCONFIG",
