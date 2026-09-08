@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,7 @@ from agent_run.capacity.collect import (
     STATUS_UNSUPPORTED,
     collect_once,
 )
-from agent_run.config import CapacityConfig, Config, RuntimeConfig
+from agent_run.config import CapacityConfig, Config, RuntimeAuthConfig, RuntimeConfig
 from agent_run.state import StateStore
 
 
@@ -100,13 +101,16 @@ class CapacityCollectTests(unittest.TestCase):
             schema_version=1,
             runtimes={
                 "codex": _runtime_config(),
-                "claude": _runtime_config(limits_source="native"),
+                "claude": _runtime_config(
+                    limits_source="native",
+                    auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+                ),
                 "unsupported": _runtime_config(),
                 "disabled_rt": _runtime_config(enabled=False),
             },
         )
 
-        with mock.patch.object(sources, "keychain_token", return_value="token"), mock.patch.object(
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "token"}), mock.patch.object(
             sources.urllib.request, "urlopen", side_effect=RuntimeError("provider unreachable")
         ):
             report = collect_once(

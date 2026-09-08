@@ -239,15 +239,25 @@ class NativeClaudeMappingTests(unittest.TestCase):
         def read(self):
             return json.dumps(self._payload).encode()
 
-    def collect(self, payload=None, *, urlopen=None, runtime=None, keychain_token_value="access-token"):
+    def collect(self, payload=None, *, urlopen=None, runtime=None, token="access-token"):
+        """Collect a native fixture using an explicitly declared OAuth token."""
+
         payload = self._PAYLOAD if payload is None else payload
         opener = urlopen or (lambda request, timeout, **kwargs: self.Response(payload))
-        with mock.patch.object(sources, "keychain_token", return_value=keychain_token_value), mock.patch.object(
+        runtime = runtime if runtime is not None else _runtime_config(
+            limits_source="native",
+            auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"CLAUDE_CODE_OAUTH_TOKEN": token},
+            clear=False,
+        ), mock.patch.object(
             sources.urllib.request, "urlopen", side_effect=opener
         ), mock.patch.object(sources.time, "time", return_value=1788278400.0):
             return sources.collect_samples(
                 "claude",
-                runtime if runtime is not None else _runtime_config(limits_source="native"),
+                runtime,
                 CapacityConfig(),
                 None,
             )
@@ -291,11 +301,10 @@ class NativeClaudeMappingTests(unittest.TestCase):
     def test_missing_token_http_error_and_timeout_are_source_failures(self) -> None:
         # Missing token, HTTP failure, and timeout are failures, never
         # collected-empty evidence.
-        with mock.patch.object(sources, "keychain_token", return_value=None):
-            with self.assertRaises(CapacitySourceError) as raised:
-                sources.collect_samples(
-                    "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
-                )
+        with self.assertRaises(CapacitySourceError) as raised:
+            sources.collect_samples(
+                "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
+            )
         self.assertEqual(raised.exception.reason, "claude_token_missing")
 
         for error in (urllib.error.HTTPError("https://example.com", 401, "unauthorized", {}, None), TimeoutError()):
@@ -325,20 +334,22 @@ class NativeClaudeMappingTests(unittest.TestCase):
             def read(self):
                 return b"not-json"
 
-        with mock.patch.object(sources, "keychain_token", return_value="access-token"):
-            with mock.patch.object(
-                sources.urllib.request, "urlopen", return_value=RawResponse({})
-            ):
-                with self.assertRaises(CapacitySourceError) as raised:
-                    sources.collect_samples(
-                        "claude",
-                        _runtime_config(limits_source="native"),
-                        CapacityConfig(),
-                        None,
-                    )
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "access-token"}, clear=False), mock.patch.object(
+            sources.urllib.request, "urlopen", return_value=RawResponse({})
+        ):
+            with self.assertRaises(CapacitySourceError) as raised:
+                sources.collect_samples(
+                    "claude",
+                    _runtime_config(
+                        limits_source="native",
+                        auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+                    ),
+                    CapacityConfig(),
+                    None,
+                )
         self.assertEqual(raised.exception.reason, "claude_malformed_response")
 
-    def test_declared_oauth_env_takes_precedence_over_keychain(self) -> None:
+    def test_declared_oauth_env_is_used_without_reading_cli_state(self) -> None:
         captured = {}
 
         def opener(request, timeout, context=None):
@@ -353,12 +364,11 @@ class NativeClaudeMappingTests(unittest.TestCase):
             "CLAUDE_CODE_OAUTH_TOKEN": "env-oauth-value",
             "ANTHROPIC_API_KEY": "api-key-value",
         }
-        with mock.patch.dict(os.environ, environment), mock.patch.object(
-            sources, "keychain_token", return_value="keychain-value"
-        ) as keychain:
-            self.assertEqual(self.collect(urlopen=opener, runtime=runtime), ())
+        with mock.patch.dict(os.environ, environment):
+            self.assertEqual(
+                self.collect(urlopen=opener, runtime=runtime, token="env-oauth-value"), ()
+            )
         self.assertEqual(captured["auth"], "Bearer env-oauth-value")
-        keychain.assert_not_called()
 
     def test_undeclared_or_api_key_env_never_becomes_the_oauth_token(self) -> None:
         captured = {}
@@ -374,8 +384,11 @@ class NativeClaudeMappingTests(unittest.TestCase):
         # No auth declaration: an exported variable must not silently widen
         # the auth bridge, and an API key is never an OAuth token.
         with mock.patch.dict(os.environ, environment):
-            self.assertEqual(self.collect(urlopen=opener, keychain_token_value="keychain-value"), ())
-        self.assertEqual(captured["auth"], "Bearer keychain-value")
+            with self.assertRaisesRegex(CapacitySourceError, "^claude_token_missing$"):
+                sources.collect_samples(
+                    "claude", _runtime_config(limits_source="native"), CapacityConfig(), None
+                )
+        self.assertEqual(captured, {})
 
 
 class CodexbarMappingTests(unittest.TestCase):

@@ -28,9 +28,9 @@ from typing import Callable, Mapping
 from ..accounts import account_auth_source, account_email
 from ..adapters import omniroute
 from ..adapters.base import Capability, LimitSample, RuntimeAdapter
-from ..adapters.claude.auth import TOKEN_ENV_NAME, keychain_token, refresh_keychain
+from ..adapters.claude.auth import TOKEN_ENV_NAME
 from ..config import CapacityConfig, RuntimeConfig
-from ..errors import AuthError, CapacitySourceError
+from ..errors import CapacitySourceError
 from .topology import (
     CapacityCollectionSlice,
     CapacityRouteDescriptor,
@@ -300,13 +300,12 @@ def _claude_oauth_token(runtime_config: RuntimeConfig, now: float) -> str | None
     An explicitly exported ``CLAUDE_CODE_OAUTH_TOKEN`` wins, but only when
     the runtime's auth configuration declares that variable: honouring an
     undeclared export would silently widen the configured auth bridge.
-    ``ANTHROPIC_API_KEY`` is an API key and is never used as an OAuth
-    token. Otherwise a usable Keychain token is returned directly. A missing
-    or expired entry triggers the adapter-owned, 60-second-bounded Keychain
-    refresh once, then this function rereads the Keychain. Refresh failures
-    and still-unusable entries return ``None`` without exposing credential or
-    child-process details. The caller maps that result to its fixed safe
-    capacity-source outcome.
+    ``ANTHROPIC_API_KEY`` is an API key and is never used as an OAuth token.
+    Agent-run deliberately cannot inspect Claude Code's scoped credential
+    state without reintroducing a global-account fallback, so an absent
+    explicit OAuth variable returns ``None``. The caller maps that result to
+    its fixed safe capacity-source outcome; CLI-backed capacity sources remain
+    available for scoped Claude credentials.
     """
 
     auth = runtime_config.auth
@@ -314,14 +313,8 @@ def _claude_oauth_token(runtime_config: RuntimeConfig, now: float) -> str | None
         exported = os.environ.get(TOKEN_ENV_NAME)
         if exported:
             return exported
-    token = keychain_token(now)
-    if token is not None:
-        return token
-    try:
-        refresh_keychain(runtime_config.binary)
-    except AuthError:
-        return None
-    return keychain_token(now)
+    del now
+    return None
 
 
 def _claude_native_samples(

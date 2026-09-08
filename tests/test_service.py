@@ -321,6 +321,10 @@ class AgentServiceTests(unittest.TestCase):
         attempt_home = self.root / "agents" / str(agent["id"]) / "runtime-home"
         self.assertEqual(ADAPTER.materialize_homes[-1], attempt_home)
         self.assertEqual(ADAPTER.materialize_configs[-1].auth.source, auth_source)
+        self.assertEqual(
+            ADAPTER.materialize_configs[-1].credential_state_home,
+            account_runtime_home(runtime.home, "personal2"),
+        )
         self.assertTrue(attempt_home.is_dir())
         self.assertTrue(str(agent["config_revision"]).startswith("snapshot:v1:"))
         self.assertTrue(

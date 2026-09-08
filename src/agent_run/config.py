@@ -134,6 +134,9 @@ class RuntimeConfig:
     and quota-lane mappings optionally override it for opaque descriptors.
     ``plugin_snapshot_assets`` maps a uniquely configured plugin basename to
     explicit relative non-secret assets that a runtime may snapshot.
+    ``credential_state_home`` is an internal, service-resolved durable home
+    for a runtime-owned credential store; it is never parsed from config and
+    remains ``None`` outside a prepared launch.
     """
 
     enabled: bool
@@ -156,6 +159,7 @@ class RuntimeConfig:
     rust: RustConfig | None = None
     environment: EnvironmentConfig | None = None
     plugin_snapshot_assets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    credential_state_home: Path | None = None
 
 
 @dataclass(frozen=True)

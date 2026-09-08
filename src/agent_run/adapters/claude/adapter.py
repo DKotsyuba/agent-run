@@ -41,7 +41,7 @@ from ..version import observe_binary_version
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
 from ..rust import RUST_ENVIRONMENT_NAMES
 from ..snapshots import finalize_runtime_snapshots
-from .auth import TOKEN_ENV_NAME, auth_environment, keychain_token
+from .auth import auth_environment, claude_config_dir
 from .constants import (
     ALWAYS_DISALLOWED as _ALWAYS_DISALLOWED, AUTH_NAMES as _AUTH_NAMES,
     CAPABILITIES as _CAPABILITIES, KNOWN_HOOK_EVENTS as _KNOWN_HOOK_EVENTS,
@@ -151,12 +151,10 @@ class ClaudeAdapter:
         available = config.binary.exists() and os.access(config.binary, os.X_OK)
         authenticated: bool | None = None
         if config.auth is not None and config.auth.kind == "environment":
-            authenticated = any(name in os.environ for name in config.auth.names)
-            if not authenticated and TOKEN_ENV_NAME in config.auth.names:
-                # ``prepare`` can source this launch from the Keychain, so
-                # reporting "unauthenticated" on a bare environment would be
-                # a false alarm. Read only -- probe never refreshes.
-                authenticated = keychain_token(time.time()) is not None
+            # Scoped Claude Code state is opaque to agent-run. A bare
+            # environment is therefore unknown, not permission to inspect or
+            # borrow an ambient/global credential.
+            authenticated = any(name in os.environ for name in config.auth.names) or None
         version, version_reason = observe_binary_version(config.binary, Path(home))
         reason = version_reason if available else f"claude binary not executable: {config.binary}"
         return RuntimeHealth(available, version, authenticated, reason)
@@ -179,8 +177,15 @@ class ClaudeAdapter:
         return agent_rate_limit_samples(Path(home), time.time())
 
     def _auth_environment(self, binary: Path, names: tuple[str, ...]) -> Mapping[str, str]:
-        """Resolve the auth env for a child; subclasses may supply their own."""
-        return auth_environment(binary, names)
+        """Resolve declared explicit auth values; subclasses may supply their own.
+
+        ``binary`` is retained for Claude-family override compatibility and is
+        not invoked. ``names`` is the configured environment allow-list. An
+        empty result intentionally leaves OAuth handling to the child CLI's
+        scoped config directory rather than inspecting host credential storage.
+        """
+        del binary
+        return auth_environment(names)
 
     def prepare(
         self,
@@ -287,7 +292,11 @@ class ClaudeAdapter:
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
-        environment: dict[str, str] = {"HOME": str(home), **managed_uv_python_environment()}
+        environment: dict[str, str] = {
+            "HOME": str(home),
+            "CLAUDE_CONFIG_DIR": str(claude_config_dir(config)),
+            **managed_uv_python_environment(),
+        }
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value

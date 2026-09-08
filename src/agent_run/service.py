@@ -774,6 +774,7 @@ class AgentService:
                 home=effective_home,
                 auth=effective_auth,
                 default_account=account_label,
+                credential_state_home=configured_home,
             )
             if self._cancel_accepted_start(store, cancelled, agent_id):
                 return

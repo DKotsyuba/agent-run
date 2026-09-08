@@ -61,6 +61,11 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
         "adapter": config.adapter,
         "binary": str(config.binary),
         "home": str(config.home),
+        "credential_state_home": (
+            None
+            if config.credential_state_home is None
+            else str(config.credential_state_home)
+        ),
         "models": list(config.models),
         "skills": list(config.skills),
         "mcp": list(config.mcp),

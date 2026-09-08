@@ -1,153 +1,65 @@
-"""OAuth credential acquisition for the ``claude`` runtime.
+"""Credential environment and durable Claude Code state paths.
 
-An explicitly exported auth variable always wins. Otherwise the adapter
-reads the macOS Keychain entry the Claude Code CLI maintains for itself,
-and when that entry is missing or expired it runs the bare CLI exactly
-once with every auth variable stripped from the child's environment --
-which is what makes the CLI refresh the Keychain instead of trusting an
-inherited value. At most one refresh per launch: a stale credential is a
-hard launch failure, never a retry loop.
-
-No function here returns, raises, or logs anything derived from a token
-value; the token is handed straight to the caller's environment mapping,
-whose name is already registered as a secret for stream sanitization.
+Claude Code is the sole owner of its OAuth credential and refresh lifecycle.
+This module deliberately never reads a global Keychain item, extracts an
+access token, or invokes a refresh probe. Each launch receives a private,
+account-scoped ``CLAUDE_CONFIG_DIR`` below the service-selected durable runtime
+home, so the real CLI can refresh its own state without falling back to a
+global Claude account.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
-import time
 from pathlib import Path
 
-from ...errors import AuthError, ValidationError
+from ...config import RuntimeConfig
 
-__all__ = ["TOKEN_ENV_NAME", "auth_environment", "keychain_token", "refresh_keychain", "resolve_token"]
+__all__ = ["AUTH_ENV_NAMES", "TOKEN_ENV_NAME", "auth_environment", "claude_config_dir"]
 
 TOKEN_ENV_NAME = "CLAUDE_CODE_OAUTH_TOKEN"
 
-#: Auth variables that must not reach the refresh child: with any one of
-#: them set the CLI uses it verbatim and never touches the Keychain.
+#: Explicit caller credentials remain authoritative. When none is declared
+#: and exported, Claude Code reads and refreshes only its scoped config state.
 AUTH_ENV_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-
-_SECURITY_BIN = "/usr/bin/security"
-_KEYCHAIN_SERVICE = "Claude Code-credentials"
-_READ_TIMEOUT_SECONDS = 15.0
-_REFRESH_TIMEOUT_SECONDS = 60.0
-# Treat a token that expires within the margin as already stale: one that
-# dies mid-run is no more useful than one that died before it.
-_EXPIRY_MARGIN_SECONDS = 300.0
+_CONFIG_DIR_NAME = "claude-config"
 
 
-def keychain_token(now: float) -> str | None:
-    """Return a live access token from the Keychain, or ``None``.
+def claude_config_dir(config: RuntimeConfig) -> Path:
+    """Create and return Claude Code's durable, account-scoped config directory.
 
-    Every failure mode -- no entry, a locked keychain, malformed JSON, a
-    past ``expiresAt`` -- collapses to ``None``, meaning "no usable
-    token"; the caller decides whether to refresh. ``stderr`` is captured
-    rather than inherited so a Keychain diagnostic cannot land in a log.
+    ``config.credential_state_home`` is set by :class:`AgentService` before it
+    swaps the materialized runtime home for a per-agent snapshot; it therefore
+    identifies either the configured base runtime home or its selected account
+    sibling. Direct adapter callers that do not go through the service use
+    ``config.home``. The returned ``claude-config`` directory is private (mode
+    ``0700``), persists refresh state between launches, and is never derived
+    from ambient ``CLAUDE_CONFIG_DIR`` or ``HOME``.
+
+    :param config: Effective runtime configuration with an optional durable
+        credential-state home.
+    :returns: The existing private config directory for the real Claude child.
+    :raises OSError: If the durable directory cannot be created or protected.
     """
 
-    try:
-        completed = subprocess.run(
-            [_SECURITY_BIN, "find-generic-password", "-s", _KEYCHAIN_SERVICE, "-w"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=_READ_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    try:
-        payload = json.loads(completed.stdout)
-    except (TypeError, ValueError):
-        return None
-    oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
-    if not isinstance(oauth, dict):
-        return None
-    token = oauth.get("accessToken")
-    if not isinstance(token, str) or not token.strip():
-        return None
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
-        # The CLI stores milliseconds since the epoch.
-        if expires_at / 1000.0 - _EXPIRY_MARGIN_SECONDS <= now:
-            return None
-    return token
+    directory = (config.credential_state_home or config.home) / _CONFIG_DIR_NAME
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    return directory
 
 
-def refresh_keychain(binary: Path) -> None:
-    """Run the bare CLI once so it refreshes the Keychain entry itself.
+def auth_environment(auth_names: tuple[str, ...]) -> dict[str, str]:
+    """Return only explicitly declared and exported Claude auth variables.
 
-    Bounded by a hard timeout and never inspected for output: whether the
-    refresh worked is decided by re-reading the Keychain, not by trusting
-    the child's exit status.
+    ``auth_names`` is the configured allow-list. A nonempty ambient value for
+    one of those names is copied unchanged, preserving explicit API-key or
+    OAuth-token precedence. With no such value this returns ``{}``: the child
+    CLI is responsible for reading, refreshing, or rejecting its own scoped
+    credential state. Undeclared ambient values are never copied.
+
+    :param auth_names: Configured environment variable names allowed into the
+        child.
+    :returns: The nonempty explicitly exported subset of ``auth_names``.
     """
 
-    # ponytail: no cross-process lock, so N launches racing on the same
-    # stale token each spend one refresh. Bounded and idempotent -- add a
-    # lock under <home>/locks only if that ever shows up as real cost.
-    environment = {
-        name: value for name, value in os.environ.items() if name not in AUTH_ENV_NAMES
-    }
-    try:
-        subprocess.run(
-            [str(binary), "--print", "ping"],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=_REFRESH_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        # Only the exception class, never its message: a subprocess error
-        # can quote the child's own output back at us.
-        raise AuthError(
-            "claude runtime could not run the credential refresh: "
-            f"{type(error).__name__}"
-        ) from None
-
-
-def resolve_token(binary: Path, *, now: float | None = None) -> str:
-    """Return a live OAuth token, refreshing the Keychain at most once."""
-
-    at = time.time() if now is None else now
-    token = keychain_token(at)
-    if token is not None:
-        return token
-    refresh_keychain(binary)
-    token = keychain_token(time.time() if now is None else now)
-    if token is None:
-        raise AuthError(
-            "claude runtime has no usable credential: the macOS Keychain entry "
-            f"{_KEYCHAIN_SERVICE!r} is missing or expired and the bare-CLI "
-            "refresh did not renew it"
-        )
-    return token
-
-
-def auth_environment(binary: Path, auth_names: tuple[str, ...]) -> dict[str, str]:
-    """Resolve the child's auth variables for one launch.
-
-    An explicitly exported variable wins unchanged, so an API key or a
-    token supplied by the caller keeps behaving exactly as before. Only
-    when none is exported does the adapter fall back to the macOS
-    Keychain -- and only if the runtime actually declares the OAuth
-    variable, since exporting a credential under a name the owner did not
-    declare would silently widen the configured auth bridge.
-    """
-
-    inherited = {
-        name: value for name in auth_names if (value := os.environ.get(name))
-    }
-    if inherited:
-        return inherited
-    if TOKEN_ENV_NAME not in auth_names:
-        raise ValidationError(
-            "claude runtime auth requires one of the declared environment "
-            f"variables to be set: {', '.join(auth_names)}"
-        )
-    return {TOKEN_ENV_NAME: resolve_token(binary)}
+    return {name: value for name in auth_names if (value := os.environ.get(name))}

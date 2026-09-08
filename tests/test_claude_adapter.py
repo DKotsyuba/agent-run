@@ -11,11 +11,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import Capability, LimitSample
-from agent_run.adapters.claude import auth as claude_auth
 from agent_run.adapters.claude.adapter import ADAPTER, ADAPTER_API_VERSION, ClaudeAdapter
 from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
 from agent_run.domain import StartRequest
-from agent_run.errors import AuthError, ValidationError
+from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
 
 
@@ -425,9 +424,12 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.request(model="not-a-model"), self.profile(), self.runtime_config(), self.home, self.agent_dir
             )
 
-    def test_prepare_fails_closed_when_no_declared_auth_env_is_set(self) -> None:
-        with self.assertRaisesRegex(ValidationError, "auth requires one of"):
-            self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
+    def test_prepare_without_explicit_auth_leaves_the_scoped_cli_to_fail_closed(self) -> None:
+        """A bare launch never imports an ambient/global Claude credential."""
+
+        plan = self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
+        self.assertIn("CLAUDE_CONFIG_DIR", plan.environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", plan.environment)
 
     def test_prepare_resolves_only_the_fable_alias_in_the_child_argv(self) -> None:
         config = self.runtime_config(models=("sonnet", "fable", "opus"))
@@ -702,6 +704,7 @@ class ClaudeAdapterTests(unittest.TestCase):
             dict(plan.environment),
             {
                 "HOME": str(self.home),
+                "CLAUDE_CONFIG_DIR": str(self.home / "claude-config"),
                 "PATH": "/usr/bin",
                 "ANTHROPIC_API_KEY": "sk-test",
                 "UV_PYTHON_INSTALL_DIR": str(managed_python),
@@ -828,153 +831,39 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertNotIn("Skill", bare.argv[bare.argv.index("--tools") + 1].split(","))
         self.assertNotIn("Skill", bare.argv[bare.argv.index("--allowedTools") + 1].split(","))
 
-    # -- keychain-sourced OAuth (T050) --------------------------------------
+    # -- scoped Claude CLI credentials --------------------------------------
 
-    OAUTH_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+    def test_prepare_scopes_cli_state_without_injecting_an_oauth_token(self) -> None:
+        """A bare launch leaves refresh ownership to a durable private CLI home."""
 
-    def credential(self, token: str, *, expires_in_seconds: float) -> str:
-        """One Keychain payload shaped exactly like the CLI's own entry."""
-
-        return json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": token,
-                    "refreshToken": "sk-ant-ort-refresh",
-                    # The CLI stores milliseconds since the epoch.
-                    "expiresAt": int((time.time() + expires_in_seconds) * 1000),
-                    "scopes": ["user:inference"],
-                    "subscriptionType": "max",
-                }
-            }
-        )
-
-    def fake_keychain(self, *, initial: str | None) -> tuple[Path, Path, Path]:
-        """Install a fake ``security`` binary over a writable credential file.
-
-        Returns the credential file, the fake ``claude`` binary whose only
-        job is to rewrite that file the way a real refresh would, and the
-        file counting how many times the refresh actually ran.
-        """
-
-        cred = self.root / "credentials.json"
-        if initial is not None:
-            cred.write_text(initial, encoding="utf-8")
-        calls = self.root / "refresh-calls"
-        security = self.root / "fake-security"
-        # Absolute tool paths: the suite pins PATH to /usr/bin.
-        security.write_text(
-            f'#!/bin/sh\n[ -f "{cred}" ] || exit 44\nexec /bin/cat "{cred}"\n', encoding="utf-8"
-        )
-        security.chmod(0o755)
-        binary = self.root / "fake-claude"
-        binary.write_text(
-            "#!/bin/sh\n"
-            f'echo x >> "{calls}"\n'
-            f"/bin/cat > \"{cred}\" <<'JSON'\n"
-            f"{self.credential('sk-ant-oat-refreshed', expires_in_seconds=86400)}\n"
-            "JSON\n"
-            "echo pong.\n",
-            encoding="utf-8",
-        )
-        binary.chmod(0o755)
-        patcher = patch.object(claude_auth, "_SECURITY_BIN", str(security))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return cred, binary, calls
-
-    def refresh_count(self, calls: Path) -> int:
-        return len(calls.read_text(encoding="utf-8").splitlines()) if calls.exists() else 0
-
-    def test_prepare_reads_a_live_keychain_token_without_refreshing(self) -> None:
-        _, binary, calls = self.fake_keychain(
-            initial=self.credential("sk-ant-oat-live", expires_in_seconds=86400)
-        )
+        state_home = self.root / "configured-home"
         config = self.runtime_config(
-            binary=binary, auth=RuntimeAuthConfig("environment", names=self.OAUTH_NAMES)
+            auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",)),
+            credential_state_home=state_home,
         )
         plan = self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
-        self.assertEqual(plan.environment["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat-live")
-        self.assertEqual(self.refresh_count(calls), 0)
-        # The token is registered as a secret, so the stream sanitizer strips it.
-        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", plan.adapter_state["secret_env_names"])
-        self.assertNotIn("sk-ant-oat-live", " ".join(plan.argv))
-
-    def test_prepare_refreshes_a_stale_keychain_token_exactly_once(self) -> None:
-        cred, binary, calls = self.fake_keychain(
-            initial=self.credential("sk-ant-oat-stale", expires_in_seconds=-60)
-        )
-        config = self.runtime_config(
-            binary=binary, auth=RuntimeAuthConfig("environment", names=self.OAUTH_NAMES)
-        )
-        plan = self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
-        self.assertEqual(plan.environment["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat-refreshed")
-        self.assertEqual(self.refresh_count(calls), 1)
-        self.assertNotIn("sk-ant-oat-stale", cred.read_text(encoding="utf-8"))
-
-    def test_prepare_refreshes_once_when_the_keychain_entry_is_absent(self) -> None:
-        _, binary, calls = self.fake_keychain(initial=None)
-        config = self.runtime_config(
-            binary=binary, auth=RuntimeAuthConfig("environment", names=self.OAUTH_NAMES)
-        )
-        plan = self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
-        self.assertEqual(plan.environment["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat-refreshed")
-        self.assertEqual(self.refresh_count(calls), 1)
-
-    def test_prepare_fails_with_auth_error_when_one_refresh_does_not_renew(self) -> None:
-        _, binary, calls = self.fake_keychain(
-            initial=self.credential("sk-ant-oat-stale", expires_in_seconds=-60)
-        )
-        # A refresh that reports success but renews nothing: exactly one
-        # attempt, then a clear failure -- never a silent retry loop.
-        binary.write_text(f'#!/bin/sh\necho x >> "{calls}"\nexit 0\n', encoding="utf-8")
-        binary.chmod(0o755)
-        config = self.runtime_config(
-            binary=binary, auth=RuntimeAuthConfig("environment", names=self.OAUTH_NAMES)
-        )
-        with self.assertRaisesRegex(AuthError, "missing or expired"):
-            self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
-        self.assertEqual(self.refresh_count(calls), 1)
-
-    def test_prepare_prefers_an_explicit_env_var_over_the_keychain(self) -> None:
-        _, binary, calls = self.fake_keychain(
-            initial=self.credential("sk-ant-oat-live", expires_in_seconds=86400)
-        )
-        config = self.runtime_config(
-            binary=binary, auth=RuntimeAuthConfig("environment", names=self.OAUTH_NAMES)
-        )
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-explicit"}):
-            plan = self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
-        self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-explicit")
+        config_dir = state_home / "claude-config"
+        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(config_dir))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", plan.environment)
-        self.assertEqual(self.refresh_count(calls), 0)
+        self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
 
-    def test_keychain_refresh_child_never_inherits_an_auth_variable(self) -> None:
-        cred, _, _ = self.fake_keychain(initial=None)
-        dump = self.root / "refresh-env"
-        binary = self.root / "env-dump-claude"
-        binary.write_text(f'#!/bin/sh\nenv > "{dump}"\nexit 1\n', encoding="utf-8")
-        binary.chmod(0o755)
-        with patch.dict(
-            "os.environ",
-            {
-                "CLAUDE_CODE_OAUTH_TOKEN": "sk-inherited",
-                "ANTHROPIC_API_KEY": "sk-inherited",
-                "ANTHROPIC_AUTH_TOKEN": "sk-inherited",
-            },
-        ):
-            with self.assertRaises(AuthError):
-                claude_auth.resolve_token(binary)
-        rendered = dump.read_text(encoding="utf-8")
-        for name in claude_auth.AUTH_ENV_NAMES:
-            self.assertNotIn(name, rendered)
-        self.assertNotIn("sk-inherited", rendered)
+    def test_prepare_uses_explicit_declared_auth_over_scoped_cli_state(self) -> None:
+        """An explicitly allowed API key still has precedence over CLI auth."""
 
-    def test_probe_reports_a_keychain_credential_when_the_env_is_bare(self) -> None:
-        self.fake_keychain(initial=self.credential("sk-ant-oat-live", expires_in_seconds=86400))
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-explicit"}):
+            plan = self.prepare(
+                self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir
+            )
+        self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-explicit")
+        self.assertIn("CLAUDE_CONFIG_DIR", plan.environment)
+
+    def test_probe_reports_scoped_cli_state_as_unknown_when_env_is_bare(self) -> None:
+        """Probe never borrows a global credential to declare scoped auth healthy."""
+
         config = self.runtime_config(
-            binary=Path("/bin/echo"), auth=RuntimeAuthConfig("environment", names=self.OAUTH_NAMES)
+            auth=RuntimeAuthConfig("environment", names=("CLAUDE_CODE_OAUTH_TOKEN",))
         )
-        self.assertTrue(self.adapter.probe(config, self.home).authenticated)
+        self.assertIsNone(self.adapter.probe(config, self.home).authenticated)
 
     def test_prepare_validates_effort_and_passes_the_native_flag(self) -> None:
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
