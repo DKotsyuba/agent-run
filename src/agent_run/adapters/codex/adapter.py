@@ -21,7 +21,7 @@ from typing import Mapping
 
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
-from ...errors import PathEscapeError, ValidationError
+from ...errors import ValidationError
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -43,6 +43,7 @@ from ..plugin_skills import skill_dirs
 from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import build_environment, developer_approval_fields, developer_config_lines, prepared_environment
+from .skills import prune_skills
 from .toml import toml_array as _toml_array, toml_string as _toml_string
 
 
@@ -221,32 +222,6 @@ def _resolved_directory(value: object, label: str) -> Path:
     return resolved
 
 
-def _prune_skills(home: Path, selected: frozenset[str]) -> None:
-    """Drop adapter-owned skill directories that are no longer selected.
-
-    Only direct children below ``skills/`` that carry a managed ``SKILL.md``
-    are touched, so runtime-owned state below the generated home survives.
-    """
-
-    skills_root = home / "skills"
-    if skills_root.is_symlink():
-        raise PathEscapeError(f"codex skills root must not be a symlink: {skills_root}")
-    if not skills_root.is_dir():
-        return
-    for child in sorted(skills_root.iterdir()):
-        if child.name in selected or child.is_symlink() or not child.is_dir():
-            continue
-        managed = child / "SKILL.md"
-        if managed.is_symlink() or not managed.is_file():
-            continue
-        managed.unlink()
-        try:
-            child.rmdir()
-        except OSError:
-            # The runtime kept unrelated files below this skill; leave them.
-            pass
-
-
 def _bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
     """The bridge is authenticated only if it canonically resolves to the configured source."""
 
@@ -355,7 +330,7 @@ class CodexAdapter:
             except ValidationError as error:
                 raise ValidationError(f"codex skill is not available: {name}: {error}") from error
             skill_hashes[name] = snapshot.sha256
-        _prune_skills(Path(home), frozenset(config.skills))
+        prune_skills(Path(home), frozenset(config.skills))
 
         mcp_lines: list[str] = []
         for name in sorted(config.mcp):

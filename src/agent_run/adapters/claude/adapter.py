@@ -6,24 +6,19 @@ existing uv managed-Python root is the sole ambient exception for offline hooks.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import select
-import signal
 import subprocess
-import threading
 import time
 import uuid
-from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 from ...config import McpConfig, RuntimeConfig
-from ...domain import AgentStatus, Outcome, StartRequest
+from ...domain import StartRequest
 from ...errors import ValidationError
-from ..home import content_hash, managed_uv_python_environment, seal_answer
+from ..home import content_hash, managed_uv_python_environment
 from ...profiles import AgentProfile, normalize_read_roots
 from ..base import (
     ADAPTER_API_VERSION,
@@ -56,7 +51,7 @@ from .constants import (
     SKILL_TOOLS as _SKILL_TOOLS, SUPPORTED_EFFORTS as _SUPPORTED_EFFORTS,
     WRITE_TOOLS as _WRITE_TOOLS,
 )
-from .launch_io import abort_launch, known_secrets, open_runtime_log
+from .launch_io import abort_launch
 from .limits import agent_rate_limit_samples
 from .materialize import (
     render_declared_plugin_snapshots,
@@ -64,22 +59,10 @@ from .materialize import (
     render_plugin_dirs,
     render_settings,
 )
-from .stderr import StderrTail
-from .stream import (
-    StreamDecoder,
-    classify_failure,
-    is_secret_env_name,
-    sanitize_line,
-    terminal_event_data,
-)
+from .session import ClaudeSession
+from .stream import is_secret_env_name
 
 __all__ = ["ADAPTER_API_VERSION", "ADAPTER", "ClaudeAdapter"]
-
-#: Maximum time one prompt or steer may hold the session's input pipe.
-_INPUT_WRITE_TIMEOUT_SECONDS = 1.0
-#: Cancellation polling interval while the child applies stdin backpressure.
-_INPUT_WRITE_POLL_SECONDS = 0.05
-
 
 class ClaudeAdapter:
     """Runtime adapter for the ``claude`` engine."""
@@ -422,350 +405,6 @@ class ClaudeAdapter:
         except BaseException:
             abort_launch(process)
             raise
-
-
-class ClaudeSession:
-    """A launched Claude Code child process and its stream reader threads.
-
-    Owns the child from construction until ``wait`` returns; any failure
-    while wiring up the log, stdout/stderr readers, or the initial prompt
-    propagates out of ``__init__`` so ``launch`` can native-cancel the
-    process group instead of leaking a running child. Stderr is retained only
-    as a bounded, secret-redacted tail for failed-run classification.
-    """
-
-    def __init__(
-        self, process: "subprocess.Popen[str]", plan: LaunchPlan, sink: EventSink
-    ) -> None:
-        """Attach to a launched text-mode child and start its reader threads.
-
-        :param process: The running child, opened with ``text=True`` and pipes
-            on stdin/stdout/stderr; ownership of those pipes passes here.
-        :param plan: The plan the child was launched from; supplies the initial
-            prompt, the runtime log path, and the secret names to redact.
-        :param sink: Receives session id, messages, and events as they decode.
-        :raises BaseException: Re-raised after closing the runtime log if
-            opening it or starting a reader thread fails; the caller aborts
-            the launch.
-        """
-
-        self._process = process
-        self._plan = plan
-        self._sink = sink
-        self._decoder = StreamDecoder()
-        self._lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._write_cancelled = threading.Event()
-        self._cancelled = False
-        self._reader_error: BaseException | None = None
-        # Set the instant a terminal ``result`` line is decoded, or when the
-        # reader loop ends for any other reason (crash, EOF). ``wait`` blocks
-        # on this instead of on OS process exit: the real engine holds stdin
-        # open for another turn after answering, which in agent-run's
-        # one-shot task model never comes, so process exit is not a signal
-        # we can wait on.
-        self._settled = threading.Event()
-        # Set when ``wait`` had to end a still-alive child itself (rather
-        # than the child exiting on its own): the resulting exit code (a
-        # signal-terminated process rarely reports 0) must not then flip an
-        # otherwise-successful engine result to failed.
-        self._force_stopped = False
-        # Last session id handed to the sink. The child repeats its session id
-        # on every stream line, and forwarding each repeat wrote the same row
-        # thousands of times per run; only a first sighting or a genuine switch
-        # is news.
-        self._reported_session_id: str | None = None
-        self._secrets = known_secrets(plan)
-        self._stderr = StderrTail(process.stderr, self._secrets)
-        self._raw_stream = open_runtime_log(plan.runtime_stream_path)
-        try:
-            if process.stdin is not None:
-                os.set_blocking(process.stdin.fileno(), False)
-            self._stderr_reader = threading.Thread(target=self._stderr.drain, daemon=True)
-            self._stderr_reader.start()
-            self._reader = threading.Thread(target=self._read_stdout, daemon=True)
-            self._reader.start()
-            if plan.initial_input:
-                self._write_input(plan.initial_input, "initial input")
-        except BaseException:
-            self._raw_stream.close()
-            raise
-
-    def _write_input(self, text: str, label: str) -> None:
-        """Write one UTF-8 frame within a fixed, cancellable pipe budget.
-
-        ``text`` is the complete prompt or steer frame and ``label`` names it
-        in failures. Writes serialize so concurrent callers cannot interleave
-        frames. Child exit, cancellation, and pipe errors raise immediately;
-        sustained backpressure raises ``TimeoutError`` after one second.
-        """
-
-        frame = text.encode("utf-8")
-        deadline = time.monotonic() + _INPUT_WRITE_TIMEOUT_SECONDS
-        with self._write_lock:
-            stdin = self._process.stdin
-            if stdin is None:
-                raise ConnectionError(f"claude closed stdin while writing {label}")
-            try:
-                fd = stdin.fileno()
-            except ValueError as error:
-                raise ConnectionError(
-                    f"claude closed stdin while writing {label}"
-                ) from error
-            sent = 0
-            while sent < len(frame):
-                if self._write_cancelled.is_set():
-                    raise InterruptedError(f"claude cancelled while writing {label}")
-                if self._process.poll() is not None:
-                    raise ConnectionError(f"claude exited while writing {label}")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"claude timed out writing {label}")
-                try:
-                    _, writable, _ = select.select(
-                        [], [fd], [], min(remaining, _INPUT_WRITE_POLL_SECONDS)
-                    )
-                except (OSError, ValueError) as error:
-                    raise ConnectionError(
-                        f"claude closed stdin while writing {label}"
-                    ) from error
-                if not writable:
-                    continue
-                try:
-                    count = os.write(fd, frame[sent:])
-                except BlockingIOError:
-                    continue
-                except OSError as error:
-                    raise ConnectionError(
-                        f"claude closed stdin while writing {label}"
-                    ) from error
-                if count <= 0:
-                    raise ConnectionError(f"claude closed stdin while writing {label}")
-                sent += count
-
-    @property
-    def pid(self) -> int | None:
-        return self._process.pid
-
-    @property
-    def owns_process_group(self) -> bool:
-        return True
-
-    def _error_only_result_line(self, result_text: str) -> str | None:
-        """Bounded first line when the final result is an error-only payload.
-
-        The claude CLI signals engine/provider failures structurally
-        (``is_error``/subtype), so the base session never treats clean-exit
-        result text as a failure; the Qwen session overrides this because
-        its CLI can emit an upstream ``[API Error: ...]`` line as the whole
-        result while exiting 0.
-        """
-
-        del result_text
-        return None
-
-    def _read_stdout(self) -> None:
-        """Redact/log stdout and publish decoded messages, events and warnings.
-
-        Publish native identity once and verify it for continuations. Store
-        reader exceptions for wait() while draining the pipe; wake wait() on
-        any error, terminal result, crash or EOF.
-        """
-
-        try:
-            stdout = self._process.stdout
-            if stdout is None:
-                return
-            for raw_line in stdout:
-                try:
-                    sanitized = sanitize_line(raw_line, self._secrets)
-                    with self._lock:
-                        self._raw_stream.write(sanitized if sanitized.endswith("\n") else sanitized + "\n")
-                        self._raw_stream.flush()
-                    result = self._decoder.feed(sanitized, at=time.time())
-                    expected = self._plan.resume_session_id
-                    if expected is not None and result.session_id and result.session_id != expected:
-                        raise ValidationError("runtime resumed a different native session")
-                    if expected is not None and result.terminal and result.terminal.runtime_session_id != expected:
-                        raise ValidationError("runtime did not confirm the resumed native session")
-                    if result.session_id and result.session_id != self._reported_session_id:
-                        self._reported_session_id = result.session_id
-                        self._sink.session(result.session_id)
-                    for message in result.messages:
-                        self._sink.message(message)
-                    if result.event:
-                        self._sink.event(*result.event)
-                    if result.warning:
-                        # Best-effort: a bookkeeping write here must never mask
-                        # the real outcome already captured in ``result``/self._decoder.
-                        with contextlib.suppress(Exception):
-                            self._sink.event("stream_diagnostic", {"reason": result.warning})
-                    if result.terminal:
-                        self._sink.event("runtime_result", terminal_event_data(result.terminal))
-                        # First result/success (or error) wins: settle now
-                        # instead of waiting for the child to exit on its own.
-                        self._settled.set()
-                except BaseException as error:  # persisted for wait(); keep draining the pipe
-                    if self._reader_error is None:
-                        self._reader_error = error
-                    self._settled.set()
-        finally:
-            # Covers the crash/EOF case too: the child exited (or the pipe
-            # closed) without ever producing a terminal line, so ``wait``
-            # must still unblock and fall back to ``finalize()``.
-            self._settled.set()
-
-    def steer(self, text: str) -> None:
-        """Deliver one nonblank steer frame within the bounded input budget."""
-
-        if not isinstance(text, str) or not text.strip():
-            raise ValidationError("steer text must be nonblank")
-        line = (
-            json.dumps(
-                {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}},
-                sort_keys=True,
-            )
-            + "\n"
-        )
-        self._write_input(line, "steer")
-
-    def cancel(self, grace_seconds: float) -> None:
-        self._cancelled = True
-        self._write_cancelled.set()
-        if self._process.poll() is not None:
-            return
-        try:
-            self._process.send_signal(signal.SIGINT)
-        except OSError:
-            return
-        deadline = time.time() + max(grace_seconds, 0.0)
-        while time.time() < deadline and self._process.poll() is None:
-            time.sleep(0.05)
-
-    def _stop_process(self) -> None:
-        """End a child that is still alive after its answer already arrived.
-
-        The real engine holds stdin open for another turn in this
-        stream-json session; agent-run's one-shot task model has nothing
-        more to send, so leaving it running only strands the process group
-        and leaves room for a spurious duplicate cycle (observed live: a
-        second system/init-to-result cycle on the same session, long after
-        the first result/success). Idempotent settling in the decoder means
-        such a duplicate is discarded even if this loses the race, but
-        closing stdin and signaling promptly avoids relying on that.
-        """
-
-        self._force_stopped = True
-        stdin = self._process.stdin
-        if stdin is not None:
-            with contextlib.suppress(OSError, ValueError):
-                stdin.close()
-        with contextlib.suppress(OSError):
-            self._process.send_signal(signal.SIGINT)
-        try:
-            self._process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(OSError):
-                os.killpg(self._process.pid, signal.SIGKILL)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                self._process.wait(timeout=5)
-
-    def wait(self, timeout_seconds: float | None) -> Outcome | None:
-        # Settle on stream content, not process exit: the child may keep
-        # running (or spontaneously start a second turn) after its first
-        # result/success line arrives, per the live evidence above.
-        if not self._settled.wait(timeout=timeout_seconds):
-            return None
-        try:
-            # Brief natural-exit grace: a process that answered and is
-            # already finishing on its own should not be signalled.
-            exit_code = self._process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            self._stop_process()
-            try:
-                exit_code = self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                return None
-        self._reader.join(timeout=5 if timeout_seconds is None else timeout_seconds)
-        self._stderr_reader.join(timeout=5 if timeout_seconds is None else timeout_seconds)
-        if self._reader.is_alive() or self._stderr_reader.is_alive():
-            return None
-        with self._lock:
-            self._raw_stream.close()
-        for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-        if self._reader_error is not None:
-            raise self._reader_error
-        metadata = self._decoder.finalize()
-        stderr_text = self._stderr.text()
-        # A signal-terminated exit code from ``_stop_process`` reflects how
-        # agent-run ended an already-answered child, not whether the engine
-        # itself succeeded; only a naturally-exited child must report 0.
-        exit_ok = exit_code == 0 or self._force_stopped
-        error_only_line = (
-            self._error_only_result_line(metadata.result_text) if metadata.result_text else None
-        )
-        succeeded = (
-            exit_ok
-            and not metadata.is_error
-            and metadata.subtype != "no_answer"
-            and bool(metadata.result_text)
-            and error_only_line is None
-        )
-        if self._cancelled:
-            status = AgentStatus.CANCELLED
-        elif succeeded:
-            status = AgentStatus.SUCCEEDED
-        else:
-            status = AgentStatus.FAILED
-        if status == AgentStatus.SUCCEEDED:
-            failure_kind = None
-            failure_text = None
-        else:
-            if error_only_line is not None:
-                failure_kind = "provider_error"
-                failure_text = error_only_line
-            elif metadata.subtype == "no_answer" and stderr_text:
-                classified = classify_failure(
-                    replace(metadata, subtype="", result_text=stderr_text)
-                )
-                failure_kind = (
-                    "provider_error" if classified == "engine_error" else classified
-                )
-                failure_text = stderr_text
-            else:
-                empty_result = (
-                    exit_ok
-                    and not metadata.is_error
-                    and metadata.subtype != "no_answer"
-                    and not metadata.result_text
-                )
-                failure_kind = "empty_result" if empty_result else classify_failure(metadata)
-                failure_text = metadata.result_text
-        answer_path = None
-        answer_bytes = None
-        answer_sha256 = None
-        if status is AgentStatus.SUCCEEDED:
-            answer_path = self._plan.answer_path or self._plan.runtime_stream_path.with_name(
-                "answer.md"
-            )
-            answer_bytes, answer_sha256 = seal_answer(
-                answer_path, metadata.result_text or ""
-            )
-        return Outcome(
-            status=status,
-            exit_code=exit_code,
-            failure_kind=failure_kind,
-            failure_text=failure_text,
-            runtime_session_id=metadata.runtime_session_id,
-            answer_path=answer_path,
-            answer_bytes=answer_bytes,
-            answer_sha256=answer_sha256,
-        )
 
 
 ADAPTER = ClaudeAdapter()

@@ -62,6 +62,30 @@ class ArgumentsTests(unittest.TestCase):
 class StreamIdentityTests(unittest.TestCase):
     """Exercise the actual stream decoder with a lightweight process double."""
 
+    def test_descriptorless_injected_stdin_accepts_initial_input(self):
+        """In-memory process doubles retain the initial-input contract without ``fileno``."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = {
+                "type": "result", "subtype": "success", "is_error": False,
+                "result": "answer", "usage": {},
+            }
+            process = Mock()
+            process.stdout = io.StringIO(json.dumps(result) + "\n")
+            process.stderr = io.StringIO()
+            process.stdin = io.StringIO()
+            process.wait.return_value = 0
+            plan = LaunchPlan(
+                ("engine",), root, {}, "initial\n", root / "runtime.jsonl", {}, root / "answer.md"
+            )
+
+            session = ClaudeSession(process, plan, FakeSink())
+
+            self.assertEqual(process.stdin.getvalue(), "initial\n")
+            self.assertEqual(session.wait(3).status, AgentStatus.SUCCEEDED)
+
     def test_resume_refuses_missing_or_wrong_stream_identity(self):
         """An otherwise successful result cannot certify a different native context."""
         import tempfile
