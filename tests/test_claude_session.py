@@ -445,25 +445,35 @@ class ClaudeSessionTests(unittest.TestCase):
         self.assertEqual(outcome.status, AgentStatus.CANCELLED)
 
     def test_cancel_interrupts_owned_group_before_leader_exits(self) -> None:
-        """Native cancel reaches a spawned child instead of orphaning the group."""
+        """Native cancel kills a spawned child that explicitly ignores SIGINT."""
 
         child_path = self.root / "child.pid"
+        ready_path = self.root / "child.ready"
+        child_code = (
+            "import signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            f"Path({str(ready_path)!r}).write_text('ready')\n"
+            "time.sleep(30)\n"
+        )
         script = (
             "import subprocess, sys, time\n"
-            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
             f"open({str(child_path)!r}, 'w').write(str(child.pid))\n"
             "sys.stdin.readline()\n"
             "time.sleep(30)\n"
         )
         session = ADAPTER.launch(self.plan(script), FakeSink())
         deadline = time.monotonic() + 2
-        while not child_path.exists():
+        while not (child_path.exists() and ready_path.exists()):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.01)
         child_pid = int(child_path.read_text(encoding="utf-8"))
 
         try:
-            session.cancel(grace_seconds=2)
+            started = time.monotonic()
+            session.cancel(grace_seconds=0.1)
+            self.assertLess(time.monotonic() - started, 1)
             outcome = session.wait(timeout_seconds=5)
             self.assertIsNotNone(outcome)
             self.assertEqual(outcome.status, AgentStatus.CANCELLED)

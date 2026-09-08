@@ -222,12 +222,15 @@ class ClaudeSession:
     def cancel(self, grace_seconds: float) -> None:
         """Interrupt the owned process group and bound the leader's exit wait.
 
-        Grace seconds is a nonnegative wait budget after SIGINT. A real adapter
-        launch records its freshly created PID-equals-PGID group during
+        Grace seconds is a nonnegative group-exit budget after SIGINT. A real
+        adapter launch records its freshly created PID-equals-PGID group during
         construction and interrupts the whole group before the leader can leave
-        descendants behind. Injected processes without that proof retain the
-        leader-only fallback. Signal failures return without weakening the
-        supervisor's later independent PID/birth verification.
+        descendants behind. The leader is deliberately not polled/reaped while
+        group liveness is checked, so its PID/PGID cannot be reused before a
+        surviving group receives SIGKILL at the deadline. Injected processes
+        without that proof retain the leader-only fallback. Signal failures
+        return without weakening the supervisor's later independent PID/birth
+        verification.
         """
         self._cancelled = True
         self._write_cancelled.set()
@@ -241,6 +244,20 @@ class ClaudeSession:
         except OSError:
             return
         deadline = time.monotonic() + max(grace_seconds, 0.0)
+        if self._owned_process_group is not None:
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(self._owned_process_group, 0)
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    break
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            try:
+                os.killpg(self._owned_process_group, signal.SIGKILL)
+            except OSError:
+                pass
+            return
         while time.monotonic() < deadline and self._process.poll() is None:
             time.sleep(0.05)
 
