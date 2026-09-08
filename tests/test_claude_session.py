@@ -495,6 +495,58 @@ class ClaudeSessionTests(unittest.TestCase):
             except psutil.NoSuchProcess:
                 pass
 
+    def test_cancel_keeps_zombie_leader_fence_until_group_is_killed(self) -> None:
+        """An exited leader still fences PGID while its SIGINT-ignoring child dies."""
+
+        child_path = self.root / "exited-leader-child.pid"
+        ready_path = self.root / "exited-leader-child.ready"
+        child_code = (
+            "import signal, time\n"
+            "from pathlib import Path\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            f"Path({str(ready_path)!r}).write_text('ready')\n"
+            "time.sleep(30)\n"
+        )
+        script = (
+            "import subprocess, sys\n"
+            "sys.stdin.readline()\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"open({str(child_path)!r}, 'w').write(str(child.pid))\n"
+        )
+        session = ADAPTER.launch(self.plan(script), FakeSink())
+        leader_pid = session.pid
+        deadline = time.monotonic() + 2
+        while not (child_path.exists() and ready_path.exists()):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        child_pid = int(child_path.read_text(encoding="utf-8"))
+        while psutil.Process(leader_pid).status() != psutil.STATUS_ZOMBIE:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+
+        try:
+            session.cancel(grace_seconds=0.1)
+            outcome = session.wait(timeout_seconds=5)
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.status, AgentStatus.CANCELLED)
+            for _ in range(100):
+                try:
+                    status = psutil.Process(child_pid).status()
+                except psutil.NoSuchProcess:
+                    break
+                if status == psutil.STATUS_ZOMBIE:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("zombie leader cancellation left its child alive")
+        finally:
+            try:
+                child = psutil.Process(child_pid)
+                if child.status() != psutil.STATUS_ZOMBIE:
+                    child.kill()
+            except psutil.NoSuchProcess:
+                pass
+
     def test_stdout_larger_than_pipe_capacity_is_drained_before_initial_input(self) -> None:
         """A child may fill stdout before it starts reading the prompt."""
 

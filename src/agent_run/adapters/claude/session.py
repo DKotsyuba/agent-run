@@ -234,32 +234,33 @@ class ClaudeSession:
         """
         self._cancelled = True
         self._write_cancelled.set()
-        if self._process.poll() is not None:
+        deadline = time.monotonic() + max(grace_seconds, 0.0)
+        if self._owned_process_group is None:
+            if self._process.poll() is not None:
+                return
+            try:
+                self._process.send_signal(signal.SIGINT)
+            except OSError:
+                return
+            while time.monotonic() < deadline and self._process.poll() is None:
+                time.sleep(0.05)
             return
         try:
-            if self._owned_process_group is None:
-                self._process.send_signal(signal.SIGINT)
-            else:
-                os.killpg(self._owned_process_group, signal.SIGINT)
+            os.killpg(self._owned_process_group, signal.SIGINT)
         except OSError:
             return
-        deadline = time.monotonic() + max(grace_seconds, 0.0)
-        if self._owned_process_group is not None:
-            while time.monotonic() < deadline:
-                try:
-                    os.killpg(self._owned_process_group, 0)
-                except ProcessLookupError:
-                    return
-                except OSError:
-                    break
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        while time.monotonic() < deadline:
             try:
-                os.killpg(self._owned_process_group, signal.SIGKILL)
+                os.killpg(self._owned_process_group, 0)
+            except ProcessLookupError:
+                return
             except OSError:
-                pass
-            return
-        while time.monotonic() < deadline and self._process.poll() is None:
-            time.sleep(0.05)
+                break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        try:
+            os.killpg(self._owned_process_group, signal.SIGKILL)
+        except OSError:
+            pass
 
     def _stop_process(self) -> None:
         """End a child that stayed alive after producing its terminal result."""
