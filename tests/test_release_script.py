@@ -49,6 +49,25 @@ class PublicationTests(unittest.TestCase):
                 local.prepare(runner, target, Path(directory) / "wheel.whl", Path(directory) / "requirements.lock", "1.2.3", "python3.13")
             self.assertFalse(target.exists())
 
+    def test_mcp_smoke_keeps_stdin_open_until_tools_reply(self):
+        """The official SDK may emit tools/list after its initialize response."""
+        with tempfile.TemporaryDirectory() as directory:
+            child = Path(directory) / "delayed_mcp.py"
+            child.write_text(
+                "import json, select, sys\n"
+                "requests = [json.loads(sys.stdin.readline()) for _ in range(3)]\n"
+                "print(json.dumps({'jsonrpc':'2.0','id':1,'result':{}}), flush=True)\n"
+                "ready, _, _ = select.select([sys.stdin], [], [], 0.2)\n"
+                "if ready and sys.stdin.read() == '': raise SystemExit(3)\n"
+                "print(json.dumps({'jsonrpc':'2.0','id':2,'result':{'tools':[{'name':'status'}]}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            runner = release.Runner(5, 0.01)
+            tools = local.mcp_tools(
+                runner, [sys.executable, str(child)], subprocess.DEVNULL
+            )
+            self.assertEqual(tools, [{"name": "status"}])
+
     def test_cli_uses_shared_exception_identity_and_restores_every_job(self):
         """Real __main__ loading catches local failures and attempts all three restarts."""
         calls = []
