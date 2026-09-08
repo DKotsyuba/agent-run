@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import threading
 import time
@@ -444,6 +445,15 @@ Review the requested work.
         self.assertFalse(ADAPTER.prepare_profiles[-1].write)
         self.assertEqual(ADAPTER.materialize_configs[-1].skills, ("code-reading",))
         self.assertEqual(ADAPTER.skills_roots[-1], skills)
+        row = self.store.list_agents()[0]
+        snapshot = json.loads(
+            (self.root / "agents" / str(row["id"]) / "config-snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(snapshot["profile"]["role_name"], "profile")
+        self.assertEqual(snapshot["profile"]["auth"]["mode"], "global")
+        self.assertEqual(len(snapshot["profile"]["config_revision"]), 64)
         service.close()
 
     def test_canonical_role_rejects_legacy_runtime_asset_lists(self) -> None:

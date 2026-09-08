@@ -15,10 +15,13 @@ from agent_run.adapters.base import (
     RuntimeAdapter,
     RuntimeHealth,
     RuntimeInfo,
+    compile_role,
 )
 from agent_run.adapters.registry import AdapterRegistry, load_adapter
 from agent_run.config import McpConfig, RuntimeConfig
 from agent_run.errors import ValidationError
+from agent_run.domain import StartRequest
+from agent_run.role_plan import ResolvedMcp, ResolvedRolePlan, ResolvedSkill
 
 
 class FakeAdapter:
@@ -61,6 +64,37 @@ class LegacyAdapter(FakeAdapter):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_compile_role_passes_only_resolved_inputs_to_native_prepare(self) -> None:
+        """Bridge one immutable role to the existing adapter translator."""
+
+        role = ResolvedRolePlan(
+            "review", "1", "Review.", False, False, True, (),
+            (ResolvedSkill("code-reading", "a" * 64),),
+            (ResolvedMcp("codegraph", "stdio", "/bin/echo", (), ("PATH",)),),
+            frozenset(), "global", None, "b" * 64,
+        )
+        config = replace(
+            self.runtime(), skills=("code-reading",), mcp=("codegraph",)
+        )
+        request = StartRequest(
+            "fake", "test", "review", "Review.", Path("/tmp")
+        )
+        result = LaunchPlan(
+            ("fake",), Path("/tmp"), {}, None, Path("/tmp/runtime.jsonl"), {}
+        )
+        adapter = FakeAdapter()
+        with patch.object(adapter, "prepare", return_value=result) as prepare:
+            self.assertIs(
+                compile_role(
+                    adapter, request, role, config, Path("/tmp/home"), Path("/tmp/agent")
+                ),
+                result,
+            )
+        self.assertEqual(prepare.call_args.args[1].body, "Review.")
+        self.assertEqual(
+            tuple(prepare.call_args.kwargs["mcp_servers"]), ("codegraph",)
+        )
+
     def test_launch_plan_payload_preserves_bytes_and_rejects_shape_coercion(self) -> None:
         """Private launch payloads round-trip bytes and reject ambiguous JSON shapes."""
 

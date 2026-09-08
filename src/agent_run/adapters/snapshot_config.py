@@ -9,6 +9,7 @@ from pathlib import Path
 from ..config import EnvironmentConfig, RuntimeConfig
 from ..errors import ValidationError
 from ..profiles import AgentProfile
+from ..role_plan import ResolvedRolePlan
 from .home import content_hash
 from .snapshot_runtime import _valid_sha256
 from .snapshot_tree import _MAX_SNAPSHOT_METADATA_BYTES, _read_metadata
@@ -106,9 +107,13 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
     return document
 
 
-def _profile_document(profile: AgentProfile) -> dict[str, object]:
+def _profile_document(
+    profile: AgentProfile | ResolvedRolePlan,
+) -> dict[str, object]:
     """Return the effective role contract as deterministic JSON-safe values."""
 
+    if isinstance(profile, ResolvedRolePlan):
+        return profile.to_payload()
     legacy = {
         "name": profile.name,
         "body": profile.body,
@@ -139,7 +144,7 @@ def build_config_snapshot(
     materialize_revision: str,
     snapshot_index_sha256: str,
     config: RuntimeConfig,
-    profile: AgentProfile,
+    profile: AgentProfile | ResolvedRolePlan,
     runtime_version: str | None = None,
 ) -> ConfigSnapshot:
     """Build canonical effective configuration evidence for one attempt.
@@ -162,8 +167,12 @@ def build_config_snapshot(
         raise ValidationError("snapshot materialize_revision must be nonblank")
     if not _valid_sha256(snapshot_index_sha256):
         raise ValidationError("snapshot index sha256 must be 64 hexadecimal characters")
-    if not isinstance(config, RuntimeConfig) or not isinstance(profile, AgentProfile):
-        raise ValidationError("snapshot requires RuntimeConfig and AgentProfile")
+    if not isinstance(config, RuntimeConfig) or not isinstance(
+        profile, (AgentProfile, ResolvedRolePlan)
+    ):
+        raise ValidationError(
+            "snapshot requires RuntimeConfig and a profile or resolved role"
+        )
     if runtime_version is not None and (
         not isinstance(runtime_version, str) or not runtime_version.strip()
     ):

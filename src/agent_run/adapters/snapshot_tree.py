@@ -54,18 +54,6 @@ class SnapshotInspection:
     hash_mismatches: tuple[str, ...] = ()
 
 
-def tree_revision(source: Path) -> str:
-    """Return the canonical content revision of one real source tree.
-
-    The same no-follow traversal and manifest representation used for managed
-    publication define the revision. The source is read only; missing,
-    symlinked, special, or unreadable entries raise ``ValidationError``.
-    """
-
-    entries, _files = _read_tree(source)
-    return content_hash(_manifest(entries))
-
-
 def _relative(value: str | Path, label: str) -> Path:
     """Return a nonempty managed relative path or raise ``PathEscapeError``."""
 

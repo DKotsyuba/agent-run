@@ -42,6 +42,7 @@ from ..plugin_skills import skill_dirs
 from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import (
+    auth_bridge,
     bridge_points_at_source,
     build_environment,
     developer_approval_fields,
@@ -60,14 +61,6 @@ _LIMITS_STALE_SECONDS = 900
 _ROLLOUT_FILES = 24
 _ROLLOUT_TAIL_BYTES = 262_144
 _ROLLOUT_TAIL_LINES = 2_048
-
-
-def _native_auth_source() -> Path:
-    """Return the host Codex account file without reading its contents."""
-
-    configured = os.environ.get("CODEX_HOME")
-    root = Path(configured).expanduser() if configured else Path.home() / ".codex"
-    return root / "auth.json"
 
 
 def _read_json(path: Path) -> object | None:
@@ -392,24 +385,13 @@ class CodexAdapter:
 
         auth_digest = ""
         managed_links: tuple[tuple[str, str], ...] = ()
-        auth = config.auth
-        if auth is None:
-            source = _native_auth_source()
-            target = "auth.json"
-            if source.is_file():
-                auth_target = str(source.expanduser().resolve(strict=True))
-                create_symlink_bridge(home, target, source)
-                auth_digest = auth_target
-                managed_links = ((target, auth_target),)
-        elif auth.kind == "file_link":
-            if auth.source is None:
-                raise ValidationError("codex file_link auth source is missing")
-            if auth.target is None:
-                raise ValidationError("codex file_link auth target is missing")
-            auth_target = str(auth.source.expanduser().resolve(strict=True))
-            create_symlink_bridge(home, auth.target, auth.source)
+        bridge = auth_bridge(config)
+        if bridge is not None:
+            source, target = bridge
+            auth_target = str(source.expanduser().resolve(strict=True))
+            create_symlink_bridge(home, target, source)
             auth_digest = auth_target
-            managed_links = ((auth.target, auth_target),)
+            managed_links = ((target, auth_target),)
 
         fingerprint = "\n".join(
             [
@@ -446,14 +428,10 @@ class CodexAdapter:
         binary_ok = config.binary.exists() and os.access(config.binary, os.X_OK)
         home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
         auth_ok = None
-        if config.auth is not None and config.auth.kind == "file_link":
-            if config.auth.target is not None:
-                auth_ok = bridge_points_at_source(
-                    home_path / config.auth.target, config.auth.source
-                )
-        elif config.auth is None:
-            source = _native_auth_source()
-            auth_ok = bridge_points_at_source(home_path / "auth.json", source)
+        bridge = auth_bridge(config)
+        if bridge is not None:
+            source, target = bridge
+            auth_ok = bridge_points_at_source(home_path / target, source)
         version, version_reason = observe_binary_version(config.binary, home_path)
         available = bool(binary_ok and home_ok and (auth_ok is not False))
         reason = (

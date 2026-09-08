@@ -51,6 +51,26 @@ def bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
         return False
 
 
+def auth_bridge(config: RuntimeConfig) -> tuple[Path, str] | None:
+    """Return the selected Codex auth source and generated-home target.
+
+    Explicit file-link declarations are validated. Without one, the host
+    ``CODEX_HOME`` or ``~/.codex/auth.json`` is used when it exists; a missing
+    native account returns ``None`` without reading credential bytes.
+    """
+
+    if config.auth is None:
+        configured = os.environ.get("CODEX_HOME")
+        root = Path(configured).expanduser() if configured else Path.home() / ".codex"
+        source = root / "auth.json"
+        return (source, "auth.json") if source.is_file() else None
+    if config.auth.source is None:
+        raise ValidationError("codex file_link auth source is missing")
+    if config.auth.target is None:
+        raise ValidationError("codex file_link auth target is missing")
+    return config.auth.source, config.auth.target
+
+
 def require_resolved_mcp(
     config: RuntimeConfig, mcp_servers: Mapping[str, McpConfig], where: str
 ) -> None:
