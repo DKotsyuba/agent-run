@@ -203,6 +203,9 @@ class ClaudeAdapter:
         Public model ids remain on the plan boundary; only child argv aliases
         ``fable``. Presets add declared paths, variables, Rust, and command
         denials to the isolated environment; invalid inputs raise before launch.
+        The adapter reasserts its scoped ``CLAUDE_CONFIG_DIR`` after preset
+        assembly and treats it as engine-owned for MCP requirements, so neither
+        path can redirect Claude's durable credential state.
         """
 
         if request.fast:
@@ -292,15 +295,17 @@ class ClaudeAdapter:
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
+        scoped_config_dir = str(claude_config_dir(config))
         environment: dict[str, str] = {
             "HOME": str(home),
-            "CLAUDE_CONFIG_DIR": str(claude_config_dir(config)),
+            "CLAUDE_CONFIG_DIR": scoped_config_dir,
             **managed_uv_python_environment(),
         }
         path_value = os.environ.get("PATH")
         if path_value:
             environment["PATH"] = path_value
         environment = developer_environment(environment, config, request.workdir)
+        environment["CLAUDE_CONFIG_DIR"] = scoped_config_dir
 
         selected_environment = config.environment
         if selected_environment is not None and selected_environment.denied_commands:
@@ -340,7 +345,9 @@ class ClaudeAdapter:
             if server is None:
                 raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
             for env_name in server.env_from:
-                if env_name in configured_keys or (
+                if env_name == "CLAUDE_CONFIG_DIR":
+                    value = scoped_config_dir
+                elif env_name in configured_keys or (
                     config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES
                 ):
                     value = environment.get(env_name)

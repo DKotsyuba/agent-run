@@ -12,7 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import Capability, LimitSample
 from agent_run.adapters.claude.adapter import ADAPTER, ADAPTER_API_VERSION, ClaudeAdapter
-from agent_run.config import McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
+from agent_run.config import (
+    EnvironmentConfig,
+    McpConfig,
+    RuntimeAuthConfig,
+    RuntimeConfig,
+    RuntimeHookConfig,
+    RustConfig,
+)
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
@@ -846,6 +853,41 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(config_dir))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", plan.environment)
         self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_prepare_reasserts_scoped_state_after_a_developer_preset(self) -> None:
+        """A preset cannot redirect the Claude credential store it inherits."""
+
+        state_home = self.root / "configured-home"
+        config = self.runtime_config(
+            credential_state_home=state_home,
+            environment=EnvironmentConfig(variables={"CLAUDE_CONFIG_DIR": "/preset-store"}),
+        )
+        plan = self.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
+        self.assertEqual(
+            plan.environment["CLAUDE_CONFIG_DIR"], str(state_home / "claude-config")
+        )
+
+    def test_prepare_keeps_scoped_state_when_an_mcp_declares_it(self) -> None:
+        """An MCP requirement reuses the engine value instead of ambient state."""
+
+        state_home = self.root / "configured-home"
+        config = self.runtime_config(
+            credential_state_home=state_home,
+            mcp=("scoped",),
+        )
+        servers = {
+            "scoped": McpConfig(
+                "stdio", Path("/bin/echo"), (), ("CLAUDE_CONFIG_DIR",)
+            )
+        }
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/ambient-store"}):
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir,
+                mcp_servers=servers,
+            )
+        self.assertEqual(
+            plan.environment["CLAUDE_CONFIG_DIR"], str(state_home / "claude-config")
+        )
 
     def test_prepare_uses_explicit_declared_auth_over_scoped_cli_state(self) -> None:
         """An explicitly allowed API key still has precedence over CLI auth."""
