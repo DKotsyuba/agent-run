@@ -28,7 +28,6 @@ from typing import IO, Callable
 from .dispatch import (
     TOOL_NAMES,
     TOOLS,
-    Session,
     _arguments,
     _bounded,
     _emit,
@@ -56,7 +55,7 @@ CONTROL_FRAME_DEADLINE_SECONDS = 0.5
 _MISSING = object()
 _DEFAULT_SOCKET = ".agent-run/api.sock"
 METHOD_NAMES = TOOL_NAMES | {"tools", "ping", "wait"}
-_CONTROL_METHODS = frozenset({"start", "resume", "cancel", "steer", "fast"})
+_CONTROL_METHODS = frozenset({"start", "resume", "cancel", "steer"})
 
 
 class _Overloaded(RuntimeError):
@@ -119,11 +118,11 @@ class _Dispatcher:
                 item = self._queue.get()
                 if item is None:
                     return
-                method, params, session, future = item
+                method, params, future = item
                 if not future.set_running_or_notify_cancel():
                     continue
                 try:
-                    future.set_result(call_tool(service, method, params, session))
+                    future.set_result(call_tool(service, method, params))
                 except BaseException as error:
                     future.set_exception(error)
         finally:
@@ -131,7 +130,7 @@ class _Dispatcher:
             if callable(close):
                 close()
 
-    def call(self, method: str, params: dict, session: Session) -> object:
+    def call(self, method: str, params: dict) -> object:
         """Submit one call or raise an explicit overload/deadline/closed error."""
 
         future: Future = Future()
@@ -139,7 +138,7 @@ class _Dispatcher:
             if self._closed.is_set():
                 raise _DispatcherClosed("API dispatcher is shutting down")
             try:
-                self._queue.put_nowait((method, params, session, future))
+                self._queue.put_nowait((method, params, future))
             except queue.Full as error:
                 raise _Overloaded("API request queue is full") from error
         try:
@@ -160,7 +159,7 @@ class _Dispatcher:
                     except queue.Empty:
                         break
                     if item is not None:
-                        future = item[3]
+                        future = item[2]
                         if not future.done():
                             future.set_exception(
                                 _DispatcherClosed("API dispatcher is shutting down")
@@ -240,7 +239,7 @@ def _run_wait(
             close()
 
 
-def _handle(server: ApiServer, request: object, session: Session) -> dict | None:
+def _handle(server: ApiServer, request: object) -> dict | None:
     """Validate and execute one decoded JSON-RPC request for ``server``."""
 
     if isinstance(request, list):
@@ -271,7 +270,7 @@ def _handle(server: ApiServer, request: object, session: Session) -> dict | None
             response = _rpc_error(response_id, -32601, "method not found")
             return None if request_id is _MISSING else response
         else:
-            result = _jsonable(server.dispatcher_for(method).call(method, params, session))
+            result = _jsonable(server.dispatcher_for(method).call(method, params))
     except _Overloaded as error:
         response = _rpc_error(response_id, -32001, error)
         return None if request_id is _MISSING else response
@@ -317,12 +316,11 @@ class _SocketWriter:
 
 
 class _Handler(socketserver.StreamRequestHandler):
-    """Serve one deadline-bound, session-isolated client connection."""
+    """Serve one deadline-bound client connection."""
 
     def handle(self) -> None:
         """Read bounded newline frames until EOF, idle timeout, or write failure."""
 
-        session = Session()
         writer = _SocketWriter(self.wfile)
         control_only = self.server.control_connection_only(self.request)
         self.request.settimeout(self.server.idle_timeout)
@@ -379,7 +377,7 @@ class _Handler(socketserver.StreamRequestHandler):
                 except (OSError, TimeoutError):
                     pass
                 return
-            response = _handle(self.server, request, session)
+            response = _handle(self.server, request)
             if response is not None:
                 self.request.settimeout(self.server.write_timeout)
                 try:
@@ -499,8 +497,8 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
         Numeric limits must be positive and finite. ``service_factory`` is
         called once in each dispatcher thread and must return a fresh service
         with its own SQLite connection. Potentially slow read/probe methods use
-        the read lane; durable admission, cancel, steer, and session-local fast
-        settings use the control lane. Construction refuses ambiguous existing
+        the read lane; durable admission, cancel and steer use the control lane.
+        Construction refuses ambiguous existing
         sockets and releases every acquired resource on failure.
         """
 

@@ -26,6 +26,12 @@ import time
 
 import psutil
 
+
+_EXPECTED_TOOLS = {
+    "start", "resume", "cancel", "steer", "list_agents", "answer",
+    "transcript", "capacity_order",
+}
+
 from release import ReleaseError, Runner
 
 
@@ -190,12 +196,23 @@ def smoke(runner: Runner, release: Path) -> None:
                     if process.poll() is not None:
                         raise ReleaseError("Isolated API exited during smoke")
                     try:
-                        if rpc(home, "ping") != {"ok": True} or not rpc(home, "tools"):
-                            raise ReleaseError("Isolated API returned empty tools")
+                        tools = rpc(home, "tools")
+                        if (
+                            rpc(home, "ping") != {"ok": True}
+                            or not isinstance(tools, list)
+                            or len(tools) != len(_EXPECTED_TOOLS)
+                            or {item.get("name") for item in tools if isinstance(item, dict)}
+                            != _EXPECTED_TOOLS
+                        ):
+                            raise ReleaseError("Isolated API returned the wrong tool surface")
                         break
                     except (OSError, ValueError):
                         runner.pause("isolated API readiness")
-                mcp_tools(runner, command, log)
+                tools = mcp_tools(runner, command, log)
+                if len(tools) != len(_EXPECTED_TOOLS) or {
+                    item.get("name") for item in tools
+                } != _EXPECTED_TOOLS:
+                    raise ReleaseError("Isolated MCP returned the wrong tool surface")
             finally:
                 process.terminate()
                 try:

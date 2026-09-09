@@ -421,13 +421,11 @@ class ResumeTests(unittest.TestCase):
         self.service = self._service(
             self._accounted(accounts=("work", "other"), default="other")
         )
-        self.service.resume(parent, "keep going")
+        child = self.service.resume(parent, "keep going")
         self._wait(2)
         self.assertIn(
             '"account":"work"',
-            str(self.store.get_agent(self.service.chain(parent).items[1].agent_id)[
-                "identity_json"
-            ]),
+            str(self.store.get_agent(child.agent_id)["identity_json"]),
         )
 
     def test_account_no_longer_declared_is_refused(self) -> None:
@@ -756,24 +754,7 @@ Review.
         self.assertEqual(self.service.get(grandchild.agent_id).sequence, 3)
         self.assertEqual(self.service.get(grandchild.agent_id).root_agent_id, parent)
 
-    def test_chain_pages_chronologically_from_any_member(self) -> None:
-        parent = self._parent()
-        second = self.service.resume(parent, "two").agent_id
-        self._wait(2)
-        self._finish(second, session="sess-2")
-        third = self.service.resume(second, "three").agent_id
-        self._wait(3)
 
-        page = self.service.chain(third, limit=2)
-        self.assertEqual([view.agent_id for view in page.items], [parent, second])
-        self.assertEqual([view.sequence for view in page.items], [1, 2])
-        self.assertEqual(page.next_cursor, 3)
-        self.assertFalse(page.complete)
-
-        rest = self.service.chain(parent, cursor=page.next_cursor, limit=2)
-        self.assertEqual([view.agent_id for view in rest.items], [third])
-        self.assertIsNone(rest.next_cursor)
-        self.assertTrue(rest.complete)
 
     def test_a_fresh_start_is_its_own_chain_root(self) -> None:
         result = self.service.start(

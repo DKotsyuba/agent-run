@@ -1,7 +1,7 @@
 # agent-run architecture
 
-How the pieces fit, as shipped today. For the operator's how-to see
-`agent-run doc`; for API integration see [api.md](api.md).
+How the pieces fit, as shipped today. For integration details see
+[api.md](api.md).
 
 ## Managed Codex context
 
@@ -140,7 +140,7 @@ a local OmniRoute router, or `none`. A collection replaces one current snapshot
 containing samples and explicit physical-pool/route topology. Per-account scopes refresh
 independently, so a failed account keeps its previous topology only until that
 snapshot expires instead of deleting healthy sibling scopes. Samples carry
-validity windows; `limits` serves those current values without projections.
+validity windows used by capacity route ordering.
 
 Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
 and `unsupported`. A source failure is not a successful collection of zero
@@ -201,15 +201,6 @@ compatible role/model alias and decides whether to launch. The output retains
 deferred evidence, exhausted omissions, unavailable runtimes, and the
 `insufficient_diversity` signal alongside the working routes.
 
-The context hook uses the same capacity-order builder and injects a compact
-English Runtime priorities summary, not raw quota windows. It instructs the
-orchestrator to choose the first compatible route while retaining role/model
-selection. A model-specific quota lane cannot lend its priority to a different
-model on the same runtime/account. Per-session component receipts suppress unchanged visible summaries,
-including when only active-agent context changes; a later return to a previous
-summary is delivered again. Visible rounded priorities and route identities
-determine changes, not observation timestamps or insignificant float tails.
-The diagnostic `limits` view is not a required routing step.
 Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
 terminal, with an idempotent `stats backfill`.
 
@@ -219,7 +210,7 @@ The runtime deploys as a **sealed release**: a venv built from a git SHA
 under `~/.agent-run/standalone/releases/<sha>` with a `COMPLETE` marker,
 selected by the `standalone/current` symlink. Rollback is repointing the
 symlink; retention keeps releases that live sessions still execute from.
-Details: `agent-run doc releases`.
+Details: [releasing.md](releasing.md).
 
 ## Design invariants
 

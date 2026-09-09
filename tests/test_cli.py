@@ -61,11 +61,6 @@ class FakeService:
         self.request = {"agent_id": agent_id, "task": task, **kwargs}
         return self._return("resume", FakeStart())
 
-    def chain(self, agent_id, **kwargs):
-        """Return a deterministic page for CLI forwarding checks."""
-        return self._return("chain", {"agent_id": agent_id, **kwargs})
-
-
     def cancel(self, agent_id):
         return self._return("cancel", {"agent_id": agent_id, "status": "cancelling"})
 
@@ -84,9 +79,6 @@ class FakeService:
 
     def list(self, query):
         return self._return("list", query)
-
-    def summary(self, **kwargs):
-        return self._return("summary", kwargs)
 
     def transcript(self, agent_id, cursor=0, limit=200):
         self.calls.append(("transcript", cursor, limit))
@@ -109,14 +101,14 @@ class FakeService:
         )
 
     def answer(self, agent_id):
-        return self._return("answer", {"agent_id": agent_id, "available": False})
-
-    def models(self):
-        return self._return("models", MappingProxyType({"codex": ("model",)}))
-
-    def limits(self):
-        return self._return("limits", {"risk": AgentStatus.RUNNING})
-
+        return self._return(
+            "answer",
+            FakeView(
+                AgentStatus.RUNNING,
+                Path("/tmp/answer.md"),
+                MappingProxyType({"agent_id": agent_id}),
+            ),
+        )
 
     def capacity_collect(self):
         return self._return("capacity_collect", {"collected": True})
@@ -159,11 +151,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(broker.resume.call_args.args, (AGENT_ID, "fix"))
         broker.close.assert_called_once()
 
-    def test_chain_forwards_cursor_and_limit(self):
-        """Chain pagination stays owned by the service."""
-        code, output, error = self.run_cli(["chain", AGENT_ID, "--cursor", "2", "--limit", "3"])
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(json.loads(output), {"agent_id": AGENT_ID, "cursor": 2, "limit": 3})
+
     def run_cli(self, argv, *, service=None, stdin=""):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -465,7 +453,7 @@ target = "auth.json"
         self.assertTrue(service.request.fast)
 
     def test_json_supports_dataclasses_enums_paths_and_mappingproxy(self):
-        code, output, error = self.run_cli(["status", AGENT_ID])
+        code, output, error = self.run_cli(["answer", AGENT_ID])
         self.assertEqual(code, 0)
         self.assertEqual(error, "")
         self.assertEqual(
@@ -544,7 +532,7 @@ target = "auth.json"
     def test_expected_errors_are_stable_json_but_unexpected_faults_propagate(self):
         expected = FakeService()
         expected.error = ValidationError("bad request")
-        code, output, error = self.run_cli(["status", AGENT_ID], service=expected)
+        code, output, error = self.run_cli(["answer", AGENT_ID], service=expected)
         self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
@@ -557,7 +545,7 @@ target = "auth.json"
         unexpected = FakeService()
         unexpected.error = RuntimeError("bug")
         with self.assertRaisesRegex(RuntimeError, "bug"):
-            self.run_cli(["status", AGENT_ID], service=unexpected)
+            self.run_cli(["answer", AGENT_ID], service=unexpected)
 
     def test_bootstrap_failure_error_envelope_carries_the_agent_id(self):
         bootstrapped = FakeService()
@@ -571,7 +559,7 @@ target = "auth.json"
         failure.failure_text = "ModuleNotFoundError: no module named agent_run.adapters"
         bootstrapped.error = failure
 
-        code, output, error = self.run_cli(["status", AGENT_ID], service=bootstrapped)
+        code, output, error = self.run_cli(["answer", AGENT_ID], service=bootstrapped)
         self.assertEqual(code, 2)
         self.assertEqual(output, "")
         payload = json.loads(error)["error"]
@@ -586,10 +574,7 @@ target = "auth.json"
             (["cancel", AGENT_ID], "cancel"),
             (["steer", AGENT_ID, "--text", "go"], "steer"),
             (["agents"], "list"),
-            (["summary", "--agent-id", AGENT_ID], "summary"),
             (["answer", AGENT_ID], "answer"),
-            (["models"], "models"),
-            (["limits"], "limits"),
             (["capacity", "collect", "--once"], "capacity_collect"),
             (["init"], "init"),
             (["doctor"], "doctor"),
@@ -607,7 +592,8 @@ target = "auth.json"
         for command in (
             ["workflow", "status", "wf_old"], ["batch", "--file", "-"],
             ["delivery", "dispatch"], ["hook", "context"], ["bind", AGENT_ID],
-            ["context"],
+            ["context"], ["chain", AGENT_ID], ["status", AGENT_ID],
+            ["summary"], ["models"], ["limits"], ["doc"],
         ):
             with self.subTest(command=command), self.assertRaises(ValidationError):
                 cli._parser().parse_args(command)
@@ -813,12 +799,8 @@ target = "auth.json"
         self.assertEqual([response["id"] for response in responses], [1, 2])
         self.assertEqual(
             [tool["name"] for tool in responses[1]["result"]["tools"]],
-            [
-                "capacity_order", "start", "fast", "cancel", "steer", "status", "list_agents",
-                "list_orchestrators",
-                "summary", "transcript", "answer", "models", "limits", "doc",
-                "resume", "chain",
-            ],
+            ["capacity_order", "start", "cancel", "steer", "list_agents",
+             "transcript", "answer", "resume"],
         )
 
 

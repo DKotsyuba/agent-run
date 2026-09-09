@@ -103,11 +103,6 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--request-id")
     _session(resume)
 
-    chain = commands.add_parser("chain")
-    chain.add_argument("agent_id")
-    chain.add_argument("--cursor", type=int)
-    chain.add_argument("--limit", type=int, default=50)
-
     auth = commands.add_parser("auth")
     auth.add_argument("label")
     auth.add_argument("runtime")
@@ -116,7 +111,7 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("runtime")
     login.add_argument("--account")
 
-    for name in ("cancel", "status", "answer"):
+    for name in ("cancel", "answer"):
         command = commands.add_parser(name)
         command.add_argument("agent_id")
 
@@ -134,10 +129,6 @@ def _parser() -> argparse.ArgumentParser:
     agents.add_argument("--limit", type=int, default=100)
     _session(agents)
 
-    summary = commands.add_parser("summary")
-    summary.add_argument("--agent-id")
-    _session(summary)
-
     transcript = commands.add_parser("transcript")
     transcript.add_argument("agent_id")
     transcript.add_argument("--cursor", type=int, default=0)
@@ -145,9 +136,6 @@ def _parser() -> argparse.ArgumentParser:
     transcript_mode = transcript.add_mutually_exclusive_group()
     transcript_mode.add_argument("--follow", action="store_true")
     transcript_mode.add_argument("--full", action="store_true")
-
-    commands.add_parser("models")
-    commands.add_parser("limits")
 
     stats = commands.add_parser("stats").add_subparsers(
         dest="stats_command", required=True
@@ -185,8 +173,6 @@ def _parser() -> argparse.ArgumentParser:
     api_launchd.add_argument("--label", default=_API_LAUNCHD_LABEL)
     api_launchd.add_argument("--stdout-log", default=None)
     api_launchd.add_argument("--stderr-log", default=None)
-    doc = commands.add_parser("doc")
-    doc.add_argument("topic", nargs="?")
     return parser
 
 
@@ -320,8 +306,6 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
             request_id=args.request_id, orchestrator=_ref(args),
         )
         return {"agent_id": result.agent_id, "created": result.created}
-    if command == "chain":
-        return service.chain(args.agent_id, cursor=args.cursor, limit=args.limit)
     if command == "start":
         result = service.start(_request(args, stream))
         return {"agent_id": result.agent_id, "created": result.created}
@@ -329,14 +313,10 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
         return service.cancel(args.agent_id)
     if command == "steer":
         return service.steer(args.agent_id, _text(args.text, stream, "steer text"))
-    if command == "status":
-        return service.get(args.agent_id)
     if command == "agents":
         return service.list(
             AgentQuery(args.active, _ref(args), args.offset, args.limit)
         )
-    if command == "summary":
-        return service.summary(agent_id=args.agent_id, orchestrator=_ref(args))
     if command == "transcript":
         return (
             _follow_transcript(service, args)
@@ -347,10 +327,6 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
         )
     if command == "answer":
         return service.answer(args.agent_id)
-    if command == "models":
-        return service.models()
-    if command == "limits":
-        return service.limits()
     if command == "capacity":
         return (
             service.capacity_collect()
@@ -706,13 +682,6 @@ def _stats(home: Path, args: argparse.Namespace) -> dict[str, object]:
     raise AgentRunError(f"unsupported stats command: {args.stats_command}")
 
 
-def _doc(args: argparse.Namespace) -> dict[str, object]:
-    from .doc import topic_text
-
-    topic = args.topic
-    return {"topic": topic or "index", "text": topic_text(topic)}
-
-
 def main(
     argv: list[str] | None = None,
     *,
@@ -761,8 +730,6 @@ def main(
                 return result
         elif service is None and args.command == "doctor":
             result = _doctor(home)
-        elif service is None and args.command == "doc":
-            result = _doc(args)
         elif service is None and args.command == "stats":
             result = _stats(home, args)
         elif args.command == "capacity" and args.capacity_command == "launchd":
@@ -786,7 +753,7 @@ def main(
             if service is None:
                 if args.command == "api":
                     child_reaper = ChildReaper()
-                if args.command in {"start", "resume", "chain"}:
+                if args.command in {"start", "resume"}:
                     start_broker = BrokerClient(home / "api.sock")
                     target = start_broker
                 else:

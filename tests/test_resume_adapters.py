@@ -13,7 +13,7 @@ from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.glm.adapter import ADAPTER as GLM
 from agent_run.adapters.qwen.adapter import ADAPTER as QWEN
-from agent_run.dispatch import Session, call_tool
+from agent_run.dispatch import call_tool
 from agent_run.domain import AgentStatus
 from agent_run.errors import ValidationError
 from test_claude_session import FakeSink
@@ -37,11 +37,11 @@ class ArgumentsTests(unittest.TestCase):
         """Resume ignores ephemeral fast defaults and rejects authority overrides."""
         service = Mock()
         caller = {"transport": "codex_queue", "external_session_id": "caller"}
-        call_tool(service, "resume", {"agent_id": "parent", "task": "fix", "orchestrator": caller}, Session())
+        call_tool(service, "resume", {"agent_id": "parent", "task": "fix", "orchestrator": caller})
         self.assertEqual(service.resume.call_args.args, ("parent", "fix"))
         self.assertEqual(service.resume.call_args.kwargs["orchestrator"].external_session_id, "caller")
         with self.assertRaises(ValidationError):
-            call_tool(service, "resume", {"agent_id": "parent", "task": "fix", "write": True}, Session())
+            call_tool(service, "resume", {"agent_id": "parent", "task": "fix", "write": True})
 
     def test_adapters_pass_exact_native_resume_selector_to_process(self):
         """Exercise each real CLI adapter's launch wiring without contacting a provider."""

@@ -787,43 +787,6 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual([row["observed_at"] for row in rows], [3.0, 1.0])
 
 
-    def test_list_orchestrator_sessions_counts_orders_and_includes_unbound(self) -> None:
-        """Aggregate bound and unbound agents without changing stored rows."""
-
-        unbound = self.create()
-        first = self.store.create_agent(
-            self.request(orchestrator=OrchestratorRef("socket", "first", "turn-1")),
-            task_summary="summary", config_revision="cfg-1", at=10,
-        ).agent_id
-        second = self.store.create_agent(
-            self.request(orchestrator=OrchestratorRef("socket", "second", "turn-2")),
-            task_summary="summary", config_revision="cfg-1", at=20,
-        ).agent_id
-        first_session = self.store.get_agent(first)["orchestrator_session_id"]
-        second_session = self.store.get_agent(second)["orchestrator_session_id"]
-        self.store.transition(first, AgentStatus.STARTING, at=2)
-        self.store.transition(first, AgentStatus.RUNNING, at=3)
-        self.store.transition(
-            unbound, AgentStatus.CANCELLED, outcome=Outcome(AgentStatus.CANCELLED), at=4
-        )
-        rows = self.store.list_orchestrator_sessions(limit=10)
-        self.assertEqual([row["id"] for row in rows], [second_session, first_session, None])
-        self.assertEqual(
-            [(row["active"], row["total"]) for row in rows], [(1, 1), (1, 1), (0, 1)]
-        )
-        self.assertEqual(rows[-1]["created_at"], self.store.get_agent(unbound)["created_at"])
-        self.assertEqual(rows[0]["page_total"], 3)
-        self.assertEqual(len(self.store.list_orchestrator_sessions(limit=1)), 1)
-
-    def test_list_orchestrator_sessions_omits_unbound_row_when_none_are_unbound(self) -> None:
-        """No agent without an orchestrator leaves no synthetic unbound row."""
-
-        bound = self.create(self.request(orchestrator=OrchestratorRef("socket", "only", "turn-1")))
-        session = self.store.get_agent(bound)["orchestrator_session_id"]
-        rows = self.store.list_orchestrator_sessions(limit=10)
-        self.assertEqual([row["id"] for row in rows], [session])
-        self.assertEqual([(row["active"], row["total"]) for row in rows], [(1, 1)])
-        self.assertEqual(rows[0]["page_total"], 1)
 
 
 if __name__ == "__main__":

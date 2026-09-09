@@ -9,8 +9,6 @@ connect the records into one chronological chain.
 ```sh
 agent-run resume <agent-id> --task "Address these review findings" --request-id review-2
 agent-run resume <agent-id> --task-file review.txt --timeout 900
-agent-run chain <any-id-in-the-chain> --limit 50
-agent-run chain <any-id-in-the-chain> --cursor 51 --limit 50
 ```
 
 `--task` and `--task-file` are mutually exclusive. A task file is UTF-8 and its
@@ -19,19 +17,15 @@ the resident broker, so closing the CLI cannot orphan a preparation worker.
 The usual `--session-transport`, `--session-id` and `--session-turn-id` options
 record the **new** run's caller namespace.
 
-MCP and the socket API expose the same tools:
-
-- `resume(agent_id, task, timeout_seconds?, request_id?, orchestrator?)` returns
-  the normal asynchronous start envelope with a new `agent_id`.
-- `chain(agent_id, cursor?, limit?)` returns `items`, `cursor`, `limit`,
-  `next_cursor`, and `complete`. Cursors are positive sequence numbers.
+MCP and the socket API expose `resume(agent_id, task, timeout_seconds?,
+request_id?, orchestrator?)`, which returns the normal asynchronous start
+envelope with a new `agent_id`.
 
 The original runtime, model, reasoning effort, account/home, working directory,
 write/network/read-root grants, output schema and fast setting are inherited.
 Only the task and timeout change. Omitted timeout inherits the previous budget.
-Session-level fast toggles do not override a continuation. Missing or changed
-identity/permissions fail explicitly, including a profile changed while the
-new run is being prepared.
+Missing or changed identity/permissions fail explicitly, including a profile
+changed while the new run is being prepared.
 
 Only the latest terminal run may be continued. The database permits one child
 per predecessor, so concurrent requests cannot branch the conversation. A

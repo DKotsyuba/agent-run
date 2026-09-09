@@ -936,17 +936,12 @@ Review.
         with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
             self.service.transcript(agent_id, limit=1001)
 
-    def test_list_orchestrators_and_agent_effort_are_read_only(self) -> None:
-        """Expose persisted effort and bounded orchestrator aggregates."""
+    def test_list_exposes_persisted_agent_effort(self) -> None:
+        """Expose persisted effort through the factual agent page."""
 
         result = self.service.start(replace(self.request(request_id="effort"), effort="high"))
         self.wait_until(lambda: bool(self.launched))
-        self.assertEqual(self.service.get(result.agent_id).effort, "high")
         self.assertEqual(self.service.list(AgentQuery(limit=1)).items[0].effort, "high")
-        page = self.service.list_orchestrators(limit=1)
-        self.assertEqual((page.total, len(page.items), page.complete), (1, 1, True))
-        with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
-            self.service.list_orchestrators(limit=1001)
 
     def test_transcript_cursor_is_explicit_and_raw_ref_is_preserved(self) -> None:
         agent_id = self.start("transcript").agent_id
@@ -1032,54 +1027,7 @@ Review.
         with self.assertRaises(StateTransitionError):
             self.service.cancel(terminal_id)
 
-    def test_summary_models_and_stored_limits_share_the_service(self) -> None:
-        agent_id = self.start("summary", task="safe task").agent_id
-        ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
-        self.terminal(agent_id)
-        view = self.service.get(agent_id)
-        self.assertEqual(self.service.summary(agent_id=agent_id).agents, (view,))
-        self.assertEqual(self.service.summary(orchestrator=ref).total, 0)
-        with self.assertRaises(ValidationError):
-            self.service.summary()
-        with self.assertRaises(ValidationError):
-            self.service.summary(agent_id=agent_id, orchestrator=ref)
 
-        self.assertEqual(tuple(self.service.models()), ("fake",))
-        fake_roster = self.service.models()["fake"]
-        self.assertEqual(fake_roster.models[0].id, "model")
-        self.assertEqual(
-            fake_roster.capabilities, tuple(sorted(c.value for c in Capability))
-        )
-        self.assertTrue(fake_roster.available)
-        self.assertIsNone(fake_roster.reason)
-        self.store.replace_capacity_snapshot(
-            runtime="fake", scope_id="fake", observed_at=100, valid_until=150,
-            payload={"samples": [{"lane": "main", "window": "5h", "source": "test", "target": None, "remaining_percent": 50, "reset_at": 200, "observed_at": 100, "valid_until": 150}], "pools": [], "routes": []},
-        )
-        limits = self.service.limits()
-        self.assertEqual(len(limits.items), 1)
-        self.assertEqual(limits.items[0].key.runtime, "fake")
-        self.assertEqual(ADAPTER.limits_calls, 0)
-
-
-    def test_empty_roster_still_lists_the_runtime_with_a_reason(self) -> None:
-        ADAPTER.models_result = ()
-
-        roster = self.service.models()["fake"]
-
-        self.assertEqual(roster.models, ())
-        self.assertFalse(roster.available)
-        self.assertEqual(roster.reason, "roster empty")
-
-    def test_empty_roster_prefers_the_adapters_own_unavailable_reason(self) -> None:
-        ADAPTER.models_result = ()
-        ADAPTER.probe_health = RuntimeHealth(False, None, None, "no network route")
-
-        roster = self.service.models()["fake"]
-
-        self.assertEqual(roster.models, ())
-        self.assertFalse(roster.available)
-        self.assertEqual(roster.reason, "no network route")
 
     def test_codex_models_bootstrap_from_config_without_isolated_cache(self) -> None:
         from agent_run.config import RuntimeAuthConfig
@@ -1101,32 +1049,22 @@ Review.
                 )
             },
         )
-        service = AgentService(
-            config,
-            self.store,
-            self.root,
-            launch=lambda *_: None,
-            now=lambda: 100.0,
-        )
+        from agent_run.adapters.codex.adapter import ADAPTER as codex_adapter
 
-        roster = service.models()["codex"]
+        runtime = config.runtimes["codex"]
+        roster = codex_adapter.models(runtime, codex_home)
+        health = codex_adapter.probe(runtime, codex_home)
 
         self.assertEqual(
-            [(model.id, model.description, model.efforts) for model in roster.models],
+            [(model.id, model.description, model.efforts) for model in roster],
             [
                 ("gpt-5.6-sol", "", ()),
                 ("gpt-5.6-terra", "", ()),
             ],
         )
-        from agent_run.adapters.codex.adapter import ADAPTER as codex_adapter
-
+        self.assertFalse(health.available)
         self.assertEqual(
-            roster.capabilities,
-            tuple(sorted(c.value for c in codex_adapter.describe().capabilities)),
-        )
-        self.assertFalse(roster.available)
-        self.assertEqual(
-            roster.reason, "codex binary, generated home, or auth bridge is missing"
+            health.reason, "codex binary, generated home, or auth bridge is missing"
         )
         self.assertFalse((codex_home / "cache" / "models.json").exists())
 

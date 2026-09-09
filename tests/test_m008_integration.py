@@ -15,7 +15,6 @@ from agent_run.api_socket import ApiServer
 from agent_run.broker_client import BrokerClient
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.domain import Message, MessageRole, StartRequest
-from agent_run.dispatch import Session, call_tool
 from agent_run.errors import ValidationError
 from agent_run.mcp import serve
 from agent_run.paths import agent_dir
@@ -149,7 +148,8 @@ class M008IntegrationTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("asynchronous integration condition did not become true")
 
-    def test_real_service_mcp_preserves_counts_pagination_capacity_and_gate(self) -> None:
+
+    def test_real_service_mcp_preserves_counts_pagination_and_gate(self) -> None:
         ids = [self.service.start(self.request(f"active-{index}")).agent_id for index in range(3)]
         listed = self.mcp_call(
             self.service, 1, "list_agents", {"active": True, "limit": 2}
@@ -177,14 +177,6 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertFalse(transcript["complete"])
         self.assertIsNotNone(transcript["next_cursor"])
         self.assertEqual(transcript["messages"][1]["raw_ref"], "raw/two.json")
-
-        self.assertEqual(self.service.limits().items, (), "missing capacity stays unknown")
-        self.store.replace_capacity_snapshot(
-            runtime="fake", scope_id="fake", observed_at=10, valid_until=50,
-            payload={"samples": [{"lane": "main", "window": "5h", "source": "stale-test", "target": None, "remaining_percent": 50, "reset_at": 200, "observed_at": 10, "valid_until": 50}], "pools": [], "routes": []},
-        )
-        self.assertEqual(self.service.limits().items, ())
-        self.assertEqual(SERVICE_ADAPTER.limits_calls, 0)
 
         SERVICE_ADAPTER.capabilities = frozenset(
             capability for capability in Capability if capability is not Capability.STEER

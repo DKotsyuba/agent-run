@@ -142,32 +142,7 @@ class StateStore:
             startup_deadline_seconds=startup_deadline_seconds,
         )
 
-    def resume_chain(
-        self,
-        agent_id: str | AgentId,
-        *,
-        cursor: int = 1,
-        limit: int = 50,
-    ) -> list[sqlite3.Row]:
-        """Return one resume chain's rows in chronological (``sequence``) order.
 
-        ``agent_id`` may name any member of the chain; its ``root_agent_id``
-        selects the whole chain. ``cursor`` is the 1-based ``sequence`` to
-        start at and ``limit`` the maximum number of rows returned. Returns
-        ``limit + 1`` rows at most, so the caller can detect a further page
-        without a second count query; an unknown agent raises
-        :class:`agent_run.errors.NotFoundError` via :meth:`get_agent`.
-        """
-
-        root = self.get_agent(agent_id)["root_agent_id"]
-        return list(
-            self.connection.execute(
-                """SELECT * FROM agents
-                   WHERE root_agent_id = ? AND sequence >= ?
-                   ORDER BY sequence LIMIT ?""",
-                (root, cursor, limit + 1),
-            )
-        )
 
     def replace_config_revision(
         self,
@@ -225,50 +200,7 @@ class StateStore:
         ).fetchone()
         return None if row is None else str(row["id"])
 
-    def list_orchestrator_sessions(self, *, limit: int) -> list[dict[str, object]]:
-        """Return the most active bound sessions and one aggregate unbound row.
 
-        ``limit`` is a positive row bound.  Each returned mapping contains the
-        session metadata, active and total agent counts, and ``page_total`` for
-        the exact number of available rows before the bound; the synthetic
-        unbound mapping has a null ``id`` and is omitted when no agents are
-        unbound.  The read does not mutate state.
-        """
-
-        integer("limit", limit, minimum=1)
-        active = tuple(status.value for status in ACTIVE)
-        placeholders = ",".join("?" for _ in active)
-        rows = self.connection.execute(
-            f"""WITH bound AS (
-                    SELECT sessions.id, sessions.transport,
-                           sessions.external_session_id, sessions.external_turn_id,
-                           sessions.created_at, sessions.last_seen_at,
-                           SUM(CASE WHEN agents.status IN ({placeholders})
-                                    THEN 1 ELSE 0 END) AS active,
-                           COUNT(agents.id) AS total
-                    FROM orchestrator_sessions AS sessions
-                    JOIN agents ON agents.orchestrator_session_id = sessions.id
-                    GROUP BY sessions.id
-                ), unbound AS (
-                    SELECT NULL AS id, '' AS transport, '' AS external_session_id,
-                           NULL AS external_turn_id, MIN(created_at) AS created_at,
-                           MAX(created_at) AS last_seen_at,
-                           SUM(CASE WHEN status IN ({placeholders})
-                                    THEN 1 ELSE 0 END) AS active,
-                           COUNT(*) AS total
-                    FROM agents
-                    WHERE orchestrator_session_id IS NULL
-                    HAVING COUNT(*) > 0
-                ), all_sessions AS (
-                    SELECT * FROM bound UNION ALL SELECT * FROM unbound
-                )
-                SELECT *, COUNT(*) OVER () AS page_total
-                FROM all_sessions
-                ORDER BY active DESC, last_seen_at DESC
-                LIMIT ?""",
-            (*active, *active, limit),
-        )
-        return [dict(row) for row in rows]
 
     def get_agent(self, agent_id: str | AgentId) -> dict[str, object]:
         return dict(agent_row(self.connection, validate_agent_id(agent_id)))

@@ -82,7 +82,6 @@ jobs:
           "$RUNNER_TEMP/wheel-smoke/bin/python" -m pip check
           test "$("$RUNNER_TEMP/wheel-smoke/bin/python" -c 'from importlib.metadata import version; print(version("agent-run"))')" = "$version"
           AGENT_RUN_HOME="$RUNNER_TEMP/wheel-home" "$RUNNER_TEMP/wheel-smoke/bin/agent-run" init
-          AGENT_RUN_HOME="$RUNNER_TEMP/wheel-home" "$RUNNER_TEMP/wheel-smoke/bin/agent-run" doc releases
           python -m venv "$RUNNER_TEMP/sdist-smoke"
           "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --require-hashes --only-binary=:all: -r dist/build-requirements.lock
           "$RUNNER_TEMP/sdist-smoke/bin/python" -m pip install --no-build-isolation --no-deps dist/*.tar.gz

@@ -12,10 +12,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeAlias
 
-from .adapters.base import Capability, ModelInfo
+from .adapters.base import Capability
 from .adapters.registry import AdapterRegistry
 from .capacity.ranking import CapacityOrder
-from .capacity.snapshot import CapacityReading, build_capacity_routes
 from .config import Config, RuntimeConfig, load_config
 from .domain import (
     ACTIVE,
@@ -60,7 +59,6 @@ from .verify import (
 
 _logger = logging.getLogger("agent_run.service")
 
-_SUMMARY_LIMIT = 50
 _TASK_SUMMARY_CHARS = 160
 _DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
 _MAX_PAGE_SIZE = 1000
@@ -255,28 +253,6 @@ class AgentView:
     acceptance: str = "pending"
 
 
-@dataclass(frozen=True, slots=True)
-class OrchestratorView:
-    """Read-only aggregate for one launching orchestrator session."""
-
-    session_id: str | None
-    transport: str
-    external_session_id: str
-    external_turn_id: str | None
-    created_at: float
-    last_seen_at: float
-    active: int
-    total: int
-
-
-@dataclass(frozen=True, slots=True)
-class OrchestratorPage:
-    """A bounded read-only orchestrator-session page with an exact total."""
-
-    items: tuple[OrchestratorView, ...]
-    total: int
-    limit: int
-    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,22 +309,6 @@ class AgentPage:
     observed_at: float = 0.0
 
 
-@dataclass(frozen=True, slots=True)
-class ChainPage:
-    """One bounded, chronological page of a resume chain.
-
-    ``items`` are the chain's agents ordered by ``sequence``. ``cursor`` is the
-    1-based sequence this page started at, ``limit`` the requested page size,
-    and ``next_cursor`` the sequence to pass back for the following page, or
-    ``None`` when this page reached the end. ``complete`` mirrors that: it is
-    ``True`` only when no further page exists.
-    """
-
-    items: tuple[AgentView, ...]
-    cursor: int
-    limit: int
-    next_cursor: int | None
-    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,42 +368,6 @@ class AnswerView:
     proof_version: int | None
 
 
-@dataclass(frozen=True, slots=True)
-class WorkSummary:
-    scope: str
-    agent_id: AgentId | None
-    orchestrator: OrchestratorRef | None
-    agents: tuple[AgentView, ...]
-    total: int
-    complete: bool
-
-
-@dataclass(frozen=True, slots=True)
-class CapacityReport:
-    """Current fresh provider readings observed at one service clock value."""
-
-    observed_at: float
-    items: tuple[CapacityReading, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeModels:
-    """One runtime's model discovery snapshot: roster plus capability/health context.
-
-    ``models`` keeps the pre-existing :class:`ModelInfo` shape unchanged so
-    current consumers of individual model entries do not break. ``capabilities``
-    is the adapter's declared :class:`Capability` set (sorted string values), so
-    a router can check whether a runtime supports a requested right (e.g.
-    ``write``) before selecting it. ``available`` is ``False`` whenever the
-    adapter is unhealthy or its roster is empty; ``reason`` carries the
-    adapter-supplied explanation, falling back to ``"roster empty"`` when the
-    adapter reports itself healthy but the roster still came back empty.
-    """
-
-    models: tuple[ModelInfo, ...]
-    capabilities: tuple[str, ...]
-    available: bool
-    reason: str | None
 
 
 class AgentService:
@@ -783,44 +707,7 @@ class AgentService:
             role_plan=role_plan,
         )
 
-    def chain(
-        self,
-        agent_id: str | AgentId,
-        *,
-        cursor: int | None = None,
-        limit: int = _SUMMARY_LIMIT,
-    ) -> ChainPage:
-        """Page one resume chain in chronological order.
 
-        ``agent_id`` may be any member of the chain; the whole chain is
-        returned regardless of which node was named. ``cursor`` is the 1-based
-        ``sequence`` to resume paging from, defaulting to the chain's first
-        agent, and ``limit`` bounds the page at :data:`_MAX_PAGE_SIZE`.
-
-        Returns a :class:`ChainPage` whose ``next_cursor`` is the sequence of
-        the first unreturned agent, or ``None`` when the page ends the chain.
-        Raises :class:`ValidationError` for a non-positive cursor or an
-        out-of-range limit.
-        """
-
-        start = 1 if cursor is None else cursor
-        if isinstance(start, bool) or not isinstance(start, int) or start < 1:
-            raise ValidationError("cursor must be a positive integer")
-        bounded = _page_limit(limit)
-        rows = self._store.resume_chain(agent_id, cursor=start, limit=bounded)
-        now = self._now()
-        selected = rows[:bounded]
-        projection = self._store.agent_projection(
-            str(row["id"]) for row in selected
-        )
-        items = tuple(
-            self._agent_view(row, now, projection[str(row["id"])])
-            for row in selected
-        )
-        next_cursor = (
-            int(rows[bounded]["sequence"]) if len(rows) > bounded else None
-        )
-        return ChainPage(items, start, bounded, next_cursor, next_cursor is None)
 
     def steer(self, agent_id: str | AgentId, text: str) -> CommandView:
         if not isinstance(text, str) or not text.strip():
@@ -896,31 +783,7 @@ class AgentService:
             observed_at,
         )
 
-    def list_orchestrators(self, *, limit: int = 100) -> OrchestratorPage:
-        """Return up to ``limit`` session aggregates, ordered by activity.
 
-        ``limit`` must be a positive integer no greater than 1000.  The page
-        includes bound sessions with agents and, when applicable, one null-ID
-        aggregate for unbound agents; no state is changed.
-        """
-
-        _page_limit(limit)
-        rows = self._store.list_orchestrator_sessions(limit=limit)
-        total = 0 if not rows else int(rows[0]["page_total"])
-        items = tuple(
-            OrchestratorView(
-                None if row["id"] is None else str(row["id"]),
-                str(row["transport"]),
-                str(row["external_session_id"]),
-                None if row["external_turn_id"] is None else str(row["external_turn_id"]),
-                float(row["created_at"]),
-                float(row["last_seen_at"]),
-                int(row["active"]),
-                int(row["total"]),
-            )
-            for row in rows
-        )
-        return OrchestratorPage(items, total, limit, len(items) == total)
 
     def transcript(
         self, agent_id: str | AgentId, cursor: int = 0, limit: int = 200
@@ -1019,68 +882,7 @@ class AgentService:
             proof_version,
         )
 
-    def summary(
-        self,
-        *,
-        agent_id: str | AgentId | None = None,
-        orchestrator: OrchestratorRef | None = None,
-    ) -> WorkSummary:
-        if (agent_id is None) == (orchestrator is None):
-            raise ValidationError("summary requires exactly one of agent_id or orchestrator")
-        if agent_id is not None:
-            agent = self.get(agent_id)
-            return WorkSummary("agent", agent.agent_id, None, (agent,), 1, True)
-        if not isinstance(orchestrator, OrchestratorRef):
-            raise ValidationError("orchestrator must be an OrchestratorRef")
-        page = self.list(
-            AgentQuery(active=True, orchestrator=orchestrator, limit=_SUMMARY_LIMIT)
-        )
-        return WorkSummary(
-            "orchestrator", None, orchestrator, page.items, page.total, page.complete
-        )
 
-    def models(self) -> Mapping[str, RuntimeModels]:
-        result: dict[str, RuntimeModels] = {}
-        for name in sorted(self._config.runtimes):
-            runtime = self._config.runtimes[name]
-            if not runtime.enabled:
-                continue
-            adapter = self._registry.load(name, (Capability.MODEL_ROSTER,))
-            adapter.validate(runtime)
-            allowed = set(runtime.models)
-            roster = tuple(
-                model
-                for model in adapter.models(runtime, runtime.home)
-                if model.id in allowed
-            )
-            capabilities = tuple(
-                sorted(capability.value for capability in adapter.describe().capabilities)
-            )
-            health = adapter.probe(runtime, runtime.home)
-            available = health.available and bool(roster)
-            reason = health.reason
-            if not roster and reason is None:
-                reason = "roster empty"
-            _logger.debug(
-                "models runtime=%s available=%s count=%d reason=%s",
-                name, available, len(roster), reason,
-            )
-            result[name] = RuntimeModels(roster, capabilities, available, reason)
-        _logger.info("models runtimes=%d", len(result))
-        return MappingProxyType(result)
-
-    def limits(self) -> CapacityReport:
-        """Return enabled runtimes' current fresh samples without projections."""
-
-        observed_at = self._now()
-        enabled = {
-            name for name, runtime in self._config.runtimes.items() if runtime.enabled
-        }
-        snapshot = build_capacity_routes(self._store, now=observed_at)
-        return CapacityReport(
-            observed_at,
-            tuple(item for item in snapshot.readings if item.key.runtime in enabled),
-        )
 
     def capacity_order(self) -> CapacityOrder:
         """Return enabled runtimes' deterministic capacity routing order.

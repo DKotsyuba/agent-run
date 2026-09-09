@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import IO, Mapping
@@ -42,24 +42,6 @@ _ORCHESTRATOR = _schema(
     },
     ("transport", "external_session_id"),
 )
-_CONTINUATION_TOOLS = (
-    {
-        "name": "resume",
-        "description": "Continue a terminal agent's native context as a new durable run with inherited identity and permissions.",
-        "inputSchema": _schema({
-            "agent_id": _ID, "task": {"type": "string"},
-            "timeout_seconds": {"type": ["number", "null"]},
-            "request_id": {"type": ["string", "null"]},
-            "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
-        }, ("agent_id", "task")),
-    },
-    {
-        "name": "chain",
-        "description": "Read a chronological page of the continuation chain containing this agent.",
-        "inputSchema": _schema({"agent_id": _ID, "cursor": {"type": ["integer", "null"]},
-                                "limit": {"type": "integer"}}, ("agent_id",)),
-    },
-)
 TOOLS = (
     {
         "name": "capacity_order",
@@ -91,14 +73,6 @@ TOOLS = (
         ),
     },
     {
-        "name": "fast",
-        "description": "Get or set the ephemeral Codex fast-mode toggle, optionally for one account.",
-        "inputSchema": _schema(
-            {"runtime": {"type": "string"}, "enabled": {"type": "boolean"},
-             "account": {"type": ["string", "null"]}}
-        ),
-    },
-    {
         "name": "cancel",
         "description": "Durably request agent cancellation.",
         "inputSchema": _schema({"agent_id": _ID}, ("agent_id",)),
@@ -112,11 +86,6 @@ TOOLS = (
         ),
     },
     {
-        "name": "status",
-        "description": "Get one agent's current durable status.",
-        "inputSchema": _schema({"agent_id": _ID}, ("agent_id",)),
-    },
-    {
         "name": "list_agents",
         "description": "List a bounded page with an exact total.",
         "inputSchema": _schema(
@@ -127,21 +96,6 @@ TOOLS = (
                 "limit": {"type": "integer"},
                 "after_revision": {"type": ["integer", "null"]},
                 "wait_seconds": {"type": "number"},
-            }
-        ),
-    },
-    {
-        "name": "list_orchestrators",
-        "description": "List bounded orchestrator-session aggregates with an exact total.",
-        "inputSchema": _schema({"limit": {"type": "integer"}}),
-    },
-    {
-        "name": "summary",
-        "description": "Summarize exactly one agent or orchestration session.",
-        "inputSchema": _schema(
-            {
-                "agent_id": {"type": ["string", "null"]},
-                "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
             }
         ),
     },
@@ -163,53 +117,24 @@ TOOLS = (
         "inputSchema": _schema({"agent_id": _ID}, ("agent_id",)),
     },
     {
-        "name": "models",
-        "description": (
-            "List enabled runtime model rosters with each runtime's declared "
-            "capabilities and available/reason health."
-        ),
-        "inputSchema": _schema({}),
-    },
-    {
-        "name": "limits",
-        "description": "Read stored fresh capacity projections without provider calls.",
-        "inputSchema": _schema({}),
-    },
-    {
-        "name": "doc",
-        "description": "Read one operator guide topic, or the index when omitted.",
-        "inputSchema": _schema({"topic": {"type": ["string", "null"]}}),
+        "name": "resume",
+        "description": "Continue a terminal agent's native context as a new durable run with inherited identity and permissions.",
+        "inputSchema": _schema({
+            "agent_id": _ID, "task": {"type": "string"},
+            "timeout_seconds": {"type": ["number", "null"]},
+            "request_id": {"type": ["string", "null"]},
+            "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
+        }, ("agent_id", "task")),
     },
 )
-TOOLS += _CONTINUATION_TOOLS
 TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 
-@dataclass
-class Session:
-    """Own fast defaults for one transport session, without persistence.
+def call_tool(service: AgentService, name: str, raw: dict) -> object:
+    """Validate and dispatch one of the eight public tools."""
 
-    ``fast_modes`` maps runtime names (str) to bool defaults.
-    ``fast_account_modes`` maps (runtime, account) string pairs to bool
-    overrides, including explicit False. The owning transport serializes access.
-    """
-
-    fast_modes: dict[str, bool] = field(default_factory=lambda: {"codex": False})
-    fast_account_modes: dict[tuple[str, str], bool] = field(default_factory=dict)
-
-
-def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> object:
-    """Validate and dispatch a named tool using the session's mutable defaults.
-
-    ``service`` is the AgentService facade, ``name`` a tool-name str, ``raw``
-    its argument dict, and ``session`` the transport-owned Session. Return the
-    tool's JSON-compatible result; invalid arguments raise ValidationError.
-    Fast mutations last only for this session. Starts prefer an explicit bool,
-    then the resolved account override, then the runtime default. Fast queries
-    return detached dicts, adding ``accounts`` only when overrides exist.
-    """
-
-    fast_modes = session.fast_modes
+    if name not in TOOL_NAMES:
+        raise ValidationError(f"unknown tool: {name}")
     if name == "resume":
         args = _arguments(raw, {"agent_id", "task", "timeout_seconds", "request_id", "orchestrator"}, {"agent_id", "task"})
         return service.resume(
@@ -218,31 +143,6 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
             request_id=_optional_string(args, "request_id"),
             orchestrator=_optional_orchestrator(args.get("orchestrator")),
         )
-    if name == "chain":
-        args = _arguments(raw, {"agent_id", "cursor", "limit"}, {"agent_id"})
-        return service.chain(_string(args, "agent_id"), cursor=args.get("cursor"), limit=args.get("limit", 50))
-    if name == "fast":
-        args = _arguments(raw, {"runtime", "enabled", "account"})
-        if not args:
-            if not session.fast_account_modes:
-                return dict(fast_modes)
-            return {**fast_modes, "accounts": {
-                account: enabled for (runtime, account), enabled in session.fast_account_modes.items()
-                if runtime == "codex"
-            }}
-        runtime = _string(args, "runtime")
-        if runtime != "codex":
-            raise ValidationError(f"{runtime} runtime does not support fast mode")
-        enabled = args.get("enabled")
-        if not isinstance(enabled, bool):
-            raise ValidationError("enabled must be a boolean")
-        account = _optional_string(args, "account")
-        if account is None:
-            fast_modes[runtime] = enabled
-        else:
-            service.resolve_account(runtime, account)
-            session.fast_account_modes[(runtime, account)] = enabled
-        return call_tool(service, "fast", {}, session)
     if name == "start":
         args = _arguments(
             raw,
@@ -259,9 +159,7 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
             raise ValidationError("write must be a boolean")
         runtime_name = _string(args, "runtime")
         account = _optional_string(args, "account")
-        effective_account = service.resolve_account(runtime_name, account)
-        fast = args.get("fast", session.fast_account_modes.get(
-            (runtime_name, effective_account), fast_modes.get(runtime_name, False)))
+        fast = args.get("fast", False)
         if not isinstance(fast, bool):
             raise ValidationError("fast must be a boolean")
         roots = args.get("read_roots", [])
@@ -309,13 +207,11 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 required_constraints=required_constraints,
             )
         )
-    if name in {"cancel", "status", "answer"}:
+    if name in {"cancel", "answer"}:
         args = _arguments(raw, {"agent_id"}, {"agent_id"})
         agent_id = _string(args, "agent_id")
         if name == "cancel":
             return service.cancel(agent_id)
-        if name == "status":
-            return service.get(agent_id)
         return service.answer(agent_id)
     if name == "steer":
         args = _arguments(raw, {"agent_id", "text"}, {"agent_id", "text"})
@@ -338,18 +234,6 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 wait_seconds=args.get("wait_seconds", 0.0),
             )
         )
-    if name == "list_orchestrators":
-        args = _arguments(raw, {"limit"})
-        limit = args.get("limit", 100)
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            raise ValidationError("limit must be an integer")
-        return service.list_orchestrators(limit=limit)
-    if name == "summary":
-        args = _arguments(raw, {"agent_id", "orchestrator"})
-        return service.summary(
-            agent_id=_optional_string(args, "agent_id"),
-            orchestrator=_optional_orchestrator(args.get("orchestrator")),
-        )
     if name == "transcript":
         args = _arguments(raw, {"agent_id", "cursor", "limit"}, {"agent_id"})
         return service.transcript(
@@ -357,16 +241,8 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
             cursor=args.get("cursor", 0),
             limit=args.get("limit", 200),
         )
-    if name == "doc":
-        from .doc import topic_text
-
-        args = _arguments(raw, {"topic"})
-        topic = _optional_string(args, "topic")
-        return {"topic": topic or "index", "text": topic_text(topic)}
     args = _arguments(raw, set())
-    if name == "capacity_order":
-        return service.capacity_order()
-    return service.models() if name == "models" else service.limits()
+    return service.capacity_order()
 
 
 def _arguments(raw: dict, allowed: set[str], required: set[str] = set()) -> dict:

@@ -41,8 +41,7 @@ you / your agent / your app
 - **Quota-aware.** A capacity collector samples remaining limits per
   provider (native engine data, [codexbar](https://github.com/steipete/codexbar),
   or a local router), computes usage priorities from burn rate and reset time,
-  and injects an ordered summary when it changes. The orchestrator chooses the
-  first role-compatible route; `limits` remains available for diagnostics.
+  and ranks compatible routes for the orchestrator.
 - **Locked dependencies.** Runtime packages are declared in `pyproject.toml`,
   resolved in the committed `uv.lock`, and release installs verify a hashed
   dependency closure before the application wheel.
@@ -153,15 +152,6 @@ When Claude declares `accounts`, select one explicitly with
 `agent-run login claude --account personal`. Labelled runs use private
 `CLAUDE_CONFIG_DIR` state; unlabelled runs use the native global directory.
 
-The built-in operator guide documents every section:
-
-```bash
-agent-run doc            # index
-agent-run doc config     # config.toml rules
-agent-run doc models     # rosters; also: skills, plugins, mcp-servers,
-                         # service, releases, migrations, troubleshoot
-```
-
 Check the installation:
 
 ```bash
@@ -189,9 +179,9 @@ agent-run wait ag-20260831-...
 agent-run answer ag-20260831-...
 ```
 
-Useful verbs beyond that: `status`, `transcript --follow`, `steer`,
-`cancel`, `agents` (list), `models`, `limits`, `summary`,
-`stats backfill`. All output is line-delimited JSON — pipe it into `jq`.
+Useful verbs beyond that: `transcript --follow`, `steer`, `cancel`, `agents`
+(list), and `stats backfill`. All output is line-delimited JSON — pipe it into
+`jq`.
 
 ## Use as an MCP server
 
@@ -210,9 +200,9 @@ agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgent
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 ```
 
-The proxy exposes the same tool surface as the resident daemon: `start`,
-`status`, `answer`, `wait`-free async flow, `cancel`, `steer`, `summary`,
-`transcript`, `list_agents`, `models`, `limits`, `capacity_order`, `fast`, and `doc`.
+The proxy exposes the same eight tools as the resident daemon: `start`,
+`resume`, `cancel`, `steer`, `list_agents`, `answer`, `transcript`, and
+`capacity_order`.
 
 **Claude Code:**
 
@@ -257,7 +247,6 @@ a copy-paste Python client: [docs/api.md](docs/api.md).
 | CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
 | MCP server | `agent-run mcp` | stdio, shared tool surface |
 | JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
-| Operator guide | `agent-run doc` | built into the package |
 | Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
 | Capacity collector | `agent-run capacity collect` | + launchd plist generator |
 | Capacity priority | `agent-run capacity order` | read-only, role-independent route order |
@@ -277,7 +266,6 @@ macOS Git bootstrap).
 - [CHANGELOG.md](CHANGELOG.md) — user-visible changes by version
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development and pull-request checks
 - [SECURITY.md](SECURITY.md) — supported versions and private reporting
-- `agent-run doc` — operator guide (config, models, releases, …)
 - [AGENTS.md](AGENTS.md) — rules for working on this codebase
 
 ## License

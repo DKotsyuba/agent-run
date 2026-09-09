@@ -12,7 +12,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.config import Config, RuntimeConfig
-from agent_run.dispatch import Session, _jsonable, call_tool
+from agent_run.dispatch import _jsonable, call_tool
 from agent_run.service import AgentService
 from agent_run.state import StateStore
 
@@ -165,8 +165,8 @@ class CapacityServiceTests(unittest.TestCase):
         self.assertEqual(order.unavailable_runtimes, ("empty",))
         self.assertNotIn("disabled", repr(order))
 
-    def test_dispatch_serializes_multiplier_aliases_omissions_and_limits_shape(self) -> None:
-        """Shared transports retain concrete aliases and the legacy limits schema."""
+    def test_dispatch_serializes_multiplier_aliases_and_omissions(self) -> None:
+        """Shared transports retain concrete aliases and omission evidence."""
 
         self._append_scope(
             "boosted",
@@ -190,10 +190,9 @@ class CapacityServiceTests(unittest.TestCase):
             },
             lambda: _NOW,
         )
-        session = Session()
         result = cast(
             dict[str, object],
-            _jsonable(call_tool(service, "capacity_order", {}, session)),
+            _jsonable(call_tool(service, "capacity_order", {})),
         )
         routes = cast(list[dict[str, object]], result["routes"])
         aliases = cast(list[dict[str, object]], routes[0]["aliases"])
@@ -209,12 +208,6 @@ class CapacityServiceTests(unittest.TestCase):
         )
         self.assertEqual(omitted[0]["runtime"], "exhausted")
         self.assertFalse(result["insufficient_diversity"])
-
-        limits = cast(
-            dict[str, object], _jsonable(call_tool(service, "limits", {}, session))
-        )
-        items = cast(list[dict[str, object]], limits["items"])
-        self.assertEqual(set(items[0]), {"key", "remaining_percent", "reset_at", "observed_at", "valid_until"})
 
 
 if __name__ == "__main__":
