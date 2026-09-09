@@ -2,6 +2,40 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.0] - 2026-09-09
+
+- test(roles): canonicalize fixture command path
+- fix(api): isolate list long polls
+- test(supervisor): prepare detached launch fixtures
+- test(capacity): remove obsolete history coverage
+- test(service): follow supervisor preparation boundary
+- test(service): remove obsolete bootstrap wait
+- fix(claude): reap leader after group cancellation
+- test(runtime): execute preparation at supervisor boundary
+- test(capacity): read current identity snapshots
+- feat(cli)!: fold waiting into start
+- feat: restore push delivery and operator tools
+- refactor!: shrink public agent tool surface
+- refactor!: remove completion delivery pipeline
+- refactor(capacity)!: keep only current snapshots
+- test(runtime): align startup fixtures with supervisor preparation
+- fix(runtime): require process proof for startup loss
+- test(runtime): prepare captured supervisor launches
+- refactor(tui)!: remove standalone terminal dashboard
+- feat(supervisor): remove automatic runtime timers
+- test(supervisor): prove explicit cancel cleanup
+- feat(status): expose factual agent revisions
+- refactor(supervisor): own preparation before ready
+- fix(runtime): tighten resolved role decoding
+- fix(runtime): preserve resolved role compatibility
+- fix(runtime): compile isolated resolved role contracts
+- test(claude): cover inherited host environment
+- refactor(config): move runtime readiness out of launch
+- refactor(adapters): compile resolved roles through one boundary
+- feat(auth): default to native runtime accounts
+- feat(roles): resolve one canonical runtime contract
+- refactor(adapters): inherit host development environment
+
 ## [0.10.2] - 2026-09-08
 
 - fix(snapshots): preserve legacy resume compatibility
