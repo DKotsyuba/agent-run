@@ -39,6 +39,7 @@ from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
+from agent_run.preparation import prepare_launch
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
@@ -207,6 +208,14 @@ class AgentServiceTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("asynchronous condition did not become true")
 
+    def prepare_captured(self, index: int = -1) -> None:
+        """Execute preparation for one captured three-field supervisor payload."""
+
+        agent_id, request, role = self.launched[index]
+        prepare_launch(
+            self.store, self.root, self.service._config, agent_id, request, role
+        )
+
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
 
@@ -315,12 +324,7 @@ class AgentServiceTests(unittest.TestCase):
         self.service.start(
             replace(self.request(request_id="account"), account="personal2")
         )
-        self.wait_until(lambda: bool(ADAPTER.materialize_homes))
-        self.wait_until(
-            lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
-                "snapshot:v1:"
-            )
-        )
+        self.prepare_captured()
         agent = self.store.list_agents()[0]
         attempt_home = self.root / "agents" / str(agent["id"]) / "runtime-home"
         self.assertEqual(ADAPTER.materialize_homes[-1], attempt_home)
@@ -1005,6 +1009,7 @@ Review.
 
     def test_answer_verifies_path_size_hash_and_bounds_inline_content(self) -> None:
         agent_id = self.start("answer").agent_id
+        self.prepare_captured()
         directory = agent_dir(agent_id, self.root)
         self.assertTrue(directory.is_dir())
         path = directory / "answer.md"

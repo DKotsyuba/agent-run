@@ -24,6 +24,7 @@ from agent_run.adapters.base import (
 from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.domain import StartRequest
+from agent_run.preparation import prepare_launch
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
@@ -179,31 +180,28 @@ class ServiceLoggingTests(unittest.TestCase):
         )
 
     def test_service_start_logs_a_reconstructable_lifecycle(self) -> None:
-        """Capture logs until the asynchronous start worker has fully returned."""
+        """Capture admission and preparation logs across the supervisor boundary."""
 
-        finished = threading.Event()
-        original = self.service._continue_start
+        def tracked_launch(agent_id, request, role) -> None:
+            """Execute the captured payload at the detached preparation boundary."""
 
-        def tracked_start(*args, **kwargs):
-            """Signal only after the real worker emitted its terminal lifecycle log."""
-
-            try:
-                return original(*args, **kwargs)
-            finally:
-                finished.set()
+            prepare_launch(self.store, self.root, self.config, agent_id, request, role)
 
         with (
-            self.assertLogs("agent_run.service", level="DEBUG") as captured,
-            patch.object(self.service, "_continue_start", side_effect=tracked_start),
+            self.assertLogs("agent_run", level="DEBUG") as captured,
+            patch.object(self.service, "_launch", side_effect=tracked_launch),
         ):
             self.service.start(self.request(request_id="log-test"))
-            self.assertTrue(finished.wait(2), "start worker did not finish")
         joined = "\n".join(captured.output)
         self.assertIn("start runtime=fake model=model", joined)
-        self.assertIn("gate=capabilities ok", joined)
-        self.assertIn("materialized runtime=fake revision=snapshot:v1:", joined)
         self.assertIn("created=True", joined)
-        self.assertIn("done", joined)
+        row = self.store.list_agents()[0]
+        self.assertTrue(str(row["config_revision"]).startswith("snapshot:v1:"))
+        stages = self.store.connection.execute(
+            "SELECT kind FROM events WHERE agent_id = ? AND kind = 'preparation_stage'",
+            (row["id"],),
+        ).fetchall()
+        self.assertGreater(len(stages), 0)
 
     def test_service_start_never_logs_env_secret_values(self) -> None:
         secret = "sk-super-secret-token-value"

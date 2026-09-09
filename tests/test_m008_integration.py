@@ -317,12 +317,8 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertFalse(failed["isError"])
         self.assertTrue(failed["structuredContent"]["created"])
         agent_id = failed["structuredContent"]["agent_id"]
-        self.wait_until(
-            lambda: self.store.get_agent(agent_id)["status"]
-            == AgentStatus.FAILED.value
-        )
         row = self.store.list_agents()[0]
-        self.assertEqual((row["status"], row["failure_kind"]), ("failed", "supervisor_start_failed"))
+        self.assertEqual((row["status"], row["failure_kind"]), ("failed", "start_submit_failed"))
         retried = self.mcp_call(service, 2, "start", arguments)
         self.assertFalse(retried["isError"])
         self.assertFalse(retried["structuredContent"]["created"])

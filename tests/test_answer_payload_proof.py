@@ -26,6 +26,7 @@ from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.domain import TERMINAL, AgentStatus, Outcome, StartRequest
 from agent_run.errors import PathEscapeError
 from agent_run.paths import agent_dir
+from agent_run.preparation import prepare_launch
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 from agent_run.verify import (
@@ -423,11 +424,16 @@ class _ServiceFixture:
             },
         )
         self.store = StateStore.initialize(self.root / "state.db")
+        def launch(agent_id, request, role) -> None:
+            """Execute the detached supervisor's preparation boundary synchronously."""
+
+            prepare_launch(self.store, self.root, self.config, agent_id, request, role)
+
         self.service = AgentService(
             self.config,
             self.store,
             self.root,
-            launch=lambda *args: None,
+            launch=launch,
             now=lambda: 100.0,
         )
 
@@ -448,15 +454,7 @@ class _ServiceFixture:
             task="produce an answer",
             workdir=self.workdir,
         )
-        agent_id = str(self.service.start(request).agent_id)
-        for _ in range(1000):
-            status = self.service.get(agent_id).status
-            if status is AgentStatus.STARTING and agent_dir(agent_id, self.root).is_dir():
-                return agent_id
-            if status in TERMINAL:
-                self.fail(f"fixture agent failed during preparation: {status.value}")
-            time.sleep(0.001)
-        self.fail("fixture agent did not reach running state")
+        return str(self.service.start(request).agent_id)
 
     def _record_answer(self, agent_id: str, payload: bytes, *, seal: bool) -> tuple[Path, int, str]:
         """Record a current sealed or historical framed answer for one agent."""
