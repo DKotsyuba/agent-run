@@ -259,8 +259,7 @@ compatible role/model alias and decides whether to launch. The output retains
 deferred evidence, exhausted omissions, unavailable runtimes, and the
 `insufficient_diversity` signal alongside the working routes.
 
-Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
-terminal, with an idempotent `stats backfill`.
+Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at terminal.
 
 ## Releases
 

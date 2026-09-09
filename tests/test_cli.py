@@ -274,6 +274,57 @@ class CliTests(unittest.TestCase):
             broker.close.assert_called_once_with()
             self.assertIn(AGENT_ID, output.getvalue())
 
+    def test_start_wait_reuses_private_socket_until_existing_agent_finishes(self):
+        """Wait for an idempotent start and emit its terminal answer once."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            broker = Mock()
+            broker.start.return_value = FakeStart(created=False)
+            broker.call.side_effect = [
+                {"agent_id": AGENT_ID, "status": "running", "timed_out": True},
+                {"agent_id": AGENT_ID, "status": "failed", "available": False},
+            ]
+            output, error = io.StringIO(), io.StringIO()
+            with patch.object(cli, "BrokerClient", return_value=broker):
+                code = cli.main(
+                    ["--home", directory, "start", "--runtime", "codex",
+                     "--model", "model", "--profile", "review", "--task", "task",
+                     "--workdir", directory, "--wait"],
+                    stdin=io.StringIO(), stdout=output, stderr=error,
+                )
+        self.assertEqual((code, error.getvalue()), (2, ""))
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {"agent_id": AGENT_ID, "status": "failed", "available": False},
+        )
+        self.assertEqual(broker.call.call_count, 2)
+        for call in broker.call.call_args_list:
+            self.assertEqual(call.args[0], "wait")
+            self.assertEqual(call.args[1]["agent_id"], AGENT_ID)
+            self.assertEqual(call.kwargs["timeout"], cli._PRIVATE_WAIT_CALL_SECONDS)
+        broker.close.assert_called_once_with()
+
+    def test_start_wait_interrupt_closes_only_the_client(self):
+        """Propagate Ctrl-C after admission without sending agent cancellation."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            broker = Mock()
+            broker.start.return_value = FakeStart()
+            broker.call.side_effect = KeyboardInterrupt
+            output = io.StringIO()
+            with patch.object(cli, "BrokerClient", return_value=broker):
+                with self.assertRaises(KeyboardInterrupt):
+                    cli.main(
+                        ["--home", directory, "start", "--runtime", "codex",
+                         "--model", "model", "--profile", "review", "--task", "task",
+                         "--workdir", directory, "--wait"],
+                        stdin=io.StringIO(), stdout=output, stderr=io.StringIO(),
+                    )
+        self.assertEqual(output.getvalue(), "")
+        broker.start.assert_called_once()
+        broker.cancel.assert_not_called()
+        broker.close.assert_called_once_with()
+
     def test_auth_runs_codex_login_in_account_home(self):
         """Run account login without resolving away the configured launcher path."""
         with tempfile.TemporaryDirectory() as directory:
@@ -653,6 +704,7 @@ target = "auth.json"
         for command in (
             ["workflow", "status", "wf_old"], ["batch", "--file", "-"],
             ["chain", AGENT_ID], ["status", AGENT_ID], ["summary"],
+            ["wait", AGENT_ID], ["stats", "backfill"],
         ):
             with self.subTest(command=command), self.assertRaises(ValidationError):
                 cli._parser().parse_args(command)

@@ -212,6 +212,8 @@ Notes for the loop:
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
+- CLI `start --wait` repeatedly uses the private socket `wait` method and emits
+  its terminal answer; interrupting that client leaves the durable run active.
 - Use `capacity_order` to choose the first compatible available route.
 - Use `models` for current runtime rosters and health; `limits` returns current
   fresh capacity readings without history, forecasts, burn, risk, or advice.

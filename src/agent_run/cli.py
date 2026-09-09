@@ -44,8 +44,7 @@ from .preparation import request_payload
 from .role_plan import ResolvedRolePlan
 from .service import AgentQuery, AgentService
 from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
-from .state.run_stats import backfill_run_stats
-from .wait import DEFAULT_POLL_SECONDS, wait_for_agent
+from .wait import AGENT_EXIT_CODES
 
 _logger = logging.getLogger("agent_run.cli")
 
@@ -54,6 +53,8 @@ _EXPECTED_ERROR_EXIT = 2
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
+_PRIVATE_WAIT_SECONDS = 60.0
+_PRIVATE_WAIT_CALL_SECONDS = 65.0
 #: Transports a `hook bind`/`hook context` may record, and the only names the
 #: dispatcher can route back to. An unknown name is refused at bind time
 #: rather than becoming an undeliverable row hours later.
@@ -69,19 +70,6 @@ def _session(parser: argparse.ArgumentParser, *, required: bool = False) -> None
     parser.add_argument("--session-transport", required=required)
     parser.add_argument("--session-id", required=required)
     parser.add_argument("--session-turn-id")
-
-
-def _wait_options(parser: argparse.ArgumentParser) -> None:
-    """Add the shared ``wait`` polling options to a subcommand parser.
-
-    ``--timeout`` is the watcher budget in seconds, where ``0`` (the default)
-    waits forever because the run's own ``timeout_seconds`` bounds it;
-    ``--poll`` is the seconds between polls, defaulting to the wait module's
-    ``DEFAULT_POLL_SECONDS``.
-    """
-
-    parser.add_argument("--timeout", type=float, default=0.0)
-    parser.add_argument("--poll", type=float, default=DEFAULT_POLL_SECONDS)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -103,6 +91,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--output-schema")
     start.add_argument("--request-id")
     start.add_argument("--account")
+    start.add_argument("--wait", action="store_true")
     _session(start)
 
     resume = commands.add_parser("resume")
@@ -130,10 +119,6 @@ def _parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("agent_id")
 
-    agent_wait = commands.add_parser("wait")
-    agent_wait.add_argument("agent_id")
-    _wait_options(agent_wait)
-
     steer = commands.add_parser("steer")
     steer.add_argument("agent_id")
     steer.add_argument("--text", required=True)
@@ -154,11 +139,6 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("models")
     commands.add_parser("limits")
-
-    stats = commands.add_parser("stats").add_subparsers(
-        dest="stats_command", required=True
-    )
-    stats.add_parser("backfill")
 
     context = commands.add_parser("context")
     _session(context, required=True)
@@ -465,24 +445,28 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     raise AgentRunError(f"unsupported command: {command}")
 
 
-def _wait_command(
-    args: argparse.Namespace, service, stdout: TextIO, stderr: TextIO
-) -> int:
-    """Run a blocking ``wait`` verb and return its status-coded exit.
+def _wait_started(broker: BrokerClient, agent_id: str) -> tuple[dict, int]:
+    """Wait through bounded private socket calls and return final payload/exit.
 
-    The polling loop lives in :mod:`agent_run.wait`; this only hands it the
-    parsed arguments and owns the process-visible side effects: the terminal
-    payload goes to stdout, and when the watcher gives up the current status
-    payload is joined by a one-line note on stderr.
+    Each server wait is finite so a lost response cannot hang the client
+    forever. Watcher timeouts retry the same durable agent; interruption closes
+    only this client and never cancels the run.
     """
 
-    outcome = wait_for_agent(
-        service, args.agent_id, timeout=args.timeout, poll=args.poll
-    )
-    _emit(outcome.payload, stdout)
-    if outcome.note is not None:
-        stderr.write(f"{outcome.note}\n")
-    return outcome.exit_code
+    while True:
+        result = broker.call(
+            "wait",
+            {"agent_id": agent_id, "timeout_seconds": _PRIVATE_WAIT_SECONDS},
+            timeout=_PRIVATE_WAIT_CALL_SECONDS,
+        )
+        if not isinstance(result, dict):
+            raise AgentRunError("broker returned an invalid wait result")
+        if result.get("timed_out") is True:
+            continue
+        status = result.get("status")
+        if not isinstance(status, str) or status not in AGENT_EXIT_CODES:
+            raise AgentRunError("broker returned an invalid terminal wait result")
+        return result, AGENT_EXIT_CODES[status]
 
 
 def _jsonable(value):
@@ -901,16 +885,6 @@ def _doctor(home: Path):
     return run_doctor(home)
 
 
-def _stats(home: Path, args: argparse.Namespace) -> dict[str, object]:
-    if args.stats_command == "backfill":
-        store = StateStore.open(state_db_path(home))
-        try:
-            return backfill_run_stats(store)
-        finally:
-            store.close()
-    raise AgentRunError(f"unsupported stats command: {args.stats_command}")
-
-
 def _exec_desktop_relay(home: Path) -> None:
     """Replace a real MCP process with the signed Node relay when configured."""
 
@@ -989,8 +963,6 @@ def main(
             result = _doctor(home)
         elif service is None and args.command == "doc":
             result = _doc(args)
-        elif service is None and args.command == "stats":
-            result = _stats(home, args)
         elif args.command == "capacity" and args.capacity_command == "launchd":
             result = _capacity_launchd(home, args)
         elif args.command == "delivery" and args.delivery_command == "launchd":
@@ -1045,16 +1017,12 @@ def main(
                     (time.monotonic() - started) * 1000,
                 )
                 return returned if isinstance(returned, int) else 0
-            if args.command == "wait":
-                # A wait verb exits with the run's own terminal code, so it
-                # returns here instead of through the always-successful emit.
-                code = _wait_command(args, target, stdout, stderr)
-                _logger.info(
-                    "cli command=%s outcome=ok duration_ms=%.1f",
-                    args.command, (time.monotonic() - started) * 1000,
-                )
-                return code
             result = _execute(args, target, stdin)
+            command_exit = 0
+            if args.command == "start" and args.wait:
+                result, command_exit = _wait_started(
+                    target, str(result["agent_id"])
+                )
         _emit(result, stdout)
         _logger.info(
             "cli command=%s outcome=%s duration_ms=%.1f",
@@ -1076,7 +1044,7 @@ def main(
             and getattr(result, "ok", True) is False
         ):
             return _EXPECTED_ERROR_EXIT
-        return 0
+        return command_exit if args.command == "start" and args.wait else 0
     except AgentRunError as error:
         _emit(_error_payload(error), stderr)
         _logger.warning(

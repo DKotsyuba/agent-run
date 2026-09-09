@@ -171,16 +171,18 @@ agent-run start --runtime claude --model sonnet --profile review \
   --task "Summarize what this repo does in three lines." \
   --workdir ~/projects/myrepo --timeout 600
 
-# block until it finishes (exit code maps the outcome class)
-agent-run wait ag-20260831-...
+# add --wait to start when the same command should emit the terminal answer
+agent-run start --runtime claude --model sonnet --profile review \
+  --task "Summarize what this repo does in three lines." \
+  --workdir ~/projects/myrepo --wait
 
 # fetch the verified answer (works any time later, too)
 agent-run answer ag-20260831-...
 ```
 
 Useful verbs beyond that: `transcript --follow`, `steer`, `cancel`, `agents`
-(list), `models`, `limits`, and `stats backfill`. All output is line-delimited
-JSON — pipe it into `jq`.
+(list), `models`, and `limits`. All output is line-delimited JSON — pipe it
+into `jq`.
 
 For Codex queue delivery, `agent-run delivery status <agent-id>` exposes the latest
 bounded diagnostic summary: classifier, duration, exact exit status or spawn

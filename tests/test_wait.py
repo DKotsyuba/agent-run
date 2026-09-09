@@ -1,22 +1,18 @@
-"""Contract tests for blocking agent ``wait`` and its CLI wiring.
+"""Contract tests for the private blocking agent wait loop.
 
 Polling paths run against fakes with an injected clock and sleeper, so no test
-really sleeps; the CLI wiring is exercised with runs that are already
-terminal, which the wait loop answers on its first poll.
+really sleeps.
 """
 
 from __future__ import annotations
 
-import io
-import json
 import unittest
 from dataclasses import dataclass
 from typing import Any
 
-from agent_run import cli
 from agent_run.domain import AgentStatus
 from agent_run.errors import ValidationError
-from agent_run.wait import DEFAULT_POLL_SECONDS, WATCHER_TIMEOUT_EXIT, wait_for_agent
+from agent_run.wait import WATCHER_TIMEOUT_EXIT, wait_for_agent
 
 AGENT_ID = "ag-20260826-120000-0123456789"
 
@@ -90,35 +86,7 @@ class _ScriptedAgents:
         return self.envelope
 
 
-class _TerminalService:
-    """Facade whose agent is already terminal."""
 
-    def __init__(self, status: AgentStatus = AgentStatus.SUCCEEDED) -> None:
-        """Report ``status`` on every poll."""
-
-        self.status = status
-        self.gets = 0
-        self.answers = 0
-
-    def get(self, agent_id: str) -> _AgentView:
-        """Report the terminal status and count the poll."""
-
-        self.gets += 1
-        return _AgentView(self.status)
-
-    def answer(self, agent_id: str) -> dict[str, Any]:
-        """Return the flat answer envelope and count the call."""
-
-        self.answers += 1
-        return {"agent_id": agent_id, "status": self.status.value, "available": False}
-
-class _UnknownService:
-    """Raise exactly as the store does for an id that was never started."""
-
-    def get(self, agent_id: str) -> _AgentView:
-        """Refuse the unknown agent id."""
-
-        raise ValidationError(f"unknown agent: {agent_id}")
 
 class WaitAgentTests(unittest.TestCase):
     """Poll an agent through the service facade with virtual time."""
@@ -215,71 +183,6 @@ class WaitAgentTests(unittest.TestCase):
         self.assertEqual(time.intervals, [1.0, 1.0])
 
 
-class WaitCliTests(unittest.TestCase):
-    """Exercise the CLI wiring with runs that are already terminal."""
-
-    def run_cli(self, argv: list[str], service) -> tuple[int, str, str]:
-        """Run one CLI invocation over in-memory streams."""
-
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        code = cli.main(
-            argv,
-            service=service,
-            stdin=io.StringIO(""),
-            stdout=stdout,
-            stderr=stderr,
-        )
-        return code, stdout.getvalue(), stderr.getvalue()
-
-    def test_wait_arguments_parse_with_the_documented_defaults(self):
-        """The command accepts the positional id and polling options."""
-
-        args = cli._parser().parse_args(["wait", AGENT_ID])
-        self.assertEqual(
-            (args.command, args.agent_id, args.timeout, args.poll),
-            ("wait", AGENT_ID, 0.0, DEFAULT_POLL_SECONDS),
-        )
-
-    def test_wait_prints_the_answer_envelope_for_a_terminal_agent(self):
-        """A terminal id prints the answer envelope once and exits zero."""
-
-        service = _TerminalService()
-        code, output, error = self.run_cli(["wait", AGENT_ID], service)
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(
-            json.loads(output),
-            {"agent_id": AGENT_ID, "status": "succeeded", "available": False},
-        )
-        self.assertEqual((service.gets, service.answers), (1, 1))
-
-    def test_agent_statuses_map_to_their_exit_codes(self):
-        """Failed, cancelled, timed out, and lost keep their exit codes."""
-
-        for status, expected in (
-            (AgentStatus.FAILED, 2),
-            (AgentStatus.CANCELLED, 3),
-            (AgentStatus.TIMED_OUT, 4),
-            (AgentStatus.LOST, 2),
-        ):
-            with self.subTest(status=status):
-                code, output, _ = self.run_cli(
-                    ["wait", AGENT_ID], _TerminalService(status)
-                )
-                self.assertEqual(code, expected)
-                self.assertEqual(json.loads(output)["status"], status.value)
-
-    def test_unknown_agent_fails_like_the_status_verb(self):
-        """An unknown id shares the status verb's exit and error envelope."""
-
-        wait_code, _, wait_error = self.run_cli(["wait", AGENT_ID], _UnknownService())
-        status_code, _, status_error = self.run_cli(
-            ["status", AGENT_ID], _UnknownService()
-        )
-        self.assertEqual(wait_code, status_code)
-        self.assertNotEqual(wait_code, 0)
-        self.assertEqual(json.loads(wait_error), json.loads(status_error))
-        self.assertIn("unknown agent", wait_error)
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
