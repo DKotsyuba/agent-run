@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.2] - 2026-09-09
+
+- fix(codex): admit public GPT-6 profiles
+
 ## [0.11.1] - 2026-09-09
 
 - fix(capacity): restore forecast-based routing
