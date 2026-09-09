@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
 from typing import TYPE_CHECKING
 
 from agent_run.domain import ACTIVE, AgentId, AgentStatus, Outcome
@@ -25,7 +26,7 @@ def _fair_rows(
     select: str,
     params: tuple[object, ...],
     limit: int,
-) -> list[object]:
+) -> list[sqlite3.Row]:
     """Return and advance one persisted keyset window over ``select``.
 
     ``select`` is an internal fixed SQL prefix ending in a complete WHERE
@@ -161,13 +162,14 @@ def reconcile_unowned_starting(
     grace_seconds: float = DEFAULT_UNOWNED_STARTING_GRACE_SECONDS,
     limit: int = 100,
 ) -> tuple[AgentId, ...]:
-    """Converge stale or expired ``STARTING`` rows to ``LOST``.
+    """Converge ``STARTING`` rows whose recorded owner is proven gone.
 
-    Candidate selection and process probes run outside the short terminal
-    transition transaction. Recent, supervisor-owned and non-``STARTING`` rows are untouched. A coordinator
-    owner protects preparation and spawn handoff only until its durable deadline; probes run
-    outside the short transition transactions so a slow ``ps`` cannot block
-    writers.
+    ``grace_seconds`` remains accepted for call compatibility but elapsed time
+    never proves loss. A row changes only when its persisted startup PID and
+    birth time yield an OS ``DEAD`` or ``REUSED`` observation. Missing,
+    inaccessible, unknown, live, supervisor-owned, and non-``STARTING`` rows are
+    preserved. Process probes run outside the short transition transaction so a
+    slow ``ps`` cannot block writers.
     """
 
     from .store import StateStore
@@ -185,53 +187,43 @@ def reconcile_unowned_starting(
     if limit > 1_000:
         raise ValidationError("limit must not exceed 1000")
     checked_at = timestamp(at)
-    cutoff = checked_at - float(grace_seconds)
     changed: list[AgentId] = []
     rows = _fair_rows(
         store,
         "unowned_starting",
         """SELECT id, created_at, startup_owner_pid_identity,
-                  startup_owner_birth_time, startup_deadline_at
+                  startup_owner_birth_time
            FROM agents
            WHERE status = ? AND supervisor_pid IS NULL
-             AND process_group_id IS NULL AND supervisor_identity IS NULL
-             AND (created_at <= ? OR startup_deadline_at <= ?)""",
-        (AgentStatus.STARTING.value, cutoff, checked_at),
+             AND process_group_id IS NULL AND supervisor_identity IS NULL""",
+        (AgentStatus.STARTING.value,),
         limit,
     )
     for row in rows:
         agent_id = AgentId(str(row["id"]))
-        deadline = row["startup_deadline_at"]
-        owner_live = False
-        if isinstance(deadline, (int, float)) and deadline > checked_at:
-            owner = row["startup_owner_pid_identity"]
-            if isinstance(owner, str):
-                pid = _owner_pid(owner)
-                if pid is not None:
-                    birth = row["startup_owner_birth_time"]
-                    observation = observe_process(
-                        pid, float(birth) if isinstance(birth, (int, float)) else None
-                    )
-                    if observation.state in {
-                        ProcessState.ALIVE,
-                        ProcessState.UNKNOWN,
-                        ProcessState.DENIED,
-                    }:
-                        owner_live = True
-        if owner_live:
+        owner = row["startup_owner_pid_identity"]
+        birth = row["startup_owner_birth_time"]
+        pid = _owner_pid(owner) if isinstance(owner, str) else None
+        if pid is None or not isinstance(birth, (int, float)):
+            continue
+        observation = observe_process(pid, float(birth))
+        if observation.state not in {ProcessState.DEAD, ProcessState.REUSED}:
             continue
         with immediate(store.connection):
             current = store.connection.execute(
                 """SELECT status, supervisor_pid, process_group_id, supervisor_identity,
-                          startup_deadline_at FROM agents WHERE id = ?""",
+                          startup_owner_pid_identity, startup_owner_birth_time
+                   FROM agents WHERE id = ?""",
                 (agent_id,),
             ).fetchone()
             if current is None or current["status"] != AgentStatus.STARTING.value:
                 continue
             if any(current[field] is not None for field in ("supervisor_pid", "process_group_id", "supervisor_identity")):
                 continue
-            current_deadline = current["startup_deadline_at"]
-            if current_deadline != deadline:
+            if (
+                current["startup_owner_pid_identity"] != owner
+                or current["startup_owner_birth_time"] != birth
+            ):
                 continue
             store._transition(
                 agent_id,
@@ -240,11 +232,11 @@ def reconcile_unowned_starting(
                 outcome=Outcome(
                     AgentStatus.LOST,
                     failure_kind="unowned_starting",
-                    failure_text="accepted start exceeded its startup ownership deadline",
+                    failure_text=f"startup owner process is {observation.state.value}",
                 ),
                 attempt_id=None,
                 kind="reconciled_lost",
-                data={"verdict": "unowned_starting"},
+                data={"verdict": observation.state.value},
             )
             changed.append(agent_id)
     return tuple(changed)

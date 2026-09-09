@@ -656,11 +656,10 @@ class StateStore:
     ) -> None:
         """Record the detached supervisor's immutable ownership proof.
 
-        The first binding for a ``STARTING`` agent must occur before its startup
-        lease expires. Once recorded, the same supervisor may refine its process
-        group after engine launch even if that lease has elapsed; terminal rows
-        and conflicting identities remain rejected. ``birth_time`` is optional
-        only for legacy callers; once present it is immutable across heartbeats.
+        A ``STARTING`` agent may bind whenever its supervisor reaches READY;
+        elapsed wall time does not invalidate ownership. Terminal rows and
+        conflicting identities remain rejected. ``birth_time`` is optional only
+        for legacy callers; once present it is immutable across later refinements.
         """
 
         agent_id = validate_agent_id(agent_id)
@@ -685,14 +684,6 @@ class StateStore:
             agent = agent_row(self.connection, agent_id)
             if AgentStatus(agent["status"]) in TERMINAL:
                 raise StateTransitionError("terminal agent cannot bind a supervisor")
-            deadline = agent["startup_deadline_at"]
-            if (
-                AgentStatus(agent["status"]) is AgentStatus.STARTING
-                and agent["supervisor_pid"] is None
-                and isinstance(deadline, (int, float))
-                and deadline <= timestamp(at)
-            ):
-                raise StateTransitionError("expired startup cannot bind a supervisor")
             fields = (
                 "supervisor_pid",
                 "supervisor_identity",

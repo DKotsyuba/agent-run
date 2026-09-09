@@ -643,7 +643,6 @@ class AgentService:
             ),
             startup_owner_identity=startup_owner,
             startup_owner_birth_time=startup_birth,
-            startup_deadline_seconds=120.0,
         )
         if not creation.created:
             _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)

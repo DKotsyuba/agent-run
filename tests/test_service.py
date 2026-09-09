@@ -529,55 +529,41 @@ Review.
         self.assertEqual(self.store.list_agents(), [])
         self.assertEqual(ADAPTER.materialize_calls, 0)
 
-    def test_start_returns_before_prepare_and_pending_replay_stays_single(self) -> None:
-        """A live bounded lease survives slow preparation and sibling queueing."""
+    def test_start_returns_after_submission_and_pending_replay_stays_single(self) -> None:
+        """Admission submits one owned supervisor payload without preparing inline."""
 
-        entered = threading.Event()
-        release = threading.Event()
-        original = ADAPTER.prepare
         clock = [100.0]
         self.service = AgentService(
             self.config, self.store, self.root,
             launch=lambda *args: self.launched.append(args), now=lambda: clock[0],
         )
 
-        def blocked_prepare(*args, **kwargs):
-            """Hold prepare until the test has exercised the admission path."""
+        started = time.monotonic()
+        first = self.service.start(self.request(request_id="pending-replay"))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIs(first.agent.status, AgentStatus.STARTING)
+        self.assertEqual(len(self.launched), 1)
+        self.assertIs(self.service.get(first.agent_id).status, AgentStatus.STARTING)
 
-            entered.set()
-            release.wait(2)
-            return original(*args, **kwargs)
-
-        with patch.object(ADAPTER, "prepare", side_effect=blocked_prepare):
-            started = time.monotonic()
-            first = self.service.start(self.request(request_id="pending-replay"))
-            self.assertLess(time.monotonic() - started, 0.5)
-            self.assertIs(first.agent.status, AgentStatus.STARTING)
-            self.assertTrue(entered.wait(1))
-            self.assertIs(self.service.get(first.agent_id).status, AgentStatus.STARTING)
-
-            replay = self.service.start(self.request(request_id="pending-replay"))
-            self.assertFalse(replay.created)
-            self.assertEqual(replay.agent_id, first.agent_id)
-            sibling_started = time.monotonic()
-            sibling = self.service.start(self.request(request_id="pending-sibling"))
-            self.assertLess(time.monotonic() - sibling_started, 0.5)
-            self.assertIs(sibling.agent.status, AgentStatus.STARTING)
-            clock[0] = 131.0
-            for _ in range(3):
-                self.service.get(first.agent_id)
-                self.service.list()
-                self.assertEqual(
-                    reconcile_unowned_starting(self.store, at=clock[0]), ()
-                )
-            with self.assertRaisesRegex(
-                ValidationError, "request_id was reused for a different request"
-            ):
-                self.service.start(
-                    self.request(request_id="pending-replay", task="changed")
-                )
-            release.set()
-            self.wait_until(lambda: len(self.launched) == 2)
+        replay = self.service.start(self.request(request_id="pending-replay"))
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.agent_id, first.agent_id)
+        sibling_started = time.monotonic()
+        sibling = self.service.start(self.request(request_id="pending-sibling"))
+        self.assertLess(time.monotonic() - sibling_started, 0.5)
+        self.assertIs(sibling.agent.status, AgentStatus.STARTING)
+        self.assertEqual(len(self.launched), 2)
+        clock[0] = 131.0
+        for _ in range(3):
+            self.service.get(first.agent_id)
+            self.service.list()
+            self.assertEqual(reconcile_unowned_starting(self.store, at=clock[0]), ())
+        with self.assertRaisesRegex(
+            ValidationError, "request_id was reused for a different request"
+        ):
+            self.service.start(
+                self.request(request_id="pending-replay", task="changed")
+            )
 
     def test_request_id_returns_one_agent_and_launches_once(self) -> None:
         first = self.start("same-request", task="  do   work  ")
