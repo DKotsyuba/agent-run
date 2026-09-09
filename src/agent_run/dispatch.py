@@ -12,7 +12,6 @@ from .domain import OrchestratorRef, StartRequest
 from .effective_policy import Constraint
 from .errors import ValidationError
 from .service import AgentQuery, AgentService
-from .delivery.completion_notice_contract import completion_notice_contract_text
 
 _MAX_ERROR_CHARS = 512
 _MAX_LINE_BYTES = 1024 * 1024
@@ -46,7 +45,7 @@ _ORCHESTRATOR = _schema(
 _CONTINUATION_TOOLS = (
     {
         "name": "resume",
-        "description": "Continue a terminal agent's native context as a NEW durable run; inherit identity and permissions. " + completion_notice_contract_text(),
+        "description": "Continue a terminal agent's native context as a new durable run with inherited identity and permissions.",
         "inputSchema": _schema({
             "agent_id": _ID, "task": {"type": "string"},
             "timeout_seconds": {"type": ["number", "null"]},
@@ -69,7 +68,7 @@ TOOLS = (
     },
     {
         "name": "start",
-        "description": "Start one asynchronous durable agent. " + completion_notice_contract_text(),
+        "description": "Start one asynchronous durable agent.",
         "inputSchema": _schema(
             {
                 "runtime": {"type": "string"},

@@ -47,7 +47,7 @@ The command waits until the GitHub Release is public, verifies the downloaded
 wheel and sdist against `SHA256SUMS` and GitHub attestations (repository,
 workflow, tag, commit, and subject hash), then updates the local sealed runtime.
 It requires authenticated `gh`, `git`, Python 3.14, and the existing macOS
-standalone installation and API/capacity/delivery launchd plists.
+standalone installation and API/capacity launchd plists.
 
 For a new version, start from a clean committed checkout equal to `origin/main`.
 The script prepares only `pyproject.toml` and `CHANGELOG.md` on the deterministic

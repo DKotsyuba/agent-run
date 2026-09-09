@@ -216,7 +216,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(results[0].agent_id, results[1].agent_id)
         self.assertEqual(self.store.get_agent(results[0].agent_id)["status"], "starting")
 
-    def test_session_request_id_is_idempotent_and_binding_is_immutable(self) -> None:
+    def test_session_request_id_is_idempotent(self) -> None:
         ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
         request = self.request(request_id="request-1", orchestrator=ref)
         first = self.store.create_agent(
@@ -229,17 +229,9 @@ class StateStoreTests(unittest.TestCase):
         self.assertFalse(second.created)
         self.assertEqual(first.agent_id, second.agent_id)
         self.assertEqual(len(self.store.list_agents()), 1)
-        self.assertEqual(
-            self.store.bind_orchestrator(first.agent_id, ref, at=2),
-            self.store.get_agent(first.agent_id)["orchestrator_session_id"],
+        self.assertIsNotNone(
+            self.store.get_agent(first.agent_id)["orchestrator_session_id"]
         )
-
-        with self.assertRaises(ValidationError):
-            self.store.bind_orchestrator(
-                first.agent_id,
-                OrchestratorRef("codex_queue", "different-session"),
-                at=3,
-            )
         self.assertEqual(len(self.store.list_agents()), 1)
 
     def test_unresolved_timeout_is_never_persisted(self) -> None:
@@ -259,7 +251,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_agents(), [])
 
     def test_unbound_request_id_is_globally_concurrent_and_exact(self) -> None:
-        """Concurrent replays stay single before and after notification binding."""
+        """Concurrent unbound replays remain one durable agent."""
 
         request = self.request(request_id="shared-request")
         barrier = Barrier(2)
@@ -296,11 +288,6 @@ class StateStoreTests(unittest.TestCase):
                 (results[0].agent_id,),
             ).fetchone()[0],
             1,
-        )
-        self.store.bind_orchestrator(
-            results[0].agent_id,
-            OrchestratorRef("codex_queue", "late-session", "turn-1"),
-            at=3,
         )
         barrier = Barrier(2)
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -531,29 +518,19 @@ class StateStoreTests(unittest.TestCase):
         )
 
     def test_session_lookup_and_agent_filter_are_read_only_and_composable(self) -> None:
-        first = self.create(self.request(task="first"))
-        second = self.create(self.request(task="second"))
-        other = self.create(self.request(task="other"))
         ref = OrchestratorRef("codex_queue", "session-a", "turn-a")
-        updated_ref = OrchestratorRef("codex_queue", "session-a", "turn-b")
         other_ref = OrchestratorRef("other_transport", "session-a", "turn-c")
-        session_id = self.store.bind_orchestrator(first, ref, at=2)
-        self.assertEqual(
-            self.store.bind_orchestrator(second, updated_ref, at=3), session_id
-        )
-        self.assertEqual(
-            self.store.bind_orchestrator(
-                first, OrchestratorRef("codex_queue", "session-a"), at=4
-            ),
-            session_id,
-        )
-        self.store.bind_orchestrator(other, other_ref, at=2)
+        first = self.create(self.request(task="first", orchestrator=ref))
+        second = self.create(self.request(task="second", orchestrator=ref))
+        other = self.create(self.request(task="other", orchestrator=other_ref))
+        session_id = self.store.get_agent(first)["orchestrator_session_id"]
+        self.assertEqual(self.store.get_agent(second)["orchestrator_session_id"], session_id)
         stored_session = self.store.connection.execute(
             """SELECT external_turn_id, last_seen_at FROM orchestrator_sessions
                WHERE id = ?""",
             (session_id,),
         ).fetchone()
-        self.assertEqual(tuple(stored_session), ("turn-b", 4))
+        self.assertEqual(tuple(stored_session), ("turn-a", 1))
         self.assertEqual(
             self.store.connection.execute(
                 """SELECT COUNT(*) FROM orchestrator_sessions
@@ -597,7 +574,7 @@ class StateStoreTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.store.list_agents(orchestrator_session_id=" ")
 
-    def test_guarded_transitions_attempts_and_atomic_terminal_outbox(self) -> None:
+    def test_guarded_transitions_attempts_do_not_create_delivery_rows(self) -> None:
         agent_id = self.create(
             self.request(orchestrator=OrchestratorRef("codex_queue", "session", "turn"))
         )
@@ -610,55 +587,21 @@ class StateStoreTests(unittest.TestCase):
             self.store.transition(agent_id, AgentStatus.CREATED, at=5)
         self.store.finish_attempt(agent_id, attempt_id, state="finished", at=6)
 
-        event_seq = self.store.transition(
+        self.store.transition(
             agent_id,
             AgentStatus.SUCCEEDED,
             outcome=Outcome(AgentStatus.SUCCEEDED, exit_code=0),
             at=7,
         )
         agent = self.store.get_agent(agent_id)
-        delivery = self.store.connection.execute(
-            "SELECT * FROM deliveries WHERE agent_id = ?", (agent_id,)
-        ).fetchone()
         self.assertEqual(agent["status"], "succeeded")
         self.assertEqual(agent["finished_at"], 7)
-        self.assertEqual(delivery["terminal_event_seq"], event_seq)
-        self.assertEqual(delivery["state"], "pending")
+        self.assertIsNone(self.store.connection.execute(
+            "SELECT id FROM deliveries WHERE agent_id = ?", (agent_id,)
+        ).fetchone())
         with self.assertRaises(StateTransitionError):
             self.store.transition(agent_id, AgentStatus.RUNNING, at=8)
 
-    def test_terminal_update_rolls_back_when_delivery_activation_fails(self) -> None:
-        ref = OrchestratorRef("codex_queue", "session", "turn")
-        agent_id = self.create(self.request(orchestrator=ref))
-        self.store.transition(agent_id, AgentStatus.STARTING, at=2)
-        self.store.transition(agent_id, AgentStatus.RUNNING, at=3)
-        self.store.connection.execute(
-            """CREATE TRIGGER reject_delivery BEFORE INSERT ON deliveries
-               BEGIN SELECT RAISE(ABORT, 'delivery rejected'); END"""
-        )
-
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.store.transition(
-                agent_id,
-                AgentStatus.FAILED,
-                outcome=Outcome(AgentStatus.FAILED),
-                at=4,
-            )
-
-        self.assertEqual(self.store.get_agent(agent_id)["status"], "running")
-        self.assertEqual(
-            self.store.connection.execute(
-                "SELECT COUNT(*) FROM events WHERE agent_id = ? AND to_status = 'failed'",
-                (agent_id,),
-            ).fetchone()[0],
-            0,
-        )
-        self.assertEqual(
-            self.store.connection.execute(
-                "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?", (agent_id,)
-            ).fetchone()[0],
-            0,
-        )
 
     def test_transcript_order_exact_active_count_and_command_ownership(self) -> None:
         first = self.create()
@@ -848,14 +791,16 @@ class StateStoreTests(unittest.TestCase):
         """Aggregate bound and unbound agents without changing stored rows."""
 
         unbound = self.create()
-        first = self.create()
-        second = self.create()
-        first_session = self.store.bind_orchestrator(
-            first, OrchestratorRef("socket", "first", "turn-1"), at=10
-        )
-        second_session = self.store.bind_orchestrator(
-            second, OrchestratorRef("socket", "second", "turn-2"), at=20
-        )
+        first = self.store.create_agent(
+            self.request(orchestrator=OrchestratorRef("socket", "first", "turn-1")),
+            task_summary="summary", config_revision="cfg-1", at=10,
+        ).agent_id
+        second = self.store.create_agent(
+            self.request(orchestrator=OrchestratorRef("socket", "second", "turn-2")),
+            task_summary="summary", config_revision="cfg-1", at=20,
+        ).agent_id
+        first_session = self.store.get_agent(first)["orchestrator_session_id"]
+        second_session = self.store.get_agent(second)["orchestrator_session_id"]
         self.store.transition(first, AgentStatus.STARTING, at=2)
         self.store.transition(first, AgentStatus.RUNNING, at=3)
         self.store.transition(
@@ -873,10 +818,8 @@ class StateStoreTests(unittest.TestCase):
     def test_list_orchestrator_sessions_omits_unbound_row_when_none_are_unbound(self) -> None:
         """No agent without an orchestrator leaves no synthetic unbound row."""
 
-        bound = self.create()
-        session = self.store.bind_orchestrator(
-            bound, OrchestratorRef("socket", "only", "turn-1"), at=10
-        )
+        bound = self.create(self.request(orchestrator=OrchestratorRef("socket", "only", "turn-1")))
+        session = self.store.get_agent(bound)["orchestrator_session_id"]
         rows = self.store.list_orchestrator_sessions(limit=10)
         self.assertEqual([row["id"] for row in rows], [session])
         self.assertEqual([(row["active"], row["total"]) for row in rows], [(1, 1)])

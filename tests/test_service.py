@@ -35,8 +35,6 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.effective_policy import Constraint, Enforcement
-from agent_run.delivery.base import DeliveryAttemptEvidence
-from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
@@ -697,37 +695,6 @@ Review.
         self.assertEqual(cleanup.scope, "verified_descendants")
         self.assertTrue(cleanup.confirmed)
 
-    def test_post_tool_binding_survives_fresh_service_replay(self) -> None:
-        """Late notification binding must not change the original replay namespace."""
-
-        request = self.request(request_id="post-tool-replay")
-        first = self.start("post-tool-replay")
-        run_hook(
-            self.store,
-            {
-                "agent_id": first.agent_id,
-                "transport": "codex_queue",
-                "external_session_id": "session-1",
-                "external_turn_id": "turn-1",
-            },
-            at=101,
-        )
-        self.service.close()
-        self.store = StateStore.open(self.root / "state.db")
-        self.service = AgentService(
-            self.config,
-            self.store,
-            self.root,
-            launch=lambda *args: self.launched.append(args),
-            now=lambda: 102.0,
-        )
-
-        replay = self.service.start(request)
-
-        self.assertFalse(replay.created)
-        self.assertEqual(replay.agent_id, first.agent_id)
-        self.assertEqual(len(self.launched), 1)
-        self.assertEqual(len(self.store.list_agents()), 1)
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""
@@ -870,9 +837,6 @@ Review.
         self.assertEqual(row["failure_kind"], "supervisor_start_failed")
         self.assertEqual(row["failure_text"], "ready failed")
         view = service.get(agent_id)
-        # The start carried no orchestrator session reference, so no notice was
-        # created: nothing could ever bind to deliver it.
-        self.assertEqual(view.delivery.state, "not_created")
         self.assertIsNone(
             self.store.connection.execute(
                 "SELECT id FROM deliveries WHERE agent_id = ?", (agent_id,)
@@ -1068,20 +1032,11 @@ Review.
         with self.assertRaises(StateTransitionError):
             self.service.cancel(terminal_id)
 
-    def test_binding_summary_models_and_stored_limits_share_the_service(self) -> None:
-        agent_id = self.start("binding", task="safe task").agent_id
+    def test_summary_models_and_stored_limits_share_the_service(self) -> None:
+        agent_id = self.start("summary", task="safe task").agent_id
         ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
-        delivery = self.service.bind(agent_id, ref)
-        self.assertTrue(delivery.bound)
-        self.assertEqual(delivery.state, "not_created")
-        with self.assertRaisesRegex(ValidationError, "immutable"):
-            self.service.bind(
-                agent_id, OrchestratorRef("codex_queue", "other-session")
-            )
-
         self.terminal(agent_id)
         view = self.service.get(agent_id)
-        self.assertEqual(view.delivery.state, "pending")
         self.assertEqual(self.service.summary(agent_id=agent_id).agents, (view,))
         self.assertEqual(self.service.summary(orchestrator=ref).total, 0)
         with self.assertRaises(ValidationError):
@@ -1106,24 +1061,6 @@ Review.
         self.assertEqual(limits.items[0].key.runtime, "fake")
         self.assertEqual(ADAPTER.limits_calls, 0)
 
-    def test_delivery_view_exposes_only_the_latest_typed_attempt_evidence(self) -> None:
-        """Expose latest safe evidence additively after a completed delivery."""
-
-        agent_id = self.start("delivery-evidence").agent_id
-        self.service.bind(
-            agent_id, OrchestratorRef("codex_queue", "session-1", "turn-1")
-        )
-        self.terminal(agent_id)
-        claimed = self.store.claim_delivery("worker", at=102, lease_seconds=10)
-        evidence = DeliveryAttemptEvidence(
-            "success", "/bin/codex", ("executable", "queue"), 2,
-            returncode=0, message_id_present=True,
-        )
-        self.store.complete_delivery(
-            claimed["id"], "worker", at=103, evidence=evidence
-        )
-
-        self.assertEqual(self.service.get(agent_id).delivery.last_attempt, evidence)
 
     def test_empty_roster_still_lists_the_runtime_with_a_reason(self) -> None:
         ADAPTER.models_result = ()

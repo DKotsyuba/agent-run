@@ -119,9 +119,8 @@ lookups where configured.
 Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 10`.
 Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
 `commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
-`deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
-`capacity_route_snapshots`, `run_stats`, and `context_receipts`. Legacy
-`workflow_runs`, `workflow_steps`, and `workflow_deliveries` tables remain so
+`capacity_samples`, `capacity_route_snapshots`, and `run_stats`. Legacy
+delivery, delivery-evidence, context-receipt, and workflow tables remain so
 upgrades preserve historical rows; no current product path reads or writes them.
 
 Schema changes ship as numbered migrations (`state/migrations/`) with a
@@ -131,61 +130,6 @@ newer schema rather than corrupt it.
 SQLite connections are **thread-affine** and the code treats that as law:
 a store is used only on the thread that created it (the socket API runs a
 dedicated dispatch thread for exactly this reason).
-
-## Orchestrator binding and delivery
-
-An agent started by an MCP session (or with explicit `--session-*` flags)
-is **bound** to that orchestrator session. On terminal state, a delivery
-row is created and a dispatcher pushes the completion notice back to the
-orchestrator's chat (the relay-backed `codex_queue` compatibility identifier
-and Claude UDS transports exist).
-Unbound runs create no delivery row — `wait` on them is the delivery.
-Deliveries retry with backoff and expire instead of retrying forever.
-Each Codex delivery attempt records an immutable bounded evidence row in the same
-transaction that completes, retries, or fails its owned delivery claim. The
-record distinguishes exit status (including 127), spawn errno, timeout, session
-loss, and success while storing no message, session id, argv/environment value,
-or credential. Status exposes only the latest validated safe summary.
-
-Codex Desktop delivery uses a volatile local relay. With both
-`CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` supplied by the host, the
-MCP CLI replaces itself with the host's signed Node executable. That wrapper
-owns a private Unix socket and a thin Python MCP child; the child receives
-neither host capability, preventing recursive wrappers. The wrapper calls only
-`send_message_to_thread` and renders the same structured completion notice from
-validated lifecycle fields, immutable runtime/model/effort selectors, and an
-optional bounded failure category. Task, answer, and runtime error prose never
-enter the notice; metadata is escaped for safe single-line display. Failure
-reasons and recovery advice come from a package-owned allowlist keyed by that
-category. Effort is the explicit value persisted in the launch request, not an
-inferred runtime default; missing effort is `unspecified`.
-Host tool inventories have an 8 MiB frame limit;
-local delivery requests remain bounded to 8 KiB. No socket path, host response,
-or message text enters delivery evidence.
-
-Agent completion notices use the `agent-run/completion` header and a short list:
-ID, terminal status, optional Failure/Advice lines, `runtime/model:effort`, and
-notification identity. Failure/Advice appear only for failed, lost, and timed-out
-agents. Python and the Node relay render one packaged template. Handling instructions live in
-the same contract, exposed by the MCP `start` description and `agent-run doc
-completion`; they are not repeated in each notice. The contract explains
-asynchronous launch, bound delivery, result retrieval, and why a completion
-notice is neither a new task nor user approval. Host-added trust warnings remain
-under the host's control.
-The local relay protocol accepts strict legacy v1 requests, selector-bearing v2,
-and failure-aware v3. A current host advertises `ar-cdx-v3-*.sock`; clients
-prefer v3, then v2, and use legacy requests for older hosts. Old clients send
-their v1 shape to a v3 host and remain compatible. Existing
-outbox rows require no migration. Already-running old MCP hosts keep delivering
-their old format until the `agent-run` MCP connection is restarted.
-
-Codex completion delivery uses only the signed Desktop relay. The persisted
-`codex_queue` name is a compatibility identifier; it never invokes the Codex
-UI queue or requires a queue executable. Missing or rejected relays are
-retryable; unknown acceptance after transmission remains ambiguous and
-retryable. Relay discovery has a ten-second total budget and the host call
-has an eight-second budget, within the existing thirty-second lease.
-The Node wrapper preserves MCP stdio and removes its socket on child exit.
 
 ## Capacity and limits
 

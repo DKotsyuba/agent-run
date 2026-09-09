@@ -2,8 +2,8 @@
 
 `resume` starts a **new durable run in the same native conversation**. It does
 not reset the previous run or substitute a summary for the runtime's history.
-Each run retains its own prompt, timestamps, events, transcript, answer proof
-and completion notification. `parent_agent_id`, `root_agent_id` and `sequence`
+Each run retains its own prompt, timestamps, events, transcript and answer proof.
+`parent_agent_id`, `root_agent_id` and `sequence`
 connect the records into one chronological chain.
 
 ```sh
@@ -17,7 +17,7 @@ agent-run chain <any-id-in-the-chain> --cursor 51 --limit 50
 whitespace is preserved; `--task-file -` reads stdin. The CLI submits through
 the resident broker, so closing the CLI cannot orphan a preparation worker.
 The usual `--session-transport`, `--session-id` and `--session-turn-id` options
-bind the **new** run's notification to its caller.
+record the **new** run's caller namespace.
 
 MCP and the socket API expose the same tools:
 
@@ -44,8 +44,8 @@ Terminal status alone does not prove that the previous process stopped. A live
 or unprovable process group blocks continuation; this includes `lost` runs.
 Native runtimes also reject missing histories or busy/mismatched sessions.
 There is no automatic replay of an ambiguously submitted prompt and no fallback
-to a new conversation. The new caller's binding must be confirmed just as for
-`start`; the old caller's binding is never reused implicitly.
+to a new conversation. The new caller namespace is recorded just as for
+`start`; the old caller is never reused implicitly.
 
 ## Runtime history and compatibility
 

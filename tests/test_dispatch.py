@@ -5,8 +5,6 @@ from unittest.mock import patch
 
 from agent_run.dispatch import TOOL_NAMES, TOOLS, Session, call_tool
 from agent_run.domain import StartRequest
-from agent_run.delivery.completion_notice_contract import completion_notice_contract_text
-from agent_run.doc import topic_text
 from agent_run.mcp import serve
 from agent_run.errors import ValidationError
 from agent_run.effective_policy import Constraint
@@ -91,17 +89,6 @@ def test_start_accepts_only_unique_known_policy_requirements() -> None:
         else:
             raise AssertionError("invalid required_constraints accepted")
 
-
-def test_start_description_includes_completion_contract_text() -> None:
-    """Start discovery includes the exact doc contract and all four format fields."""
-    start_tool = next(tool for tool in TOOLS if tool["name"] == "start")
-    expected = completion_notice_contract_text()
-    self_desc = start_tool["description"]
-    assert self_desc.startswith("Start one asynchronous durable agent.")
-    assert expected in self_desc
-    assert expected == topic_text("completion")
-    for label in ("- ID:", "- Status:", "- Runtime/model:", "- Notice:"):
-        assert label in self_desc
 
 
 def _start(service, session, **values):

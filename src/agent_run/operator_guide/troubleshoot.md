@@ -54,23 +54,6 @@ Capacity/limits data is only as fresh as its source last reported:
 An "unknown" limit is the system being honest about missing data, not a
 bug to chase.
 
-## Delivery binding
-
-The `PostToolUse` hook on `mcp__agent[-_]run__start` binds a session using
-`--transport` per client: codex defaults to `codex_queue`, claude to
-`claude_uds`. A missing or wrong `--transport` on that hook is the usual
-cause of "the agent ran but never delivered a result back."
-
-## Delivery attempt evidence
-
-When relay-backed Codex delivery retries or fails, inspect `status.delivery.last_attempt`.
-`classifier`, `returncode`, `spawn_errno`, `error_class`, and `duration_ms`
-separate relay unavailability, rejection, ambiguous post-write acceptance,
-and success. `codex_queue` is only a compatibility binding name: completion
-delivery never invokes the Codex UI queue. `null` means no attempt evidence
-has been recorded. Raw messages, session ids, argument/environment values,
-and credentials are intentionally unavailable.
-
 ## Orphan check
 
 To find agents whose supervisor process died without cleanup: `ps` for

@@ -55,14 +55,6 @@ tool's arguments.
 {"jsonrpc": "2.0", "id": 1, "result": {"agent_id": "ag-...", "status": "running", ...}}
 ```
 
-Terminal agent responses include `delivery.last_attempt` when Codex queue made
-at least one delivery attempt. The additive nullable object records a safe
-classifier, executable provenance, argv shape without values, duration, exact
-return code or spawn errno, error class, original output byte counts,
-truncation flags, bounded redacted stdout/stderr tails, and whether a remote
-message id was observed. Each tail is at most 4096 UTF-8 bytes. Messages,
-session ids, argv/environment values, and credentials are never persisted.
-
 One connection may send many requests; on a single connection they are
 answered in order. Open several connections for parallelism — dispatch is
 serialized within two bounded owner lanes. Durable start/resume/cancel/steer
@@ -111,8 +103,8 @@ agent row is admitted; advisory evidence and unrelated tool filtering do not
 satisfy isolation requirements. Unknown or duplicate names are invalid.
 
 `request_id` replay is scoped to the caller namespace in the original request.
-A later PostToolUse notification binding does not change that identity. Clients
-that omit `orchestrator` share the unbound namespace across fresh connections.
+Clients that omit `orchestrator` share the unbound namespace across fresh
+connections.
 
 `list_orchestrators` (optional `limit`, default 100, max 1000) is a read-only
 view of the orchestrator sessions that launched agents. Each item carries
@@ -124,6 +116,12 @@ orchestrator binding, one synthetic item with `session_id: null` and empty
 `transport` carries their counters; it is absent when no such agents exist.
 The page reports `total` (exact number of items available) and `complete`.
 
+`list_agents` accepts optional `after_revision` and `wait_seconds`. When the
+current event revision is not newer, the call waits up to 60 seconds and wakes
+as soon as a committed event advances it. The returned `revision` becomes the
+next cursor, so terminal completion is observable without a notification
+worker or polling at a fixed interval.
+
 Agent views returned by `status`, `list_agents`, and `summary` include
 `effort` — the reasoning effort requested at launch, or `null` when the
 request did not set one.
@@ -132,8 +130,8 @@ Those views also include nullable `cleanup` evidence from the latest owned
 process cleanup observation: attempted `signals`, `scope`, `group_gone`,
 nullable `descendants_gone`, `confirmed`, and nullable `process_group_id`.
 Confirmation requires the original group and the readable pre-signal owned set
-to be gone. Page projections resolve progress, warnings, delivery evidence and
-cleanup in one batched state query.
+to be gone. Page projections resolve progress, warnings and cleanup in one
+batched state query.
 
 New rows also expose immutable `policy` evidence with the runtime/platform and
 one entry for every known constraint: actual enforcement, support, whether the
@@ -215,11 +213,8 @@ Notes for the loop:
 - The returned agent view is a snapshot, not a promise of `starting`: a fast
   bootstrap failure may already be terminal. Match concurrent results by agent
   or request ID rather than submission order.
-- Bound Codex/Claude chats receive completion notices automatically when
-  delivery is configured. The MCP `start` description includes the shared
-  notice format and handling contract; `agent-run doc completion` (or MCP
-  `doc` with `{"topic": "completion"}`) serves the same contract. The `wait`
-  example above is for an unbound API caller, not a bound-chat polling loop.
+- Call `list_agents` with the last observed revision to wait for lifecycle
+  changes, then fetch the terminal result with `answer`.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
@@ -255,5 +250,5 @@ id); `-32603` as a bug to report.
   the optional sealed-release layout restart it after switching
   `~/.agent-run/standalone/current`; ordinary pip/pipx installs use the
   `agent-run` executable on `PATH`.
-- Schema version 9 adds immutable per-attempt delivery evidence. Older resident
-  processes refuse the migrated database and must be restarted after upgrade.
+- Older resident processes refuse a newer migrated database and must be
+  restarted after upgrade.

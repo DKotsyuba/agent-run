@@ -59,14 +59,6 @@ class CapacityConfig:
 
 
 @dataclass(frozen=True)
-class DeliveryConfig:
-    retry_base_seconds: float = 2
-    retry_cap_seconds: float = 60
-    max_attempts: int = 0
-    codex_queue_bin: Path | None = None
-
-
-@dataclass(frozen=True)
 class ProfilesConfig:
     directory: Path = Path("~/.agent-run/profiles")
 
@@ -166,7 +158,6 @@ class Config:
     schema_version: int
     core: CoreConfig = field(default_factory=CoreConfig)
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
-    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     profiles: ProfilesConfig = field(default_factory=ProfilesConfig)
     skills_directory: Path = Path("~/.agent-run/skills")
     mcp: Mapping[str, McpConfig] = field(
@@ -482,7 +473,9 @@ def _parse_capacity(value: object) -> CapacityConfig:
     )
 
 
-def _parse_delivery(value: object) -> DeliveryConfig:
+def _parse_legacy_delivery(value: object) -> None:
+    """Validate the retired delivery table during one installed-state upgrade."""
+
     table = _table(value, "delivery")
     _reject_unknown(
         table,
@@ -494,19 +487,14 @@ def _parse_delivery(value: object) -> DeliveryConfig:
         "delivery.retry_base_seconds",
         minimum=0.000001,
     )
-    cap = _number(
+    _number(
         table.get("retry_cap_seconds", 60),
         "delivery.retry_cap_seconds",
         minimum=base,
     )
-    return DeliveryConfig(
-        base,
-        cap,
-        _int(table.get("max_attempts", 0), "delivery.max_attempts", minimum=0),
-        None
-        if table.get("codex_queue_bin") is None
-        else _path(table["codex_queue_bin"], "delivery.codex_queue_bin"),
-    )
+    _int(table.get("max_attempts", 0), "delivery.max_attempts", minimum=0)
+    if table.get("codex_queue_bin") is not None:
+        _path(table["codex_queue_bin"], "delivery.codex_queue_bin")
 
 
 def _parse_profiles(value: object) -> ProfilesConfig:
@@ -795,6 +783,7 @@ def load_config(path: str | Path) -> Config:
     version = raw.get("schema_version")
     if type(version) is not int or version != 1:
         raise ValidationError(f"unsupported schema_version: {version!r}")
+    _parse_legacy_delivery(raw.get("delivery", {}))
     mcp = _parse_mcp(raw.get("mcp", {}))
     environments = _parse_environments(raw.get("environments", {}))
     runtimes = _parse_runtimes(raw.get("runtimes", {}), environments)
@@ -808,7 +797,6 @@ def load_config(path: str | Path) -> Config:
         schema_version=1,
         core=_parse_core(raw.get("core", {})),
         capacity=_parse_capacity(raw.get("capacity", {})),
-        delivery=_parse_delivery(raw.get("delivery", {})),
         profiles=_parse_profiles(raw.get("profiles", {})),
         skills_directory=_parse_skills(raw.get("skills", {})),
         mcp=mcp,

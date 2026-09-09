@@ -44,12 +44,6 @@ class DocTopicsTests(unittest.TestCase):
         for name in TOPICS:
             self.assertTrue(topic_text(name).strip())
 
-    def test_topic_text_completion_is_contract_template(self):
-        """Completion is discoverable and serves its shared format."""
-        self.assertIn("completion", TOPICS)
-        text = topic_text("completion")
-        self.assertIn("agent-run/completion", text)
-        self.assertIn("- Notice:", text)
 
     def test_topic_text_rejects_unknown_topic(self):
         with self.assertRaises(ValidationError):
@@ -77,13 +71,6 @@ class DocCliTests(unittest.TestCase):
         self.assertEqual(payload["topic"], "config")
         self.assertIn("config.toml", payload["text"])
 
-    def test_doc_with_completion_topic_returns_contract_text(self):
-        """CLI readers receive the generated completion contract as a doc topic."""
-        code, output, error = self.run_cli(["doc", "completion"])
-        self.assertEqual((code, error), (0, ""))
-        payload = json.loads(output)
-        self.assertEqual(payload["topic"], "completion")
-        self.assertIn("agent-run/completion", payload["text"])
 
     def test_doc_with_unknown_topic_is_refused(self):
         code, output, error = self.run_cli(["doc", "not-a-real-topic"])
@@ -141,7 +128,7 @@ class DocMcpTests(unittest.TestCase):
         self.assertIn("doc", names)
 
     def test_doc_tool_call_returns_index_and_topic(self):
-        """MCP serves the index, Markdown topics and generated contract uniformly."""
+        """MCP serves the index and packaged Markdown topics uniformly."""
         responses = self.run_server(
             [
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "doc", "arguments": {}}},
@@ -151,22 +138,13 @@ class DocMcpTests(unittest.TestCase):
                     "method": "tools/call",
                     "params": {"name": "doc", "arguments": {"topic": "models"}},
                 },
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {"name": "doc", "arguments": {"topic": "completion"}},
-                },
             ]
         )
         first = responses[0]["result"]["structuredContent"]
         second = responses[1]["result"]["structuredContent"]
-        third = responses[2]["result"]["structuredContent"]
         self.assertEqual(first["topic"], "index")
         self.assertEqual(second["topic"], "models")
         self.assertIn("opencode/", second["text"])
-        self.assertEqual(third["topic"], "completion")
-        self.assertIn("agent-run/completion", third["text"])
 
     def test_doc_tool_call_rejects_unknown_topic(self):
         responses = self.run_server(

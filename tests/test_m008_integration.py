@@ -14,37 +14,15 @@ from agent_run.adapters.base import Capability
 from agent_run.api_socket import ApiServer
 from agent_run.broker_client import BrokerClient
 from agent_run.config import Config, ProfilesConfig, RuntimeConfig
-from agent_run.delivery.base import DeliveryReceipt
-from agent_run.delivery.dispatch import DeliveryDispatcher
-from agent_run.domain import AgentStatus, Message, MessageRole, OrchestratorRef, Outcome, StartRequest
+from agent_run.domain import Message, MessageRole, StartRequest
 from agent_run.dispatch import Session, call_tool
 from agent_run.errors import ValidationError
-from agent_run.hooks.bind import BindHookError, bind
 from agent_run.mcp import serve
 from agent_run.paths import agent_dir
 from agent_run.preparation import prepare_launch
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.store import StateStore
-from agent_run.supervisor import Supervisor, SupervisorSettings
-from agent_run.verify import DEFAULT_SENTINEL
 from tests.test_service import ADAPTER as SERVICE_ADAPTER
-from tests.test_supervisor import FakeAdapter as EngineAdapter
-from tests.test_supervisor import FakeOps, FakeSession
-
-
-class RecordingTransport:
-    name = "codex_queue"
-    api_version = 1
-
-    def __init__(self) -> None:
-        self.sent = []
-
-    def validate(self, config) -> None:
-        return None
-
-    def send(self, target, notice):
-        self.sent.append((target, notice))
-        return DeliveryReceipt("remote-1")
 
 
 class M008IntegrationTests(unittest.TestCase):
@@ -170,83 +148,6 @@ class M008IntegrationTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail("asynchronous integration condition did not become true")
-
-    def test_async_start_supervisor_late_bind_and_one_trusted_dispatch(self) -> None:
-        """Complete an admitted three-field launch through preparation and delivery."""
-
-        started = self.service.start(self.request("async-completion"))
-        self.assertTrue(started.created)
-        self.assertIs(started.agent.status, AgentStatus.STARTING)
-        self.wait_until(lambda: len(self.launches) == 1)
-        self.assertEqual(len(self.launches), 1, "start returns after the launch decision")
-
-        agent_id, request, role = self.launches[0]
-        prepared = prepare_launch(
-            self.store, self.root, self.config, agent_id, request, role
-        )
-        directory = agent_dir(agent_id, self.root)
-        self.assertTrue(directory.is_dir())
-        answer_path = prepared.answer_path
-        answer_path.write_text(f"done\n{DEFAULT_SENTINEL}\n", encoding="utf-8")
-        # The orchestrator binds before the agent finishes, so the terminal
-        # transition creates a pending notice rather than one that can never bind.
-        bind(
-            self.store,
-            agent_id,
-            OrchestratorRef("codex_queue", "root-session", "turn-1"),
-            at=100,
-        )
-        ops = FakeOps()
-        session = FakeSession(
-            ops, outcome=Outcome(AgentStatus.SUCCEEDED), exit_after_polls=1
-        )
-        outcome = Supervisor(
-            self.store,
-            agent_id,
-            EngineAdapter(session),
-            prepared.plan,
-            answer_path=answer_path,
-            settings=SupervisorSettings(
-                poll_seconds=0.1,
-                grace_seconds=0.1,
-                kill_grace_seconds=0.1,
-                natural_grace_seconds=0.1,
-            ),
-            ops=ops,
-        ).run()
-        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
-        self.assertEqual(self.service.get(agent_id).delivery.state, "pending")
-
-        ref = OrchestratorRef("codex_queue", "root-session", "turn-1")
-        # A repeat of the same bind is idempotent; a different session is refused.
-        bind(self.store, agent_id, ref, at=200)
-        with self.assertRaises(BindHookError):
-            bind(
-                self.store,
-                agent_id,
-                OrchestratorRef("codex_queue", "other-session"),
-                at=201,
-            )
-
-        transport = RecordingTransport()
-        dispatcher = DeliveryDispatcher(
-            self.store, {transport.name: transport}, owner="integration-dispatcher"
-        )
-        # The notice was created pending at the agent's own terminal timestamp,
-        # so the dispatcher is run well past it.
-        first = dispatcher.drain(at=10_000_000_000)
-        second = dispatcher.drain(at=10_000_000_000)
-        self.assertEqual((first.claimed, first.delivered), (1, 1))
-        self.assertEqual(second.claimed, 0)
-        self.assertEqual(len(transport.sent), 1)
-        target, notice = transport.sent[0]
-        self.assertEqual(target, ref)
-        self.assertEqual(
-            set(notice.payload()),
-            {"version", "notification_id", "agent_id", "status"},
-        )
-        self.assertNotIn("safe task", notice.render())
-        self.assertEqual(self.service.get(agent_id).delivery.state, "delivered")
 
     def test_real_service_mcp_preserves_counts_pagination_capacity_and_gate(self) -> None:
         ids = [self.service.start(self.request(f"active-{index}")).agent_id for index in range(3)]

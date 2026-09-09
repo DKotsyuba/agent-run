@@ -21,7 +21,6 @@ import argparse
 import json
 import logging
 import os
-import signal
 import sys
 import traceback
 from contextlib import suppress
@@ -59,7 +58,7 @@ def _write_early_failure(fd: int | None, stage: str, error: BaseException) -> No
 
 _ERROR_FD = _bootstrap_error_fd(sys.argv)
 try:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping
 
     from .config import load_config
     from .errors import ValidationError
@@ -166,18 +165,12 @@ def _supervise(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -
         store.close()
 
 
-def _dispatch(home: Path) -> None:
-    from .cli import _dispatch_once
-
-    _dispatch_once(home)
-
-
 def main(argv: list[str] | None = None) -> int:
-    """Run one supervisor, then its bounded post-terminal delivery dispatch.
+    """Run one supervisor process and report bootstrap failures.
 
     ``payload["canary"] == True`` selects the doctor handshake probe: identity
     proof and READY happen exactly as in a real launch, but no adapter, plan,
-    or session ever runs, and no post-terminal dispatch fires. It exists so
+    or session ever runs. It exists so
     `agent-run doctor` can exercise the real fork -> exec -> identity-proof ->
     READY path with no provider/runtime involved.
     """
@@ -200,7 +193,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = _read_payload(args.payload_fd)
         home = Path(_text(payload, "home"))
-        dispatch_timeout = _number(payload, "post_terminal_timeout_seconds")
         configure_logging(home, "supervisor")
         _logger.info(
             "agent_id=%s stage=payload_read pid=%d",
@@ -230,29 +222,11 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
     finally:
         ready.close_write()
-        try:
-            _bounded(lambda: _dispatch(home), dispatch_timeout)
-        except BaseException:
-            exit_code = 1
     _logger.info(
         "agent_id=%s stage=exit pid=%d exit_code=%d",
         payload.get("agent_id"), child_pid, exit_code,
     )
     return exit_code
-
-
-def _bounded(callback: Callable[[], object], timeout_seconds: float) -> None:
-    def expired(_number: int, _frame: object) -> None:
-        raise TimeoutError("post-terminal callback exceeded its deadline")
-
-    previous = signal.getsignal(signal.SIGALRM)
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        callback()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
 
 
 def _redirect_standard_streams() -> None:
