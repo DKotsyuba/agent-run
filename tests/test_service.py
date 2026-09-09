@@ -901,12 +901,9 @@ Review.
     ) -> None:
         """Preserve the accepted agent identity while bootstrap failure evidence settles."""
 
-        release_callback = threading.Event()
-
         def fail_launch(*args) -> None:
-            """Wait until the caller has asserted the STARTING snapshot."""
+            """Raise the bootstrap evidence from the synchronous submit boundary."""
 
-            release_callback.wait()
             raise SupervisorBootstrapError(
                 "detached supervisor died before session proof at stage "
                 "'import': ModuleNotFoundError: no module named agent_run.adapters "
@@ -927,15 +924,8 @@ Review.
             now=lambda: 100.0,
         )
         request = self.request(request_id="bootstrap-failure")
-        try:
-            accepted = service.start(request)
-            self.assertIs(accepted.agent.status, AgentStatus.STARTING)
-        finally:
-            release_callback.set()
-        self.wait_until(
-            lambda: self.store.get_agent(accepted.agent_id)["status"]
-            == AgentStatus.FAILED.value
-        )
+        accepted = service.start(request)
+        self.assertIs(accepted.agent.status, AgentStatus.FAILED)
 
         row = self.store.list_agents()[0]
         agent_id = row["id"]
