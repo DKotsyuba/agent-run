@@ -427,6 +427,14 @@ class StateStore:
         )
         return [dict(row) for row in rows]
 
+    def events_revision(self) -> int:
+        """Return the global committed event sequence, or zero for an empty store."""
+
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS revision FROM events"
+        ).fetchone()
+        return int(row["revision"])
+
     def agent_projection(
         self, agent_ids: Iterable[str | AgentId]
     ) -> dict[str, dict[str, object]]:
@@ -477,6 +485,15 @@ class StateStore:
                 ), latest_cleanup AS (
                     SELECT events.agent_id, events.data_json AS cleanup_json
                     FROM events JOIN cleanup_seq USING (agent_id, seq)
+                ), phase_seq AS (
+                    SELECT agent_id, MAX(seq) AS seq
+                    FROM events WHERE agent_id IN (SELECT id FROM selected)
+                      AND kind = 'phase'
+                    GROUP BY agent_id
+                ), latest_phase AS (
+                    SELECT events.agent_id, events.at AS phase_started_at,
+                           events.data_json AS phase_json
+                    FROM events JOIN phase_seq USING (agent_id, seq)
                 )
                 SELECT selected.id, progress.last_progress_at,
                        COALESCE(warnings.deadline_warned, 0) AS deadline_warned,
@@ -486,14 +503,17 @@ class StateStore:
                        latest_delivery.ambiguous_result AS delivery_ambiguous,
                        latest_delivery.last_error AS delivery_last_error,
                        latest_evidence.evidence_json,
-                       latest_cleanup.cleanup_json
+                       latest_cleanup.cleanup_json,
+                       latest_phase.phase_started_at,
+                       latest_phase.phase_json
                 FROM selected
                 LEFT JOIN progress ON progress.agent_id = selected.id
                 LEFT JOIN warnings ON warnings.agent_id = selected.id
                 LEFT JOIN latest_delivery ON latest_delivery.agent_id = selected.id
                 LEFT JOIN latest_evidence
                   ON latest_evidence.delivery_id = latest_delivery.id
-                LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id""",
+                LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id
+                LEFT JOIN latest_phase ON latest_phase.agent_id = selected.id""",
             selected,
         )
         return {str(row["id"]): dict(row) for row in rows}

@@ -11,7 +11,7 @@ from agent_run.mcp import serve
 from agent_run.errors import ValidationError
 from agent_run.effective_policy import Constraint
 from agent_run.config import RuntimeConfig
-from agent_run.service import AgentService
+from agent_run.service import AgentQuery, AgentService
 
 
 class _Broker:
@@ -36,6 +36,11 @@ class _Service:
         self.request = request
         return request
 
+    def list(self, query):
+        """Return the factual-list query for dispatch assertions."""
+
+        return query
+
 
 def test_start_accepts_account() -> None:
     service = _Service()
@@ -47,6 +52,19 @@ def test_start_accepts_account() -> None:
     )
     assert isinstance(result, StartRequest)
     assert result.account == "personal2"
+
+
+def test_list_agents_accepts_revision_long_poll_fields() -> None:
+    """Translate factual list cursor/wait inputs into the typed service query."""
+
+    result = call_tool(
+        _Service(),
+        "list_agents",
+        {"after_revision": 12, "wait_seconds": 1.5, "limit": 7},
+        Session(),
+    )
+    assert isinstance(result, AgentQuery)
+    assert (result.after_revision, result.wait_seconds, result.limit) == (12, 1.5, 7)
 
 
 def test_start_accepts_only_unique_known_policy_requirements() -> None:

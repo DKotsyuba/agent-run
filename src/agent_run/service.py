@@ -46,7 +46,7 @@ from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, runtime_skills_dir, state_db_path
 from .profiles import AgentProfile, load_profile
 from .role_plan import ResolvedRolePlan, resolve_role_plan
-from .process_identity import capture_process_birth
+from .process_identity import capture_process_birth, observe_process
 from .resume import identity_snapshot, inherited_request, proven_identity, replayed_resume
 from .state.reconciliation import process_owner_identity
 from .supervisor import supervisor_identity
@@ -254,6 +254,12 @@ class AgentView:
     sequence: int = 1
     cleanup: CleanupView | None = None
     policy: EffectivePolicy | None = None
+    phase: str = "accepted"
+    phase_started_at: float = 0.0
+    process_state: str = "not_started"
+    observed_at: float = 0.0
+    runtime_outcome: str | None = None
+    acceptance: str = "pending"
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +299,8 @@ class AgentQuery:
     orchestrator: OrchestratorRef | None = None
     offset: int = 0
     limit: int = 100
+    after_revision: int | None = None
+    wait_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.active, bool):
@@ -308,6 +316,16 @@ class AgentQuery:
         ):
             raise ValidationError("offset must be a nonnegative integer")
         _page_limit(self.limit)
+        if self.after_revision is not None and (
+            type(self.after_revision) is not int or self.after_revision < 0
+        ):
+            raise ValidationError("after_revision must be a nonnegative integer or None")
+        if (
+            isinstance(self.wait_seconds, bool)
+            or not isinstance(self.wait_seconds, (int, float))
+            or not 0 <= self.wait_seconds <= 60
+        ):
+            raise ValidationError("wait_seconds must be from 0 to 60")
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +336,8 @@ class AgentPage:
     limit: int
     next_offset: int | None
     complete: bool
+    revision: int = 0
+    observed_at: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -839,27 +859,47 @@ class AgentService:
         return self._agent_view(row, self._now(), projection[str(row["id"])])
 
     def list(self, query: AgentQuery = AgentQuery()) -> AgentPage:
+        """Return one consistent factual page, optionally waiting for revision."""
+
         if not isinstance(query, AgentQuery):
             raise ValidationError("query must be an AgentQuery")
+        deadline = time.monotonic() + query.wait_seconds
+        while True:
+            page = self._list_once(query)
+            if (
+                query.after_revision is None
+                or page.revision > query.after_revision
+                or time.monotonic() >= deadline
+            ):
+                return page
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _list_once(self, query: AgentQuery) -> AgentPage:
+        """Read agents, projection, count, and event revision in one snapshot."""
+
         statuses = ACTIVE if query.active else None
-        session_id = (
-            None
-            if query.orchestrator is None
-            else self._store.find_orchestrator_session(query.orchestrator)
-        )
-        if query.orchestrator is not None and session_id is None:
-            return AgentPage((), 0, query.offset, query.limit, None, True)
-        rows = self._store.list_agents(
-            statuses=statuses,
-            orchestrator_session_id=session_id,
-            limit=query.limit,
-            offset=query.offset,
-        )
-        total = self._count_agents(statuses, session_id)
-        projection = self._store.agent_projection(str(row["id"]) for row in rows)
-        now = self._now()
+        connection = self._store.connection
+        connection.execute("BEGIN")
+        try:
+            revision = self._store.events_revision()
+            session_id = (
+                None
+                if query.orchestrator is None
+                else self._store.find_orchestrator_session(query.orchestrator)
+            )
+            rows = [] if query.orchestrator is not None and session_id is None else self._store.list_agents(
+                statuses=statuses,
+                orchestrator_session_id=session_id,
+                limit=query.limit,
+                offset=query.offset,
+            )
+            total = 0 if query.orchestrator is not None and session_id is None else self._count_agents(statuses, session_id)
+            projection = self._store.agent_projection(str(row["id"]) for row in rows)
+        finally:
+            connection.rollback()
+        observed_at = self._now()
         items = tuple(
-            self._agent_view(row, now, projection[str(row["id"])]) for row in rows
+            self._agent_view(row, observed_at, projection[str(row["id"])]) for row in rows
         )
         consumed = query.offset + len(items)
         complete = consumed >= total
@@ -870,6 +910,8 @@ class AgentService:
             query.limit,
             None if complete else consumed,
             complete,
+            revision,
+            observed_at,
         )
 
     def list_orchestrators(self, *, limit: int = 100) -> OrchestratorPage:
@@ -1305,6 +1347,35 @@ class AgentService:
             None if row["answer_sha256"] is None else str(row["answer_sha256"])
         )
         cleanup = self._cleanup_view(projection["cleanup_json"])
+        phase = "accepted"
+        phase_started_at = created_at
+        if status in TERMINAL:
+            phase = "terminal"
+            phase_started_at = finished_at or created_at
+        elif status is AgentStatus.CANCELLING:
+            phase = "stopping"
+            phase_started_at = started_at or created_at
+        elif status is AgentStatus.RUNNING:
+            phase = "running"
+            phase_started_at = started_at or created_at
+        elif projection["phase_json"] is not None:
+            try:
+                phase_payload = json.loads(str(projection["phase_json"]))
+            except ValueError:
+                phase_payload = None
+            candidate = phase_payload.get("phase") if isinstance(phase_payload, dict) else None
+            if candidate in {"preparing", "spawning"}:
+                phase = candidate
+                phase_started_at = float(projection["phase_started_at"])
+        supervisor_pid = row["supervisor_pid"]
+        if supervisor_pid is None:
+            process_state = "not_started"
+        else:
+            birth = row["supervisor_birth_time"]
+            process_state = observe_process(
+                int(supervisor_pid),
+                None if birth is None else float(birth),
+            ).state.value
         return AgentView(
             agent_id,
             str(row["runtime"]),
@@ -1339,6 +1410,12 @@ class AgentService:
             int(row["sequence"]),
             cleanup,
             _policy_from_identity(row["identity_json"]),
+            phase,
+            phase_started_at,
+            process_state,
+            now,
+            status.value if status in TERMINAL else None,
+            "pending",
         )
 
     def _delivery_view(

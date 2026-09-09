@@ -95,6 +95,7 @@ def report_ready(
         process_group_id=owner_pid,
         birth_time=capture_process_birth(owner_pid),
     )
+    store.append_event(checked, "phase", data={"phase": "preparing"})
     if ready is not None:
         ready.ready()
     _logger.info("agent_id=%s stage=READY pid=%d", checked, owner_pid)
@@ -315,6 +316,9 @@ class Supervisor:
 
     def _launch_and_supervise(self) -> Outcome:
         try:
+            self._store.append_event(
+                self._agent_id, "phase", data={"phase": "spawning"}
+            )
             steerable = Capability.STEER in self._adapter.describe().capabilities
             session = self._adapter.launch(self._plan, self._sink)
             _logger.info(

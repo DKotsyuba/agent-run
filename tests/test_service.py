@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -41,6 +42,7 @@ from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
+from agent_run.supervisor import report_ready
 
 
 class FakeAdapter:
@@ -616,6 +618,55 @@ Review.
         self.assertIsNone(row["supervisor_pid"])
         self.assertEqual(request.profile, role.role_name)
 
+    def test_list_long_poll_wakes_on_revision_and_expiry_does_not_mutate(self) -> None:
+        """Expose factual phase/process fields and wait only for committed events."""
+
+        self.service.close()
+        self.store = StateStore.open(self.root / "state.db")
+        self.service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=lambda *_args: None,
+            now=time.time,
+        )
+        result = self.service.start(self.request(request_id="factual-list"))
+        report_ready(
+            self.store, result.agent_id, None, pid=os.getpid(), identity="test-supervisor"
+        )
+        initial = self.service.list()
+        self.assertEqual(initial.items[0].phase, "preparing")
+        self.assertEqual(initial.items[0].process_state, "alive")
+        self.assertEqual(initial.items[0].acceptance, "pending")
+
+        def publish() -> None:
+            """Commit one later phase through a thread-owned store."""
+
+            time.sleep(0.05)
+            writer = StateStore.open(self.root / "state.db")
+            try:
+                writer.append_event(
+                    result.agent_id, "phase", data={"phase": "spawning"}
+                )
+            finally:
+                writer.close()
+
+        thread = threading.Thread(target=publish)
+        thread.start()
+        changed = self.service.list(
+            AgentQuery(after_revision=initial.revision, wait_seconds=1)
+        )
+        thread.join()
+        self.assertGreater(changed.revision, initial.revision)
+        self.assertEqual(changed.items[0].phase, "spawning")
+
+        before = self.store.get_agent(result.agent_id)["status"]
+        expired = self.service.list(
+            AgentQuery(after_revision=changed.revision, wait_seconds=0.05)
+        )
+        self.assertEqual(expired.revision, changed.revision)
+        self.assertEqual(self.store.get_agent(result.agent_id)["status"], before)
+
     def test_list_projection_is_batched_and_exposes_cleanup_evidence(self) -> None:
         """One page uses fixed SQL count and returns validated cleanup evidence."""
 
@@ -652,7 +703,7 @@ Review.
             self.store.connection.set_trace_callback(None)
 
         selects = [statement for statement in statements if statement.startswith("SELECT") or statement.startswith("WITH")]
-        self.assertLessEqual(len(selects), 3)
+        self.assertLessEqual(len(selects), 4)
         self.assertEqual(page.total, 25)
         cleanup = next(
             item.cleanup for item in page.items if item.agent_id == agent_ids[-1]

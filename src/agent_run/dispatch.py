@@ -126,6 +126,8 @@ TOOLS = (
                 "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
                 "offset": {"type": "integer"},
                 "limit": {"type": "integer"},
+                "after_revision": {"type": ["integer", "null"]},
+                "wait_seconds": {"type": "number"},
             }
         ),
     },
@@ -320,7 +322,10 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
         args = _arguments(raw, {"agent_id", "text"}, {"agent_id", "text"})
         return service.steer(_string(args, "agent_id"), _string(args, "text"))
     if name == "list_agents":
-        args = _arguments(raw, {"active", "orchestrator", "offset", "limit"})
+        args = _arguments(
+            raw,
+            {"active", "orchestrator", "offset", "limit", "after_revision", "wait_seconds"},
+        )
         active = args.get("active", False)
         if not isinstance(active, bool):
             raise ValidationError("active must be a boolean")
@@ -330,6 +335,8 @@ def call_tool(service: AgentService, name: str, raw: dict, session: Session) -> 
                 orchestrator=_optional_orchestrator(args.get("orchestrator")),
                 offset=args.get("offset", 0),
                 limit=args.get("limit", 100),
+                after_revision=args.get("after_revision"),
+                wait_seconds=args.get("wait_seconds", 0.0),
             )
         )
     if name == "list_orchestrators":
