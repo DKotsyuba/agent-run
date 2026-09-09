@@ -454,7 +454,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         """A bare launch never imports an ambient/global Claude credential."""
 
         plan = self.prepare(self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir)
-        self.assertIn("CLAUDE_CONFIG_DIR", plan.environment)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plan.environment)
         self.assertNotIn("ANTHROPIC_API_KEY", plan.environment)
 
     def test_prepare_resolves_only_the_fable_alias_in_the_child_argv(self) -> None:
@@ -713,7 +713,6 @@ class ClaudeAdapterTests(unittest.TestCase):
         managed_python.mkdir()
         ambient = {
             "HOME": "/ambient/home",
-            "CLAUDE_CONFIG_DIR": "/ambient/claude",
             "UNRELATED_SECRET": "must-not-copy",
             "ANTHROPIC_API_KEY": "sk-test",
             "UV_PYTHON_INSTALL_DIR": str(managed_python),
@@ -727,9 +726,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.agent_dir,
             )
         self.assertEqual(plan.environment["HOME"], "/ambient/home")
-        self.assertEqual(
-            plan.environment["CLAUDE_CONFIG_DIR"], "/ambient/claude"
-        )
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plan.environment)
         self.assertEqual(plan.environment["PATH"], "/usr/bin")
         self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-test")
         self.assertEqual(
@@ -772,6 +769,21 @@ class ClaudeAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "LSP_TOKEN"):
                 self.prepare(
                     self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
+                )
+
+    def test_prepare_fails_closed_when_native_run_lacks_scoped_claude_config_for_mcp(self) -> None:
+        config = self.runtime_config(mcp=("scoped",))
+        servers = {
+            "scoped": McpConfig("stdio", Path("/bin/echo"), (), ("CLAUDE_CONFIG_DIR",))
+        }
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": "/ambient/claude"}):
+            with self.assertRaisesRegex(
+                ValidationError,
+                "claude mcp 'scoped' requires environment variable CLAUDE_CONFIG_DIR, which is not set",
+            ):
+                self.prepare(
+                    self.request(), self.profile(), config, self.home, self.agent_dir,
+                    mcp_servers=servers,
                 )
 
     def test_prepare_inherits_host_toolchain_for_read_only_mcp(self) -> None:
@@ -833,7 +845,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         native = self.root / "native-claude"
         with patch.dict(
             os.environ,
-            {"CLAUDE_CONFIG_DIR": str(native), "ANTHROPIC_API_KEY": "sk-test"},
+            {"HOME": str(self.home / "native-home"), "ANTHROPIC_API_KEY": "sk-test"},
             clear=False,
         ):
             plan = self.prepare(
@@ -843,7 +855,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.home,
                 self.agent_dir,
             )
-        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plan.environment)
         self.assertFalse(native.exists())
 
     def test_prepare_preserves_host_home_for_unscoped_native_state(self) -> None:
@@ -854,7 +866,6 @@ class ClaudeAdapterTests(unittest.TestCase):
             os.environ,
             {
                 "HOME": "/host/claude-home",
-                "CLAUDE_CONFIG_DIR": str(native),
             },
             clear=False,
         ):
@@ -866,7 +877,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.agent_dir,
             )
         self.assertEqual(plan.environment["HOME"], "/host/claude-home")
-        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plan.environment)
 
     def test_prepare_keeps_scoped_home_for_account_state(self) -> None:
         """Keep isolated runtime HOME when account-scoped credential state is selected."""
@@ -967,7 +978,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.request(), self.profile(), self.runtime_config(), self.home, self.agent_dir
             )
         self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-explicit")
-        self.assertIn("CLAUDE_CONFIG_DIR", plan.environment)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plan.environment)
 
     def test_probe_reports_scoped_cli_state_as_unknown_when_env_is_bare(self) -> None:
         """Probe never borrows a global credential to declare scoped auth healthy."""

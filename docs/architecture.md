@@ -241,8 +241,8 @@ pool. Upstream snapshot timestamps and the source's shelf life remain intact.
 
 Claude credentials are account-scoped when a Claude `account` is configured: login
 and launches share one `CLAUDE_CONFIG_DIR` child path under that account home.
-When `account` is omitted, Claude keeps native host credential state, including
-Keychain-backed OAuth, and uses the native global config directory.
+When `account` is omitted, Claude uses native host credential state and keychain
+auth, and `CLAUDE_CONFIG_DIR` is left unset in the child process environment.
 Native usage collection uses only a declared, explicitly exported OAuth token;
 otherwise its capacity is reported unavailable rather than inspecting scoped
 credential state. API keys are not OAuth tokens.

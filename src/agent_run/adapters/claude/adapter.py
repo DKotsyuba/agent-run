@@ -291,7 +291,11 @@ class ClaudeAdapter:
         argv += ["--append-system-prompt", "\n\n".join(system_prompt_parts)]
         argv += ["--session-id", session_id]
 
-        scoped_config_dir = str(claude_config_dir(config))
+        scoped_config_dir = (
+            str(claude_config_dir(config))
+            if config.credential_state_home is not None
+            else None
+        )
         selected_mcp = role.mcp
         allowed_secret_names = tuple(
             dict.fromkeys(
@@ -305,15 +309,17 @@ class ClaudeAdapter:
                 )
             )
         )
-        launch_home = (
-            os.environ.get("HOME", str(home))
-            if config.credential_state_home is None
-            else str(home)
-        )
+        launch_home = os.environ.get("HOME", str(home)) if scoped_config_dir is None else str(home)
+        overrides: dict[str, str] = {"HOME": launch_home}
+        if scoped_config_dir is not None:
+            overrides["CLAUDE_CONFIG_DIR"] = scoped_config_dir
+
         environment = host_environment(
-            {"HOME": launch_home, "CLAUDE_CONFIG_DIR": scoped_config_dir},
+            overrides,
             allowed_secret_names=allowed_secret_names,
         )
+        if config.credential_state_home is None:
+            environment.pop("CLAUDE_CONFIG_DIR", None)
 
         selected_environment = config.environment
         if selected_environment is not None and selected_environment.denied_commands:
@@ -350,7 +356,7 @@ class ClaudeAdapter:
         for server in selected_mcp:
             for env_name in server.env_from:
                 if env_name == "CLAUDE_CONFIG_DIR":
-                    value = scoped_config_dir
+                    value = environment.get("CLAUDE_CONFIG_DIR")
                 else:
                     value = environment.get(env_name)
                 if not value:
