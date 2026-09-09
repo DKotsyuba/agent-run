@@ -13,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.errors import ValidationError
 from agent_run.lifecycle import (
-    Deadline,
-    Phase,
     ProcessIdentity,
     ReadyChannel,
     SystemProcessOps,
@@ -102,36 +100,6 @@ class ReusedLeaderOps(FakeOps):
         """Report that the captured PID/birth identity is no longer alive."""
 
         return False
-
-
-class DeadlineTests(unittest.TestCase):
-    def test_phases_cross_at_the_warning_fraction_and_the_hard_stop(self) -> None:
-        deadline = Deadline(100.0, 200.0, 0.90)
-        self.assertEqual(deadline.warning_at, 280.0)
-        self.assertEqual(deadline.expires_at, 300.0)
-        self.assertIs(deadline.phase(100.0), Phase.RUNNING)
-        self.assertIs(deadline.phase(279.999), Phase.RUNNING)
-        self.assertIs(deadline.phase(280.0), Phase.WARNING)
-        self.assertIs(deadline.phase(299.999), Phase.WARNING)
-        self.assertIs(deadline.phase(300.0), Phase.EXPIRED)
-        self.assertIs(deadline.phase(1000.0), Phase.EXPIRED)
-
-    def test_remaining_never_goes_negative(self) -> None:
-        deadline = Deadline(0.0, 10.0)
-        self.assertEqual(deadline.remaining(4.0), 6.0)
-        self.assertEqual(deadline.remaining(99.0), 0.0)
-
-    def test_invalid_budgets_are_refused(self) -> None:
-        for kwargs in (
-            {"started_at": 0.0, "timeout_seconds": 0.0},
-            {"started_at": 0.0, "timeout_seconds": float("inf")},
-            {"started_at": -1.0, "timeout_seconds": 5.0},
-            {"started_at": 0.0, "timeout_seconds": 5.0, "warning_fraction": 0.0},
-            {"started_at": 0.0, "timeout_seconds": 5.0, "warning_fraction": 1.5},
-            {"started_at": 0.0, "timeout_seconds": True},
-        ):
-            with self.assertRaises(ValidationError):
-                Deadline(**kwargs)
 
 
 class TerminateProcessGroupTests(unittest.TestCase):

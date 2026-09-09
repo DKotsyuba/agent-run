@@ -199,7 +199,6 @@ class M008IntegrationTests(unittest.TestCase):
             EngineAdapter(session),
             plan,
             answer_path=answer_path,
-            timeout_seconds=10,
             settings=SupervisorSettings(
                 poll_seconds=0.1,
                 grace_seconds=0.1,

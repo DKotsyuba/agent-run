@@ -30,8 +30,8 @@ you / your agent / your app
   its supervisor, and `answer <id>` works tomorrow.
 - **Verified outcomes.** "Succeeded" is derived from recorded evidence
   (completion sentinels, answer hashes, classified failure kinds) — not
-  from an engine's exit code. Error-only replies, stalls, and timeouts are
-  classified, not celebrated.
+  from an engine's exit code. Error-only replies are classified, not
+  celebrated; legacy stall and timeout outcomes remain readable.
 - **One tool table, three transports.** The same tool surface is exposed via
   CLI, MCP, and the socket API, generated from a single dispatcher; a
   parity test keeps them from drifting.
@@ -177,6 +177,7 @@ serve` first, or install the launchd job below; if the daemon is unavailable,
 
 ```bash
 # start one read-only agent; returns immediately with a durable id
+# --timeout remains accepted for compatibility and does not stop execution
 agent-run start --runtime claude --model sonnet --profile review \
   --task "Summarize what this repo does in three lines." \
   --workdir ~/projects/myrepo --timeout 600

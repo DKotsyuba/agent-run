@@ -75,7 +75,7 @@ try:
     )
     from .role_plan import ResolvedRolePlan
     from .state.store import StateStore
-    from .supervisor import Supervisor, SupervisorSettings, report_ready
+    from .supervisor import Supervisor, report_ready
 except BaseException as _import_error:  # fail closed with evidence, no partial module
     _write_early_failure(_ERROR_FD, "import", _import_error)
     os._exit(1)
@@ -160,11 +160,6 @@ def _supervise(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -
             prepared.adapter,
             prepared.plan,
             answer_path=prepared.answer_path,
-            timeout_seconds=request.timeout_seconds or 480.0,
-            settings=SupervisorSettings(
-                warning_fraction=config.core.warning_fraction,
-                stalled_after_seconds=config.core.stalled_after_seconds,
-            ),
             ownership_recorded=True,
         ).run()
     finally:

@@ -59,15 +59,16 @@ payloads kept as file references.
 
 The supervisor enforces:
 
-- **timeouts** — with a configurable warning to the child at 90% asking it
-  to summarize what is done and what remains;
-- **stall detection** — a child silent on its output stream past
-  `core.stalled_after_seconds` (default 900) is killed and classified
-  `stalled`, distinct from a timeout;
 - **cancellation** — kills the process tree, not just the first child;
 - **outcome classification** — the terminal status is derived from
   recorded evidence (result payloads, completion sentinels, error-only
   answer detection), never from exit code alone.
+
+Runtime execution has no automatic deadline, warning, silence watchdog, or
+periodic heartbeat. Legacy timeout and watchdog fields remain accepted and
+stored so older requests and state snapshots stay readable, but the supervisor
+does not act on them. Runs stop when the engine finishes or cancellation is
+requested.
 
 Current answers store the engine's exact UTF-8 payload without a completion
 sentinel. A directory format marker makes the adjacent versioned proof
