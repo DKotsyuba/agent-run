@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.7] - 2026-09-10
+
+- docs(claude): clarify unlabelled home and config env contract
+
 ## [0.11.6] - 2026-09-10
 
 - docs(claude): document native credential home
