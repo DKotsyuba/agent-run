@@ -121,7 +121,7 @@ def _finite(value: object, name: str) -> float:
 
 
 def _optional_nonnegative(value: object, name: str) -> float | None:
-    """Validate an optional finite nonnegative forecast field.
+    """Validate an optional finite nonnegative current-reading field.
 
     ``None`` remains absent. Numeric values are returned as floats; negative,
     boolean, non-finite, or non-numeric values raise ``ValidationError``.

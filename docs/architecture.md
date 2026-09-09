@@ -38,17 +38,16 @@ touch the store or an engine directly.
 
 ## Durable agents
 
-`start` validates and durably admits the request as `starting`, then returns its
-agent id before authentication, materialization, adapter preparation, spawn, or
-READY. A bounded worker with its own thread-affine store performs those slow
-steps and launches a **detached supervisor process** that owns the child engine.
-The accepted preparation lease is finite. Immediately before spawning, the
-coordinator atomically transfers its live claim into a bounded handoff window
-covering READY and failed-launch cleanup. Once the supervisor records its
-ownership proof, the preparation deadline no longer invalidates that proof.
-An abandoned handoff still expires as `lost` and cannot revive the agent later.
-Payload writes share the READY deadline and honor cancellation even when the
-child stops reading the pipe.
+`start` validates and durably admits the request as `starting`, then launches a
+**detached supervisor process**. The supervisor records its PID and birth proof
+and signals READY before authentication, materialization, or adapter preparation;
+`start` returns after that ownership handoff. The supervisor opens its own
+thread-affine store, performs those slow steps, and then owns the child engine.
+Payload delivery and the READY handshake are bounded and honor cancellation even
+when the child stops reading the pipe. After READY, preparation and runtime
+execution have no service-owned age or deadline transition. Reconciliation marks
+an owned run `lost` only when observing its stored PID and birth proof yields the
+OS verdict `dead` or `reused`; `unknown` and `denied` remain unchanged.
 On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
 the legacy fork path is only a compatibility fallback when session-creating
 spawn is explicitly unavailable.

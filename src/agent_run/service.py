@@ -678,8 +678,9 @@ class AgentService:
         latest node of its chain, be finished in a :data:`RESUMABLE
         <agent_run.state.start.RESUMABLE>` status, and have recorded a native
         runtime session. ``task`` is the new prompt and the only inherited
-        field that changes; ``timeout_seconds`` overrides the parent's when
-        given and inherits it when omitted. Everything else -- runtime, model,
+        field that changes; ``timeout_seconds`` overrides the parent's stored
+        compatibility value when given and inherits it when omitted, but never
+        stops runtime execution. Everything else -- runtime, model,
         profile, effort, fast, account, workdir, read roots, write right and
         output schema -- comes from the parent's persisted request, so config
         or default-account drift cannot silently redirect the continuation.

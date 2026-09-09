@@ -404,6 +404,104 @@ class ApiSocketTests(unittest.TestCase):
         waiter.join(timeout=2)
         self.assertTrue(pending["response"]["result"]["timed_out"])
 
+    def test_list_long_poll_outlives_read_deadline_without_blocking_reads(
+        self,
+    ) -> None:
+        """Keep a valid list wait off the ordinary read dispatcher."""
+
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        wait_services = []
+        factory_calls = 0
+
+        class DispatcherService(StubService):
+            """Serve the simultaneous zero-wait list on the normal read lane."""
+
+            def list(self, query):
+                """Return one immediate factual list response."""
+
+                self.list_query = query
+                return {"revision": 8}
+
+        dispatcher_service = DispatcherService()
+
+        class ListWaitService:
+            """Block one validated list call and record its owning thread."""
+
+            def __init__(self) -> None:
+                """Record the handler thread that owns this service."""
+
+                self.created_in = threading.get_ident()
+                self.called_in = None
+                self.closed_in = None
+                self.query = None
+
+            def list(self, query):
+                """Wait for release, then return one factual revision page."""
+
+                self.called_in = threading.get_ident()
+                self.query = query
+                started.set()
+                release.wait(1)
+                return {"revision": 7}
+
+            def close(self) -> None:
+                """Record owner-thread cleanup after the long poll returns."""
+
+                self.closed_in = threading.get_ident()
+
+        def factory():
+            """Create two dispatcher services, then the isolated wait service."""
+
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls <= 2:
+                return dispatcher_service
+            service = ListWaitService()
+            wait_services.append(service)
+            return service
+
+        self.replace_server(factory, request_timeout=0.05)
+        pending = {}
+        waiter = threading.Thread(
+            target=lambda: pending.setdefault(
+                "response",
+                self.request(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "list_agents",
+                        "params": {"after_revision": 7, "wait_seconds": 0.2},
+                    }
+                ),
+            )
+        )
+        waiter.start()
+        self.assertTrue(started.wait(1))
+        time.sleep(0.08)
+        self.assertTrue(waiter.is_alive())
+        self.assertEqual(
+            self.request(
+                {"jsonrpc": "2.0", "id": 2, "method": "list_agents"}
+            )["result"],
+            {"revision": 8},
+        )
+        self.assertEqual(dispatcher_service.list_query.wait_seconds, 0)
+        self.assertTrue(waiter.is_alive())
+        release.set()
+        waiter.join(timeout=1)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(pending["response"]["result"]["revision"], 7)
+        self.assertEqual(len(wait_services), 1)
+        wait_service = wait_services[0]
+        self.assertEqual(wait_service.query.wait_seconds, 0.2)
+        self.assertEqual(
+            wait_service.created_in,
+            wait_service.called_in,
+        )
+        self.assertEqual(wait_service.created_in, wait_service.closed_in)
+
     def test_request_deadline_and_queue_overload_are_explicit(self) -> None:
         """One running and one queued read bound waiting time and capacity."""
 

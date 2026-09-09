@@ -1,10 +1,9 @@
 """JSON-RPC API over a private Unix-domain socket.
 
-SQLite connections are thread-affine (see StateStore.path), so the server
-never shares the service across handler threads: one dedicated dispatcher
-thread constructs the service and executes every tool call sequentially,
-while ThreadingUnixStreamServer handlers only forward requests to it and
-wait on a future. That also serializes dispatch, so no extra lock exists.
+SQLite connections are thread-affine (see StateStore.path), so no service
+crosses threads. Dedicated control and read dispatchers own ordinary calls.
+Positive ``list_agents`` waits instead use one handler-owned service, leaving
+the ordinary read dispatcher available.
 """
 
 from __future__ import annotations
@@ -209,6 +208,21 @@ def _wait_result(outcome) -> object:
     return result
 
 
+def _run_list_wait(
+    params: dict,
+    service_factory: Callable[[], object],
+) -> object:
+    """Run one list long poll on a service owned by this handler thread."""
+
+    service = service_factory()
+    try:
+        return call_tool(service, "list_agents", params)
+    finally:
+        close = getattr(service, "close", None)
+        if callable(close):
+            close()
+
+
 def _run_wait(
     params: dict,
     service_factory: Callable[[], object],
@@ -266,6 +280,8 @@ def _handle(server: ApiServer, request: object) -> dict | None:
             result = _jsonable(TOOLS)
         elif method == "wait":
             result = _run_wait(params, server.service_factory, server.shutdown_event)
+        elif method == "list_agents" and params.get("wait_seconds", 0) != 0:
+            result = _jsonable(_run_list_wait(params, server.service_factory))
         elif method not in TOOL_NAMES:
             response = _rpc_error(response_id, -32601, "method not found")
             return None if request_id is _MISSING else response
@@ -495,10 +511,10 @@ class ApiServer(socketserver.ThreadingUnixStreamServer):
         """Fence ``socket_path`` and initialize bounded control/read owners.
 
         Numeric limits must be positive and finite. ``service_factory`` is
-        called once in each dispatcher thread and must return a fresh service
-        with its own SQLite connection. Potentially slow read/probe methods use
-        the read lane; durable admission, cancel and steer use the control lane.
-        Construction refuses ambiguous existing
+        called once in each dispatcher thread and for each positive list wait;
+        every result must be a fresh service with its own SQLite connection.
+        Ordinary read/probe methods use the read lane; durable admission, cancel
+        and steer use the control lane. Construction refuses ambiguous existing
         sockets and releases every acquired resource on failure.
         """
 

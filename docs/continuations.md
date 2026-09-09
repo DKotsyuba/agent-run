@@ -23,9 +23,11 @@ envelope with a new `agent_id`.
 
 The original runtime, model, reasoning effort, account/home, working directory,
 write/network/read-root grants, output schema and fast setting are inherited.
-Only the task and timeout change. Omitted timeout inherits the previous budget.
-Missing or changed identity/permissions fail explicitly, including a profile
-changed while the new run is being prepared.
+Only the task and stored compatibility timeout change. Omitted timeout inherits
+the previous value. This field remains part of legacy request, replay, and
+snapshot identity; it does not stop runtime execution. Missing or changed
+identity/permissions fail explicitly, including a profile changed while the new
+run is being prepared.
 
 Only the latest terminal run may be continued. The database permits one child
 per predecessor, so concurrent requests cannot branch the conversation. A
