@@ -846,6 +846,22 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
         self.assertFalse(native.exists())
 
+    def test_prepare_uses_native_home_for_unscoped_cli_state(self) -> None:
+        """Preserve native global credential lookup when runtime HOME is isolated."""
+
+        native_home = self.root / "native-home"
+        native_home.mkdir()
+        with patch("agent_run.adapters.claude.auth._native_home", return_value=native_home):
+            with patch.dict("os.environ", {"HOME": str(self.root / "isolated-home")}):
+                plan = self.prepare(
+                    self.request(),
+                    self.profile(),
+                    self.runtime_config(auth=None),
+                    self.home,
+                    self.agent_dir,
+                )
+        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native_home / ".claude"))
+
     def test_prepare_scopes_cli_state_without_injecting_an_oauth_token(self) -> None:
         """A bare launch leaves refresh ownership to a durable private CLI home."""
 
