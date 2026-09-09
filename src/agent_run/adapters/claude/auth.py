@@ -24,23 +24,6 @@ AUTH_ENV_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUT
 _CONFIG_DIR_NAME = "claude-config"
 
 
-def _native_home() -> Path:
-    """Resolve the host login home for native Claude credential lookup.
-
-    ``Path.home()`` follows the current process ``HOME`` environment, which is
-    intentionally isolated for Claude runtime launches. The account-keyed fallback
-    path must remain anchored to the real user home instead.
-    """
-
-    try:
-        import pwd
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-    except (AttributeError, KeyError, ImportError, OSError):
-        configured_home = os.environ.get("HOME")
-        return Path(configured_home).expanduser() if configured_home else Path.home()
-
-
 def claude_config_dir(config: RuntimeConfig) -> Path:
     """Return native global state or create one explicit account directory.
 
@@ -61,7 +44,7 @@ def claude_config_dir(config: RuntimeConfig) -> Path:
         return (
             Path(configured).expanduser()
             if configured
-            else _native_home() / ".claude"
+            else Path.home() / ".claude"
         )
     directory = config.credential_state_home / _CONFIG_DIR_NAME
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
