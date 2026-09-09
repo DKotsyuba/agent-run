@@ -1137,6 +1137,51 @@ class CodexAppServerSessionTests(unittest.TestCase):
                     self.assertEqual(outcome.failure_kind, "oom")
                     self.assertEqual(outcome.failure_text, "boom")
 
+    def test_structured_provider_errors_preserve_precedence_and_overload(self) -> None:
+        """Normalize captured Codex error codes without exposing provider details."""
+
+        provider_message = "Selected model is at capacity. Please try a different model."
+        captured_error = {
+            "message": provider_message,
+            "codexErrorInfo": "serverOverloaded",
+            "additionalDetails": {"requestId": "private-provider-detail"},
+            "willRetry": False,
+        }
+        session, _transport, _sink = self.start(
+            events=[completed(status="failed", error=captured_error)]
+        )
+        outcome = session.wait(0)
+        self.assertEqual(outcome.failure_kind, "provider_overloaded")
+        self.assertEqual(outcome.failure_text, provider_message)
+        self.assertNotIn("private-provider-detail", repr(outcome))
+
+        for error, expected in (
+            (
+                {
+                    "kind": "kind_first",
+                    "code": "code_second",
+                    "codexErrorInfo": "serverOverloaded",
+                },
+                "kind_first",
+            ),
+            (
+                {"code": "code_second", "codexErrorInfo": "serverOverloaded"},
+                "code_second",
+            ),
+            ({"codexErrorInfo": "future/Provider Code\n" * 8}, None),
+        ):
+            with self.subTest(error=error):
+                session, _transport, _sink = self.start(
+                    events=[completed(status="failed", error=error)]
+                )
+                failure_kind = session.wait(0).failure_kind
+                if expected is not None:
+                    self.assertEqual(failure_kind, expected)
+                else:
+                    self.assertTrue(failure_kind.startswith("codex_future_Provider_Code"))
+                    self.assertLessEqual(len(failure_kind), 64)
+                    self.assertNotIn("\n", failure_kind)
+
     def test_in_progress_completion_is_refused_and_the_raw_event_is_retained(self) -> None:
         session, transport, _sink = self.start(events=[completed(status="inProgress")])
         with self.assertRaisesRegex(VerificationError, "nonterminal or unknown status"):

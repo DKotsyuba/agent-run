@@ -15,6 +15,7 @@ from typing import Mapping, Protocol
 
 from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
+from ._error_classification import _structured_failure_kind
 from .environment import thread_grant_params
 from .process_transport import ProcessTransport
 
@@ -258,7 +259,7 @@ def _normalize_outcome(turn: Mapping[str, object], thread_id: str) -> Outcome:
     return Outcome(
         status=status,
         exit_code=_optional_int(turn.get("exit_code")),
-        failure_kind=_optional_str(error.get("kind") or error.get("code")),
+        failure_kind=_structured_failure_kind(error),
         failure_text=_optional_str(error.get("message")),
         runtime_session_id=thread_id,
         answer_path=Path(answer_path) if answer_path else None,
@@ -389,8 +390,6 @@ class CodexAppServerSession:
         Resumed runs require an explicit matching turn; missing identity is
         insufficient evidence that a historical event belongs to this run.
         """
-        """Return whether an item event belongs to this active thread and turn."""
-
         thread_id = params.get("threadId")
         if isinstance(thread_id, str) and thread_id and thread_id != self._thread_id:
             return False
