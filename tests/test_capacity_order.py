@@ -29,6 +29,7 @@ class CapacityOrderTests(TestCase):
         )
         config = SimpleNamespace(
             runtimes={"provider-a": runtime},
+            capacity=SimpleNamespace(sample_retention=10),
         )
         ranked = CapacityOrder(0.0, (), (), (), (), True)
         with patch("agent_run.capacity.order.build_capacity_routes", return_value=CapacityRouteSnapshot((cast(Any, route),), (), ())), patch(
@@ -56,7 +57,8 @@ class CapacityOrderTests(TestCase):
             priority_lane_multipliers={"lane": 2.0} if name == "provider-a" else {},
         ) for name, factor in (("provider-a", 0.5), ("provider-b", 4.0),
                                ("disabled", 9.0), ("unknown", 1.0))}
-        config = SimpleNamespace(runtimes=runtimes)
+        config = SimpleNamespace(runtimes=runtimes,
+                                 capacity=SimpleNamespace(sample_retention=10))
         with patch("agent_run.capacity.order.build_capacity_routes",
                    return_value=CapacityRouteSnapshot(cast(Any, routes), (), ())), patch(
             "agent_run.capacity.order.rank_capacity_routes",

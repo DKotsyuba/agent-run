@@ -54,6 +54,7 @@ class CoreConfig:
 @dataclass(frozen=True)
 class CapacityConfig:
     collect_interval_seconds: int = 300
+    sample_retention: int = 1000
     context_max_chars: int = 2500
     codexbar_binary: Path = Path("/opt/homebrew/bin/codexbar")
 
@@ -455,6 +456,7 @@ def _parse_capacity(value: object) -> CapacityConfig:
         table,
         {
             "collect_interval_seconds",
+            "sample_retention",
             "context_max_chars",
             "codexbar_binary",
         },
@@ -475,6 +477,7 @@ def _parse_capacity(value: object) -> CapacityConfig:
     codexbar_binary = table.get("codexbar_binary")
     return CapacityConfig(
         interval,
+        _int(table.get("sample_retention", 1000), "capacity.sample_retention", minimum=1),
         context_max_chars,
         Path("/opt/homebrew/bin/codexbar")
         if codexbar_binary is None

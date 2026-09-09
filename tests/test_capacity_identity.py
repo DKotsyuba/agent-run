@@ -51,7 +51,7 @@ class CapacityIdentityTests(unittest.TestCase):
                 for item in slices:
                     persist_slice(store, item)
                 self.assertEqual(len(store.capacity_route_snapshots()), 2)
-                snapshot = build_capacity_routes(store, now=1001)
+                snapshot = build_capacity_routes(store, retention=10, now=1001)
                 self.assertEqual(len(snapshot.routes), 2)
                 self.assertFalse(snapshot.deferred)
             finally:

@@ -7,7 +7,6 @@ from ``codex app-server``'s ``account/rateLimits/read``: multi-bucket
 and JSON-RPC-style wrapped results accepted for captured fixtures.
 """
 
-import json
 import sys
 import time
 import unittest
@@ -343,6 +342,7 @@ class CollectCodexAppserverSlicesTests(unittest.TestCase):
             try:
                 for slice_ in slices:
                     persist_slice(store, slice_)
+                rows = store.capacity_sample_history(retention=100, runtime=_RUNTIME)
                 snapshots = store.capacity_route_snapshots(runtime=_RUNTIME)
                 failing = {
                     str(runtime.home): {"rateLimitsByLimitId": {"broken": {"primary": "bad"}}},
@@ -361,8 +361,7 @@ class CollectCodexAppserverSlicesTests(unittest.TestCase):
         # Multi-scope persistence: both scopes stored once, then left untouched.
         self.assertEqual(len(snapshots), 2)
         self.assertEqual({s["scope_id"] for s in snapshots}, {"codex:base", "codex:@plus"})
-        samples = [sample for snapshot in snapshots for sample in json.loads(snapshot["payload_json"])["samples"]]
-        self.assertEqual({row["target"] for row in samples}, {None, "plus"})
+        self.assertEqual({row["target"] for row in rows}, {None, "plus"})
 
 
 class ReadRateLimitsTests(unittest.TestCase):
@@ -559,7 +558,7 @@ class ResetCreditPersistenceTests(unittest.TestCase):
             store = StateStore.initialize(Path(directory) / "state.db")
             try:
                 persist_slice(store, CapacityCollectionSlice(_RUNTIME, "codex:base", samples, topology, _OBSERVED, _OBSERVED + 900))
-                snapshot = build_capacity_routes(store, now=_OBSERVED)
+                snapshot = build_capacity_routes(store, retention=10, now=_OBSERVED)
                 order = rank_capacity_routes(snapshot, {}, now=_OBSERVED)
             finally:
                 store.close()

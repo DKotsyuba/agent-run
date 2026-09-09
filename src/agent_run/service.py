@@ -14,8 +14,10 @@ from typing import Callable, Mapping, TypeAlias
 
 from .adapters.base import Capability, ModelInfo
 from .adapters.registry import AdapterRegistry
+from .capacity.advice import CapacityAdvice, build_advice
+from .capacity.forecast import build_forecasts
+from .capacity.history import load_series
 from .capacity.ranking import CapacityOrder
-from .capacity.snapshot import CapacityReading, build_capacity_routes
 from .config import Config, RuntimeConfig, load_config
 from .domain import (
     ACTIVE,
@@ -376,10 +378,8 @@ class AnswerView:
 
 @dataclass(frozen=True, slots=True)
 class CapacityReport:
-    """Current fresh provider readings observed at one service clock value."""
-
     observed_at: float
-    items: tuple[CapacityReading, ...]
+    items: tuple[CapacityAdvice, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -955,17 +955,33 @@ class AgentService:
         return MappingProxyType(result)
 
     def limits(self) -> CapacityReport:
-        """Return enabled runtimes' current fresh readings without projections."""
+        """Return enabled runtimes' stored forecasts without provider calls."""
 
         observed_at = self._now()
         enabled = {
             name for name, runtime in self._config.runtimes.items() if runtime.enabled
         }
-        snapshot = build_capacity_routes(self._store, now=observed_at)
-        return CapacityReport(
-            observed_at,
-            tuple(item for item in snapshot.readings if item.key.runtime in enabled),
+        series = tuple(
+            item
+            for item in load_series(
+                self._store, retention=self._config.capacity.sample_retention
+            )
+            if item.key.runtime in enabled
         )
+        items = build_advice(build_forecasts(series, now=observed_at))
+        ordered = tuple(
+            sorted(
+                items,
+                key=lambda item: (
+                    item.key.runtime,
+                    item.key.lane,
+                    item.key.window,
+                    item.key.target or "",
+                    item.key.source,
+                ),
+            )
+        )
+        return CapacityReport(observed_at, ordered)
 
     def capacity_order(self) -> CapacityOrder:
         """Return enabled runtimes' deterministic capacity routing order.

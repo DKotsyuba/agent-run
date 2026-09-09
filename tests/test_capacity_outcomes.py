@@ -181,10 +181,12 @@ class CapacityOutcomeRegressionTests(unittest.TestCase):
                         store, "codex", runtime, CapacityConfig(),
                         cast(Any, lambda *_: None), 1, None,
                     )
-                rows = store.capacity_route_snapshots(runtime="codex")
+                rows = store.connection.execute(
+                    "SELECT remaining_percent FROM capacity_samples ORDER BY remaining_percent"
+                ).fetchall()
                 self.assertEqual(result.status, "partial")
                 self.assertEqual(result.sample_count, 2)
-                self.assertEqual([row["scope_id"] for row in rows], ["first", "last", "middle"])
+                self.assertEqual([row["remaining_percent"] for row in rows], [10.0, 20.0, 30.0])
                 rendered = "\n".join(logs.output)
                 self.assertIn("persist_failed", rendered)
                 self.assertNotIn("provider-secret", rendered)
@@ -216,7 +218,7 @@ class CapacityOutcomeRegressionTests(unittest.TestCase):
                     ("codex", STATUS_FAILED, 0), ("healthy", "collected", 1),
                 ])
                 self.assertEqual(
-                    store.connection.execute("SELECT COUNT(*) FROM capacity_route_snapshots").fetchone()[0], 1
+                    store.connection.execute("SELECT COUNT(*) FROM capacity_samples").fetchone()[0], 1
                 )
             finally:
                 store.close()
