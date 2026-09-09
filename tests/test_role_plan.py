@@ -52,7 +52,7 @@ Review the assigned change.
                 skills_root=skills,
                 mcp_catalog={
                     "codegraph": McpConfig(
-                        "stdio", Path("/bin/echo"), ("serve",), ("PATH",)
+                        "stdio", Path("/bin/echo").resolve(), ("serve",), ("PATH",)
                     )
                 },
                 auth_mode="account",
@@ -77,7 +77,7 @@ Review the assigned change.
                     skills_root=skills,
                     mcp_catalog={
                         "codegraph": McpConfig(
-                            "stdio", Path("/bin/echo"), ("serve",), ("PATH",)
+                            "stdio", Path("/bin/echo").resolve(), ("serve",), ("PATH",)
                         )
                     },
                     auth_mode="account",
