@@ -28,6 +28,7 @@ from agent_run.config import Config, ProfilesConfig, RuntimeAuthConfig, RuntimeC
 from agent_run.domain import AgentStatus, OrchestratorRef, Outcome, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.effective_policy import Constraint
+from agent_run.preparation import PreparationFailure, fail_preparation, prepare_launch
 from agent_run.service import AgentService
 from agent_run.state.store import StateStore
 
@@ -173,6 +174,7 @@ class ResumeTests(unittest.TestCase):
         )
         self.store = StateStore.initialize(self.root / "state.db")
         self.launched: list[tuple] = []
+        self.prepared: dict[int, LaunchPlan] = {}
         self.service = self._service(self.config)
 
     def _service(self, config: Config) -> AgentService:
@@ -189,12 +191,22 @@ class ResumeTests(unittest.TestCase):
         return service
 
     def _wait(self, count: int) -> LaunchPlan:
-        """Wait for the ``count``-th launch and return the plan it received."""
+        """Prepare the ``count``-th captured supervisor payload and return its plan."""
 
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if len(self.launched) >= count:
-                return self.launched[count - 1][3]
+                if count not in self.prepared:
+                    agent_id, request, role = self.launched[count - 1]
+                    self.prepared[count] = prepare_launch(
+                        self.store,
+                        self.root,
+                        self.service._config,
+                        agent_id,
+                        request,
+                        role,
+                    ).plan
+                return self.prepared[count]
             time.sleep(0.01)
         self.fail("launch did not happen")
 
@@ -210,6 +222,17 @@ class ResumeTests(unittest.TestCase):
             outcome=Outcome(status, runtime_session_id=session),
             at=102.0,
         )
+
+    def _fail_preparation(self, count: int) -> PreparationFailure:
+        """Run one captured payload and persist its expected preparation failure."""
+
+        agent_id = self.launched[count - 1][0]
+        try:
+            self._wait(count)
+        except PreparationFailure as error:
+            fail_preparation(self.store, agent_id, error)
+            return error
+        self.fail("preparation unexpectedly succeeded")
 
     def _parent(
         self,
@@ -444,8 +467,10 @@ class ResumeTests(unittest.TestCase):
     def test_runtime_without_resume_capability_is_refused(self) -> None:
         parent = self._parent()
         ADAPTER.capabilities = frozenset(Capability) - {Capability.RESUME}
-        with self.assertRaises(ValidationError):
-            self.service.resume(parent, "keep going")
+        child = self.service.resume(parent, "keep going")
+        error = self._fail_preparation(2)
+        self.assertIn("lacks required capabilities", str(error))
+        self.assertIs(self.service.get(child.agent_id).status, AgentStatus.FAILED)
 
     # -- idempotency, races, chains --------------------------------------
 
@@ -578,19 +603,13 @@ Review.
         runtime_home.rename(runtime_home.with_name("runtime-home-missing"))
 
         child = self.service.resume(parent, "continue")
-        deadline = time.monotonic() + 2
-        while self.service.get(child.agent_id).status not in {
-            AgentStatus.FAILED,
-            AgentStatus.CANCELLED,
-        }:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
+        self._fail_preparation(2)
 
         view = self.service.get(child.agent_id)
         self.assertIs(view.status, AgentStatus.FAILED)
         self.assertIn("snapshot", view.failure_text)
         self.assertEqual(ADAPTER.materialize_calls, 1)
-        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len(self.launched), 2)
 
     def test_snapshot_resume_rejects_prepare_rematerialization(self) -> None:
         """A resume plan cannot report mutation of its verified lineage HOME."""
@@ -599,15 +618,12 @@ Review.
         ADAPTER.prepare_materialize_revision = "cfg-2"
 
         child = self.service.resume(parent, "continue")
-        deadline = time.monotonic() + 2
-        while self.service.get(child.agent_id).status is AgentStatus.STARTING:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
+        self._fail_preparation(2)
 
         view = self.service.get(child.agent_id)
         self.assertIs(view.status, AgentStatus.FAILED)
         self.assertIn("must not rematerialize", view.failure_text)
-        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len(self.launched), 2)
 
     def test_legacy_shared_home_resume_rematerializes_before_native_attach(self) -> None:
         """Legacy parents refresh current role state before exact session attach."""

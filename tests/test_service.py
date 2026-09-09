@@ -577,7 +577,7 @@ Review.
         self.assertEqual(first.agent.task_summary, "do work")
         launched = self.launched[0]
         self.assertEqual(launched[0], first.agent_id)
-        self.assertEqual(launched[1].task, "do work")
+        self.assertEqual(launched[1].task, "  do   work  ")
         self.assertEqual(launched[2].role_name, "profile")
 
     def test_start_launches_immediately_after_atomic_admission(self) -> None:

@@ -194,8 +194,8 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
             reconcile_unowned_starting(self.store, at=170, grace_seconds=30), ()
         )
 
-    def test_expired_handoff_without_supervisor_proof_becomes_lost(self) -> None:
-        """A handoff remains bounded when no child ever records ownership."""
+    def test_elapsed_handoff_with_live_owner_remains_starting(self) -> None:
+        """Handoff metadata cannot override matching live PID and birth evidence."""
 
         owner = f"{os.getpid()} {supervisor_identity()}"
         agent_id = self.starting("handoff-expired", at=10)
@@ -210,7 +210,7 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
 
         self.assertEqual(
             reconcile_unowned_starting(self.store, at=139, grace_seconds=30),
-            (agent_id,),
+            (),
         )
 
     @settings(max_examples=30, deadline=None)
@@ -219,13 +219,13 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         handoff_extension=st.integers(min_value=0, max_value=10),
         ready_before_expiry=st.booleans(),
     )
-    def test_generated_handoff_preserves_terminal_capacity_invariant(
+    def test_generated_handoff_never_uses_elapsed_time_as_loss_proof(
         self,
         preparation_delay: int,
         handoff_extension: int,
         ready_before_expiry: bool,
     ) -> None:
-        """Generated handoffs retain capacity through READY or release it on expiry."""
+        """Generated clock advances preserve capacity without dead PID evidence."""
 
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore.initialize(Path(directory) / "state.db")
@@ -286,17 +286,19 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
                         reconcile_unowned_starting(
                             store, at=handoff_deadline, grace_seconds=0
                         ),
-                        (agent_id,),
+                        (),
                     )
-                    replacement = store.create_agent_limited(
-                        self.request("replacement"),
-                        task_summary="task",
-                        config_revision="pending:materialization",
-                        global_limit=1,
-                        runtime_limit=None,
-                        at=handoff_deadline + 1,
-                    )
-                    self.assertTrue(replacement.created)
+                    with self.assertRaisesRegex(
+                        ValidationError, "global active agent limit reached"
+                    ):
+                        store.create_agent_limited(
+                            self.request("replacement"),
+                            task_summary="task",
+                            config_revision="pending:materialization",
+                            global_limit=1,
+                            runtime_limit=None,
+                            at=handoff_deadline + 1,
+                        )
             finally:
                 store.close()
 
