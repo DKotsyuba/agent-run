@@ -1,21 +1,29 @@
-"""A real-process stub adapter the exec'd supervisor loads from a test home.
+"""A deterministic real-process adapter for exec'd supervisor tests.
 
-`launch` is the only method the detached supervisor calls; everything else exists
-so the trusted adapter registry accepts the module.
+The adapter materializes and prepares inside the detached supervisor, then
+launches a short shell process whose answer is verified as durable evidence.
 """
 
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 from agent_run.adapters.base import (
     ADAPTER_API_VERSION,
+    Capability,
     LaunchPlan,
     ModelInfo,
     RuntimeHealth,
     RuntimeInfo,
 )
+from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.domain import AgentStatus, Outcome
+from agent_run.verify import DEFAULT_SENTINEL
+
+
+ENGINE = r'printf "%s\n%s\n" "$STUB_SECRET" "$STUB_SENTINEL" > "$1"'
+SECRET = "opencode-server-password-2f7c"
 
 
 class StubEngineSession:
@@ -48,12 +56,23 @@ class StubEngineSession:
 
 class StubEngineAdapter:
     def describe(self) -> RuntimeInfo:
-        return RuntimeInfo("fake", ADAPTER_API_VERSION, frozenset())
+        """Advertise the capabilities exercised by supervisor preparation."""
+
+        return RuntimeInfo(
+            "fake",
+            ADAPTER_API_VERSION,
+            frozenset(
+                {Capability.MODEL_ROSTER, Capability.SKILLS, Capability.TRANSCRIPT}
+            ),
+        )
 
     def validate(self, config) -> None:
         return None
 
     def materialize(self, config, home, *, mcp_servers, skills_root) -> str:
+        """Create an empty managed runtime snapshot and return its revision."""
+
+        finalize_runtime_snapshots(Path(home), "cfg-1")
         return "cfg-1"
 
     def probe(self, config, home) -> RuntimeHealth:
@@ -65,10 +84,38 @@ class StubEngineAdapter:
     def limits(self, config, home):
         return ()
 
-    def prepare(self, request, role, config, home, agent_dir, *, resume_session_id=None):
-        """Reject preparation because supervisor tests provide a completed plan."""
+    def prepare(
+        self,
+        request,
+        role,
+        config,
+        home,
+        agent_dir,
+        *,
+        resume_session_id=None,
+    ) -> LaunchPlan:
+        """Build the deterministic shell plan encoded by the fixture request.
 
-        raise AssertionError("the detached supervisor never prepares a plan")
+        The request task is a nonnegative sleep duration in seconds. The plan
+        writes the fixed secret and completion sentinel before that optional
+        delay, allowing the supervisor tests to observe RUNNING when requested.
+        """
+
+        sleep_seconds = float(request.task)
+        if sleep_seconds < 0:
+            raise ValueError("stub sleep duration must be nonnegative")
+        script = ENGINE if sleep_seconds == 0 else f"{ENGINE}; sleep {sleep_seconds}"
+        answer_path = agent_dir / "answer.md"
+        return LaunchPlan(
+            (str(config.binary), "-c", script, "sh", str(answer_path)),
+            request.workdir,
+            {"STUB_SECRET": SECRET, "STUB_SENTINEL": DEFAULT_SENTINEL},
+            None,
+            agent_dir / "runtime.jsonl",
+            {},
+            answer_path,
+            resume_session_id,
+        )
 
     def launch(self, plan: LaunchPlan, sink) -> StubEngineSession:
         sink.event("stub_engine_launched", {"argv": list(plan.argv)})
