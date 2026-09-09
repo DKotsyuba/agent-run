@@ -1097,16 +1097,9 @@ Review.
         )
         self.assertTrue(fake_roster.available)
         self.assertIsNone(fake_roster.reason)
-        self.store.insert_capacity_sample(
-            runtime="fake",
-            lane="main",
-            window="5h",
-            source="test",
-            payload={},
-            remaining_percent=50,
-            reset_at=200,
-            observed_at=100,
-            valid_until=150,
+        self.store.replace_capacity_snapshot(
+            runtime="fake", scope_id="fake", observed_at=100, valid_until=150,
+            payload={"samples": [{"lane": "main", "window": "5h", "source": "test", "target": None, "remaining_percent": 50, "reset_at": 200, "observed_at": 100, "valid_until": 150}], "pools": [], "routes": []},
         )
         limits = self.service.limits()
         self.assertEqual(len(limits.items), 1)

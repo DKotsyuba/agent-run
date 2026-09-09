@@ -192,12 +192,11 @@ The Node wrapper preserves MCP stdio and removes its socket on child exit.
 A collector (`agent-run capacity collect`, launchd-schedulable) samples
 remaining quota per runtime through a pluggable per-runtime source:
 `native` engine data, a short-lived Codex app-server, the `codexbar` CLI,
-a local OmniRoute router, or `none`. A collection stores samples and its
-explicit physical-pool/route topology atomically. Per-account scopes refresh
+a local OmniRoute router, or `none`. A collection replaces one current snapshot
+containing samples and explicit physical-pool/route topology. Per-account scopes refresh
 independently, so a failed account keeps its previous topology only until that
 snapshot expires instead of deleting healthy sibling scopes. Samples carry
-validity windows; `limits` serves projections with burn-rate–based exhaustion
-risk per lane, worst first, hiding nothing.
+validity windows; `limits` serves those current values without projections.
 
 Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
 and `unsupported`. A source failure is not a successful collection of zero
@@ -209,15 +208,10 @@ reason codes and counts, never provider response bodies or raw child stderr.
 Sources retain their bounded call deadlines; a round exceeding the configured
 collection interval is explicitly warned about.
 
-Freshness uses source observations, not the time an old payload was fetched
-again. Future observations and windows whose reset has arrived are unknown.
-Diagnostic snapshots select the newest row per quota identity before applying
-their result cap, so a busy account cannot hide a stale sibling through repeated
-samples. Stored sample history retains its separate, global retention bound.
-Reset-cycle grouping tolerates up to one second of reporting jitter only when
-both reported resets were still in the future at the latest observation.
-Stored timestamps and the reported latest reset remain unchanged; a reset
-that already passed is not merged into the next cycle.
+Freshness uses source observations and each snapshot's validity bound. Future
+observations, expired snapshots, and windows whose reset has arrived are
+unavailable until the next collection. Historical sample rows from older schema
+versions remain upgrade-readable but production no longer reads or writes them.
 
 OmniRoute quotas come from its current `key_value` cache under the
 `providerLimitsCache` namespace, using `fetchedAt` as the observation clock.
@@ -251,9 +245,7 @@ governing limit does not exist.
 
 Capacity route ranking is a pure read of those snapshots. Every governing
 window must be fresh and known; a zero window is omitted before scoring.
-Evidence spanning at least one hour projects remaining capacity to reset,
-while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
-at 50%. The worst window defines a nonnegative route score, then a positive
+The lowest current remaining percentage defines the route score, then a positive
 runtime multiplier scales its priority. Optional account and quota-lane weight
 maps override that default, with account taking precedence over lane. Weights
 are absolute replacements, not products. Concrete account/model aliases sharing

@@ -38,14 +38,12 @@ from .db import (
     count_agents,
     immediate,
     integer,
-    insert_capacity_row,
     initialize_database,
     insert_event,
     json_text,
     message_rows,
     nonblank,
     open_database,
-    recent_capacity_rows,
     require_attempt,
     resolve_message_storage,
     row_dict,
@@ -1140,78 +1138,8 @@ class StateStore:
             if updated != 1:
                 raise ValidationError("command is unclaimed or owned by another agent")
 
-    def insert_capacity_sample(
+    def replace_capacity_snapshot(
         self,
-        *,
-        runtime: str,
-        lane: str,
-        window: str,
-        source: str,
-        payload: object,
-        target: str | None = None,
-        remaining_percent: float | None = None,
-        reset_at: float | None = None,
-        observed_at: float | None = None,
-        valid_until: float | None = None,
-    ) -> int:
-        for name, value in (
-            ("runtime", runtime),
-            ("lane", lane),
-            ("window", window),
-            ("source", source),
-        ):
-            nonblank(name, value)
-        if remaining_percent is not None and (
-            isinstance(remaining_percent, bool)
-            or not isinstance(remaining_percent, (int, float))
-            or not math.isfinite(remaining_percent)
-            or not 0 <= remaining_percent <= 100
-        ):
-            raise ValidationError("remaining_percent must be between 0 and 100")
-        return insert_capacity_row(
-            self.connection,
-            runtime=runtime,
-            lane=lane,
-            window=window,
-            target=target,
-            source=source,
-            remaining_percent=remaining_percent,
-            reset_at=None if reset_at is None else timestamp(reset_at),
-            observed_at=None if observed_at is None else timestamp(observed_at),
-            valid_until=None if valid_until is None else timestamp(valid_until),
-            payload_json=json_text(payload),
-        )
-
-    def recent_capacity_samples(
-        self,
-        *,
-        at: float | None = None,
-        runtime: str | None = None,
-        limit: int = 100,
-    ) -> list[dict[str, object]]:
-        integer("limit", limit, minimum=1)
-        now = timestamp(at)
-        if runtime is not None:
-            nonblank("runtime", runtime)
-        rows = recent_capacity_rows(self.connection, now, runtime, limit)
-        return [dict(row) for row in rows]
-
-    def prune_capacity_samples(self, retention: int) -> int:
-        return capacity.prune_capacity_samples(self.connection, retention)
-
-    def capacity_sample_history(
-        self, *, retention: int, runtime: str | None = None
-    ) -> list[dict[str, object]]:
-        return [
-            dict(row)
-            for row in capacity.capacity_sample_history(
-                self.connection, retention=retention, runtime=runtime
-            )
-        ]
-
-    def append_capacity_samples(
-        self,
-        samples: Iterable[dict[str, object]],
         *,
         runtime: str,
         scope_id: str,
@@ -1219,18 +1147,14 @@ class StateStore:
         valid_until: float,
         payload: object,
     ) -> None:
-        """Atomically persist samples and one route topology snapshot.
+        """Atomically replace one current route and sample snapshot.
 
-        ``samples`` is consumed once; each mapping must belong to ``runtime``.
-        ``scope_id`` must be nonblank, timestamps must be finite and ordered
-        with expiry no earlier than observation, and the JSON ``payload`` is
-        limited to 65,536 UTF-8 bytes. The store commits all rows and the
-        snapshot together or leaves both unchanged. Validation errors and
-        SQLite failures are propagated according to the StateStore contract.
+        ``scope_id`` must be nonblank, timestamps must be finite and ordered,
+        and ``payload`` is bounded JSON containing the latest provider values.
         """
 
-        capacity.append_capacity_samples(
-            self.connection, samples, runtime=runtime, scope_id=scope_id,
+        capacity.replace_capacity_snapshot(
+            self.connection, runtime=runtime, scope_id=scope_id,
             observed_at=observed_at, valid_until=valid_until, payload=payload,
         )
 

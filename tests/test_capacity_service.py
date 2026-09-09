@@ -93,8 +93,13 @@ class CapacityServiceTests(unittest.TestCase):
             "target": None,
             "source": "source",
         }
-        self.store.append_capacity_samples(
-            [
+        self.store.replace_capacity_snapshot(
+            runtime=runtime,
+            scope_id=scope,
+            observed_at=900.0,
+            valid_until=valid_until,
+            payload={
+                "samples": [
                 {
                     "lane": lane,
                     "window": "window",
@@ -104,14 +109,8 @@ class CapacityServiceTests(unittest.TestCase):
                     "reset_at": 2_000.0,
                     "observed_at": 900.0,
                     "valid_until": valid_until,
-                    "payload": None,
                 }
-            ],
-            runtime=runtime,
-            scope_id=scope,
-            observed_at=900.0,
-            valid_until=valid_until,
-            payload={
+                ],
                 "pools": [{"pool_id": pool_id, "keys": [key]}],
                 "routes": [
                     {
@@ -215,18 +214,7 @@ class CapacityServiceTests(unittest.TestCase):
             dict[str, object], _jsonable(call_tool(service, "limits", {}, session))
         )
         items = cast(list[dict[str, object]], limits["items"])
-        self.assertEqual(
-            set(items[0]),
-            {
-                "key",
-                "known",
-                "remaining_percent",
-                "reset_at",
-                "warmup",
-                "risk",
-                "recommendations",
-            },
-        )
+        self.assertEqual(set(items[0]), {"key", "remaining_percent", "reset_at", "observed_at", "valid_until"})
 
 
 if __name__ == "__main__":

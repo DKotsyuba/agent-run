@@ -142,12 +142,12 @@ caller required it, exact scope, and reason. Historical rows return `null`.
 `capacity_order` takes no parameters. It returns fresh non-exhausted physical
 quota routes in descending priority, plus deferred evidence, exhausted
 `omitted` routes, and `unavailable_runtimes`. Each working route includes its
-concrete runtime/account/quota-lane aliases, governing windows, raw score,
+concrete runtime/account/quota-lane aliases, current governing windows, raw score,
 configured multiplier, manual-reset credit count and its bounded bonus, final
 priority, and limiting exact key/reset. The manual reset bonus is only applied
 to the stable Codex ``codex`` limit id after the route remains eligible: with
-``n`` credits its factor is ``1 + n/(n+1)``. It never creates quota, changes
-forecasts, or restores an exhausted route. The list
+``n`` credits its factor is ``1 + n/(n+1)``. It never creates quota or restores
+an exhausted route. The list
 is role-independent: callers still choose the first alias whose models fit the
 task. `insufficient_diversity` is true when fewer than two working physical
 choices remain; the routes list is still authoritative and may contain one or
@@ -225,7 +225,8 @@ Notes for the loop:
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - Model rosters and health come from `models`. Choose the first compatible
   route from the injected Runtime priorities; if absent, obtain `capacity_order`.
-  Do not repeatedly query `limits` for routing; it remains a diagnostic view.
+  `limits` is a diagnostic view of current samples with no history, forecast,
+  burn, risk, or advice fields.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit

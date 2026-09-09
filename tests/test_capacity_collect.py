@@ -128,7 +128,7 @@ class CapacityCollectTests(unittest.TestCase):
         self.assertEqual(by_runtime["claude"].error, "RuntimeError")
         self.assertEqual(by_runtime["unsupported"].status, STATUS_UNSUPPORTED)
 
-        stored = self.store.recent_capacity_samples(at=0.0, limit=100)
+        stored = json.loads(self.store.capacity_route_snapshots(runtime="codex")[0]["payload_json"])["samples"]
         self.assertEqual(len(stored), 2)
         by_lane = {row["lane"]: row for row in stored}
         self.assertEqual(by_lane["requests"]["remaining_percent"], 72.5)
@@ -137,7 +137,7 @@ class CapacityCollectTests(unittest.TestCase):
         self.assertEqual(by_lane["requests"]["valid_until"], observed.timestamp() + 600)
         self.assertIsNone(by_lane["tokens"]["remaining_percent"])
         self.assertEqual(by_lane["tokens"]["observed_at"], 1_704_110_400.0)
-        self.assertIsNone(by_lane["tokens"]["valid_until"])
+        self.assertEqual(by_lane["tokens"]["valid_until"], 1_704_111_000.0)
 
     def test_malformed_samples_and_raising_generators_are_runtime_local(self) -> None:
         sample = LimitSample(
@@ -206,8 +206,7 @@ class CapacityCollectTests(unittest.TestCase):
         }
         config = Config(schema_version=1, runtimes={"codex": _runtime_config()})
         collect_once(self.store, config, at=1.0, loader=lambda name, cfg: adapters[name])
-        stored = self.store.recent_capacity_samples(at=0.0, limit=10)
-        payload = stored[0]["payload_json"]
+        payload = self.store.capacity_route_snapshots(runtime="codex")[0]["payload_json"]
         self.assertNotIn("auth", payload)
         self.assertNotIn("token", payload.lower())
 
@@ -245,7 +244,7 @@ class CapacityCollectTests(unittest.TestCase):
         self.assertEqual(result.status, STATUS_COLLECTED)
         self.assertEqual(result.sample_count, 1)
 
-        stored = self.store.recent_capacity_samples(at=0.0, limit=10)
+        stored = json.loads(self.store.capacity_route_snapshots(runtime="codex")[0]["payload_json"])["samples"]
         self.assertEqual(len(stored), 1)
         row = stored[0]
         expected = datetime(2026, 8, 29, 12, 12, 53, tzinfo=timezone.utc).timestamp()
@@ -253,32 +252,6 @@ class CapacityCollectTests(unittest.TestCase):
         self.assertEqual(row["remaining_percent"], 54.0)
         self.assertEqual(row["observed_at"], expected)
         self.assertEqual(row["valid_until"], expected + 900)
-
-    def test_partial_failure_still_prunes_to_global_retention(self) -> None:
-        for observed_at in (1, 2):
-            self.store.insert_capacity_sample(
-                runtime="codex", lane="requests", window="5h", source="provider",
-                payload={}, observed_at=observed_at,
-            )
-        config = Config(
-            schema_version=1,
-            capacity=CapacityConfig(sample_retention=1),
-            runtimes={"broken": _runtime_config()},
-        )
-        adapter = FakeAdapter(
-            capabilities=frozenset({Capability.LIVE_LIMITS}),
-            limits_error=RuntimeError("unavailable"),
-        )
-
-        report = collect_once(
-            self.store, config, at=3, loader=lambda name, runtime: adapter
-        )
-
-        self.assertEqual(report.results[0].status, STATUS_FAILED)
-        rows = self.store.capacity_sample_history(retention=10)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["observed_at"], 2)
-
 
 if __name__ == "__main__":
     unittest.main()

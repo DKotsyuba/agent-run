@@ -7,8 +7,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run.adapters.base import LimitSample
 from agent_run.capacity import sources
 from agent_run.capacity.collect import collect_slice
-from agent_run.capacity.history import CapacityKey
 from agent_run.capacity.topology import (
+    CapacityKey,
     CapacityRouteDescriptor,
     CapacityTopology,
     PhysicalPoolDescriptor,
@@ -335,18 +335,17 @@ class CollectSliceTests(unittest.TestCase):
             store = StateStore.initialize(Path(directory) / "state.db")
             try:
                 persist_slice(store, collected)
-                rows = store.capacity_sample_history(retention=10, runtime="cortex-runtime")
                 snapshots = store.capacity_route_snapshots(runtime="cortex-runtime")
             finally:
                 store.close()
-        (row,) = rows
+        (snapshot,) = snapshots
+        payload = json.loads(snapshot["payload_json"])
+        (row,) = payload["samples"]
         self.assertEqual(row["lane"], "primary")
         self.assertEqual(row["target"], "team1")
         self.assertEqual(row["observed_at"], 1000.0)
         self.assertEqual(row["valid_until"], 1600.0)
-        (snapshot,) = snapshots
         self.assertEqual(snapshot["scope_id"], "cortex-runtime")
-        payload = json.loads(snapshot["payload_json"])
         self.assertEqual(payload["routes"][0]["account"], "team1")
         self.assertTrue(payload["pools"])
 

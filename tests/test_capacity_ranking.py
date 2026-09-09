@@ -6,15 +6,15 @@ from collections.abc import Mapping
 from typing import cast
 import unittest
 
-from agent_run.capacity.forecast import CapacityForecast
-from agent_run.capacity.history import CapacityKey
 from agent_run.capacity.ranking import rank_capacity_routes
 from agent_run.capacity.snapshot import (
+    CapacityReading,
     CapacityRoute,
     CapacityRouteEvidence,
     CapacityRouteSnapshot,
 )
 from agent_run.capacity.topology import (
+    CapacityKey,
     CapacityRouteDescriptor,
     PhysicalPoolDescriptor,
 )
@@ -25,46 +25,25 @@ from agent_run.errors import ValidationError
 _NOW = 1_000.0
 
 
-def _forecast(
+def _reading(
     runtime: str,
     lane: str,
-    remaining: float,
+    remaining: float | None,
     *,
     reset_at: float | None = 4_600.0,
-    burn: float | None = None,
-    span: float | None = None,
-    warmup: bool | None = None,
-    risk: str = "low",
-    known: bool = True,
     observed_at: float | None = _NOW,
-) -> CapacityForecast:
-    """Build one exact forecast with explicit burn evidence for a test route.
-
-    ``runtime`` and ``lane`` form an opaque key. Percentages and timestamps use
-    the same domains as production forecasts; ``warmup`` defaults to whether
-    burn is absent. Unknown forecasts intentionally carry no remaining value.
-    """
+) -> CapacityReading:
+    """Build one exact current reading for a test route."""
 
     key = CapacityKey(runtime, lane, "window", None, "source")
-    return CapacityForecast(
-        key=key,
-        known=known,
-        remaining_percent=remaining if known else None,
-        reset_at=reset_at if known else None,
-        observed_at=observed_at if known else None,
-        warmup=(burn is None) if warmup is None else warmup,
-        burn_percent_per_hour=burn if known else None,
-        sustainable_percent_per_hour=None,
-        risk=risk if known else "unknown",
-        burn_span_seconds=span if known else None,
-    )
+    return CapacityReading(key, remaining, reset_at, _NOW if observed_at is None else observed_at, 2_000.0)
 
 
 def _route(
     runtime: str,
     route_id: str,
     pool_id: str,
-    forecasts: tuple[CapacityForecast, ...],
+    forecasts: tuple[CapacityReading, ...],
     *,
     account: str | None = None,
     quota_lane: str = "lane",
@@ -106,24 +85,22 @@ class CapacityRankingTests(unittest.TestCase):
             "runtime-a",
             "route-a",
             "pool-a",
-            (_forecast("runtime-a", "lane-a", 80.0, burn=20.0, span=7_200.0),),
+            (_reading("runtime-a", "lane-a", 80.0),),
         )
         route_b = _route(
             "runtime-b",
             "route-b",
             "pool-b",
-            (_forecast("runtime-b", "lane-b", 90.0, burn=0.0, span=7_200.0),),
+            (_reading("runtime-b", "lane-b", 90.0),),
         )
         order = rank_capacity_routes(
             _snapshot(route_b, route_a), {"runtime-a": 2.0}, now=_NOW
         )
         first = order.routes[0]
         self.assertEqual(first.runtime, "runtime-a")
-        self.assertAlmostEqual(first.score, 1.6)
+        self.assertAlmostEqual(first.score, 0.8)
         self.assertEqual(first.multiplier, 2.0)
-        self.assertAlmostEqual(first.priority, 3.2)
-        self.assertEqual(first.windows[0].projected_percent, 60.0)
-        self.assertEqual(first.windows[0].marker, "projected")
+        self.assertAlmostEqual(first.priority, 1.6)
         self.assertFalse(order.insufficient_diversity)
 
     def test_fallback_markers_use_centered_remaining_percent(self) -> None:
@@ -134,34 +111,17 @@ class CapacityRankingTests(unittest.TestCase):
             "route",
             "pool",
             (
-                _forecast("opaque-runtime", "warm", 75.0),
-                _forecast(
-                    "opaque-runtime", "thin", 75.0, burn=5.0, span=1_800.0
-                ),
-                _forecast(
-                    "opaque-runtime",
-                    "none",
-                    75.0,
-                    reset_at=None,
-                    burn=5.0,
-                    span=7_200.0,
-                ),
+                _reading("opaque-runtime", "first", 75.0),
+                _reading("opaque-runtime", "second", 75.0, reset_at=None),
             ),
         )
         order = rank_capacity_routes(_snapshot(route), {}, now=_NOW)
-        self.assertAlmostEqual(order.routes[0].score, 1.5)
-        self.assertEqual(
-            {item.marker for item in order.routes[0].windows},
-            {"warmup", "thin_evidence", "no_reset"},
-        )
-        self.assertTrue(
-            all(item.projected_percent is None for item in order.routes[0].windows)
-        )
+        self.assertAlmostEqual(order.routes[0].score, 0.75)
 
     def test_exhaustion_is_omitted_and_multiplier_cannot_revive_zero_score(self) -> None:
         """A zero window is omitted while forecast-zero priority stays last."""
 
-        exhausted = _forecast("provider-x", "empty", 0.0)
+        exhausted = _reading("provider-x", "empty", 0.0)
         alias_a = _route(
             "provider-x", "route-a", "shared-pool", (exhausted,), account="a"
         )
@@ -172,16 +132,14 @@ class CapacityRankingTests(unittest.TestCase):
             "provider-y",
             "high",
             "high-pool",
-            (_forecast("provider-y", "high", 1.0, risk="high"),),
+            (_reading("provider-y", "high", 1.0),),
         )
         zero_score = _route(
             "provider-z",
             "zero",
             "zero-pool",
             (
-                _forecast(
-                    "provider-z", "zero", 1.0, burn=200.0, span=7_200.0
-                ),
+                _reading("provider-z", "zero", 1.0),
             ),
         )
         order = rank_capacity_routes(
@@ -193,15 +151,13 @@ class CapacityRankingTests(unittest.TestCase):
         self.assertEqual(
             [alias.account for alias in order.omitted[0].aliases], ["a", "b"]
         )
-        self.assertEqual([item.runtime for item in order.routes], ["provider-y", "provider-z"])
-        self.assertEqual(order.routes[0].windows[0].risk, "high")
-        self.assertEqual(order.routes[1].score, 0.0)
-        self.assertEqual(order.routes[1].priority, 0.0)
+        self.assertEqual([item.runtime for item in order.routes], ["provider-z", "provider-y"])
+        self.assertEqual(order.routes[1].score, 0.01)
 
     def test_alias_collapse_preserves_concrete_launch_descriptors(self) -> None:
         """Shared physical capacity appears once with every account alias."""
 
-        forecast = _forecast("provider-ζ", "shared", 80.0)
+        forecast = _reading("provider-ζ", "shared", 80.0)
         routes = (
             _route(
                 "provider-ζ",
@@ -238,13 +194,13 @@ class CapacityRankingTests(unittest.TestCase):
 
         routes = (
             _route(
-                "runtime", "route-c", "pool-c", (_forecast("runtime", "c", 60.0, reset_at=3_000.0),)
+                "runtime", "route-c", "pool-c", (_reading("runtime", "c", 60.0, reset_at=3_000.0),)
             ),
             _route(
-                "runtime", "route-b", "pool-b", (_forecast("runtime", "b", 60.0, reset_at=2_000.0),)
+                "runtime", "route-b", "pool-b", (_reading("runtime", "b", 60.0, reset_at=2_000.0),)
             ),
             _route(
-                "runtime", "route-a", "pool-a", (_forecast("runtime", "a", 60.0, reset_at=2_000.0),)
+                "runtime", "route-a", "pool-a", (_reading("runtime", "a", 60.0, reset_at=2_000.0),)
             ),
         )
         forward = rank_capacity_routes(_snapshot(*routes), {}, now=_NOW)
@@ -260,16 +216,16 @@ class CapacityRankingTests(unittest.TestCase):
 
         first = rank_capacity_routes(
             _snapshot(
-                _route("runtime", "a", "pool-a", (_forecast("runtime", "a", 20.0),)),
-                _route("runtime", "b", "pool-b", (_forecast("runtime", "b", 80.0),)),
+                _route("runtime", "a", "pool-a", (_reading("runtime", "a", 20.0),)),
+                _route("runtime", "b", "pool-b", (_reading("runtime", "b", 80.0),)),
             ),
             {},
             now=_NOW,
         )
         second = rank_capacity_routes(
             _snapshot(
-                _route("runtime", "a", "pool-a", (_forecast("runtime", "a", 90.0),)),
-                _route("runtime", "b", "pool-b", (_forecast("runtime", "b", 10.0),)),
+                _route("runtime", "a", "pool-a", (_reading("runtime", "a", 90.0),)),
+                _route("runtime", "b", "pool-b", (_reading("runtime", "b", 10.0),)),
             ),
             {},
             now=_NOW,
@@ -281,13 +237,13 @@ class CapacityRankingTests(unittest.TestCase):
         """Snapshot and ranker deferrals remain visible without hiding siblings."""
 
         good = _route(
-            "runtime-u", "good", "good-pool", (_forecast("runtime-u", "good", 50.0),)
+            "runtime-u", "good", "good-pool", (_reading("runtime-u", "good", 50.0),)
         )
         unknown = _route(
             "runtime-x",
             "unknown",
             "unknown-pool",
-            (_forecast("runtime-x", "unknown", 0.0, known=False),),
+            (_reading("runtime-x", "unknown", None),),
         )
         snapshot = _snapshot(
             unknown,
@@ -298,7 +254,7 @@ class CapacityRankingTests(unittest.TestCase):
         order = rank_capacity_routes(snapshot, {}, now=_NOW)
         self.assertEqual(
             {item.reason for item in order.deferred},
-            {"malformed", "expired", "ranker_unknown_forecast"},
+            {"malformed", "expired", "ranker_unavailable"},
         )
         self.assertEqual(order.unavailable_runtimes, ("runtime-d", "runtime-x"))
         self.assertEqual(order.routes[0].runtime, "runtime-u")
@@ -331,9 +287,9 @@ class CapacityRankingTests(unittest.TestCase):
     def test_route_multiplier_is_scoped_by_runtime_and_alias_weight_is_maximum(self) -> None:
         """Same route ids stay isolated while aliases choose the largest factor."""
 
-        shared_a = _route("provider-a", "shared", "pool-a", (_forecast("provider-a", "a", 80.0),))
-        alias_a = _route("provider-a", "alias", "pool-a", (_forecast("provider-a", "a", 80.0),))
-        shared_b = _route("provider-b", "shared", "pool-b", (_forecast("provider-b", "b", 80.0),))
+        shared_a = _route("provider-a", "shared", "pool-a", (_reading("provider-a", "a", 80.0),))
+        alias_a = _route("provider-a", "alias", "pool-a", (_reading("provider-a", "a", 80.0),))
+        shared_b = _route("provider-b", "shared", "pool-b", (_reading("provider-b", "b", 80.0),))
         order = rank_capacity_routes(
             _snapshot(shared_b, alias_a, shared_a),
             {"provider-a": 1.0, "provider-b": 1.0},
@@ -369,9 +325,9 @@ class CapacityRankingTests(unittest.TestCase):
     def test_manual_reset_credits_are_bounded_and_never_revive_exhaustion(self) -> None:
         """Credit metadata boosts eligible Codex routes but cannot restore zero windows."""
 
-        one = _route("codex", "one", "one", (_forecast("codex", "one", 80.0),), reset_credits=1)
-        two = _route("codex", "two", "two", (_forecast("codex", "two", 80.0),), reset_credits=2)
-        exhausted = _route("codex", "empty", "empty", (_forecast("codex", "empty", 0.0),), reset_credits=2)
+        one = _route("codex", "one", "one", (_reading("codex", "one", 80.0),), reset_credits=1)
+        two = _route("codex", "two", "two", (_reading("codex", "two", 80.0),), reset_credits=2)
+        exhausted = _route("codex", "empty", "empty", (_reading("codex", "empty", 0.0),), reset_credits=2)
         order = rank_capacity_routes(_snapshot(one, two, exhausted), {}, now=_NOW)
         self.assertEqual([item.aliases[0].route_id for item in order.routes], ["two", "one"])
         self.assertAlmostEqual(order.routes[0].reset_credit_multiplier, 1 + 2 / 3)

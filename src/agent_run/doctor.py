@@ -428,30 +428,12 @@ def _keychain_present(name: str) -> bool:
 
 
 def _capacity(config: Config, rows, at: float, findings) -> None:
-    """Flag capacity identities whose newest sample no longer describes now.
+    """Flag current capacity scopes whose explicit validity has expired."""
 
-    A sample that carries its own ``valid_until`` is judged only by it: a
-    still-future ``valid_until`` is never stale (sources stamp their own
-    validity window, which can be far longer than the collection interval),
-    and a past one is always stale. Only a sample without ``valid_until``
-    falls back to the age bound of twice the configured collection interval.
-    ``rows`` are the snapshot's capacity samples; ``at`` is the check time in
-    epoch seconds.
-    """
-
-    latest = {}
+    del config
     for row in rows:
-        key = tuple(row[name] for name in ("runtime", "lane", "window", "target", "source"))
-        latest.setdefault(key, row)
-    stale_after = max(1, config.capacity.collect_interval_seconds) * 2
-    for key, row in latest.items():
-        valid_until = row["valid_until"]
-        if valid_until is not None:
-            stale = float(valid_until) < at
-        else:
-            stale = at - float(row["observed_at"]) > stale_after
-        if stale:
-            _add(findings, "capacity_stale", "warning", f"capacity:{key[0]}", "/".join(str(x or "-") for x in key[1:]))
+        if float(row["valid_until"]) < at:
+            _add(findings, "capacity_stale", "warning", f"capacity:{row['runtime']}", str(row["scope_id"]))
 
 
 def _supervisors(rows, probe: ProcessProbe, findings) -> None:
