@@ -86,7 +86,11 @@ whitespace and repeated deltas are preserved. These partial
 messages do not create an answer proof or imply success; an interrupted or
 timed-out run can therefore have a useful transcript without a complete answer.
 Unexpected app-server EOF is a transport failure, not an indefinitely silent
-session. Initialization and native interruption follow the
+session. Terminal Codex errors retain explicit `error.kind`/`error.code`
+precedence, then use a bounded safe `codexErrorInfo` category. The
+`serverOverloaded` code becomes `provider_overloaded`; its provider message
+remains durable detail while completion notices use only package-owned guidance.
+Initialization and native interruption follow the
 [Codex app-server contract](https://learn.chatgpt.com/docs/app-server).
 
 An owned engine may exit before process-group discovery. This is not an

@@ -122,9 +122,30 @@ class CompletionNoticeTests(unittest.TestCase):
             "- Failure: prepare_failed — Runtime preparation rejected", known
         )
         self.assertIn("- Advice: Check model availability", known)
+        overloaded = self.notice(
+            status=AgentStatus.FAILED,
+            failure_kind="provider_overloaded",
+        ).render()
+        self.assertIn(
+            "- Failure: provider_overloaded — "
+            "The selected provider model is temporarily at capacity.\n"
+            "- Advice: Preserve the worktree and completed commits; resume later "
+            "or switch models without repeating completed work.",
+            overloaded,
+        )
+        unknown_code = self.notice(
+            status=AgentStatus.FAILED,
+            failure_kind="codex_futureProviderCode",
+        ).render()
+        self.assertIn(
+            "- Failure: codex_futureProviderCode — "
+            "The agent ended without a recognized failure category.",
+            unknown_code,
+        )
         unknown = self.notice(status=AgentStatus.LOST).render()
         self.assertIn("- Failure: unknown — The supervisor could no longer", unknown)
         self.assertNotIn("traceback", known.casefold())
+        self.assertNotIn("Selected model is at capacity", overloaded)
 
     def test_success_and_cancelled_notices_reject_failure_categories(self) -> None:
         """Nonfailure terminal states cannot carry contradictory failure metadata."""

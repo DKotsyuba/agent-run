@@ -48,6 +48,10 @@
       "reason": "The runtime or provider returned an explicit error.",
       "advice": "Inspect the redacted status/transcript detail, correct the request, model, credential, or provider condition, then retry."
     },
+    "provider_overloaded": {
+      "reason": "The selected provider model is temporarily at capacity.",
+      "advice": "Preserve the worktree and completed commits; resume later or switch models without repeating completed work."
+    },
     "empty_result": {
       "reason": "The runtime completed without a nonblank result.",
       "advice": "Inspect the transcript and provider diagnostics; retry only after confirming why the result was empty."
