@@ -22,6 +22,7 @@ from agent_run.errors import ValidationError
 from agent_run.hooks.bind import BindHookError, bind
 from agent_run.mcp import serve
 from agent_run.paths import agent_dir
+from agent_run.preparation import prepare_launch
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.store import StateStore
 from agent_run.supervisor import Supervisor, SupervisorSettings
@@ -171,15 +172,21 @@ class M008IntegrationTests(unittest.TestCase):
         self.fail("asynchronous integration condition did not become true")
 
     def test_async_start_supervisor_late_bind_and_one_trusted_dispatch(self) -> None:
+        """Complete an admitted three-field launch through preparation and delivery."""
+
         started = self.service.start(self.request("async-completion"))
         self.assertTrue(started.created)
         self.assertIs(started.agent.status, AgentStatus.STARTING)
         self.wait_until(lambda: len(self.launches) == 1)
         self.assertEqual(len(self.launches), 1, "start returns after the launch decision")
 
-        agent_id, _request, _adapter, plan, directory = self.launches[0]
+        agent_id, request, role = self.launches[0]
+        prepared = prepare_launch(
+            self.store, self.root, self.config, agent_id, request, role
+        )
+        directory = agent_dir(agent_id, self.root)
         self.assertTrue(directory.is_dir())
-        answer_path = directory / "answer.md"
+        answer_path = prepared.answer_path
         answer_path.write_text(f"done\n{DEFAULT_SENTINEL}\n", encoding="utf-8")
         # The orchestrator binds before the agent finishes, so the terminal
         # transition creates a pending notice rather than one that can never bind.
@@ -197,7 +204,7 @@ class M008IntegrationTests(unittest.TestCase):
             self.store,
             agent_id,
             EngineAdapter(session),
-            plan,
+            prepared.plan,
             answer_path=answer_path,
             settings=SupervisorSettings(
                 poll_seconds=0.1,
