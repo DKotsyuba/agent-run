@@ -1,7 +1,7 @@
 # agent-run architecture
 
-How the pieces fit, as shipped today. For the operator's how-to see
-`agent-run doc`; for API integration see [api.md](api.md).
+How the pieces fit, as shipped today. For integration details see
+[api.md](api.md).
 
 ## Managed Codex context
 
@@ -38,17 +38,16 @@ touch the store or an engine directly.
 
 ## Durable agents
 
-`start` validates and durably admits the request as `starting`, then returns its
-agent id before authentication, materialization, adapter preparation, spawn, or
-READY. A bounded worker with its own thread-affine store performs those slow
-steps and launches a **detached supervisor process** that owns the child engine.
-The accepted preparation lease is finite. Immediately before spawning, the
-coordinator atomically transfers its live claim into a bounded handoff window
-covering READY and failed-launch cleanup. Once the supervisor records its
-ownership proof, the preparation deadline no longer invalidates that proof.
-An abandoned handoff still expires as `lost` and cannot revive the agent later.
-Payload writes share the READY deadline and honor cancellation even when the
-child stops reading the pipe.
+`start` validates and durably admits the request as `starting`, then launches a
+**detached supervisor process**. The supervisor records its PID and birth proof
+and signals READY before authentication, materialization, or adapter preparation;
+`start` returns after that ownership handoff. The supervisor opens its own
+thread-affine store, performs those slow steps, and then owns the child engine.
+Payload delivery and the READY handshake are bounded and honor cancellation even
+when the child stops reading the pipe. After READY, preparation and runtime
+execution have no service-owned age or deadline transition. Reconciliation marks
+an owned run `lost` only when observing its stored PID and birth proof yields the
+OS verdict `dead` or `reused`; `unknown` and `denied` remain unchanged.
 On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
 the legacy fork path is only a compatibility fallback when session-creating
 spawn is explicitly unavailable.
@@ -59,15 +58,16 @@ payloads kept as file references.
 
 The supervisor enforces:
 
-- **timeouts** — with a configurable warning to the child at 90% asking it
-  to summarize what is done and what remains;
-- **stall detection** — a child silent on its output stream past
-  `core.stalled_after_seconds` (default 900) is killed and classified
-  `stalled`, distinct from a timeout;
 - **cancellation** — kills the process tree, not just the first child;
 - **outcome classification** — the terminal status is derived from
   recorded evidence (result payloads, completion sentinels, error-only
   answer detection), never from exit code alone.
+
+Runtime execution has no automatic deadline, warning, silence watchdog, or
+periodic heartbeat. Legacy timeout and watchdog fields remain accepted and
+stored so older requests and state snapshots stay readable, but the supervisor
+does not act on them. Runs stop when the engine finishes or cancellation is
+requested.
 
 Current answers store the engine's exact UTF-8 payload without a completion
 sentinel. A directory format marker makes the adjacent versioned proof
@@ -191,12 +191,13 @@ The Node wrapper preserves MCP stdio and removes its socket on child exit.
 A collector (`agent-run capacity collect`, launchd-schedulable) samples
 remaining quota per runtime through a pluggable per-runtime source:
 `native` engine data, a short-lived Codex app-server, the `codexbar` CLI,
-a local OmniRoute router, or `none`. A collection stores samples and its
-explicit physical-pool/route topology atomically. Per-account scopes refresh
+a local OmniRoute router, or `none`. A collection replaces one current snapshot
+containing samples and explicit physical-pool/route topology. Per-account scopes refresh
 independently, so a failed account keeps its previous topology only until that
 snapshot expires instead of deleting healthy sibling scopes. Samples carry
-validity windows; `limits` serves projections with burn-rate–based exhaustion
-risk per lane, worst first, hiding nothing.
+validity windows used by capacity route ordering. The public `limits` read
+returns only current fresh samples, without history, forecasts, burn, risk, or
+advice.
 
 Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
 and `unsupported`. A source failure is not a successful collection of zero
@@ -208,15 +209,10 @@ reason codes and counts, never provider response bodies or raw child stderr.
 Sources retain their bounded call deadlines; a round exceeding the configured
 collection interval is explicitly warned about.
 
-Freshness uses source observations, not the time an old payload was fetched
-again. Future observations and windows whose reset has arrived are unknown.
-Diagnostic snapshots select the newest row per quota identity before applying
-their result cap, so a busy account cannot hide a stale sibling through repeated
-samples. Stored sample history retains its separate, global retention bound.
-Reset-cycle grouping tolerates up to one second of reporting jitter only when
-both reported resets were still in the future at the latest observation.
-Stored timestamps and the reported latest reset remain unchanged; a reset
-that already passed is not merged into the next cycle.
+Freshness uses source observations and each snapshot's validity bound. Future
+observations, expired snapshots, and windows whose reset has arrived are
+unavailable until the next collection. Historical sample rows from older schema
+versions remain upgrade-readable but production no longer reads or writes them.
 
 OmniRoute quotas come from its current `key_value` cache under the
 `providerLimitsCache` namespace, using `fetchedAt` as the observation clock.
@@ -250,9 +246,7 @@ governing limit does not exist.
 
 Capacity route ranking is a pure read of those snapshots. Every governing
 window must be fresh and known; a zero window is omitted before scoring.
-Evidence spanning at least one hour projects remaining capacity to reset,
-while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
-at 50%. The worst window defines a nonnegative route score, then a positive
+The lowest current remaining percentage defines the route score, then a positive
 runtime multiplier scales its priority. Optional account and quota-lane weight
 maps override that default, with account taking precedence over lane. Weights
 are absolute replacements, not products. Concrete account/model aliases sharing
@@ -264,17 +258,7 @@ compatible role/model alias and decides whether to launch. The output retains
 deferred evidence, exhausted omissions, unavailable runtimes, and the
 `insufficient_diversity` signal alongside the working routes.
 
-The context hook uses the same capacity-order builder and injects a compact
-English Runtime priorities summary, not raw quota windows. It instructs the
-orchestrator to choose the first compatible route while retaining role/model
-selection. A model-specific quota lane cannot lend its priority to a different
-model on the same runtime/account. Per-session component receipts suppress unchanged visible summaries,
-including when only active-agent context changes; a later return to a previous
-summary is delivered again. Visible rounded priorities and route identities
-determine changes, not observation timestamps or insignificant float tails.
-The diagnostic `limits` view is not a required routing step.
-Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at
-terminal, with an idempotent `stats backfill`.
+Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at terminal.
 
 ## Releases
 
@@ -282,7 +266,7 @@ The runtime deploys as a **sealed release**: a venv built from a git SHA
 under `~/.agent-run/standalone/releases/<sha>` with a `COMPLETE` marker,
 selected by the `standalone/current` symlink. Rollback is repointing the
 symlink; retention keeps releases that live sessions still execute from.
-Details: `agent-run doc releases`.
+Details: [releasing.md](releasing.md).
 
 ## Design invariants
 

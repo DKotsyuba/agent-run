@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import TYPE_CHECKING, Mapping, Protocol
 
 from ..config import McpConfig, RuntimeConfig
 from ..domain import Message, Outcome, StartRequest
 from ..errors import ValidationError
-from ..profiles import AgentProfile
+
+if TYPE_CHECKING:
+    from ..role_plan import ResolvedRolePlan
 
 
 ADAPTER_API_VERSION = 2
@@ -247,12 +249,11 @@ class RuntimeAdapter(Protocol):
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan: ...
 

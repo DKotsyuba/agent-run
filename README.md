@@ -30,8 +30,8 @@ you / your agent / your app
   its supervisor, and `answer <id>` works tomorrow.
 - **Verified outcomes.** "Succeeded" is derived from recorded evidence
   (completion sentinels, answer hashes, classified failure kinds) — not
-  from an engine's exit code. Error-only replies, stalls, and timeouts are
-  classified, not celebrated.
+  from an engine's exit code. Error-only replies are classified, not
+  celebrated; legacy stall and timeout outcomes remain readable.
 - **One tool table, three transports.** The same tool surface is exposed via
   CLI, MCP, and the socket API, generated from a single dispatcher; a
   parity test keeps them from drifting.
@@ -40,9 +40,7 @@ you / your agent / your app
   agent may read or write is explicit (`--write`, `--read-root`).
 - **Quota-aware.** A capacity collector samples remaining limits per
   provider (native engine data, [codexbar](https://github.com/steipete/codexbar),
-  or a local router), computes usage priorities from burn rate and reset time,
-  and injects an ordered summary when it changes. The orchestrator chooses the
-  first role-compatible route; `limits` remains available for diagnostics.
+  or a local router) and ranks compatible routes from current fresh readings.
 - **Locked dependencies.** Runtime packages are declared in `pyproject.toml`,
   resolved in the committed `uv.lock`, and release installs verify a hashed
   dependency closure before the application wheel.
@@ -125,7 +123,7 @@ short-lived local app-server process. Standard and model-specific buckets
 account failure does not erase fresh evidence from the others.
 
 **Multiple accounts** (codex): declare labels on the runtime —
-`accounts = ["personal1", "personal2"]` (optionally `default_account`) —
+`accounts = ["personal1", "personal2"]` —
 then log each one in via the engine's own OAuth flow:
 
 ```bash
@@ -133,7 +131,8 @@ agent-run auth personal2 codex     # opens the browser login once
 agent-run start --runtime codex --account personal2 ...
 ```
 
-Credentials live in `<home>/accounts/codex/<label>/`, each account gets
+Omitting `--account` uses the native global Codex account. Labelled credentials
+live in `<home>/accounts/codex/<label>/`; each account gets
 its own child-home lineage, and `--account` works identically over MCP
 and the socket API. With no accounts declared, nothing changes in account
 selection. A configured model is launchable only when the selected account's
@@ -142,26 +141,15 @@ app-server roster reports it. `gpt-6-astra` permits only read-only
 high-demand model for the hardest architecture and review decisions; coding
 and routine work use other models.
 
-Claude uses its own isolated CLI credential state. Authenticate an unlabelled
-Claude runtime once with:
+Claude uses its native global CLI credential state when no label is supplied:
 
 ```bash
 agent-run login claude
 ```
 
-When Claude declares `accounts`, use its configured `default_account` or select
-one explicitly: `agent-run login claude --account personal`. This runs
-`claude auth login` with the same private `CLAUDE_CONFIG_DIR` the child launch
-uses; it never copies the global Claude configuration or prints credentials.
-
-The built-in operator guide documents every section:
-
-```bash
-agent-run doc            # index
-agent-run doc config     # config.toml rules
-agent-run doc models     # rosters; also: skills, plugins, mcp-servers,
-                         # service, releases, migrations, troubleshoot
-```
+When Claude declares `accounts`, select one explicitly with
+`agent-run login claude --account personal`. Labelled runs use private
+`CLAUDE_CONFIG_DIR` state; unlabelled runs use the native global directory.
 
 Check the installation:
 
@@ -178,22 +166,25 @@ serve` first, or install the launchd job below; if the daemon is unavailable,
 
 ```bash
 # start one read-only agent; returns immediately with a durable id
+# --timeout remains accepted for compatibility and does not stop execution
 agent-run start --runtime claude --model sonnet --profile review \
   --task "Summarize what this repo does in three lines." \
   --workdir ~/projects/myrepo --timeout 600
 
-# block until it finishes (exit code maps the outcome class)
-agent-run wait ag-20260831-...
+# add --wait to start when the same command should emit the terminal answer
+agent-run start --runtime claude --model sonnet --profile review \
+  --task "Summarize what this repo does in three lines." \
+  --workdir ~/projects/myrepo --wait
 
 # fetch the verified answer (works any time later, too)
 agent-run answer ag-20260831-...
 ```
 
-Useful verbs beyond that: `status`, `transcript --follow`, `steer`,
-`cancel`, `agents` (list), `models`, `limits`, `summary`,
-`stats backfill`. All output is line-delimited JSON — pipe it into `jq`.
+Useful verbs beyond that: `transcript --follow`, `steer`, `cancel`, `agents`
+(list), `models`, and `limits`. All output is line-delimited JSON — pipe it
+into `jq`.
 
-For Codex queue delivery, `status.delivery.last_attempt` exposes the latest
+For Codex queue delivery, `agent-run delivery status <agent-id>` exposes the latest
 bounded diagnostic summary: classifier, duration, exact exit status or spawn
 errno, output byte counts/truncation, and redacted stdout/stderr tails. It never
 contains the delivered message, session id, argv values, environment values,
@@ -216,9 +207,9 @@ agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgent
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 ```
 
-The proxy exposes the same tool surface as the resident daemon: `start`,
-`status`, `answer`, `wait`-free async flow, `cancel`, `steer`, `summary`,
-`transcript`, `list_agents`, `models`, `limits`, `capacity_order`, `fast`, and `doc`.
+The proxy exposes the same eleven tools as the resident daemon: `start`,
+`resume`, `cancel`, `steer`, `list_agents`, `answer`, `transcript`, and
+`capacity_order`, plus `doc`, `models`, and `limits`.
 
 **Claude Code:**
 
@@ -263,7 +254,7 @@ a copy-paste Python client: [docs/api.md](docs/api.md).
 | CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
 | MCP server | `agent-run mcp` | stdio, shared tool surface |
 | JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
-| Operator guide | `agent-run doc` | built into the package |
+| Operator guide | `agent-run doc` | packaged orchestration rules and maintenance topics |
 | Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
 | Capacity collector | `agent-run capacity collect` | + launchd plist generator |
 | Capacity priority | `agent-run capacity order` | read-only, role-independent route order |
@@ -276,15 +267,14 @@ macOS Git bootstrap).
 
 ## Documentation
 
+- `agent-run doc` — packaged orchestration and operating rules
 - [docs/architecture.md](docs/architecture.md) — how the pieces fit
 - [docs/api.md](docs/api.md) — socket API integration guide
 - [docs/delegation-authorization.md](docs/delegation-authorization.md) — owner-adopted delegation and context-transfer authorization
-- [docs/tui.md](docs/tui.md) — terminal dashboard (`agent-run-tui`)
 - [docs/releasing.md](docs/releasing.md) — version, CI, and GitHub Release procedure
 - [CHANGELOG.md](CHANGELOG.md) — user-visible changes by version
 - [CONTRIBUTING.md](CONTRIBUTING.md) — development and pull-request checks
 - [SECURITY.md](SECURITY.md) — supported versions and private reporting
-- `agent-run doc` — operator guide (config, models, releases, …)
 - [AGENTS.md](AGENTS.md) — rules for working on this codebase
 
 ## License

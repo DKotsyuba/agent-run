@@ -1,14 +1,4 @@
-"""Regression coverage for the shared adapter-owned Codex child environment.
-
-The launchd collector runs without an interactive shell, so its inherited
-``PATH`` cannot resolve the interpreter a packaged ``codex`` launcher names in
-its ``#!/usr/bin/env`` line.  These tests spawn a *real* local subprocess: a
-stub executable whose shebang names an interpreter that only exists beside it,
-speaking the ``initialize``/``account/rateLimits/read`` JSON-RPC handshake.  One
-case loads the configured launcher from a real ``config.toml`` through
-``load_config``, reproducing a version-managed ``bin/codex`` symlink.
-Fictitious account ids and homes throughout; no provider or network access.
-"""
+"""Regression coverage for Codex host-environment inheritance."""
 
 import os
 import sys
@@ -132,7 +122,9 @@ class RealSubprocessRateLimitsTests(unittest.TestCase):
             base_home.mkdir()
             account_home.mkdir()
             config = _config(executable, base_home)
-            with mock.patch.dict(os.environ, {"PATH": _MINIMAL_PATH}):
+            with mock.patch.dict(
+                os.environ, {"PATH": f"{executable.parent}{os.pathsep}{_MINIMAL_PATH}"}
+            ):
                 base = codex_rate_limits.read_rate_limits(config, base_home)
                 account = codex_rate_limits.read_rate_limits(config, account_home)
         for observed, home in ((base, base_home), (account, account_home)):
@@ -144,19 +136,19 @@ class RealSubprocessRateLimitsTests(unittest.TestCase):
 
 
 class BuildEnvironmentTests(unittest.TestCase):
-    """Verify PATH ordering, dedup, fallback, and home confinement."""
+    """Verify exact host inheritance, credential filtering, and runtime homes."""
 
-    def test_path_prefixes_the_binary_directory_and_keeps_inherited_order(self):
-        """The launcher directory leads and inherited entries keep their order."""
+    def test_path_keeps_the_inherited_order(self):
+        """The child receives the host PATH unchanged."""
 
         with mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin:/bin"}):
             environment = codex_environment.build_environment(
                 Path("/opt/tools/bin/codex"), Path("/tmp/home")
             )
-        self.assertEqual(environment["PATH"], "/opt/tools/bin:/usr/local/bin:/usr/bin:/bin")
+        self.assertEqual(environment["PATH"], "/usr/local/bin:/usr/bin:/bin")
 
-    def test_repeated_entries_are_deduplicated_without_reordering(self):
-        """A first-seen entry survives exactly once, at its first position."""
+    def test_repeated_path_entries_remain_unchanged(self):
+        """Agent-run does not rewrite the host's executable search semantics."""
 
         with mock.patch.dict(
             os.environ, {"PATH": "/opt/tools/bin:/usr/bin:/opt/tools/bin:/bin:/usr/bin"}
@@ -164,10 +156,13 @@ class BuildEnvironmentTests(unittest.TestCase):
             environment = codex_environment.build_environment(
                 Path("/opt/tools/bin/codex"), Path("/tmp/home")
             )
-        self.assertEqual(environment["PATH"], "/opt/tools/bin:/usr/bin:/bin")
+        self.assertEqual(
+            environment["PATH"],
+            "/opt/tools/bin:/usr/bin:/opt/tools/bin:/bin:/usr/bin",
+        )
 
-    def test_missing_or_empty_path_falls_back_without_empty_entries(self):
-        """An absent or blank inherited PATH yields defpath entries only."""
+    def test_missing_or_empty_path_is_not_invented(self):
+        """An absent or blank host PATH remains absent or blank."""
 
         for inherited in (None, ""):
             patch = {} if inherited is None else {"PATH": inherited}
@@ -175,11 +170,10 @@ class BuildEnvironmentTests(unittest.TestCase):
                 environment = codex_environment.build_environment(
                     Path("/opt/tools/bin/codex"), Path("/tmp/home")
                 )
-            entries = environment["PATH"].split(os.pathsep)
-            self.assertEqual(entries[0], "/opt/tools/bin")
-            self.assertEqual(
-                entries[1:], [entry for entry in os.defpath.split(os.pathsep) if entry]
-            )
+            if inherited is None:
+                self.assertNotIn("PATH", environment)
+            else:
+                self.assertEqual(environment["PATH"], "")
 
     def test_relative_binary_is_rejected_instead_of_searching_the_workdir(self):
         """A relative executable fails loudly rather than gaining a PATH hole."""
@@ -190,19 +184,14 @@ class BuildEnvironmentTests(unittest.TestCase):
     def test_home_and_codex_home_track_only_the_supplied_home(self):
         """Each supplied home is used verbatim and never mixed with another."""
 
-        with mock.patch.object(
-            codex_environment,
-            "managed_uv_python_environment",
-            return_value={"UV_PYTHON_INSTALL_DIR": "/managed/uv/python"},
-        ):
+        with mock.patch.dict(os.environ, {"PATH": "/host/bin"}, clear=True):
             base = codex_environment.build_environment(Path("/opt/bin/codex"), Path("/tmp/base"))
             account = codex_environment.build_environment(Path("/opt/bin/codex"), Path("/tmp/plus"))
         self.assertEqual(base["HOME"], "/tmp/base")
         self.assertEqual(base["CODEX_HOME"], "/tmp/base")
         self.assertEqual(account["HOME"], "/tmp/plus")
         self.assertEqual(account["CODEX_HOME"], "/tmp/plus")
-        self.assertEqual(base["UV_PYTHON_INSTALL_DIR"], "/managed/uv/python")
-        self.assertEqual(set(base), {"HOME", "CODEX_HOME", "PATH", "UV_PYTHON_INSTALL_DIR"})
+        self.assertEqual(set(base), {"HOME", "CODEX_HOME", "PATH"})
 
     def test_uv_install_root_honors_the_explicit_parent_setting(self):
         """An existing explicit uv root survives the child's replaced HOME."""
@@ -308,7 +297,9 @@ class LoadedConfigLauncherTests(unittest.TestCase):
             self.assertEqual(runtime.binary, linked)
             self.assertTrue(runtime.binary.is_symlink())
             self.assertEqual(runtime.binary.parent, root / "bin")
-            with mock.patch.dict(os.environ, {"PATH": _MINIMAL_PATH}):
+            with mock.patch.dict(
+                os.environ, {"PATH": f"{root / 'bin'}{os.pathsep}{_MINIMAL_PATH}"}
+            ):
                 base = codex_rate_limits.read_rate_limits(runtime, base_home)
                 account = codex_rate_limits.read_rate_limits(runtime, account_home)
         for observed, home in ((base, base_home), (account, account_home)):

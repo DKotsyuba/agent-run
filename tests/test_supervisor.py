@@ -21,13 +21,12 @@ from agent_run.domain import AgentStatus, Message, MessageRole, Outcome, StartRe
 from agent_run.lifecycle import ReadyChannel, terminate_process_group
 from agent_run.state.store import StateStore
 from agent_run.supervisor import (
-    DEFAULT_WARNING_TEXT,
     StoreEventSink,
     Supervisor,
     SupervisorSettings,
     supervisor_identity,
 )
-from agent_run.verify import ANSWER_INCOMPLETE, DEFAULT_SENTINEL, NO_ANSWER
+from agent_run.verify import DEFAULT_SENTINEL
 
 from agent_run.domain import TERMINAL
 from agent_run.errors import StateTransitionError, ValidationError
@@ -273,7 +272,6 @@ class SupervisorTests(unittest.TestCase):
         adapter: FakeAdapter,
         ops: FakeOps,
         *,
-        timeout_seconds: float = 60.0,
         settings: SupervisorSettings | None = None,
         ready: ReadyChannel | None = None,
     ) -> Supervisor:
@@ -283,7 +281,6 @@ class SupervisorTests(unittest.TestCase):
             adapter,
             self.plan(),
             answer_path=self.answer,
-            timeout_seconds=timeout_seconds,
             settings=settings or SupervisorSettings(poll_seconds=0.5, grace_seconds=2.0),
             ops=ops,
             ready=ready,
@@ -550,191 +547,23 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(session.cancels, 0)
         self.assertEqual(ops.sent, [])
 
-    def test_one_warning_at_ninety_percent_then_a_hard_stop_at_one_hundred(self) -> None:
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4, grace_seconds=1.0, heartbeat_seconds=1000.0
-        )
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
-        ).run()
-
-        self.assertEqual(session.steers, [DEFAULT_WARNING_TEXT])
-        warnings = self.events("deadline_warning")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn('"remaining_seconds":1.0', warnings[0]["data_json"])
-        self.assertGreater(session.polls, 20, "the engine kept running through the band")
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(outcome.failure_kind, NO_ANSWER)
-        self.assertEqual(outcome.failure_text, "silence=no_progress")
-        self.assertEqual(self.agent()["status"], "timed_out")
-        self.assertEqual(ops.alive_members(), set())
-
-    def test_stalled_watchdog_kills_a_stream_silent_engine(self) -> None:
-        """No stream events past the budget fails the run as stalled.
-
-        The fake session never reports progress, so the baseline is the run
-        start and the watchdog must fire long before the generous deadline.
-        """
+    def test_elapsed_clock_never_stops_a_runtime(self) -> None:
+        """Arbitrary elapsed time cannot warn, stall, heartbeat, or time out a run."""
 
         ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4,
-            grace_seconds=1.0,
-            heartbeat_seconds=1000.0,
-            stalled_after_seconds=3.0,
-        )
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=1000.0, settings=settings
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.FAILED)
-        self.assertEqual(outcome.failure_kind, "stalled")
-        self.assertIn("no stream events", outcome.failure_text)
-        self.assertEqual(len(self.events("stalled")), 1)
-        self.assertEqual(self.agent()["status"], "failed")
-        self.assertEqual(ops.alive_members(), set())
-
-    def test_stream_progress_defers_the_stall_until_the_deadline(self) -> None:
-        """A live engine that keeps streaming is never killed as stalled."""
-
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4,
-            grace_seconds=1.0,
-            heartbeat_seconds=1000.0,
-            stalled_after_seconds=3.0,
-        )
-        supervisor = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
-        )
-        session._on_wait = lambda polls: setattr(
-            supervisor._sink, "last_progress_at", ops.monotonic()
-        )
-        outcome = supervisor.run()
-
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(self.events("stalled"), [])
-
-    def test_stalled_watchdog_disabled_at_zero(self) -> None:
-        """stalled_after_seconds=0 disables the watchdog entirely."""
-
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4,
-            grace_seconds=1.0,
-            heartbeat_seconds=1000.0,
-            stalled_after_seconds=0.0,
-        )
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(self.events("stalled"), [])
-
-    def test_deadline_expiry_wins_over_a_simultaneous_stall(self) -> None:
-        """When both budgets elapse in one tick, the timeout outcome wins."""
-
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4,
-            grace_seconds=1.0,
-            heartbeat_seconds=1000.0,
-            stalled_after_seconds=10.0,
-        )
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(self.events("stalled"), [])
-
-    def test_warning_text_demands_the_done_and_not_done_summary(self) -> None:
-        """The 90% nudge must require the completion summary contract."""
-
-        self.assertIn("COMPLETE", DEFAULT_WARNING_TEXT)
-        self.assertIn("NOT done", DEFAULT_WARNING_TEXT)
-        self.assertIn("continuation point", DEFAULT_WARNING_TEXT)
-
-    def test_a_failing_stopping_bookkeeping_write_does_not_mask_the_timeout(self) -> None:
-        """A durable-write hiccup on the "stopping" event must stay best-effort.
-
-        stop_reason is already durable in memory once _stop() begins; losing
-        the informational "stopping" record must not turn a real timed_out
-        outcome into supervision_failed.
-        """
-
-        self.store.fail_event_kind = "stopping"
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4, grace_seconds=1.0, heartbeat_seconds=1000.0
-        )
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(self.agent()["status"], "timed_out")
-        self.assertEqual(self.events("stopping"), [])
-
-    def test_a_failing_termination_bookkeeping_write_does_not_mask_the_timeout(self) -> None:
-        """Same guarantee for the ``process_cleanup`` write in ``_finish``.
-
-        _record_termination already supports ``best_effort`` (used by
-        _fail_launched); _finish() must use it too so the group-kill record
-        cannot turn a known outcome into supervision_failed.
-        """
-
-        self.store.fail_event_kind = "process_cleanup"
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        settings = SupervisorSettings(
-            poll_seconds=0.4, grace_seconds=1.0, heartbeat_seconds=1000.0
-        )
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=10.0, settings=settings
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(self.agent()["status"], "timed_out")
-        self.assertEqual(self.events("process_cleanup"), [])
-
-    def test_timeout_distinguishes_a_cut_off_answer_from_no_answer(self) -> None:
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        self.write_answer("half of a thought, no sentinel")
-        outcome = self.supervisor(
-            FakeAdapter(session),
+        session = FakeSession(
             ops,
-            timeout_seconds=5.0,
-            settings=SupervisorSettings(poll_seconds=1.0, grace_seconds=1.0),
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
-        self.assertEqual(outcome.failure_kind, ANSWER_INCOMPLETE)
-
-    def test_a_warning_is_recorded_even_when_the_runtime_cannot_steer(self) -> None:
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-        outcome = self.supervisor(
-            FakeAdapter(session, steerable=False),
-            ops,
-            timeout_seconds=5.0,
-            settings=SupervisorSettings(poll_seconds=1.0, grace_seconds=1.0),
-        ).run()
-
-        self.assertEqual(session.steers, [])
-        warnings = self.events("deadline_warning")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn('"delivered":false', warnings[0]["data_json"])
-        self.assertIs(outcome.status, AgentStatus.TIMED_OUT)
+            outcome=Outcome(AgentStatus.SUCCEEDED),
+            exit_after_polls=3,
+            on_wait=lambda _polls: setattr(ops, "clock", ops.clock + 1_000_000.0),
+        )
+        self.write_answer(f"done\n{DEFAULT_SENTINEL}\n")
+        outcome = self.supervisor(FakeAdapter(session), ops).run()
+        self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
+        self.assertEqual(session.cancels, 0)
+        self.assertEqual(self.store.heartbeats, 2)
+        self.assertEqual(self.events("deadline_warning"), [])
+        self.assertEqual(self.events("stalled"), [])
 
     def test_steer_commands_are_durably_answered_by_capability(self) -> None:
         self.store.enqueue_command(self.agent_id, "steer", {"text": "focus on tests"})
@@ -808,27 +637,6 @@ class SupervisorTests(unittest.TestCase):
 
         self.assertEqual(observed, [3])
 
-    def test_heartbeats_are_written_while_the_engine_runs(self) -> None:
-        ops = FakeOps()
-        samples: list[float] = []
-        session = FakeSession(
-            ops,
-            outcome=Outcome(AgentStatus.SUCCEEDED),
-            exit_after_polls=5,
-            on_wait=lambda _poll: samples.append(float(self.agent()["heartbeat_at"])),
-        )
-        self.write_answer(f"done {DEFAULT_SENTINEL}")
-        self.supervisor(
-            FakeAdapter(session),
-            ops,
-            settings=SupervisorSettings(poll_seconds=1.0, heartbeat_seconds=1.0, grace_seconds=1.0),
-        ).run()
-
-        self.assertGreaterEqual(self.store.heartbeats, 4)
-        self.assertEqual(samples, sorted(samples))
-        self.assertEqual(self.agent()["supervisor_pid"], os.getpid())
-        self.assertEqual(self.agent()["process_group_id"], ENGINE_PID)
-
     def test_a_failed_launch_is_durable_not_a_crash(self) -> None:
         ops = FakeOps()
         outcome = self.supervisor(FakeAdapter(None, error="engine missing"), ops).run()
@@ -865,16 +673,10 @@ class SupervisorTests(unittest.TestCase):
     def test_invalid_settings_are_refused_before_adapter_launch(self) -> None:
         adapter = FakeAdapter(FakeSession(FakeOps()))
         invalid = (
-            {"heartbeat_seconds": 0},
             {"poll_seconds": float("nan")},
             {"grace_seconds": 0},
             {"kill_grace_seconds": float("inf")},
             {"natural_grace_seconds": -1},
-            {"warning_fraction": 0},
-            {"warning_fraction": 1},
-            {"warning_fraction": float("nan")},
-            {"silence_threshold_seconds": -1},
-            {"warning_text": "  "},
             {"sentinel": ""},
         )
         for values in invalid:
@@ -898,19 +700,6 @@ class SupervisorTests(unittest.TestCase):
         self.assertIs(outcome.status, AgentStatus.SUCCEEDED)
         self.assertEqual(ops.sent, [])
         self.assertEqual(outcome.answer_bytes, len(body.encode()))
-
-    def test_timeout_zero_after_launch_is_cleaned_and_failed(self) -> None:
-        ops = FakeOps()
-        session = FakeSession(ops, native_cancel=False)
-
-        outcome = self.supervisor(
-            FakeAdapter(session), ops, timeout_seconds=0
-        ).run()
-
-        self.assertIs(outcome.status, AgentStatus.FAILED)
-        self.assertEqual(outcome.failure_kind, "supervision_failed")
-        self.assertEqual(session.cancels, 1)
-        self.assertEqual(ops.alive_members(), set())
 
     def test_non_group_leader_is_never_native_cancelled_or_group_signalled(self) -> None:
         """A present PID in the wrong group has no cancellation authority."""
@@ -1281,7 +1070,6 @@ class RunStatsSupervisorTests(unittest.TestCase):
             adapter,
             self.plan(),
             answer_path=self.answer,
-            timeout_seconds=60.0,
             settings=SupervisorSettings(poll_seconds=0.5, grace_seconds=2.0),
             ops=ops,
         )

@@ -59,14 +59,14 @@ class PublicationTests(unittest.TestCase):
                 "print(json.dumps({'jsonrpc':'2.0','id':1,'result':{}}), flush=True)\n"
                 "ready, _, _ = select.select([sys.stdin], [], [], 0.2)\n"
                 "if ready and sys.stdin.read() == '': raise SystemExit(3)\n"
-                "print(json.dumps({'jsonrpc':'2.0','id':2,'result':{'tools':[{'name':'status'}]}}), flush=True)\n",
+                "print(json.dumps({'jsonrpc':'2.0','id':2,'result':{'tools':[{'name':'start'}]}}), flush=True)\n",
                 encoding="utf-8",
             )
             runner = release.Runner(5, 0.01)
             tools = local.mcp_tools(
                 runner, [sys.executable, str(child)], subprocess.DEVNULL
             )
-            self.assertEqual(tools, [{"name": "status"}])
+            self.assertEqual(tools, [{"name": "start"}])
 
     def test_mcp_smoke_bounds_partial_frames(self):
         """A readable partial frame cannot turn the handshake timeout into a hang."""
@@ -94,7 +94,7 @@ class PublicationTests(unittest.TestCase):
                 "import json, sys\n"
                 "[sys.stdin.readline() for _ in range(3)]\n"
                 "print(json.dumps({'jsonrpc':'2.0','id':1,'error':{'code':-1}}), flush=True)\n"
-                "print(json.dumps({'jsonrpc':'2.0','id':2,'result':{'tools':[{'name':'status'}]}}), flush=True)\n",
+                "print(json.dumps({'jsonrpc':'2.0','id':2,'result':{'tools':[{'name':'start'}]}}), flush=True)\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(release.ReleaseError, "protocol error"):

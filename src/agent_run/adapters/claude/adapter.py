@@ -1,8 +1,4 @@
-"""Claude Code runtime adapter: strict isolation, no live auth/quota calls.
-
-Generated assets use only declared configuration, profiles, and skills. An
-existing uv managed-Python root is the sole ambient exception for offline hooks.
-"""
+"""Claude Code runtime adapter with generated config and inherited host tools."""
 
 from __future__ import annotations
 
@@ -18,8 +14,10 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
-from ..home import content_hash, managed_uv_python_environment
-from ...profiles import AgentProfile, normalize_read_roots
+from ..environment import host_environment
+from ..home import content_hash
+from ...profiles import normalize_read_roots
+from ...role_plan import ResolvedRolePlan
 from ..base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -32,14 +30,8 @@ from ..base import (
 )
 from ..command_policy import materialize_refusal_commands, render_claude_denials
 from ..continuation import cli_resume_plan
-from ..developer_environment import (
-    configured_environment_keys,
-    developer_environment,
-    environment_digest,
-)
 from ..version import observe_binary_version
 from ..plugin_skills import local_skill_names, unlisted_plugin_skills
-from ..rust import RUST_ENVIRONMENT_NAMES
 from ..snapshots import finalize_runtime_snapshots
 from .auth import auth_environment, claude_config_dir
 from .constants import (
@@ -73,16 +65,15 @@ class ClaudeAdapter:
     def validate(self, config: RuntimeConfig) -> None:
         """Validate Claude-specific runtime configuration before materialization.
 
-        ``config`` must provide environment auth, supported hooks, and complete
-        plugin skill declarations. Rust provisioning is accepted here and
-        applied only by ``prepare``; invalid auth, plugins, or hooks raise
+        ``config`` may omit auth to use Claude's native global account or name
+        selected environment variables. Invalid auth, plugins, or hooks raise
         ``ValidationError`` without touching the filesystem.
         """
-        if config.auth is None:
-            raise ValidationError("claude runtime requires an auth bridge")
-        if config.auth.kind != "environment":
+        if config.auth is not None and config.auth.kind != "environment":
             raise ValidationError("claude runtime auth.kind must be 'environment'")
-        unknown = sorted(set(config.auth.names) - _AUTH_NAMES)
+        unknown = sorted(
+            set(config.auth.names if config.auth is not None else ()) - _AUTH_NAMES
+        )
         if unknown:
             raise ValidationError(
                 f"claude runtime auth.names has unsupported entries: {', '.join(unknown)}"
@@ -115,11 +106,9 @@ class ClaudeAdapter:
         A configured but unresolved MCP name fails closed rather than
         emitting a non-functional entry.
 
-        The returned newline-delimited digest includes declared Rust roots when
-        provisioning is enabled and a selected developer-environment preset's
-        declared paths, variables, and command policy, so materialization
-        revision evidence changes with the launch environment without storing
-        credentials.
+        The returned newline-delimited digest covers only generated runtime
+        assets. Host environment values and credentials remain process-memory
+        launch inputs and never affect the stored revision.
         """
 
         settings_digest = render_settings(home, config.hooks)
@@ -134,9 +123,6 @@ class ClaudeAdapter:
             home, config.plugins, snapshot_assets
         )
         digests = [settings_digest, mcp_digest, plugin_digest, declared_digest]
-        if config.rust is not None:
-            digests.append(content_hash(f"{config.rust.rustup_home}\0{config.rust.cargo_bin}"))
-        digests.append(environment_digest(config))
         revision = "\n".join(digests)
         managed_files = (
             "settings.json",
@@ -199,22 +185,18 @@ class ClaudeAdapter:
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build the isolated launch plan for one start request.
 
         Public model ids remain on the plan boundary; only child argv aliases
-        ``fable``. Presets add declared paths, variables, Rust, and command
-        denials to the isolated environment; invalid inputs raise before launch.
-        The adapter reasserts its scoped ``CLAUDE_CONFIG_DIR`` after preset
-        assembly and treats it as engine-owned for MCP requirements, so neither
-        path can redirect Claude's durable credential state.
+        ``fable``. Request grants and runtime assets must match ``role``.
+        Optional legacy command denials remain active during config migration.
         """
 
         if request.fast:
@@ -226,13 +208,18 @@ class ClaudeAdapter:
                 f"claude runtime effort must be one of {sorted(_SUPPORTED_EFFORTS)}: {request.effort!r}"
             )
 
-        if request.write and not profile.write:
-            raise ValidationError("claude profile does not allow requested write access")
-        allow_write = request.write and profile.write
-        declared_roots = tuple(
-            normalize_read_roots((root,))[0]
-            for root in (*profile.read_roots, *request.read_roots)
-        )
+        if not isinstance(role, ResolvedRolePlan):
+            raise ValidationError("prepare requires a ResolvedRolePlan")
+        if request.profile != role.role_name:
+            raise ValidationError("claude request profile does not match the resolved role")
+        if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
+            server.id for server in role.mcp
+        ):
+            raise ValidationError("claude runtime assets do not match the resolved role")
+        if request.write != role.write or request.read_roots != role.read_roots:
+            raise ValidationError("claude request grants do not match the resolved role")
+        allow_write = role.write
+        declared_roots = role.read_roots
         roots = normalize_read_roots((request.workdir, *declared_roots))
         if allow_write:
             for root in declared_roots:
@@ -244,19 +231,19 @@ class ClaudeAdapter:
 
         skill_tools = _SKILL_TOOLS if config.skills else ()
         shell_tools = _SHELL_TOOLS if allow_write else ()
-        network_tools = _NETWORK_TOOLS if profile.network else ()
+        network_tools = _NETWORK_TOOLS if role.network else ()
         base_tools = (
             _READ_TOOLS + skill_tools + (_WRITE_TOOLS if allow_write else ()) + shell_tools + network_tools
         )
         write_scope = tuple(f"{tool}({request.workdir}/**)" for tool in _WRITE_TOOLS) if allow_write else ()
         allowed_tools = (
             _READ_TOOLS + skill_tools + write_scope + shell_tools + network_tools
-            + tuple(f"mcp__{name}" for name in config.mcp)
+            + tuple(f"mcp__{server.id}" for server in role.mcp)
         )
-        disallowed_tools = () if profile.network else _ALWAYS_DISALLOWED
+        disallowed_tools = () if role.network else _ALWAYS_DISALLOWED
         permission_mode = "acceptEdits" if allow_write else "default"
 
-        system_prompt_parts = [profile.body]
+        system_prompt_parts = [role.prompt]
         if request.output_schema is not None:
             schema_text = json.dumps(request.output_schema, sort_keys=True)
             system_prompt_parts.append(
@@ -284,7 +271,7 @@ class ClaudeAdapter:
             "--settings",
             str(home / "settings.json"),
         ]
-        if config.mcp:
+        if role.mcp:
             argv += ["--mcp-config", str(home / "mcp" / "mcp-config.json")]
         for name in local_skill_names(config.plugins, config.skills):
             argv += ["--plugin-dir", str(home / "plugins" / name)]
@@ -305,16 +292,23 @@ class ClaudeAdapter:
         argv += ["--session-id", session_id]
 
         scoped_config_dir = str(claude_config_dir(config))
-        environment: dict[str, str] = {
-            "HOME": str(home),
-            "CLAUDE_CONFIG_DIR": scoped_config_dir,
-            **managed_uv_python_environment(),
-        }
-        path_value = os.environ.get("PATH")
-        if path_value:
-            environment["PATH"] = path_value
-        environment = developer_environment(environment, config, request.workdir)
-        environment["CLAUDE_CONFIG_DIR"] = scoped_config_dir
+        selected_mcp = role.mcp
+        allowed_secret_names = tuple(
+            dict.fromkeys(
+                (
+                    *(config.auth.names if config.auth is not None else ()),
+                    *(
+                        env_name
+                        for server in selected_mcp
+                        for env_name in server.env_from
+                    ),
+                )
+            )
+        )
+        environment = host_environment(
+            {"HOME": str(home), "CLAUDE_CONFIG_DIR": scoped_config_dir},
+            allowed_secret_names=allowed_secret_names,
+        )
 
         selected_environment = config.environment
         if selected_environment is not None and selected_environment.denied_commands:
@@ -347,39 +341,19 @@ class ClaudeAdapter:
                 name for name in injected if is_secret_env_name(name)
             )
 
-        configured_keys = configured_environment_keys(config)
         mcp_env_names: list[str] = []
-        for name in config.mcp:
-            server = mcp_servers.get(name)
-            if server is None:
-                raise ValidationError(f"no resolved MCP definition for runtimes.claude.mcp entry: {name}")
+        for server in selected_mcp:
             for env_name in server.env_from:
                 if env_name == "CLAUDE_CONFIG_DIR":
                     value = scoped_config_dir
-                elif env_name in configured_keys or (
-                    config.rust is not None and env_name in RUST_ENVIRONMENT_NAMES
-                ):
-                    value = environment.get(env_name)
                 else:
-                    value = os.environ.get(env_name)
+                    value = environment.get(env_name)
                 if not value:
-                    detail = (
-                        "Rust provisioning does not permit RUSTUP_TOOLCHAIN; use rust-toolchain files"
-                        if config.rust is not None and env_name == "RUSTUP_TOOLCHAIN"
-                        else f"claude mcp {name!r} requires environment variable {env_name}, which is not set"
-                    )
                     raise ValidationError(
-                        detail
+                        f"claude mcp {server.id!r} requires environment variable {env_name}, which is not set"
                     )
                 environment[env_name] = value
                 mcp_env_names.append(env_name)
-
-        mcp_environment = {
-            name: environment[name] for name in configured_keys if name in environment
-        }
-        if config.mcp and mcp_environment:
-            render_mcp_config(agent_dir, config.mcp, mcp_servers, environment=mcp_environment)
-            argv[argv.index("--mcp-config") + 1] = str(agent_dir / "mcp" / "mcp-config.json")
 
         initial_input = (
             json.dumps(

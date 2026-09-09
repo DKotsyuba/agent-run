@@ -20,15 +20,15 @@ from agent_run.adapters.codex import adapter as codex_adapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
-from agent_run.adapters.developer_environment import configured_environment_keys
 from agent_run.adapters.snapshots import (
     inspect_runtime_snapshots,
     runtime_snapshot_index_sha256,
 )
-from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig, RustConfig
+from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.domain import StartRequest
 from agent_run.errors import PathEscapeError, ValidationError
-from agent_run.profiles import AgentProfile
+from agent_run.profiles import AgentProfile, normalize_read_roots
+from role_helpers import resolved_role
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -111,44 +111,61 @@ env_from = ["PATH"]
             with self.subTest(method=name):
                 current = inspect.signature(getattr(ADAPTER, name))
                 contract = inspect.signature(getattr(RuntimeAdapter, name))
-                parameter = current.parameters["mcp_servers"]
-                self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
-                self.assertIs(parameter.default, inspect.Parameter.empty)
                 self.assertEqual(
                     list(current.parameters), list(contract.parameters)[1:]  # minus self
                 )
+                if name == "prepare":
+                    self.assertIn("role", current.parameters)
+                    self.assertNotIn("mcp_servers", current.parameters)
         with self.assertRaises(TypeError):
             ADAPTER.materialize(self.runtime_config(), self.home)
 
-    def test_validate_requires_file_link_auth(self) -> None:
+    def test_validate_accepts_global_or_file_link_auth(self) -> None:
+        """Use native global auth or an explicit account bridge."""
+
         ADAPTER.validate(self.runtime_config())
-        with self.assertRaisesRegex(ValidationError, "file_link auth bridge"):
+        ADAPTER.validate(self.runtime_config(auth=None))
+        with self.assertRaisesRegex(ValidationError, "file_link bridge"):
             ADAPTER.validate(self.runtime_config(auth=RuntimeAuthConfig("environment", names=("TOKEN",))))
 
-    def test_declared_rust_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
-        """Codex keeps isolated homes while declared Rust reaches both child boundaries."""
+    def test_materialize_links_native_global_auth_without_copying_bytes(self) -> None:
+        """Bridge the host account by reference while keeping its bytes outside HOME."""
+
+        native_home = Path(self._mkdtemp()).resolve()
+        source = native_home / "auth.json"
+        source.write_text('{"token":"native-secret"}', encoding="utf-8")
+        config = self.runtime_config(auth=None)
+        with patch.dict(os.environ, {"CODEX_HOME": str(native_home)}, clear=False):
+            ADAPTER.materialize(config, self.home, mcp_servers={})
+
+        bridge = self.home / "auth.json"
+        self.assertTrue(bridge.is_symlink())
+        self.assertEqual(bridge.resolve(strict=True), source)
+        self.assertNotIn(
+            "native-secret",
+            (self.home / "config.toml").read_text(encoding="utf-8"),
+        )
+
+    def test_host_toolchain_is_propagated_to_the_launch_and_mcp_environment(self) -> None:
+        """Codex inherits host toolchains without running provisioning probes."""
         import tomllib
 
-        rust = RustConfig(Path("/rustup"), Path("/cargo-bin"))
-        config = self.runtime_config(rust=rust, mcp=("agent_lsp",))
+        config = self.runtime_config(mcp=("agent_lsp",))
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(
             generated["mcp_servers"]["agent_lsp"]["env_vars"],
-            list(configured_environment_keys(config)),
+            ["PATH"],
         )
         profile = AgentProfile("review", "body", False, (self.workdir,))
-        with patch.dict(
-            codex_environment.prepared_environment.__globals__,
-            {"developer_environment": lambda environment, _config, workdir: {**environment, "CARGO_HOME": str(workdir / ".cargo-home")}},
-        ):
+        with patch.dict(os.environ, {"RUSTUP_HOME": "/host/rustup"}, clear=False):
             plan = self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
-        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
+        self.assertEqual(plan.environment["RUSTUP_HOME"], "/host/rustup")
 
-    def test_developer_preset_reaches_shell_mcp_and_native_denial_rules(self) -> None:
-        """Codex forwards only declared preset keys and denies configured commands."""
+    def test_legacy_environment_only_retains_native_denial_rules(self) -> None:
+        """Ignore legacy path/variables while retaining command denials."""
         tools = Path(self._mkdtemp())
         for name in ("git", "gh"):
             command = tools / name
@@ -163,8 +180,8 @@ env_from = ["PATH"]
         config = self.runtime_config(environment=preset, mcp=("agent_lsp",))
         digest = ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
-        self.assertIs(generated["allow_login_shell"], False)
-        self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH", "PROJECT"])
+        self.assertNotIn("allow_login_shell", generated)
+        self.assertEqual(generated["mcp_servers"]["agent_lsp"]["env_vars"], ["PATH"])
         self.assertNotEqual(
             digest,
             ADAPTER.materialize(
@@ -175,8 +192,12 @@ env_from = ["PATH"]
         )
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         profile = AgentProfile("review", "body", True, (self.workdir,))
-        plan = self.prepare(self.start_request(write=True), profile, config, mcp_servers=self.resolved_mcp())
-        self.assertEqual(plan.environment["PROJECT"], str(self.workdir / "project"))
+        with patch.dict(os.environ, {"PATH": f"{tools}:/usr/bin:/bin"}, clear=False):
+            plan = self.prepare(
+                self.start_request(write=True), profile, config,
+                mcp_servers=self.resolved_mcp(),
+            )
+        self.assertNotIn("PROJECT", plan.environment)
         self.assertEqual(plan.adapter_state["approval_policy"], "on-request")
         self.assertEqual(plan.adapter_state["approvals_reviewer"], "auto_review")
         self.assertEqual(
@@ -191,13 +212,15 @@ env_from = ["PATH"]
         self.assertIn('"gh"', rules)
         self.assertIn(str(tools / "gh"), rules)
 
-    def test_developer_preset_fails_closed_when_a_required_command_is_missing(self) -> None:
-        """An unavailable required command prevents Codex from receiving a launch plan."""
+    def test_legacy_required_command_does_not_probe_during_prepare(self) -> None:
+        """Do not require a legacy environment command on the start path."""
         config = self.runtime_config(environment=EnvironmentConfig(required_commands=("missing",)))
         ADAPTER.materialize(config, self.home, mcp_servers=self.resolved_mcp())
         profile = AgentProfile("review", "body", False, (self.workdir,))
-        with self.assertRaisesRegex(ValidationError, "missing executable: missing"):
-            self.prepare(self.start_request(), profile, config, mcp_servers=self.resolved_mcp())
+        plan = self.prepare(
+            self.start_request(), profile, config, mcp_servers=self.resolved_mcp()
+        )
+        self.assertEqual(plan.environment["HOME"], str(self.home))
 
     # -- materialize ----------------------------------------------------------
 
@@ -944,13 +967,20 @@ env_from = ["PATH"]
 
     def prepare(self, request, profile, config=None, mcp_servers=_UNSET):
         runtime = self.runtime_config() if config is None else config
+        servers = {} if mcp_servers is self._UNSET else mcp_servers
+        request = replace(
+            request,
+            profile=profile.name,
+            read_roots=normalize_read_roots(
+                (*profile.read_roots, *request.read_roots)
+            ),
+        )
         return ADAPTER.prepare(
             request,
-            profile,
+            resolved_role(request, profile, runtime, servers),
             runtime,
             self.home,
             self.workdir,
-            mcp_servers={} if mcp_servers is self._UNSET else mcp_servers,
         )
 
     def materialized(self, **overrides) -> RuntimeConfig:
@@ -972,10 +1002,8 @@ env_from = ["PATH"]
         self.assertIsInstance(plan, LaunchPlan)
         self.assertEqual(plan.argv, (str(config.binary), "app-server"))
         self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(
-            set(plan.environment),
-            {"CODEX_HOME", "HOME", "PATH", "UV_PYTHON_INSTALL_DIR"},
-        )
+        self.assertIn("PATH", plan.environment)
+        self.assertNotIn("UNRELATED_TOKEN", plan.environment)
         self.assertEqual(plan.environment["UV_PYTHON_INSTALL_DIR"], str(managed_python))
         self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(plan.adapter_state["writable_roots"], ())
@@ -1100,13 +1128,8 @@ env_from = ["PATH"]
         with self.assertRaisesRegex(
             ValidationError, "cannot grant external read roots"
         ):
-            ADAPTER.prepare(
-                self.start_request(workdir=work, write=True),
-                profile,
-                config,
-                self.home,
-                self.workdir,
-                mcp_servers={},
+            self.prepare(
+                self.start_request(workdir=work, write=True), profile, config
             )
 
     def test_prepare_refuses_unknown_model(self) -> None:
@@ -1153,6 +1176,22 @@ env_from = ["PATH"]
                 self.assertEqual(plan.adapter_state["sandbox_mode"], "read-only")
                 self.assertEqual(plan.adapter_state["writable_roots"], ())
 
+    def test_prepare_requires_request_profile_to_match_resolved_role(self) -> None:
+        """Reject a role payload substituted under a different public profile id."""
+
+        config = self.materialized()
+        request = replace(
+            self.start_request(), read_roots=(self.auth_source_dir,)
+        )
+        role = resolved_role(
+            request,
+            AgentProfile("role-review", "body", False, (self.auth_source_dir,)),
+            config,
+            {},
+        )
+        with self.assertRaisesRegex(ValidationError, "profile does not match"):
+            ADAPTER.prepare(request, role, config, self.home, self.workdir)
+
     def test_prepare_refuses_output_schema(self) -> None:
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
@@ -1189,14 +1228,16 @@ env_from = ["PATH"]
     def test_prepare_refuses_write_beyond_profile_grant(self) -> None:
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
-        with self.assertRaisesRegex(ValidationError, "does not grant write"):
+        with self.assertRaisesRegex(ValidationError, "grants do not match"):
             self.prepare(self.start_request(write=True), profile, config)
 
-    def test_prepare_refuses_no_filesystem_profile(self) -> None:
+    def test_prepare_read_only_role_always_receives_its_workdir(self) -> None:
+        """Treat the task workdir as the minimal read scope for every role."""
+
         config = self.materialized()
         profile = AgentProfile("blank", "body", False, ())
-        with self.assertRaisesRegex(ValidationError, "no-filesystem profile"):
-            self.prepare(self.start_request(), profile, config)
+        plan = self.prepare(self.start_request(), profile, config)
+        self.assertEqual(plan.adapter_state["roots"], (str(self.workdir),))
 
     def test_prepare_accepts_a_request_read_root_as_the_only_filesystem_grant(self) -> None:
         config = self.materialized()
@@ -1209,7 +1250,7 @@ env_from = ["PATH"]
     def test_prepare_refuses_unresolved_mcp_servers(self) -> None:
         config = self.materialized(mcp=("agent_lsp",))
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
-        with self.assertRaisesRegex(ValidationError, "codex mcp reference is not configured"):
+        with self.assertRaisesRegex(ValidationError, "no resolved MCP definition"):
             self.prepare(self.start_request(), profile, config, mcp_servers={})
         with self.assertRaisesRegex(ValidationError, "resolved mcp_servers mapping"):
             self.prepare(self.start_request(), profile, config, mcp_servers=None)

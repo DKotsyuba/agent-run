@@ -68,8 +68,8 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         self.store.transition(created.agent_id, AgentStatus.STARTING, at=at)
         return str(created.agent_id)
 
-    def test_only_stale_identity_less_starting_rows_become_lost(self) -> None:
-        """Recent and supervisor-owned rows must survive the convergence sweep."""
+    def test_identity_less_starting_rows_are_never_lost_by_age(self) -> None:
+        """Elapsed time alone preserves both old and recent unowned rows."""
 
         stale = self.starting("stale", at=10)
         recent = self.starting("recent", at=90)
@@ -78,19 +78,10 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
             owned, pid=123, identity="identity", process_group_id=123
         )
 
-        changed = reconcile_unowned_starting(
-            self.store, at=100, grace_seconds=30
-        )
+        changed = reconcile_unowned_starting(self.store, at=10_000, grace_seconds=0)
 
-        self.assertEqual(changed, (stale,))
-        self.assertEqual(self.store.get_agent(stale)["status"], "lost")
-        self.assertEqual(
-            self.store.get_agent(stale)["failure_kind"], "unowned_starting"
-        )
-        self.assertEqual(
-            self.store.get_agent(stale)["failure_text"],
-            "accepted start exceeded its startup ownership deadline",
-        )
+        self.assertEqual(changed, ())
+        self.assertEqual(self.store.get_agent(stale)["status"], "starting")
         self.assertEqual(self.store.get_agent(recent)["status"], "starting")
         self.assertEqual(self.store.get_agent(owned)["status"], "starting")
         self.assertEqual(
@@ -98,9 +89,13 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         )
 
     def test_lost_convergence_releases_active_capacity(self) -> None:
-        """A dead pre-ownership row must not exhaust the active-agent limit."""
+        """A dead startup owner releases capacity from its unowned row."""
 
-        self.starting("first", at=10)
+        first = self.starting("first", at=10)
+        self.store.claim_startup(
+            first, "123 dead-owner", owner_birth_time=12.5, at=10,
+            deadline_seconds=120,
+        )
         with self.assertRaisesRegex(
             ValidationError, "global active agent limit reached"
         ):
@@ -113,7 +108,14 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
                 at=100,
             )
 
-        reconcile_unowned_starting(self.store, at=100, grace_seconds=30)
+        with patch(
+            "agent_run.state.reconciliation.observe_process",
+            return_value=ProcessObservation(ProcessState.DEAD),
+        ):
+            self.assertEqual(
+                reconcile_unowned_starting(self.store, at=100, grace_seconds=30),
+                (first,),
+            )
         admitted = self.store.create_agent_limited(
             self.request("admitted"),
             task_summary="task",
@@ -124,8 +126,8 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         )
         self.assertTrue(admitted.created)
 
-    def test_live_owner_is_bounded_by_startup_deadline(self) -> None:
-        """Birth identity ignores command drift but remains deadline bounded."""
+    def test_live_owner_survives_elapsed_startup_deadline(self) -> None:
+        """Matching PID and birth evidence remains authoritative at any age."""
 
         agent_id = self.starting("owned-startup", at=10)
         self.store.claim_startup(
@@ -141,7 +143,7 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         )
         self.assertEqual(
             reconcile_unowned_starting(self.store, at=131, grace_seconds=30),
-            (agent_id,),
+            (),
         )
 
     def test_unavailable_startup_birth_proof_is_not_death_before_deadline(self) -> None:
@@ -192,8 +194,8 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
             reconcile_unowned_starting(self.store, at=170, grace_seconds=30), ()
         )
 
-    def test_expired_handoff_without_supervisor_proof_becomes_lost(self) -> None:
-        """A handoff remains bounded when no child ever records ownership."""
+    def test_elapsed_handoff_with_live_owner_remains_starting(self) -> None:
+        """Handoff metadata cannot override matching live PID and birth evidence."""
 
         owner = f"{os.getpid()} {supervisor_identity()}"
         agent_id = self.starting("handoff-expired", at=10)
@@ -208,7 +210,7 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
 
         self.assertEqual(
             reconcile_unowned_starting(self.store, at=139, grace_seconds=30),
-            (agent_id,),
+            (),
         )
 
     @settings(max_examples=30, deadline=None)
@@ -217,13 +219,13 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
         handoff_extension=st.integers(min_value=0, max_value=10),
         ready_before_expiry=st.booleans(),
     )
-    def test_generated_handoff_preserves_terminal_capacity_invariant(
+    def test_generated_handoff_never_uses_elapsed_time_as_loss_proof(
         self,
         preparation_delay: int,
         handoff_extension: int,
         ready_before_expiry: bool,
     ) -> None:
-        """Generated handoffs retain capacity through READY or release it on expiry."""
+        """Generated clock advances preserve capacity without dead PID evidence."""
 
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore.initialize(Path(directory) / "state.db")
@@ -284,30 +286,32 @@ class UnownedStartingReconciliationTests(unittest.TestCase):
                         reconcile_unowned_starting(
                             store, at=handoff_deadline, grace_seconds=0
                         ),
-                        (agent_id,),
+                        (),
                     )
-                    replacement = store.create_agent_limited(
-                        self.request("replacement"),
-                        task_summary="task",
-                        config_revision="pending:materialization",
-                        global_limit=1,
-                        runtime_limit=None,
-                        at=handoff_deadline + 1,
-                    )
-                    self.assertTrue(replacement.created)
+                    with self.assertRaisesRegex(
+                        ValidationError, "global active agent limit reached"
+                    ):
+                        store.create_agent_limited(
+                            self.request("replacement"),
+                            task_summary="task",
+                            config_revision="pending:materialization",
+                            global_limit=1,
+                            runtime_limit=None,
+                            at=handoff_deadline + 1,
+                        )
             finally:
                 store.close()
 
-    def test_expired_startup_cannot_bind_a_supervisor(self) -> None:
-        """A delayed supervisor cannot revive an expired accepted start."""
+    def test_delayed_startup_can_bind_a_supervisor(self) -> None:
+        """A valid supervisor binding is independent of elapsed startup time."""
 
         agent_id = self.starting("expired-bind", at=10)
         self.store.claim_startup(agent_id, "1 stale", at=10, deadline_seconds=1)
 
-        with self.assertRaisesRegex(ValidationError, "expired startup"):
-            self.store.record_supervisor(
-                agent_id, pid=123, identity="identity", process_group_id=123, at=11
-            )
+        self.store.record_supervisor(
+            agent_id, pid=123, identity="identity", process_group_id=123, at=11
+        )
+        self.assertEqual(self.store.get_agent(agent_id)["supervisor_pid"], 123)
 
     def test_owned_supervisor_can_refine_its_group_after_startup_expiry(self) -> None:
         """A completed handoff does not make later group refinement expire."""

@@ -157,7 +157,6 @@ max_active_agents = 2
 warning_fraction = 0.8
 [capacity]
 collect_interval_seconds = 10
-sample_retention = 20
 context_max_chars = 100
 [delivery]
 retry_base_seconds = 1
@@ -165,6 +164,8 @@ retry_cap_seconds = 5
 max_attempts = 3
 [profiles]
 directory = "/tmp/profiles"
+[skills]
+directory = "/tmp/skills"
 [mcp.agent_lsp]
 transport = "stdio"
 command = "/bin/echo"
@@ -189,6 +190,7 @@ command = ["echo", "done"]
 """
         )
         self.assertEqual(config.core.max_active_agents, 2)
+        self.assertEqual(config.skills_directory, Path("/tmp/skills").resolve())
         self.assertEqual(config.mcp["agent_lsp"].env_from, ("PATH",))
         self.assertEqual(config.runtimes["fake"].models, ("test",))
         self.assertEqual(config.runtimes["fake"].auth.names, ("TEST_TOKEN",))
@@ -266,7 +268,9 @@ target = "auth.json"
 '''
                 )
 
-    def test_accounts_require_file_link_and_default_must_be_declared(self) -> None:
+    def test_accounts_require_supported_adapter_and_legacy_default_is_declared(self) -> None:
+        """Reject unsupported account state and malformed legacy defaults."""
+
         base = '''schema_version = 1
 [runtimes.fake]
 enabled = true
@@ -276,13 +280,18 @@ home = "/tmp/runtime-home"
 models = ["test"]
 accounts = ["personal"]
 '''
-        with self.assertRaisesRegex(ValidationError, "requires file_link"):
+        with self.assertRaisesRegex(ValidationError, "supported only"):
             self.load(base)
+        codex = base.replace(
+            "[runtimes.fake]", "[runtimes.codex]"
+        ).replace(
+            'adapter = "example.adapter:ADAPTER"',
+            'adapter = "agent_run.adapters.codex:ADAPTER"',
+        )
         with self.assertRaisesRegex(ValidationError, "default_account"):
             self.load(
-                base
+                codex
                 + 'default_account = "missing"\n'
-                + '[runtimes.fake.auth]\nkind = "file_link"\nsource = "/tmp/auth"\ntarget = "auth.json"\n'
             )
 
     def test_claude_accounts_accept_its_scoped_environment_auth(self) -> None:

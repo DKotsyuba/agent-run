@@ -12,17 +12,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run import cli
 from agent_run.doc import TOPICS, topic_text
 from agent_run.errors import ValidationError
-from agent_run.dispatch import Session, call_tool
+from agent_run.dispatch import call_tool
 from agent_run.mcp import serve
 
 
 class _Broker:
     def __init__(self, service):
         self.service = service
-        self.session = Session()
 
     def call(self, method, params=None, timeout=600):
-        return call_tool(self.service, method, params or {}, self.session)
+        return call_tool(self.service, method, params or {})
 
 
 _MAX_BYTES = 8192
@@ -133,11 +132,11 @@ class DocMcpTests(unittest.TestCase):
         return [responses[line["id"]] for line in lines]
 
     def test_doc_tool_is_listed(self):
-        """Expose the documentation tool among all sixteen shared tools."""
+        """Expose documentation among the eleven shared tools."""
 
         responses = self.run_server([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
         names = [tool["name"] for tool in responses[0]["result"]["tools"]]
-        self.assertEqual(len(names), 16)
+        self.assertEqual(len(names), 11)
         self.assertIn("doc", names)
 
     def test_doc_tool_call_returns_index_and_topic(self):

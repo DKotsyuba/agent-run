@@ -7,31 +7,19 @@ from dataclasses import dataclass
 import math
 
 from ..errors import ValidationError
-from .forecast import CapacityForecast
-from .history import CapacityKey
-from .snapshot import CapacityRoute, CapacityRouteEvidence, CapacityRouteSnapshot
-from .topology import CapacityRouteDescriptor
+from .snapshot import CapacityReading, CapacityRoute, CapacityRouteEvidence, CapacityRouteSnapshot
+from .topology import CapacityKey, CapacityRouteDescriptor
 
 
 @dataclass(frozen=True)
 class CapacityWindowExplanation:
-    """Scoring evidence for one exact governing quota window.
-
-    The numeric fields preserve the forecast inputs and derived reserve used by
-    the ranker. ``marker`` is ``projected`` for reliable burn evidence or one
-    of ``warmup``, ``thin_evidence``, and ``no_reset`` for the centered
-    remaining-percent fallback.
-    """
+    """Current value for one exact governing quota window."""
 
     key: CapacityKey
     remaining_percent: float
-    burn_percent_per_hour: float | None
-    burn_span_seconds: float | None
     reset_at: float | None
-    projected_percent: float | None
-    slack: float
-    marker: str
-    risk: str
+    observed_at: float
+    valid_until: float
 
 
 @dataclass(frozen=True)
@@ -133,7 +121,7 @@ def _finite(value: object, name: str) -> float:
 
 
 def _optional_nonnegative(value: object, name: str) -> float | None:
-    """Validate an optional finite nonnegative forecast field.
+    """Validate an optional finite nonnegative current-reading field.
 
     ``None`` remains absent. Numeric values are returned as floats; negative,
     boolean, non-finite, or non-numeric values raise ``ValidationError``.
@@ -147,66 +135,29 @@ def _optional_nonnegative(value: object, name: str) -> float | None:
     return number
 
 
-def _window(
-    forecast: CapacityForecast, now: float
-) -> CapacityWindowExplanation | None:
-    """Convert one forecast to conservative scoring evidence.
+def _window(reading: CapacityReading, now: float) -> CapacityWindowExplanation | None:
+    """Return one fresh current reading or ``None`` when malformed or stale."""
 
-    Unknown, malformed, future-observed, or already-reset forecasts return
-    ``None`` so the caller defers their route. Reliable projection requires a
-    nonnegative burn rate, at least one hour of evidence, and a future reset;
-    all other known evidence uses the centered remaining-percent fallback.
-    """
-
-    if not isinstance(forecast, CapacityForecast) or not forecast.known:
+    if not isinstance(reading, CapacityReading):
         return None
     try:
-        remaining = _finite(forecast.remaining_percent, "remaining_percent")
+        remaining = _finite(reading.remaining_percent, "remaining_percent")
         if not 0 <= remaining <= 100:
             raise ValidationError("remaining_percent must be between 0 and 100")
-        observed = _finite(forecast.observed_at, "observed_at")
+        observed = _finite(reading.observed_at, "observed_at")
         if observed > now:
             raise ValidationError("observed_at must not be in the future")
-        burn = _optional_nonnegative(
-            forecast.burn_percent_per_hour, "burn_percent_per_hour"
-        )
-        span = _optional_nonnegative(
-            forecast.burn_span_seconds, "burn_span_seconds"
-        )
-        reset = _optional_nonnegative(forecast.reset_at, "reset_at")
+        valid_until = _finite(reading.valid_until, "valid_until")
+        if valid_until < now:
+            raise ValidationError("reading is stale")
+        reset = _optional_nonnegative(reading.reset_at, "reset_at")
         if reset is not None and reset <= now:
             raise ValidationError("reset_at must be in the future")
-        if not isinstance(forecast.key, CapacityKey):
-            raise ValidationError("forecast key must be a CapacityKey")
-        if not isinstance(forecast.warmup, bool) or not isinstance(forecast.risk, str):
-            raise ValidationError("forecast metadata is malformed")
+        if not isinstance(reading.key, CapacityKey):
+            raise ValidationError("reading key must be a CapacityKey")
     except ValidationError:
         return None
-
-    if burn is not None and span is not None and span >= 3600 and reset is not None:
-        projected = remaining - burn * ((reset - now) / 3600)
-        slack = max(-1.0, min(1.0, projected / 100))
-        marker = "projected"
-    else:
-        projected = None
-        slack = max(-1.0, min(1.0, 2 * remaining / 100 - 1))
-        if reset is None:
-            marker = "no_reset"
-        elif burn is None or forecast.warmup:
-            marker = "warmup"
-        else:
-            marker = "thin_evidence"
-    return CapacityWindowExplanation(
-        forecast.key,
-        remaining,
-        burn,
-        span,
-        reset,
-        projected,
-        slack,
-        marker,
-        forecast.risk,
-    )
+    return CapacityWindowExplanation(reading.key, remaining, reset, observed, valid_until)
 
 
 def _key_order(key: CapacityKey) -> tuple[str, str, str, str, str]:
@@ -320,8 +271,8 @@ def rank_capacity_routes(
         canonical = min(values, key=lambda value: value.descriptor.route_id)
         windows: list[CapacityWindowExplanation] = []
         malformed = False
-        for forecast in canonical.forecasts:
-            explanation = _window(forecast, ranked_at)
+        for reading in canonical.readings:
+            explanation = _window(reading, ranked_at)
             if explanation is None:
                 malformed = True
                 break
@@ -333,8 +284,8 @@ def rank_capacity_routes(
                     runtime,
                     None,
                     aliases[0].route_id,
-                    "ranker_unknown_forecast",
-                    "forecast is unknown, stale, or malformed",
+                    "ranker_unavailable",
+                    "current sample is unknown, stale, or malformed",
                 )
             )
             continue
@@ -365,13 +316,13 @@ def rank_capacity_routes(
         limiting = min(
             windows,
             key=lambda item: (
-                item.slack,
+                item.remaining_percent,
                 item.reset_at is None,
                 item.reset_at or math.inf,
                 _key_order(item.key),
             ),
         )
-        score = 1.0 + limiting.slack
+        score = limiting.remaining_percent / 100
         multiplier = max(
             (
                 checked_routes.get((runtime, alias.route_id), checked.get(runtime, 1.0))

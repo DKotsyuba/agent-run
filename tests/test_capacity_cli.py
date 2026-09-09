@@ -49,8 +49,13 @@ def _append_scope(
 
     lane = f"lane-{runtime}"
     pool_id = f"pool-{runtime}"
-    store.append_capacity_samples(
-        [
+    store.replace_capacity_snapshot(
+        runtime=runtime,
+        scope_id="scope",
+        observed_at=observed_at,
+        valid_until=valid_until,
+        payload={
+            "samples": [
             {
                 "lane": lane,
                 "window": "window",
@@ -60,14 +65,8 @@ def _append_scope(
                 "reset_at": reset_at,
                 "observed_at": observed_at,
                 "valid_until": valid_until,
-                "payload": None,
             }
-        ],
-        runtime=runtime,
-        scope_id="scope",
-        observed_at=observed_at,
-        valid_until=valid_until,
-        payload={
+            ],
             "pools": [
                 {
                     "pool_id": pool_id,

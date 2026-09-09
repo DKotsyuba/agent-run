@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import tempfile
 import threading
 import time
@@ -37,9 +39,15 @@ from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
-from agent_run.service import AgentQuery, AgentService, _log_start_preparation_stage
+from agent_run.preparation import (
+    PreparationFailure,
+    fail_preparation,
+    prepare_launch,
+)
+from agent_run.service import AgentQuery, AgentService
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
+from agent_run.supervisor import report_ready
 
 
 class FakeAdapter:
@@ -95,19 +103,18 @@ class FakeAdapter:
     def prepare(
         self,
         request,
-        profile,
+        role,
         config,
         home,
         agent_dir,
         *,
-        mcp_servers,
         resume_session_id=None,
     ):
         """Return one plan carrying the supplied optional resume identity."""
 
         self.prepare_calls += 1
         self.prepare_dirs.append(agent_dir)
-        self.prepare_profiles.append(profile)
+        self.prepare_profiles.append(role)
         if self.prepare_error is not None:
             raise self.prepare_error
         if self.prepare_materialize_revision is not None:
@@ -204,6 +211,32 @@ class AgentServiceTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail("asynchronous condition did not become true")
+
+    def prepare_captured(
+        self,
+        index: int = -1,
+        *,
+        service: AgentService | None = None,
+    ) -> None:
+        """Execute one captured supervisor payload and persist preparation failure.
+
+        The index selects the captured launch, while service supplies the
+        effective configuration when a test owns a separate service instance.
+        """
+
+        agent_id, request, role = self.launched[index]
+        active_service = service or self.service
+        try:
+            prepare_launch(
+                self.store,
+                self.root,
+                active_service._config,
+                agent_id,
+                request,
+                role,
+            )
+        except PreparationFailure as error:
+            fail_preparation(self.store, agent_id, error)
 
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
@@ -310,13 +343,10 @@ class AgentServiceTests(unittest.TestCase):
             )}),
             self.store, self.root, launch=lambda *args: self.launched.append(args), now=lambda: 100.0,
         )
-        self.service.start(self.request(request_id="account"))
-        self.wait_until(lambda: bool(ADAPTER.materialize_homes))
-        self.wait_until(
-            lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
-                "snapshot:v1:"
-            )
+        self.service.start(
+            replace(self.request(request_id="account"), account="personal2")
         )
+        self.prepare_captured()
         agent = self.store.list_agents()[0]
         attempt_home = self.root / "agents" / str(agent["id"]) / "runtime-home"
         self.assertEqual(ADAPTER.materialize_homes[-1], attempt_home)
@@ -330,6 +360,27 @@ class AgentServiceTests(unittest.TestCase):
         self.assertTrue(
             (self.root / "agents" / str(agent["id"]) / "config-snapshot.json").is_file()
         )
+
+    def test_omitted_account_uses_global_auth_despite_legacy_default(self) -> None:
+        """Do not redirect an unlabelled start through ``default_account``."""
+
+        runtime = replace(
+            self.config.runtimes["fake"],
+            accounts=("legacy",),
+            default_account="legacy",
+        )
+        self.service = AgentService(
+            replace(self.config, runtimes={"fake": runtime}),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        self.service.start(self.request(request_id="global-account"))
+        self.prepare_captured()
+        effective = ADAPTER.materialize_configs[-1]
+        self.assertIsNone(effective.credential_state_home)
+        self.assertIn('"account":null', str(self.store.list_agents()[0]["identity_json"]))
 
     def test_claude_environment_account_uses_its_sibling_credential_home(self) -> None:
         """Claude labels need no file bridge but retain isolated durable state."""
@@ -351,27 +402,27 @@ class AgentServiceTests(unittest.TestCase):
             launch=lambda *args: self.launched.append(args),
             now=lambda: 100.0,
         )
-        request = replace(self.request(request_id="claude-account"), runtime="claude")
+        request = replace(
+            self.request(request_id="claude-account"),
+            runtime="claude",
+            account="personal",
+        )
         with patch("agent_run.service.AdapterRegistry.load", return_value=ADAPTER):
             self.service.start(request)
-            self.wait_until(lambda: bool(ADAPTER.materialize_homes))
-            self.wait_until(
-                lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
-                    "snapshot:v1:"
-                )
-            )
+            self.prepare_captured()
         effective = ADAPTER.materialize_configs[-1]
         self.assertEqual(
             effective.credential_state_home,
             account_runtime_home(runtime.home, "personal"),
         )
-        self.assertEqual(effective.auth, runtime.auth)
+        self.assertIsNone(effective.auth)
 
     def test_prepare_final_materialize_revision_is_the_persisted_snapshot(self) -> None:
         """Request-dependent prepare output replaces the initial home revision."""
 
         ADAPTER.prepare_materialize_revision = "cfg-2"
         result = self.start("prepare-revision")
+        self.prepare_captured()
         row = self.store.get_agent(result.agent_id)
         expected_sha256 = str(row["config_revision"]).removeprefix("snapshot:v1:")
         snapshot = inspect_config_snapshot(
@@ -381,176 +432,169 @@ class AgentServiceTests(unittest.TestCase):
 
         self.assertEqual(snapshot.materialize_revision, "cfg-2")
 
-    def test_start_hands_the_adapter_a_profile_carrying_its_role_assignment(self) -> None:
-        """The profile is where agent-run assigns the shared role contract.
+    def test_start_resolves_canonical_role_assets_from_one_catalog(self) -> None:
+        """Use the role prompt and shared skill selection without assignment glue."""
 
-        The adapters only inject ``profile.body``, so if this wiring were
-        dropped every runtime would silently stop assigning roles.
-        """
+        skills = self.root / "skills"
+        skill = skills / "code-reading"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+        (self.profiles / "profile.md").write_text(
+            """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = []
+required_constraints = []
++++
+Review the requested work.
+""",
+            encoding="utf-8",
+        )
+        service = AgentService(
+            replace(self.config, skills_directory=skills),
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 100.0,
+        )
+        service.start(self.request(request_id="canonical-role", write=True))
+        self.prepare_captured(service=service)
+        self.assertEqual(
+            ADAPTER.prepare_profiles[-1].prompt, "Review the requested work."
+        )
+        self.assertFalse(ADAPTER.prepare_profiles[-1].write)
+        self.assertEqual(ADAPTER.materialize_configs[-1].skills, ("code-reading",))
+        self.assertEqual(ADAPTER.skills_roots[-1], skills)
+        row = self.store.list_agents()[0]
+        snapshot = json.loads(
+            (self.root / "agents" / str(row["id"]) / "config-snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(snapshot["profile"]["role_name"], "profile")
+        self.assertEqual(snapshot["profile"]["auth"]["mode"], "global")
+        self.assertEqual(len(snapshot["profile"]["config_revision"]), 64)
+        service.close()
 
-        runtime = self.config.runtimes["fake"]
+    def test_start_persists_the_role_normalized_read_root_antichain(self) -> None:
+        """Collapse nested request roots before persistence and adapter preparation."""
+
+        parent = self.root / "read-root"
+        nested = parent / "nested"
+        nested.mkdir(parents=True)
+        result = self.service.start(
+            replace(
+                self.request(request_id="normalized-roots"),
+                read_roots=(parent, nested),
+            )
+        )
+        self.wait_until(lambda: bool(self.launched))
+        self.prepare_captured()
+        stored = json.loads(self.store.get_agent(result.agent_id)["request_json"])
+        self.assertEqual(stored["read_roots"], [str(parent)])
+        self.assertEqual(ADAPTER.prepare_profiles[-1].read_roots, (parent,))
+
+    def test_canonical_role_rejects_legacy_runtime_asset_lists(self) -> None:
+        """Fail before admission instead of merging role and runtime assets."""
+
+        skills = self.root / "skills"
+        skill = skills / "code-reading"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+        (self.profiles / "profile.md").write_text(
+            """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = []
+required_constraints = []
++++
+Review.
+""",
+            encoding="utf-8",
+        )
+        runtime = replace(self.config.runtimes["fake"], skills=("legacy",))
         service = AgentService(
             replace(
                 self.config,
-                runtimes={"fake": replace(runtime, skills=("role-profile",))},
+                skills_directory=skills,
+                runtimes={"fake": runtime},
             ),
             self.store,
             self.root,
             launch=lambda *args: self.launched.append(args),
             now=lambda: 100.0,
         )
-        service.start(self.request(request_id="assigned"))
-        self.wait_until(lambda: bool(ADAPTER.prepare_profiles))
-        body = ADAPTER.prepare_profiles[-1].body
-        self.assertTrue(body.startswith("Do the requested work."))
-        self.assertIn("Your assigned role is role-profile.", body)
-
-        # No matching skill shipped: the same start leaves the body alone.
-        self.start("unassigned")
-        self.assertEqual(ADAPTER.prepare_profiles[-1].body, "Do the requested work.")
+        with self.assertRaisesRegex(ValidationError, "cannot be mixed"):
+            service.start(self.request(request_id="mixed-role"))
+        self.assertEqual(self.store.list_agents(), [])
         service.close()
 
-    def test_complete_refusal_happens_before_agent_row(self) -> None:
+    def test_capability_refusal_is_durable_but_unknown_model_is_not_admitted(
+        self,
+    ) -> None:
+        """Persist capability refusal after admission and reject unknown models first."""
+
         ADAPTER.capabilities = frozenset(
             capability for capability in Capability if capability is not Capability.WRITE
         )
-        with self.assertRaisesRegex(ValidationError, "lacks required capabilities"):
-            self.service.start(self.request(write=True, request_id="refused-write"))
-        self.assertEqual(self.store.list_agents(), [])
-        self.assertEqual(self.launched, [])
+        capability = self.service.start(
+            self.request(write=True, request_id="refused-write")
+        )
+        self.prepare_captured()
+        capability_row = self.store.get_agent(capability.agent_id)
+        self.assertEqual(capability_row["status"], AgentStatus.FAILED.value)
+        self.assertEqual(capability_row["failure_kind"], "prepare_adapter_failed")
+        self.assertIn("lacks required capabilities", capability_row["failure_text"])
 
         ADAPTER.capabilities = frozenset(Capability)
         with self.assertRaisesRegex(ValidationError, "model is not configured"):
             self.service.start(
                 self.request(model="missing", request_id="refused-model")
             )
-        self.assertEqual(self.store.list_agents(), [])
+        self.assertEqual(len(self.store.list_agents()), 1)
         self.assertEqual(ADAPTER.materialize_calls, 0)
 
-    def test_start_returns_before_prepare_and_pending_replay_stays_single(self) -> None:
-        """A live bounded lease survives slow preparation and sibling queueing."""
+    def test_start_returns_after_submission_and_pending_replay_stays_single(self) -> None:
+        """Admission submits one owned supervisor payload without preparing inline."""
 
-        entered = threading.Event()
-        release = threading.Event()
-        original = ADAPTER.prepare
         clock = [100.0]
         self.service = AgentService(
             self.config, self.store, self.root,
             launch=lambda *args: self.launched.append(args), now=lambda: clock[0],
         )
 
-        def blocked_prepare(*args, **kwargs):
-            """Hold prepare until the test has exercised the admission path."""
+        started = time.monotonic()
+        first = self.service.start(self.request(request_id="pending-replay"))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIs(first.agent.status, AgentStatus.STARTING)
+        self.assertEqual(len(self.launched), 1)
+        self.assertIs(self.service.get(first.agent_id).status, AgentStatus.STARTING)
 
-            entered.set()
-            release.wait(2)
-            return original(*args, **kwargs)
-
-        with patch.object(ADAPTER, "prepare", side_effect=blocked_prepare):
-            started = time.monotonic()
-            first = self.service.start(self.request(request_id="pending-replay"))
-            self.assertLess(time.monotonic() - started, 0.5)
-            self.assertIs(first.agent.status, AgentStatus.STARTING)
-            self.assertTrue(entered.wait(1))
-            self.assertIs(self.service.get(first.agent_id).status, AgentStatus.STARTING)
-
-            replay = self.service.start(self.request(request_id="pending-replay"))
-            self.assertFalse(replay.created)
-            self.assertEqual(replay.agent_id, first.agent_id)
-            sibling_started = time.monotonic()
-            sibling = self.service.start(self.request(request_id="pending-sibling"))
-            self.assertLess(time.monotonic() - sibling_started, 0.5)
-            self.assertIs(sibling.agent.status, AgentStatus.STARTING)
-            clock[0] = 131.0
-            for _ in range(3):
-                self.service.get(first.agent_id)
-                self.service.list()
-                self.assertEqual(
-                    reconcile_unowned_starting(self.store, at=clock[0]), ()
-                )
-            with self.assertRaisesRegex(
-                ValidationError, "request_id was reused for a different request"
-            ):
-                self.service.start(
-                    self.request(request_id="pending-replay", task="changed")
-                )
-            release.set()
-            self.wait_until(lambda: len(self.launched) == 2)
-
-    def test_cancel_during_prepare_prevents_launch(self) -> None:
-        """Durable cancellation during prepare must stop before spawn."""
-
-        entered = threading.Event()
-        release = threading.Event()
-        original = ADAPTER.prepare
-
-        def blocked_prepare(*args, **kwargs):
-            """Expose the cancellation window inside adapter preparation."""
-
-            entered.set()
-            release.wait(2)
-            return original(*args, **kwargs)
-
-        with patch.object(ADAPTER, "prepare", side_effect=blocked_prepare):
-            accepted = self.service.start(self.request(request_id="cancel-prepare"))
-            self.assertTrue(entered.wait(1))
-            self.service.cancel(accepted.agent_id)
-            release.set()
-            self.wait_until(
-                lambda: self.store.get_agent(accepted.agent_id)["status"]
-                == AgentStatus.CANCELLED.value
-            )
-        self.assertEqual(self.launched, [])
-
-    def test_expired_prepare_cannot_launch_after_reconciliation(self) -> None:
-        """A released worker cannot revive a start lost after its lease expires."""
-
-        entered = threading.Event()
-        release = threading.Event()
-        finished = threading.Event()
-        original = ADAPTER.prepare
-        original_continue = self.service._continue_start
-        clock = [100.0]
-        self.service = AgentService(
-            self.config, self.store, self.root,
-            launch=lambda *args: self.launched.append(args), now=lambda: clock[0],
-        )
-
-        def blocked_prepare(*args, **kwargs):
-            """Hold preparation until the durable lease is reconciled lost."""
-
-            entered.set()
-            release.wait(2)
-            return original(*args, **kwargs)
-
-        def tracked_continue(*args, **kwargs):
-            """Expose completion of the worker that resumed after expiry."""
-
-            try:
-                return original_continue(*args, **kwargs)
-            finally:
-                finished.set()
-
-        with (
-            patch.object(ADAPTER, "prepare", side_effect=blocked_prepare),
-            patch.object(self.service, "_continue_start", side_effect=tracked_continue),
-            patch("agent_run.service._log_start_preparation_stage", wraps=_log_start_preparation_stage) as stages,
-            self.assertLogs("agent_run.service", "INFO") as logs,
+        replay = self.service.start(self.request(request_id="pending-replay"))
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.agent_id, first.agent_id)
+        sibling_started = time.monotonic()
+        sibling = self.service.start(self.request(request_id="pending-sibling"))
+        self.assertLess(time.monotonic() - sibling_started, 0.5)
+        self.assertIs(sibling.agent.status, AgentStatus.STARTING)
+        self.assertEqual(len(self.launched), 2)
+        clock[0] = 131.0
+        for _ in range(3):
+            self.service.get(first.agent_id)
+            self.service.list()
+            self.assertEqual(reconcile_unowned_starting(self.store, at=clock[0]), ())
+        with self.assertRaisesRegex(
+            ValidationError, "request_id was reused for a different request"
         ):
-            accepted = self.service.start(self.request(request_id="expired-prepare"))
-            self.assertTrue(entered.wait(1))
-            self.assertTrue(any("stage=prepare " in message for message in logs.output))
-            clock[0] = 221.0
-            self.assertEqual(
-                reconcile_unowned_starting(self.store, at=clock[0]),
-                (accepted.agent_id,),
+            self.service.start(
+                self.request(request_id="pending-replay", task="changed")
             )
-            release.set()
-            self.assertTrue(finished.wait(1))
-        self.assertEqual(
-            self.store.get_agent(accepted.agent_id)["status"], AgentStatus.LOST.value
-        )
-        self.assertEqual(self.launched, [])
 
     def test_request_id_returns_one_agent_and_launches_once(self) -> None:
         first = self.start("same-request", task="  do   work  ")
@@ -564,8 +608,81 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(first.agent.task_summary, "do work")
         launched = self.launched[0]
         self.assertEqual(launched[0], first.agent_id)
-        self.assertIs(launched[2], ADAPTER)
-        self.assertIsInstance(launched[3], LaunchPlan)
+        self.assertEqual(launched[1].task, "  do   work  ")
+        self.assertEqual(launched[2].role_name, "profile")
+
+    def test_start_launches_immediately_after_atomic_admission(self) -> None:
+        """Expose only a broker-owned STARTING row at the launch boundary."""
+
+        observed = []
+
+        def launch(agent_id, request, role) -> None:
+            """Capture the durable row before the supervisor callback returns."""
+
+            observed.append((self.store.get_agent(agent_id), request, role))
+
+        service = AgentService(
+            self.config, self.store, self.root, launch=launch, now=lambda: 100.0
+        )
+        try:
+            result = service.start(self.request(request_id="immediate-supervisor"))
+        finally:
+            service.close()
+        row, request, role = observed[0]
+        self.assertTrue(result.created)
+        self.assertEqual(row["status"], AgentStatus.STARTING.value)
+        self.assertIsNotNone(row["startup_owner_pid_identity"])
+        self.assertIsNone(row["supervisor_pid"])
+        self.assertEqual(request.profile, role.role_name)
+
+    def test_list_long_poll_wakes_on_revision_and_expiry_does_not_mutate(self) -> None:
+        """Expose factual phase/process fields and wait only for committed events."""
+
+        self.service.close()
+        self.store = StateStore.open(self.root / "state.db")
+        self.service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=lambda *_args: None,
+            now=time.time,
+        )
+        result = self.service.start(self.request(request_id="factual-list"))
+        report_ready(
+            self.store, result.agent_id, None, pid=os.getpid(), identity="test-supervisor"
+        )
+        initial = self.service.list()
+        self.assertEqual(initial.items[0].phase, "preparing")
+        self.assertEqual(initial.items[0].process_state, "alive")
+        self.assertEqual(initial.items[0].acceptance, "pending")
+
+        def publish() -> None:
+            """Commit one later phase through a thread-owned store."""
+
+            time.sleep(0.05)
+            writer = StateStore.open(self.root / "state.db")
+            try:
+                writer.append_event(
+                    result.agent_id, "phase", data={"phase": "spawning"}
+                )
+            finally:
+                writer.close()
+
+        thread = threading.Thread(target=publish)
+        thread.start()
+        changed = self.service.list(
+            AgentQuery(after_revision=initial.revision, wait_seconds=1)
+        )
+        thread.join()
+        self.assertGreater(changed.revision, initial.revision)
+        self.assertEqual(changed.items[0].phase, "spawning")
+
+        before = self.store.get_agent(result.agent_id)["status"]
+        expired = self.service.list(
+            AgentQuery(after_revision=changed.revision, wait_seconds=0.05)
+        )
+        self.assertEqual(expired.revision, changed.revision)
+        self.assertEqual(self.store.get_agent(result.agent_id)["status"], before)
 
     def test_list_projection_is_batched_and_exposes_cleanup_evidence(self) -> None:
         """One page uses fixed SQL count and returns validated cleanup evidence."""
@@ -603,7 +720,7 @@ class AgentServiceTests(unittest.TestCase):
             self.store.connection.set_trace_callback(None)
 
         selects = [statement for statement in statements if statement.startswith("SELECT") or statement.startswith("WITH")]
-        self.assertLessEqual(len(selects), 3)
+        self.assertLessEqual(len(selects), 4)
         self.assertEqual(page.total, 25)
         cleanup = next(
             item.cleanup for item in page.items if item.agent_id == agent_ids[-1]
@@ -642,27 +759,6 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(replay.agent_id, first.agent_id)
         self.assertEqual(len(self.launched), 1)
         self.assertEqual(len(self.store.list_agents()), 1)
-
-    def test_crash_before_worker_registration_leaves_owned_starting_row(self) -> None:
-        """A process-level interruption cannot expose ownerless ``CREATED`` state."""
-
-        with patch.object(
-            self.service._starts,
-            "submit",
-            side_effect=KeyboardInterrupt("coordinator crashed"),
-        ), self.assertRaisesRegex(KeyboardInterrupt, "coordinator crashed"):
-            self.service.start(self.request(request_id="registration-crash"))
-
-        row = self.store.list_agents()[0]
-        self.assertEqual(row["status"], AgentStatus.STARTING.value)
-        self.assertIsInstance(row["startup_owner_pid_identity"], str)
-        self.assertIsInstance(row["startup_owner_birth_time"], float)
-        self.assertEqual(row["startup_deadline_at"], 220.0)
-        events = self.store.connection.execute(
-            "SELECT kind FROM events WHERE agent_id = ? ORDER BY seq", (row["id"],)
-        ).fetchall()
-        self.assertEqual([event["kind"] for event in events], ["created", "start_accepted"])
-        self.assertEqual(self.launched, [])
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""
@@ -754,21 +850,18 @@ class AgentServiceTests(unittest.TestCase):
 
         accepted = self.service.start(request)
         self.assertTrue(accepted.created)
-        self.assertIn(accepted.agent.status, {AgentStatus.STARTING, AgentStatus.FAILED})
-        self.wait_until(
-            lambda: self.store.get_agent(accepted.agent_id)["status"]
-            == AgentStatus.FAILED.value
-        )
+        self.assertIs(accepted.agent.status, AgentStatus.STARTING)
+        self.prepare_captured()
 
         rows = self.store.list_agents()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], AgentStatus.FAILED.value)
-        self.assertEqual(rows[0]["failure_kind"], "prepare_failed")
+        self.assertEqual(rows[0]["failure_kind"], "prepare_prepare_failed")
         path = self.root / "agents" / str(rows[0]["id"])
         self.assertTrue(path.is_dir())
         self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         self.assertEqual(ADAPTER.prepare_dirs, [path])
-        self.assertEqual(self.launched, [])
+        self.assertEqual(len(self.launched), 1)
 
         retry = self.service.start(request)
         self.assertFalse(retry.created)
@@ -802,7 +895,7 @@ class AgentServiceTests(unittest.TestCase):
         row = self.store.list_agents()[0]
         agent_id = row["id"]
         self.assertEqual(row["status"], "failed")
-        self.assertEqual(row["failure_kind"], "supervisor_start_failed")
+        self.assertEqual(row["failure_kind"], "start_submit_failed")
         self.assertEqual(row["failure_text"], "ready failed")
         view = service.get(agent_id)
         # The start carried no orchestrator session reference, so no notice was
@@ -818,7 +911,7 @@ class AgentServiceTests(unittest.TestCase):
                WHERE agent_id = ? ORDER BY seq DESC LIMIT 1""",
             (agent_id,),
         ).fetchone()
-        self.assertEqual(event["kind"], "supervisor_start_failed")
+        self.assertEqual(event["kind"], "start_submit_failed")
         self.assertIn(str(agent_id), event["data_json"])
 
         retry = service.start(request)
@@ -832,12 +925,9 @@ class AgentServiceTests(unittest.TestCase):
     ) -> None:
         """Preserve the accepted agent identity while bootstrap failure evidence settles."""
 
-        release_callback = threading.Event()
-
         def fail_launch(*args) -> None:
-            """Wait until the caller has asserted the STARTING snapshot."""
+            """Raise the bootstrap evidence from the synchronous submit boundary."""
 
-            release_callback.wait()
             raise SupervisorBootstrapError(
                 "detached supervisor died before session proof at stage "
                 "'import': ModuleNotFoundError: no module named agent_run.adapters "
@@ -858,15 +948,8 @@ class AgentServiceTests(unittest.TestCase):
             now=lambda: 100.0,
         )
         request = self.request(request_id="bootstrap-failure")
-        try:
-            accepted = service.start(request)
-            self.assertIs(accepted.agent.status, AgentStatus.STARTING)
-        finally:
-            release_callback.set()
-        self.wait_until(
-            lambda: self.store.get_agent(accepted.agent_id)["status"]
-            == AgentStatus.FAILED.value
-        )
+        accepted = service.start(request)
+        self.assertIs(accepted.agent.status, AgentStatus.FAILED)
 
         row = self.store.list_agents()[0]
         agent_id = row["id"]
@@ -907,17 +990,12 @@ class AgentServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
             self.service.transcript(agent_id, limit=1001)
 
-    def test_list_orchestrators_and_agent_effort_are_read_only(self) -> None:
-        """Expose persisted effort and bounded orchestrator aggregates."""
+    def test_list_exposes_persisted_agent_effort(self) -> None:
+        """Expose persisted effort through the factual agent page."""
 
         result = self.service.start(replace(self.request(request_id="effort"), effort="high"))
         self.wait_until(lambda: bool(self.launched))
-        self.assertEqual(self.service.get(result.agent_id).effort, "high")
         self.assertEqual(self.service.list(AgentQuery(limit=1)).items[0].effort, "high")
-        page = self.service.list_orchestrators(limit=1)
-        self.assertEqual((page.total, len(page.items), page.complete), (1, 1, True))
-        with self.assertRaisesRegex(ValidationError, "limit must not exceed 1000"):
-            self.service.list_orchestrators(limit=1001)
 
     def test_transcript_cursor_is_explicit_and_raw_ref_is_preserved(self) -> None:
         agent_id = self.start("transcript").agent_id
@@ -945,6 +1023,7 @@ class AgentServiceTests(unittest.TestCase):
 
     def test_answer_verifies_path_size_hash_and_bounds_inline_content(self) -> None:
         agent_id = self.start("answer").agent_id
+        self.prepare_captured()
         directory = agent_dir(agent_id, self.root)
         self.assertTrue(directory.is_dir())
         path = directory / "answer.md"
@@ -1003,7 +1082,7 @@ class AgentServiceTests(unittest.TestCase):
         with self.assertRaises(StateTransitionError):
             self.service.cancel(terminal_id)
 
-    def test_binding_summary_models_and_stored_limits_share_the_service(self) -> None:
+    def test_binding_models_and_current_limits_share_the_service(self) -> None:
         agent_id = self.start("binding", task="safe task").agent_id
         ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
         delivery = self.service.bind(agent_id, ref)
@@ -1017,12 +1096,6 @@ class AgentServiceTests(unittest.TestCase):
         self.terminal(agent_id)
         view = self.service.get(agent_id)
         self.assertEqual(view.delivery.state, "pending")
-        self.assertEqual(self.service.summary(agent_id=agent_id).agents, (view,))
-        self.assertEqual(self.service.summary(orchestrator=ref).total, 0)
-        with self.assertRaises(ValidationError):
-            self.service.summary()
-        with self.assertRaises(ValidationError):
-            self.service.summary(agent_id=agent_id, orchestrator=ref)
 
         self.assertEqual(tuple(self.service.models()), ("fake",))
         fake_roster = self.service.models()["fake"]
@@ -1032,16 +1105,9 @@ class AgentServiceTests(unittest.TestCase):
         )
         self.assertTrue(fake_roster.available)
         self.assertIsNone(fake_roster.reason)
-        self.store.insert_capacity_sample(
-            runtime="fake",
-            lane="main",
-            window="5h",
-            source="test",
-            payload={},
-            remaining_percent=50,
-            reset_at=200,
-            observed_at=100,
-            valid_until=150,
+        self.store.replace_capacity_snapshot(
+            runtime="fake", scope_id="fake", observed_at=100, valid_until=150,
+            payload={"samples": [{"lane": "main", "window": "5h", "source": "test", "target": None, "remaining_percent": 50, "reset_at": 200, "observed_at": 100, "valid_until": 150}], "pools": [], "routes": []},
         )
         limits = self.service.limits()
         self.assertEqual(len(limits.items), 1)
@@ -1113,7 +1179,6 @@ class AgentServiceTests(unittest.TestCase):
             launch=lambda *_: None,
             now=lambda: 100.0,
         )
-
         roster = service.models()["codex"]
 
         self.assertEqual(
@@ -1122,12 +1187,6 @@ class AgentServiceTests(unittest.TestCase):
                 ("gpt-5.6-sol", "", ()),
                 ("gpt-5.6-terra", "", ()),
             ],
-        )
-        from agent_run.adapters.codex.adapter import ADAPTER as codex_adapter
-
-        self.assertEqual(
-            roster.capabilities,
-            tuple(sorted(c.value for c in codex_adapter.describe().capabilities)),
         )
         self.assertFalse(roster.available)
         self.assertEqual(

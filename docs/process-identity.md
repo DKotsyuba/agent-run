@@ -4,11 +4,12 @@ An owned process is identified by its PID and `psutil.Process(pid).create_time()
 `alive`, `dead`, `reused`, `unknown`, and `denied` are distinct verdicts. Missing
 legacy birth evidence is `unknown`, never `dead`; an unknown or reused PID is
 never signalled. Command text remains diagnostic only. Tests inject `psutil.Process`
-at this helper seam. The API coordinator persists its own birth time with the
-bounded startup claim, and supervisors persist theirs before READY. Legacy rows
-without birth evidence can still prove a missing PID dead,
-but a present PID remains unknown until the existing deadline or another exact
-ownership proof settles it.
+at this helper seam. The API coordinator persists its own PID and birth time
+for the pre-READY startup claim, and the supervisor replaces that claim with its
+own PID and birth proof before signalling READY. Reconciliation records `lost`
+only for the OS verdict `dead` or `reused`. Legacy rows without birth evidence
+can still prove a missing PID dead, but a present PID remains `unknown`; elapsed
+age never upgrades an uncertain observation into process loss.
 
 Runtime cleanup signals only the process group whose leader/group equality and
 stable psutil creation time were verified. Before signalling, it snapshots any

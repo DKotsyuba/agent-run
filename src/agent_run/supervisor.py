@@ -17,8 +17,6 @@ from .adapters.base import Capability, LaunchPlan, RuntimeAdapter, RuntimeSessio
 from .domain import TERMINAL, AgentId, AgentStatus, Message, Outcome, validate_agent_id
 from .errors import AgentRunError, ValidationError
 from .lifecycle import (
-    Deadline,
-    Phase,
     ProcessOps,
     ReadyChannel,
     SystemProcessOps,
@@ -34,7 +32,6 @@ from .state.store import StateStore
 from .verify import (
     DEFAULT_SENTINEL,
     STOP_CANCEL,
-    STOP_TIMEOUT,
     inspect_answer,
     verify_completion,
 )
@@ -44,14 +41,6 @@ _logger = logging.getLogger("agent_run.supervisor")
 
 CANCEL_COMMAND = "cancel"
 STEER_COMMAND = "steer"
-_MINIMUM_POLL = 0.001
-DEFAULT_WARNING_TEXT = (
-    "Time budget is nearly exhausted. Stop starting new work NOW. Write your final "
-    "answer immediately: (1) what is COMPLETE, with evidence (files, tests, commands "
-    "run); (2) what is NOT done and the exact continuation point for a successor. Then "
-    "end with your completion sentinel."
-)
-
 
 def supervisor_identity() -> str:
     """Return a nonblank command diagnostic for the current process.
@@ -70,24 +59,51 @@ def _error_text(error: BaseException) -> str:
     return str(error).strip() or type(error).__name__
 
 
+def report_ready(
+    store: StateStore,
+    agent_id: str | AgentId,
+    ready: ReadyChannel | None,
+    *,
+    pid: int | None = None,
+    identity: str | None = None,
+) -> None:
+    """Persist supervisor ownership before emitting technical READY."""
+
+    checked = validate_agent_id(agent_id)
+    owner_pid = os.getpid() if pid is None else pid
+    owner_identity = identity or supervisor_identity()
+    status = AgentStatus(str(store.get_agent(checked)["status"]))
+    if status is AgentStatus.CREATED:
+        store.transition(checked, AgentStatus.STARTING, kind="supervisor_starting")
+    elif status not in {AgentStatus.STARTING, AgentStatus.CANCELLING}:
+        store.transition(checked, AgentStatus.STARTING, kind="supervisor_starting")
+    store.record_supervisor(
+        checked,
+        pid=owner_pid,
+        identity=owner_identity,
+        process_group_id=owner_pid,
+        birth_time=capture_process_birth(owner_pid),
+    )
+    store.append_event(checked, "phase", data={"phase": "preparing"})
+    if ready is not None:
+        ready.ready()
+    _logger.info("agent_id=%s stage=READY pid=%d", checked, owner_pid)
+
+
 @dataclass(frozen=True)
 class SupervisorSettings:
-    """Validated timing and work bounds for one supervisor lifecycle.
+    """Validated technical bounds for one supervisor lifecycle.
 
     Durations are seconds. ``command_limit`` and ``command_seconds`` bound one
-    running command-drain tick so engine polling, heartbeat, and deadline checks
-    regain control even while commands keep arriving.
+    running command-drain tick so engine polling regains control even while
+    commands keep arriving. Grace periods bound process cleanup only; they do
+    not limit runtime execution.
     """
 
-    heartbeat_seconds: float = 5.0
     poll_seconds: float = 0.25
     grace_seconds: float = 10.0
     kill_grace_seconds: float = 5.0
     natural_grace_seconds: float = 1.0
-    warning_fraction: float = 0.90
-    warning_text: str = DEFAULT_WARNING_TEXT
-    silence_threshold_seconds: float = 60.0
-    stalled_after_seconds: float = 900.0
     command_limit: int = 16
     command_seconds: float = 1.0
     sentinel: str | None = DEFAULT_SENTINEL
@@ -96,7 +112,6 @@ class SupervisorSettings:
         """Reject unsafe or non-finite supervisor settings before launch."""
 
         for name in (
-            "heartbeat_seconds",
             "poll_seconds",
             "grace_seconds",
             "kill_grace_seconds",
@@ -110,11 +125,7 @@ class SupervisorSettings:
                 or value <= 0
             ):
                 raise ValidationError(f"{name} must be positive and finite")
-        for name in (
-            "natural_grace_seconds",
-            "silence_threshold_seconds",
-            "stalled_after_seconds",
-        ):
+        for name in ("natural_grace_seconds",):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
@@ -123,16 +134,6 @@ class SupervisorSettings:
                 or value < 0
             ):
                 raise ValidationError(f"{name} must be nonnegative and finite")
-        fraction = self.warning_fraction
-        if (
-            isinstance(fraction, bool)
-            or not isinstance(fraction, (int, float))
-            or not math.isfinite(fraction)
-            or not 0 < fraction < 1
-        ):
-            raise ValidationError("warning_fraction must be strictly between 0 and 1")
-        if not isinstance(self.warning_text, str) or not self.warning_text.strip():
-            raise ValidationError("warning_text must be a nonblank string")
         if (
             isinstance(self.command_limit, bool)
             or not isinstance(self.command_limit, int)
@@ -213,24 +214,24 @@ class Supervisor:
         plan: LaunchPlan,
         *,
         answer_path: str | Path,
-        timeout_seconds: float,
         settings: SupervisorSettings | None = None,
         ops: ProcessOps | None = None,
         ready: ReadyChannel | None = None,
         identity: str | None = None,
         supervisor_pid: int | None = None,
+        ownership_recorded: bool = False,
     ):
         self._store = store
         self._agent_id = validate_agent_id(agent_id)
         self._adapter = adapter
         self._plan = plan
         self._answer_path = Path(answer_path)
-        self._timeout_seconds = timeout_seconds
         self._settings = settings or SupervisorSettings()
         self._ops = ops or SystemProcessOps()
         self._ready = ready
         self._identity = identity or supervisor_identity()
         self._pid = os.getpid() if supervisor_pid is None else supervisor_pid
+        self._ownership_recorded = ownership_recorded
         self._birth_time = capture_process_birth(self._pid)
         self._sink = StoreEventSink(store, self._agent_id, self._ops)
         self._group: VerifiedProcessGroup | None = None
@@ -239,16 +240,14 @@ class Supervisor:
         self._recorded_group_id: int | None = None
         self._stop_reason: str | None = None
         self._signalled = False
-        self._warned = False
-        self._last_heartbeat: float | None = None
-        self._run_started_at: float | None = None
 
     def run(self) -> Outcome:
         """Report ready only after handlers are armed and `starting` is durable."""
 
         previous = install_signal_handlers(self._on_signal)
         try:
-            self._report_ready()
+            if not self._ownership_recorded:
+                self._report_ready()
             return self._launch_and_supervise()
         finally:
             restore_signal_handlers(previous)
@@ -262,27 +261,13 @@ class Supervisor:
         """
 
         try:
-            status = AgentStatus(str(self._store.get_agent(self._agent_id)["status"]))
-            if status is AgentStatus.CREATED:
-                self._store.transition(
-                    self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
-                )
-            elif status not in {AgentStatus.STARTING, AgentStatus.CANCELLING}:
-                self._store.transition(
-                    self._agent_id, AgentStatus.STARTING, kind="supervisor_starting"
-                )
-            # Persist pid and identity before ready so every ready row can later
-            # be converged by reconciliation, even if launch never returns.
-            self._store.record_supervisor(
+            report_ready(
+                self._store,
                 self._agent_id,
+                self._ready,
                 pid=self._pid,
                 identity=self._identity,
-                process_group_id=self._pid,
-                birth_time=self._birth_time,
             )
-            if self._ready is not None:
-                self._ready.ready()
-            _logger.info("agent_id=%s stage=READY pid=%d", self._agent_id, self._pid)
         except Exception as error:
             _logger.warning(
                 "agent_id=%s stage=READY failed error_kind=%s", self._agent_id, type(error).__name__
@@ -296,6 +281,9 @@ class Supervisor:
 
     def _launch_and_supervise(self) -> Outcome:
         try:
+            self._store.append_event(
+                self._agent_id, "phase", data={"phase": "spawning"}
+            )
             steerable = Capability.STEER in self._adapter.describe().capabilities
             session = self._adapter.launch(self._plan, self._sink)
             _logger.info(
@@ -360,7 +348,6 @@ class Supervisor:
             self._owned_pid = None
             self._group = None
             self._recorded_group_id = self._pid
-        started_at = self._ops.monotonic()
         self._store.record_supervisor(
             self._agent_id,
             pid=self._pid,
@@ -368,16 +355,8 @@ class Supervisor:
             process_group_id=self._recorded_group_id,
             birth_time=self._birth_time,
         )
-        self._last_heartbeat = started_at
-        # Baseline for the stalled watchdog only. Seeding the sink itself
-        # would erase the "no stream progress ever" evidence that timeout
-        # outcomes report as silence=no_progress.
-        self._run_started_at = started_at
         self._store.transition(self._agent_id, AgentStatus.RUNNING, kind="running")
-        deadline = Deadline(
-            started_at, self._timeout_seconds, self._settings.warning_fraction
-        )
-        session_outcome = self._supervise(session, deadline, steerable)
+        session_outcome = self._supervise(session, steerable)
         return self._finish(session, session_outcome)
 
     def _fail_launched(self, session: RuntimeSession, error: BaseException) -> Outcome:
@@ -423,118 +402,30 @@ class Supervisor:
                 stop_reason=None,
                 answer=proof,
                 group_gone=termination.group_gone,
-                last_progress_at=self._sink.last_progress_at,
-                now=self._ops.monotonic(),
-                silence_threshold_seconds=self._settings.silence_threshold_seconds,
             )
         committed = self._commit(outcome)
         self._drain_terminal_commands()
         return committed
 
-    def _supervise(
-        self, session: RuntimeSession, deadline: Deadline, steerable: bool
-    ) -> Outcome | None:
+    def _supervise(self, session: RuntimeSession, steerable: bool) -> Outcome | None:
+        """Poll until the runtime finishes or receives an explicit cancellation."""
+
         while True:
             self._drain_commands(session, steerable)
-            now = self._ops.monotonic()
-            if self._stop_reason is None:
-                if self._signalled:
-                    self._stop_reason = STOP_CANCEL
-                else:
-                    phase = deadline.phase(now)
-                    if phase is Phase.WARNING and not self._warned:
-                        self._warn(session, steerable, deadline, now)
-                    elif phase is Phase.EXPIRED:
-                        self._stop_reason = STOP_TIMEOUT
-                    elif self._is_stalled(now):
-                        silence = now - self._stall_baseline()
-                        self._store.append_event(
-                            self._agent_id, "stalled", data={"silence_seconds": silence}
-                        )
-                        self._stop_reason = "stalled"
+            if self._stop_reason is None and self._signalled:
+                self._stop_reason = STOP_CANCEL
             if self._stop_reason is not None:
                 return self._stop(session)
-            outcome = session.wait(self._wait_timeout(deadline, now))
+            outcome = session.wait(self._settings.poll_seconds)
             if outcome is not None:
                 return outcome
-            self._heartbeat(self._ops.monotonic())
-
-    def _stall_baseline(self) -> float:
-        """Return the moment stream silence is measured from.
-
-        The last stream event when one ever arrived, otherwise the run start:
-        a child that never emitted anything must still stall, while the sink's
-        own ``last_progress_at`` stays untouched so timeout outcomes keep
-        reporting ``silence=no_progress`` honestly.
-        """
-
-        last_event = self._sink.last_progress_at
-        if last_event is not None:
-            return last_event
-        return self._run_started_at if self._run_started_at is not None else 0.0
-
-    def _is_stalled(self, now: float) -> bool:
-        """Return whether the running engine has exceeded its stream-silence budget."""
-
-        if self._settings.stalled_after_seconds <= 0:
-            return False
-        return now - self._stall_baseline() > self._settings.stalled_after_seconds
-
-    def _wait_timeout(self, deadline: Deadline, now: float) -> float:
-        """Never sleep past the warning point, so a coarse poll cannot skip it."""
-
-        boundary = deadline.expires_at
-        if not self._warned and now < deadline.warning_at:
-            boundary = deadline.warning_at
-        return max(_MINIMUM_POLL, min(self._settings.poll_seconds, boundary - now))
-
-    def _heartbeat(self, now: float) -> None:
-        if (
-            self._last_heartbeat is not None
-            and now - self._last_heartbeat < self._settings.heartbeat_seconds
-        ):
-            return
-        self._last_heartbeat = now
-        if self._recorded_group_id is None:
-            raise ValidationError("supervisor process identity was not recorded")
-        self._store.record_supervisor(
-            self._agent_id,
-            pid=self._pid,
-            identity=self._identity,
-            process_group_id=self._recorded_group_id,
-            birth_time=self._birth_time,
-        )
-
-    def _warn(
-        self, session: RuntimeSession, steerable: bool, deadline: Deadline, now: float
-    ) -> None:
-        """Issue the single model-visible completion nudge at the warning point."""
-
-        self._warned = True
-        delivered = False
-        detail: str | None = None
-        if steerable:
-            try:
-                session.steer(self._settings.warning_text)
-                delivered = True
-            except Exception as error:  # a refused steer is evidence, not a crash
-                detail = str(error)
-        self._store.append_event(
-            self._agent_id,
-            "deadline_warning",
-            data={
-                "delivered": delivered,
-                "remaining_seconds": round(deadline.remaining(now), 3),
-                "error": detail,
-            },
-        )
 
     def _drain_commands(self, session: RuntimeSession, steerable: bool) -> None:
         """Handle a bounded command page, returning immediately after cancel.
 
         The store supplies cancellation-first ordering. This loop caps both
         claimed rows and elapsed monotonic seconds so a sustained producer
-        cannot starve engine polling, heartbeat writes, or deadline checks.
+        cannot starve engine polling or explicit cancellation handling.
         """
 
         started = self._ops.monotonic()
@@ -663,26 +554,12 @@ class Supervisor:
         self._record_termination(termination, best_effort=True)
         self._reap_session(session)
         proof = inspect_answer(self._answer_path, sentinel=self._settings.sentinel)
-        if self._stop_reason == "stalled":
-            # verify_completion knows only timeout/cancel stop reasons, and a
-            # stalled child by definition produced no fresh answer to verify.
-            silence = self._ops.monotonic() - self._stall_baseline()
-            outcome = Outcome(
-                AgentStatus.FAILED,
-                failure_kind="stalled",
-                failure_text=f"no stream events for {silence:.0f}s",
-                runtime_session_id=self._sink.runtime_session_id,
-            )
-        else:
-            outcome = verify_completion(
-                session_outcome=session_outcome,
-                stop_reason=self._stop_reason,
-                answer=proof,
-                group_gone=termination.group_gone,
-                last_progress_at=self._sink.last_progress_at,
-                now=self._ops.monotonic(),
-                silence_threshold_seconds=self._settings.silence_threshold_seconds,
-            )
+        outcome = verify_completion(
+            session_outcome=session_outcome,
+            stop_reason=self._stop_reason,
+            answer=proof,
+            group_gone=termination.group_gone,
+        )
         committed = self._commit(outcome)
         self._drain_terminal_commands()
         return committed

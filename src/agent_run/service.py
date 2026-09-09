@@ -6,29 +6,17 @@ import json
 import logging
 import os
 import sys
-import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeAlias
 
-from .adapters.base import Capability, LaunchPlan, ModelInfo, RuntimeAdapter
+from .adapters.base import Capability, ModelInfo
 from .adapters.registry import AdapterRegistry
-from .adapters.home import write_managed_file
-from .adapters.snapshots import (
-    CONFIG_SNAPSHOT_FILENAME,
-    build_config_snapshot,
-    inspect_config_snapshot,
-    inspect_runtime_snapshots,
-    runtime_snapshot_index_sha256,
-)
-from .accounts import account_auth_source, account_runtime_home
-from .capacity.advice import CapacityAdvice, build_advice
-from .capacity.forecast import build_forecasts
-from .capacity.history import load_series
 from .capacity.ranking import CapacityOrder
-from .config import Config, McpConfig, RuntimeConfig, load_config
+from .capacity.snapshot import CapacityReading, build_capacity_routes
+from .config import Config, RuntimeConfig, load_config
 from .domain import (
     ACTIVE,
     TERMINAL,
@@ -52,16 +40,12 @@ from .effective_policy import (
 )
 from .delivery.base import DeliveryAttemptEvidence
 from .delivery.dispatch import _effort_from_request_json
-from .launch import DEFAULT_STARTUP_HANDOFF_SECONDS, launch_cancellation
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
-from .paths import agent_dir, config_path, create_agent_dir, runtime_skills_dir, state_db_path
-from .profiles import AgentProfile, assign_role, load_profile
-from .process_identity import capture_process_birth
-from .resume import (
-    identity_snapshot, inherited_request, proven_identity, record_profile_grants,
-    replayed_resume,
-)
-from .start_coordinator import StartCoordinator
+from .paths import agent_dir, config_path, runtime_skills_dir, state_db_path
+from .profiles import AgentProfile, load_profile
+from .role_plan import ResolvedRolePlan, resolve_role_plan
+from .process_identity import capture_process_birth, observe_process
+from .resume import identity_snapshot, inherited_request, proven_identity, replayed_resume
 from .state.reconciliation import process_owner_identity
 from .supervisor import supervisor_identity
 from .state.store import StateStore
@@ -78,7 +62,6 @@ from .verify import (
 
 _logger = logging.getLogger("agent_run.service")
 
-_SUMMARY_LIMIT = 50
 _TASK_SUMMARY_CHARS = 160
 _DEFAULT_INLINE_ANSWER_BYTES = 1024 * 1024
 _MAX_PAGE_SIZE = 1000
@@ -87,29 +70,7 @@ _PENDING_CONFIG_REVISION = "pending:materialization"
 _SNAPSHOT_CONFIG_REVISION = "snapshot:v1:"
 
 
-def _log_start_preparation_stage(
-    agent_id: AgentId, stage: str, started_at: float
-) -> None:
-    """Record one bounded startup-preparation stage without request payloads.
-
-    ``agent_id`` (AgentId) identifies the accepted run; ``stage`` (str) is a
-    caller-supplied fixed internal label, never request or exception text.
-    ``started_at`` (float) is the worker's monotonic preparation start in seconds.
-    Returns None after emitting the id, stage and cumulative elapsed seconds to
-    the existing logger. Successive entries identify each stage's duration;
-    the entry is emitted before work so a blocked stage remains identifiable.
-    This helper does not alter deadlines or state and uses no request payloads.
-    """
-    _logger.info(
-        "start preparation agent_id=%s stage=%s elapsed_seconds=%.3f",
-        agent_id,
-        stage,
-        time.monotonic() - started_at,
-    )
-
-LaunchAgent: TypeAlias = Callable[
-    [AgentId, StartRequest, RuntimeAdapter, LaunchPlan, Path], None
-]
+LaunchAgent: TypeAlias = Callable[[AgentId, StartRequest, ResolvedRolePlan], None]
 
 
 def _page_limit(value: int) -> int:
@@ -290,30 +251,14 @@ class AgentView:
     sequence: int = 1
     cleanup: CleanupView | None = None
     policy: EffectivePolicy | None = None
+    phase: str = "accepted"
+    phase_started_at: float = 0.0
+    process_state: str = "not_started"
+    observed_at: float = 0.0
+    runtime_outcome: str | None = None
+    acceptance: str = "pending"
 
 
-@dataclass(frozen=True, slots=True)
-class OrchestratorView:
-    """Read-only aggregate for one launching orchestrator session."""
-
-    session_id: str | None
-    transport: str
-    external_session_id: str
-    external_turn_id: str | None
-    created_at: float
-    last_seen_at: float
-    active: int
-    total: int
-
-
-@dataclass(frozen=True, slots=True)
-class OrchestratorPage:
-    """A bounded read-only orchestrator-session page with an exact total."""
-
-    items: tuple[OrchestratorView, ...]
-    total: int
-    limit: int
-    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +274,8 @@ class AgentQuery:
     orchestrator: OrchestratorRef | None = None
     offset: int = 0
     limit: int = 100
+    after_revision: int | None = None
+    wait_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.active, bool):
@@ -344,6 +291,16 @@ class AgentQuery:
         ):
             raise ValidationError("offset must be a nonnegative integer")
         _page_limit(self.limit)
+        if self.after_revision is not None and (
+            type(self.after_revision) is not int or self.after_revision < 0
+        ):
+            raise ValidationError("after_revision must be a nonnegative integer or None")
+        if (
+            isinstance(self.wait_seconds, bool)
+            or not isinstance(self.wait_seconds, (int, float))
+            or not 0 <= self.wait_seconds <= 60
+        ):
+            raise ValidationError("wait_seconds must be from 0 to 60")
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,24 +311,10 @@ class AgentPage:
     limit: int
     next_offset: int | None
     complete: bool
+    revision: int = 0
+    observed_at: float = 0.0
 
 
-@dataclass(frozen=True, slots=True)
-class ChainPage:
-    """One bounded, chronological page of a resume chain.
-
-    ``items`` are the chain's agents ordered by ``sequence``. ``cursor`` is the
-    1-based sequence this page started at, ``limit`` the requested page size,
-    and ``next_cursor`` the sequence to pass back for the following page, or
-    ``None`` when this page reached the end. ``complete`` mirrors that: it is
-    ``True`` only when no further page exists.
-    """
-
-    items: tuple[AgentView, ...]
-    cursor: int
-    limit: int
-    next_cursor: int | None
-    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,39 +375,29 @@ class AnswerView:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkSummary:
-    scope: str
-    agent_id: AgentId | None
-    orchestrator: OrchestratorRef | None
-    agents: tuple[AgentView, ...]
-    total: int
-    complete: bool
-
-
-@dataclass(frozen=True, slots=True)
 class CapacityReport:
+    """Current fresh provider readings observed at one service clock value."""
+
     observed_at: float
-    items: tuple[CapacityAdvice, ...]
+    items: tuple[CapacityReading, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeModels:
-    """One runtime's model discovery snapshot: roster plus capability/health context.
+    """One runtime's model discovery snapshot with capability and health context.
 
-    ``models`` keeps the pre-existing :class:`ModelInfo` shape unchanged so
-    current consumers of individual model entries do not break. ``capabilities``
-    is the adapter's declared :class:`Capability` set (sorted string values), so
-    a router can check whether a runtime supports a requested right (e.g.
-    ``write``) before selecting it. ``available`` is ``False`` whenever the
-    adapter is unhealthy or its roster is empty; ``reason`` carries the
-    adapter-supplied explanation, falling back to ``"roster empty"`` when the
-    adapter reports itself healthy but the roster still came back empty.
+    ``models`` contains configured entries returned by the adapter,
+    ``capabilities`` contains its sorted declared capability names,
+    ``available`` requires both healthy runtime evidence and a nonempty roster,
+    and ``reason`` carries the adapter explanation or ``"roster empty"``.
     """
 
     models: tuple[ModelInfo, ...]
     capabilities: tuple[str, ...]
     available: bool
     reason: str | None
+
+
 
 
 class AgentService:
@@ -480,11 +413,7 @@ class AgentService:
         now: Callable[[], float] = time.time,
         max_inline_answer_bytes: int = _DEFAULT_INLINE_ANSWER_BYTES,
     ) -> None:
-        """Create the service and its thread-isolated start coordinator.
-
-        The supplied store remains on the service thread. Start workers retain
-        only its database path and open their own thread-affine connections.
-        """
+        """Create the service around one thread-affine state connection."""
 
         if not isinstance(config, Config):
             raise ValidationError("config must be a Config")
@@ -505,9 +434,6 @@ class AgentService:
         self._launch = launch
         self._now = now
         self._max_inline_answer_bytes = max_inline_answer_bytes
-        self._starts = StartCoordinator(
-            store.path(), max_workers=config.core.max_active_agents
-        )
 
     @classmethod
     def from_home(
@@ -531,17 +457,17 @@ class AgentService:
         )
 
     def close(self) -> None:
-        """Signal pre-ownership starts before closing the service store."""
+        """Close the service's owning state connection."""
 
-        self._starts.close()
         self._store.close()
 
     def start(self, request: StartRequest) -> StartResult:
         """Durably accept one start and return before slow runtime bootstrap.
 
         Validation, replay, capacity admission, row creation, and ``STARTING``
-        transition are synchronous. Materialization, authentication, prepare,
-        detached spawn, and READY run on a thread-isolated coordinator worker.
+        transition are synchronous. The detached supervisor is spawned
+        immediately; this method returns after its durable ownership READY,
+        while authentication/materialization/prepare continue in that process.
         Labelled file-link runtimes require their configured bridge; labelled
         Claude environment-auth runtimes instead use their private sibling
         credential home and are admitted without a bridge file.
@@ -560,22 +486,32 @@ class AgentService:
                 timeout_seconds=self._config.core.default_timeout_seconds,
             )
         runtime = self._runtime_config(request.runtime)
+        profile = self._effective_profile(request, runtime)
         label = self.resolve_account(request.runtime, request.account)
-        if label is not None:
-            claude_environment_account = (
-                runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER"
-                and runtime.auth is not None
-                and runtime.auth.kind == "environment"
-            )
-            if not claude_environment_account and (
-                runtime.auth is None or runtime.auth.target is None
-            ):
-                raise ValidationError(f"runtime {request.runtime} account auth is not configured")
-        adapter = self._registry.load(
-            request.runtime, self._required_capabilities(request, runtime)
+        runtime, role_plan = self._runtime_for_profile(
+            runtime,
+            profile,
+            label,
+            request.required_constraints,
+            request.runtime,
         )
-        adapter.validate(runtime)
-        _logger.debug("start gate=capabilities ok runtime=%s", request.runtime)
+        request = replace(
+            request,
+            write=role_plan.write,
+            read_roots=role_plan.read_roots,
+            required_constraints=role_plan.required_constraints,
+        )
+        if label is not None:
+            claude_state = runtime.adapter in {
+                "agent_run.adapters.claude:ADAPTER",
+                "agent_run.adapters.claude.adapter:ADAPTER",
+            }
+            file_state = runtime.auth is not None and runtime.auth.target is not None
+            codex_state = request.runtime == "codex"
+            if not (claude_state or file_state or codex_state):
+                raise ValidationError(
+                    f"runtime {request.runtime} does not support separate accounts"
+                )
         if request.model not in runtime.models:
             _logger.warning(
                 "start gate=model_configured failed runtime=%s model=%s",
@@ -584,8 +520,10 @@ class AgentService:
             raise ValidationError(
                 f"model is not configured for runtime {request.runtime}: {request.model}"
             )
-        policy = self._admission_policy(request, runtime)
-        return self._admit(request, runtime, label, policy=policy)
+        policy = self._policy_for_profile(request, runtime, profile)
+        return self._admit(
+            request, runtime, label, policy=policy, role_plan=role_plan,
+        )
 
     def _admit(
         self,
@@ -595,8 +533,9 @@ class AgentService:
         *,
         parent_agent_id: AgentId | None = None,
         policy: EffectivePolicy,
+        role_plan: ResolvedRolePlan,
     ) -> StartResult:
-        """Durably accept one already validated start and hand it to a worker.
+        """Durably accept one validated start and immediately spawn its supervisor.
 
         Shared by :meth:`start` and :meth:`resume`; everything runtime- and
         model-specific has been checked by the caller. ``parent_agent_id`` is
@@ -608,11 +547,9 @@ class AgentService:
         auth target, granted permissions, ``fast``) is persisted alongside the
         row but outside ``request_json``, so a later resume can prove what this
         run used without changing what idempotent replay compares.
-        A continuation preserves its parent's completed grant snapshot, which
-        the preparation worker compares with the actual loaded profile.
-        The resident coordinator's process birth time and bounded startup claim
-        commit atomically with ``STARTING`` and both acceptance events, before a
-        worker is registered or this method can return.
+        A continuation preserves its parent's completed grant snapshot. The
+        broker PID/birth claim commits atomically with ``STARTING`` and both
+        acceptance events, covering only the admission-to-READY spawn gap.
 
         The native session a resumed child attaches to is read back from the
         row that was just committed, never from the caller: store and adapter
@@ -655,7 +592,6 @@ class AgentService:
             ),
             startup_owner_identity=startup_owner,
             startup_owner_birth_time=startup_birth,
-            startup_deadline_seconds=120.0,
         )
         if not creation.created:
             _logger.info("start agent_id=%s created=False (idempotent replay)", creation.agent_id)
@@ -663,28 +599,8 @@ class AgentService:
                 creation.agent_id, False, self.get(creation.agent_id)
             )
         _logger.info("start agent_id=%s created=True", creation.agent_id)
-        resume_session_id = (
-            None
-            if parent_agent_id is None
-            else self._store.get_agent(creation.agent_id)[
-                "resume_of_runtime_session_id"
-            ]
-        )
         try:
-            self._starts.submit(
-                creation.agent_id,
-                lambda worker_store, cancelled: self._continue_start(
-                    worker_store,
-                    cancelled,
-                    creation.agent_id,
-                    request,
-                    runtime,
-                    label,
-                    startup_owner,
-                    None if resume_session_id is None else str(resume_session_id),
-                    parent_agent_id,
-                ),
-            )
+            self._launch(creation.agent_id, request, role_plan)
         except Exception as error:
             _logger.warning(
                 "start agent_id=%s failed stage=submit error_kind=%s",
@@ -697,337 +613,6 @@ class AgentService:
             creation.agent_id, True, self.get(creation.agent_id)
         )
 
-
-    def _continue_start(
-        self,
-        store: StateStore,
-        cancelled: threading.Event,
-        agent_id: AgentId,
-        request: StartRequest,
-        runtime: RuntimeConfig,
-        account_label: str | None,
-        startup_owner: str,
-        resume_session_id: str | None = None,
-        parent_agent_id: AgentId | None = None,
-    ) -> None:
-        """Materialize and launch one already accepted start.
-
-        ``store`` belongs to this worker thread. Cancellation is checked before
-        work, after authentication/materialization/prepare, and before spawn.
-        ``startup_owner`` is the immutable coordinator identity whose live
-        preparation claim is atomically renewed for the bounded READY and
-        cleanup handoff. Post-accept failures become durable outcomes.
-
-        ``resume_session_id`` is the parent's native runtime session for a
-        resumed start, or ``None`` for a fresh one. It is stamped onto the
-        adapter's plan after ``prepare`` and before the plan is serialized for
-        launch, so an adapter builds its plan without needing to know it is a
-        resume. Attachment is only requested here; the runtime session the
-        supervisor later records is whatever the adapter's sink actually emits.
-        ``parent_agent_id`` additionally selects snapshot-v1 lineage state: a
-        new-format continuation verifies and reuses its parent's runtime home
-        without rematerializing; an unprefixed historical parent retains the
-        shared-home compatibility path. A labelled Claude environment-auth
-        runtime uses its account sibling as durable credential state without a
-        file bridge; other labelled runtimes retain the file-link requirement.
-        A predecessor snapshot that predates the optional credential-state
-        declaration is compared using its original runtime-document shape,
-        while current snapshots bind that path.
-        """
-
-        failure_kind = "prepare_failed"
-        preparation_started = time.monotonic()
-        stage = "account"
-        _log_start_preparation_stage(agent_id, stage, preparation_started)
-        try:
-            if self._cancel_accepted_start(store, cancelled, agent_id):
-                return
-            candidate_dir = create_agent_dir(agent_id, self._home)
-            configured_home = runtime.home
-            effective_auth = runtime.auth
-            if account_label is not None:
-                claude_environment_account = (
-                    runtime.adapter == "agent_run.adapters.claude.adapter:ADAPTER"
-                    and runtime.auth is not None
-                    and runtime.auth.kind == "environment"
-                )
-                if claude_environment_account:
-                    configured_home = account_runtime_home(runtime.home, account_label)
-                elif runtime.auth is None or runtime.auth.target is None:
-                    raise ValidationError(
-                        f"runtime {request.runtime} account auth is not configured"
-                    )
-                else:
-                    effective_source = account_auth_source(
-                        self._home, request.runtime, account_label, runtime.auth.target
-                    )
-                    if not effective_source.is_file():
-                        raise ValidationError(
-                            f"account {account_label!r} is not authenticated; "
-                            f"run agent-run auth {account_label} {request.runtime}"
-                        )
-                    configured_home = account_runtime_home(runtime.home, account_label)
-                    effective_auth = replace(runtime.auth, source=effective_source)
-
-            parent_revision = None
-            snapshot_resume = False
-            lineage_agent_id = parent_agent_id
-            if parent_agent_id is not None:
-                parent_row = store.get_agent(parent_agent_id)
-                parent_revision = str(parent_row["config_revision"])
-                lineage_agent_id = validate_agent_id(
-                    str(parent_row["root_agent_id"] or parent_agent_id)
-                )
-                snapshot_resume = parent_revision.startswith(
-                    _SNAPSHOT_CONFIG_REVISION
-                )
-            if parent_agent_id is None:
-                effective_home = candidate_dir / "runtime-home"
-                effective_home.mkdir(mode=0o700)
-            elif snapshot_resume:
-                assert lineage_agent_id is not None
-                effective_home = agent_dir(lineage_agent_id, self._home) / "runtime-home"
-            else:
-                effective_home = configured_home
-                effective_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if not snapshot_resume:
-                effective_home.chmod(0o700)
-            effective_runtime = replace(
-                runtime,
-                home=effective_home,
-                auth=effective_auth,
-                default_account=account_label,
-                credential_state_home=configured_home,
-            )
-            if self._cancel_accepted_start(store, cancelled, agent_id):
-                return
-
-            stage = "adapter"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            adapter = AdapterRegistry(self._config).load(
-                request.runtime,
-                self._required_capabilities(request, effective_runtime),
-            )
-            adapter.validate(effective_runtime)
-            stage = "profile"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            profile = self._effective_profile(request, effective_runtime)
-            self._policy_for_profile(request, effective_runtime, profile)
-            record_profile_grants(store.connection, agent_id, profile)
-            mcp_servers = self._mcp_servers(effective_runtime)
-            stored_snapshot = None
-            if snapshot_resume:
-                assert lineage_agent_id is not None and parent_revision is not None
-                expected_sha256 = parent_revision.removeprefix(
-                    _SNAPSHOT_CONFIG_REVISION
-                )
-                stored_snapshot = inspect_config_snapshot(
-                    agent_dir(lineage_agent_id, self._home), expected_sha256
-                )
-                runtime_snapshot = inspect_runtime_snapshots(
-                    effective_home,
-                    stored_snapshot.materialize_revision,
-                    expected_sha256=stored_snapshot.snapshot_index_sha256,
-                )
-                if not runtime_snapshot.verified:
-                    raise ValidationError(
-                        "runtime snapshot is incomplete or changed: "
-                        f"missing={len(runtime_snapshot.missing)} "
-                        f"mismatched={len(runtime_snapshot.mismatched)} "
-                        f"temps={len(runtime_snapshot.owned_temps)} "
-                        f"orphans={len(runtime_snapshot.orphans)}"
-                    )
-                comparison_runtime = effective_runtime
-                if not stored_snapshot.credential_state_home_bound:
-                    # v1 snapshots created before credential_state_home must
-                    # retain their original declaration during resume checks.
-                    comparison_runtime = replace(
-                        effective_runtime, credential_state_home=None
-                    )
-                current_snapshot = build_config_snapshot(
-                    runtime=request.runtime,
-                    adapter_api_version=adapter.describe().adapter_api_version,
-                    schema_version=self._config.schema_version,
-                    materialize_revision=stored_snapshot.materialize_revision,
-                    snapshot_index_sha256=stored_snapshot.snapshot_index_sha256,
-                    config=comparison_runtime,
-                    profile=profile,
-                    runtime_version=stored_snapshot.runtime_version,
-                )
-                if current_snapshot.sha256 != expected_sha256:
-                    raise ValidationError(
-                        "effective runtime or profile changed since the parent snapshot"
-                    )
-                revision = parent_revision
-                _logger.info(
-                    "start reused runtime snapshot runtime=%s revision=%s",
-                    request.runtime,
-                    revision,
-                )
-            else:
-                stage = "materialize"
-                _log_start_preparation_stage(
-                    agent_id, stage, preparation_started
-                )
-                materialize_revision = adapter.materialize(
-                    effective_runtime,
-                    effective_home,
-                    mcp_servers=mcp_servers,
-                    skills_root=runtime_skills_dir(request.runtime, self._home),
-                )
-                revision = materialize_revision
-            if self._cancel_accepted_start(store, cancelled, agent_id):
-                return
-
-            stage = "models"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            roster = adapter.models(effective_runtime, effective_home)
-            if request.model not in {model.id for model in roster}:
-                raise ValidationError(
-                    f"model is not available for runtime {request.runtime}: {request.model}"
-                )
-            stage = "prepare"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            prepare_resume_id = resume_session_id if snapshot_resume else None
-            plan = adapter.prepare(
-                request,
-                profile,
-                effective_runtime,
-                effective_home,
-                candidate_dir,
-                mcp_servers=mcp_servers,
-                resume_session_id=prepare_resume_id,
-            )
-            if plan.resume_session_id != prepare_resume_id:
-                raise ValidationError("adapter returned a mismatched resume session")
-            if resume_session_id is not None and not snapshot_resume:
-                plan = replace(plan, resume_session_id=resume_session_id)
-            if snapshot_resume:
-                assert stored_snapshot is not None
-                if plan.materialize_revision is not None:
-                    raise ValidationError(
-                        "snapshot resume must not rematerialize its runtime home"
-                    )
-                runtime_snapshot = inspect_runtime_snapshots(
-                    effective_home,
-                    stored_snapshot.materialize_revision,
-                    expected_sha256=stored_snapshot.snapshot_index_sha256,
-                )
-                if not runtime_snapshot.verified:
-                    raise ValidationError(
-                        "adapter prepare changed the verified runtime snapshot"
-                    )
-            else:
-                revision = plan.materialize_revision or revision
-            if parent_agent_id is None:
-                snapshot_index_sha256 = runtime_snapshot_index_sha256(
-                    effective_home, revision
-                )
-                runtime_snapshot = inspect_runtime_snapshots(
-                    effective_home,
-                    revision,
-                    expected_sha256=snapshot_index_sha256,
-                )
-                if not runtime_snapshot.verified:
-                    raise ValidationError(
-                        "fresh runtime snapshot is incomplete after prepare"
-                    )
-                runtime_version = adapter.probe(
-                    effective_runtime, effective_home
-                ).version
-                config_snapshot = build_config_snapshot(
-                    runtime=request.runtime,
-                    adapter_api_version=adapter.describe().adapter_api_version,
-                    schema_version=self._config.schema_version,
-                    materialize_revision=revision,
-                    snapshot_index_sha256=snapshot_index_sha256,
-                    config=effective_runtime,
-                    profile=profile,
-                    runtime_version=runtime_version,
-                )
-                write_managed_file(
-                    candidate_dir,
-                    CONFIG_SNAPSHOT_FILENAME,
-                    config_snapshot.document,
-                )
-                revision = _SNAPSHOT_CONFIG_REVISION + config_snapshot.sha256
-            stage = "config_revision"
-            _log_start_preparation_stage(agent_id, stage, preparation_started)
-            store.replace_config_revision(
-                agent_id, _PENDING_CONFIG_REVISION, revision
-            )
-            _logger.info(
-                "start materialized runtime=%s revision=%s",
-                request.runtime,
-                revision,
-            )
-            if self._cancel_accepted_start(store, cancelled, agent_id):
-                return
-            with launch_cancellation(
-                lambda: cancelled.is_set() or store.has_pending_cancel(agent_id)
-            ):
-                if self._cancel_accepted_start(store, cancelled, agent_id):
-                    return
-                stage = "handoff"
-                _log_start_preparation_stage(agent_id, stage, preparation_started)
-                if not store.begin_supervisor_handoff(
-                    agent_id,
-                    startup_owner,
-                    at=self._now(),
-                    deadline_seconds=DEFAULT_STARTUP_HANDOFF_SECONDS,
-                ):
-                    _logger.warning("start agent_id=%s expired before supervisor spawn", agent_id)
-                    return
-                failure_kind = "supervisor_start_failed"
-                stage = "supervisor"
-                _log_start_preparation_stage(agent_id, stage, preparation_started)
-                self._launch(agent_id, request, adapter, plan, candidate_dir)
-            _logger.info("start agent_id=%s done", agent_id)
-        except BaseException as error:
-            if self._cancel_accepted_start(store, cancelled, agent_id):
-                return
-            _logger.warning(
-                "start agent_id=%s failed stage=%s elapsed_seconds=%.3f error_kind=%s",
-                agent_id,
-                stage,
-                time.monotonic() - preparation_started,
-                type(error).__name__,
-            )
-            self._fail_created_start(
-                agent_id, error, failure_kind, store=store
-            )
-
-    def _cancel_accepted_start(
-        self,
-        store: StateStore,
-        cancelled: threading.Event,
-        agent_id: AgentId,
-    ) -> bool:
-        """Commit pre-ownership cancellation when either signal is durable."""
-
-        if not cancelled.is_set() and not store.has_pending_cancel(agent_id):
-            return False
-        status = AgentStatus(str(store.get_agent(agent_id)["status"]))
-        if status in TERMINAL:
-            return True
-        if status not in {
-            AgentStatus.CREATED,
-            AgentStatus.STARTING,
-            AgentStatus.CANCELLING,
-        }:
-            return True
-        try:
-            store.transition(
-                agent_id,
-                AgentStatus.CANCELLED,
-                outcome=Outcome(AgentStatus.CANCELLED),
-                kind="start_cancelled",
-                at=self._now(),
-            )
-        except StateTransitionError:
-            if AgentStatus(str(store.get_agent(agent_id)["status"])) not in TERMINAL:
-                raise
-        return True
 
     def _fail_created_start(
         self,
@@ -1072,10 +657,9 @@ class AgentService:
         return self._delivery_view(validate_agent_id(agent_id), session_id)
 
     def cancel(self, agent_id: str | AgentId) -> AgentView:
-        """Persist cancellation before signalling a pre-ownership worker."""
+        """Persist cancellation for the owning supervisor to observe."""
 
         self._store.enqueue_command(agent_id, "cancel", {}, at=self._now())
-        self._starts.cancel(agent_id)
         _logger.info("cancel agent_id=%s", agent_id)
         return self.get(agent_id)
 
@@ -1094,8 +678,9 @@ class AgentService:
         latest node of its chain, be finished in a :data:`RESUMABLE
         <agent_run.state.start.RESUMABLE>` status, and have recorded a native
         runtime session. ``task`` is the new prompt and the only inherited
-        field that changes; ``timeout_seconds`` overrides the parent's when
-        given and inherits it when omitted. Everything else -- runtime, model,
+        field that changes; ``timeout_seconds`` overrides the parent's stored
+        compatibility value when given and inherits it when omitted, but never
+        stops runtime execution. Everything else -- runtime, model,
         profile, effort, fast, account, workdir, read roots, write right and
         output schema -- comes from the parent's persisted request, so config
         or default-account drift cannot silently redirect the continuation.
@@ -1132,67 +717,40 @@ class AgentService:
         request = inherited_request(
             row, snapshot, label, task, timeout_seconds, request_id, orchestrator
         )
+        profile = self._effective_profile(request, runtime)
+        runtime, role_plan = self._runtime_for_profile(
+            runtime,
+            profile,
+            label,
+            request.required_constraints,
+            request.runtime,
+        )
+        request = replace(
+            request,
+            write=role_plan.write,
+            read_roots=role_plan.read_roots,
+            required_constraints=role_plan.required_constraints,
+        )
         _logger.info(
             "resume parent_agent_id=%s runtime=%s request_id=%s",
             parent_id, runtime_name, request_id,
         )
-        adapter = self._registry.load(
-            request.runtime,
-            self._required_capabilities(request, runtime) | {Capability.RESUME},
-        )
-        adapter.validate(runtime)
         if request.model not in runtime.models:
             raise ValidationError(
                 f"model is no longer configured for runtime {request.runtime}: "
                 f"{request.model}"
             )
-        policy = self._admission_policy(request, runtime)
+        policy = self._policy_for_profile(request, runtime, profile)
         return self._admit(
             request,
             runtime,
             label,
             parent_agent_id=parent_id,
             policy=policy,
+            role_plan=role_plan,
         )
 
-    def chain(
-        self,
-        agent_id: str | AgentId,
-        *,
-        cursor: int | None = None,
-        limit: int = _SUMMARY_LIMIT,
-    ) -> ChainPage:
-        """Page one resume chain in chronological order.
 
-        ``agent_id`` may be any member of the chain; the whole chain is
-        returned regardless of which node was named. ``cursor`` is the 1-based
-        ``sequence`` to resume paging from, defaulting to the chain's first
-        agent, and ``limit`` bounds the page at :data:`_MAX_PAGE_SIZE`.
-
-        Returns a :class:`ChainPage` whose ``next_cursor`` is the sequence of
-        the first unreturned agent, or ``None`` when the page ends the chain.
-        Raises :class:`ValidationError` for a non-positive cursor or an
-        out-of-range limit.
-        """
-
-        start = 1 if cursor is None else cursor
-        if isinstance(start, bool) or not isinstance(start, int) or start < 1:
-            raise ValidationError("cursor must be a positive integer")
-        bounded = _page_limit(limit)
-        rows = self._store.resume_chain(agent_id, cursor=start, limit=bounded)
-        now = self._now()
-        selected = rows[:bounded]
-        projection = self._store.agent_projection(
-            str(row["id"]) for row in selected
-        )
-        items = tuple(
-            self._agent_view(row, now, projection[str(row["id"])])
-            for row in selected
-        )
-        next_cursor = (
-            int(rows[bounded]["sequence"]) if len(rows) > bounded else None
-        )
-        return ChainPage(items, start, bounded, next_cursor, next_cursor is None)
 
     def steer(self, agent_id: str | AgentId, text: str) -> CommandView:
         if not isinstance(text, str) or not text.strip():
@@ -1213,27 +771,47 @@ class AgentService:
         return self._agent_view(row, self._now(), projection[str(row["id"])])
 
     def list(self, query: AgentQuery = AgentQuery()) -> AgentPage:
+        """Return one consistent factual page, optionally waiting for revision."""
+
         if not isinstance(query, AgentQuery):
             raise ValidationError("query must be an AgentQuery")
+        deadline = time.monotonic() + query.wait_seconds
+        while True:
+            page = self._list_once(query)
+            if (
+                query.after_revision is None
+                or page.revision > query.after_revision
+                or time.monotonic() >= deadline
+            ):
+                return page
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def _list_once(self, query: AgentQuery) -> AgentPage:
+        """Read agents, projection, count, and event revision in one snapshot."""
+
         statuses = ACTIVE if query.active else None
-        session_id = (
-            None
-            if query.orchestrator is None
-            else self._store.find_orchestrator_session(query.orchestrator)
-        )
-        if query.orchestrator is not None and session_id is None:
-            return AgentPage((), 0, query.offset, query.limit, None, True)
-        rows = self._store.list_agents(
-            statuses=statuses,
-            orchestrator_session_id=session_id,
-            limit=query.limit,
-            offset=query.offset,
-        )
-        total = self._count_agents(statuses, session_id)
-        projection = self._store.agent_projection(str(row["id"]) for row in rows)
-        now = self._now()
+        connection = self._store.connection
+        connection.execute("BEGIN")
+        try:
+            revision = self._store.events_revision()
+            session_id = (
+                None
+                if query.orchestrator is None
+                else self._store.find_orchestrator_session(query.orchestrator)
+            )
+            rows = [] if query.orchestrator is not None and session_id is None else self._store.list_agents(
+                statuses=statuses,
+                orchestrator_session_id=session_id,
+                limit=query.limit,
+                offset=query.offset,
+            )
+            total = 0 if query.orchestrator is not None and session_id is None else self._count_agents(statuses, session_id)
+            projection = self._store.agent_projection(str(row["id"]) for row in rows)
+        finally:
+            connection.rollback()
+        observed_at = self._now()
         items = tuple(
-            self._agent_view(row, now, projection[str(row["id"])]) for row in rows
+            self._agent_view(row, observed_at, projection[str(row["id"])]) for row in rows
         )
         consumed = query.offset + len(items)
         complete = consumed >= total
@@ -1244,33 +822,11 @@ class AgentService:
             query.limit,
             None if complete else consumed,
             complete,
+            revision,
+            observed_at,
         )
 
-    def list_orchestrators(self, *, limit: int = 100) -> OrchestratorPage:
-        """Return up to ``limit`` session aggregates, ordered by activity.
 
-        ``limit`` must be a positive integer no greater than 1000.  The page
-        includes bound sessions with agents and, when applicable, one null-ID
-        aggregate for unbound agents; no state is changed.
-        """
-
-        _page_limit(limit)
-        rows = self._store.list_orchestrator_sessions(limit=limit)
-        total = 0 if not rows else int(rows[0]["page_total"])
-        items = tuple(
-            OrchestratorView(
-                None if row["id"] is None else str(row["id"]),
-                str(row["transport"]),
-                str(row["external_session_id"]),
-                None if row["external_turn_id"] is None else str(row["external_turn_id"]),
-                float(row["created_at"]),
-                float(row["last_seen_at"]),
-                int(row["active"]),
-                int(row["total"]),
-            )
-            for row in rows
-        )
-        return OrchestratorPage(items, total, limit, len(items) == total)
 
     def transcript(
         self, agent_id: str | AgentId, cursor: int = 0, limit: int = 200
@@ -1369,27 +925,11 @@ class AgentService:
             proof_version,
         )
 
-    def summary(
-        self,
-        *,
-        agent_id: str | AgentId | None = None,
-        orchestrator: OrchestratorRef | None = None,
-    ) -> WorkSummary:
-        if (agent_id is None) == (orchestrator is None):
-            raise ValidationError("summary requires exactly one of agent_id or orchestrator")
-        if agent_id is not None:
-            agent = self.get(agent_id)
-            return WorkSummary("agent", agent.agent_id, None, (agent,), 1, True)
-        if not isinstance(orchestrator, OrchestratorRef):
-            raise ValidationError("orchestrator must be an OrchestratorRef")
-        page = self.list(
-            AgentQuery(active=True, orchestrator=orchestrator, limit=_SUMMARY_LIMIT)
-        )
-        return WorkSummary(
-            "orchestrator", None, orchestrator, page.items, page.total, page.complete
-        )
+
 
     def models(self) -> Mapping[str, RuntimeModels]:
+        """Return current enabled runtime rosters with capability and health facts."""
+
         result: dict[str, RuntimeModels] = {}
         for name in sorted(self._config.runtimes):
             runtime = self._config.runtimes[name]
@@ -1411,40 +951,21 @@ class AgentService:
             reason = health.reason
             if not roster and reason is None:
                 reason = "roster empty"
-            _logger.debug(
-                "models runtime=%s available=%s count=%d reason=%s",
-                name, available, len(roster), reason,
-            )
             result[name] = RuntimeModels(roster, capabilities, available, reason)
-        _logger.info("models runtimes=%d", len(result))
         return MappingProxyType(result)
 
     def limits(self) -> CapacityReport:
+        """Return enabled runtimes' current fresh readings without projections."""
+
         observed_at = self._now()
         enabled = {
             name for name, runtime in self._config.runtimes.items() if runtime.enabled
         }
-        series = tuple(
-            item
-            for item in load_series(
-                self._store, retention=self._config.capacity.sample_retention
-            )
-            if item.key.runtime in enabled
+        snapshot = build_capacity_routes(self._store, now=observed_at)
+        return CapacityReport(
+            observed_at,
+            tuple(item for item in snapshot.readings if item.key.runtime in enabled),
         )
-        items = build_advice(build_forecasts(series, now=observed_at))
-        ordered = tuple(
-            sorted(
-                items,
-                key=lambda item: (
-                    item.key.runtime,
-                    item.key.lane,
-                    item.key.window,
-                    item.key.target or "",
-                    item.key.source,
-                ),
-            )
-        )
-        return CapacityReport(observed_at, ordered)
 
     def capacity_order(self) -> CapacityOrder:
         """Return enabled runtimes' deterministic capacity routing order.
@@ -1459,17 +980,15 @@ class AgentService:
         return build_capacity_order(self._store, self._config, now=self._now())
 
     def resolve_account(self, runtime: str, account: str | None) -> str | None:
-        """Return a configured account label (str), or None for an unlabelled run.
+        """Return an explicit account label or ``None`` for native global auth.
 
-        ``runtime`` is a configured runtime-name str; ``account`` is an explicit
-        label str or None to use its configured default. Raise ValidationError
-        for an unknown runtime, undeclared explicit label, or invalid default.
-        This lookup performs no I/O and does not mutate configuration.
+        ``default_account`` is ignored as a readable legacy declaration. An
+        explicit label must remain declared; lookup performs no credential I/O.
         """
         config = self._runtime_config(runtime)
         if account is not None and not config.accounts:
             raise ValidationError(f"runtime {runtime} declares no accounts")
-        label = account if account is not None else config.default_account
+        label = account
         if label is not None and label not in config.accounts:
             known = ", ".join(config.accounts) or "none"
             raise ValidationError(
@@ -1493,31 +1012,52 @@ class AgentService:
         except KeyError as error:
             raise ValidationError(f"runtime is not configured: {name}") from error
 
-    def _mcp_servers(self, runtime: RuntimeConfig) -> Mapping[str, McpConfig]:
-        try:
-            return MappingProxyType(
-                {name: self._config.mcp[name] for name in runtime.mcp}
-            )
-        except KeyError as error:
-            raise ValidationError(
-                f"runtime references unknown MCP server: {error.args[0]}"
-            ) from error
-
     def _effective_profile(
         self, request: StartRequest, runtime: RuntimeConfig
     ) -> AgentProfile:
-        """Load and role-assign the exact profile used for policy and launch."""
+        """Load the exact complete role or legacy compatibility profile."""
 
-        return assign_role(
-            load_profile(
-                self._config.profiles,
-                request.profile,
-                requested_write=request.write,
-                read_roots=request.read_roots,
-            ),
-            request.runtime,
-            runtime.skills,
+        del runtime
+        return load_profile(
+            self._config.profiles,
+            request.profile,
+            requested_write=request.write,
+            read_roots=request.read_roots,
         )
+
+    def _runtime_for_profile(
+        self,
+        runtime: RuntimeConfig,
+        profile: AgentProfile,
+        account_label: str | None,
+        required_constraints: frozenset[Constraint],
+        runtime_name: str,
+    ) -> tuple[RuntimeConfig, ResolvedRolePlan]:
+        """Resolve legacy or canonical input once into one adapter role plan."""
+
+        skills_root = self._config.skills_directory
+        if profile.canonical and (runtime.skills or runtime.mcp):
+            raise ValidationError(
+                "canonical role cannot be mixed with runtime skills or MCP declarations"
+            )
+        if not profile.canonical:
+            skills_root = runtime_skills_dir(runtime_name, self._home)
+            profile = replace(
+                profile,
+                revision="legacy",
+                skills=runtime.skills,
+                mcp=runtime.mcp,
+                required_constraints=required_constraints,
+                canonical=True,
+            )
+        role_plan = resolve_role_plan(
+            profile,
+            skills_root=skills_root,
+            mcp_catalog=self._config.mcp,
+            auth_mode="global" if account_label is None else "account",
+            auth_reference=account_label,
+        )
+        return replace(runtime, skills=profile.skills, mcp=profile.mcp), role_plan
 
     @staticmethod
     def _policy_capabilities(
@@ -1560,7 +1100,11 @@ class AgentService:
             request.runtime,
             sys.platform,
             self._policy_capabilities(request.runtime, runtime),
-            required=request.required_constraints,
+            required=(
+                profile.required_constraints
+                if profile.canonical
+                else request.required_constraints
+            ),
         )
         decision = admission_decision(policy)
         if not decision.allowed:
@@ -1656,6 +1200,35 @@ class AgentService:
             None if row["answer_sha256"] is None else str(row["answer_sha256"])
         )
         cleanup = self._cleanup_view(projection["cleanup_json"])
+        phase = "accepted"
+        phase_started_at = created_at
+        if status in TERMINAL:
+            phase = "terminal"
+            phase_started_at = finished_at or created_at
+        elif status is AgentStatus.CANCELLING:
+            phase = "stopping"
+            phase_started_at = started_at or created_at
+        elif status is AgentStatus.RUNNING:
+            phase = "running"
+            phase_started_at = started_at or created_at
+        elif projection["phase_json"] is not None:
+            try:
+                phase_payload = json.loads(str(projection["phase_json"]))
+            except ValueError:
+                phase_payload = None
+            candidate = phase_payload.get("phase") if isinstance(phase_payload, dict) else None
+            if candidate in {"preparing", "spawning"}:
+                phase = candidate
+                phase_started_at = float(projection["phase_started_at"])
+        supervisor_pid = row["supervisor_pid"]
+        if supervisor_pid is None:
+            process_state = "not_started"
+        else:
+            birth = row["supervisor_birth_time"]
+            process_state = observe_process(
+                int(supervisor_pid),
+                None if birth is None else float(birth),
+            ).state.value
         return AgentView(
             agent_id,
             str(row["runtime"]),
@@ -1690,6 +1263,12 @@ class AgentService:
             int(row["sequence"]),
             cleanup,
             _policy_from_identity(row["identity_json"]),
+            phase,
+            phase_started_at,
+            process_state,
+            now,
+            status.value if status in TERMINAL else None,
+            "pending",
         )
 
     def _delivery_view(

@@ -52,7 +52,8 @@ Capacity/limits data is only as fresh as its source last reported:
   recent run, then age out to unknown rather than showing stale numbers.
 
 An "unknown" limit is the system being honest about missing data, not a
-bug to chase.
+bug to chase. `agent-run limits` returns only current fresh readings; it has no
+history, forecast, burn, risk, or advice fields.
 
 ## Delivery binding
 
@@ -63,7 +64,8 @@ cause of "the agent ran but never delivered a result back."
 
 ## Delivery attempt evidence
 
-When relay-backed Codex delivery retries or fails, inspect `status.delivery.last_attempt`.
+When relay-backed Codex delivery retries or fails, inspect
+`agent-run delivery status <agent-id>` and its `last_attempt`.
 `classifier`, `returncode`, `spawn_errno`, `error_class`, and `duration_ms`
 separate relay unavailability, rejection, ambiguous post-write acceptance,
 and success. `codex_queue` is only a compatibility binding name: completion

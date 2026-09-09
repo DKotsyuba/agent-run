@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import site
 import subprocess
@@ -15,18 +16,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.adapters.base import LaunchPlan
-from agent_run.domain import AgentStatus, StartRequest
+from agent_run.domain import TERMINAL, AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.launch import launch_detached
-from agent_run.paths import create_agent_dir, state_db_path
+from agent_run.paths import agent_dir, state_db_path
+from agent_run.preparation import PENDING_CONFIG_REVISION, request_payload
 from agent_run.state.store import StateStore
 from agent_run.verify import DEFAULT_SENTINEL
 
+from tests.stub_engine_adapter import SECRET
 from tests.test_launch import child_pythonpath
-
-
-ENGINE = r'printf "%s\n%s\n" "$STUB_SECRET" "$STUB_SENTINEL" > "$1"'
-SECRET = "opencode-server-password-2f7c"
 LAUNCH_ROUNDS = 10
 
 
@@ -95,39 +94,51 @@ class SupervisorMainTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.environment = dict(os.environ)
         self.environment["PYTHONPATH"] = child_pythonpath()
-
-    def create_agent(self, sleep_seconds: float = 0.0) -> tuple[str, Path, LaunchPlan]:
-        agent_id = self.store.create_agent(
-            StartRequest(
-                "fake", "model", "profile", "task", self.workdir, timeout_seconds=60
-            ),
-            task_summary="task",
-            config_revision="rev-1",
-        ).agent_id
-        directory = create_agent_dir(agent_id, self.home)
-        answer_path = directory / "answer.md"
-        script = ENGINE if sleep_seconds <= 0 else f"{ENGINE}; sleep {sleep_seconds}"
-        plan = LaunchPlan(
-            ("/bin/sh", "-c", script, "sh", str(answer_path)),
-            self.workdir,
-            {"STUB_SECRET": SECRET, "STUB_SENTINEL": DEFAULT_SENTINEL},
-            None,
-            directory / "runtime.jsonl",
-            {},
-            answer_path,
+        self.role_payload = json.loads(
+            (Path(__file__).parent / "fixtures" / "role_plan_7bbd43b.json").read_text(
+                encoding="utf-8"
+            )
         )
-        return str(agent_id), directory, plan
 
-    def payload(self, agent_id: str, directory: Path, plan: LaunchPlan) -> dict:
+    def create_agent(
+        self,
+        sleep_seconds: float = 0.0,
+        *,
+        runtime: str = "fake",
+    ) -> tuple[str, Path, StartRequest]:
+        """Create one admitted fixture and its matching supervisor request.
+
+        The sleep_seconds value controls the deterministic stub engine duration,
+        while runtime may select an intentionally missing runtime for failure tests.
+        """
+
+        request = StartRequest(
+            runtime,
+            "model",
+            "profile",
+            str(sleep_seconds),
+            self.workdir,
+            timeout_seconds=60,
+        )
+        agent_id = self.store.create_agent_limited(
+            request,
+            task_summary="task",
+            config_revision=PENDING_CONFIG_REVISION,
+            global_limit=LAUNCH_ROUNDS,
+            runtime_limit=LAUNCH_ROUNDS,
+            identity_json="{}",
+        ).agent_id
+        directory = agent_dir(agent_id, self.home)
+        return str(agent_id), directory, request
+
+    def payload(self, agent_id: str, request: StartRequest) -> dict[str, object]:
+        """Serialize one admitted request and canonical role for the supervisor."""
+
         return {
             "agent_id": agent_id,
             "home": str(self.home),
-            "runtime": "fake",
-            "timeout_seconds": 60.0,
-            "answer_path": str(directory / "answer.md"),
-            "agent_dir": str(directory),
-            "warning_fraction": 0.9,
-            "plan": plan.to_payload(),
+            "request": request_payload(request),
+            "role": self.role_payload,
         }
 
     def launch(self, payload: dict, *, executable: str | None = None, **kwargs) -> int:
@@ -175,11 +186,16 @@ class SupervisorMainTests(unittest.TestCase):
 
     def test_ten_consecutive_exec_launches_all_land_durably(self) -> None:
         for round_number in range(LAUNCH_ROUNDS):
-            agent_id, directory, plan = self.create_agent()
-            pid = self.launch(self.payload(agent_id, directory, plan))
+            agent_id, directory, request = self.create_agent()
+            pid = self.launch(self.payload(agent_id, request))
             self.wait_for(
-                lambda agent=agent_id: self.status(agent) is AgentStatus.SUCCEEDED,
+                lambda agent=agent_id: self.status(agent) in TERMINAL,
                 timeout=20.0,
+            )
+            self.assertIs(
+                self.status(agent_id),
+                AgentStatus.SUCCEEDED,
+                f"round {round_number}",
             )
             self.wait_for(lambda child=pid: not self.alive(child))
             row = self.store.get_agent(agent_id)
@@ -203,11 +219,11 @@ class SupervisorMainTests(unittest.TestCase):
         # own Resources/Python.app binary, so `ps -o command=` reports a
         # path that never appears in the argv passed to exec -- exactly the
         # hazard that broke reconciliation on the release venv.
-        agent_id, directory, plan = self.create_agent(sleep_seconds=1.5)
+        agent_id, directory, request = self.create_agent(sleep_seconds=1.5)
         symlink = Path(self.temporary.name) / "python-symlink"
         symlink.symlink_to(framework_python)
         self.environment["PYTHONPATH"] = _dependency_pythonpath()
-        pid = self.launch(self.payload(agent_id, directory, plan), executable=str(symlink))
+        pid = self.launch(self.payload(agent_id, request), executable=str(symlink))
         self.wait_for(lambda: self.status(agent_id) is AgentStatus.RUNNING)
 
         recorded = str(self.store.get_agent(agent_id)["supervisor_identity"])
@@ -255,13 +271,19 @@ class SupervisorMainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "must be a mapping"):
             LaunchPlan.from_payload("nope")
 
-    def test_unknown_runtime_fails_closed_before_ready(self) -> None:
-        agent_id, directory, plan = self.create_agent()
-        payload = self.payload(agent_id, directory, plan)
-        payload["runtime"] = "missing"
-        with self.assertRaisesRegex(ValidationError, "runtime is not configured"):
-            self.launch(payload)
-        self.assertIs(self.status(agent_id), AgentStatus.CREATED)
+    def test_unknown_runtime_fails_durably_after_ready(self) -> None:
+        """Own the process before persisting an unknown-runtime preparation failure."""
+
+        agent_id, directory, request = self.create_agent(runtime="missing")
+        pid = self.launch(self.payload(agent_id, request))
+        self.wait_for(lambda: self.status(agent_id) in TERMINAL)
+        self.assertIs(self.status(agent_id), AgentStatus.FAILED)
+        self.wait_for(lambda: not self.alive(pid))
+        row = self.store.get_agent(agent_id)
+        self.assertEqual(row["failure_kind"], "prepare_runtime_failed")
+        self.assertEqual(row["failure_text"], "runtime is not configured: missing")
+        self.assertEqual(len(self.events(agent_id, "prepare_runtime_failed")), 1)
+        self.assertFalse((directory / "answer.md").exists())
 
     def test_malformed_payload_exits_nonzero_with_a_ready_failure(self) -> None:
         token, code = self.run_entrypoint(b"{not json")

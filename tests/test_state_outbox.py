@@ -354,29 +354,7 @@ class StateOutboxTests(unittest.TestCase):
             )
         )
 
-    def test_capacity_samples_return_only_recent_matching_rows(self) -> None:
-        self.store.insert_capacity_sample(
-            runtime="codex",
-            lane="main",
-            window="five-hour",
-            source="runtime",
-            remaining_percent=10,
-            observed_at=1,
-            valid_until=5,
-            payload={"stale": True},
-        )
-        recent_id = self.store.insert_capacity_sample(
-            runtime="codex",
-            lane="main",
-            window="five-hour",
-            source="runtime",
-            remaining_percent=80,
-            observed_at=9,
-            valid_until=20,
-            payload={"stale": False},
-        )
-        rows = self.store.recent_capacity_samples(at=10, runtime="codex")
-        self.assertEqual([row["id"] for row in rows], [recent_id])
+
 
     def test_reaped_supervisor_reconciles_only_its_active_rows(self) -> None:
         dead = self.create()
@@ -541,33 +519,6 @@ class StateOutboxTests(unittest.TestCase):
         self.assertEqual(self.store.get_agent(second)["status"], "lost")
 
 
-    def test_capacity_retention_is_global_deterministic_and_keeps_expired_rows(self) -> None:
-        first = self.store.insert_capacity_sample(
-            runtime="codex", lane="requests", window="5h", source="one",
-            payload={}, observed_at=1, valid_until=1,
-        )
-        second = self.store.insert_capacity_sample(
-            runtime="claude", lane="tokens", window="daily", source="two",
-            payload={}, observed_at=2, valid_until=1,
-        )
-        third = self.store.insert_capacity_sample(
-            runtime="opencode", lane="requests", window="weekly", source="three",
-            payload={}, observed_at=2, valid_until=1,
-        )
-
-        rows = self.store.capacity_sample_history(retention=2)
-        self.assertEqual([row["id"] for row in rows], [third, second])
-        self.assertEqual(self.store.prune_capacity_samples(2), 1)
-        self.assertEqual(
-            [row["id"] for row in self.store.capacity_sample_history(retention=10)],
-            [third, second],
-        )
-        self.assertNotIn(first, {row["id"] for row in rows})
-        for retention in (True, 0, 1.5):
-            with self.subTest(retention=retention), self.assertRaisesRegex(
-                ValidationError, "positive integer"
-            ):
-                self.store.prune_capacity_samples(retention)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

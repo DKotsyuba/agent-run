@@ -1,5 +1,3 @@
-import io
-import json
 import sys
 import tempfile
 import unittest
@@ -7,7 +5,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent_run import cli
 from agent_run.domain import AgentStatus, Outcome, StartRequest
 from agent_run.state.run_stats import backfill_run_stats, record_run_stats
 from agent_run.state.store import StateStore
@@ -273,37 +270,6 @@ class RunStatsTests(unittest.TestCase):
         )
 
 
-class CliStatsBackfillTests(unittest.TestCase):
-    def test_stats_backfill_verb_prints_counts_and_is_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory).resolve()
-            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
-            store = StateStore.initialize(home / "state.db")
-            try:
-                agent_id = store.create_agent(
-                    StartRequest("claude", "model", "profile", "task", home,
-                                 timeout_seconds=480),
-                    task_summary="task",
-                    config_revision="rev-1",
-                ).agent_id
-                store.append_event(
-                    agent_id, "runtime_result", data=_RUNTIME_RESULT_PAYLOAD
-                )
-            finally:
-                store.close()
-
-            def run():
-                stdout = io.StringIO()
-                code = cli.main(
-                    ["--home", str(home), "stats", "backfill"],
-                    stdin=io.StringIO(),
-                    stdout=stdout,
-                    stderr=io.StringIO(),
-                )
-                return code, json.loads(stdout.getvalue())
-
-            self.assertEqual(run(), (0, {"backfilled": 1, "skipped": 0}))
-            self.assertEqual(run(), (0, {"backfilled": 0, "skipped": 0}))
 
 
 if __name__ == "__main__":

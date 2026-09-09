@@ -15,6 +15,8 @@ from typing import Callable
 from .config import Config, RuntimeConfig, load_config
 from .adapters.home import managed_uv_python_environment
 from .errors import AgentRunError, SchemaMigrationRequired
+from .profiles import load_profile
+from .role_plan import resolve_role_plan
 from .launch import launch_detached
 from .launch_evidence import SupervisorBootstrapError
 from .paths import config_path, state_db_path
@@ -25,12 +27,6 @@ _LIMIT = 256
 _SECRET = re.compile(
     r"(?i)^\s*[\w.-]*(?:secret|token|password|api[_-]?key)[\w.-]*\s*="
 )
-_MARKERS = {
-    "codex": "config.toml",
-    "claude": "settings.json",
-    "qwen": ".qwen/settings.json",
-    "glm": "settings.json",
-}
 #: Runtimes whose environment auth also has a macOS keychain item the adapter
 #: falls back to when the variable is unset. Maps the config runtime name to
 #: the ``(service, account)`` pair the item is stored under; an ``account`` of
@@ -146,10 +142,13 @@ def _plaintext_secrets(path: Path, findings: list[DoctorFinding]) -> None:
 def _configuration(
     config: Config, path: Path, root: Path, findings: list[DoctorFinding]
 ) -> None:
-    modified = path.stat().st_mtime
+    """Append bounded runtime, role, MCP, hook, and auth readiness findings."""
+
+    del path
     for name, server in sorted(config.mcp.items())[:_LIMIT]:
         if not _executable(server.command):
             _add(findings, "mcp_executable_missing", "error", f"mcp:{name}", str(server.command))
+    canonical_roles = _roles(config, findings)
     trusted = (root, (root / "standalone" / "current").resolve())
     for name, runtime in sorted(config.runtimes.items())[:_LIMIT]:
         if not runtime.enabled:
@@ -157,17 +156,86 @@ def _configuration(
         component = f"runtime:{name}"
         if not _executable(runtime.binary):
             _add(findings, "runtime_binary_missing", "error", component, str(runtime.binary))
-        if not runtime.home.is_dir():
-            _add(findings, "runtime_home_missing", "error", component, str(runtime.home))
-        else:
-            marker = runtime.home / _MARKERS.get(name, "")
-            if not marker.is_file():
-                _add(findings, "runtime_home_unsupported", "error", component, str(marker))
-            elif marker.stat().st_mtime < modified:
-                _add(findings, "runtime_home_stale", "warning", component, str(marker))
-        _skills(root, name, runtime, findings)
+        if canonical_roles and (runtime.skills or runtime.mcp):
+            _add(
+                findings,
+                "mixed_role_assets",
+                "error",
+                component,
+                "canonical roles cannot be mixed with runtime skills or MCP lists",
+            )
+        elif not canonical_roles:
+            _skills(root, name, runtime, findings)
+        if runtime.rust is not None or runtime.environment is not None:
+            _add(
+                findings,
+                "legacy_environment_config",
+                "warning",
+                component,
+                "legacy environment/toolchain declarations are not used for readiness",
+            )
+        if runtime.default_account is not None:
+            _add(
+                findings,
+                "legacy_default_account",
+                "warning",
+                component,
+                "default_account is ignored; omit account for native global auth",
+            )
         _hooks(runtime, component, trusted, findings)
         _auth(name, runtime, component, findings)
+
+
+def _roles(config: Config, findings: list[DoctorFinding]) -> bool:
+    """Validate canonical role files and return whether the catalog uses them."""
+
+    directory = config.profiles.directory
+    try:
+        paths = sorted(directory.glob("*.md"))[:_LIMIT]
+    except OSError:
+        paths = []
+    if not directory.is_dir():
+        _add(
+            findings,
+            "profile_directory_missing",
+            "error",
+            "profiles",
+            str(directory),
+        )
+        return False
+    canonical = False
+    legacy = False
+    skill_revisions: dict[Path, str] = {}
+    for path in paths:
+        try:
+            profile = load_profile(config.profiles, path.stem)
+            if profile.canonical:
+                canonical = True
+                resolve_role_plan(
+                    profile,
+                    skills_root=config.skills_directory,
+                    mcp_catalog=config.mcp,
+                    skill_revision_cache=skill_revisions,
+                )
+            else:
+                legacy = True
+        except AgentRunError as error:
+            _add(
+                findings,
+                "role_invalid",
+                "error",
+                f"profile:{path.stem}",
+                str(error),
+            )
+    if canonical and legacy:
+        _add(
+            findings,
+            "mixed_role_catalog",
+            "error",
+            "profiles",
+            "canonical and legacy profiles cannot be mixed",
+        )
+    return canonical
 
 
 def _skills(root: Path, name: str, runtime: RuntimeConfig, findings) -> None:
@@ -360,30 +428,12 @@ def _keychain_present(name: str) -> bool:
 
 
 def _capacity(config: Config, rows, at: float, findings) -> None:
-    """Flag capacity identities whose newest sample no longer describes now.
+    """Flag current capacity scopes whose explicit validity has expired."""
 
-    A sample that carries its own ``valid_until`` is judged only by it: a
-    still-future ``valid_until`` is never stale (sources stamp their own
-    validity window, which can be far longer than the collection interval),
-    and a past one is always stale. Only a sample without ``valid_until``
-    falls back to the age bound of twice the configured collection interval.
-    ``rows`` are the snapshot's capacity samples; ``at`` is the check time in
-    epoch seconds.
-    """
-
-    latest = {}
+    del config
     for row in rows:
-        key = tuple(row[name] for name in ("runtime", "lane", "window", "target", "source"))
-        latest.setdefault(key, row)
-    stale_after = max(1, config.capacity.collect_interval_seconds) * 2
-    for key, row in latest.items():
-        valid_until = row["valid_until"]
-        if valid_until is not None:
-            stale = float(valid_until) < at
-        else:
-            stale = at - float(row["observed_at"]) > stale_after
-        if stale:
-            _add(findings, "capacity_stale", "warning", f"capacity:{key[0]}", "/".join(str(x or "-") for x in key[1:]))
+        if float(row["valid_until"]) < at:
+            _add(findings, "capacity_stale", "warning", f"capacity:{row['runtime']}", str(row["scope_id"]))
 
 
 def _supervisors(rows, probe: ProcessProbe, findings) -> None:

@@ -253,6 +253,7 @@ class ClaudeSession:
             try:
                 os.killpg(self._owned_process_group, 0)
             except ProcessLookupError:
+                self._wait_cancelled_leader()
                 return
             except OSError:
                 break
@@ -261,6 +262,13 @@ class ClaudeSession:
             os.killpg(self._owned_process_group, signal.SIGKILL)
         except OSError:
             pass
+        self._wait_cancelled_leader()
+
+    def _wait_cancelled_leader(self) -> None:
+        """Reap the cancelled leader for a bounded interval after group death."""
+
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self._process.wait(timeout=0.5)
 
     def _stop_process(self) -> None:
         """End a child that stayed alive after producing its terminal result."""

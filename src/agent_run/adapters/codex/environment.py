@@ -19,8 +19,8 @@ from pathlib import Path
 from ...config import McpConfig, RuntimeConfig
 from ...errors import ValidationError
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
-from ..developer_environment import developer_environment
-from ..home import managed_uv_python_environment, write_managed_file
+from ..environment import host_environment
+from ..home import write_managed_file
 
 
 def resolved_directory(value: object, label: str) -> Path:
@@ -51,6 +51,26 @@ def bridge_points_at_source(bridge: Path, source: Path | None) -> bool:
         return False
 
 
+def auth_bridge(config: RuntimeConfig) -> tuple[Path, str] | None:
+    """Return the selected Codex auth source and generated-home target.
+
+    Explicit file-link declarations are validated. Without one, the host
+    ``CODEX_HOME`` or ``~/.codex/auth.json`` is used when it exists; a missing
+    native account returns ``None`` without reading credential bytes.
+    """
+
+    if config.auth is None:
+        configured = os.environ.get("CODEX_HOME")
+        root = Path(configured).expanduser() if configured else Path.home() / ".codex"
+        source = root / "auth.json"
+        return (source, "auth.json") if source.is_file() else None
+    if config.auth.source is None:
+        raise ValidationError("codex file_link auth source is missing")
+    if config.auth.target is None:
+        raise ValidationError("codex file_link auth target is missing")
+    return config.auth.source, config.auth.target
+
+
 def require_resolved_mcp(
     config: RuntimeConfig, mcp_servers: Mapping[str, McpConfig], where: str
 ) -> None:
@@ -67,25 +87,15 @@ def require_resolved_mcp(
             raise ValidationError(f"codex mcp reference is not resolved: {name}")
 
 
-def build_environment(binary: Path, home: Path) -> dict[str, str]:
-    """Return the fully replaced environment for one Codex child process.
+def build_environment(
+    binary: Path, home: Path, *, allowed_secret_names: tuple[str, ...] = ()
+) -> dict[str, str]:
+    """Return the inherited host environment for one Codex child process.
 
-    ``binary`` is the configured Codex executable and must be absolute, so a
-    child never depends on the collector's working directory; its parent
-    directory is prefixed to ``PATH`` verbatim, without resolving symlinks, so
-    a version-managed layout (nvm, Homebrew Cellar) keeps working without this
-    module hard-coding a Node or package version.  ``home`` is the runtime home
-    that owns the child's state -- either the base runtime home or one
-    account-specific home -- and both ``HOME`` and ``CODEX_HOME`` point at it;
-    no other variable is copied from the collector, except uv's existing
-    managed-install root when present, so managed Python remains discoverable
-    after ``HOME`` is replaced.
-
-    ``PATH`` preserves the inherited entries in their original order and
-    deduplicates them, so repeated launches cannot inflate the value, and it
-    never contains an empty entry, which ``exec`` would read as the current
-    directory. Nonempty ``os.defpath`` entries follow as fallback paths;
-    a missing or blank inherited ``PATH`` contributes no entries.
+    ``binary`` must be absolute. ``home`` replaces only ``HOME`` and
+    ``CODEX_HOME`` so generated Codex configuration stays separate. PATH,
+    locales, SDKs and toolchains come from the service host. Credential-shaped
+    variables are inherited only when ``allowed_secret_names`` selected them.
 
     Raises:
         ValidationError: If ``binary`` is not an absolute path.
@@ -95,24 +105,16 @@ def build_environment(binary: Path, home: Path) -> dict[str, str]:
     if not executable.is_absolute():
         raise ValidationError(f"codex binary must be an absolute path: {binary}")
     home_text = str(home)
-    return {
-        "CODEX_HOME": home_text,
-        "HOME": home_text,
-        "PATH": _child_path(str(executable.parent)),
-        **managed_uv_python_environment(),
-    }
+    return host_environment(
+        {"CODEX_HOME": home_text, "HOME": home_text},
+        allowed_secret_names=allowed_secret_names,
+    )
 
 
-def developer_config_lines(config: RuntimeConfig) -> tuple[str, ...]:
-    """Return native config lines needed by a selected developer environment."""
+def approval_fields(write: bool) -> dict[str, str | None]:
+    """Return approval settings for the effective write grant."""
 
-    return ("allow_login_shell = false", "") if config.environment is not None else ()
-
-
-def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, str | None]:
-    """Return the retained-review policy for a write-capable developer run."""
-
-    if write and config.environment is not None:
+    if write:
         return {"approval_policy": "on-request", "approvals_reviewer": "auto_review"}
     return {"approval_policy": "never", "approvals_reviewer": None}
 
@@ -120,20 +122,22 @@ def developer_approval_fields(config: RuntimeConfig, write: bool) -> dict[str, s
 def prepared_environment(
     binary: Path,
     home: Path,
-    config: RuntimeConfig,
-    workdir: Path,
     *,
+    mcp_environment_names: tuple[str, ...] = (),
+    denied_commands: tuple[str, ...] = (),
     refresh: bool = True,
 ) -> dict[str, str]:
     """Return the Codex child environment with its managed command policy.
 
-    The selected developer environment augments the isolated Codex baseline.
-    Private refusal shims lead ``PATH`` for normal shell lookup, while native
-    ``.rules`` also deny each bare command and resolved executable path.
+    ``mcp_environment_names`` may cross the credential filter. Optional legacy
+    command denials remain active during config migration.
     """
 
-    environment = developer_environment(build_environment(binary, home), config, workdir)
-    denied_commands = config.environment.denied_commands if config.environment is not None else ()
+    environment = build_environment(
+        binary, home, allowed_secret_names=mcp_environment_names
+    )
+    if not denied_commands:
+        return environment
     policy_directory = home / "command-refusals"
     if refresh:
         command_policy = materialize_refusal_commands(
@@ -184,21 +188,3 @@ def thread_grant_params(
     if approvals_reviewer is not None:
         params["approvalsReviewer"] = approvals_reviewer
     return params
-
-
-def _child_path(launcher_directory: str) -> str:
-    """Return the child ``PATH`` with ``launcher_directory`` leading.
-
-    Inherited ``PATH`` entries follow in first-seen order, then the nonempty
-    ``os.defpath`` entries as fallback paths.
-    Duplicate and empty entries are dropped; the launcher directory is kept
-    even when the inherited path already contains it, so the executable's own
-    package always wins resolution order.
-    """
-
-    entries: list[str] = []
-    for candidate in (launcher_directory, os.environ.get("PATH"), os.defpath):
-        for entry in (candidate or "").split(os.pathsep):
-            if entry and entry not in entries:
-                entries.append(entry)
-    return os.pathsep.join(entries)

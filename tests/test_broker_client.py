@@ -72,8 +72,8 @@ class BrokerClientTests(unittest.TestCase):
         self.addCleanup(server.close)
         client = BrokerClient(self.path)
         self.addCleanup(client.close)
-        self.assertEqual(client.call("limits", {"x": 1}), {"value": {"x": 1}})
-        self.assertEqual(client.call("status", {"x": 2}), {"value": {"x": 2}})
+        self.assertEqual(client.call("capacity_order", {"x": 1}), {"value": {"x": 1}})
+        self.assertEqual(client.call("answer", {"x": 2}), {"value": {"x": 2}})
         self.assertEqual([item["id"] for item in seen], [1, 2])
 
     def test_start_serializes_request_and_rejects_malformed_results(self):
@@ -129,11 +129,11 @@ class BrokerClientTests(unittest.TestCase):
         second = FakeSocketApi(self.path, lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": {"restarted": True}})
         second.start()
         self.addCleanup(second.close)
-        self.assertEqual(client.call("limits"), {"restarted": True})
+        self.assertEqual(client.call("capacity_order"), {"restarted": True})
 
     def test_unavailable_has_actionable_message(self):
         with self.assertRaisesRegex(BrokerUnavailable, "agent-run broker is not running"):
-            BrokerClient(self.path).call("limits")
+            BrokerClient(self.path).call("capacity_order")
 
     def test_invalid_deadlines_are_rejected_before_socket_creation(self) -> None:
         """Nonpositive and nonfinite client deadlines never reach transport."""
@@ -143,7 +143,7 @@ class BrokerClientTests(unittest.TestCase):
                 "agent_run.broker_client.socket.socket"
             ) as socket_factory:
                 with self.assertRaisesRegex(ValidationError, "positive and finite"):
-                    BrokerClient(self.path).call("limits", timeout=value)
+                    BrokerClient(self.path).call("capacity_order", timeout=value)
                 socket_factory.assert_not_called()
 
     def test_validation_error_mapping(self):
@@ -153,7 +153,7 @@ class BrokerClientTests(unittest.TestCase):
         server.start()
         self.addCleanup(server.close)
         with self.assertRaisesRegex(ValidationError, "bad params"):
-            BrokerClient(self.path).call("limits")
+            BrokerClient(self.path).call("capacity_order")
 
     def test_agent_error_mapping_preserves_data_code(self):
         server = FakeSocketApi(self.path, lambda request: {
@@ -165,7 +165,7 @@ class BrokerClientTests(unittest.TestCase):
         server.start()
         self.addCleanup(server.close)
         with self.assertRaises(AgentRunError) as context:
-            BrokerClient(self.path).call("limits")
+            BrokerClient(self.path).call("capacity_order")
         self.assertEqual(str(context.exception), "domain failure")
         self.assertEqual(context.exception.broker_error_code, "AuthError")
 
@@ -208,7 +208,7 @@ class BrokerClientTests(unittest.TestCase):
             def call():
                 """Capture the terminal cancellation raised by the client worker."""
                 try:
-                    client.call("limits")
+                    client.call("capacity_order")
                 except BaseException as error:
                     failures.append(error)
 
@@ -231,7 +231,7 @@ class BrokerClientTests(unittest.TestCase):
         client.abort()
         with patch("agent_run.broker_client.socket.socket", ConnectingSocket):
             with self.assertRaisesRegex(ConnectionError, "cancelled"):
-                client.call("limits")
+                client.call("capacity_order")
         self.assertFalse(entered.is_set(), "pre-cancelled clients must not call connect")
         self.assertEqual(len(sockets), 1)
         self.assertTrue(closed.is_set())

@@ -7,13 +7,13 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
 from agent_run.adapters import omniroute
-from agent_run.adapters.developer_environment import environment_digest
 from agent_run.adapters.claude import adapter as claude_adapter
 from agent_run.adapters.qwen import auth as qwen_auth
 from agent_run.adapters.qwen.adapter import ADAPTER, QwenAdapter
@@ -22,6 +22,7 @@ from agent_run.config import EnvironmentConfig, McpConfig, RuntimeAuthConfig, Ru
 from agent_run.domain import AgentStatus, StartRequest
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
+from role_helpers import resolved_role
 
 
 class QwenAdapterTests(unittest.TestCase):
@@ -95,10 +96,39 @@ class QwenAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "PATH": path, "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }):
+            request = self.request(write=write)
             return self.adapter.prepare(
-                self.request(write=write), self.profile(write=write), config, self.home,
-                self.agent_dir, mcp_servers=servers if mcp else {},
+                request,
+                resolved_role(
+                    request, self.profile(write=write), config,
+                    servers if mcp else {},
+                ),
+                config,
+                self.home,
+                self.agent_dir,
             )
+
+    def direct_prepare(
+        self,
+        request: StartRequest,
+        profile: AgentProfile,
+        config: RuntimeConfig,
+        *,
+        mcp_servers: dict[str, McpConfig] | None = None,
+        resume_session_id: str | None = None,
+    ):
+        """Prepare an explicit fixture through the resolved-role contract."""
+
+        servers = {} if mcp_servers is None else mcp_servers
+        request = replace(request, profile=profile.name)
+        return self.adapter.prepare(
+            request,
+            resolved_role(request, profile, config, servers),
+            config,
+            self.home,
+            self.agent_dir,
+            resume_session_id=resume_session_id,
+        )
 
     def test_read_only_and_write_modes_are_explicit_and_sandboxed(self) -> None:
         """Map read-only to plan and writes to yolo (live shell) without dropping sandbox."""
@@ -111,19 +141,44 @@ class QwenAdapterTests(unittest.TestCase):
             self.assertEqual(plan.adapter_state["approval_mode"], expected)
             self.assertTrue(plan.adapter_state["sandbox"])
 
-    def test_child_path_bypasses_the_macos_xcode_git_shim_when_available(self) -> None:
-        """Prefer Xcode's real Git binary without changing non-macOS PATHs."""
-        plan = self.prepare(path="/usr/bin:/bin")
-        xcode = Path("/Applications/Xcode.app/Contents/Developer/usr/bin")
-        expected = (
-            f"{xcode}{os.pathsep}/usr/bin:/bin"
-            if (xcode / "git").is_file()
-            else "/usr/bin:/bin"
-        )
-        self.assertEqual(plan.environment["PATH"], expected)
+    def test_validate_accepts_native_or_selected_environment_auth(self) -> None:
+        """Allow global provider defaults and reject foreign auth kinds."""
 
-    def test_environment_preset_reaches_shell_mcp_and_native_denials(self) -> None:
-        """Keep declared tools and workdir values in Qwen plus its MCP child."""
+        self.adapter.validate(self.config(auth=None))
+        self.adapter.validate(self.config())
+        with self.assertRaisesRegex(ValidationError, "auth.kind"):
+            self.adapter.validate(
+                self.config(
+                    auth=RuntimeAuthConfig(
+                        "file_link", source=Path("/tmp/auth"), target="auth.json"
+                    )
+                )
+            )
+
+    def test_prepare_uses_native_provider_environment_without_auth_config(self) -> None:
+        """Resolve Qwen's global provider values when no auth block is declared."""
+
+        config = self.config(auth=None)
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "OPENAI_API_KEY": "global-secret",
+                "OPENAI_BASE_URL": "https://provider/v1",
+            },
+            clear=True,
+        ):
+            plan = self.direct_prepare(self.request(), self.profile(), config)
+        self.assertEqual(plan.environment["OPENAI_API_KEY"], "global-secret")
+        self.assertNotIn("global-secret", " ".join(plan.argv))
+
+    def test_child_path_matches_the_host_path(self) -> None:
+        """Keep the host PATH unchanged for every platform."""
+        plan = self.prepare(path="/usr/bin:/bin")
+        self.assertEqual(plan.environment["PATH"], "/usr/bin:/bin")
+
+    def test_legacy_environment_only_retains_native_denials(self) -> None:
+        """Ignore legacy path/variables while retaining command denials."""
 
         tools = self.root / "tools"
         tools.mkdir()
@@ -139,35 +194,26 @@ class QwenAdapterTests(unittest.TestCase):
             ("git",), ("gh",),
         )
         config = self.config(environment=environment, mcp=("agent_lsp",))
-        changed = self.config(environment=EnvironmentConfig(
-            (tools,), MappingProxyType({"PROJECT": "{workdir}/other"}), ("git",), ("gh",),
-        ))
-        self.assertNotEqual(environment_digest(config), environment_digest(changed))
         servers = {"agent_lsp": McpConfig("stdio", Path("/bin/lsp"), ("--stdio",), ())}
         with patch.dict(os.environ, {
             "PATH": "/bin", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }, clear=True):
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers,
+            plan = self.direct_prepare(
+                self.request(), self.profile(), config, mcp_servers=servers
             )
         settings = json.loads((self.home / ".qwen" / "settings.json").read_text(encoding="utf-8"))
         denied = settings["permissions"]["deny"]
-        self.assertEqual(plan.environment["PROJECT"], f"{self.workdir}/generated")
-        expected_path = [str(self.home / ".qwen" / "denied-commands"), str(tools)]
-        if (Path("/Applications/Xcode.app/Contents/Developer/usr/bin") / "git").is_file():
-            expected_path.append("/Applications/Xcode.app/Contents/Developer/usr/bin")
-        expected_path.append("/bin")
+        self.assertNotIn("PROJECT", plan.environment)
+        expected_path = [str(self.home / ".qwen" / "denied-commands"), "/bin"]
         self.assertEqual(plan.environment["PATH"], os.pathsep.join(expected_path))
-        self.assertEqual(settings["mcpServers"]["agent_lsp"]["env"], {
-            "PATH": "${PATH}", "PROJECT": "${PROJECT}",
-        })
+        self.assertNotIn("env", settings["mcpServers"]["agent_lsp"])
         self.assertIn("Bash(gh)", denied)
-        self.assertIn(f"Bash({tools / 'gh'})", denied)
-        self.assertIn(f"Bash({target})", denied)
+        self.assertNotIn(f"Bash({tools / 'gh'})", denied)
+        self.assertNotIn(f"Bash({target})", denied)
         self.assertNotIn("Bash(git)", denied)
 
-    def test_environment_missing_required_command_fails_before_settings_write(self) -> None:
-        """Reject a preset whose final child PATH lacks its required command."""
+    def test_legacy_required_command_does_not_probe_during_prepare(self) -> None:
+        """Do not execute or require legacy toolchain probes on the start path."""
 
         tools = self.root / "tools"
         tools.mkdir()
@@ -175,11 +221,9 @@ class QwenAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "PATH": "", "OPENAI_API_KEY": "secret", "OPENAI_BASE_URL": "https://provider/v1",
         }, clear=True):
-            with self.assertRaisesRegex(ValidationError, "missing executable: git"):
-                self.adapter.prepare(
-                    self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers={},
-                )
-        self.assertFalse((self.home / ".qwen" / "settings.json").exists())
+            plan = self.direct_prepare(self.request(), self.profile(), config)
+        self.assertEqual(plan.environment["PATH"], "")
+        self.assertTrue((self.home / ".qwen" / "settings.json").exists())
 
     def test_provider_model_mcp_and_role_are_isolated(self) -> None:
         """Carry provider values in env and materialize MCP plus the role under HOME."""
@@ -207,13 +251,8 @@ class QwenAdapterTests(unittest.TestCase):
             "OPENAI_API_KEY": "secret",
             "OPENAI_BASE_URL": "https://provider/v1",
         }):
-            plan = self.adapter.prepare(
-                self.request(),
-                self.profile(),
-                self.config(),
-                self.home,
-                self.agent_dir,
-                mcp_servers={},
+            plan = self.direct_prepare(
+                self.request(), self.profile(), self.config(),
                 resume_session_id="session-1",
             )
         after = {
@@ -228,9 +267,8 @@ class QwenAdapterTests(unittest.TestCase):
         """Reject network profiles because this adapter grants no Qwen web tools."""
         with patch.dict(os.environ, {"OPENAI_API_KEY": "x", "OPENAI_BASE_URL": "https://p/v1"}):
             with self.assertRaisesRegex(ValidationError, "network profiles"):
-                self.adapter.prepare(
-                    self.request(), self.profile(network=True), self.config(), self.home,
-                    self.agent_dir, mcp_servers={},
+                self.direct_prepare(
+                    self.request(), self.profile(network=True), self.config()
                 )
 
     def test_process_env_credentials_win_over_keychain_and_default_base_url(self) -> None:
@@ -249,9 +287,8 @@ class QwenAdapterTests(unittest.TestCase):
             "agent_run.adapters.qwen.adapter.keychain_omniroute_api_key",
             return_value="kc-secret",
         ) as spy:
-            plan = self.adapter.prepare(
-                self.request(), self.profile(), self.config(), self.home,
-                self.agent_dir, mcp_servers={},
+            plan = self.direct_prepare(
+                self.request(), self.profile(), self.config()
             )
         spy.assert_called_once_with()
         self.assertEqual(plan.environment["OPENAI_API_KEY"], "kc-secret")
@@ -264,9 +301,8 @@ class QwenAdapterTests(unittest.TestCase):
             return_value=None,
         ):
             with self.assertRaisesRegex(ValidationError, "OPENAI_API_KEY"):
-                self.adapter.prepare(
-                    self.request(), self.profile(), self.config(), self.home,
-                    self.agent_dir, mcp_servers={},
+                self.direct_prepare(
+                    self.request(), self.profile(), self.config()
                 )
 
     def test_probe_reports_authenticated_via_keychain_fallback(self) -> None:

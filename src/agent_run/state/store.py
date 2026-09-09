@@ -38,14 +38,12 @@ from .db import (
     count_agents,
     immediate,
     integer,
-    insert_capacity_row,
     initialize_database,
     insert_event,
     json_text,
     message_rows,
     nonblank,
     open_database,
-    recent_capacity_rows,
     require_attempt,
     resolve_message_storage,
     row_dict,
@@ -167,32 +165,7 @@ class StateStore:
             startup_deadline_seconds=startup_deadline_seconds,
         )
 
-    def resume_chain(
-        self,
-        agent_id: str | AgentId,
-        *,
-        cursor: int = 1,
-        limit: int = 50,
-    ) -> list[sqlite3.Row]:
-        """Return one resume chain's rows in chronological (``sequence``) order.
 
-        ``agent_id`` may name any member of the chain; its ``root_agent_id``
-        selects the whole chain. ``cursor`` is the 1-based ``sequence`` to
-        start at and ``limit`` the maximum number of rows returned. Returns
-        ``limit + 1`` rows at most, so the caller can detect a further page
-        without a second count query; an unknown agent raises
-        :class:`agent_run.errors.NotFoundError` via :meth:`get_agent`.
-        """
-
-        root = self.get_agent(agent_id)["root_agent_id"]
-        return list(
-            self.connection.execute(
-                """SELECT * FROM agents
-                   WHERE root_agent_id = ? AND sequence >= ?
-                   ORDER BY sequence LIMIT ?""",
-                (root, cursor, limit + 1),
-            )
-        )
 
     def replace_config_revision(
         self,
@@ -279,50 +252,7 @@ class StateStore:
         ).fetchone()
         return None if row is None else str(row["id"])
 
-    def list_orchestrator_sessions(self, *, limit: int) -> list[dict[str, object]]:
-        """Return the most active bound sessions and one aggregate unbound row.
 
-        ``limit`` is a positive row bound.  Each returned mapping contains the
-        session metadata, active and total agent counts, and ``page_total`` for
-        the exact number of available rows before the bound; the synthetic
-        unbound mapping has a null ``id`` and is omitted when no agents are
-        unbound.  The read does not mutate state.
-        """
-
-        integer("limit", limit, minimum=1)
-        active = tuple(status.value for status in ACTIVE)
-        placeholders = ",".join("?" for _ in active)
-        rows = self.connection.execute(
-            f"""WITH bound AS (
-                    SELECT sessions.id, sessions.transport,
-                           sessions.external_session_id, sessions.external_turn_id,
-                           sessions.created_at, sessions.last_seen_at,
-                           SUM(CASE WHEN agents.status IN ({placeholders})
-                                    THEN 1 ELSE 0 END) AS active,
-                           COUNT(agents.id) AS total
-                    FROM orchestrator_sessions AS sessions
-                    JOIN agents ON agents.orchestrator_session_id = sessions.id
-                    GROUP BY sessions.id
-                ), unbound AS (
-                    SELECT NULL AS id, '' AS transport, '' AS external_session_id,
-                           NULL AS external_turn_id, MIN(created_at) AS created_at,
-                           MAX(created_at) AS last_seen_at,
-                           SUM(CASE WHEN status IN ({placeholders})
-                                    THEN 1 ELSE 0 END) AS active,
-                           COUNT(*) AS total
-                    FROM agents
-                    WHERE orchestrator_session_id IS NULL
-                    HAVING COUNT(*) > 0
-                ), all_sessions AS (
-                    SELECT * FROM bound UNION ALL SELECT * FROM unbound
-                )
-                SELECT *, COUNT(*) OVER () AS page_total
-                FROM all_sessions
-                ORDER BY active DESC, last_seen_at DESC
-                LIMIT ?""",
-            (*active, *active, limit),
-        )
-        return [dict(row) for row in rows]
 
     def record_context_receipt(
         self,
@@ -427,6 +357,14 @@ class StateStore:
         )
         return [dict(row) for row in rows]
 
+    def events_revision(self) -> int:
+        """Return the global committed event sequence, or zero for an empty store."""
+
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS revision FROM events"
+        ).fetchone()
+        return int(row["revision"])
+
     def agent_projection(
         self, agent_ids: Iterable[str | AgentId]
     ) -> dict[str, dict[str, object]]:
@@ -477,6 +415,15 @@ class StateStore:
                 ), latest_cleanup AS (
                     SELECT events.agent_id, events.data_json AS cleanup_json
                     FROM events JOIN cleanup_seq USING (agent_id, seq)
+                ), phase_seq AS (
+                    SELECT agent_id, MAX(seq) AS seq
+                    FROM events WHERE agent_id IN (SELECT id FROM selected)
+                      AND kind = 'phase'
+                    GROUP BY agent_id
+                ), latest_phase AS (
+                    SELECT events.agent_id, events.at AS phase_started_at,
+                           events.data_json AS phase_json
+                    FROM events JOIN phase_seq USING (agent_id, seq)
                 )
                 SELECT selected.id, progress.last_progress_at,
                        COALESCE(warnings.deadline_warned, 0) AS deadline_warned,
@@ -486,14 +433,17 @@ class StateStore:
                        latest_delivery.ambiguous_result AS delivery_ambiguous,
                        latest_delivery.last_error AS delivery_last_error,
                        latest_evidence.evidence_json,
-                       latest_cleanup.cleanup_json
+                       latest_cleanup.cleanup_json,
+                       latest_phase.phase_started_at,
+                       latest_phase.phase_json
                 FROM selected
                 LEFT JOIN progress ON progress.agent_id = selected.id
                 LEFT JOIN warnings ON warnings.agent_id = selected.id
                 LEFT JOIN latest_delivery ON latest_delivery.agent_id = selected.id
                 LEFT JOIN latest_evidence
                   ON latest_evidence.delivery_id = latest_delivery.id
-                LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id""",
+                LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id
+                LEFT JOIN latest_phase ON latest_phase.agent_id = selected.id""",
             selected,
         )
         return {str(row["id"]): dict(row) for row in rows}
@@ -636,11 +586,10 @@ class StateStore:
     ) -> None:
         """Record the detached supervisor's immutable ownership proof.
 
-        The first binding for a ``STARTING`` agent must occur before its startup
-        lease expires. Once recorded, the same supervisor may refine its process
-        group after engine launch even if that lease has elapsed; terminal rows
-        and conflicting identities remain rejected. ``birth_time`` is optional
-        only for legacy callers; once present it is immutable across heartbeats.
+        A ``STARTING`` agent may bind whenever its supervisor reaches READY;
+        elapsed wall time does not invalidate ownership. Terminal rows and
+        conflicting identities remain rejected. ``birth_time`` is optional only
+        for legacy callers; once present it is immutable across later refinements.
         """
 
         agent_id = validate_agent_id(agent_id)
@@ -665,14 +614,6 @@ class StateStore:
             agent = agent_row(self.connection, agent_id)
             if AgentStatus(agent["status"]) in TERMINAL:
                 raise StateTransitionError("terminal agent cannot bind a supervisor")
-            deadline = agent["startup_deadline_at"]
-            if (
-                AgentStatus(agent["status"]) is AgentStatus.STARTING
-                and agent["supervisor_pid"] is None
-                and isinstance(deadline, (int, float))
-                and deadline <= timestamp(at)
-            ):
-                raise StateTransitionError("expired startup cannot bind a supervisor")
             fields = (
                 "supervisor_pid",
                 "supervisor_identity",
@@ -1129,78 +1070,8 @@ class StateStore:
             if updated != 1:
                 raise ValidationError("command is unclaimed or owned by another agent")
 
-    def insert_capacity_sample(
+    def replace_capacity_snapshot(
         self,
-        *,
-        runtime: str,
-        lane: str,
-        window: str,
-        source: str,
-        payload: object,
-        target: str | None = None,
-        remaining_percent: float | None = None,
-        reset_at: float | None = None,
-        observed_at: float | None = None,
-        valid_until: float | None = None,
-    ) -> int:
-        for name, value in (
-            ("runtime", runtime),
-            ("lane", lane),
-            ("window", window),
-            ("source", source),
-        ):
-            nonblank(name, value)
-        if remaining_percent is not None and (
-            isinstance(remaining_percent, bool)
-            or not isinstance(remaining_percent, (int, float))
-            or not math.isfinite(remaining_percent)
-            or not 0 <= remaining_percent <= 100
-        ):
-            raise ValidationError("remaining_percent must be between 0 and 100")
-        return insert_capacity_row(
-            self.connection,
-            runtime=runtime,
-            lane=lane,
-            window=window,
-            target=target,
-            source=source,
-            remaining_percent=remaining_percent,
-            reset_at=None if reset_at is None else timestamp(reset_at),
-            observed_at=None if observed_at is None else timestamp(observed_at),
-            valid_until=None if valid_until is None else timestamp(valid_until),
-            payload_json=json_text(payload),
-        )
-
-    def recent_capacity_samples(
-        self,
-        *,
-        at: float | None = None,
-        runtime: str | None = None,
-        limit: int = 100,
-    ) -> list[dict[str, object]]:
-        integer("limit", limit, minimum=1)
-        now = timestamp(at)
-        if runtime is not None:
-            nonblank("runtime", runtime)
-        rows = recent_capacity_rows(self.connection, now, runtime, limit)
-        return [dict(row) for row in rows]
-
-    def prune_capacity_samples(self, retention: int) -> int:
-        return capacity.prune_capacity_samples(self.connection, retention)
-
-    def capacity_sample_history(
-        self, *, retention: int, runtime: str | None = None
-    ) -> list[dict[str, object]]:
-        return [
-            dict(row)
-            for row in capacity.capacity_sample_history(
-                self.connection, retention=retention, runtime=runtime
-            )
-        ]
-
-    def append_capacity_samples(
-        self,
-        samples: Iterable[dict[str, object]],
         *,
         runtime: str,
         scope_id: str,
@@ -1208,18 +1079,14 @@ class StateStore:
         valid_until: float,
         payload: object,
     ) -> None:
-        """Atomically persist samples and one route topology snapshot.
+        """Atomically replace one current route and sample snapshot.
 
-        ``samples`` is consumed once; each mapping must belong to ``runtime``.
-        ``scope_id`` must be nonblank, timestamps must be finite and ordered
-        with expiry no earlier than observation, and the JSON ``payload`` is
-        limited to 65,536 UTF-8 bytes. The store commits all rows and the
-        snapshot together or leaves both unchanged. Validation errors and
-        SQLite failures are propagated according to the StateStore contract.
+        ``scope_id`` must be nonblank, timestamps must be finite and ordered,
+        and ``payload`` is bounded JSON containing the latest provider values.
         """
 
-        capacity.append_capacity_samples(
-            self.connection, samples, runtime=runtime, scope_id=scope_id,
+        capacity.replace_capacity_snapshot(
+            self.connection, runtime=runtime, scope_id=scope_id,
             observed_at=observed_at, valid_until=valid_until, payload=payload,
         )
 

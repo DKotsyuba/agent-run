@@ -84,9 +84,10 @@ def create_agent(
 
     Supplying ``startup_owner_identity`` makes this the service admission path:
     the row, ``created``/``start_accepted`` events, ``STARTING`` status, owner
-    birth proof and finite deadline commit in this transaction. Omitting it
-    retains low-level historical/test creation as ``CREATED``; partial owner
-    parameters are rejected.
+        birth proof commit in this transaction. ``startup_deadline_seconds`` is
+        optional legacy metadata and does not govern ownership. Omitting the
+        owner retains low-level historical/test creation as ``CREATED``; partial
+        owner parameters are rejected.
     """
 
     if not isinstance(request, StartRequest):
@@ -109,7 +110,7 @@ def create_agent(
             or startup_owner_birth_time < 0
         ):
             raise ValidationError("startup owner birth time must be finite and nonnegative")
-        if (
+        if startup_deadline_seconds is not None and (
             isinstance(startup_deadline_seconds, bool)
             or not isinstance(startup_deadline_seconds, (int, float))
             or not math.isfinite(startup_deadline_seconds)
@@ -205,7 +206,11 @@ def create_agent(
                     AgentStatus.STARTING.value,
                     startup_owner_identity,
                     startup_owner_birth_time,
-                    created_at + float(startup_deadline_seconds),
+                    (
+                        None
+                        if startup_deadline_seconds is None
+                        else created_at + float(startup_deadline_seconds)
+                    ),
                     candidate,
                 ),
             )

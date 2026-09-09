@@ -54,6 +54,24 @@ class SnapshotInspection:
     hash_mismatches: tuple[str, ...] = ()
 
 
+def tree_revision(source: Path) -> str:
+    """Return the role-skill content revision used by canonical snapshots.
+
+    No-follow traversal comes from :func:`_read_tree`. The digest deliberately
+    omits file modes and manifest version to retain snapshots written by the
+    original resolved-role format.
+    """
+
+    entries, _files = _read_tree(source)
+    content_entries = [
+        [entry["path"], entry["type"]]
+        if entry["type"] == "directory"
+        else [entry["path"], entry["type"], entry["bytes"], entry["sha256"]]
+        for entry in entries
+    ]
+    return content_hash(json.dumps(content_entries, separators=(",", ":")))
+
+
 def _relative(value: str | Path, label: str) -> Path:
     """Return a nonempty managed relative path or raise ``PathEscapeError``."""
 

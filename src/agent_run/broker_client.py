@@ -17,7 +17,7 @@ MAX_LINE_BYTES = 1024 * 1024
 _DEFAULT_TIMEOUT = 600.0
 _BROKER_MESSAGE = (
     "agent-run broker is not running; start it with `agent-run api serve` "
-    "or its launchd job (agent-run doc service)"
+    "or its launchd job"
 )
 
 
@@ -42,13 +42,6 @@ class BrokerClient:
         if not isinstance(result, dict) or not isinstance(result.get("agent_id"), str) or not isinstance(result.get("created"), bool):
             raise AgentRunError("broker returned an invalid resume result")
         return SimpleNamespace(**result)
-
-    def chain(self, agent_id: str, *, cursor: int | None = None, limit: int = 50) -> dict:
-        """Read one server-validated continuation page without opening a local store."""
-        result = self.call("chain", {"agent_id": agent_id, "cursor": cursor, "limit": limit})
-        if not isinstance(result, dict):
-            raise AgentRunError("broker returned an invalid chain result")
-        return result
 
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = Path(socket_path)

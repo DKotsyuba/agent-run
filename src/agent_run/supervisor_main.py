@@ -61,15 +61,21 @@ _ERROR_FD = _bootstrap_error_fd(sys.argv)
 try:
     from collections.abc import Callable, Mapping
 
-    from .adapters.base import LaunchPlan
-    from .adapters.registry import AdapterRegistry
     from .config import load_config
     from .errors import ValidationError
     from .lifecycle import ReadyChannel
     from .logging_setup import configure_logging
     from .paths import config_path, state_db_path
+    from .preparation import (
+        PreparationCancelled,
+        PreparationFailure,
+        fail_preparation,
+        prepare_launch,
+        request_from_payload,
+    )
+    from .role_plan import ResolvedRolePlan
     from .state.store import StateStore
-    from .supervisor import Supervisor, SupervisorSettings
+    from .supervisor import Supervisor, report_ready
 except BaseException as _import_error:  # fail closed with evidence, no partial module
     _write_early_failure(_ERROR_FD, "import", _import_error)
     os._exit(1)
@@ -131,32 +137,30 @@ def _number(payload: Mapping[str, object], key: str) -> float:
 
 def _supervise(payload: Mapping[str, object], home: Path, ready: ReadyChannel) -> None:
     agent_id = _text(payload, "agent_id")
-    config = load_config(config_path(home))
-    _logger.debug("agent_id=%s stage=config", agent_id)
-    adapter = AdapterRegistry(config).load(_text(payload, "runtime"))
-    _logger.debug("agent_id=%s stage=adapter_load runtime=%s", agent_id, payload.get("runtime"))
-    plan = LaunchPlan.from_payload(payload.get("plan"))
     store = StateStore.open(state_db_path(home))
     _logger.debug("agent_id=%s stage=store_open", agent_id)
     try:
+        report_ready(store, agent_id, ready)
+        try:
+            request = request_from_payload(payload.get("request"))
+            role = ResolvedRolePlan.from_payload(payload.get("role"))
+            config = load_config(config_path(home))
+            prepared = prepare_launch(store, home, config, agent_id, request, role)
+        except PreparationCancelled:
+            return
+        except PreparationFailure as error:
+            fail_preparation(store, agent_id, error)
+            return
+        except BaseException as error:
+            fail_preparation(store, agent_id, PreparationFailure("payload", error))
+            return
         Supervisor(
             store,
-            _text(payload, "agent_id"),
-            adapter,
-            plan,
-            answer_path=Path(_text(payload, "answer_path")),
-            timeout_seconds=_number(payload, "timeout_seconds"),
-            settings=SupervisorSettings(
-                warning_fraction=_number(payload, "warning_fraction"),
-                # Optional for payloads written by an older launcher: a mixed
-                # release window must not fail bootstrap over the new knob.
-                stalled_after_seconds=(
-                    _number(payload, "stalled_after_seconds")
-                    if "stalled_after_seconds" in payload
-                    else 900.0
-                ),
-            ),
-            ready=ready,
+            agent_id,
+            prepared.adapter,
+            prepared.plan,
+            answer_path=prepared.answer_path,
+            ownership_recorded=True,
         ).run()
     finally:
         store.close()

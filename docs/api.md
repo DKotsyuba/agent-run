@@ -51,8 +51,8 @@ supported (`-32600`).
 tool's arguments.
 
 ```json
-{"jsonrpc": "2.0", "id": 1, "method": "status", "params": {"agent_id": "ag-..."}}
-{"jsonrpc": "2.0", "id": 1, "result": {"agent_id": "ag-...", "status": "running", ...}}
+{"jsonrpc": "2.0", "id": 1, "method": "list_agents", "params": {"limit": 1}}
+{"jsonrpc": "2.0", "id": 1, "result": {"items": [...], "revision": 42, ...}}
 ```
 
 Terminal agent responses include `delivery.last_attempt` when Codex queue made
@@ -66,7 +66,7 @@ session ids, argv/environment values, and credentials are never persisted.
 One connection may send many requests; on a single connection they are
 answered in order. Open several connections for parallelism — dispatch is
 serialized within two bounded owner lanes. Durable start/resume/cancel/steer
-admission uses the control lane; status, answer, model probing and other reads
+admission uses the control lane; list, answer, transcript and capacity reads
 use a separate lane, so a slow read cannot starve cancellation. The server caps
 connections and queued calls, reserves one connection slot for parsed control
 methods, rejects ordinary overload with JSON-RPC code `-32001`, and
@@ -90,19 +90,12 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-The tool set (same names as the MCP server):
-`start`, `resume`, `chain`, `status`, `answer`, `cancel`, `steer`, `summary`, `transcript`,
-`list_agents`, `list_orchestrators`, `models`, `limits`, `capacity_order`,
-`fast`, and `doc`.
+The tool set (same names as the MCP server) is exactly `start`, `resume`,
+`cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
+`doc`, `models`, and `limits`.
 
-See [continuations](continuations.md) for native-context `resume` and chronological
-`chain` pages, including inherited authority, idempotency and history availability.
-
-`fast` settings are ephemeral to the current transport session. Set
-`{"runtime":"codex","enabled":true}` for the runtime default, or add
-`account` for one account. In `start`, explicit `fast` wins over an account
-override, which wins over the runtime default; an omitted account uses the
-runtime's configured default account.
+See [continuations](continuations.md) for native-context `resume`, inherited
+authority, idempotency and history availability.
 
 `start.required_constraints` is an optional array of unique policy constraint
 names from tool discovery. Omission means no additional requirement. A named
@@ -114,17 +107,13 @@ satisfy isolation requirements. Unknown or duplicate names are invalid.
 A later PostToolUse notification binding does not change that identity. Clients
 that omit `orchestrator` share the unbound namespace across fresh connections.
 
-`list_orchestrators` (optional `limit`, default 100, max 1000) is a read-only
-view of the orchestrator sessions that launched agents. Each item carries
-`session_id`, `transport`, `external_session_id`, `external_turn_id`,
-`created_at`, `last_seen_at`, and two counters: `active` (children in a
-non-terminal status) and `total`. Items are ordered by `active` descending,
-then `last_seen_at` descending. When agents were launched without an
-orchestrator binding, one synthetic item with `session_id: null` and empty
-`transport` carries their counters; it is absent when no such agents exist.
-The page reports `total` (exact number of items available) and `complete`.
+`list_agents` accepts optional `after_revision` and `wait_seconds`. When the
+current event revision is not newer, the call waits up to 60 seconds and wakes
+as soon as a committed event advances it. The returned `revision` becomes the
+next cursor, so terminal completion is observable without a notification
+worker or polling at a fixed interval.
 
-Agent views returned by `status`, `list_agents`, and `summary` include
+Agent views returned by `list_agents` include
 `effort` — the reasoning effort requested at launch, or `null` when the
 request did not set one.
 
@@ -142,12 +131,12 @@ caller required it, exact scope, and reason. Historical rows return `null`.
 `capacity_order` takes no parameters. It returns fresh non-exhausted physical
 quota routes in descending priority, plus deferred evidence, exhausted
 `omitted` routes, and `unavailable_runtimes`. Each working route includes its
-concrete runtime/account/quota-lane aliases, governing windows, raw score,
+concrete runtime/account/quota-lane aliases, current governing windows, raw score,
 configured multiplier, manual-reset credit count and its bounded bonus, final
 priority, and limiting exact key/reset. The manual reset bonus is only applied
 to the stable Codex ``codex`` limit id after the route remains eligible: with
-``n`` credits its factor is ``1 + n/(n+1)``. It never creates quota, changes
-forecasts, or restores an exhausted route. The list
+``n`` credits its factor is ``1 + n/(n+1)``. It never creates quota or restores
+an exhausted route. The list
 is role-independent: callers still choose the first alias whose models fit the
 task. `insufficient_diversity` is true when fewer than two working physical
 choices remain; the routes list is still authoritative and may contain one or
@@ -203,7 +192,7 @@ started = api.call(
 )
 final = api.call("wait", agent_id=started["agent_id"], timeout_seconds=600)
 if final.get("timed_out"):
-    ...  # still running; poll `status` or wait again
+    ...  # still running; call list_agents or wait again
 else:
     print(final["content"])  # the agent's answer text
 ```
@@ -223,9 +212,11 @@ Notes for the loop:
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
-- Model rosters and health come from `models`. Choose the first compatible
-  route from the injected Runtime priorities; if absent, obtain `capacity_order`.
-  Do not repeatedly query `limits` for routing; it remains a diagnostic view.
+- CLI `start --wait` repeatedly uses the private socket `wait` method and emits
+  its terminal answer; interrupting that client leaves the durable run active.
+- Use `capacity_order` to choose the first compatible available route.
+- Use `models` for current runtime rosters and health; `limits` returns current
+  fresh capacity readings without history, forecasts, burn, risk, or advice.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit

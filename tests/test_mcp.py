@@ -32,7 +32,7 @@ class Broker:
 
     def call(self, method, params=None, timeout=600.0):
         \"\"\"Return one deterministic result or one typed domain failure.\"\"\"
-        if method == "limits":
+        if method == "capacity_order":
             raise AgentRunError("controlled broker failure")
         return {"method": method, "arguments": params or {}}
 
@@ -61,15 +61,16 @@ class McpSdkTests(unittest.TestCase):
                         initialized = await session.initialize()
                         self.assertEqual(initialized.server_info.name, "agent-run")
                         tools = await session.list_tools()
-                        self.assertIn("models", {tool.name for tool in tools.tools})
+                        self.assertEqual(len(tools.tools), 11)
                         result = await session.call_tool(
-                            "models", {"orchestrator": {"id": "root", "name": "root"}}
+                            "answer", {"agent_id": "ag-20260826-120000-0123456789"}
                         )
+                        models = await session.call_tool("models")
+                        limits = await session.call_tool("limits")
             self.assertFalse(result.is_error)
-            self.assertEqual(result.structured_content["method"], "models")
-            self.assertEqual(
-                result.structured_content["arguments"]["orchestrator"]["id"], "root"
-            )
+            self.assertEqual(result.structured_content["method"], "answer")
+            self.assertEqual(models.structured_content["method"], "models")
+            self.assertEqual(limits.structured_content["method"], "limits")
 
         anyio.run(exercise)
 
@@ -89,7 +90,7 @@ class McpSdkTests(unittest.TestCase):
                 async with stdio_client(parameters) as (read_stream, write_stream):
                     async with ClientSession(read_stream, write_stream) as session:
                         await session.initialize()
-                        result = await session.call_tool("limits")
+                        result = await session.call_tool("capacity_order")
             self.assertTrue(result.is_error)
             self.assertEqual(result.structured_content["error"]["message"], "controlled broker failure")
 
@@ -184,7 +185,7 @@ serve(lambda: ObservedBrokerClient(Path(os.environ[\"AGENT_RUN_TEST_SOCKET\"])))
                             """Run one cancellable request through the official client."""
                             try:
                                 with scope:
-                                    await session.call_tool("models")
+                                    await session.call_tool("capacity_order")
                             finally:
                                 finished.set()
 

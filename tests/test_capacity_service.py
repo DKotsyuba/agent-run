@@ -12,7 +12,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent_run.config import Config, RuntimeConfig
-from agent_run.dispatch import Session, _jsonable, call_tool
+from agent_run.dispatch import _jsonable, call_tool
 from agent_run.service import AgentService
 from agent_run.state import StateStore
 
@@ -93,8 +93,13 @@ class CapacityServiceTests(unittest.TestCase):
             "target": None,
             "source": "source",
         }
-        self.store.append_capacity_samples(
-            [
+        self.store.replace_capacity_snapshot(
+            runtime=runtime,
+            scope_id=scope,
+            observed_at=900.0,
+            valid_until=valid_until,
+            payload={
+                "samples": [
                 {
                     "lane": lane,
                     "window": "window",
@@ -104,14 +109,8 @@ class CapacityServiceTests(unittest.TestCase):
                     "reset_at": 2_000.0,
                     "observed_at": 900.0,
                     "valid_until": valid_until,
-                    "payload": None,
                 }
-            ],
-            runtime=runtime,
-            scope_id=scope,
-            observed_at=900.0,
-            valid_until=valid_until,
-            payload={
+                ],
                 "pools": [{"pool_id": pool_id, "keys": [key]}],
                 "routes": [
                     {
@@ -166,8 +165,8 @@ class CapacityServiceTests(unittest.TestCase):
         self.assertEqual(order.unavailable_runtimes, ("empty",))
         self.assertNotIn("disabled", repr(order))
 
-    def test_dispatch_serializes_multiplier_aliases_omissions_and_limits_shape(self) -> None:
-        """Shared transports retain concrete aliases and the legacy limits schema."""
+    def test_dispatch_serializes_routes_and_current_limits(self) -> None:
+        """Shared transports expose route order and current reading fields."""
 
         self._append_scope(
             "boosted",
@@ -191,10 +190,9 @@ class CapacityServiceTests(unittest.TestCase):
             },
             lambda: _NOW,
         )
-        session = Session()
         result = cast(
             dict[str, object],
-            _jsonable(call_tool(service, "capacity_order", {}, session)),
+            _jsonable(call_tool(service, "capacity_order", {})),
         )
         routes = cast(list[dict[str, object]], result["routes"])
         aliases = cast(list[dict[str, object]], routes[0]["aliases"])
@@ -211,21 +209,11 @@ class CapacityServiceTests(unittest.TestCase):
         self.assertEqual(omitted[0]["runtime"], "exhausted")
         self.assertFalse(result["insufficient_diversity"])
 
-        limits = cast(
-            dict[str, object], _jsonable(call_tool(service, "limits", {}, session))
-        )
+        limits = cast(dict[str, object], _jsonable(call_tool(service, "limits", {})))
         items = cast(list[dict[str, object]], limits["items"])
         self.assertEqual(
             set(items[0]),
-            {
-                "key",
-                "known",
-                "remaining_percent",
-                "reset_at",
-                "warmup",
-                "risk",
-                "recommendations",
-            },
+            {"key", "remaining_percent", "reset_at", "observed_at", "valid_until"},
         )
 
 

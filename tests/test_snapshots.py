@@ -27,6 +27,7 @@ from agent_run.adapters.snapshots import (
 from agent_run.config import EnvironmentConfig, RuntimeConfig
 from agent_run.errors import ValidationError
 from agent_run.profiles import AgentProfile
+from agent_run.role_plan import ResolvedRolePlan
 
 
 class ManagedSnapshotTests(unittest.TestCase):
@@ -138,6 +139,10 @@ class ManagedSnapshotTests(unittest.TestCase):
             ),
         )
         profile = AgentProfile("review", "Review exactly.", False, (self.root,), False)
+        role = ResolvedRolePlan(
+            "review", "legacy", profile.body, False, False, True,
+            profile.read_roots, (), (), frozenset(), "global", None, "a" * 64,
+        )
         index_sha256 = finalize_runtime_snapshots(self.home, "files-1")
         first = build_config_snapshot(
             runtime="claude",
@@ -146,7 +151,7 @@ class ManagedSnapshotTests(unittest.TestCase):
             materialize_revision="files-1",
             snapshot_index_sha256=index_sha256,
             config=config,
-            profile=profile,
+            profile=role,
         )
         same = build_config_snapshot(
             runtime="claude",
@@ -155,7 +160,7 @@ class ManagedSnapshotTests(unittest.TestCase):
             materialize_revision="files-1",
             snapshot_index_sha256=index_sha256,
             config=config,
-            profile=profile,
+            profile=role,
         )
         changed = build_config_snapshot(
             runtime="claude",
@@ -164,7 +169,7 @@ class ManagedSnapshotTests(unittest.TestCase):
             materialize_revision="files-1",
             snapshot_index_sha256=index_sha256,
             config=config,
-            profile=AgentProfile("review", "Changed body.", False, (self.root,), False),
+            profile=replace(role, prompt="Changed body.", config_revision="b" * 64),
         )
         declared_assets = build_config_snapshot(
             runtime="claude",
@@ -178,7 +183,7 @@ class ManagedSnapshotTests(unittest.TestCase):
                     {"compressor": ("hooks/hooks.json",)}
                 ),
             ),
-            profile=profile,
+            profile=role,
         )
         observed_version = build_config_snapshot(
             runtime="claude",
@@ -187,7 +192,7 @@ class ManagedSnapshotTests(unittest.TestCase):
             materialize_revision="files-1",
             snapshot_index_sha256=index_sha256,
             config=config,
-            profile=profile,
+            profile=role,
             runtime_version="2.1.0 (Claude Code)",
         )
         self.assertEqual(first, same)

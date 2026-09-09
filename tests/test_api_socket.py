@@ -16,7 +16,7 @@ from agent_run.api_socket import (
     _DispatcherClosed,
 )
 from agent_run.domain import AgentStatus
-from agent_run.dispatch import TOOL_NAMES, TOOLS, Session
+from agent_run.dispatch import TOOL_NAMES, TOOLS
 from agent_run.errors import ValidationError
 
 
@@ -26,21 +26,25 @@ class StubService:
         self.call_threads = []
         self.created_in = threading.get_ident()
 
-    def limits(self):
-        self.calls.append("limits")
+    def capacity_order(self):
+        self.calls.append("capacity_order")
         self.call_threads.append(threading.get_ident())
         return {"ok": True}
+
+    def models(self):
+        """Return one deterministic public model response."""
+
+        return {"runtime": "model"}
+
+    def limits(self):
+        """Return one deterministic current-reading response."""
+
+        return {"items": []}
 
     def cancel(self, agent_id):
         """Return an immediate durable-control substitute for the agent."""
 
         return {"agent_id": agent_id, "status": "cancelling"}
-
-    def list_orchestrators(self, *, limit=100):
-        """Return a deterministic response used to prove socket dispatch."""
-
-        self.calls.append(("list_orchestrators", limit))
-        return {"limit": limit}
 
     def resolve_account(self, runtime, account):
         """Return the stub's personal label for a str/None account or reject it."""
@@ -119,7 +123,7 @@ class DispatcherShutdownTests(unittest.TestCase):
         """Append the exception from one call racing dispatcher shutdown."""
 
         try:
-            dispatcher.call("limits", {}, Session())
+            dispatcher.call("capacity_order", {})
         except BaseException as error:
             errors.append(error)
 
@@ -164,19 +168,21 @@ class ApiSocketTests(unittest.TestCase):
         self.assertEqual(response["result"], list(TOOLS))
 
     def test_successful_tool_round_trip(self):
-        response = self.request({"jsonrpc": "2.0", "id": 1, "method": "limits", "params": {}})
+        response = self.request({"jsonrpc": "2.0", "id": 1, "method": "capacity_order", "params": {}})
         self.assertEqual(response["result"], {"ok": True})
-
-    def test_list_orchestrators_round_trip(self):
-        response = self.request({
-            "jsonrpc": "2.0", "id": 1, "method": "list_orchestrators", "params": {"limit": 7},
-        })
-        self.assertEqual(response["result"], {"limit": 7})
+        self.assertEqual(
+            self.request({"jsonrpc": "2.0", "id": 2, "method": "models"})["result"],
+            {"runtime": "model"},
+        )
+        self.assertEqual(
+            self.request({"jsonrpc": "2.0", "id": 3, "method": "limits"})["result"],
+            {"items": []},
+        )
 
     def test_unknown_method_and_validation_error(self):
         unknown = self.request({"jsonrpc": "2.0", "id": 1, "method": "missing"})
         self.assertEqual(unknown["error"]["code"], -32601)
-        invalid = self.request({"jsonrpc": "2.0", "id": 2, "method": "status", "params": {}})
+        invalid = self.request({"jsonrpc": "2.0", "id": 2, "method": "cancel", "params": {}})
         self.assertEqual(invalid["error"]["code"], -32602)
         self.assertIn("missing arguments", invalid["error"]["message"])
 
@@ -317,38 +323,7 @@ class ApiSocketTests(unittest.TestCase):
             worker.join(timeout=1)
             path.unlink(missing_ok=True)
 
-    def test_connections_have_isolated_sessions(self):
-        def exchange(lines):
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.connect(str(self.path))
-                stream = client.makefile("rb")
-                for line in lines:
-                    client.sendall(json.dumps(line).encode() + b"\n")
-                return [json.loads(stream.readline()) for _ in lines]
 
-        first = exchange([
-            {"jsonrpc": "2.0", "id": 1, "method": "fast", "params": {"runtime": "codex", "enabled": True}},
-            {"jsonrpc": "2.0", "id": 2, "method": "fast", "params": {}},
-        ])
-        second = exchange([{"jsonrpc": "2.0", "id": 3, "method": "fast", "params": {}}])
-        self.assertEqual(first[1]["result"], {"codex": True})
-        self.assertEqual(second[0]["result"], {"codex": False})
-
-    def test_account_fast_toggle_round_trip(self):
-        """One socket session can set and query an account-specific override."""
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect(str(self.path))
-            stream = client.makefile("rb")
-            for request in (
-                {"jsonrpc": "2.0", "id": 1, "method": "fast", "params": {"runtime": "codex", "account": "personal", "enabled": True}},
-                {"jsonrpc": "2.0", "id": 2, "method": "fast", "params": {}},
-            ):
-                client.sendall(json.dumps(request).encode() + b"\n")
-            self.assertEqual(json.loads(stream.readline())["result"], {"codex": False, "accounts": {"personal": True}})
-            self.assertEqual(json.loads(stream.readline()), {
-                "jsonrpc": "2.0", "id": 2,
-                "result": {"codex": False, "accounts": {"personal": True}},
-            })
 
     def test_socket_mode_and_stale_socket_replacement(self):
         mode = os.stat(self.path).st_mode & 0o777
@@ -424,10 +399,108 @@ class ApiSocketTests(unittest.TestCase):
         self.assertTrue(started.wait(1))
         began = time.monotonic()
         self.assertEqual(self.request({"jsonrpc": "2.0", "id": 2, "method": "ping"})["result"], {"ok": True})
-        self.assertEqual(self.request({"jsonrpc": "2.0", "id": 3, "method": "limits", "params": {}})["result"], {"ok": True})
+        self.assertEqual(self.request({"jsonrpc": "2.0", "id": 3, "method": "capacity_order", "params": {}})["result"], {"ok": True})
         self.assertLess(time.monotonic() - began, 0.5)
         waiter.join(timeout=2)
         self.assertTrue(pending["response"]["result"]["timed_out"])
+
+    def test_list_long_poll_outlives_read_deadline_without_blocking_reads(
+        self,
+    ) -> None:
+        """Keep a valid list wait off the ordinary read dispatcher."""
+
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        wait_services = []
+        factory_calls = 0
+
+        class DispatcherService(StubService):
+            """Serve the simultaneous zero-wait list on the normal read lane."""
+
+            def list(self, query):
+                """Return one immediate factual list response."""
+
+                self.list_query = query
+                return {"revision": 8}
+
+        dispatcher_service = DispatcherService()
+
+        class ListWaitService:
+            """Block one validated list call and record its owning thread."""
+
+            def __init__(self) -> None:
+                """Record the handler thread that owns this service."""
+
+                self.created_in = threading.get_ident()
+                self.called_in = None
+                self.closed_in = None
+                self.query = None
+
+            def list(self, query):
+                """Wait for release, then return one factual revision page."""
+
+                self.called_in = threading.get_ident()
+                self.query = query
+                started.set()
+                release.wait(1)
+                return {"revision": 7}
+
+            def close(self) -> None:
+                """Record owner-thread cleanup after the long poll returns."""
+
+                self.closed_in = threading.get_ident()
+
+        def factory():
+            """Create two dispatcher services, then the isolated wait service."""
+
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls <= 2:
+                return dispatcher_service
+            service = ListWaitService()
+            wait_services.append(service)
+            return service
+
+        self.replace_server(factory, request_timeout=0.05)
+        pending = {}
+        waiter = threading.Thread(
+            target=lambda: pending.setdefault(
+                "response",
+                self.request(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "list_agents",
+                        "params": {"after_revision": 7, "wait_seconds": 0.2},
+                    }
+                ),
+            )
+        )
+        waiter.start()
+        self.assertTrue(started.wait(1))
+        time.sleep(0.08)
+        self.assertTrue(waiter.is_alive())
+        self.assertEqual(
+            self.request(
+                {"jsonrpc": "2.0", "id": 2, "method": "list_agents"}
+            )["result"],
+            {"revision": 8},
+        )
+        self.assertEqual(dispatcher_service.list_query.wait_seconds, 0)
+        self.assertTrue(waiter.is_alive())
+        release.set()
+        waiter.join(timeout=1)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(pending["response"]["result"]["revision"], 7)
+        self.assertEqual(len(wait_services), 1)
+        wait_service = wait_services[0]
+        self.assertEqual(wait_service.query.wait_seconds, 0.2)
+        self.assertEqual(
+            wait_service.created_in,
+            wait_service.called_in,
+        )
+        self.assertEqual(wait_service.created_in, wait_service.closed_in)
 
     def test_request_deadline_and_queue_overload_are_explicit(self) -> None:
         """One running and one queued read bound waiting time and capacity."""
@@ -436,9 +509,9 @@ class ApiSocketTests(unittest.TestCase):
         release = threading.Event()
 
         class SlowService(StubService):
-            """Hold every limits call until the test releases the read lane."""
+            """Hold every capacity_order call until the test releases the read lane."""
 
-            def limits(self):
+            def capacity_order(self):
                 """Expose one deterministic slow read request."""
 
                 entered.set()
@@ -451,17 +524,17 @@ class ApiSocketTests(unittest.TestCase):
         )
         responses: list[dict] = []
 
-        def request_limits(request_id: int) -> None:
-            """Record one limits response from a separate connection."""
+        def request_capacity_order(request_id: int) -> None:
+            """Record one capacity_order response from a separate connection."""
 
             responses.append(
                 self.request(
-                    {"jsonrpc": "2.0", "id": request_id, "method": "limits"}
+                    {"jsonrpc": "2.0", "id": request_id, "method": "capacity_order"}
                 )
             )
 
-        first = threading.Thread(target=request_limits, args=(1,))
-        second = threading.Thread(target=request_limits, args=(2,))
+        first = threading.Thread(target=request_capacity_order, args=(1,))
+        second = threading.Thread(target=request_capacity_order, args=(2,))
         first.start()
         self.assertTrue(entered.wait(1))
         second.start()
@@ -470,7 +543,7 @@ class ApiSocketTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.005)
         overloaded = self.request(
-            {"jsonrpc": "2.0", "id": 3, "method": "limits"}
+            {"jsonrpc": "2.0", "id": 3, "method": "capacity_order"}
         )
         self.assertEqual(overloaded["error"]["code"], -32001)
         first.join(timeout=1)
@@ -481,8 +554,8 @@ class ApiSocketTests(unittest.TestCase):
         )
         release.set()
 
-    def test_slow_models_lane_does_not_delay_durable_cancel(self) -> None:
-        """Cancel stays responsive while model probing occupies the read owner."""
+    def test_slow_capacity_order_lane_does_not_delay_durable_cancel(self) -> None:
+        """Cancel stays responsive while capacity ordering occupies the read owner."""
 
         entered = threading.Event()
         release = threading.Event()
@@ -490,8 +563,8 @@ class ApiSocketTests(unittest.TestCase):
         class LaneService(StubService):
             """Expose one slow read and one fast durable control operation."""
 
-            def models(self):
-                """Block model discovery until the latency sample completes."""
+            def capacity_order(self):
+                """Block capacity ordering until the latency sample completes."""
 
                 entered.set()
                 release.wait(2)
@@ -504,13 +577,13 @@ class ApiSocketTests(unittest.TestCase):
 
         service = LaneService()
         self.replace_server(lambda: service, request_timeout=2)
-        model_response: list[dict] = []
-        model_worker = threading.Thread(
-            target=lambda: model_response.append(
-                self.request({"jsonrpc": "2.0", "id": 1, "method": "models"})
+        order_response: list[dict] = []
+        order_worker = threading.Thread(
+            target=lambda: order_response.append(
+                self.request({"jsonrpc": "2.0", "id": 1, "method": "capacity_order"})
             )
         )
-        model_worker.start()
+        order_worker.start()
         self.assertTrue(entered.wait(1))
         durations = []
         for request_id in range(2, 22):
@@ -528,8 +601,8 @@ class ApiSocketTests(unittest.TestCase):
         p95 = sorted(durations)[18]
         self.assertLess(p95, 1.0)
         release.set()
-        model_worker.join(timeout=2)
-        self.assertEqual(model_response[0]["result"], {})
+        order_worker.join(timeout=2)
+        self.assertEqual(order_response[0]["result"], {})
 
     def test_shutdown_closes_each_owner_service_once_in_its_thread(self) -> None:
         """Shutdown closes both thread-affine services exactly once."""
@@ -600,7 +673,7 @@ class ApiSocketTests(unittest.TestCase):
         # SQLite connections are thread-affine: every tool call must execute
         # on the dispatcher thread, never on per-connection handler threads.
         for request_id in (1, 2):
-            self.request({"jsonrpc": "2.0", "id": request_id, "method": "limits", "params": {}})
+            self.request({"jsonrpc": "2.0", "id": request_id, "method": "capacity_order", "params": {}})
         self.assertEqual(len(set(self.service.call_threads)), 1)
         self.assertNotIn(threading.get_ident(), self.service.call_threads)
 

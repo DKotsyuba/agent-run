@@ -26,9 +26,7 @@ def build_capacity_order(store: StateStore, config: Config, *, now: float) -> Ca
     enabled = {
         name: runtime for name, runtime in config.runtimes.items() if runtime.enabled
     }
-    snapshot = build_capacity_routes(
-        store, retention=config.capacity.sample_retention, now=now
-    )
+    snapshot = build_capacity_routes(store, now=now)
     filtered = CapacityRouteSnapshot(
         tuple(route for route in snapshot.routes if route.descriptor.runtime in enabled),
         tuple(item for item in snapshot.deferred if item.runtime in enabled),

@@ -54,7 +54,6 @@ class CoreConfig:
 @dataclass(frozen=True)
 class CapacityConfig:
     collect_interval_seconds: int = 300
-    sample_retention: int = 1000
     context_max_chars: int = 2500
     codexbar_binary: Path = Path("/opt/homebrew/bin/codexbar")
 
@@ -169,6 +168,7 @@ class Config:
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     profiles: ProfilesConfig = field(default_factory=ProfilesConfig)
+    skills_directory: Path = Path("~/.agent-run/skills")
     mcp: Mapping[str, McpConfig] = field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -455,7 +455,6 @@ def _parse_capacity(value: object) -> CapacityConfig:
         table,
         {
             "collect_interval_seconds",
-            "sample_retention",
             "context_max_chars",
             "codexbar_binary",
         },
@@ -476,7 +475,6 @@ def _parse_capacity(value: object) -> CapacityConfig:
     codexbar_binary = table.get("codexbar_binary")
     return CapacityConfig(
         interval,
-        _int(table.get("sample_retention", 1000), "capacity.sample_retention", minimum=1),
         context_max_chars,
         Path("/opt/homebrew/bin/codexbar")
         if codexbar_binary is None
@@ -515,6 +513,14 @@ def _parse_profiles(value: object) -> ProfilesConfig:
     table = _table(value, "profiles")
     _reject_unknown(table, {"directory"}, "profiles")
     return ProfilesConfig(_path(table.get("directory", "~/.agent-run/profiles"), "profiles.directory"))
+
+
+def _parse_skills(value: object) -> Path:
+    """Parse the one canonical skill catalog location."""
+
+    table = _table(value, "skills")
+    _reject_unknown(table, {"directory"}, "skills")
+    return _path(table.get("directory", "~/.agent-run/skills"), "skills.directory")
 
 
 def _parse_mcp(value: object) -> Mapping[str, McpConfig]:
@@ -707,15 +713,16 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             if default_account not in account_names:
                 raise ValidationError(f"{path}.default_account must be declared in accounts")
         parsed_auth = None if auth is None else _parse_auth(auth, f"{path}.auth")
-        claude_environment_accounts = (
-            adapter == "agent_run.adapters.claude.adapter:ADAPTER"
-            and parsed_auth is not None
-            and parsed_auth.kind == "environment"
-        )
-        if account_names and not claude_environment_accounts and (
-            parsed_auth is None or parsed_auth.kind != "file_link"
-        ):
-            raise ValidationError(f"{path}.accounts requires file_link auth")
+        scoped_accounts = adapter in {
+            "agent_run.adapters.codex:ADAPTER",
+            "agent_run.adapters.codex.adapter:ADAPTER",
+            "agent_run.adapters.claude:ADAPTER",
+            "agent_run.adapters.claude.adapter:ADAPTER",
+        }
+        if account_names and not scoped_accounts:
+            raise ValidationError(
+                f"{path}.accounts is supported only by codex and claude adapters"
+            )
         priority_multiplier = table.get("priority_multiplier", 1.0)
         if (
             isinstance(priority_multiplier, bool)
@@ -784,7 +791,7 @@ def load_config(path: str | Path) -> Config:
             raw = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValidationError(f"cannot load config {path}: {error}") from error
-    _reject_unknown(raw, {"schema_version", "core", "capacity", "delivery", "profiles", "mcp", "environments", "runtimes"}, "")
+    _reject_unknown(raw, {"schema_version", "core", "capacity", "delivery", "profiles", "skills", "mcp", "environments", "runtimes"}, "")
     version = raw.get("schema_version")
     if type(version) is not int or version != 1:
         raise ValidationError(f"unsupported schema_version: {version!r}")
@@ -803,6 +810,7 @@ def load_config(path: str | Path) -> Config:
         capacity=_parse_capacity(raw.get("capacity", {})),
         delivery=_parse_delivery(raw.get("delivery", {})),
         profiles=_parse_profiles(raw.get("profiles", {})),
+        skills_directory=_parse_skills(raw.get("skills", {})),
         mcp=mcp,
         environments=environments,
         runtimes=runtimes,

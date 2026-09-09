@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from agent_run import doctor
+from agent_run import role_plan
 from agent_run.config import Config, RuntimeAuthConfig, RuntimeConfig, RuntimeHookConfig
 from agent_run.doctor import run_doctor
 from agent_run.domain import AgentStatus, StartRequest
@@ -23,6 +24,73 @@ from tests.test_launch import child_pythonpath
 
 
 class DoctorTests(unittest.TestCase):
+    def test_canonical_role_readiness_uses_shared_catalog_without_runtime_home(self) -> None:
+        """Validate role assets and reject legacy runtime lists outside start."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            profiles = home / "profiles"
+            profiles.mkdir()
+            skills = home / "skills"
+            skill = skills / "code-reading"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("Read code.\n", encoding="utf-8")
+            (profiles / "review.md").write_text(
+                """+++
+revision = "1"
+write = false
+network = false
+allow_external_read_roots = true
+skills = ["code-reading"]
+mcp = ["codegraph"]
+required_constraints = []
++++
+Review.
+""",
+                encoding="utf-8",
+            )
+            (profiles / "inspect.md").write_text(
+                (profiles / "review.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            base = f'''schema_version = 1
+[profiles]
+directory = "{profiles}"
+[skills]
+directory = "{skills}"
+[mcp.codegraph]
+transport = "stdio"
+command = "/bin/echo"
+[runtimes.fake]
+enabled = true
+adapter = "example:ADAPTER"
+binary = "/bin/echo"
+home = "{home / 'not-materialized'}"
+models = ["model"]
+'''
+            (home / "config.toml").write_text(base, encoding="utf-8")
+            StateStore.initialize(home / "state.db").close()
+            with mock.patch(
+                "agent_run.role_plan.tree_revision",
+                wraps=role_plan.tree_revision,
+            ) as revision:
+                report = run_doctor(
+                    home, at=1, canary_runner=lambda: 1, mcp_process_lister=lambda: []
+                )
+            self.assertEqual(revision.call_count, 1)
+            codes = {finding.code for finding in report.findings}
+            self.assertNotIn("role_invalid", codes)
+            self.assertNotIn("runtime_home_missing", codes)
+
+            (home / "config.toml").write_text(
+                base.replace('models = ["model"]', 'models = ["model"]\nskills = ["legacy"]'),
+                encoding="utf-8",
+            )
+            mixed = run_doctor(
+                home, at=1, canary_runner=lambda: 1, mcp_process_lister=lambda: []
+            )
+            self.assertIn("mixed_role_assets", {item.code for item in mixed.findings})
+
     def test_reports_bounded_metadata_without_mutating_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
@@ -30,7 +98,9 @@ class DoctorTests(unittest.TestCase):
             runtime_home.mkdir()
             config = home / "config.toml"
             config.write_text(
-                f'''schema_version = 1
+                    f'''schema_version = 1
+[profiles]
+directory = "{home / 'missing-profiles'}"
 [mcp.missing]
 transport = "stdio"
 command = "{home / 'missing-mcp'}"
@@ -74,9 +144,9 @@ models = ["model"]
                 at=3,
             )
             store.transition(agent_id, AgentStatus.RUNNING, at=4)
-            store.insert_capacity_sample(
-                runtime="codex", lane="requests", window="5h", source="test",
-                payload={}, observed_at=1, valid_until=2,
+            store.replace_capacity_snapshot(
+                runtime="codex", scope_id="test", observed_at=1, valid_until=2,
+                payload={"samples": [], "pools": [], "routes": []},
             )
             store.close()
             database = home / "state.db"
@@ -96,8 +166,7 @@ models = ["model"]
                 {
                     "mcp_executable_missing",
                     "runtime_binary_missing",
-                    "runtime_home_missing",
-                    "runtime_home_unsupported",
+                    "profile_directory_missing",
                     "runtime_skill_missing",
                     "hook_executable_missing",
                     "hook_untrusted",
@@ -106,7 +175,8 @@ models = ["model"]
                     "capacity_stale",
                     "dead_supervisor",
                     "suspected_orphan",
-                }.issubset(codes)
+                }.issubset(codes),
+                codes,
             )
             self.assertFalse(report.ok)
             self.assertEqual(before, (database.stat().st_mtime_ns, database.stat().st_mode))
@@ -515,16 +585,13 @@ class HookTrustTests(unittest.TestCase):
 
 
 class CapacityStalenessTests(unittest.TestCase):
-    """``valid_until`` decides staleness; age is only the fallback bound."""
+    """Explicit current-snapshot validity decides staleness."""
 
     @staticmethod
-    def _row(lane: str, observed_at: float, valid_until: float | None) -> dict:
+    def _row(lane: str, observed_at: float, valid_until: float) -> dict:
         return {
             "runtime": "qwen",
-            "lane": lane,
-            "window": "5h",
-            "target": None,
-            "source": "omniroute",
+            "scope_id": lane,
             "observed_at": observed_at,
             "valid_until": valid_until,
         }
@@ -541,8 +608,3 @@ class CapacityStalenessTests(unittest.TestCase):
 
     def test_an_expired_sample_is_stale_even_when_recently_observed(self) -> None:
         self.assertEqual(self._lanes([self._row("expired", 999, 500)]), ["expired"])
-
-    def test_a_sample_without_validity_keeps_the_age_bound(self) -> None:
-        rows = [self._row("aged", 100, None), self._row("recent", 900, None)]
-
-        self.assertEqual(self._lanes(rows), ["aged"])

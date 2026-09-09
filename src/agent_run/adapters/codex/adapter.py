@@ -22,7 +22,8 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
-from ...profiles import AgentProfile, normalize_read_roots
+from ...profiles import normalize_read_roots
+from ...role_plan import ResolvedRolePlan
 from ..base import (
     ADAPTER_API_VERSION,
     Capability,
@@ -35,7 +36,6 @@ from ..base import (
     RuntimeInfo,
     RuntimeSession,
 )
-from ..developer_environment import configured_environment_keys, environment_digest
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
@@ -43,10 +43,10 @@ from ..plugin_skills import skill_dirs
 from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
 from .environment import (
+    auth_bridge,
     bridge_points_at_source,
     build_environment,
-    developer_approval_fields,
-    developer_config_lines,
+    approval_fields,
     prepared_environment,
     require_resolved_mcp,
     resolved_directory,
@@ -245,14 +245,14 @@ class CodexAdapter:
     def validate(self, config: RuntimeConfig) -> None:
         """Validate Codex configuration accepted by the isolated adapter.
 
-        ``config`` must be a ``RuntimeConfig`` with Codex's file-link auth and
-        at least one model. A declared Rust table is applied only to the
-        per-launch child environment.
+        ``config`` must be a ``RuntimeConfig`` with at least one model. Auth may
+        be absent to use the host Codex account or an explicit file-link for a
+        separate account.
         """
         if not isinstance(config, RuntimeConfig):
             raise ValidationError("codex adapter requires a RuntimeConfig")
-        if config.auth is None or config.auth.kind != "file_link":
-            raise ValidationError("codex runtime requires a file_link auth bridge")
+        if config.auth is not None and config.auth.kind != "file_link":
+            raise ValidationError("codex runtime auth must be a file_link bridge")
         if not config.models:
             raise ValidationError("codex runtime requires at least one configured model")
 
@@ -309,9 +309,7 @@ class CodexAdapter:
             mcp_lines.append(f"[mcp_servers.{name}]")
             mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
             mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
-            mcp_environment = tuple(
-                dict.fromkeys((*mcp_def.env_from, *configured_environment_keys(config)))
-            )
+            mcp_environment = mcp_def.env_from
             if mcp_environment:
                 mcp_lines.append(f"env_vars = {_toml_array(mcp_environment)}")
             mcp_lines.append("")
@@ -355,7 +353,6 @@ class CodexAdapter:
             "model_auto_compact_token_limit = 780000",
             'model_auto_compact_token_limit_scope = "total"',
             "",
-            *developer_config_lines(config),
             *mcp_lines,
             *hook_lines,
             *trust_lines,
@@ -377,24 +374,25 @@ class CodexAdapter:
             Path(home) / "command-refusals",
             environment=policy_environment,
         )
+        policy_text = render_codex_denial_rules(
+            denied_commands,
+            command_paths=tuple(command_policy.resolved_commands.values()),
+        )
         write_managed_file(
             home,
             "rules/agent-run-command-policy.rules",
-            render_codex_denial_rules(
-                denied_commands,
-                command_paths=tuple(command_policy.resolved_commands.values()),
-            ),
+            policy_text,
         )
 
         auth_digest = ""
         managed_links: tuple[tuple[str, str], ...] = ()
-        if config.auth is not None and config.auth.kind == "file_link":
-            if config.auth.source is None:
-                raise ValidationError("codex file_link auth source is missing")
-            auth_target = str(config.auth.source.expanduser().resolve(strict=True))
-            create_symlink_bridge(home, config.auth.target, config.auth.source)
+        bridge = auth_bridge(config)
+        if bridge is not None:
+            source, target = bridge
+            auth_target = str(source.expanduser().resolve(strict=True))
+            create_symlink_bridge(home, target, source)
             auth_digest = auth_target
-            managed_links = ((config.auth.target, auth_target),)
+            managed_links = ((target, auth_target),)
 
         fingerprint = "\n".join(
             [
@@ -403,7 +401,7 @@ class CodexAdapter:
                 *hook_digests,
                 plugin_digest,
                 auth_digest,
-                environment_digest(config),
+                content_hash(policy_text),
             ]
         )
         revision = content_hash(fingerprint)
@@ -431,8 +429,10 @@ class CodexAdapter:
         binary_ok = config.binary.exists() and os.access(config.binary, os.X_OK)
         home_ok = home_path.is_dir() and (home_path / _CONFIG_REL).is_file()
         auth_ok = None
-        if config.auth is not None and config.auth.kind == "file_link":
-            auth_ok = bridge_points_at_source(home_path / config.auth.target, config.auth.source)
+        bridge = auth_bridge(config)
+        if bridge is not None:
+            source, target = bridge
+            auth_ok = bridge_points_at_source(home_path / target, source)
         version, version_reason = observe_binary_version(config.binary, home_path)
         available = bool(binary_ok and home_ok and (auth_ok is not False))
         reason = (
@@ -541,19 +541,17 @@ class CodexAdapter:
     def prepare(
         self,
         request: StartRequest,
-        profile: AgentProfile,
+        role: ResolvedRolePlan,
         config: RuntimeConfig,
         home: Path,
         agent_dir: Path,
         *,
-        mcp_servers: Mapping[str, McpConfig],
         resume_session_id: str | None = None,
     ) -> LaunchPlan:
         """Build an isolated Codex launch plan for an authorized request.
 
-        Validates ``request`` against ``profile`` and ``config``. Network
-        profiles receive app-server's tagged sandbox request form; other
-        profiles retain the legacy string sandbox mode. Workspace-write
+        Validates request grants and runtime assets against ``role``. Network
+        roles receive app-server's tagged sandbox request form. Workspace-write
         threads cannot grant external read roots in the pinned app-server
         contract. ``gpt-6-astra`` is limited to read-only architecture and
         review roles. Raises ``ValidationError`` when an authorization or
@@ -561,10 +559,17 @@ class CodexAdapter:
         """
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
-        if not isinstance(profile, AgentProfile):
-            raise ValidationError("prepare requires an AgentProfile")
+        if not isinstance(role, ResolvedRolePlan):
+            raise ValidationError("prepare requires a ResolvedRolePlan")
+        if request.profile != role.role_name:
+            raise ValidationError("codex request profile does not match the resolved role")
         self.validate(config)
-        require_resolved_mcp(config, mcp_servers, "prepare")
+        if config.skills != tuple(skill.id for skill in role.skills) or config.mcp != tuple(
+            server.id for server in role.mcp
+        ):
+            raise ValidationError("codex runtime assets do not match the resolved role")
+        if request.write != role.write or request.read_roots != role.read_roots:
+            raise ValidationError("codex request grants do not match the resolved role")
         if request.runtime != "codex":
             raise ValidationError(f"codex adapter cannot prepare runtime {request.runtime!r}")
         if request.model not in config.models:
@@ -572,9 +577,11 @@ class CodexAdapter:
         if request.output_schema is not None:
             raise ValidationError("codex runtime does not support output_schema")
         if request.model == "gpt-6-astra":
-            if profile.name not in ("role-architect", "role-review"):
-                raise ValidationError("gpt-6-astra is limited to role-architect and role-review")
-            if request.write:
+            if role.role_name not in ("role-architect", "role-review"):
+                raise ValidationError(
+                    "gpt-6-astra is limited to role-architect and role-review"
+                )
+            if role.write:
                 raise ValidationError("gpt-6-astra does not permit write-capable launches")
 
         discovered = {info.id: info for info in self.models(config, home)}
@@ -587,13 +594,7 @@ class CodexAdapter:
             raise ValidationError(
                 f"effort {request.effort!r} is not offered for model {request.model!r}"
             )
-        if request.write and not profile.write:
-            raise ValidationError("profile does not grant write access for this request")
-        effective_write = bool(request.write and profile.write)
-        if not profile.write and not profile.read_roots and not request.read_roots:
-            raise ValidationError(
-                "codex refuses a no-filesystem profile: grant write or at least one read root"
-            )
+        effective_write = role.write
         home_path = Path(home)
         if not (home_path / _CONFIG_REL).is_file():
             raise ValidationError(f"codex home is not materialized: {home_path}")
@@ -602,7 +603,7 @@ class CodexAdapter:
         roots = tuple(
             str(root)
             for root in normalize_read_roots(
-                (workdir, *profile.read_roots, *request.read_roots)
+                (workdir, *role.read_roots)
             )
         )
         # The writable grant never widens beyond the workdir, even when a read
@@ -622,11 +623,18 @@ class CodexAdapter:
         # so leaving ``HOME`` out does not unset it -- the engine falls back to
         # the passwd entry and reads the operator's own global skills straight
         # past this generated home (defect T20B).
+        denied_commands = (
+            config.environment.denied_commands if config.environment is not None else ()
+        )
         environment = prepared_environment(
             config.binary,
             home_path,
-            config,
-            workdir,
+            mcp_environment_names=tuple(
+                dict.fromkeys(
+                    env_name for server in role.mcp for env_name in server.env_from
+                )
+            ),
+            denied_commands=denied_commands,
             refresh=resume_session_id is None,
         )
         if config.plugins and not effective_write:
@@ -641,15 +649,15 @@ class CodexAdapter:
             "model": request.model,
             "effort": request.effort,
             "sandbox_mode": sandbox_mode,
-            **developer_approval_fields(config, effective_write),
+            **approval_fields(effective_write),
             "roots": roots,
             "writable_roots": writable_roots,
-            "mcp": tuple(config.mcp),
-            "skills": tuple(config.skills),
-            "profile": profile.name,
+            "mcp": tuple(server.id for server in role.mcp),
+            "skills": tuple(skill.id for skill in role.skills),
+            "profile": role.role_name,
             "request_timeout_seconds": request.timeout_seconds,
         }
-        if profile.network:
+        if role.network:
             # The app-server's read-only sandbox is a unit variant: it takes
             # no parameters, so network access cannot be granted without also
             # granting workspace writes. Refuse rather than widen the sandbox
@@ -668,12 +676,8 @@ class CodexAdapter:
             argv=tuple(argv),
             cwd=workdir,
             environment=MappingProxyType(environment),
-            # The profile preamble reaches this engine only here: codex
-            # app-server takes no system-prompt argument, and the generated
-            # home carries no instructions file. Without this the child ran
-            # the task with the profile's permissions but none of its wording
-            # -- including the role assignment a ``role-*`` contract requires.
-            initial_input=f"{profile.body}\n\n{request.task}",
+            # app-server has no system-prompt argument, so prepend the role.
+            initial_input=f"{role.prompt}\n\n{request.task}",
             runtime_stream_path=Path(agent_dir) / "runtime.jsonl",
             adapter_state=MappingProxyType(adapter_state),
             answer_path=Path(agent_dir) / "answer.md",

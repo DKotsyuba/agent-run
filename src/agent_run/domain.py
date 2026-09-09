@@ -154,9 +154,11 @@ class OrchestratorRef:
 class StartRequest:
     """One validated launch request and its explicit policy requirements.
 
-    Runtime/model/profile/task/workdir select execution; write, effort, timeout,
-    read roots, output schema, fast mode and account refine it. Orchestrator and
-    request ID provide notification and replay identity. Required constraints
+    Runtime/model/profile/task/workdir select execution; write, effort, read
+    roots, output schema, fast mode and account refine it. ``timeout_seconds`` is
+    retained only for legacy request, replay, and snapshot compatibility; it
+    never stops runtime execution. Orchestrator and request ID provide
+    notification and replay identity. Required constraints
     are an immutable typed set of policy boundaries admission must prove; the
     empty default preserves legacy behavior. Paths resolve at construction,
     while invalid scalar, collection, policy, or filesystem inputs raise

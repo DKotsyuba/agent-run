@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
@@ -18,11 +19,11 @@ from agent_run.config import (
     RuntimeAuthConfig,
     RuntimeConfig,
     RuntimeHookConfig,
-    RustConfig,
 )
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
-from agent_run.profiles import AgentProfile
+from agent_run.profiles import AgentProfile, normalize_read_roots
+from role_helpers import resolved_role
 
 
 class ClaudeAdapterTests(unittest.TestCase):
@@ -80,7 +81,22 @@ class ClaudeAdapterTests(unittest.TestCase):
         return StartRequest(**values)
 
     def prepare(self, *args, mcp_servers: dict = {}, **kwargs):
-        return self.adapter.prepare(*args, mcp_servers=mcp_servers, **kwargs)
+        request, profile, config, home, agent_dir = args
+        request = replace(
+            request,
+            profile=profile.name,
+            read_roots=normalize_read_roots(
+                (*profile.read_roots, *request.read_roots)
+            ),
+        )
+        return self.adapter.prepare(
+            request,
+            resolved_role(request, profile, config, mcp_servers),
+            config,
+            home,
+            agent_dir,
+            **kwargs,
+        )
 
     def materialize(self, *args, mcp_servers: dict = {}, **kwargs):
         skills_root = kwargs.pop(
@@ -104,10 +120,11 @@ class ClaudeAdapterTests(unittest.TestCase):
 
     # -- validate -------------------------------------------------------
 
-    def test_validate_requires_environment_auth_from_the_known_names(self) -> None:
+    def test_validate_accepts_global_or_known_environment_auth(self) -> None:
+        """Use native Claude state or a selected environment credential."""
+
         self.adapter.validate(self.runtime_config())
-        with self.assertRaisesRegex(ValidationError, "requires an auth bridge"):
-            self.adapter.validate(self.runtime_config(auth=None))
+        self.adapter.validate(self.runtime_config(auth=None))
         with self.assertRaisesRegex(ValidationError, "auth.kind must be"):
             self.adapter.validate(
                 self.runtime_config(auth=RuntimeAuthConfig("file_link", source=Path("/tmp"), target="a"))
@@ -315,11 +332,13 @@ class ClaudeAdapterTests(unittest.TestCase):
 
     # -- mcp_servers is required --------------------------------------------
 
-    def test_materialize_and_prepare_require_the_mcp_servers_keyword(self) -> None:
+    def test_materialize_requires_mcp_mapping_and_prepare_requires_role(self) -> None:
+        """Keep asset resolution explicit and reject an unresolved profile object."""
+
         config = self.runtime_config()
         with self.assertRaises(TypeError):
             self.adapter.materialize(config, self.home)
-        with self.assertRaises(TypeError):
+        with self.assertRaisesRegex(ValidationError, "ResolvedRolePlan"):
             self.adapter.prepare(self.request(), self.profile(), config, self.home, self.agent_dir)
 
     # -- materialize ---------------------------------------------------------
@@ -623,7 +642,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.home,
                 self.agent_dir,
             )
-            with self.assertRaisesRegex(ValidationError, "does not allow requested write"):
+            with self.assertRaisesRegex(ValidationError, "grants do not match"):
                 self.prepare(
                     self.request(write=True),
                     self.profile(write=False),
@@ -688,8 +707,8 @@ class ClaudeAdapterTests(unittest.TestCase):
             roots, tuple(sorted(roots, key=lambda value: (len(Path(value).parts), value)))
         )
 
-    def test_prepare_sets_isolated_home_and_copies_only_declared_environment(self) -> None:
-        """Verify preparation resolves the managed Python directory from the child environment."""
+    def test_prepare_inherits_host_environment_with_runtime_home(self) -> None:
+        """Inherit host tooling while replacing homes and filtering unrelated secrets."""
         managed_python = self.root / "managed-uv-python"
         managed_python.mkdir()
         ambient = {
@@ -707,16 +726,16 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.home,
                 self.agent_dir,
             )
+        self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(
-            dict(plan.environment),
-            {
-                "HOME": str(self.home),
-                "CLAUDE_CONFIG_DIR": str(self.home / "claude-config"),
-                "PATH": "/usr/bin",
-                "ANTHROPIC_API_KEY": "sk-test",
-                "UV_PYTHON_INSTALL_DIR": str(managed_python),
-            },
+            plan.environment["CLAUDE_CONFIG_DIR"], "/ambient/claude"
         )
+        self.assertEqual(plan.environment["PATH"], "/usr/bin")
+        self.assertEqual(plan.environment["ANTHROPIC_API_KEY"], "sk-test")
+        self.assertEqual(
+            plan.environment["UV_PYTHON_INSTALL_DIR"], str(managed_python)
+        )
+        self.assertNotIn("UNRELATED_SECRET", plan.environment)
         self.assertNotIn("/ambient", " ".join(plan.argv))
 
     def test_prepare_adds_dirs_and_mcp_flags_and_never_leaks_secrets_into_argv(self) -> None:
@@ -755,28 +774,10 @@ class ClaudeAdapterTests(unittest.TestCase):
                     self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
                 )
 
-    def test_prepare_provisions_rust_for_read_only_mcp_without_ambient_overrides(self) -> None:
-        """Configured Rust works for a read-only plan and supplies the same values to MCP."""
+    def test_prepare_inherits_host_toolchain_for_read_only_mcp(self) -> None:
+        """Pass host Rust paths to the runtime and selected MCP without probing them."""
 
-        rustup_home = self.root / "rustup"
-        rustup_home.mkdir()
-        cargo_bin = self.root / "cargo-bin"
-        cargo_bin.mkdir()
-        for name, text in {
-            "cargo": "#!/bin/sh\nexit 0\n",
-            "rustc": "#!/bin/sh\nexit 0\n",
-            "rust-analyzer": "#!/bin/sh\nexit 0\n",
-            "rustup": (
-                "#!/bin/sh\n"
-                "if [ \"$1\" = --version ]; then echo 'rustup 1.28.1'; exit 0; fi\n"
-                "if [ \"$1\" = show ]; then echo active; exit 0; fi\n"
-                "printf '%s\\n' rust-src rust-analyzer\n"
-            ),
-        }.items():
-            proxy = cargo_bin / name
-            proxy.write_text(text, encoding="utf-8")
-            proxy.chmod(0o755)
-        config = self.runtime_config(mcp=("rust_lsp",), rust=RustConfig(rustup_home, cargo_bin))
+        config = self.runtime_config(mcp=("rust_lsp",))
         servers = {
             "rust_lsp": McpConfig(
                 "stdio", Path("/bin/agent-lsp"), (), ("RUSTUP_HOME", "CARGO_HOME", "PATH")
@@ -784,36 +785,22 @@ class ClaudeAdapterTests(unittest.TestCase):
         }
         with patch.dict(
             "os.environ",
-            {"ANTHROPIC_API_KEY": "sk-test", "RUSTUP_HOME": "/stale", "PATH": "/ambient/bin"},
+            {
+                "ANTHROPIC_API_KEY": "sk-test",
+                "RUSTUP_HOME": "/host/rustup",
+                "CARGO_HOME": "/host/cargo",
+                "PATH": "/ambient/bin",
+            },
             clear=False,
         ):
             plan = self.prepare(
                 self.request(), self.profile(), config, self.home, self.agent_dir, mcp_servers=servers
             )
-        self.assertEqual(plan.environment["RUSTUP_HOME"], str(rustup_home))
-        self.assertEqual(plan.environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
-        self.assertTrue(plan.environment["PATH"].startswith(str(cargo_bin) + os.pathsep))
-        self.assertEqual(plan.environment["RUSTUP_AUTO_INSTALL"], "0")
+        self.assertEqual(plan.environment["RUSTUP_HOME"], "/host/rustup")
+        self.assertEqual(plan.environment["CARGO_HOME"], "/host/cargo")
+        self.assertEqual(plan.environment["PATH"], "/ambient/bin")
         self.assertFalse((self.workdir / ".cargo-home").exists())
-        descriptor = json.loads((self.agent_dir / "mcp" / "mcp-config.json").read_text())
-        mcp_environment = descriptor["mcpServers"]["rust_lsp"]["env"]
-        self.assertEqual(mcp_environment["CARGO_HOME"], str(self.workdir / ".cargo-home"))
-        self.assertEqual(set(mcp_environment), {"PATH", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_AUTO_INSTALL"})
-        self.assertNotIn("ANTHROPIC_API_KEY", json.dumps(descriptor))
-        other_workdir = self.root / "other-work"
-        other_workdir.mkdir()
-        other_agent_dir = self.root / "agents" / "ag-2"
-        other_agent_dir.mkdir()
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "PATH": "/ambient/bin"}, clear=False):
-            self.prepare(
-                self.request(workdir=other_workdir), self.profile(), config, self.home, other_agent_dir,
-                mcp_servers=servers,
-            )
-        other_descriptor = json.loads((other_agent_dir / "mcp" / "mcp-config.json").read_text())
-        self.assertEqual(
-            other_descriptor["mcpServers"]["rust_lsp"]["env"]["CARGO_HOME"],
-            str(other_workdir / ".cargo-home"),
-        )
+        self.assertNotIn("ANTHROPIC_API_KEY", " ".join(plan.argv))
 
     def test_prepare_exposes_the_skill_tool_only_when_skills_are_configured(self) -> None:
         # --plugin-dir registers the skills, but the child can neither see
@@ -840,6 +827,25 @@ class ClaudeAdapterTests(unittest.TestCase):
 
     # -- scoped Claude CLI credentials --------------------------------------
 
+    def test_prepare_uses_native_global_claude_state_by_default(self) -> None:
+        """Point an unlabelled run at the host CLI state without copying it."""
+
+        native = self.root / "native-claude"
+        with patch.dict(
+            os.environ,
+            {"CLAUDE_CONFIG_DIR": str(native), "ANTHROPIC_API_KEY": "sk-test"},
+            clear=False,
+        ):
+            plan = self.prepare(
+                self.request(),
+                self.profile(),
+                self.runtime_config(auth=None),
+                self.home,
+                self.agent_dir,
+            )
+        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
+        self.assertFalse(native.exists())
+
     def test_prepare_scopes_cli_state_without_injecting_an_oauth_token(self) -> None:
         """A bare launch leaves refresh ownership to a durable private CLI home."""
 
@@ -853,6 +859,29 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(config_dir))
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", plan.environment)
         self.assertEqual(config_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_labelled_state_drops_ambient_global_credentials(self) -> None:
+        """Keep global Claude tokens out of an explicitly scoped account plan."""
+
+        state_home = self.root / "labelled-home"
+        config = self.runtime_config(auth=None, credential_state_home=state_home)
+        with patch.dict(
+            os.environ,
+            {
+                "CLAUDE_CODE_OAUTH_TOKEN": "global-oauth",
+                "ANTHROPIC_API_KEY": "global-api-key",
+            },
+            clear=False,
+        ):
+            plan = self.prepare(
+                self.request(), self.profile(), config, self.home, self.agent_dir
+            )
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", plan.environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", plan.environment)
+        self.assertEqual(
+            plan.environment["CLAUDE_CONFIG_DIR"],
+            str(state_home / "claude-config"),
+        )
 
     def test_prepare_reasserts_scoped_state_after_a_developer_preset(self) -> None:
         """A preset cannot redirect the Claude credential store it inherits."""

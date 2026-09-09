@@ -9,7 +9,6 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, Mapping, Protocol
 
 import psutil
@@ -45,48 +44,6 @@ def checked_pgid(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 1:
         raise ValidationError("process group id must be an integer above 1")
     return value
-
-
-class Phase(str, Enum):
-    RUNNING = "running"
-    WARNING = "warning"
-    EXPIRED = "expired"
-
-
-@dataclass(frozen=True)
-class Deadline:
-    """Monotonic budget with a single warning point before the hard stop."""
-
-    started_at: float
-    timeout_seconds: float
-    warning_fraction: float = 0.90
-
-    def __post_init__(self) -> None:
-        _nonnegative("started_at", self.started_at)
-        _positive("timeout_seconds", self.timeout_seconds)
-        fraction = self.warning_fraction
-        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
-            raise ValidationError("warning_fraction must be within (0, 1]")
-        if not math.isfinite(fraction) or not 0 < fraction <= 1:
-            raise ValidationError("warning_fraction must be within (0, 1]")
-
-    @property
-    def warning_at(self) -> float:
-        return self.started_at + self.timeout_seconds * self.warning_fraction
-
-    @property
-    def expires_at(self) -> float:
-        return self.started_at + self.timeout_seconds
-
-    def remaining(self, now: float) -> float:
-        return max(0.0, self.expires_at - now)
-
-    def phase(self, now: float) -> Phase:
-        if now >= self.expires_at:
-            return Phase.EXPIRED
-        if now >= self.warning_at:
-            return Phase.WARNING
-        return Phase.RUNNING
 
 
 class ProcessOps(Protocol):

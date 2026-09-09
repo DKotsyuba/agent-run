@@ -17,11 +17,11 @@ from agent_run.config import Config, ProfilesConfig, RuntimeConfig
 from agent_run.delivery.base import DeliveryReceipt
 from agent_run.delivery.dispatch import DeliveryDispatcher
 from agent_run.domain import AgentStatus, Message, MessageRole, OrchestratorRef, Outcome, StartRequest
-from agent_run.dispatch import Session, call_tool
 from agent_run.errors import ValidationError
 from agent_run.hooks.bind import BindHookError, bind
 from agent_run.mcp import serve
 from agent_run.paths import agent_dir
+from agent_run.preparation import prepare_launch
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.store import StateStore
 from agent_run.supervisor import Supervisor, SupervisorSettings
@@ -171,15 +171,21 @@ class M008IntegrationTests(unittest.TestCase):
         self.fail("asynchronous integration condition did not become true")
 
     def test_async_start_supervisor_late_bind_and_one_trusted_dispatch(self) -> None:
+        """Complete an admitted three-field launch through preparation and delivery."""
+
         started = self.service.start(self.request("async-completion"))
         self.assertTrue(started.created)
         self.assertIs(started.agent.status, AgentStatus.STARTING)
         self.wait_until(lambda: len(self.launches) == 1)
         self.assertEqual(len(self.launches), 1, "start returns after the launch decision")
 
-        agent_id, _request, _adapter, plan, directory = self.launches[0]
+        agent_id, request, role = self.launches[0]
+        prepared = prepare_launch(
+            self.store, self.root, self.config, agent_id, request, role
+        )
+        directory = agent_dir(agent_id, self.root)
         self.assertTrue(directory.is_dir())
-        answer_path = directory / "answer.md"
+        answer_path = prepared.answer_path
         answer_path.write_text(f"done\n{DEFAULT_SENTINEL}\n", encoding="utf-8")
         # The orchestrator binds before the agent finishes, so the terminal
         # transition creates a pending notice rather than one that can never bind.
@@ -197,9 +203,8 @@ class M008IntegrationTests(unittest.TestCase):
             self.store,
             agent_id,
             EngineAdapter(session),
-            plan,
+            prepared.plan,
             answer_path=answer_path,
-            timeout_seconds=10,
             settings=SupervisorSettings(
                 poll_seconds=0.1,
                 grace_seconds=0.1,
@@ -242,7 +247,7 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertNotIn("safe task", notice.render())
         self.assertEqual(self.service.get(agent_id).delivery.state, "delivered")
 
-    def test_real_service_mcp_preserves_counts_pagination_capacity_and_gate(self) -> None:
+    def test_real_service_mcp_preserves_counts_pagination_and_gate(self) -> None:
         ids = [self.service.start(self.request(f"active-{index}")).agent_id for index in range(3)]
         listed = self.mcp_call(
             self.service, 1, "list_agents", {"active": True, "limit": 2}
@@ -270,23 +275,6 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertFalse(transcript["complete"])
         self.assertIsNotNone(transcript["next_cursor"])
         self.assertEqual(transcript["messages"][1]["raw_ref"], "raw/two.json")
-
-        self.assertEqual(self.service.limits().items, (), "missing capacity stays unknown")
-        self.store.insert_capacity_sample(
-            runtime="fake",
-            lane="main",
-            window="5h",
-            source="stale-test",
-            payload={},
-            remaining_percent=50,
-            reset_at=200,
-            observed_at=10,
-            valid_until=50,
-        )
-        stale = self.service.limits().items[0]
-        self.assertFalse(stale.known)
-        self.assertEqual(stale.risk, "unknown")
-        self.assertEqual(SERVICE_ADAPTER.limits_calls, 0)
 
         SERVICE_ADAPTER.capabilities = frozenset(
             capability for capability in Capability if capability is not Capability.STEER
@@ -329,12 +317,8 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertFalse(failed["isError"])
         self.assertTrue(failed["structuredContent"]["created"])
         agent_id = failed["structuredContent"]["agent_id"]
-        self.wait_until(
-            lambda: self.store.get_agent(agent_id)["status"]
-            == AgentStatus.FAILED.value
-        )
         row = self.store.list_agents()[0]
-        self.assertEqual((row["status"], row["failure_kind"]), ("failed", "supervisor_start_failed"))
+        self.assertEqual((row["status"], row["failure_kind"]), ("failed", "start_submit_failed"))
         retried = self.mcp_call(service, 2, "start", arguments)
         self.assertFalse(retried["isError"])
         self.assertFalse(retried["structuredContent"]["created"])

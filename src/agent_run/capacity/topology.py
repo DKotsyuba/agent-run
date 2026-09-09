@@ -1,7 +1,7 @@
 """Provider-neutral physical-pool and route topology over collected samples.
 
 A *physical pool* is one real quota reservoir identified by an exact set of
-:class:`~agent_run.capacity.history.CapacityKey` identities. A *route* is one
+:class:`CapacityKey` identities. A *route* is one
 launchable way to consume quota: a runtime, optionally a configured account,
 and a quota lane, referencing one or more physical pools by id. Several routes
 may reference the same pool — that is the explicit statement that they share
@@ -24,7 +24,17 @@ from urllib.parse import quote
 
 from ..adapters.base import LimitSample
 from ..errors import ValidationError
-from .history import CapacityKey
+
+
+@dataclass(frozen=True)
+class CapacityKey:
+    """Identify one provider quota window without interpreting its labels."""
+
+    runtime: str
+    lane: str
+    window: str
+    target: str | None
+    source: str
 
 
 @dataclass(frozen=True)

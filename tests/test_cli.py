@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agent_run import cli
 from agent_run.domain import AgentId, AgentStatus, StartRequest
 from agent_run.errors import ValidationError
+from agent_run.preparation import request_payload
+from agent_run.role_plan import ResolvedRolePlan
 from agent_run.service import MessageView, TranscriptPage
 
 
@@ -59,10 +61,6 @@ class FakeService:
         self.request = {"agent_id": agent_id, "task": task, **kwargs}
         return self._return("resume", FakeStart())
 
-    def chain(self, agent_id, **kwargs):
-        """Return a deterministic page for CLI forwarding checks."""
-        return self._return("chain", {"agent_id": agent_id, **kwargs})
-
     def bind(self, agent_id, ref):
         return self._return("bind", {"agent_id": agent_id, "orchestrator": ref})
 
@@ -85,9 +83,6 @@ class FakeService:
     def list(self, query):
         return self._return("list", query)
 
-    def summary(self, **kwargs):
-        return self._return("summary", kwargs)
-
     def transcript(self, agent_id, cursor=0, limit=200):
         self.calls.append(("transcript", cursor, limit))
         if cursor == 0:
@@ -109,16 +104,23 @@ class FakeService:
         )
 
     def answer(self, agent_id):
-        return self._return("answer", {"agent_id": agent_id, "available": False})
+        return self._return(
+            "answer",
+            FakeView(
+                AgentStatus.RUNNING,
+                Path("/tmp/answer.md"),
+                MappingProxyType({"agent_id": agent_id}),
+            ),
+        )
+
+    def context(self, ref):
+        return self._return("context", {"orchestrator": ref, "injected": True})
 
     def models(self):
         return self._return("models", MappingProxyType({"codex": ("model",)}))
 
     def limits(self):
-        return self._return("limits", {"risk": AgentStatus.RUNNING})
-
-    def context(self, ref):
-        return self._return("context", {"orchestrator": ref, "injected": True})
+        return self._return("limits", {"items": ()})
 
     def capacity_collect(self):
         return self._return("capacity_collect", {"collected": True})
@@ -183,11 +185,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(broker.resume.call_args.args, (AGENT_ID, "fix"))
         broker.close.assert_called_once()
 
-    def test_chain_forwards_cursor_and_limit(self):
-        """Chain pagination stays owned by the service."""
-        code, output, error = self.run_cli(["chain", AGENT_ID, "--cursor", "2", "--limit", "3"])
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(json.loads(output), {"agent_id": AGENT_ID, "cursor": 2, "limit": 3})
+
     def run_cli(self, argv, *, service=None, stdin=""):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -276,6 +274,57 @@ class CliTests(unittest.TestCase):
             broker.close.assert_called_once_with()
             self.assertIn(AGENT_ID, output.getvalue())
 
+    def test_start_wait_reuses_private_socket_until_existing_agent_finishes(self):
+        """Wait for an idempotent start and emit its terminal answer once."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            broker = Mock()
+            broker.start.return_value = FakeStart(created=False)
+            broker.call.side_effect = [
+                {"agent_id": AGENT_ID, "status": "running", "timed_out": True},
+                {"agent_id": AGENT_ID, "status": "failed", "available": False},
+            ]
+            output, error = io.StringIO(), io.StringIO()
+            with patch.object(cli, "BrokerClient", return_value=broker):
+                code = cli.main(
+                    ["--home", directory, "start", "--runtime", "codex",
+                     "--model", "model", "--profile", "review", "--task", "task",
+                     "--workdir", directory, "--wait"],
+                    stdin=io.StringIO(), stdout=output, stderr=error,
+                )
+        self.assertEqual((code, error.getvalue()), (2, ""))
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {"agent_id": AGENT_ID, "status": "failed", "available": False},
+        )
+        self.assertEqual(broker.call.call_count, 2)
+        for call in broker.call.call_args_list:
+            self.assertEqual(call.args[0], "wait")
+            self.assertEqual(call.args[1]["agent_id"], AGENT_ID)
+            self.assertEqual(call.kwargs["timeout"], cli._PRIVATE_WAIT_CALL_SECONDS)
+        broker.close.assert_called_once_with()
+
+    def test_start_wait_interrupt_closes_only_the_client(self):
+        """Propagate Ctrl-C after admission without sending agent cancellation."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            broker = Mock()
+            broker.start.return_value = FakeStart()
+            broker.call.side_effect = KeyboardInterrupt
+            output = io.StringIO()
+            with patch.object(cli, "BrokerClient", return_value=broker):
+                with self.assertRaises(KeyboardInterrupt):
+                    cli.main(
+                        ["--home", directory, "start", "--runtime", "codex",
+                         "--model", "model", "--profile", "review", "--task", "task",
+                         "--workdir", directory, "--wait"],
+                        stdin=io.StringIO(), stdout=output, stderr=io.StringIO(),
+                    )
+        self.assertEqual(output.getvalue(), "")
+        broker.start.assert_called_once()
+        broker.cancel.assert_not_called()
+        broker.close.assert_called_once_with()
+
     def test_auth_runs_codex_login_in_account_home(self):
         """Run account login without resolving away the configured launcher path."""
         with tempfile.TemporaryDirectory() as directory:
@@ -315,8 +364,8 @@ target = "auth.json"
         self.assertEqual(calls[1][0], [binary, "login", "status"])
         self.assertEqual(Path(calls[0][1]["env"]["CODEX_HOME"]).resolve(), home.resolve() / "accounts" / "codex" / "personal2")
 
-    def test_login_claude_uses_the_launch_scoped_config_directory(self):
-        """The convenience command authenticates only the private Claude state."""
+    def test_login_claude_uses_the_native_global_config_directory(self):
+        """An omitted account authenticates the host Claude CLI state."""
 
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -359,9 +408,8 @@ names = ["CLAUDE_CODE_OAUTH_TOKEN"]
         self.assertEqual(calls[0][0], ["/bin/claude", "auth", "login"])
         self.assertEqual(calls[1][0], ["/bin/claude", "auth", "status", "--json"])
         environment = calls[0][1]["env"]
-        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str((runtime_home / "claude-config").resolve()))
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], "/ambient")
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
-        self.assertNotIn("/ambient", environment["CLAUDE_CONFIG_DIR"])
 
     def test_login_claude_account_and_status_failure_are_scoped_and_safe(self):
         """Selected accounts get distinct config state and status output stays private."""
@@ -408,8 +456,8 @@ names = ["CLAUDE_CODE_OAUTH_TOKEN"]
             str(Path("/tmp/claude@personal/claude-config").resolve()),
         )
 
-    def test_login_claude_rejects_ambiguous_or_unsupported_syntax(self):
-        """The command gives the exact supported syntax instead of choosing an account."""
+    def test_login_claude_defaults_global_and_rejects_unsupported_runtime(self):
+        """Use native global Claude state and keep other runtime syntax explicit."""
 
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -449,10 +497,12 @@ target = "auth.json"
                     stderr.getvalue(),
                 )
 
-            ambiguous = command(["--home", str(home), "login", "claude"])
-            unsupported = command(["--home", str(home), "login", "codex"])
-        self.assertEqual(ambiguous[0], 2)
-        self.assertIn("agent-run login claude --account <label>", ambiguous[2])
+            result = type("Result", (), {"returncode": 0, "stdout": "{}"})()
+            with patch("agent_run.cli.subprocess.run", return_value=result):
+                global_login = command(["--home", str(home), "login", "claude"])
+                unsupported = command(["--home", str(home), "login", "codex"])
+        self.assertEqual(global_login[0], 0)
+        self.assertEqual(json.loads(global_login[1])["account"], None)
         self.assertEqual(unsupported[0], 2)
         self.assertIn("agent-run auth <label> codex", unsupported[2])
 
@@ -488,7 +538,7 @@ target = "auth.json"
         self.assertTrue(service.request.fast)
 
     def test_json_supports_dataclasses_enums_paths_and_mappingproxy(self):
-        code, output, error = self.run_cli(["status", AGENT_ID])
+        code, output, error = self.run_cli(["answer", AGENT_ID])
         self.assertEqual(code, 0)
         self.assertEqual(error, "")
         self.assertEqual(
@@ -567,7 +617,7 @@ target = "auth.json"
     def test_expected_errors_are_stable_json_but_unexpected_faults_propagate(self):
         expected = FakeService()
         expected.error = ValidationError("bad request")
-        code, output, error = self.run_cli(["status", AGENT_ID], service=expected)
+        code, output, error = self.run_cli(["answer", AGENT_ID], service=expected)
         self.assertEqual(code, 2)
         self.assertEqual(output, "")
         self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
@@ -580,7 +630,7 @@ target = "auth.json"
         unexpected = FakeService()
         unexpected.error = RuntimeError("bug")
         with self.assertRaisesRegex(RuntimeError, "bug"):
-            self.run_cli(["status", AGENT_ID], service=unexpected)
+            self.run_cli(["answer", AGENT_ID], service=unexpected)
 
     def test_bootstrap_failure_error_envelope_carries_the_agent_id(self):
         bootstrapped = FakeService()
@@ -594,7 +644,7 @@ target = "auth.json"
         failure.failure_text = "ModuleNotFoundError: no module named agent_run.adapters"
         bootstrapped.error = failure
 
-        code, output, error = self.run_cli(["status", AGENT_ID], service=bootstrapped)
+        code, output, error = self.run_cli(["answer", AGENT_ID], service=bootstrapped)
         self.assertEqual(code, 2)
         self.assertEqual(output, "")
         payload = json.loads(error)["error"]
@@ -610,7 +660,6 @@ target = "auth.json"
             (["cancel", AGENT_ID], "cancel"),
             (["steer", AGENT_ID, "--text", "go"], "steer"),
             (["agents"], "list"),
-            (["summary", "--agent-id", AGENT_ID], "summary"),
             (["answer", AGENT_ID], "answer"),
             (["models"], "models"),
             (["limits"], "limits"),
@@ -652,7 +701,11 @@ target = "auth.json"
     def test_removed_workflow_commands_are_not_parsed(self):
         """Legacy workflow and batch entry points are absent from the CLI."""
 
-        for command in (["workflow", "status", "wf_old"], ["batch", "--file", "-"]):
+        for command in (
+            ["workflow", "status", "wf_old"], ["batch", "--file", "-"],
+            ["chain", AGENT_ID], ["status", AGENT_ID], ["summary"],
+            ["wait", AGENT_ID], ["stats", "backfill"],
+        ):
             with self.subTest(command=command), self.assertRaises(ValidationError):
                 cli._parser().parse_args(command)
 
@@ -1179,12 +1232,8 @@ target = "auth.json"
         self.assertEqual([response["id"] for response in responses], [1, 2])
         self.assertEqual(
             [tool["name"] for tool in responses[1]["result"]["tools"]],
-            [
-                "capacity_order", "start", "fast", "cancel", "steer", "status", "list_agents",
-                "list_orchestrators",
-                "summary", "transcript", "answer", "models", "limits", "doc",
-                "resume", "chain",
-            ],
+            ["capacity_order", "start", "cancel", "steer", "list_agents",
+             "transcript", "answer", "resume", "doc", "models", "limits"],
         )
 
     def test_dispatch_composes_relay_transport_and_fresh_store_once(self):
@@ -1386,8 +1435,11 @@ target = "auth.json"
                 timeout_seconds=480,
             )
             store = Mock()
-            plan = Mock()
-            plan.to_payload.return_value = {"argv": ["engine"], "environment": {"T": "s"}}
+            role = ResolvedRolePlan.from_payload(
+                json.loads(
+                    (Path(__file__).parent / "fixtures" / "role_plan_7bbd43b.json").read_text()
+                )
+            )
             events = []
             captured = {}
             store.close.side_effect = lambda: events.append("store_closed")
@@ -1404,14 +1456,12 @@ target = "auth.json"
                 return 123
 
             with patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
-                cli, "load_config", return_value=SimpleNamespace(core=SimpleNamespace(warning_fraction=0.9, stalled_after_seconds=900.0))
-            ), patch.object(
                 cli, "launch_detached", side_effect=detached
             ), patch.object(
                 cli, "reconcile_reaped_agent", side_effect=reconciled
             ):
                 cli._launch_callback(home)(
-                    AgentId(AGENT_ID), request, object(), plan, home / "agents" / AGENT_ID
+                    AgentId(AGENT_ID), request, role
                 )
 
         # The supervisor now runs in an exec'd interpreter, so the parent must
@@ -1425,13 +1475,8 @@ target = "auth.json"
             {
                 "agent_id": AGENT_ID,
                 "home": str(home),
-                "runtime": "codex",
-                "timeout_seconds": 480,
-                "answer_path": str(home / "agents" / AGENT_ID / "answer.md"),
-                "agent_dir": str(home / "agents" / AGENT_ID),
-                "warning_fraction": 0.9,
-                "stalled_after_seconds": 900.0,
-                "plan": {"argv": ["engine"], "environment": {"T": "s"}},
+                "request": request_payload(request),
+                "role": role.to_payload(),
             },
         )
 
@@ -1440,7 +1485,7 @@ class PackagingTests(unittest.TestCase):
     def test_console_script_and_schema_are_present_in_sdist(self):
         root = Path(__file__).resolve().parents[1]
         config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(config["project"]["scripts"]["agent-run"], "agent_run.cli:main")
+        self.assertEqual(config["project"]["scripts"], {"agent-run": "agent_run.cli:main"})
         self.assertIn("schema.sql", config["tool"]["setuptools"]["package-data"]["agent_run.state"])
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1469,6 +1514,7 @@ class PackagingTests(unittest.TestCase):
                 entry = next(name for name in names if name.endswith(".egg-info/entry_points.txt"))
                 metadata = bundle.extractfile(entry).read().decode("utf-8")
         self.assertIn("agent-run = agent_run.cli:main", metadata)
+        self.assertNotIn("agent-run-tui", metadata)
 
 
 if __name__ == "__main__":

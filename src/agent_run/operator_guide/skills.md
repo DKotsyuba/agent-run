@@ -1,32 +1,16 @@
 # skills
 
-Each `[runtimes.<name>]` table declares `skills = [names]`: the skill names
-that runtime may use. Physical copies live under
-`<home>/skills/<runtime>/<name>/SKILL.md`.
+Configure one shared catalog:
 
-## Plugin ownership
+```toml
+[skills]
+directory = "/absolute/path/to/agent-run-skills"
+```
 
-A declared plugin that ships `skills/<name>/SKILL.md` OWNS that skill name
-for every runtime it applies to (enforced by `plugin_skills.py`). Once a
-plugin owns a name, a stale local copy under `<home>/skills/<runtime>/<name>`
-stops being read — the plugin's copy wins. Two declared plugins shipping the
-same skill name is a conflict and fails closed rather than picking one
-silently.
+Each revisioned profile selects its complete `skills = [...]` list. Adapters
+translate that same list into Codex, Claude/GLM, or Qwen native configuration.
+Missing skill directories or `SKILL.md` files fail before admission; content
+revisions are stored in the resolved role snapshot.
 
-Symlinked skill directories are supported. Their targets must remain readable
-for every runtime that uses them; editing a symlink target changes the content
-seen at the next materialization.
-
-## After changing skills
-
-1. Edit config.toml (see `config` for the safe-edit discipline).
-2. Rematerialize the affected runtime homes.
-4. claude and codex pick up the new skill list at their next agent start;
-   no running claude/codex process needs to be restarted.
-
-## Common failure
-
-A skill referenced in an agent's task but missing from that runtime's
-`skills = [...]` is invisible to the runtime, not an error at config load
-time — check `agent-run doc troubleshoot` and the runtime's materialized
-home if a skill "isn't showing up."
+Legacy per-runtime skill lists remain readable during migration. Do not combine
+them with revisioned roles.
