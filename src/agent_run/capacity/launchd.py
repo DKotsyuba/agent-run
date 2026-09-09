@@ -9,7 +9,9 @@ scheduled ticks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import plistlib
 
 from ..config import CapacityConfig
 from ..errors import ValidationError
@@ -76,36 +78,28 @@ def argv(job: LaunchdJob) -> tuple[str, ...]:
     return (str(job.binary),) + COLLECT_SUBCOMMAND
 
 
-def _escape(value: str) -> str:
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 def render_plist(job: LaunchdJob) -> str:
-    """Render a launchd property list for the bounded collector command."""
+    """Render a one-shot collector with the invoking user's ``HOME`` and ``PATH``.
 
-    program_arguments = "\n".join(
-        f"        <string>{_escape(part)}</string>" for part in argv(job)
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-        '<plist version="1.0">\n'
-        "<dict>\n"
-        "    <key>Label</key>\n"
-        f"    <string>{_escape(job.label)}</string>\n"
-        "    <key>ProgramArguments</key>\n"
-        "    <array>\n"
-        f"{program_arguments}\n"
-        "    </array>\n"
-        "    <key>StartInterval</key>\n"
-        f"    <integer>{job.interval_seconds}</integer>\n"
-        "    <key>StandardOutPath</key>\n"
-        f"    <string>{_escape(str(job.stdout_log))}</string>\n"
-        "    <key>StandardErrorPath</key>\n"
-        f"    <string>{_escape(str(job.stderr_log))}</string>\n"
-        "    <key>RunAtLoad</key>\n"
-        "    <false/>\n"
-        "</dict>\n"
-        "</plist>\n"
-    )
+    launchd's default path omits common Node installation directories, while
+    Codex app-server probes may invoke ``node`` through an env shebang. Only
+    these two ordinary process-location variables are copied; credentials and
+    all other ambient values stay outside the plist.
+    """
+
+    environment = {"HOME": str(Path.home())}
+    if path := os.environ.get("PATH"):
+        environment["PATH"] = path
+    return plistlib.dumps(
+        {
+            "Label": job.label,
+            "ProgramArguments": list(argv(job)),
+            "EnvironmentVariables": environment,
+            "StartInterval": job.interval_seconds,
+            "StandardOutPath": str(job.stdout_log),
+            "StandardErrorPath": str(job.stderr_log),
+            "RunAtLoad": False,
+        },
+        fmt=plistlib.FMT_XML,
+        sort_keys=False,
+    ).decode("utf-8")

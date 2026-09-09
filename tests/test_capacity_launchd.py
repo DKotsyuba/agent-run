@@ -2,6 +2,7 @@ import plistlib
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -57,6 +58,22 @@ class CapacityLaunchdTests(unittest.TestCase):
         self.assertNotIn("KeepAlive", parsed)
         self.assertEqual(parsed["StandardOutPath"], "/tmp/capacity<out>.log")
         self.assertEqual(parsed["StandardErrorPath"], "/tmp/capacity&err.log")
+
+    def test_plist_copies_only_invoking_home_and_path(self) -> None:
+        """Headless collectors can resolve host tools without persisting secrets."""
+
+        job = build_job("com.example.capacity", interval_seconds=60, **self.paths())
+        with patch("agent_run.capacity.launchd.Path.home", return_value=Path("/Users/test")), patch.dict(
+            "agent_run.capacity.launchd.os.environ",
+            {"PATH": "/Users/test/.nvm/bin:/usr/bin", "SECRET_TOKEN": "secret"},
+            clear=True,
+        ):
+            parsed = plistlib.loads(render_plist(job).encode("utf-8"))
+
+        self.assertEqual(parsed["EnvironmentVariables"], {
+            "HOME": "/Users/test",
+            "PATH": "/Users/test/.nvm/bin:/usr/bin",
+        })
 
 
 if __name__ == "__main__":
