@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.5] - 2026-09-09
+
+- fix(capacity): preserve host path in launchd
+
 ## [0.11.4] - 2026-09-09
 
 - refactor(codex): split error classification
