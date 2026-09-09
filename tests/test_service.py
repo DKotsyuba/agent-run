@@ -39,7 +39,11 @@ from agent_run.delivery.base import DeliveryAttemptEvidence
 from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
-from agent_run.preparation import prepare_launch
+from agent_run.preparation import (
+    PreparationFailure,
+    fail_preparation,
+    prepare_launch,
+)
 from agent_run.service import AgentQuery, AgentService
 from agent_run.state.reconciliation import reconcile_unowned_starting
 from agent_run.state.store import StateStore
@@ -208,13 +212,31 @@ class AgentServiceTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("asynchronous condition did not become true")
 
-    def prepare_captured(self, index: int = -1) -> None:
-        """Execute preparation for one captured three-field supervisor payload."""
+    def prepare_captured(
+        self,
+        index: int = -1,
+        *,
+        service: AgentService | None = None,
+    ) -> None:
+        """Execute one captured supervisor payload and persist preparation failure.
+
+        The index selects the captured launch, while service supplies the
+        effective configuration when a test owns a separate service instance.
+        """
 
         agent_id, request, role = self.launched[index]
-        prepare_launch(
-            self.store, self.root, self.service._config, agent_id, request, role
-        )
+        active_service = service or self.service
+        try:
+            prepare_launch(
+                self.store,
+                self.root,
+                active_service._config,
+                agent_id,
+                request,
+                role,
+            )
+        except PreparationFailure as error:
+            fail_preparation(self.store, agent_id, error)
 
     def terminal(self, agent_id, status=AgentStatus.CANCELLED) -> None:
         self.store.transition(agent_id, status, outcome=Outcome(status), at=101)
@@ -355,7 +377,7 @@ class AgentServiceTests(unittest.TestCase):
             now=lambda: 100.0,
         )
         self.service.start(self.request(request_id="global-account"))
-        self.wait_until(lambda: bool(ADAPTER.materialize_configs))
+        self.prepare_captured()
         effective = ADAPTER.materialize_configs[-1]
         self.assertIsNone(effective.credential_state_home)
         self.assertIn('"account":null', str(self.store.list_agents()[0]["identity_json"]))
@@ -387,12 +409,7 @@ class AgentServiceTests(unittest.TestCase):
         )
         with patch("agent_run.service.AdapterRegistry.load", return_value=ADAPTER):
             self.service.start(request)
-            self.wait_until(lambda: bool(ADAPTER.materialize_homes))
-            self.wait_until(
-                lambda: str(self.store.list_agents()[0]["config_revision"]).startswith(
-                    "snapshot:v1:"
-                )
-            )
+            self.prepare_captured()
         effective = ADAPTER.materialize_configs[-1]
         self.assertEqual(
             effective.credential_state_home,
@@ -405,6 +422,7 @@ class AgentServiceTests(unittest.TestCase):
 
         ADAPTER.prepare_materialize_revision = "cfg-2"
         result = self.start("prepare-revision")
+        self.prepare_captured()
         row = self.store.get_agent(result.agent_id)
         expected_sha256 = str(row["config_revision"]).removeprefix("snapshot:v1:")
         snapshot = inspect_config_snapshot(
@@ -443,7 +461,7 @@ Review the requested work.
             now=lambda: 100.0,
         )
         service.start(self.request(request_id="canonical-role", write=True))
-        self.wait_until(lambda: bool(ADAPTER.prepare_profiles))
+        self.prepare_captured(service=service)
         self.assertEqual(
             ADAPTER.prepare_profiles[-1].prompt, "Review the requested work."
         )
@@ -474,6 +492,7 @@ Review the requested work.
             )
         )
         self.wait_until(lambda: bool(self.launched))
+        self.prepare_captured()
         stored = json.loads(self.store.get_agent(result.agent_id)["request_json"])
         self.assertEqual(stored["read_roots"], [str(parent)])
         self.assertEqual(ADAPTER.prepare_profiles[-1].read_roots, (parent,))
@@ -516,21 +535,29 @@ Review.
         self.assertEqual(self.store.list_agents(), [])
         service.close()
 
-    def test_complete_refusal_happens_before_agent_row(self) -> None:
+    def test_capability_refusal_is_durable_but_unknown_model_is_not_admitted(
+        self,
+    ) -> None:
+        """Persist capability refusal after admission and reject unknown models first."""
+
         ADAPTER.capabilities = frozenset(
             capability for capability in Capability if capability is not Capability.WRITE
         )
-        with self.assertRaisesRegex(ValidationError, "lacks required capabilities"):
-            self.service.start(self.request(write=True, request_id="refused-write"))
-        self.assertEqual(self.store.list_agents(), [])
-        self.assertEqual(self.launched, [])
+        capability = self.service.start(
+            self.request(write=True, request_id="refused-write")
+        )
+        self.prepare_captured()
+        capability_row = self.store.get_agent(capability.agent_id)
+        self.assertEqual(capability_row["status"], AgentStatus.FAILED.value)
+        self.assertEqual(capability_row["failure_kind"], "prepare_adapter_failed")
+        self.assertIn("lacks required capabilities", capability_row["failure_text"])
 
         ADAPTER.capabilities = frozenset(Capability)
         with self.assertRaisesRegex(ValidationError, "model is not configured"):
             self.service.start(
                 self.request(model="missing", request_id="refused-model")
             )
-        self.assertEqual(self.store.list_agents(), [])
+        self.assertEqual(len(self.store.list_agents()), 1)
         self.assertEqual(ADAPTER.materialize_calls, 0)
 
     def test_start_returns_after_submission_and_pending_replay_stays_single(self) -> None:
@@ -823,21 +850,18 @@ Review.
 
         accepted = self.service.start(request)
         self.assertTrue(accepted.created)
-        self.assertIn(accepted.agent.status, {AgentStatus.STARTING, AgentStatus.FAILED})
-        self.wait_until(
-            lambda: self.store.get_agent(accepted.agent_id)["status"]
-            == AgentStatus.FAILED.value
-        )
+        self.assertIs(accepted.agent.status, AgentStatus.STARTING)
+        self.prepare_captured()
 
         rows = self.store.list_agents()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], AgentStatus.FAILED.value)
-        self.assertEqual(rows[0]["failure_kind"], "prepare_failed")
+        self.assertEqual(rows[0]["failure_kind"], "prepare_prepare_failed")
         path = self.root / "agents" / str(rows[0]["id"])
         self.assertTrue(path.is_dir())
         self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         self.assertEqual(ADAPTER.prepare_dirs, [path])
-        self.assertEqual(self.launched, [])
+        self.assertEqual(len(self.launched), 1)
 
         retry = self.service.start(request)
         self.assertFalse(retry.created)
@@ -871,7 +895,7 @@ Review.
         row = self.store.list_agents()[0]
         agent_id = row["id"]
         self.assertEqual(row["status"], "failed")
-        self.assertEqual(row["failure_kind"], "supervisor_start_failed")
+        self.assertEqual(row["failure_kind"], "start_submit_failed")
         self.assertEqual(row["failure_text"], "ready failed")
         view = service.get(agent_id)
         # The start carried no orchestrator session reference, so no notice was
@@ -887,7 +911,7 @@ Review.
                WHERE agent_id = ? ORDER BY seq DESC LIMIT 1""",
             (agent_id,),
         ).fetchone()
-        self.assertEqual(event["kind"], "supervisor_start_failed")
+        self.assertEqual(event["kind"], "start_submit_failed")
         self.assertIn(str(agent_id), event["data_json"])
 
         retry = service.start(request)
