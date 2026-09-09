@@ -15,6 +15,7 @@ from typing import Mapping, Protocol
 
 from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
+from ._error_classification import _structured_failure_kind
 from .environment import thread_grant_params
 from .process_transport import ProcessTransport
 
@@ -206,33 +207,6 @@ def _optional_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _structured_failure_kind(error: Mapping[str, object]) -> str | None:
-    """Return explicit kind/code or a safe bounded Codex structured code.
-
-    Existing non-null ``kind``/``code`` precedence is preserved. The known
-    ``serverOverloaded`` provider code maps to the stable
-    ``provider_overloaded`` category. Other nonblank structured codes retain a
-    bounded ASCII identifier for diagnostics; provider detail objects are ignored.
-    """
-
-    explicit = _optional_str(error.get("kind") or error.get("code"))
-    if explicit is not None:
-        return explicit
-    value = error.get("codexErrorInfo")
-    if not isinstance(value, str) or not value.strip():
-        return None
-    code = value.strip()
-    if code == "serverOverloaded":
-        return "provider_overloaded"
-    safe = "".join(
-        character
-        if character.isascii() and (character.isalnum() or character in "._-")
-        else "_"
-        for character in code
-    )[:58].strip("._-")
-    return f"codex_{safe or 'error'}"
-
-
 def _mapping(value: object) -> Mapping[str, object]:
     return value if isinstance(value, Mapping) else {}
 
@@ -416,8 +390,6 @@ class CodexAppServerSession:
         Resumed runs require an explicit matching turn; missing identity is
         insufficient evidence that a historical event belongs to this run.
         """
-        """Return whether an item event belongs to this active thread and turn."""
-
         thread_id = params.get("threadId")
         if isinstance(thread_id, str) and thread_id and thread_id != self._thread_id:
             return False
