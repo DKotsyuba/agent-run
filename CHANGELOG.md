@@ -2,6 +2,11 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.4] - 2026-09-09
+
+- refactor(codex): split error classification
+- fix(codex): classify provider overloads
+
 ## [0.11.3] - 2026-09-09
 
 - fix(adapters): inherit installed Rust homes
