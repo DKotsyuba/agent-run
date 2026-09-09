@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 
 
 _SECRET_NAME = re.compile(r"(key|token|secret|password|credential)", re.IGNORECASE)
@@ -49,8 +50,10 @@ def host_environment(
 
     Ordinary variables are inherited unchanged. Credential-shaped names and a
     compact set of known credential/config carriers are subtracted unless the
-    resolved runtime auth or MCP contract names them. ``overrides`` always wins
-    and remains process-memory-only.
+    resolved runtime auth or MCP contract names them. Explicit Rust toolchain
+    homes are preserved; when absent, existing `.rustup` and `.cargo` directories
+    beneath the original host ``HOME`` are inherited before a runtime replaces
+    ``HOME``. ``overrides`` always wins and remains process-memory-only.
     """
 
     allowed = frozenset(allowed_secret_names)
@@ -63,5 +66,14 @@ def host_environment(
             and not is_secret_env_name(name)
         )
     }
+    host_home = os.environ.get("HOME")
+    if host_home:
+        for name, directory in (
+            ("RUSTUP_HOME", ".rustup"),
+            ("CARGO_HOME", ".cargo"),
+        ):
+            candidate = Path(host_home) / directory
+            if name not in environment and candidate.is_dir():
+                environment[name] = str(candidate)
     environment.update(overrides)
     return environment

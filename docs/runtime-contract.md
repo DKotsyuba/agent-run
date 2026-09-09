@@ -4,8 +4,11 @@ Agent-run gives every child the host PATH, language toolchains, SDK variables,
 locale, and ordinary build environment. It changes only the runtime HOME/config
 locations and credentials explicitly selected for that runtime or one of its
 MCP servers. Credential-shaped ambient variables not selected by that contract
-are omitted. Agent-run does not provision or probe Python, Node, or Rust during
-start.
+are omitted. Exported ``RUSTUP_HOME`` and ``CARGO_HOME`` remain authoritative;
+when unset, existing `.rustup` and `.cargo` directories beneath the original
+host ``HOME`` are forwarded before the child ``HOME`` is isolated. Agent-run
+does not create these directories or provision or probe Python, Node, or Rust
+during start.
 
 Each runtime gets generated lightweight configuration so subagents see only the
 skills and MCP servers selected by their role. The generated directory is

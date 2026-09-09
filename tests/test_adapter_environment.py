@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -61,6 +62,29 @@ class HostEnvironmentTests(unittest.TestCase):
             "KRB5CCNAME", "GNUPGHOME",
         ):
             self.assertNotIn(carrier, environment)
+
+    def test_derives_only_existing_rust_homes_before_isolating_home(self) -> None:
+        """Derive standard Rust homes without creating or redirecting them."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            host_home = Path(directory)
+            rustup_home = host_home / ".rustup"
+            cargo_home = host_home / ".cargo"
+            rustup_home.mkdir()
+            cargo_home.mkdir()
+            with patch.dict(os.environ, {"HOME": str(host_home)}, clear=True):
+                environment = host_environment({"HOME": "/isolated/home"})
+            self.assertEqual(environment["HOME"], "/isolated/home")
+            self.assertEqual(environment["RUSTUP_HOME"], str(rustup_home))
+            self.assertEqual(environment["CARGO_HOME"], str(cargo_home))
+
+            rustup_home.rmdir()
+            cargo_home.rmdir()
+            with patch.dict(os.environ, {"HOME": str(host_home)}, clear=True):
+                environment = host_environment({"HOME": "/isolated/home"})
+            self.assertNotIn("RUSTUP_HOME", environment)
+            self.assertNotIn("CARGO_HOME", environment)
+            self.assertFalse(rustup_home.exists() or cargo_home.exists())
 
     def test_selected_credential_carrier_is_forwarded(self) -> None:
         """Allow an otherwise filtered carrier only when the contract names it."""
