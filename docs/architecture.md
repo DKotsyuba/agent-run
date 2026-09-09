@@ -201,6 +201,9 @@ independently, so a failed account keeps its previous topology only until that
 snapshot expires instead of deleting healthy sibling scopes. Samples carry
 validity windows; `limits` serves projections with burn-rate–based exhaustion
 risk per lane, worst first, hiding nothing.
+The launchd job copies the invoking user's `HOME` and `PATH` so headless Codex
+app-server and CLI probes resolve the same host runtimes as an interactive
+shell; it persists no credentials or other environment variables.
 
 Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
 and `unsupported`. A source failure is not a successful collection of zero
