@@ -29,7 +29,10 @@ limits_source = "codex_appserver"
 ```
 
 Revisioned Markdown profiles own write/network grants, external read-root policy,
-skills, MCP selection, and required constraints. Legacy profiles and runtime
+skills, MCP selection, and required constraints. ``gpt-6-astra`` accepts only the
+public read-only profiles ``review`` and ``architect``; provider-facing agent-type
+names such as ``role-review`` are not profile identifiers. Legacy profiles and
+runtime
 `skills`/`mcp` lists remain readable until migration, but canonical and legacy
 asset declarations cannot be mixed.
 
