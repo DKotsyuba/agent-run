@@ -553,8 +553,9 @@ class CodexAdapter:
         Validates request grants and runtime assets against ``role``. Network
         roles receive app-server's tagged sandbox request form. Workspace-write
         threads cannot grant external read roots in the pinned app-server
-        contract. ``gpt-6-astra`` is limited to read-only architecture and
-        review roles. Raises ``ValidationError`` when an authorization or
+        contract. ``gpt-6-astra`` is limited to the public read-only
+        ``architect`` and ``review`` profiles. Raises ``ValidationError`` when
+        an authorization or
         runtime constraint fails.
         """
         if not isinstance(request, StartRequest):
@@ -577,9 +578,9 @@ class CodexAdapter:
         if request.output_schema is not None:
             raise ValidationError("codex runtime does not support output_schema")
         if request.model == "gpt-6-astra":
-            if role.role_name not in ("role-architect", "role-review"):
+            if role.role_name not in ("architect", "review"):
                 raise ValidationError(
-                    "gpt-6-astra is limited to role-architect and role-review"
+                    "gpt-6-astra is limited to architect and review profiles"
                 )
             if role.write:
                 raise ValidationError("gpt-6-astra does not permit write-capable launches")
