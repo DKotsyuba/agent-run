@@ -14,8 +14,6 @@ from .db import _validate_schema, integer, timestamp
 
 @dataclass(frozen=True, slots=True)
 class DiagnosticSnapshot:
-    """Bounded active-agent and current capacity-snapshot rows."""
-
     agents: tuple[dict[str, object], ...]
     capacity: tuple[dict[str, object], ...]
 
@@ -23,9 +21,10 @@ class DiagnosticSnapshot:
 def diagnostic_snapshot(
     database: str | Path, *, at: float, limit: int = 256
 ) -> DiagnosticSnapshot:
-    """Read bounded active agents and current capacity scopes.
+    """Read bounded active agents and the newest row per capacity identity.
 
-    ``limit`` caps agents and capacity scopes independently.
+    ``limit`` caps agents and distinct capacity identities independently.
+    Repeated healthy samples must not hide an older, stale sibling identity.
     The database is opened read-only; invalid paths, schema or bounds raise
     ``ValidationError`` or the existing schema error without modifying state.
     """
@@ -51,9 +50,16 @@ def diagnostic_snapshot(
             (*statuses, limit),
         )
         capacity = connection.execute(
-            """SELECT runtime, scope_id, observed_at, valid_until
-               FROM capacity_route_snapshots
-               ORDER BY observed_at DESC, runtime, scope_id LIMIT ?""",
+            """SELECT id, runtime, lane, window, target, source,
+                      observed_at, valid_until
+               FROM (
+                   SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY runtime, lane, window, target, source
+                       ORDER BY observed_at DESC, id DESC
+                   ) AS position
+                   FROM capacity_samples
+               ) WHERE position = 1
+               ORDER BY observed_at DESC, id DESC LIMIT ?""",
             (limit,),
         )
         return DiagnosticSnapshot(

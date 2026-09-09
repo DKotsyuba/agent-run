@@ -157,6 +157,7 @@ max_active_agents = 2
 warning_fraction = 0.8
 [capacity]
 collect_interval_seconds = 10
+sample_retention = 20
 context_max_chars = 100
 [delivery]
 retry_base_seconds = 1

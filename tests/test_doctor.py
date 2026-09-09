@@ -144,9 +144,9 @@ models = ["model"]
                 at=3,
             )
             store.transition(agent_id, AgentStatus.RUNNING, at=4)
-            store.replace_capacity_snapshot(
-                runtime="codex", scope_id="test", observed_at=1, valid_until=2,
-                payload={"samples": [], "pools": [], "routes": []},
+            store.insert_capacity_sample(
+                runtime="codex", lane="requests", window="5h", source="test",
+                payload={}, observed_at=1, valid_until=2,
             )
             store.close()
             database = home / "state.db"
@@ -585,13 +585,16 @@ class HookTrustTests(unittest.TestCase):
 
 
 class CapacityStalenessTests(unittest.TestCase):
-    """Explicit current-snapshot validity decides staleness."""
+    """``valid_until`` decides staleness; age is only the fallback bound."""
 
     @staticmethod
-    def _row(lane: str, observed_at: float, valid_until: float) -> dict:
+    def _row(lane: str, observed_at: float, valid_until: float | None) -> dict:
         return {
             "runtime": "qwen",
-            "scope_id": lane,
+            "lane": lane,
+            "window": "5h",
+            "target": None,
+            "source": "omniroute",
             "observed_at": observed_at,
             "valid_until": valid_until,
         }
@@ -608,3 +611,8 @@ class CapacityStalenessTests(unittest.TestCase):
 
     def test_an_expired_sample_is_stale_even_when_recently_observed(self) -> None:
         self.assertEqual(self._lanes([self._row("expired", 999, 500)]), ["expired"])
+
+    def test_a_sample_without_validity_keeps_the_age_bound(self) -> None:
+        rows = [self._row("aged", 100, None), self._row("recent", 900, None)]
+
+        self.assertEqual(self._lanes(rows), ["aged"])

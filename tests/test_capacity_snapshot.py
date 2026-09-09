@@ -61,15 +61,16 @@ class CapacitySnapshotTests(unittest.TestCase):
                     "reset_at": 2_000.0,
                     "observed_at": 900.0,
                     "valid_until": sample_valid_until,
+                    "payload": None,
                 }
             )
-        self.store.replace_capacity_snapshot(
+        self.store.append_capacity_samples(
+            sample_rows,
             runtime=runtime,
             scope_id=scope,
             observed_at=900.0,
             valid_until=snapshot_valid_until,
             payload={
-                "samples": sample_rows,
                 "pools": [
                     {
                         "pool_id": pool_id,
@@ -100,10 +101,10 @@ class CapacitySnapshotTests(unittest.TestCase):
         """A fresh arbitrary route is routable only with its exact history key."""
 
         self._append_scope("fresh")
-        snapshot = build_capacity_routes(self.store, now=1_000.0)
+        snapshot = build_capacity_routes(self.store, retention=10, now=1_000.0)
         self.assertEqual(len(snapshot.routes), 1)
         self.assertEqual(
-            snapshot.routes[0].readings[0].key.target, "account-fresh"
+            snapshot.routes[0].forecasts[0].key.target, "account-fresh"
         )
 
     def test_identical_cross_scope_definitions_collapse(self) -> None:
@@ -111,7 +112,7 @@ class CapacitySnapshotTests(unittest.TestCase):
 
         self._append_scope("one", account="shared-account")
         self._append_scope("two", account="shared-account")
-        snapshot = build_capacity_routes(self.store, now=1_000.0)
+        snapshot = build_capacity_routes(self.store, retention=20, now=1_000.0)
         self.assertEqual(len(snapshot.routes), 1)
         self.assertEqual(snapshot.routes[0].descriptor.route_id, "route")
         self.assertFalse(snapshot.deferred)
@@ -135,7 +136,7 @@ class CapacitySnapshotTests(unittest.TestCase):
             route_id="shared-route",
             lane="b",
         )
-        snapshot = build_capacity_routes(self.store, now=1_000.0)
+        snapshot = build_capacity_routes(self.store, retention=20, now=1_000.0)
         self.assertFalse(snapshot.routes)
         self.assertEqual({item.reason for item in snapshot.deferred}, {"conflict"})
         self.assertEqual(
@@ -167,7 +168,7 @@ class CapacitySnapshotTests(unittest.TestCase):
                 """,
                 ("{", "runtime-bad", "broken"),
             )
-        snapshot = build_capacity_routes(self.store, now=1_000.0)
+        snapshot = build_capacity_routes(self.store, retention=20, now=1_000.0)
         self.assertEqual(
             [route.descriptor.runtime for route in snapshot.routes],
             ["runtime-good"],
@@ -193,15 +194,27 @@ class CapacitySnapshotTests(unittest.TestCase):
             runtime="runtime-unknown",
             sample_valid_until=950.0,
         )
-        snapshot = build_capacity_routes(self.store, now=1_000.0)
+        self.store.insert_capacity_sample(
+            runtime="legacy-runtime",
+            lane="legacy",
+            window="window",
+            source="legacy-source",
+            target="legacy-account",
+            remaining_percent=99.0,
+            reset_at=2_000.0,
+            observed_at=900.0,
+            valid_until=2_000.0,
+            payload={},
+        )
+        snapshot = build_capacity_routes(self.store, retention=20, now=1_000.0)
         self.assertFalse(snapshot.routes)
         self.assertEqual(
             {(item.runtime, item.reason) for item in snapshot.deferred},
-            set(),
+            {("runtime-missing", "missing_forecast")},
         )
         self.assertEqual(
             {(item.runtime, item.reason) for item in snapshot.unavailable},
-            {("runtime-missing", "missing_sample"), ("runtime-unknown", "stale_sample")},
+            {("runtime-unknown", "unknown_forecast")},
         )
         self.assertNotIn(
             "legacy-runtime",
@@ -212,4 +225,6 @@ class CapacitySnapshotTests(unittest.TestCase):
         """Non-positive retention and non-finite time are rejected."""
 
         with self.assertRaises(ValidationError):
-            build_capacity_routes(self.store, now=float("nan"))
+            build_capacity_routes(self.store, retention=0, now=1.0)
+        with self.assertRaises(ValidationError):
+            build_capacity_routes(self.store, retention=1, now=float("nan"))

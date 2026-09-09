@@ -276,6 +276,23 @@ class M008IntegrationTests(unittest.TestCase):
         self.assertIsNotNone(transcript["next_cursor"])
         self.assertEqual(transcript["messages"][1]["raw_ref"], "raw/two.json")
 
+        self.assertEqual(self.service.limits().items, (), "missing capacity stays unknown")
+        self.store.insert_capacity_sample(
+            runtime="fake",
+            lane="main",
+            window="5h",
+            source="stale-test",
+            payload={},
+            remaining_percent=50,
+            reset_at=200,
+            observed_at=10,
+            valid_until=50,
+        )
+        stale = self.service.limits().items[0]
+        self.assertFalse(stale.known)
+        self.assertEqual(stale.risk, "unknown")
+        self.assertEqual(SERVICE_ADAPTER.limits_calls, 0)
+
         SERVICE_ADAPTER.capabilities = frozenset(
             capability for capability in Capability if capability is not Capability.STEER
         )

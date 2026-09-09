@@ -1,4 +1,4 @@
-"""Validated joins of current capacity snapshots and route topology."""
+"""Validated, in-memory joins of persisted route topology and forecasts."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from typing import Mapping
 from agent_run.errors import ValidationError
 from agent_run.state import StateStore
 
+from .forecast import CapacityForecast, build_forecasts
+from .history import CapacityKey, load_series
 from .topology import (
-    CapacityKey,
     CapacityRouteDescriptor,
     CapacityTopology,
     PhysicalPoolDescriptor,
@@ -20,23 +21,12 @@ from .topology import (
 
 
 @dataclass(frozen=True)
-class CapacityReading:
-    """One current provider quota value with its freshness bounds."""
-
-    key: CapacityKey
-    remaining_percent: float | None
-    reset_at: float | None
-    observed_at: float
-    valid_until: float
-
-
-@dataclass(frozen=True)
 class CapacityRoute:
-    """One routable descriptor with its exact pools and current readings."""
+    """One routable descriptor with its exact pools and known forecasts."""
 
     descriptor: CapacityRouteDescriptor
     pools: tuple[PhysicalPoolDescriptor, ...]
-    readings: tuple[CapacityReading, ...]
+    forecasts: tuple[CapacityForecast, ...]
 
 
 @dataclass(frozen=True)
@@ -51,12 +41,17 @@ class CapacityRouteEvidence:
 
 @dataclass(frozen=True)
 class CapacityRouteSnapshot:
-    """Fresh routes, excluded-scope evidence, and current readings."""
+    """Immutable routes and bounded evidence produced for one observation time.
+
+    ``routes`` contains only fresh, validated routes whose every exact pool key
+    has a known forecast. ``deferred`` records malformed, conflicting, or
+    missing-forecast topology. ``unavailable`` records expired topology and
+    unknown forecasts. No ranking or scoring is performed here.
+    """
 
     routes: tuple[CapacityRoute, ...]
     deferred: tuple[CapacityRouteEvidence, ...]
     unavailable: tuple[CapacityRouteEvidence, ...]
-    readings: tuple[CapacityReading, ...] = ()
 
 
 def _text(value: object, name: str) -> str:
@@ -126,72 +121,43 @@ def _topology(payload: object) -> CapacityTopology:
     return validate_topology(pools, routes)
 
 
-def _readings(payload: object, runtime: str) -> tuple[CapacityReading, ...]:
-    """Parse the current sample list embedded in one scope snapshot."""
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("samples"), list):
-        raise ValidationError("route payload must contain a samples list")
-    result = []
-    for raw in payload["samples"]:
-        if not isinstance(raw, dict):
-            raise ValidationError("sample must be an object")
-        remaining = raw.get("remaining_percent")
-        if remaining is not None and (
-            isinstance(remaining, bool)
-            or not isinstance(remaining, (int, float))
-            or not math.isfinite(remaining)
-            or not 0 <= remaining <= 100
-        ):
-            raise ValidationError("remaining_percent must be between 0 and 100")
-        values = []
-        for name in ("observed_at", "valid_until"):
-            value = raw.get(name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                raise ValidationError(f"{name} must be finite")
-            values.append(float(value))
-        reset = raw.get("reset_at")
-        if reset is not None and (
-            isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset)
-        ):
-            raise ValidationError("reset_at must be finite")
-        target = raw.get("target")
-        if target is not None:
-            target = _text(target, "target")
-        result.append(CapacityReading(
-            CapacityKey(runtime, _text(raw.get("lane"), "lane"), _text(raw.get("window"), "window"), target, _text(raw.get("source"), "source")),
-            None if remaining is None else float(remaining),
-            None if reset is None else float(reset),
-            values[0], values[1],
-        ))
-    return tuple(result)
-
-
-def _row_payload(row: Mapping[str, object]) -> tuple[CapacityTopology, tuple[CapacityReading, ...]]:
-    """Decode a state row payload and return topology plus current readings."""
+def _row_payload(row: Mapping[str, object]) -> CapacityTopology:
+    """Decode a state row payload and return its validated topology."""
 
     try:
         payload = row["payload_json"]
         if not isinstance(payload, str):
             raise ValidationError("route payload JSON must be text")
-        decoded = json.loads(payload)
-        return _topology(decoded), _readings(decoded, str(row["runtime"]))
+        return _topology(json.loads(payload))
     except (KeyError, TypeError, ValueError, ValidationError) as error:
         raise ValidationError("malformed persisted route snapshot") from error
 
 
-def build_capacity_routes(store: StateStore, *, now: float) -> CapacityRouteSnapshot:
-    """Build routes from fresh current snapshots without provider calls or writes."""
+def build_capacity_routes(
+    store: StateStore, *, retention: int, now: float
+) -> CapacityRouteSnapshot:
+    """Build fresh routable routes by exact-key forecast join.
+
+    ``store`` is read on its owning thread; ``retention`` is the positive
+    history bound passed to :func:`load_series`, and ``now`` is one finite
+    epoch timestamp used for every freshness decision. Persisted topology is
+    never inferred from legacy target values. Invalid input raises
+    :class:`ValidationError`; bad individual scopes become bounded evidence.
+    """
 
     if not isinstance(store, StateStore):
         raise ValidationError("store must be a StateStore")
+    if not isinstance(retention, int) or isinstance(retention, bool) or retention <= 0:
+        raise ValidationError("retention must be positive")
     if not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
         raise ValidationError("now must be finite")
+    forecasts = {item.key: item for item in build_forecasts(load_series(store, retention=retention), now=now)}
     routes: list[CapacityRoute] = []
     deferred: list[CapacityRouteEvidence] = []
     unavailable: list[CapacityRouteEvidence] = []
     pool_definitions: dict[tuple[str, str], list[tuple[str, PhysicalPoolDescriptor]]] = {}
     route_definitions: dict[tuple[str, str], list[tuple[str, CapacityRouteDescriptor]]] = {}
-    fresh: list[tuple[str, str, CapacityTopology, tuple[CapacityReading, ...]]] = []
+    fresh: list[tuple[str, str, CapacityTopology]] = []
     for row in store.capacity_route_snapshots():
         runtime, scope = str(row["runtime"]), str(row["scope_id"])
         def evidence(reason: str, detail: str) -> CapacityRouteEvidence:
@@ -210,7 +176,7 @@ def build_capacity_routes(store: StateStore, *, now: float) -> CapacityRouteSnap
                 or valid_until < observed
             ):
                 raise ValidationError("snapshot timestamps are malformed")
-            topology, readings = _row_payload(row)
+            topology = _row_payload(row)
         except ValidationError as error:
             deferred.append(evidence("malformed", str(error)))
             continue
@@ -220,13 +186,8 @@ def build_capacity_routes(store: StateStore, *, now: float) -> CapacityRouteSnap
         if any(key.runtime != runtime for pool in topology.pools for key in pool.keys) or any(descriptor.runtime != runtime for descriptor in topology.routes):
             deferred.append(evidence("malformed", "topology runtime differs from row runtime"))
             continue
-        fresh.append((runtime, scope, topology, readings))
-    current: dict[CapacityKey, CapacityReading] = {}
-    for runtime, scope, topology, readings in fresh:
-        for reading in readings:
-            previous = current.get(reading.key)
-            if previous is None or reading.observed_at > previous.observed_at:
-                current[reading.key] = reading
+        fresh.append((runtime, scope, topology))
+    for runtime, scope, topology in fresh:
         for pool in topology.pools:
             pool_definitions.setdefault((runtime, pool.pool_id), []).append((scope, pool))
         for descriptor in topology.routes:
@@ -246,15 +207,15 @@ def build_capacity_routes(store: StateStore, *, now: float) -> CapacityRouteSnap
             continue
         route_pools = tuple(pools[(runtime, pool_id)] for pool_id in descriptor.pool_ids)
         keys = tuple(sorted((key for pool in route_pools for key in pool.keys), key=lambda item: (item.runtime, item.lane, item.window, item.target or "", item.source)))
-        matching = tuple(current[key] for key in keys if key in current)
-        if len(matching) != len(keys):
+        matching = tuple(forecasts[key] for key in keys if key in forecasts)
+        missing = tuple(key for key in keys if key not in forecasts)
+        if missing:
             for scope, _ in values:
-                unavailable.append(CapacityRouteEvidence(runtime, scope, "missing_sample", f"route {route_id} has no exact current sample"))
-        elif any(item.remaining_percent is None or not item.observed_at <= now <= item.valid_until or (item.reset_at is not None and item.reset_at <= now) for item in matching):
+                deferred.append(CapacityRouteEvidence(runtime, scope, "missing_forecast", f"route {route_id} has no exact forecast"))
+        elif any(not item.known for item in matching):
             for scope, _ in values:
-                unavailable.append(CapacityRouteEvidence(runtime, scope, "stale_sample", f"route {route_id} has no fresh current sample"))
+                unavailable.append(CapacityRouteEvidence(runtime, scope, "unknown_forecast", f"route {route_id} has an unknown forecast"))
         else:
             routes.append(CapacityRoute(descriptor, route_pools, matching))
     key = lambda item: (item.runtime, item.scope_id, item.reason, item.detail)
-    readings = tuple(sorted(current.values(), key=lambda item: (item.key.runtime, item.key.lane, item.key.window, item.key.target or "", item.key.source)))
-    return CapacityRouteSnapshot(tuple(routes), tuple(sorted(deferred, key=key)), tuple(sorted(unavailable, key=key)), readings)
+    return CapacityRouteSnapshot(tuple(routes), tuple(sorted(deferred, key=key)), tuple(sorted(unavailable, key=key)))

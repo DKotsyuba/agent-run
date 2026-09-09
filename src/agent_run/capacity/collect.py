@@ -269,6 +269,7 @@ def collect_once(
         for name, runtime_config in config.runtimes.items()
         if runtime_config.enabled
     )
+    store.prune_capacity_samples(config.capacity.sample_retention)
     finished = time.time() if at is None else at
     _logger.info(
         "collect_once runtimes=%d samples=%d failed=%d partial=%d no_data=%d"
@@ -329,17 +330,24 @@ def collect_slice(
 
 
 def persist_slice(store: StateStore, collected: CapacityCollectionSlice) -> None:
-    """Replace one scope's current samples and topology atomically.
+    """Persist one already-validated slice atomically through the state API.
 
-    The snapshot carries only the latest provider result for ``scope_id`` and
-    expires as a unit. Raises ``ValidationError`` from the store for malformed
-    data and never writes capacity history.
+    This consumes :meth:`StateStore.append_capacity_samples` — samples and
+    the route topology snapshot land in one transaction, so a slice is either
+    wholly stored or not at all. Each sample's epoch fields come from the
+    slice's own timestamps: the per-sample ``observed_at`` when the sample
+    carries one, else the slice's. A sample with a positive shelf life gets
+    its own expiry; legacy samples without one retain ``None`` while the
+    topology snapshot keeps the slice expiry. The topology is
+    serialized as its pool ids, key identities, and routes. Raises
+    ``ValidationError`` (from the store) on the first malformed value; the
+    caller supplies a ``StateStore`` opened for this thread.
     """
 
     sample_rows = []
     for sample in collected.samples:
         observed_epoch = _epoch(sample.observed_at) or collected.observed_at
-        valid_until = collected.valid_until
+        valid_until = None
         if sample.valid_for_seconds and sample.valid_for_seconds > 0:
             valid_until = observed_epoch + sample.valid_for_seconds
         sample_rows.append(
@@ -352,15 +360,16 @@ def persist_slice(store: StateStore, collected: CapacityCollectionSlice) -> None
                 "reset_at": _epoch(sample.reset_at),
                 "observed_at": observed_epoch,
                 "valid_until": valid_until,
+                "payload": None,
             }
         )
-    store.replace_capacity_snapshot(
+    store.append_capacity_samples(
+        sample_rows,
         runtime=collected.runtime,
         scope_id=collected.scope_id,
         observed_at=collected.observed_at,
         valid_until=collected.valid_until,
         payload={
-            "samples": sample_rows,
             "pools": [
                 {
                     "pool_id": pool.pool_id,

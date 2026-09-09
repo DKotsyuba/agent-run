@@ -52,8 +52,8 @@ Capacity/limits data is only as fresh as its source last reported:
   recent run, then age out to unknown rather than showing stale numbers.
 
 An "unknown" limit is the system being honest about missing data, not a
-bug to chase. `agent-run limits` returns only current fresh readings; it has no
-history, forecast, burn, risk, or advice fields.
+bug to chase. `agent-run limits` uses stored sample history to report freshness,
+burn rate, exhaustion risk, and advisory pacing without calling providers.
 
 ## Delivery binding
 
