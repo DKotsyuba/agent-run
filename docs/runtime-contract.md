@@ -3,9 +3,9 @@
 Agent-run gives every child the host PATH, language toolchains, SDK variables,
 locale, and ordinary build environment. It changes only the runtime HOME/config
 locations and credentials explicitly selected for that runtime or one of its MCP
-servers. Claude unlabelled/native launches preserve the host `HOME` so native
-OAuth/Keychain state remains available; Claude labelled launches get an isolated
-`HOME` with an account-private `CLAUDE_CONFIG_DIR`.
+servers. Unlabelled/native Claude starts preserve host `HOME` and intentionally do
+not set `CLAUDE_CONFIG_DIR`; labelled account-scoped Claude starts use an
+isolated `HOME` and an explicit account-private `CLAUDE_CONFIG_DIR`.
 Credential-shaped ambient variables not selected by that contract
 are omitted. Exported ``RUSTUP_HOME`` and ``CARGO_HOME`` remain authoritative;
 when unset, existing `.rustup` and `.cargo` directories beneath the original
