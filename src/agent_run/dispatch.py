@@ -12,6 +12,7 @@ from .domain import OrchestratorRef, StartRequest
 from .effective_policy import Constraint
 from .errors import ValidationError
 from .service import AgentQuery, AgentService
+from .delivery.completion_notice_contract import completion_notice_contract_text
 
 _MAX_ERROR_CHARS = 512
 _MAX_LINE_BYTES = 1024 * 1024
@@ -50,7 +51,7 @@ TOOLS = (
     },
     {
         "name": "start",
-        "description": "Start one asynchronous durable agent.",
+        "description": "Start one asynchronous durable agent. " + completion_notice_contract_text(),
         "inputSchema": _schema(
             {
                 "runtime": {"type": "string"},
@@ -125,6 +126,21 @@ TOOLS = (
             "request_id": {"type": ["string", "null"]},
             "orchestrator": {"anyOf": [_ORCHESTRATOR, {"type": "null"}]},
         }, ("agent_id", "task")),
+    },
+    {
+        "name": "doc",
+        "description": "Read one operator guide topic, or the index when omitted.",
+        "inputSchema": _schema({"topic": {"type": ["string", "null"]}}),
+    },
+    {
+        "name": "models",
+        "description": "List enabled runtime model rosters with capability and health evidence.",
+        "inputSchema": _schema({}),
+    },
+    {
+        "name": "limits",
+        "description": "Read current fresh capacity readings without projections.",
+        "inputSchema": _schema({}),
     },
 )
 TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
@@ -241,7 +257,17 @@ def call_tool(service: AgentService, name: str, raw: dict) -> object:
             cursor=args.get("cursor", 0),
             limit=args.get("limit", 200),
         )
+    if name == "doc":
+        from .doc import topic_text
+
+        args = _arguments(raw, {"topic"})
+        topic = _optional_string(args, "topic")
+        return {"topic": topic or "index", "text": topic_text(topic)}
     args = _arguments(raw, set())
+    if name == "models":
+        return service.models()
+    if name == "limits":
+        return service.limits()
     return service.capacity_order()
 
 

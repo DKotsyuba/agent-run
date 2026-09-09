@@ -61,6 +61,9 @@ class FakeService:
         self.request = {"agent_id": agent_id, "task": task, **kwargs}
         return self._return("resume", FakeStart())
 
+    def bind(self, agent_id, ref):
+        return self._return("bind", {"agent_id": agent_id, "orchestrator": ref})
+
     def cancel(self, agent_id):
         return self._return("cancel", {"agent_id": agent_id, "status": "cancelling"})
 
@@ -110,9 +113,40 @@ class FakeService:
             ),
         )
 
+    def context(self, ref):
+        return self._return("context", {"orchestrator": ref, "injected": True})
+
+    def models(self):
+        return self._return("models", MappingProxyType({"codex": ("model",)}))
+
+    def limits(self):
+        return self._return("limits", {"items": ()})
+
     def capacity_collect(self):
         return self._return("capacity_collect", {"collected": True})
 
+    def delivery_status(self, agent_id):
+        return self._return("delivery_status", {"agent_id": agent_id})
+
+    def delivery_cancel(self, delivery_id):
+        return self._return("delivery_cancel", {"delivery_id": delivery_id})
+
+    def delivery_dispatch(self):
+        return self._return("delivery_dispatch", {"delivered": 1})
+
+    def hook_context(self, payload, transport="codex_queue"):
+        return self._return(
+            "hook_context",
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "context",
+                }
+            },
+        )
+
+    def hook_bind(self, payload, transport="codex_queue"):
+        return self._return("hook_bind", payload)
 
     def init(self):
         return self._return("init", {"initialized": True})
@@ -571,11 +605,18 @@ target = "auth.json"
     def test_producer_shims_and_all_top_level_commands_parse(self):
         service = FakeService()
         cases = (
+            (["bind", AGENT_ID, "--session-transport", "codex_queue", "--session-id", "s"], "bind"),
             (["cancel", AGENT_ID], "cancel"),
             (["steer", AGENT_ID, "--text", "go"], "steer"),
             (["agents"], "list"),
             (["answer", AGENT_ID], "answer"),
+            (["models"], "models"),
+            (["limits"], "limits"),
+            (["context", "--session-transport", "codex_queue", "--session-id", "s"], "context"),
             (["capacity", "collect", "--once"], "capacity_collect"),
+            (["delivery", "status", AGENT_ID], "delivery_status"),
+            (["delivery", "cancel", "delivery-1"], "delivery_cancel"),
+            (["delivery", "dispatch"], "delivery_dispatch"),
             (["init"], "init"),
             (["doctor"], "doctor"),
         )
@@ -586,14 +627,32 @@ target = "auth.json"
                 self.assertTrue(output.startswith("{"))
                 self.assertIn(expected, service.calls)
 
+        code, output, error = self.run_cli(
+            ["hook", "context"], service=service, stdin='{"agent_id":"x"}'
+        )
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(
+            json.loads(output),
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": "context",
+                }
+            },
+        )
+
+        code, output, error = self.run_cli(
+            ["hook", "bind"], service=service, stdin='{"agent_id":"x"}'
+        )
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output), {"agent_id": "x"})
+
     def test_removed_workflow_commands_are_not_parsed(self):
         """Legacy workflow and batch entry points are absent from the CLI."""
 
         for command in (
             ["workflow", "status", "wf_old"], ["batch", "--file", "-"],
-            ["delivery", "dispatch"], ["hook", "context"], ["bind", AGENT_ID],
-            ["context"], ["chain", AGENT_ID], ["status", AGENT_ID],
-            ["summary"], ["models"], ["limits"], ["doc"],
+            ["chain", AGENT_ID], ["status", AGENT_ID], ["summary"],
         ):
             with self.subTest(command=command), self.assertRaises(ValidationError):
                 cli._parser().parse_args(command)
@@ -675,6 +734,42 @@ target = "auth.json"
             self.assertEqual((code, output), (2, ""))
             self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
 
+    def test_delivery_launchd_renders_a_durable_bounded_sweeper(self):
+        import plistlib
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            queue = home / "queue"
+            (home / "config.toml").write_text(
+                f"schema_version = 1\n[delivery]\nretry_base_seconds = 2.1\n"
+                f'codex_queue_bin = "{queue}"\n',
+                encoding="utf-8",
+            )
+            binary = home / "agent-run"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            code = cli.main(
+                [
+                    "--home", str(home), "delivery", "launchd", "--binary", str(binary)
+                ],
+                stdin=io.StringIO(),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual((code, stderr.getvalue()), (0, ""))
+            self.assertFalse((home / "state.db").exists())
+            rendered = json.loads(stdout.getvalue())
+            self.assertEqual(rendered["interval_seconds"], 3)
+            self.assertEqual(
+                rendered["argv"],
+                [str(binary), "--home", str(home), "delivery", "dispatch"],
+            )
+            parsed = plistlib.loads(rendered["plist"].encode("utf-8"))
+            self.assertEqual(parsed["ProgramArguments"], rendered["argv"])
+            self.assertEqual(parsed["StartInterval"], 3)
+            self.assertIs(parsed["RunAtLoad"], False)
+            self.assertNotIn("KeepAlive", parsed)
 
     def test_api_launchd_renders_a_keep_alive_resident_daemon(self):
         import plistlib
@@ -748,6 +843,292 @@ target = "auth.json"
             )
             doctor.assert_called_once_with(home)
 
+    def test_hook_context_wraps_first_injection_and_suppresses_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            payload = json.dumps(
+                {
+                    "transport": "codex_queue",
+                    "external_session_id": "session-1",
+                }
+            )
+            args = ["--home", str(home), "hook", "context"]
+
+            code, output, error = self.run_cli(args, service=runtime, stdin=payload)
+
+            self.assertEqual((code, error), (0, ""))
+            envelope = json.loads(output)
+            self.assertEqual(set(envelope), {"hookSpecificOutput"})
+            hook_output = envelope["hookSpecificOutput"]
+            self.assertEqual(
+                set(hook_output), {"hookEventName", "additionalContext"}
+            )
+            self.assertEqual(hook_output["hookEventName"], "UserPromptSubmit")
+            self.assertTrue(hook_output["additionalContext"].strip())
+            self.assertLessEqual(len(hook_output["additionalContext"]), 2500)
+
+            code, output, error = self.run_cli(args, service=runtime, stdin=payload)
+
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(output), {})
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                receipt_count = check_store.connection.execute(
+                    "SELECT COUNT(*) FROM context_receipts"
+                ).fetchone()[0]
+            finally:
+                check_store.close()
+            self.assertEqual(receipt_count, 1)
+
+    def test_raw_codex_hooks_normalize_context_bind_and_refuse_bad_ids(self):
+        from agent_run.domain import AgentStatus, Outcome
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            workdir = home / "work"
+            workdir.mkdir()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            agent_id = str(
+                store.create_agent(
+                    StartRequest(
+                        "codex", "model", "profile", "task", workdir,
+                        timeout_seconds=480,
+                    ),
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    at=1,
+                ).agent_id
+            )
+            store.transition(agent_id, AgentStatus.STARTING, at=2)
+            store.transition(agent_id, AgentStatus.RUNNING, at=3)
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            context_payload = {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "raw-session",
+                "turn_id": "turn-1",
+                "cwd": str(home),
+                "prompt": "must-not-be-logged",
+                "transcript_path": "/ignored/raw-transcript",
+                "permission_mode": "default",
+            }
+
+            with patch.object(
+                cli, "build_context", wraps=cli.build_context
+            ) as build_context:
+                code, output, error = self.run_cli(
+                    ["--home", str(home), "hook", "context"],
+                    service=runtime,
+                    stdin=json.dumps(context_payload),
+                )
+
+            self.assertEqual((code, error), (0, ""))
+            build_context.assert_called_once()
+            ref = build_context.call_args.args[1]
+            self.assertEqual(
+                (ref.transport, ref.external_session_id, ref.external_turn_id),
+                (cli.TRANSPORT_NAME, "raw-session", "turn-1"),
+            )
+            self.assertNotIn("must-not-be-logged", output)
+            self.assertEqual(
+                json.loads(output)["hookSpecificOutput"]["hookEventName"],
+                "UserPromptSubmit",
+            )
+
+            bind_payload = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "raw-session",
+                "turn_id": "turn-2",
+                "tool_name": "mcp__agent_run__start",
+                "tool_use_id": "call-1",
+                "unrelated_metadata": {"ignored": True},
+                "tool_response": {
+                    "content": [{"type": "text", "text": "ignored"}],
+                    "structuredContent": {"agent_id": agent_id},
+                },
+            }
+            # The bind hook fires while the agent is still running, so the
+            # terminal transition below creates a deliverable pending notice.
+            with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
+                code, output, error = self.run_cli(
+                    ["--home", str(home), "hook", "bind"],
+                    service=runtime,
+                    stdin=json.dumps(bind_payload),
+                )
+
+            self.assertEqual((code, error), (0, ""))
+            run_hook.assert_called_once()
+            self.assertEqual(
+                run_hook.call_args.args[1],
+                {
+                    "agent_id": agent_id,
+                    "transport": cli.TRANSPORT_NAME,
+                    "external_session_id": "raw-session",
+                    "external_turn_id": "turn-2",
+                },
+            )
+            bind_envelope = json.loads(output)
+            self.assertEqual(set(bind_envelope), {"hookSpecificOutput"})
+            bind_output = bind_envelope["hookSpecificOutput"]
+            self.assertEqual(
+                set(bind_output), {"hookEventName", "additionalContext"}
+            )
+            self.assertEqual(bind_output["hookEventName"], "PostToolUse")
+            self.assertIn(agent_id, bind_output["additionalContext"])
+            self.assertIn("completion will be delivered", bind_output["additionalContext"])
+
+            store = cli.StateStore.open(home / "state.db")
+            try:
+                store.transition(
+                    agent_id,
+                    AgentStatus.SUCCEEDED,
+                    outcome=Outcome(AgentStatus.SUCCEEDED),
+                    at=4,
+                )
+            finally:
+                store.close()
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                session = check_store.connection.execute(
+                    "SELECT * FROM orchestrator_sessions WHERE external_session_id = ?",
+                    ("raw-session",),
+                ).fetchone()
+                delivery = check_store.connection.execute(
+                    "SELECT * FROM deliveries WHERE agent_id = ?", (agent_id,)
+                ).fetchone()
+                claimed = check_store.claim_delivery("worker", at=10_000_000_000)
+            finally:
+                check_store.close()
+            self.assertEqual(cli.TRANSPORT_NAME, "codex_queue")
+            self.assertEqual(session["transport"], cli.TRANSPORT_NAME)
+            self.assertEqual(session["external_turn_id"], "turn-2")
+            self.assertEqual(delivery["orchestrator_session_id"], session["id"])
+            self.assertEqual(delivery["state"], "pending")
+            self.assertEqual(claimed["transport"], cli.TRANSPORT_NAME)
+
+            rebind_payload = dict(bind_payload, session_id="another-session")
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(rebind_payload),
+            )
+            self.assertEqual((code, output), (2, ""))
+            rebind_error = json.loads(error)["error"]
+            self.assertEqual(rebind_error["type"], "BindHookError")
+            self.assertIn("immutable", rebind_error["message"])
+
+            # Claude Code's MCP client may drop/mis-key structuredContent and
+            # carry the id only as JSON text inside a content block. Rebinding
+            # the same (agent_id, transport, session) target is idempotent, so
+            # this doubles as proof the text-content variant alone is enough
+            # to resolve the agent_id.
+            text_variant_payload = dict(
+                bind_payload,
+                tool_response={
+                    "structuredContent": {"agentId": agent_id},
+                    "content": [{"type": "text", "text": f'{{"agent_id":"{agent_id}"}}'}],
+                },
+            )
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(text_variant_payload),
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn(
+                agent_id,
+                json.loads(output)["hookSpecificOutput"]["additionalContext"],
+            )
+
+            # A real Claude Code PostToolUse payload may serialize the whole
+            # MCP tool result as one JSON string in tool_response, rather than
+            # a dict or content-block list; that shape alone must still bind.
+            string_variant_payload = dict(
+                bind_payload,
+                tool_response=json.dumps(
+                    {"agent_id": agent_id, "created": True, "agent": {"status": "starting"}}
+                ),
+            )
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "bind"],
+                service=runtime,
+                stdin=json.dumps(string_variant_payload),
+            )
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn(
+                agent_id,
+                json.loads(output)["hookSpecificOutput"]["additionalContext"],
+            )
+
+            conflicting_id = agent_id[:-1] + ("0" if agent_id[-1] != "0" else "1")
+            refused = {
+                "missing": {
+                    "structuredContent": {"agentId": agent_id},
+                    "content": [{"type": "text", "text": "not json"}],
+                },
+                "conflicting": [
+                    {"structuredContent": {"agent_id": agent_id}},
+                    {"agent_id": conflicting_id},
+                ],
+                "not_json_string": "plain text, not json at all",
+            }
+            with patch.object(cli, "run_hook", wraps=cli.run_hook) as run_hook:
+                for label, tool_response in refused.items():
+                    with self.subTest(label=label):
+                        payload = dict(bind_payload, tool_response=tool_response)
+                        code, output, error = self.run_cli(
+                            ["--home", str(home), "hook", "bind"],
+                            service=runtime,
+                            stdin=json.dumps(payload),
+                        )
+                        self.assertEqual((code, output), (2, ""))
+                        self.assertEqual(
+                            json.loads(error)["error"]["type"], "ValidationError"
+                        )
+                run_hook.assert_not_called()
+
+            for hook, payload in (
+                ("context", dict(context_payload, hook_event_name="PostToolUse")),
+                ("bind", dict(bind_payload, hook_event_name="UserPromptSubmit")),
+            ):
+                with self.subTest(mismatched_event=hook):
+                    code, output, error = self.run_cli(
+                        ["--home", str(home), "hook", hook],
+                        service=runtime,
+                        stdin=json.dumps(payload),
+                    )
+                    self.assertEqual((code, output), (2, ""))
+                    self.assertEqual(
+                        json.loads(error)["error"]["type"], "ValidationError"
+                    )
+
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "context"],
+                service=runtime,
+                stdin=json.dumps({"session_id": " "}),
+            )
+            self.assertEqual((code, output), (2, ""))
+            self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
+
+            normalized = {
+                "transport": cli.TRANSPORT_NAME,
+                "external_session_id": "strict-normalized",
+                "unrelated": True,
+            }
+            code, output, error = self.run_cli(
+                ["--home", str(home), "hook", "context"],
+                service=runtime,
+                stdin=json.dumps(normalized),
+            )
+            self.assertEqual((code, output), (2, ""))
+            self.assertEqual(json.loads(error)["error"]["type"], "ValidationError")
 
     def test_mcp_command_is_reserved_without_importing_parallel_module(self):
         sys.modules.pop("agent_run.mcp", None)
@@ -800,9 +1181,197 @@ target = "auth.json"
         self.assertEqual(
             [tool["name"] for tool in responses[1]["result"]["tools"]],
             ["capacity_order", "start", "cancel", "steer", "list_agents",
-             "transcript", "answer", "resume"],
+             "transcript", "answer", "resume", "doc", "models", "limits"],
         )
 
+    def test_dispatch_composes_relay_transport_and_fresh_store_once(self):
+        """Construct relay-only Codex delivery without consulting a queue binary."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            store = Mock()
+            transport = Mock()
+            dispatcher = Mock()
+            result = object()
+            dispatcher.run.return_value = result
+            config = SimpleNamespace(
+                delivery=SimpleNamespace()
+            )
+            uds_sender = Mock()
+            uds_transport = Mock()
+            relay = Mock()
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                cli, "load_config", return_value=config
+            ), patch.object(cli.StateStore, "open", return_value=store) as opened, patch.object(
+                cli, "CodexQueueTransport", return_value=transport
+            ) as transport_type, patch(
+                "agent_run.delivery.codex_desktop_relay.CodexDesktopRelayClient",
+                return_value=relay,
+            ) as relay_type, patch.object(
+                cli, "ClaudeSessionSender", return_value=uds_sender
+            ) as uds_sender_type, patch.object(
+                cli, "ClaudeUdsTransport", return_value=uds_transport
+            ) as uds_transport_type, patch.object(
+                cli, "DeliveryDispatcher", return_value=dispatcher
+            ) as dispatcher_type:
+                self.assertIs(cli._dispatch_once(home), result)
+
+            opened.assert_called_once_with(home / "state.db")
+            relay_type.assert_called_once_with(home)
+            transport_type.assert_called_once_with(relay)
+            uds_sender_type.assert_called_once_with()
+            uds_transport_type.assert_called_once_with(uds_sender)
+            dispatcher_type.assert_called_once_with(
+                store,
+                {
+                    cli.TRANSPORT_NAME: transport,
+                    cli.CLAUDE_UDS_TRANSPORT_NAME: uds_transport,
+                },
+                config.delivery,
+            )
+            dispatcher.run.assert_called_once_with(home=home)
+            store.close.assert_called_once_with()
+
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            with patch.object(cli, "_dispatch_once", return_value=result) as dispatch:
+                self.assertIs(runtime.delivery_dispatch(), result)
+            dispatch.assert_called_once_with(home)
+
+    def test_dispatch_ignores_legacy_queue_binary_settings(self):
+        """Neither legacy configuration nor environment can activate UI queue."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            configured = home / "configured"
+            override = home / "override"
+            override.write_text("#!/bin/sh\n", encoding="utf-8")
+            override.chmod(0o700)
+            config = SimpleNamespace(
+                delivery=SimpleNamespace(codex_queue_bin=configured)
+            )
+            dispatcher = Mock()
+            dispatcher.run.return_value = object()
+            with patch.dict(
+                os.environ, {"CODEX_QUEUE_BIN": str(override)}, clear=True
+            ), patch.object(cli, "load_config", return_value=config), patch.object(
+                cli.StateStore, "open", return_value=Mock()
+            ), patch("agent_run.delivery.codex_queue.CodexQueueSender") as sender, patch.object(
+                cli, "CodexQueueTransport", return_value=Mock()
+            ), patch.object(cli, "DeliveryDispatcher", return_value=dispatcher):
+                cli._dispatch_once(home)
+            sender.assert_not_called()
+
+    def test_hook_transport_is_per_runtime_and_dispatch_routes_by_the_recorded_name(self):
+        from agent_run.delivery.base import DeliveryReceipt
+        from agent_run.delivery.dispatch import DeliveryDispatcher
+        from agent_run.domain import Outcome
+
+        for command in ("context", "bind"):
+            args = cli._parser().parse_args(["hook", command])
+            self.assertEqual(args.transport, cli.TRANSPORT_NAME)
+            args = cli._parser().parse_args(
+                ["hook", command, "--transport", cli.CLAUDE_UDS_TRANSPORT_NAME]
+            )
+            self.assertEqual(args.transport, cli.CLAUDE_UDS_TRANSPORT_NAME)
+            with self.assertRaises(ValidationError):
+                cli._parser().parse_args(["hook", command, "--transport", "slack"])
+        with self.assertRaises(ValidationError):
+            cli._hook_payload({"session_id": "s"}, bind=False, transport="slack")
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            workdir = home / "work"
+            workdir.mkdir()
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            store = cli.StateStore.initialize(home / "state.db")
+            agent_id = str(
+                store.create_agent(
+                    StartRequest(
+                        "claude", "model", "profile", "task", workdir,
+                        timeout_seconds=480,
+                    ),
+                    task_summary="summary",
+                    config_revision="cfg-1",
+                    at=1,
+                ).agent_id
+            )
+            store.transition(agent_id, AgentStatus.STARTING, at=2)
+            store.transition(agent_id, AgentStatus.RUNNING, at=3)
+            store.close()
+            runtime = object.__new__(cli._Runtime)
+            runtime.home = home
+            # The bind hook fires while the agent is still running, so the
+            # terminal transition below creates a deliverable pending notice.
+            code, _output, error = self.run_cli(
+                [
+                    "--home", str(home), "hook", "bind",
+                    "--transport", cli.CLAUDE_UDS_TRANSPORT_NAME,
+                ],
+                service=runtime,
+                stdin=json.dumps(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "claude-session",
+                        "turn_id": "turn-9",
+                        "tool_response": {"structuredContent": {"agent_id": agent_id}},
+                    }
+                ),
+            )
+            self.assertEqual((code, error), (0, ""))
+
+            store = cli.StateStore.open(home / "state.db")
+            try:
+                store.transition(
+                    agent_id,
+                    AgentStatus.SUCCEEDED,
+                    outcome=Outcome(AgentStatus.SUCCEEDED),
+                    at=4,
+                )
+            finally:
+                store.close()
+            check_store = cli.StateStore.open(home / "state.db")
+            try:
+                session = check_store.connection.execute(
+                    "SELECT * FROM orchestrator_sessions WHERE external_session_id = ?",
+                    ("claude-session",),
+                ).fetchone()
+                self.assertEqual(session["transport"], cli.CLAUDE_UDS_TRANSPORT_NAME)
+
+                codex = Mock(
+                    name="codex", api_version=1, **{"validate.return_value": None}
+                )
+                claude = Mock(
+                    name="claude", api_version=1, **{"validate.return_value": None}
+                )
+                claude.send.return_value = DeliveryReceipt()
+                DeliveryDispatcher(
+                    check_store,
+                    {
+                        cli.TRANSPORT_NAME: codex,
+                        cli.CLAUDE_UDS_TRANSPORT_NAME: claude,
+                    },
+                    owner="router",
+                ).drain(at=10_000_000_000)
+            finally:
+                check_store.close()
+            codex.send.assert_not_called()
+            claude.send.assert_called_once()
+            self.assertEqual(
+                claude.send.call_args.args[0].transport,
+                cli.CLAUDE_UDS_TRANSPORT_NAME,
+            )
+
+    def test_dispatch_needs_no_codex_queue_binary(self):
+        """An empty real outbox drains with missing or invalid legacy queue env."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "config.toml").write_text("schema_version = 1\n", encoding="utf-8")
+            cli.StateStore.initialize(home / "state.db").close()
+            for environment in ({}, {"CODEX_QUEUE_BIN": "codex"}):
+                with self.subTest(environment=environment), patch.dict(
+                    os.environ, environment, clear=True
+                ), patch("agent_run.delivery.codex_queue.CodexQueueSender.__call__") as queue:
+                    self.assertEqual(cli._dispatch_once(home).claimed, 0)
+                    queue.assert_not_called()
 
     def test_launch_hands_over_one_exec_payload_and_reconciles_on_reap(self):
         with tempfile.TemporaryDirectory() as directory:

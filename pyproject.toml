@@ -45,4 +45,6 @@ Changelog = "https://github.com/DKotsyuba/agent-run/blob/main/CHANGELOG.md"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"agent_run" = ["operator_guide/*.md"]
+"agent_run.delivery" = ["*.cjs", "*.json"]
 "agent_run.state" = ["schema.sql", "migrations/*.sql"]

@@ -55,6 +55,14 @@ tool's arguments.
 {"jsonrpc": "2.0", "id": 1, "result": {"items": [...], "revision": 42, ...}}
 ```
 
+Terminal agent responses include `delivery.last_attempt` when Codex queue made
+at least one delivery attempt. The additive nullable object records a safe
+classifier, executable provenance, argv shape without values, duration, exact
+return code or spawn errno, error class, original output byte counts,
+truncation flags, bounded redacted stdout/stderr tails, and whether a remote
+message id was observed. Each tail is at most 4096 UTF-8 bytes. Messages,
+session ids, argv/environment values, and credentials are never persisted.
+
 One connection may send many requests; on a single connection they are
 answered in order. Open several connections for parallelism — dispatch is
 serialized within two bounded owner lanes. Durable start/resume/cancel/steer
@@ -83,7 +91,8 @@ Discover the authoritative surface at runtime:
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
 The tool set (same names as the MCP server) is exactly `start`, `resume`,
-`cancel`, `steer`, `list_agents`, `answer`, `transcript`, and `capacity_order`.
+`cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
+`doc`, `models`, and `limits`.
 
 See [continuations](continuations.md) for native-context `resume`, inherited
 authority, idempotency and history availability.
@@ -95,8 +104,8 @@ agent row is admitted; advisory evidence and unrelated tool filtering do not
 satisfy isolation requirements. Unknown or duplicate names are invalid.
 
 `request_id` replay is scoped to the caller namespace in the original request.
-Clients that omit `orchestrator` share the unbound namespace across fresh
-connections.
+A later PostToolUse notification binding does not change that identity. Clients
+that omit `orchestrator` share the unbound namespace across fresh connections.
 
 `list_agents` accepts optional `after_revision` and `wait_seconds`. When the
 current event revision is not newer, the call waits up to 60 seconds and wakes
@@ -112,8 +121,8 @@ Those views also include nullable `cleanup` evidence from the latest owned
 process cleanup observation: attempted `signals`, `scope`, `group_gone`,
 nullable `descendants_gone`, `confirmed`, and nullable `process_group_id`.
 Confirmation requires the original group and the readable pre-signal owned set
-to be gone. Page projections resolve progress, warnings and cleanup in one
-batched state query.
+to be gone. Page projections resolve progress, warnings, delivery evidence and
+cleanup in one batched state query.
 
 New rows also expose immutable `policy` evidence with the runtime/platform and
 one entry for every known constraint: actual enforcement, support, whether the
@@ -183,7 +192,7 @@ started = api.call(
 )
 final = api.call("wait", agent_id=started["agent_id"], timeout_seconds=600)
 if final.get("timed_out"):
-    ...  # still running; poll `status` or wait again
+    ...  # still running; call list_agents or wait again
 else:
     print(final["content"])  # the agent's answer text
 ```
@@ -195,12 +204,17 @@ Notes for the loop:
 - The returned agent view is a snapshot, not a promise of `starting`: a fast
   bootstrap failure may already be terminal. Match concurrent results by agent
   or request ID rather than submission order.
-- Call `list_agents` with the last observed revision to wait for lifecycle
-  changes, then fetch the terminal result with `answer`.
+- Bound Codex/Claude chats receive completion notices automatically when
+  delivery is configured. The MCP `start` description includes the shared
+  notice format and handling contract; `agent-run doc completion` (or MCP
+  `doc` with `{"topic": "completion"}`) serves the same contract. The `wait`
+  example above is for an unbound API caller, not a bound-chat polling loop.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - Use `capacity_order` to choose the first compatible available route.
+- Use `models` for current runtime rosters and health; `limits` returns current
+  fresh capacity readings without history, forecasts, burn, risk, or advice.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit
@@ -229,5 +243,5 @@ id); `-32603` as a bug to report.
   the optional sealed-release layout restart it after switching
   `~/.agent-run/standalone/current`; ordinary pip/pipx installs use the
   `agent-run` executable on `PATH`.
-- Older resident processes refuse a newer migrated database and must be
-  restarted after upgrade.
+- Schema version 9 adds immutable per-attempt delivery evidence. Older resident
+  processes refuse the migrated database and must be restarted after upgrade.

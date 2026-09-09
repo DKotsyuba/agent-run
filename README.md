@@ -40,8 +40,7 @@ you / your agent / your app
   agent may read or write is explicit (`--write`, `--read-root`).
 - **Quota-aware.** A capacity collector samples remaining limits per
   provider (native engine data, [codexbar](https://github.com/steipete/codexbar),
-  or a local router), computes usage priorities from burn rate and reset time,
-  and ranks compatible routes for the orchestrator.
+  or a local router) and ranks compatible routes from current fresh readings.
 - **Locked dependencies.** Runtime packages are declared in `pyproject.toml`,
   resolved in the committed `uv.lock`, and release installs verify a hashed
   dependency closure before the application wheel.
@@ -180,8 +179,14 @@ agent-run answer ag-20260831-...
 ```
 
 Useful verbs beyond that: `transcript --follow`, `steer`, `cancel`, `agents`
-(list), and `stats backfill`. All output is line-delimited JSON — pipe it into
-`jq`.
+(list), `models`, `limits`, and `stats backfill`. All output is line-delimited
+JSON — pipe it into `jq`.
+
+For Codex queue delivery, `agent-run delivery status <agent-id>` exposes the latest
+bounded diagnostic summary: classifier, duration, exact exit status or spawn
+errno, output byte counts/truncation, and redacted stdout/stderr tails. It never
+contains the delivered message, session id, argv values, environment values,
+or credentials; non-queue deliveries report `null`.
 
 ## Use as an MCP server
 
@@ -200,9 +205,9 @@ agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgent
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 ```
 
-The proxy exposes the same eight tools as the resident daemon: `start`,
+The proxy exposes the same eleven tools as the resident daemon: `start`,
 `resume`, `cancel`, `steer`, `list_agents`, `answer`, `transcript`, and
-`capacity_order`.
+`capacity_order`, plus `doc`, `models`, and `limits`.
 
 **Claude Code:**
 
@@ -247,6 +252,7 @@ a copy-paste Python client: [docs/api.md](docs/api.md).
 | CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
 | MCP server | `agent-run mcp` | stdio, shared tool surface |
 | JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
+| Operator guide | `agent-run doc` | packaged orchestration rules and maintenance topics |
 | Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
 | Capacity collector | `agent-run capacity collect` | + launchd plist generator |
 | Capacity priority | `agent-run capacity order` | read-only, role-independent route order |
@@ -259,6 +265,7 @@ macOS Git bootstrap).
 
 ## Documentation
 
+- `agent-run doc` — packaged orchestration and operating rules
 - [docs/architecture.md](docs/architecture.md) — how the pieces fit
 - [docs/api.md](docs/api.md) — socket API integration guide
 - [docs/delegation-authorization.md](docs/delegation-authorization.md) — owner-adopted delegation and context-transfer authorization

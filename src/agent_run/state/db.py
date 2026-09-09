@@ -389,6 +389,117 @@ def session_for_ref(
     return session_id
 
 
+def _upsert_context_receipt(
+    connection: sqlite3.Connection,
+    orchestrator_session_id: str,
+    context_key: str,
+    injected_at: float,
+) -> bool:
+    return connection.execute(
+        """INSERT INTO context_receipts (
+               orchestrator_session_id, context_key, injected_at
+           ) VALUES (?, ?, ?)
+           ON CONFLICT(orchestrator_session_id) DO UPDATE SET
+               context_key = excluded.context_key,
+               injected_at = excluded.injected_at
+           WHERE context_receipts.context_key <> excluded.context_key""",
+        (orchestrator_session_id, context_key, injected_at),
+    ).rowcount == 1
+
+
+#: Version tag written into every component-fingerprint context receipt key.
+_CONTEXT_RECEIPT_VERSION = 2
+
+
+def encode_context_components(components: dict[str, str]) -> str:
+    """Encode component fingerprints as one versioned, order-independent key.
+
+    ``components`` maps nonblank names to nonblank fingerprint strings. The
+    result is canonical JSON (sorted names, fixed separators), so the same
+    component set always encodes to the same single ``context_receipts`` key.
+    """
+
+    if "v" in components:
+        raise ValidationError("component name v is reserved")
+    if not all(
+        isinstance(name, str) and name.strip() and isinstance(value, str) and value.strip()
+        for name, value in components.items()
+    ):
+        raise ValidationError("context components must use nonblank string names and values")
+    return json.dumps(
+        {"v": _CONTEXT_RECEIPT_VERSION, "components": components},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def parse_context_components(context_key: str) -> dict[str, str] | None:
+    """Decode a versioned component receipt key back into its fingerprints.
+
+    Returns the name-to-fingerprint mapping for any key produced by
+    :func:`encode_context_components`, or ``None`` for anything else --
+    legacy single-digest keys, foreign formats, or malformed JSON -- so the
+    caller can treat those rows as "every component changed".
+    """
+
+    try:
+        decoded = json.loads(context_key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict) or decoded.get("v") != _CONTEXT_RECEIPT_VERSION:
+        return None
+    values = decoded.get("components")
+    if not isinstance(values, dict) or not values or not all(
+        isinstance(name, str) and name.strip() and isinstance(value, str) and value.strip()
+        for name, value in values.items()
+    ):
+        return None
+    return values
+
+
+def record_context_component_receipt(
+    connection: sqlite3.Connection,
+    orchestrator_session_id: str,
+    components: dict[str, str],
+    injected_at: float,
+) -> frozenset[str]:
+    """Compare and store component fingerprints in one already-open write
+    transaction, returning the names whose stored fingerprint differs.
+
+    Must run inside the caller's ``BEGIN IMMEDIATE`` block so the read,
+    compare, and write are atomic against concurrent callers. A missing row,
+    or a row holding a legacy non-versioned key, compares as changed for
+    every component and is (re)written in place in the versioned encoding;
+    fingerprint values equal to the stored ones neither change the row nor
+    touch ``injected_at``. Components absent from ``components`` but present
+    in a valid stored row are preserved unchanged.
+    """
+
+    row = connection.execute(
+        "SELECT context_key FROM context_receipts WHERE orchestrator_session_id = ?",
+        (orchestrator_session_id,),
+    ).fetchone()
+    stored = {} if row is None else (parse_context_components(str(row["context_key"])) or {})
+    changed = frozenset(
+        name for name, value in components.items() if stored.get(name) != value
+    )
+    if not changed:
+        return changed
+    merged = dict(stored)
+    merged.update(components)
+    connection.execute(
+        """INSERT INTO context_receipts (
+               orchestrator_session_id, context_key, injected_at
+           ) VALUES (?, ?, ?)
+           ON CONFLICT(orchestrator_session_id) DO UPDATE SET
+               context_key = excluded.context_key,
+               injected_at = excluded.injected_at""",
+        (orchestrator_session_id, encode_context_components(merged), injected_at),
+    )
+    return changed
+
+
 def insert_event(
     connection: sqlite3.Connection,
     agent_id: AgentId,
@@ -555,6 +666,96 @@ def message_rows(
             (agent_id, after_seq, limit),
         )
     )
+
+
+def claim_delivery_row(
+    connection: sqlite3.Connection, owner: str, now: float, lease_until: float
+) -> sqlite3.Row | None:
+    """Claim the next due delivery and return its routing and launch facts.
+
+    The caller owns ``connection`` and its write transaction, validates the
+    string lease ``owner`` and epoch-second ``now``/``lease_until`` values.
+    A successful claim increments attempts and assigns the sending lease;
+    no eligible row or a lost claim returns None. Returned request JSON and
+    failure category are internal notice inputs; task and failure prose are
+    never projected into the delivery message.
+    """
+    row = connection.execute(
+        """SELECT id FROM deliveries
+           WHERE ((state IN ('pending', 'retry_wait')
+                   AND COALESCE(next_attempt_at, 0) <= ?)
+                  OR (state = 'sending' AND lease_until <= ?))
+           ORDER BY COALESCE(next_attempt_at, lease_until, 0), id LIMIT 1""",
+        (now, now),
+    ).fetchone()
+    if row is None:
+        return None
+    updated = connection.execute(
+        """UPDATE deliveries
+           SET state = 'sending', attempts = attempts + 1,
+               lease_owner = ?, lease_until = ?, next_attempt_at = NULL
+           WHERE id = ? AND ((state IN ('pending', 'retry_wait')
+                              AND COALESCE(next_attempt_at, 0) <= ?)
+                             OR (state = 'sending' AND lease_until <= ?))""",
+        (owner, lease_until, row["id"], now, now),
+    ).rowcount
+    if updated != 1:
+        return None
+    return connection.execute(
+        """SELECT d.*, a.status AS agent_status, a.runtime AS agent_runtime,
+                  a.model AS agent_model, a.request_json AS agent_request_json,
+                  a.failure_kind AS agent_failure_kind,
+                  s.transport,
+                  s.external_session_id, s.external_turn_id FROM deliveries d
+           JOIN agents a ON a.id = d.agent_id
+           JOIN orchestrator_sessions s ON s.id = d.orchestrator_session_id
+           WHERE d.id = ?""",
+        (row["id"],),
+    ).fetchone()
+
+
+def owned_delivery_attempts(
+    connection: sqlite3.Connection, delivery_id: str, owner: str, now: float
+) -> int | None:
+    row = connection.execute(
+        """SELECT attempts FROM deliveries
+           WHERE id = ? AND state = 'sending' AND lease_owner = ? AND lease_until > ?""",
+        (delivery_id, owner, now),
+    ).fetchone()
+    return None if row is None else int(row["attempts"])
+
+
+def finish_delivery_claim(
+    connection: sqlite3.Connection,
+    delivery_id: str,
+    owner: str,
+    state: str,
+    *,
+    now: float,
+    remote_message_id: str | None = None,
+    last_error: str | None = None,
+    ambiguous_result: bool | None = None,
+    next_attempt_at: float | None = None,
+) -> bool:
+    updated = connection.execute(
+        """UPDATE deliveries
+           SET state = ?, remote_message_id = COALESCE(?, remote_message_id),
+               last_error = COALESCE(?, last_error),
+               ambiguous_result = MAX(ambiguous_result, COALESCE(?, 0)),
+               next_attempt_at = ?, lease_owner = NULL, lease_until = NULL
+           WHERE id = ? AND state = 'sending' AND lease_owner = ? AND lease_until > ?""",
+        (
+            state,
+            remote_message_id,
+            last_error,
+            None if ambiguous_result is None else int(ambiguous_result),
+            next_attempt_at,
+            delivery_id,
+            owner,
+            now,
+        ),
+    ).rowcount
+    return updated == 1
 
 
 def _raw_connect(path: Path, *, existing: bool = False) -> sqlite3.Connection:

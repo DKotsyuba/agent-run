@@ -8,7 +8,7 @@ import math
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 _logger = logging.getLogger("agent_run.state")
 
@@ -26,8 +26,12 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 
-from . import capacity
+if TYPE_CHECKING:
+    from agent_run.delivery.base import DeliveryAttemptEvidence
+
+from . import capacity, delivery
 from .db import (
+    _upsert_context_receipt,
     agent_row,
     checked_supervisor_proof,
     connection_path,
@@ -43,9 +47,28 @@ from .db import (
     require_attempt,
     resolve_message_storage,
     row_dict,
+    session_for_ref,
     timestamp,
 )
 
+_MAX_DELIVERY_EVIDENCE_JSON_BYTES = 16384
+
+
+def _delivery_evidence_json(
+    evidence: DeliveryAttemptEvidence | None,
+) -> str | None:
+    """Return bounded canonical JSON for typed evidence, or ``None``."""
+
+    if evidence is None:
+        return None
+    from agent_run.delivery.base import DeliveryAttemptEvidence
+
+    if not isinstance(evidence, DeliveryAttemptEvidence):
+        raise ValidationError("evidence must be DeliveryAttemptEvidence or None")
+    encoded = json_text(evidence.payload())
+    if len(encoded.encode("utf-8")) > _MAX_DELIVERY_EVIDENCE_JSON_BYTES:
+        raise ValidationError("delivery attempt evidence exceeds 16384 bytes")
+    return encoded
 from .start import AgentCreation, create_agent as create_agent_record
 
 
@@ -190,6 +213,35 @@ class StateStore:
         ).fetchone()
         return row is not None
 
+    def bind_orchestrator(
+        self,
+        agent_id: str | AgentId,
+        ref: OrchestratorRef,
+        *,
+        at: float | None = None,
+    ) -> str:
+        bound_at = timestamp(at)
+        agent_id = validate_agent_id(agent_id)
+        with immediate(self.connection):
+            agent = agent_row(self.connection, agent_id)
+            session_id = session_for_ref(self.connection, ref, bound_at)
+            current = agent["orchestrator_session_id"]
+            if current is not None and current != session_id:
+                raise ValidationError("agent orchestration binding is immutable")
+            if current is None:
+                self.connection.execute(
+                    "UPDATE agents SET orchestrator_session_id = ? WHERE id = ?",
+                    (session_id, agent_id),
+                )
+                self.connection.execute(
+                    """UPDATE deliveries
+                       SET orchestrator_session_id = ?, state = 'pending',
+                           next_attempt_at = ?
+                       WHERE agent_id = ? AND state = 'waiting_binding'""",
+                    (session_id, bound_at, agent_id),
+                )
+        return session_id
+
     def find_orchestrator_session(self, ref: OrchestratorRef) -> str | None:
         if not isinstance(ref, OrchestratorRef):
             raise ValidationError("orchestrator must be an OrchestratorRef")
@@ -201,6 +253,71 @@ class StateStore:
         return None if row is None else str(row["id"])
 
 
+
+    def record_context_receipt(
+        self,
+        orchestrator_session_id: str,
+        context_key: str,
+        *,
+        at: float | None = None,
+    ) -> bool:
+        nonblank("orchestrator_session_id", orchestrator_session_id)
+        nonblank("context_key", context_key)
+        with immediate(self.connection):
+            return _upsert_context_receipt(
+                self.connection, orchestrator_session_id, context_key, timestamp(at)
+            )
+
+    def record_context_receipt_for_ref(
+        self, ref: OrchestratorRef, context_key: str, *, at: float | None = None
+    ) -> tuple[str, bool]:
+        if not isinstance(ref, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        nonblank("context_key", context_key)
+        injected_at = timestamp(at)
+        with immediate(self.connection):
+            session_id = session_for_ref(self.connection, ref, injected_at)
+            return session_id, _upsert_context_receipt(
+                self.connection, session_id, context_key, injected_at
+            )
+
+    def record_context_components_for_ref(
+        self,
+        ref: OrchestratorRef,
+        components: dict[str, str],
+        *,
+        at: float | None = None,
+    ) -> tuple[str, frozenset[str]]:
+        """Find-or-create the ref's session, then atomically compare-and-store
+        per-component context fingerprints.
+
+        ``components`` maps nonblank names to nonblank fingerprint strings and
+        must be a non-empty dict. Returns ``(session_id, changed_names)``:
+        ``changed_names`` holds exactly the components whose stored
+        fingerprint differed, and is empty when nothing was rewritten. The
+        session lookup and the receipt compare/update share one immediate
+        transaction, so concurrent callers can never interleave the read with
+        the write; a missing or legacy receipt row reports every component as
+        changed and is rewritten in place in the versioned encoding.
+        """
+
+        from .db import record_context_component_receipt
+
+        if not isinstance(ref, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        if not isinstance(components, dict) or not components:
+            raise ValidationError("components must be a non-empty mapping")
+        checked: dict[str, str] = {}
+        for name, value in components.items():
+            nonblank("component name", name)
+            nonblank(f"component {name}", value)
+            checked[name] = value
+        injected_at = timestamp(at)
+        with immediate(self.connection):
+            session_id = session_for_ref(self.connection, ref, injected_at)
+            return session_id, record_context_component_receipt(
+                self.connection, session_id, checked, injected_at
+            )
 
     def get_agent(self, agent_id: str | AgentId) -> dict[str, object]:
         return dict(agent_row(self.connection, validate_agent_id(agent_id)))
@@ -253,8 +370,8 @@ class StateStore:
     ) -> dict[str, dict[str, object]]:
         """Return batched read metadata for the exact distinct ``agent_ids``.
 
-        Progress time, deadline warning, and latest process-cleanup event are
-        resolved in one SQL statement.
+        Progress time, deadline warning, latest delivery and attempt evidence,
+        and latest process-cleanup event are resolved in one SQL statement.
         Input order is irrelevant; unknown IDs are omitted, duplicates collapse,
         and an empty iterable performs no query. Stored JSON remains raw for the
         service boundary to validate into its public typed views.
@@ -274,6 +391,22 @@ class StateStore:
                     SELECT DISTINCT agent_id, 1 AS deadline_warned
                     FROM events WHERE agent_id IN (SELECT id FROM selected)
                       AND kind = 'deadline_warning'
+                ), delivery_seq AS (
+                    SELECT agent_id, MAX(terminal_event_seq) AS terminal_event_seq
+                    FROM deliveries WHERE agent_id IN (SELECT id FROM selected)
+                    GROUP BY agent_id
+                ), latest_delivery AS (
+                    SELECT deliveries.* FROM deliveries
+                    JOIN delivery_seq USING (agent_id, terminal_event_seq)
+                ), evidence_attempt AS (
+                    SELECT delivery_id, MAX(attempt) AS attempt
+                    FROM delivery_attempt_evidence
+                    WHERE delivery_id IN (SELECT id FROM latest_delivery)
+                    GROUP BY delivery_id
+                ), latest_evidence AS (
+                    SELECT evidence.delivery_id, evidence.evidence_json
+                    FROM delivery_attempt_evidence AS evidence
+                    JOIN evidence_attempt USING (delivery_id, attempt)
                 ), cleanup_seq AS (
                     SELECT agent_id, MAX(seq) AS seq
                     FROM events WHERE agent_id IN (SELECT id FROM selected)
@@ -294,12 +427,21 @@ class StateStore:
                 )
                 SELECT selected.id, progress.last_progress_at,
                        COALESCE(warnings.deadline_warned, 0) AS deadline_warned,
+                       latest_delivery.id AS delivery_id,
+                       latest_delivery.state AS delivery_state,
+                       latest_delivery.attempts AS delivery_attempts,
+                       latest_delivery.ambiguous_result AS delivery_ambiguous,
+                       latest_delivery.last_error AS delivery_last_error,
+                       latest_evidence.evidence_json,
                        latest_cleanup.cleanup_json,
                        latest_phase.phase_started_at,
                        latest_phase.phase_json
                 FROM selected
                 LEFT JOIN progress ON progress.agent_id = selected.id
                 LEFT JOIN warnings ON warnings.agent_id = selected.id
+                LEFT JOIN latest_delivery ON latest_delivery.agent_id = selected.id
+                LEFT JOIN latest_evidence
+                  ON latest_evidence.delivery_id = latest_delivery.id
                 LEFT JOIN latest_cleanup ON latest_cleanup.agent_id = selected.id
                 LEFT JOIN latest_phase ON latest_phase.agent_id = selected.id""",
             selected,
@@ -681,6 +823,22 @@ class StateStore:
                 data=data,
             )
 
+    def expire_unbound_deliveries(
+        self, *, at: float | None = None,
+        max_age_seconds: float = delivery.BINDING_WINDOW_SECONDS,
+    ) -> list[str]:
+        """Expire never-bound completion deliveries for terminal agents.
+
+        Delegates to :func:`agent_run.state.delivery.expire_unbound_deliveries`
+        and returns the ids it expired, oldest first.  The counterpart of the
+        delivery insert in :meth:`_transition`: it retires the rows that insert
+        can no longer produce and that no bind hook will ever attach to.
+        """
+
+        return delivery.expire_unbound_deliveries(
+            self.connection, at=at, max_age_seconds=max_age_seconds
+        )
+
     def _transition(
         self,
         agent_id: AgentId,
@@ -735,6 +893,20 @@ class StateStore:
             to_status=target.value,
             data=data,
         )
+        if target in TERMINAL:
+            # A completion notice can only reach a chat through the orchestrator
+            # session that asked for it.  A start with no session reference never
+            # fires a bind hook, so a waiting_binding row here would be rescanned
+            # forever; such an agent is reported with delivery state not_created.
+            session_id = agent["orchestrator_session_id"]
+            if session_id is not None:
+                self.connection.execute(
+                    """INSERT INTO deliveries
+                       (id, agent_id, orchestrator_session_id, terminal_event_seq,
+                        state, next_attempt_at)
+                       VALUES (?, ?, ?, ?, 'pending', ?)""",
+                    (f"ntf_{uuid.uuid4().hex}", agent_id, session_id, event_seq, at),
+                )
         return event_seq
 
     def reconcile(
@@ -931,3 +1103,76 @@ class StateStore:
         return [dict(row) for row in capacity.capacity_route_snapshots(
             self.connection, runtime=runtime
         )]
+
+    def claim_delivery(
+        self, owner: str, *, at: float | None = None, lease_seconds: float = 30
+    ) -> dict[str, object] | None:
+        return delivery.claim_delivery(self.connection, owner, at=at, lease_seconds=lease_seconds)
+
+    def complete_delivery(
+        self, delivery_id: str, owner: str, *,
+        remote_message_id: str | None = None,
+        ambiguous_result: bool = False,
+        evidence: DeliveryAttemptEvidence | None = None,
+        at: float | None = None,
+    ) -> None:
+        """Complete an owned claim and atomically record optional evidence."""
+
+        delivery.complete_delivery(
+            self.connection, delivery_id, owner,
+            remote_message_id=remote_message_id,
+            ambiguous_result=ambiguous_result,
+            evidence_json=_delivery_evidence_json(evidence), at=at,
+        )
+
+    def fail_delivery(
+        self, delivery_id: str, owner: str, error: str, *,
+        at: float | None = None, ambiguous_result: bool = False,
+        evidence: DeliveryAttemptEvidence | None = None,
+    ) -> None:
+        """Fail an owned claim and atomically record optional evidence."""
+
+        delivery.fail_delivery(
+            self.connection, delivery_id, owner, error,
+            at=at, ambiguous_result=ambiguous_result,
+            evidence_json=_delivery_evidence_json(evidence),
+        )
+
+    def retry_delivery(
+        self, delivery_id: str, owner: str, error: str, *,
+        at: float | None = None, ambiguous_result: bool = False,
+        evidence: DeliveryAttemptEvidence | None = None,
+        base_delay: float = 1, max_delay: float = 300,
+    ) -> float:
+        """Schedule an owned retry and atomically record optional evidence."""
+
+        return delivery.retry_delivery(
+            self.connection, delivery_id, owner, error,
+            at=at, ambiguous_result=ambiguous_result,
+            evidence_json=_delivery_evidence_json(evidence),
+            base_delay=base_delay, max_delay=max_delay,
+        )
+
+    def latest_delivery_attempt(
+        self, delivery_id: str
+    ) -> DeliveryAttemptEvidence | None:
+        """Return the latest validated evidence for ``delivery_id``, if any."""
+
+        nonblank("delivery_id", delivery_id)
+        row = self.connection.execute(
+            """SELECT evidence_json FROM delivery_attempt_evidence
+               WHERE delivery_id = ? ORDER BY attempt DESC LIMIT 1""",
+            (delivery_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["evidence_json"]))
+        except (TypeError, ValueError) as error:
+            raise ValidationError("invalid stored delivery attempt evidence") from error
+        from agent_run.delivery.base import DeliveryAttemptEvidence
+
+        return DeliveryAttemptEvidence.from_payload(payload)
+
+    def cancel_delivery(self, delivery_id: str) -> bool:
+        return delivery.cancel_delivery(self.connection, delivery_id)

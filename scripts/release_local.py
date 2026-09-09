@@ -29,7 +29,7 @@ import psutil
 
 _EXPECTED_TOOLS = {
     "start", "resume", "cancel", "steer", "list_agents", "answer",
-    "transcript", "capacity_order",
+    "transcript", "capacity_order", "doc", "models", "limits",
 }
 
 from release import ReleaseError, Runner
@@ -504,7 +504,7 @@ def deploy(runner: Runner, home: Path, wheel: Path, requirements: Path, version:
             journal_path.unlink(missing_ok=True)
             return
         jobs = {}
-        for suffix in ("api", "capacity"):
+        for suffix in ("api", "capacity", "delivery"):
             label = f"{prefix}.{suffix}"
             plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
             contents = plistlib.loads(plist.read_bytes())

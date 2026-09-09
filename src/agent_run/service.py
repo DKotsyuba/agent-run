@@ -12,9 +12,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeAlias
 
-from .adapters.base import Capability
+from .adapters.base import Capability, ModelInfo
 from .adapters.registry import AdapterRegistry
 from .capacity.ranking import CapacityOrder
+from .capacity.snapshot import CapacityReading, build_capacity_routes
 from .config import Config, RuntimeConfig, load_config
 from .domain import (
     ACTIVE,
@@ -37,6 +38,8 @@ from .effective_policy import (
     admission_decision,
     effective_policy,
 )
+from .delivery.base import DeliveryAttemptEvidence
+from .delivery.dispatch import _effort_from_request_json
 from .launch_evidence import SupervisorBootstrapError, bootstrap_event_data
 from .paths import agent_dir, config_path, runtime_skills_dir, state_db_path
 from .profiles import AgentProfile, load_profile
@@ -68,19 +71,6 @@ _SNAPSHOT_CONFIG_REVISION = "snapshot:v1:"
 
 
 LaunchAgent: TypeAlias = Callable[[AgentId, StartRequest, ResolvedRolePlan], None]
-
-
-def _effort_from_request_json(raw: object) -> str | None:
-    """Return a bounded stored effort, or ``None`` for historical bad data."""
-
-    if not isinstance(raw, str):
-        return None
-    try:
-        parsed = json.loads(raw)
-    except ValueError:
-        return None
-    effort = parsed.get("effort") if isinstance(parsed, dict) else None
-    return effort if isinstance(effort, str) and effort.strip() and len(effort) <= 128 else None
 
 
 def _page_limit(value: int) -> int:
@@ -192,6 +182,21 @@ def _policy_from_identity(value: object) -> EffectivePolicy | None:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliveryView:
+    """Current delivery state plus the latest bounded subprocess evidence."""
+
+    agent_id: AgentId
+    bound: bool
+    orchestrator_session_id: str | None
+    notification_id: str | None
+    state: str
+    attempts: int
+    ambiguous: bool
+    last_error: str | None
+    last_attempt: DeliveryAttemptEvidence | None
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupView:
     """Latest bounded evidence that an agent's owned processes were cleaned up.
 
@@ -240,6 +245,7 @@ class AgentView:
     answer_bytes: int | None
     answer_sha256: str | None
     effort: str | None
+    delivery: DeliveryView
     parent_agent_id: AgentId | None = None
     root_agent_id: AgentId | None = None
     sequence: int = 1
@@ -366,6 +372,30 @@ class AnswerView:
     kind: str | None
     media_type: str | None
     proof_version: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityReport:
+    """Current fresh provider readings observed at one service clock value."""
+
+    observed_at: float
+    items: tuple[CapacityReading, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeModels:
+    """One runtime's model discovery snapshot with capability and health context.
+
+    ``models`` contains configured entries returned by the adapter,
+    ``capabilities`` contains its sorted declared capability names,
+    ``available`` requires both healthy runtime evidence and a nonempty roster,
+    and ``reason`` carries the adapter explanation or ``"roster empty"``.
+    """
+
+    models: tuple[ModelInfo, ...]
+    capabilities: tuple[str, ...]
+    available: bool
+    reason: str | None
 
 
 
@@ -615,6 +645,17 @@ class AgentService:
         )
         return kind, stage, outcome.failure_text
 
+    def bind(
+        self, agent_id: str | AgentId, orchestrator: OrchestratorRef
+    ) -> DeliveryView:
+        if not isinstance(orchestrator, OrchestratorRef):
+            raise ValidationError("orchestrator must be an OrchestratorRef")
+        session_id = self._store.bind_orchestrator(
+            agent_id, orchestrator, at=self._now()
+        )
+        _logger.info("bind agent_id=%s transport=%s", agent_id, orchestrator.transport)
+        return self._delivery_view(validate_agent_id(agent_id), session_id)
+
     def cancel(self, agent_id: str | AgentId) -> AgentView:
         """Persist cancellation for the owning supervisor to observe."""
 
@@ -646,8 +687,9 @@ class AgentService:
         ``request_id`` makes the call idempotent: repeating it with the same
         inputs returns the child already accepted, even after the parent has
         stopped being a valid source; reusing it with different inputs raises
-        :class:`ValidationError`. ``orchestrator`` scopes the new agent's caller
-        identity; the parent's artifacts, transcript and answer remain untouched.
+        :class:`ValidationError`. ``orchestrator`` binds notifications for the
+        new agent only -- the parent's binding is untouched, as are its
+        artifacts, transcript and answer.
 
         Returns a :class:`StartResult` whose ``agent_id`` is a *new* durable
         agent. Raises :class:`ValidationError` when the parent is unknown,
@@ -883,6 +925,46 @@ class AgentService:
         )
 
 
+
+    def models(self) -> Mapping[str, RuntimeModels]:
+        """Return current enabled runtime rosters with capability and health facts."""
+
+        result: dict[str, RuntimeModels] = {}
+        for name in sorted(self._config.runtimes):
+            runtime = self._config.runtimes[name]
+            if not runtime.enabled:
+                continue
+            adapter = self._registry.load(name, (Capability.MODEL_ROSTER,))
+            adapter.validate(runtime)
+            allowed = set(runtime.models)
+            roster = tuple(
+                model
+                for model in adapter.models(runtime, runtime.home)
+                if model.id in allowed
+            )
+            capabilities = tuple(
+                sorted(capability.value for capability in adapter.describe().capabilities)
+            )
+            health = adapter.probe(runtime, runtime.home)
+            available = health.available and bool(roster)
+            reason = health.reason
+            if not roster and reason is None:
+                reason = "roster empty"
+            result[name] = RuntimeModels(roster, capabilities, available, reason)
+        return MappingProxyType(result)
+
+    def limits(self) -> CapacityReport:
+        """Return enabled runtimes' current fresh readings without projections."""
+
+        observed_at = self._now()
+        enabled = {
+            name for name, runtime in self._config.runtimes.items() if runtime.enabled
+        }
+        snapshot = build_capacity_routes(self._store, now=observed_at)
+        return CapacityReport(
+            observed_at,
+            tuple(item for item in snapshot.readings if item.key.runtime in enabled),
+        )
 
     def capacity_order(self) -> CapacityOrder:
         """Return enabled runtimes' deterministic capacity routing order.
@@ -1166,6 +1248,13 @@ class AgentService:
             answer_bytes,
             answer_sha,
             _effort_from_request_json(row["request_json"]),
+            self._delivery_view(
+                agent_id,
+                None
+                if row["orchestrator_session_id"] is None
+                else str(row["orchestrator_session_id"]),
+                projection,
+            ),
             None
             if row["parent_agent_id"] is None
             else AgentId(str(row["parent_agent_id"])),
@@ -1179,6 +1268,43 @@ class AgentService:
             now,
             status.value if status in TERMINAL else None,
             "pending",
+        )
+
+    def _delivery_view(
+        self,
+        agent_id: AgentId,
+        session_id: str | None,
+        projection: Mapping[str, object] | None = None,
+    ) -> DeliveryView:
+        """Build delivery state from a supplied or single-agent projection."""
+
+        if projection is None:
+            projection = self._store.agent_projection((agent_id,))[str(agent_id)]
+        if projection["delivery_id"] is None:
+            return DeliveryView(
+                agent_id, session_id is not None, session_id, None,
+                "not_created", 0, False, None, None,
+            )
+        evidence_json = projection["evidence_json"]
+        last_attempt = None
+        if evidence_json is not None:
+            try:
+                evidence = json.loads(str(evidence_json))
+            except ValueError as error:
+                raise ValidationError("invalid stored delivery attempt evidence") from error
+            last_attempt = DeliveryAttemptEvidence.from_payload(evidence)
+        return DeliveryView(
+            agent_id,
+            session_id is not None,
+            session_id,
+            str(projection["delivery_id"]),
+            str(projection["delivery_state"]),
+            int(projection["delivery_attempts"]),
+            bool(projection["delivery_ambiguous"]),
+            None
+            if projection["delivery_last_error"] is None
+            else str(projection["delivery_last_error"]),
+            last_attempt,
         )
 
     @staticmethod

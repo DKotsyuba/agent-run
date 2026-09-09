@@ -35,6 +35,8 @@ from agent_run.domain import (
 )
 from agent_run.errors import StateTransitionError, ValidationError
 from agent_run.effective_policy import Constraint, Enforcement
+from agent_run.delivery.base import DeliveryAttemptEvidence
+from agent_run.hooks.bind import run_hook
 from agent_run.launch_evidence import FAILURE_KIND_BOOTSTRAP, SupervisorBootstrapError
 from agent_run.paths import agent_dir
 from agent_run.service import AgentQuery, AgentService
@@ -695,6 +697,37 @@ Review.
         self.assertEqual(cleanup.scope, "verified_descendants")
         self.assertTrue(cleanup.confirmed)
 
+    def test_post_tool_binding_survives_fresh_service_replay(self) -> None:
+        """Late notification binding must not change the original replay namespace."""
+
+        request = self.request(request_id="post-tool-replay")
+        first = self.start("post-tool-replay")
+        run_hook(
+            self.store,
+            {
+                "agent_id": first.agent_id,
+                "transport": "codex_queue",
+                "external_session_id": "session-1",
+                "external_turn_id": "turn-1",
+            },
+            at=101,
+        )
+        self.service.close()
+        self.store = StateStore.open(self.root / "state.db")
+        self.service = AgentService(
+            self.config,
+            self.store,
+            self.root,
+            launch=lambda *args: self.launched.append(args),
+            now=lambda: 102.0,
+        )
+
+        replay = self.service.start(request)
+
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.agent_id, first.agent_id)
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len(self.store.list_agents()), 1)
 
     def test_default_timeout_is_resolved_once_and_explicit_value_is_preserved(self) -> None:
         """Resolve default and explicit timeout values independently of launch order."""
@@ -837,6 +870,9 @@ Review.
         self.assertEqual(row["failure_kind"], "supervisor_start_failed")
         self.assertEqual(row["failure_text"], "ready failed")
         view = service.get(agent_id)
+        # The start carried no orchestrator session reference, so no notice was
+        # created: nothing could ever bind to deliver it.
+        self.assertEqual(view.delivery.state, "not_created")
         self.assertIsNone(
             self.store.connection.execute(
                 "SELECT id FROM deliveries WHERE agent_id = ?", (agent_id,)
@@ -1027,7 +1063,75 @@ Review.
         with self.assertRaises(StateTransitionError):
             self.service.cancel(terminal_id)
 
+    def test_binding_models_and_current_limits_share_the_service(self) -> None:
+        agent_id = self.start("binding", task="safe task").agent_id
+        ref = OrchestratorRef("codex_queue", "session-1", "turn-1")
+        delivery = self.service.bind(agent_id, ref)
+        self.assertTrue(delivery.bound)
+        self.assertEqual(delivery.state, "not_created")
+        with self.assertRaisesRegex(ValidationError, "immutable"):
+            self.service.bind(
+                agent_id, OrchestratorRef("codex_queue", "other-session")
+            )
 
+        self.terminal(agent_id)
+        view = self.service.get(agent_id)
+        self.assertEqual(view.delivery.state, "pending")
+
+        self.assertEqual(tuple(self.service.models()), ("fake",))
+        fake_roster = self.service.models()["fake"]
+        self.assertEqual(fake_roster.models[0].id, "model")
+        self.assertEqual(
+            fake_roster.capabilities, tuple(sorted(c.value for c in Capability))
+        )
+        self.assertTrue(fake_roster.available)
+        self.assertIsNone(fake_roster.reason)
+        self.store.replace_capacity_snapshot(
+            runtime="fake", scope_id="fake", observed_at=100, valid_until=150,
+            payload={"samples": [{"lane": "main", "window": "5h", "source": "test", "target": None, "remaining_percent": 50, "reset_at": 200, "observed_at": 100, "valid_until": 150}], "pools": [], "routes": []},
+        )
+        limits = self.service.limits()
+        self.assertEqual(len(limits.items), 1)
+        self.assertEqual(limits.items[0].key.runtime, "fake")
+        self.assertEqual(ADAPTER.limits_calls, 0)
+
+    def test_delivery_view_exposes_only_the_latest_typed_attempt_evidence(self) -> None:
+        """Expose latest safe evidence additively after a completed delivery."""
+
+        agent_id = self.start("delivery-evidence").agent_id
+        self.service.bind(
+            agent_id, OrchestratorRef("codex_queue", "session-1", "turn-1")
+        )
+        self.terminal(agent_id)
+        claimed = self.store.claim_delivery("worker", at=102, lease_seconds=10)
+        evidence = DeliveryAttemptEvidence(
+            "success", "/bin/codex", ("executable", "queue"), 2,
+            returncode=0, message_id_present=True,
+        )
+        self.store.complete_delivery(
+            claimed["id"], "worker", at=103, evidence=evidence
+        )
+
+        self.assertEqual(self.service.get(agent_id).delivery.last_attempt, evidence)
+
+    def test_empty_roster_still_lists_the_runtime_with_a_reason(self) -> None:
+        ADAPTER.models_result = ()
+
+        roster = self.service.models()["fake"]
+
+        self.assertEqual(roster.models, ())
+        self.assertFalse(roster.available)
+        self.assertEqual(roster.reason, "roster empty")
+
+    def test_empty_roster_prefers_the_adapters_own_unavailable_reason(self) -> None:
+        ADAPTER.models_result = ()
+        ADAPTER.probe_health = RuntimeHealth(False, None, None, "no network route")
+
+        roster = self.service.models()["fake"]
+
+        self.assertEqual(roster.models, ())
+        self.assertFalse(roster.available)
+        self.assertEqual(roster.reason, "no network route")
 
     def test_codex_models_bootstrap_from_config_without_isolated_cache(self) -> None:
         from agent_run.config import RuntimeAuthConfig
@@ -1049,22 +1153,25 @@ Review.
                 )
             },
         )
-        from agent_run.adapters.codex.adapter import ADAPTER as codex_adapter
-
-        runtime = config.runtimes["codex"]
-        roster = codex_adapter.models(runtime, codex_home)
-        health = codex_adapter.probe(runtime, codex_home)
+        service = AgentService(
+            config,
+            self.store,
+            self.root,
+            launch=lambda *_: None,
+            now=lambda: 100.0,
+        )
+        roster = service.models()["codex"]
 
         self.assertEqual(
-            [(model.id, model.description, model.efforts) for model in roster],
+            [(model.id, model.description, model.efforts) for model in roster.models],
             [
                 ("gpt-5.6-sol", "", ()),
                 ("gpt-5.6-terra", "", ()),
             ],
         )
-        self.assertFalse(health.available)
+        self.assertFalse(roster.available)
         self.assertEqual(
-            health.reason, "codex binary, generated home, or auth bridge is missing"
+            roster.reason, "codex binary, generated home, or auth bridge is missing"
         )
         self.assertFalse((codex_home / "cache" / "models.json").exists())
 

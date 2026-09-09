@@ -121,7 +121,7 @@ class PublicationTests(unittest.TestCase):
                 runner.run = Mock(side_effect=script.ReleaseError("bootstrap failed"))
                 try:
                     with patch.object(deployment, "loaded", return_value=False):
-                        deployment.restart(runner, {"api": "api.plist", "capacity": "capacity.plist"})
+                        deployment.restart(runner, {"api": "api.plist", "capacity": "capacity.plist", "delivery": "delivery.plist"})
                 finally:
                     calls.extend(runner.run.call_args_list)
 
@@ -331,7 +331,7 @@ class LocalTests(unittest.TestCase):
             )
         self.plists = self.user / "Library/LaunchAgents"
         self.plists.mkdir(parents=True)
-        for suffix in ("api", "capacity"):
+        for suffix in ("api", "capacity", "delivery"):
             label = f"com.test.agent-run.{suffix}"
             command = [str(self.current / "venv/bin/agent-run")]
             if suffix != "capacity":
@@ -364,7 +364,7 @@ class LocalTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         with sqlite3.connect(backups[0]) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 10)
-        self.assertEqual(len([c for c in self.runner.run.call_args_list if c.args[:2] == ("launchctl", "bootout")]), 2)
+        self.assertEqual(len([c for c in self.runner.run.call_args_list if c.args[:2] == ("launchctl", "bootout")]), 3)
         with sqlite3.connect(home / "state.db") as connection:
             connection.execute("PRAGMA user_version=11")
 

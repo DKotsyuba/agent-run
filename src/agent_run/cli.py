@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from importlib import resources
 import json
 import logging
 import os
@@ -26,9 +27,15 @@ from .capacity.collect import collect_once
 from .capacity.launchd import argv as launchd_argv
 from .capacity.launchd import build_configured_job, render_plist
 from .config import RuntimeConfig, load_config
+from .delivery.claude_uds import TRANSPORT_NAME as CLAUDE_UDS_TRANSPORT_NAME
+from .delivery.claude_uds import ClaudeSessionSender, ClaudeUdsTransport
+from .delivery.codex_queue import TRANSPORT_NAME, CodexQueueTransport
+from .delivery.dispatch import DeliveryDispatcher
 from .doctor import run_doctor
 from .domain import AgentId, OrchestratorRef, StartRequest
 from .errors import AgentRunError, ValidationError
+from .hooks.bind import ref_from_payload, run_hook
+from .hooks.context import build_context
 from .launch import ChildReaper, launch_detached
 from .launch_evidence import bootstrap_error_fields
 from .logging_setup import configure_logging
@@ -36,7 +43,7 @@ from .paths import agent_run_home, config_path, state_db_path
 from .preparation import request_payload
 from .role_plan import ResolvedRolePlan
 from .service import AgentQuery, AgentService
-from .state import StateStore, reconcile_reaped_agent
+from .state import StateStore, reconcile_active_agents, reconcile_reaped_agent
 from .state.run_stats import backfill_run_stats
 from .wait import DEFAULT_POLL_SECONDS, wait_for_agent
 
@@ -47,6 +54,10 @@ _EXPECTED_ERROR_EXIT = 2
 _POST_TERMINAL_TIMEOUT_SECONDS = 31.0
 _API_LAUNCHD_LABEL = "com.agent-run.api"
 _CAPACITY_LAUNCHD_LABEL = "com.pluto.agent-run.capacity"
+#: Transports a `hook bind`/`hook context` may record, and the only names the
+#: dispatcher can route back to. An unknown name is refused at bind time
+#: rather than becoming an undeliverable row hours later.
+_HOOK_TRANSPORTS = (TRANSPORT_NAME, CLAUDE_UDS_TRANSPORT_NAME)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -111,6 +122,10 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("runtime")
     login.add_argument("--account")
 
+    bind = commands.add_parser("bind")
+    bind.add_argument("agent_id")
+    _session(bind, required=True)
+
     for name in ("cancel", "answer"):
         command = commands.add_parser(name)
         command.add_argument("agent_id")
@@ -137,10 +152,16 @@ def _parser() -> argparse.ArgumentParser:
     transcript_mode.add_argument("--follow", action="store_true")
     transcript_mode.add_argument("--full", action="store_true")
 
+    commands.add_parser("models")
+    commands.add_parser("limits")
+
     stats = commands.add_parser("stats").add_subparsers(
         dest="stats_command", required=True
     )
     stats.add_parser("backfill")
+
+    context = commands.add_parser("context")
+    _session(context, required=True)
 
     capacity = commands.add_parser("capacity").add_subparsers(
         dest="capacity_command", required=True
@@ -160,6 +181,32 @@ def _parser() -> argparse.ArgumentParser:
     launchd.add_argument("--stdout-log", default="/dev/null")
     launchd.add_argument("--stderr-log")
 
+    delivery = commands.add_parser("delivery").add_subparsers(
+        dest="delivery_command", required=True
+    )
+    delivery_status = delivery.add_parser("status")
+    delivery_status.add_argument("agent_id")
+    delivery_cancel = delivery.add_parser("cancel")
+    delivery_cancel.add_argument("delivery_id")
+    delivery.add_parser("dispatch")
+    delivery_launchd = delivery.add_parser("launchd")
+    delivery_launchd.add_argument("--binary", required=True)
+    delivery_launchd.add_argument(
+        "--label", default="com.pluto.agent-run.delivery"
+    )
+    delivery_launchd.add_argument("--stdout-log", default="/dev/null")
+    delivery_launchd.add_argument("--stderr-log")
+
+    hook = commands.add_parser("hook").add_subparsers(
+        dest="hook_command", required=True
+    )
+    # Each runtime's hook config names its own transport; the default keeps
+    # existing codex hook commands working unchanged.
+    for hook_name in ("context", "bind"):
+        hook.add_parser(hook_name).add_argument(
+            "--transport", choices=sorted(_HOOK_TRANSPORTS), default=TRANSPORT_NAME
+        )
+
     commands.add_parser("init")
     commands.add_parser("doctor")
     commands.add_parser("mcp")
@@ -173,6 +220,8 @@ def _parser() -> argparse.ArgumentParser:
     api_launchd.add_argument("--label", default=_API_LAUNCHD_LABEL)
     api_launchd.add_argument("--stdout-log", default=None)
     api_launchd.add_argument("--stderr-log", default=None)
+    doc = commands.add_parser("doc")
+    doc.add_argument("topic", nargs="?")
     return parser
 
 
@@ -198,6 +247,61 @@ def _object(value: str, what: str) -> dict:
     if not isinstance(decoded, dict):
         raise ValidationError(f"{what} must be a JSON object")
     return decoded
+
+
+def _payload(stream: TextIO) -> dict:
+    return _object(_read(stream), "hook payload")
+
+
+def _hook_payload(payload: dict, *, bind: bool, transport: str = TRANSPORT_NAME) -> dict:
+    if transport not in _HOOK_TRANSPORTS:
+        raise ValidationError(f"unknown delivery transport: {transport!r}")
+    if "session_id" not in payload:
+        return payload
+    expected_event = "PostToolUse" if bind else "UserPromptSubmit"
+    event = payload.get("hook_event_name")
+    if event is not None and event != expected_event:
+        raise ValidationError(f"raw hook_event_name must be {expected_event}")
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValidationError("raw hook session_id must be nonblank")
+    normalized = {
+        "transport": transport,
+        "external_session_id": session_id,
+    }
+    if "turn_id" in payload:
+        normalized["external_turn_id"] = payload["turn_id"]
+    if not bind:
+        return normalized
+
+    agent_ids: set[str] = set()
+    pending = [payload.get("tool_response")]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if key == "agent_id":
+                    if not isinstance(item, str):
+                        raise ValidationError("raw PostToolUse agent_id must be a string")
+                    agent_ids.add(item)
+                else:
+                    pending.append(item)
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            # Claude Code's MCP envelope may carry the id only as JSON text,
+            # either the whole tool_response or a content block's "text"
+            # field; decode once and keep searching, skip silently if not JSON.
+            try:
+                pending.append(json.loads(value))
+            except ValueError:
+                pass
+    if not agent_ids:
+        raise ValidationError("raw PostToolUse payload has no agent_id")
+    if len(agent_ids) != 1:
+        raise ValidationError("raw PostToolUse payload has conflicting agent_id values")
+    normalized["agent_id"] = agent_ids.pop()
+    return normalized
 
 
 def _ref(args: argparse.Namespace, *, required: bool = False) -> OrchestratorRef | None:
@@ -309,6 +413,8 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
     if command == "start":
         result = service.start(_request(args, stream))
         return {"agent_id": result.agent_id, "created": result.created}
+    if command == "bind":
+        return service.bind(args.agent_id, _ref(args, required=True))
     if command == "cancel":
         return service.cancel(args.agent_id)
     if command == "steer":
@@ -327,11 +433,30 @@ def _execute(args: argparse.Namespace, service, stream: TextIO):
         )
     if command == "answer":
         return service.answer(args.agent_id)
+    if command == "models":
+        return service.models()
+    if command == "limits":
+        return service.limits()
+    if command == "context":
+        return service.context(_ref(args, required=True))
     if command == "capacity":
         return (
             service.capacity_collect()
             if args.capacity_command == "collect"
             else service.capacity_order()
+        )
+    if command == "delivery":
+        if args.delivery_command == "status":
+            return service.delivery_status(args.agent_id)
+        if args.delivery_command == "cancel":
+            return service.delivery_cancel(args.delivery_id)
+        return service.delivery_dispatch()
+    if command == "hook":
+        payload = _payload(stream)
+        return (
+            service.hook_context(payload, args.transport)
+            if args.hook_command == "context"
+            else service.hook_bind(payload, args.transport)
         )
     if command == "init":
         return service.init()
@@ -416,6 +541,30 @@ def _capacity_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]
     }
 
 
+def _delivery_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
+    from .delivery.launchd import argv, build_configured_job, render_plist
+
+    config = load_config(config_path(home))
+    job = build_configured_job(
+        config.delivery,
+        args.label,
+        Path(args.binary),
+        home,
+        stdout_log=Path(args.stdout_log),
+        stderr_log=(
+            home / "delivery-worker.err.log"
+            if args.stderr_log is None
+            else Path(args.stderr_log)
+        ),
+    )
+    return {
+        "label": job.label,
+        "interval_seconds": job.interval_seconds,
+        "argv": argv(job),
+        "plist": render_plist(job),
+    }
+
+
 def _api_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
     job = build_api_launchd_job(
         args.label,
@@ -437,6 +586,30 @@ def _api_launchd(home: Path, args: argparse.Namespace) -> dict[str, object]:
         "argv": api_launchd_argv(job),
         "plist": render_api_launchd_plist(job),
     }
+
+
+def _dispatch_once(home: Path):
+    """Drain the agent lifecycle outbox once."""
+
+    config = load_config(config_path(home))
+    store = StateStore.open(state_db_path(home))
+    try:
+        if isinstance(store, StateStore):
+            reconcile_active_agents(store)
+        from .delivery.codex_desktop_relay import CodexDesktopRelayClient
+
+        relay = CodexDesktopRelayClient(home)
+        dispatcher = DeliveryDispatcher(
+            store,
+            {
+                TRANSPORT_NAME: CodexQueueTransport(relay),
+                CLAUDE_UDS_TRANSPORT_NAME: ClaudeUdsTransport(ClaudeSessionSender()),
+            },
+            config.delivery,
+        )
+        return dispatcher.run(home=home)
+    finally:
+        store.close()
 
 
 def _launch_callback(home: Path, *, child_reaper: ChildReaper | None = None):
@@ -507,10 +680,66 @@ class _Runtime:
             state_db_path(self.home)
         )
 
+    def context(self, ref: OrchestratorRef):
+        config, store = self._inputs()
+        try:
+            return build_context(store, ref, config=config)
+        finally:
+            store.close()
+
     def capacity_collect(self):
         config, store = self._inputs()
         try:
             return collect_once(store, config, agent_run_home=self.home)
+        finally:
+            store.close()
+
+    def delivery_status(self, agent_id: str):
+        return self.core.get(agent_id).delivery
+
+    def delivery_cancel(self, delivery_id: str):
+        _config, store = self._inputs()
+        try:
+            return {"delivery_id": delivery_id, "cancelled": store.cancel_delivery(delivery_id)}
+        finally:
+            store.close()
+
+    def delivery_dispatch(self):
+        return _dispatch_once(self.home)
+
+    def hook_context(self, payload: dict, transport: str = TRANSPORT_NAME):
+        config, store = self._inputs()
+        try:
+            result = build_context(
+                store,
+                ref_from_payload(
+                    _hook_payload(payload, bind=False, transport=transport)
+                ),
+                config=config,
+            )
+            if result.injected and result.text.strip():
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": result.text,
+                    }
+                }
+            return {}
+        finally:
+            store.close()
+
+    def hook_bind(self, payload: dict, transport: str = TRANSPORT_NAME):
+        _config, store = self._inputs()
+        try:
+            result = run_hook(
+                store, _hook_payload(payload, bind=True, transport=transport)
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": result.message(),
+                }
+            }
         finally:
             store.close()
 
@@ -682,6 +911,32 @@ def _stats(home: Path, args: argparse.Namespace) -> dict[str, object]:
     raise AgentRunError(f"unsupported stats command: {args.stats_command}")
 
 
+def _exec_desktop_relay(home: Path) -> None:
+    """Replace a real MCP process with the signed Node relay when configured."""
+
+    node = os.environ.get("CODEX_MCP_NODE_PATH")
+    pipe = os.environ.get("CODEX_APP_TOOLS_PIPE_PATH")
+    if (
+        not node or not pipe or "\x00" in node or "\x00" in pipe
+        or len(node) > 4096 or len(pipe) > 4096
+        or not Path(node).is_absolute() or not Path(pipe).is_absolute()
+        or not Path(node).is_file() or not os.access(node, os.X_OK)
+    ):
+        return
+    wrapper = resources.files("agent_run.delivery").joinpath("codex_desktop_host.cjs")
+    try:
+        os.execv(node, [node, str(wrapper), sys.executable, str(home), "-m", "agent_run.cli", "--home", str(home), "mcp"])
+    except OSError:
+        _logger.warning("Desktop Node wrapper unavailable; using queue-only MCP")
+
+
+def _doc(args: argparse.Namespace) -> dict[str, object]:
+    from .doc import topic_text
+
+    topic = args.topic
+    return {"topic": topic or "index", "text": topic_text(topic)}
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -716,6 +971,8 @@ def main(
     started = time.monotonic()
     try:
         home = agent_run_home(args.home)
+        if service is None and args.command == "mcp":
+            _exec_desktop_relay(home)
         configure_logging(home, "mcp" if args.command == "mcp" else "cli")
         _logger.info("cli command=%s", args.command)
         if service is None and args.command == "init":
@@ -730,10 +987,14 @@ def main(
                 return result
         elif service is None and args.command == "doctor":
             result = _doctor(home)
+        elif service is None and args.command == "doc":
+            result = _doc(args)
         elif service is None and args.command == "stats":
             result = _stats(home, args)
         elif args.command == "capacity" and args.capacity_command == "launchd":
             result = _capacity_launchd(home, args)
+        elif args.command == "delivery" and args.delivery_command == "launchd":
+            result = _delivery_launchd(home, args)
         elif args.command == "api" and args.api_command == "launchd":
             result = _api_launchd(home, args)
         else:

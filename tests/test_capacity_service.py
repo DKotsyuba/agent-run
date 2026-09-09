@@ -165,8 +165,8 @@ class CapacityServiceTests(unittest.TestCase):
         self.assertEqual(order.unavailable_runtimes, ("empty",))
         self.assertNotIn("disabled", repr(order))
 
-    def test_dispatch_serializes_multiplier_aliases_and_omissions(self) -> None:
-        """Shared transports retain concrete aliases and omission evidence."""
+    def test_dispatch_serializes_routes_and_current_limits(self) -> None:
+        """Shared transports expose route order and current reading fields."""
 
         self._append_scope(
             "boosted",
@@ -208,6 +208,13 @@ class CapacityServiceTests(unittest.TestCase):
         )
         self.assertEqual(omitted[0]["runtime"], "exhausted")
         self.assertFalse(result["insufficient_diversity"])
+
+        limits = cast(dict[str, object], _jsonable(call_tool(service, "limits", {})))
+        items = cast(list[dict[str, object]], limits["items"])
+        self.assertEqual(
+            set(items[0]),
+            {"key", "remaining_percent", "reset_at", "observed_at", "valid_until"},
+        )
 
 
 if __name__ == "__main__":

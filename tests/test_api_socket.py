@@ -31,6 +31,16 @@ class StubService:
         self.call_threads.append(threading.get_ident())
         return {"ok": True}
 
+    def models(self):
+        """Return one deterministic public model response."""
+
+        return {"runtime": "model"}
+
+    def limits(self):
+        """Return one deterministic current-reading response."""
+
+        return {"items": []}
+
     def cancel(self, agent_id):
         """Return an immediate durable-control substitute for the agent."""
 
@@ -160,6 +170,14 @@ class ApiSocketTests(unittest.TestCase):
     def test_successful_tool_round_trip(self):
         response = self.request({"jsonrpc": "2.0", "id": 1, "method": "capacity_order", "params": {}})
         self.assertEqual(response["result"], {"ok": True})
+        self.assertEqual(
+            self.request({"jsonrpc": "2.0", "id": 2, "method": "models"})["result"],
+            {"runtime": "model"},
+        )
+        self.assertEqual(
+            self.request({"jsonrpc": "2.0", "id": 3, "method": "limits"})["result"],
+            {"items": []},
+        )
 
     def test_unknown_method_and_validation_error(self):
         unknown = self.request({"jsonrpc": "2.0", "id": 1, "method": "missing"})

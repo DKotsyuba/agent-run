@@ -80,6 +80,7 @@ class SupervisorMainTests(unittest.TestCase):
         (self.home / "config.toml").write_text(
             "schema_version = 1\n"
             "[core]\nwarning_fraction = 0.9\n"
+            '[delivery]\ncodex_queue_bin = "/bin/true"\n'
             "[runtimes.fake]\n"
             "enabled = true\n"
             'adapter = "tests.stub_engine_adapter:ADAPTER"\n'

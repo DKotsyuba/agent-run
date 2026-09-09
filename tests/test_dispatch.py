@@ -1,5 +1,7 @@
 from agent_run.dispatch import TOOL_NAMES, TOOLS, call_tool
 from agent_run.domain import StartRequest
+from agent_run.delivery.completion_notice_contract import completion_notice_contract_text
+from agent_run.doc import topic_text
 from agent_run.errors import ValidationError
 from agent_run.effective_policy import Constraint
 from agent_run.service import AgentQuery
@@ -64,6 +66,17 @@ def test_start_accepts_only_unique_known_policy_requirements() -> None:
             raise AssertionError("invalid required_constraints accepted")
 
 
+def test_start_description_includes_completion_contract_text() -> None:
+    """Start discovery includes the exact doc contract and all four format fields."""
+    start_tool = next(tool for tool in TOOLS if tool["name"] == "start")
+    expected = completion_notice_contract_text()
+    self_desc = start_tool["description"]
+    assert self_desc.startswith("Start one asynchronous durable agent.")
+    assert expected in self_desc
+    assert expected == topic_text("completion")
+    for label in ("- ID:", "- Status:", "- Runtime/model:", "- Notice:"):
+        assert label in self_desc
+
 
 def _start(service, **values):
     """Return a StartRequest using the stub and argument overrides."""
@@ -75,11 +88,11 @@ def _start(service, **values):
 
 
 def test_tools_table_is_exactly_pinned() -> None:
-    """Keep exactly the eight canonical tools in the shared dispatch table."""
+    """Keep exactly the eleven canonical tools in the shared dispatch table."""
 
     assert TOOL_NAMES == {
         "start", "resume", "cancel", "steer", "list_agents", "answer",
-        "transcript", "capacity_order",
+        "transcript", "capacity_order", "doc", "models", "limits",
     }
     assert TOOL_NAMES == frozenset(tool["name"] for tool in TOOLS)
 
@@ -88,8 +101,8 @@ def test_removed_tools_are_rejected() -> None:
     """Reject every retired public method before service dispatch."""
 
     for name in {
-        "fast", "status", "list_orchestrators", "summary", "models", "limits",
-        "doc", "chain",
+        "fast", "status", "list_orchestrators", "summary",
+        "chain",
     }:
         try:
             call_tool(_Service(), name, {})
@@ -111,3 +124,13 @@ def test_retained_agent_tools_dispatch() -> None:
     service.steer.assert_called_once_with("agent", "continue")
     service.answer.assert_called_once_with("agent")
     service.transcript.assert_called_once_with("agent", cursor=2, limit=3)
+
+
+def test_restored_operator_tools_dispatch() -> None:
+    """Dispatch current model and capacity reads through the shared table."""
+
+    service = Mock()
+    call_tool(service, "models", {})
+    call_tool(service, "limits", {})
+    service.models.assert_called_once_with()
+    service.limits.assert_called_once_with()

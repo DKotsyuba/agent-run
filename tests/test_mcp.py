@@ -61,12 +61,16 @@ class McpSdkTests(unittest.TestCase):
                         initialized = await session.initialize()
                         self.assertEqual(initialized.server_info.name, "agent-run")
                         tools = await session.list_tools()
-                        self.assertEqual(len(tools.tools), 8)
+                        self.assertEqual(len(tools.tools), 11)
                         result = await session.call_tool(
                             "answer", {"agent_id": "ag-20260826-120000-0123456789"}
                         )
+                        models = await session.call_tool("models")
+                        limits = await session.call_tool("limits")
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["method"], "answer")
+            self.assertEqual(models.structured_content["method"], "models")
+            self.assertEqual(limits.structured_content["method"], "limits")
 
         anyio.run(exercise)
 

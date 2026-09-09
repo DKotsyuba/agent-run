@@ -206,12 +206,12 @@ unexpected_legacy_field = "retired"
         )
         self.assertNotIn("opencode", config.runtimes)
 
-    def test_legacy_delivery_table_is_validated_but_has_no_runtime_effect(self) -> None:
-        self.assertFalse(hasattr(self.load("schema_version = 1\n"), "delivery"))
+    def test_delivery_queue_binary_is_optional_and_absolute(self) -> None:
+        self.assertIsNone(self.load("schema_version = 1\n").delivery.codex_queue_bin)
         configured = self.load(
             'schema_version = 1\n[delivery]\ncodex_queue_bin = "/bin/echo"\n'
         )
-        self.assertFalse(hasattr(configured, "delivery"))
+        self.assertEqual(configured.delivery.codex_queue_bin, Path("/bin/echo"))
         with self.assertRaisesRegex(ValidationError, "delivery.codex_queue_bin"):
             self.load(
                 'schema_version = 1\n[delivery]\ncodex_queue_bin = "relative"\n'
