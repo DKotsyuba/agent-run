@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.6] - 2026-09-10
+
+- docs(claude): document native credential home
+- fix(claude): preserve host HOME for native credential state
+- fix(claude): resolve native config home from login account
+
 ## [0.11.5] - 2026-09-09
 
 - fix(capacity): preserve host path in launchd
