@@ -239,14 +239,13 @@ the inconvenient member from the mean. Its quota query detects overflow of the
 64-row bound rather than silently returning a truncated, apparently healthy
 pool. Upstream snapshot timestamps and the source's shelf life remain intact.
 
-Claude owns OAuth refresh state in an account-scoped `CLAUDE_CONFIG_DIR` below
-its configured runtime home. `agent-run login claude` runs `claude auth login`
-and verifies `claude auth status --json` in exactly that private directory;
-agent launches reuse it without reading Keychain credentials or borrowing a
-global Claude configuration. Native usage collection uses only a declared,
-explicitly exported OAuth token; otherwise its capacity is reported unavailable
-rather than inspecting the scoped credential state. API keys are not OAuth
-tokens.
+Claude credentials are account-scoped when a Claude `account` is configured: login
+and launches share one `CLAUDE_CONFIG_DIR` child path under that account home.
+When `account` is omitted, Claude keeps native host credential state, including
+Keychain-backed OAuth, and uses the native global config directory.
+Native usage collection uses only a declared, explicitly exported OAuth token;
+otherwise its capacity is reported unavailable rather than inspecting scoped
+credential state. API keys are not OAuth tokens.
 
 Account labels are opaque: a labelled account cannot collide with the absent
 account even when its label is `base`, `default`, or `shared`. Provider-scoped

@@ -305,8 +305,13 @@ class ClaudeAdapter:
                 )
             )
         )
+        launch_home = (
+            os.environ.get("HOME", str(home))
+            if config.credential_state_home is None
+            else str(home)
+        )
         environment = host_environment(
-            {"HOME": str(home), "CLAUDE_CONFIG_DIR": scoped_config_dir},
+            {"HOME": launch_home, "CLAUDE_CONFIG_DIR": scoped_config_dir},
             allowed_secret_names=allowed_secret_names,
         )
 

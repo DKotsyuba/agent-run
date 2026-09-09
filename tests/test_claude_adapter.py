@@ -488,7 +488,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.assertEqual(plan.adapter_state["model"], requested)
 
     def test_prepare_builds_an_isolated_launch_plan_for_a_read_only_profile(self) -> None:
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}):
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "HOME": "/host/home"}):
             plan = self.prepare(
                 self.request(), self.profile(write=False), self.runtime_config(), self.home, self.agent_dir
             )
@@ -510,7 +510,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertIn("WebFetch", disallowed)
         self.assertNotIn("--mcp-config", argv)
         self.assertEqual(plan.cwd, self.workdir)
-        self.assertEqual(plan.environment["HOME"], str(self.home))
+        self.assertEqual(plan.environment["HOME"], "/host/home")
         self.assertEqual(plan.runtime_stream_path, self.agent_dir / "runtime.jsonl")
         payload = json.loads(plan.initial_input)
         self.assertEqual(payload["message"]["content"][0]["text"], "do the thing")
@@ -708,7 +708,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         )
 
     def test_prepare_inherits_host_environment_with_runtime_home(self) -> None:
-        """Inherit host tooling while replacing homes and filtering unrelated secrets."""
+        """Use host HOME for unscoped runs while keeping isolated assets."""
         managed_python = self.root / "managed-uv-python"
         managed_python.mkdir()
         ambient = {
@@ -726,7 +726,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.home,
                 self.agent_dir,
             )
-        self.assertEqual(plan.environment["HOME"], str(self.home))
+        self.assertEqual(plan.environment["HOME"], "/ambient/home")
         self.assertEqual(
             plan.environment["CLAUDE_CONFIG_DIR"], "/ambient/claude"
         )
@@ -845,6 +845,47 @@ class ClaudeAdapterTests(unittest.TestCase):
             )
         self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
         self.assertFalse(native.exists())
+
+    def test_prepare_preserves_host_home_for_unscoped_native_state(self) -> None:
+        """Prefer host HOME for native credential lookup when home is isolated."""
+
+        native = self.root / "native-claude"
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/host/claude-home",
+                "CLAUDE_CONFIG_DIR": str(native),
+            },
+            clear=False,
+        ):
+            plan = self.prepare(
+                self.request(),
+                self.profile(),
+                self.runtime_config(auth=None),
+                self.home,
+                self.agent_dir,
+            )
+        self.assertEqual(plan.environment["HOME"], "/host/claude-home")
+        self.assertEqual(plan.environment["CLAUDE_CONFIG_DIR"], str(native))
+
+    def test_prepare_keeps_scoped_home_for_account_state(self) -> None:
+        """Keep isolated runtime HOME when account-scoped credential state is selected."""
+
+        state_home = self.root / "configured-home"
+        config = self.runtime_config(auth=None, credential_state_home=state_home)
+        with patch.dict("os.environ", {"HOME": "/host/claude-home", "ANTHROPIC_API_KEY": "global-api"}):
+            plan = self.prepare(
+                self.request(),
+                self.profile(),
+                config,
+                self.home,
+                self.agent_dir,
+            )
+        self.assertEqual(plan.environment["HOME"], str(self.home))
+        self.assertEqual(
+            plan.environment["CLAUDE_CONFIG_DIR"],
+            str(state_home / "claude-config"),
+        )
 
     def test_prepare_scopes_cli_state_without_injecting_an_oauth_token(self) -> None:
         """A bare launch leaves refresh ownership to a durable private CLI home."""
