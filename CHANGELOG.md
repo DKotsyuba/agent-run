@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.8] - 2026-09-14
+
+- fix(launchd): raise API broker file limit (#46)
+
 ## [0.11.7] - 2026-09-10
 
 - docs(claude): clarify unlabelled home and config env contract
