@@ -26,7 +26,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 ```
 
 The generated service runs `BINARY --home HOME api serve` with `RunAtLoad` and
-`KeepAlive` enabled. A foreground process can still be run under another
+`KeepAlive` enabled. It sets the job's soft open-file limit to 65,536; the API
+broker, supervisors, and runtime children inherit that limit instead of
+launchd's default 256. A foreground process can still be run under another
 supervisor when launchd is unavailable.
 - Socket path defaults to `<home>/api.sock` (with `--home ~/.agent-run`
   that is `~/.agent-run/api.sock`). Override with `--socket PATH`.
