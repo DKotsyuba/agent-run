@@ -824,6 +824,8 @@ target = "auth.json"
             self.assertNotIn("KeepAlive", parsed)
 
     def test_api_launchd_renders_a_keep_alive_resident_daemon(self):
+        """The API job stays resident and gives runtime children file headroom."""
+
         import plistlib
 
         with tempfile.TemporaryDirectory() as directory:
@@ -846,6 +848,7 @@ target = "auth.json"
             self.assertEqual(parsed["ProgramArguments"], rendered["argv"])
             self.assertIs(parsed["RunAtLoad"], True)
             self.assertIs(parsed["KeepAlive"], True)
+            self.assertEqual(parsed["SoftResourceLimits"], {"NumberOfFiles": 65_536})
             self.assertEqual(parsed["StandardOutPath"], str(home / "logs" / "api.log"))
             self.assertEqual(parsed["StandardErrorPath"], str(home / "logs" / "api.err.log"))
 

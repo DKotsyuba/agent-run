@@ -48,6 +48,15 @@ def argv(job: ApiLaunchdJob) -> tuple[str, ...]:
 
 
 def render_plist(job: ApiLaunchdJob) -> str:
+    """Render a keep-alive API LaunchAgent with headroom for runtime children.
+
+    The generated job inherits the invoking user's home and optional ``PATH``.
+    It also raises the per-process open-file soft limit to 65,536 so the broker,
+    supervisors, and engine CLIs it launches do not inherit launchd's default
+    limit of 256. The returned value is an XML plist string and no files are
+    written.
+    """
+
     # launchd gives jobs a bare PATH; engine CLIs the daemon launches (node
     # shims and friends) resolve helpers through PATH, so the generator bakes
     # the invoking shell's PATH into the job. Without this the first child
@@ -63,6 +72,7 @@ def render_plist(job: ApiLaunchdJob) -> str:
             "EnvironmentVariables": environment,
             "StandardOutPath": str(job.stdout_log),
             "StandardErrorPath": str(job.stderr_log),
+            "SoftResourceLimits": {"NumberOfFiles": 65_536},
             "RunAtLoad": True,
             "KeepAlive": True,
         },
