@@ -31,6 +31,8 @@ _IMPORT_REF = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*\Z"
 )
 _ACCOUNT_LABEL = re.compile(r"[a-z0-9_-]{1,32}\Z")
+#: Codex MCP approval modes accepted by the upstream native configuration.
+MCP_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
 
 # Strict adapters validate TOML containers and scalars without coercion. Their
 # diagnostics are deliberately translated below so raw configured values never
@@ -74,10 +76,20 @@ class ProfilesConfig:
 
 @dataclass(frozen=True)
 class McpConfig:
+    """One operator-declared stdio MCP server.
+
+    ``transport`` is currently always ``stdio``; ``command`` is an absolute
+    executable path, ``args`` are literal arguments, and ``env_from`` names
+    explicitly forwarded environment variables. ``approval_mode`` selects the
+    native Codex default for this server and defaults to ``auto``; adapters that
+    lack an equivalent setting ignore it rather than widening authority.
+    """
+
     transport: str
     command: Path
     args: tuple[str, ...] = ()
     env_from: tuple[str, ...] = ()
+    approval_mode: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,8 @@ class RuntimeConfig:
     and quota-lane mappings optionally override it for opaque descriptors.
     ``plugin_snapshot_assets`` maps a uniquely configured plugin basename to
     explicit relative non-secret assets that a runtime may snapshot.
+    ``workspace_root`` optionally caps write-capable Codex sessions to one
+    operator-authorized absolute project tree; read-only sessions ignore it.
     ``credential_state_home`` is an internal, service-resolved durable home
     for a runtime-owned credential store; it is never parsed from config and
     remains ``None`` outside a prepared launch.
@@ -160,6 +174,7 @@ class RuntimeConfig:
     environment: EnvironmentConfig | None = None
     plugin_snapshot_assets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     credential_state_home: Path | None = None
+    workspace_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -527,18 +542,35 @@ def _parse_skills(value: object) -> Path:
 
 
 def _parse_mcp(value: object) -> Mapping[str, McpConfig]:
+    """Return strict MCP declarations with native approval modes.
+
+    ``value`` is the decoded ``[mcp]`` table. Only stdio servers are accepted;
+    commands resolve to absolute paths, environment entries remain names only,
+    and unknown or unsupported approval modes raise ``ValidationError``.
+    """
+
     result: dict[str, McpConfig] = {}
     for name, table in _named_table(value, "mcp").items():
         path = f"mcp.{name}"
-        _reject_unknown(table, {"transport", "command", "args", "env_from"}, path)
+        _reject_unknown(
+            table,
+            {"transport", "command", "args", "env_from", "approval_mode"},
+            path,
+        )
         transport = _string(table.get("transport"), f"{path}.transport")
         if transport != "stdio":
             raise ValidationError(f"{path}.transport must be 'stdio'")
+        approval_mode = _string(table.get("approval_mode", "auto"), f"{path}.approval_mode")
+        if approval_mode not in MCP_APPROVAL_MODES:
+            raise ValidationError(
+                f"{path}.approval_mode must be one of {', '.join(sorted(MCP_APPROVAL_MODES))}"
+            )
         result[name] = McpConfig(
             transport,
             _path(table.get("command"), f"{path}.command"),
             _strings(table.get("args", []), f"{path}.args"),
             _env_names(table.get("env_from", []), f"{path}.env_from"),
+            approval_mode,
         )
     return MappingProxyType(result)
 
@@ -655,7 +687,8 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
     expanded, symlinks unresolved) so a version-managed launcher symlink keeps
     anchoring its own interpreter directory; every other path field resolves.
     Optional account/auth, hook, plugin, explicit plugin snapshot asset,
-    capacity-source, and concurrency fields retain their existing validation.
+    Codex workspace root, capacity-source, and concurrency fields retain their
+    existing validation. ``workspace_root`` is accepted only by a Codex adapter.
     A legacy ``runtimes.opencode``
     table is accepted but omitted: OpenCode is no longer a launchable runtime,
     while accepting the old table keeps state-only commands available during
@@ -686,6 +719,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         "priority_lane_multipliers",
         "rust",
         "environment",
+        "workspace_root",
     }
     for name, table in _named_table(value, "runtimes").items():
         if name == "opencode":
@@ -757,6 +791,12 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             f"{path}.plugin_snapshot_assets",
             plugins,
         )
+        workspace_root = table.get("workspace_root")
+        if workspace_root is not None and adapter not in {
+            "agent_run.adapters.codex:ADAPTER",
+            "agent_run.adapters.codex.adapter:ADAPTER",
+        }:
+            raise ValidationError(f"{path}.workspace_root is supported only by codex")
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -778,6 +818,9 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             rust,
             environment,
             plugin_snapshot_assets,
+            workspace_root=None
+            if workspace_root is None
+            else _path(workspace_root, f"{path}.workspace_root"),
         )
         if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(

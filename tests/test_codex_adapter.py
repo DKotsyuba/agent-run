@@ -79,8 +79,14 @@ class CodexAdapterTests(unittest.TestCase):
         values.update(overrides)
         return RuntimeConfig(**values)
 
-    def resolved_mcp(self) -> dict[str, McpConfig]:
-        return {"agent_lsp": McpConfig("stdio", Path("/bin/echo"), ("serve",), ("PATH",))}
+    def resolved_mcp(self, approval_mode: str = "auto") -> dict[str, McpConfig]:
+        """Return one resolved MCP fixture using ``approval_mode`` for Codex."""
+
+        return {
+            "agent_lsp": McpConfig(
+                "stdio", Path("/bin/echo"), ("serve",), ("PATH",), approval_mode
+            )
+        }
 
     def write_ambient_config_with_mcp(self) -> None:
         """An ambient config the adapter must never read on its own."""
@@ -163,6 +169,33 @@ env_from = ["PATH"]
         self.assertEqual(plan.environment["HOME"], str(self.home))
         self.assertEqual(plan.environment["CODEX_HOME"], str(self.home))
         self.assertEqual(plan.environment["RUSTUP_HOME"], "/host/rustup")
+
+    def test_materialize_approves_only_configured_mcp_and_adds_narrow_hook(self) -> None:
+        """Render native MCP approval plus a trusted, hashed PermissionRequest hook."""
+
+        import tomllib
+
+        servers = self.resolved_mcp("approve")
+        config = self.runtime_config(
+            mcp=("agent_lsp",),
+            hooks=(
+                RuntimeHookConfig("PreToolUse", ("/usr/local/bin/dcg",), "^Bash$"),
+            ),
+        )
+        ADAPTER.materialize(config, self.home, mcp_servers=servers)
+        generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            generated["mcp_servers"]["agent_lsp"]["default_tools_approval_mode"],
+            "approve",
+        )
+        permission = generated["hooks"]["PermissionRequest"][0]
+        self.assertIn("mcp__agent_lsp__", permission["matcher"])
+        self.assertIn("--allow-mcp agent_lsp", permission["hooks"][0]["command"])
+        self.assertEqual(
+            generated["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "/usr/local/bin/dcg",
+        )
+        self.assertGreaterEqual(len(generated["hooks"]["state"]), 2)
 
     def test_legacy_environment_only_retains_native_denial_rules(self) -> None:
         """Ignore legacy path/variables while retaining command denials."""
@@ -1075,6 +1108,37 @@ env_from = ["PATH"]
         read_only = self.prepare(self.start_request(write=False), profile, config)
         self.assertEqual(read_only.adapter_state["sandbox_mode"], "read-only")
         self.assertEqual(read_only.adapter_state["writable_roots"], ())
+
+    def test_prepare_uses_configured_project_root_only_for_write_roles(self) -> None:
+        """Write roles receive the approved tree; read-only roles keep exact roots."""
+
+        projects = Path(self._mkdtemp()).resolve()
+        workdir = projects / "repo"
+        workdir.mkdir()
+        self.workdir = workdir
+        config = self.materialized(workspace_root=projects)
+        writable_profile = AgentProfile("implement", "body", True, ())
+        writable = self.prepare(
+            self.start_request(write=True, workdir=workdir), writable_profile, config
+        )
+        self.assertEqual(writable.adapter_state["roots"], (str(projects),))
+        self.assertEqual(writable.adapter_state["writable_roots"], (str(projects),))
+
+        read_only_profile = AgentProfile("review", "body", False, ())
+        read_only = self.prepare(
+            self.start_request(workdir=workdir), read_only_profile, config
+        )
+        self.assertEqual(read_only.adapter_state["roots"], (str(workdir),))
+        self.assertEqual(read_only.adapter_state["writable_roots"], ())
+
+    def test_prepare_rejects_write_workdir_outside_configured_project_root(self) -> None:
+        """A configured project root is an authorization cap, not an extra root."""
+
+        projects = Path(self._mkdtemp()).resolve()
+        config = self.materialized(workspace_root=projects)
+        profile = AgentProfile("implement", "body", True, ())
+        with self.assertRaisesRegex(ValidationError, "workspace_root"):
+            self.prepare(self.start_request(write=True), profile, config)
 
     def test_prepare_refuses_network_without_write(self) -> None:
         """Read-only is a unit sandbox variant: no network knob, so refuse."""

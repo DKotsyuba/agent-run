@@ -17,12 +17,14 @@ directory = "/absolute/path/to/skills"
 transport = "stdio"
 command = "/absolute/path/to/codegraph"
 args = ["mcp"]
+approval_mode = "auto"
 
 [runtimes.codex]
 enabled = true
 adapter = "agent_run.adapters.codex.adapter:ADAPTER"
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
+workspace_root = "/Users/you/projects"
 models = ["gpt-6-astra"]
 accounts = ["personal2"]
 limits_source = "codex_appserver"
@@ -35,6 +37,11 @@ names such as ``role-review`` are not profile identifiers. Legacy profiles and
 runtime
 `skills`/`mcp` lists remain readable until migration, but canonical and legacy
 asset declarations cannot be mixed.
+
+`workspace_root` affects write-capable Codex profiles only. Their workdir must
+be inside the configured tree; read-only profiles do not inherit write access.
+MCP `approval_mode = "approve"` is appropriate only for a locally trusted server
+whose own runtime enforces downstream permissions.
 
 Omitting an account uses native global auth. An explicit label selects separate
 credential state. Legacy `default_account`, environment, and Rust declarations

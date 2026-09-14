@@ -10,7 +10,7 @@ from typing import Mapping, cast
 
 from .adapters.home import content_hash
 from .adapters.snapshot_tree import tree_revision
-from .config import McpConfig
+from .config import MCP_APPROVAL_MODES, McpConfig
 from .domain import Constraint
 from .errors import ValidationError
 from .profiles import AgentProfile, normalize_read_roots
@@ -61,13 +61,19 @@ class ResolvedSkill:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedMcp:
-    """One credential-free MCP definition selected by a role."""
+    """One credential-free MCP definition selected by a role.
+
+    The command and arguments are canonical launch data, ``env_from`` contains
+    names but never values, and ``approval_mode`` is the operator-selected
+    native Codex approval behavior preserved across queueing and resume.
+    """
 
     id: str
     transport: str
     command: str
     args: tuple[str, ...]
     env_from: tuple[str, ...]
+    approval_mode: str = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,11 +165,11 @@ class ResolvedRolePlan:
             raise ValidationError("resolved role mcp must be a list")
         servers = []
         for index, value in enumerate(raw_mcp):
-            item = _object(
-                value,
-                frozenset({"id", "transport", "command", "args", "env_from"}),
-                f"resolved role mcp[{index}]",
-            )
+            old_keys = frozenset({"id", "transport", "command", "args", "env_from"})
+            new_keys = old_keys | {"approval_mode"}
+            if type(value) is not dict or set(value) not in (old_keys, new_keys):
+                raise ValidationError(f"resolved role mcp[{index}] has an invalid shape")
+            item = value
             server_id = _text(item["id"], f"resolved role mcp[{index}].id")
             transport = _text(item["transport"], f"resolved role mcp[{index}].transport")
             command = _text(item["command"], f"resolved role mcp[{index}].command")
@@ -171,6 +177,10 @@ class ResolvedRolePlan:
                 item["args"], f"resolved role mcp[{index}].args", unique=False
             )
             env_from = _strings(item["env_from"], f"resolved role mcp[{index}].env_from")
+            approval_mode = _text(
+                item.get("approval_mode", "auto"),
+                f"resolved role mcp[{index}].approval_mode",
+            )
             try:
                 canonical_command = str(Path(command).expanduser().resolve())
             except (OSError, RuntimeError) as error:
@@ -182,9 +192,14 @@ class ResolvedRolePlan:
                 or transport != "stdio"
                 or command != canonical_command
                 or any(_ENV_NAME.fullmatch(name) is None for name in env_from)
+                or approval_mode not in MCP_APPROVAL_MODES
             ):
                 raise ValidationError(f"resolved role mcp[{index}] is invalid")
-            servers.append(ResolvedMcp(server_id, transport, command, args, env_from))
+            servers.append(
+                ResolvedMcp(
+                    server_id, transport, command, args, env_from, approval_mode
+                )
+            )
         if len({server.id for server in servers}) != len(servers):
             raise ValidationError("resolved role MCP ids must not contain duplicates")
 
@@ -256,6 +271,11 @@ def _canonical_payload(plan: ResolvedRolePlan) -> dict[str, object]:
                 "command": server.command,
                 "args": list(server.args),
                 "env_from": list(server.env_from),
+                **(
+                    {}
+                    if server.approval_mode == "auto"
+                    else {"approval_mode": server.approval_mode}
+                ),
             }
             for server in plan.mcp
         ],
@@ -328,6 +348,7 @@ def resolve_role_plan(
                 str(definition.command),
                 definition.args,
                 definition.env_from,
+                definition.approval_mode,
             )
         )
 

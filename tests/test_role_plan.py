@@ -52,7 +52,11 @@ Review the assigned change.
                 skills_root=skills,
                 mcp_catalog={
                     "codegraph": McpConfig(
-                        "stdio", Path("/bin/echo").resolve(), ("serve",), ("PATH",)
+                        "stdio",
+                        Path("/bin/echo").resolve(),
+                        ("serve",),
+                        ("PATH",),
+                        "approve",
                     )
                 },
                 auth_mode="account",
@@ -64,6 +68,7 @@ Review the assigned change.
             self.assertEqual(payload["role_revision"], "3")
             self.assertEqual(payload["auth"], {"mode": "account", "reference": "personal2"})
             self.assertEqual(payload["skills"][0]["id"], "code-reading")
+            self.assertEqual(payload["mcp"][0]["approval_mode"], "approve")
             self.assertEqual(
                 payload["skills"][0]["revision"],
                 "29ec0f76a446221ad66bb45110a822e8b2803b1d953ed99dea296614339a8746",
@@ -77,7 +82,11 @@ Review the assigned change.
                     skills_root=skills,
                     mcp_catalog={
                         "codegraph": McpConfig(
-                            "stdio", Path("/bin/echo").resolve(), ("serve",), ("PATH",)
+                            "stdio",
+                            Path("/bin/echo").resolve(),
+                            ("serve",),
+                            ("PATH",),
+                            "approve",
                         )
                     },
                     auth_mode="account",

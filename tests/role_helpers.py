@@ -26,7 +26,12 @@ def resolved_role(
             raise ValidationError(f"no resolved MCP definition for test role: {name}")
         servers.append(
             ResolvedMcp(
-                name, server.transport, str(server.command), server.args, server.env_from
+                name,
+                server.transport,
+                str(server.command),
+                server.args,
+                server.env_from,
+                server.approval_mode,
             )
         )
     return ResolvedRolePlan(

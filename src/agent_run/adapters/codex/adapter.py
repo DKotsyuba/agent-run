@@ -22,7 +22,6 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
-from ...profiles import normalize_read_roots
 from ...role_plan import ResolvedRolePlan
 from ..base import (
     ADAPTER_API_VERSION,
@@ -52,7 +51,8 @@ from .environment import (
     resolved_directory,
 )
 from .skills import prune_skills
-from .toml import toml_array as _toml_array, toml_string as _toml_string
+from .toml import toml_string as _toml_string
+from .permissions import permission_request_hook, render_mcp_config, workspace_roots
 
 
 _CONFIG_REL = "config.toml"
@@ -303,16 +303,7 @@ class CodexAdapter:
             skill_hashes[name] = snapshot.sha256
         prune_skills(Path(home), frozenset(config.skills))
 
-        mcp_lines: list[str] = []
-        for name in sorted(config.mcp):
-            mcp_def = mcp_servers[name]
-            mcp_lines.append(f"[mcp_servers.{name}]")
-            mcp_lines.append(f"command = {_toml_string(str(mcp_def.command))}")
-            mcp_lines.append(f"args = {_toml_array(mcp_def.args)}")
-            mcp_environment = mcp_def.env_from
-            if mcp_environment:
-                mcp_lines.append(f"env_vars = {_toml_array(mcp_environment)}")
-            mcp_lines.append("")
+        mcp_lines = render_mcp_config(config, mcp_servers)
 
         plugin_lines, plugin_digest, plugin_roots = plugin_install.install(
             Path(home), config.plugins
@@ -326,7 +317,11 @@ class CodexAdapter:
         trust_lines: list[str] = []
         hook_digests: list[str] = []
         groups: dict[str, int] = {}
-        for hook in config.hooks:
+        permission_hook = permission_request_hook(config, mcp_servers)
+        runtime_hooks = (
+            config.hooks if permission_hook is None else (permission_hook, *config.hooks)
+        )
+        for hook in runtime_hooks:
             group = groups.get(hook.event, 0)
             groups[hook.event] = group + 1
             command = shlex.join(plugin_install.expand(hook.command, plugin_roots))
@@ -551,9 +546,10 @@ class CodexAdapter:
         """Build an isolated Codex launch plan for an authorized request.
 
         Validates request grants and runtime assets against ``role``. Network
-        roles receive app-server's tagged sandbox request form. Workspace-write
-        threads cannot grant external read roots in the pinned app-server
-        contract. ``gpt-6-astra`` is limited to the public read-only
+        roles receive app-server's tagged sandbox request form. A configured
+        ``workspace_root`` replaces the per-workdir write root only for write
+        roles whose workdir is contained by that project tree; external read
+        roots remain forbidden. ``gpt-6-astra`` is limited to the public read-only
         ``architect`` and ``review`` profiles. Raises ``ValidationError`` when
         an authorization or
         runtime constraint fails.
@@ -601,20 +597,9 @@ class CodexAdapter:
             raise ValidationError(f"codex home is not materialized: {home_path}")
 
         workdir = resolved_directory(request.workdir, "workdir")
-        roots = tuple(
-            str(root)
-            for root in normalize_read_roots(
-                (workdir, *role.read_roots)
-            )
+        roots, writable_roots = workspace_roots(
+            workdir, role.read_roots, config.workspace_root, effective_write
         )
-        # The writable grant never widens beyond the workdir, even when a read
-        # root above it swallowed the workdir in the normalized antichain.
-        writable_roots = (str(workdir),) if effective_write else ()
-        if effective_write and roots != writable_roots:
-            raise ValidationError(
-                "codex workspace-write threads cannot grant external read roots; "
-                "copy the material into the workdir and omit --read-root"
-            )
         sandbox_mode = "workspace-write" if effective_write else "read-only"
 
         # ``HOME`` is part of the isolation, not a convenience: the engine

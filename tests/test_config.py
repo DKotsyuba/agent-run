@@ -339,6 +339,52 @@ names = ["CLAUDE_CODE_OAUTH_TOKEN"]
         with self.assertRaisesRegex(ValidationError, "capacity.codexbar_binary"):
             self.load('schema_version = 1\n[capacity]\ncodexbar_binary = "relative"\n')
 
+    def test_codex_workspace_root_and_mcp_approval_mode_are_strict(self) -> None:
+        """Parse the optional project root and only documented MCP approval modes."""
+
+        config = self.load(
+            '''schema_version = 1
+[mcp.agent_ide]
+transport = "stdio"
+command = "/bin/echo"
+approval_mode = "approve"
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/codex"
+workspace_root = "/Users/pluto/projects"
+models = ["test"]
+mcp = ["agent_ide"]
+'''
+        )
+        self.assertEqual(config.mcp["agent_ide"].approval_mode, "approve")
+        self.assertEqual(
+            config.runtimes["codex"].workspace_root,
+            Path("/Users/pluto/projects"),
+        )
+        with self.assertRaisesRegex(ValidationError, "approval_mode"):
+            self.load(
+                '''schema_version = 1
+[mcp.bad]
+transport = "stdio"
+command = "/bin/echo"
+approval_mode = "always"
+'''
+            )
+        with self.assertRaisesRegex(ValidationError, "workspace_root"):
+            self.load(
+                '''schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/codex"
+workspace_root = "relative"
+models = ["test"]
+'''
+            )
+
     def runtime_with_plugins(self, value: str, directory: Path):
         return self.load(
             f"""schema_version = 1

@@ -17,6 +17,14 @@ Each runtime gets generated lightweight configuration so subagents see only the
 skills and MCP servers selected by their role. The generated directory is
 configuration separation, not an OS security boundary.
 
+Codex write roles normally receive only their assigned workdir. An explicit
+`runtimes.codex.workspace_root` replaces that root with one operator-authorized
+project tree after agent-run proves the workdir is contained by it; read-only
+roles ignore the setting. MCP declarations preserve native approval modes, and
+only servers explicitly set to `approve` receive the generated narrow
+PermissionRequest allow hook. Unknown tools and every shell call retain normal
+Codex review. A declared DCG `PreToolUse` hook is an additional deny-only layer.
+
 ## Canonical roles
 
 `[profiles].directory` contains one Markdown file per role. A revisioned role is
