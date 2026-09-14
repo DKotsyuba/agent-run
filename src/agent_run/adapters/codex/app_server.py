@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 from ..home import seal_answer
 from pathlib import Path
@@ -16,7 +16,7 @@ from typing import Mapping, Protocol
 from ...domain import AgentStatus, Message, MessageRole, Outcome
 from ...errors import ValidationError
 from ._error_classification import _structured_failure_kind
-from .environment import thread_grant_params
+from .permissions import EffectiveTurnParams, VerificationError, thread_grant_params, verify_effective_params
 from .process_transport import ProcessTransport
 
 
@@ -24,10 +24,6 @@ from .process_transport import ProcessTransport
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 30.0
 _MAX_STARTUP_TIMEOUT_SECONDS = 120.0
 _PENDING_DRAIN_LIMIT, _PENDING_DRAIN_SECONDS = 64, 0.05
-class VerificationError(ValidationError):
-    """Effective app-server parameters do not match the requested launch plan."""
-
-
 class SteerRejected(ValidationError):
     """The codex app-server rejected a steer request."""
 
@@ -53,95 +49,6 @@ class AppServerTransport(Protocol):
     def close(self) -> None: ...
 
 
-@dataclass(frozen=True)
-class EffectiveTurnParams:
-    """Security-relevant parameters requested for one Codex thread."""
-
-    model: str
-    cwd: str
-    roots: tuple[str, ...]
-    sandbox: str
-    approval_policy: str
-    writable_roots: tuple[str, ...]
-    network_access: bool = False
-
-
-#: The app-server's beta contract echoes ``sandbox`` in ``thread/start`` as an
-#: object (``{'type': 'readOnly', 'networkAccess': False, ...}``) instead of
-#: the legacy kebab-case string. Map its camelCase ``type`` to this codebase's
-#: kebab-case sandbox names, following the same word-boundary convention the
-#: legacy names already use (``read-only``/``readOnly``,
-#: ``workspace-write``/``workspaceWrite``); ``danger-full-access`` is the
-#: third sandbox mode codex ships and follows the identical convention.
-#: ``networkAccess`` is not checked here: this codebase does not encode a
-#: per-sandbox network expectation, so it stays purely informational.
-_SANDBOX_ECHO_TYPES: Mapping[str, str] = {
-    "readOnly": "read-only",
-    "workspaceWrite": "workspace-write",
-    "dangerFullAccess": "danger-full-access",
-}
-
-
-def _normalized_sandbox_echo(value: object) -> object:
-    """Reduce a ``thread/start`` sandbox echo to its kebab-case form.
-
-    Passes the legacy string form through unchanged. Reduces the beta object
-    form via ``_SANDBOX_ECHO_TYPES``. Returns ``value`` unchanged for any
-    other shape (including an unrecognized ``type``), so the caller's
-    equality check against the requested sandbox still fails closed.
-    """
-    if isinstance(value, Mapping):
-        return _SANDBOX_ECHO_TYPES.get(value.get("type"), value)
-    return value
-
-
-#: The same beta contract renames ``thread/start``'s top-level ``roots`` echo
-#: to ``runtimeWorkspaceRoots``, and moves ``writableRoots`` inside the
-#: ``sandbox`` object -- dropping ``cwd`` from that list entirely, since a
-#: ``workspaceWrite`` sandbox already implies the cwd is writable. The
-#: ``sandbox`` scalar check above verifies the sandbox *type* against the
-#: request separately, so this cwd substitution below never masks a genuine
-#: sandbox-mode mismatch. It also renames the started thread's top-level
-#: ``threadId`` to a nested ``thread.id``.
-def _normalized_roots_echo(actual: Mapping[str, object]) -> tuple[str, ...]:
-    """Reduce a ``thread/start`` roots echo to a tuple.
-
-    Prefers the legacy top-level ``roots`` key when present (covers any
-    codex version still using it); falls back to the beta contract's
-    ``runtimeWorkspaceRoots``. Neither key present normalizes to ``()``, so
-    the caller's equality check against the requested roots still fails
-    closed.
-    """
-    if "roots" in actual:
-        return tuple(actual.get("roots") or ())
-    return tuple(actual.get("runtimeWorkspaceRoots") or ())
-
-
-def _normalized_writable_roots_echo(actual: Mapping[str, object]) -> tuple[str, ...]:
-    """Reduce a ``thread/start`` writableRoots echo to a tuple.
-
-    Prefers the legacy top-level ``writableRoots`` key when present. The
-    beta contract nests it under ``sandbox`` instead and omits ``cwd`` from
-    the list, so an empty nested list under a ``workspaceWrite`` sandbox is
-    normalized back to ``(cwd,)``. Any other shape -- a non-empty nested
-    list, a non-``workspaceWrite`` sandbox, or no ``sandbox`` object at all
-    -- passes through unchanged, so a genuine mismatch still fails closed.
-    """
-    if "writableRoots" in actual:
-        return tuple(actual.get("writableRoots") or ())
-    sandbox = actual.get("sandbox")
-    if not isinstance(sandbox, Mapping):
-        return ()
-    nested = tuple(sandbox.get("writableRoots") or ())
-    if nested:
-        return nested
-    if sandbox.get("type") == "workspaceWrite":
-        cwd = actual.get("cwd")
-        if isinstance(cwd, str) and cwd:
-            return (cwd,)
-    return nested
-
-
 def _thread_id_echo(actual: Mapping[str, object]) -> object:
     """Locate the started thread's id.
 
@@ -152,43 +59,6 @@ def _thread_id_echo(actual: Mapping[str, object]) -> object:
         return actual.get("threadId")
     nested = actual.get("thread")
     return nested.get("id") if isinstance(nested, Mapping) else None
-
-
-def verify_effective_params(expected: EffectiveTurnParams, actual: Mapping[str, object]) -> None:
-    """Refuse a thread whose effective params drift from what was requested.
-
-    In particular, read roots must never appear in ``writableRoots``: only the
-    cwd may be writable, and only when the request actually granted write.
-    """
-
-    scalar_checks = (
-        ("model", expected.model),
-        ("cwd", expected.cwd),
-        ("sandbox", expected.sandbox),
-        ("approvalPolicy", expected.approval_policy),
-    )
-    for key, wanted in scalar_checks:
-        got = actual.get(key)
-        compare = _normalized_sandbox_echo(got) if key == "sandbox" else got
-        if compare != wanted:
-            raise VerificationError(
-                f"codex thread/start {key} mismatch: expected {wanted!r}, got {got!r}"
-            )
-    got_roots = _normalized_roots_echo(actual)
-    if got_roots != expected.roots:
-        raise VerificationError(
-            f"codex thread/start roots mismatch: expected {expected.roots!r}, got {got_roots!r}"
-        )
-    got_writable = _normalized_writable_roots_echo(actual)
-    if got_writable != expected.writable_roots:
-        raise VerificationError(
-            "codex thread/start writableRoots mismatch: expected "
-            f"{expected.writable_roots!r}, got {got_writable!r}"
-        )
-    if expected.network_access:
-        sandbox = actual.get("sandbox")
-        if not isinstance(sandbox, Mapping) or sandbox.get("networkAccess") is not True:
-            raise VerificationError("codex thread/start did not enable requested network access")
 
 
 #: Only these turn statuses end a turn; ``inProgress`` is not a completion.
@@ -535,10 +405,11 @@ class CodexAppServerSession:
 def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSession:
     """Start a Codex session and verify its effective parameters.
 
-    Initialize opts into the experimental API required by workspace roots.
-    A fresh thread sends all declared workspace roots through the current
-    ``runtimeWorkspaceRoots`` input, alongside the adapter's unchanged sandbox
-    request, then compares the server's flat echo to the requested permissions.
+    Initializes the experimental API required by workspace roots and permission
+    profile provenance. A named-profile plan relies on its generated
+    ``default_permissions`` and omits conflicting legacy sandbox fields; legacy
+    plans still send ``runtimeWorkspaceRoots`` and ``sandbox``. Both paths
+    compare the returned sandbox, roots, approval settings, and active profile.
     A plan with ``resume_session_id`` uses ``thread/resume``
     and must return that exact identity; it never falls back to a fresh
     thread. Raises ``VerificationError`` for effective-param drift or an
@@ -577,9 +448,10 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
     sandbox_mode = state["sandbox_mode"]
     network_access = bool(state.get("network_access", False))
     approvals_reviewer = state.get("approvals_reviewer")
+    permission_profile = state.get("permission_profile")
     grant_params = thread_grant_params(
         str(plan.cwd), state["model"], sandbox_mode, state["approval_policy"], roots, network_access,
-        approvals_reviewer,
+        approvals_reviewer, permission_profile,
     )
     resume_session_id = plan.resume_session_id
     if resume_session_id is None:
@@ -611,6 +483,7 @@ def start_session(transport: AppServerTransport, plan, sink) -> CodexAppServerSe
         approval_policy=state["approval_policy"],
         writable_roots=writable_roots,
         network_access=network_access,
+        permission_profile=permission_profile,
     )
     verify_effective_params(expected, thread)
     if approvals_reviewer is not None and thread.get("approvalsReviewer") != approvals_reviewer:

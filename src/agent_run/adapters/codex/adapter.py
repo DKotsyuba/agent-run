@@ -52,7 +52,13 @@ from .environment import (
 )
 from .skills import prune_skills
 from .toml import toml_string as _toml_string
-from .permissions import permission_request_hook, render_mcp_config, workspace_roots
+from .permissions import (
+    PROJECTS_PROFILE,
+    permission_request_hook,
+    render_mcp_config,
+    render_permission_profile,
+    workspace_roots,
+)
 
 
 _CONFIG_REL = "config.toml"
@@ -304,6 +310,7 @@ class CodexAdapter:
         prune_skills(Path(home), frozenset(config.skills))
 
         mcp_lines = render_mcp_config(config, mcp_servers)
+        permission_lines = render_permission_profile(config)
 
         plugin_lines, plugin_digest, plugin_roots = plugin_install.install(
             Path(home), config.plugins
@@ -348,6 +355,7 @@ class CodexAdapter:
             "model_auto_compact_token_limit = 780000",
             'model_auto_compact_token_limit_scope = "total"',
             "",
+            *permission_lines,
             *mcp_lines,
             *hook_lines,
             *trust_lines,
@@ -635,6 +643,9 @@ class CodexAdapter:
             "model": request.model,
             "effort": request.effort,
             "sandbox_mode": sandbox_mode,
+            "permission_profile": PROJECTS_PROFILE
+            if effective_write and config.workspace_root is not None and not role.network
+            else None,
             **approval_fields(effective_write),
             "roots": roots,
             "writable_roots": writable_roots,

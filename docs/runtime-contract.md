@@ -20,7 +20,10 @@ configuration separation, not an OS security boundary.
 Codex write roles normally receive only their assigned workdir. An explicit
 `runtimes.codex.workspace_root` replaces that root with one operator-authorized
 project tree after agent-run proves the workdir is contained by it; read-only
-roles ignore the setting. MCP declarations preserve native approval modes, and
+roles ignore the setting. Ordinary write roles use the generated native
+`Projects` profile and must echo that exact active profile before their first
+turn; read-only and network roles retain the stricter legacy sandbox path. MCP
+declarations preserve native approval modes, and
 only servers explicitly set to `approve` receive the generated narrow
 PermissionRequest allow hook. Unknown tools and every shell call retain normal
 Codex review. A declared DCG `PreToolUse` hook is an additional deny-only layer.

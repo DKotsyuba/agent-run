@@ -222,6 +222,22 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
         with self.assertRaisesRegex(VerificationError, "sandbox mismatch"):
             verify_effective_params(self.expected(), actual)
 
+    def test_named_permission_profile_must_match_exactly(self) -> None:
+        """A profile-based thread must prove its active profile provenance."""
+
+        actual = thread_response(
+            "/work",
+            activePermissionProfile={"id": "Projects", "extends": ":workspace"},
+        )
+        verify_effective_params(
+            self.expected(permission_profile="Projects"), actual
+        )
+        actual["activePermissionProfile"] = {"id": ":workspace"}
+        with self.assertRaisesRegex(VerificationError, "permission profile mismatch"):
+            verify_effective_params(
+                self.expected(permission_profile="Projects"), actual
+            )
+
     def test_sandbox_beta_object_echo_matching_type_passes(self) -> None:
         """The live contract drift: app-server echoes sandbox as an object."""
         actual = thread_response("/work", writable_roots=())
@@ -312,6 +328,44 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
 
 
 class StartSessionTests(unittest.TestCase):
+    def test_projects_profile_uses_generated_default_without_legacy_sandbox(self) -> None:
+        """Write sessions select Projects and omit conflicting legacy fields."""
+
+        cwd = Path("/work")
+        state = {
+            "model": "gpt-5.6-sol",
+            "effort": None,
+            "sandbox_mode": "workspace-write",
+            "permission_profile": "Projects",
+            "approval_policy": "on-request",
+            "approvals_reviewer": "auto_review",
+            "roots": (str(cwd),),
+            "writable_roots": (str(cwd),),
+        }
+        response = thread_response(
+            cwd,
+            approvalPolicy="on-request",
+            approvalsReviewer="auto_review",
+            sandbox={"type": "workspaceWrite", "writableRoots": []},
+            activePermissionProfile={"id": "Projects", "extends": ":workspace"},
+        )
+        response.pop("writableRoots")
+        transport = FakeTransport(
+            responses={
+                "initialize": [{}],
+                "thread/start": [response],
+                "turn/start": [{"turn": {"id": "turn_new"}}],
+            }
+        )
+
+        start_session(transport, make_plan(cwd, state), FakeSink())
+
+        sent = transport.requests[1][1]
+        self.assertNotIn("sandbox", sent)
+        self.assertNotIn("runtimeWorkspaceRoots", sent)
+        self.assertEqual(sent["approvalPolicy"], "on-request")
+        self.assertEqual(sent["approvalsReviewer"], "auto_review")
+
     def test_resume_uses_exact_thread_id_then_starts_a_new_turn(self) -> None:
         """A native continuation never creates a replacement thread."""
         cwd = Path("/work")

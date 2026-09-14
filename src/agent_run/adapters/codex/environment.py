@@ -160,31 +160,3 @@ def prepared_environment(
         raise ValidationError("codex resume command policy is missing")
     environment["PATH"] = os.pathsep.join((str(policy_directory), environment["PATH"]))
     return environment
-
-
-def thread_grant_params(
-    cwd: str, model: str, sandbox_mode: str, approval_policy: str,
-    roots: tuple[str, ...], network_access: bool, approvals_reviewer: str | None = None,
-) -> dict[str, object]:
-    """Return the shared ``thread/start``/``thread/resume`` grant fields.
-
-    The installed 0.153.4 experimental schema's ``sandbox`` field on both
-    ``ThreadStartParams`` and ``ThreadResumeParams`` is the plain kebab-case
-    enum string; neither accepts an ``effort``, ``mcpServers``, or ``skills``
-    field (effort belongs on ``TurnStartParams``; MCPs/skills come from the
-    generated native config the app-server already reads). A requested
-    network grant is instead conveyed through ``config``'s dotted
-    ``sandbox_workspace_write.network_access``, verified live to yield
-    ``networkAccess: true`` on the echoed thread. A selected reviewer is sent
-    only for the developer write contract that requires automatic review.
-    """
-
-    params: dict[str, object] = {
-        "cwd": cwd, "model": model, "sandbox": sandbox_mode,
-        "approvalPolicy": approval_policy, "runtimeWorkspaceRoots": list(roots),
-    }
-    if network_access and sandbox_mode == "workspace-write":
-        params["config"] = {"sandbox_workspace_write": {"network_access": True}}
-    if approvals_reviewer is not None:
-        params["approvalsReviewer"] = approvals_reviewer
-    return params

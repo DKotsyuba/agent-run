@@ -31,7 +31,12 @@ declared but attached to no runtime is inert; a name listed in `mcp =
 `runtimes.codex.workspace_root` optionally gives write-capable Codex roles one
 operator-approved project tree instead of only their assigned workdir. The
 workdir must resolve below that root, external read roots still fail closed, and
-read-only roles remain read-only with their exact roots.
+read-only roles remain read-only with their exact roots. Write roles without a
+network grant use the generated native `Projects` permission profile as their
+app-server default; agent-run omits the conflicting legacy `sandbox` request and
+verifies `activePermissionProfile.id` before starting a model turn. Read-only
+and network roles keep their explicit legacy sandbox until Codex exposes an
+equivalent scoped named profile for those grants.
 
 DCG needs no agent-run-specific adapter. Declare its absolute installed binary
 as a normal Codex runtime hook; install and verify that binary before enabling

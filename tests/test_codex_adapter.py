@@ -176,14 +176,22 @@ env_from = ["PATH"]
         import tomllib
 
         servers = self.resolved_mcp("approve")
+        projects = Path(self._mkdtemp()).resolve()
         config = self.runtime_config(
             mcp=("agent_lsp",),
+            workspace_root=projects,
             hooks=(
                 RuntimeHookConfig("PreToolUse", ("/usr/local/bin/dcg",), "^Bash$"),
             ),
         )
         ADAPTER.materialize(config, self.home, mcp_servers=servers)
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(generated["default_permissions"], "Projects")
+        self.assertEqual(
+            generated["permissions"]["Projects"]["workspace_roots"],
+            {str(projects): True},
+        )
+        self.assertNotIn(":root", generated["permissions"]["Projects"].get("filesystem", {}))
         self.assertEqual(
             generated["mcp_servers"]["agent_lsp"]["default_tools_approval_mode"],
             "approve",
@@ -1123,6 +1131,7 @@ env_from = ["PATH"]
         )
         self.assertEqual(writable.adapter_state["roots"], (str(projects),))
         self.assertEqual(writable.adapter_state["writable_roots"], (str(projects),))
+        self.assertEqual(writable.adapter_state["permission_profile"], "Projects")
 
         read_only_profile = AgentProfile("review", "body", False, ())
         read_only = self.prepare(
@@ -1130,6 +1139,7 @@ env_from = ["PATH"]
         )
         self.assertEqual(read_only.adapter_state["roots"], (str(workdir),))
         self.assertEqual(read_only.adapter_state["writable_roots"], ())
+        self.assertIsNone(read_only.adapter_state["permission_profile"])
 
     def test_prepare_rejects_write_workdir_outside_configured_project_root(self) -> None:
         """A configured project root is an authorization cap, not an extra root."""
