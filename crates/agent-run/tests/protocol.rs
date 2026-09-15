@@ -42,7 +42,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     )
     .await
     .unwrap();
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(response["result"].as_array().unwrap().len(), 11);
 }
 #[tokio::test]
 async fn invalid_envelopes_and_unknown_method_get_standard_codes() {
@@ -67,6 +67,28 @@ async fn invalid_envelopes_and_unknown_method_get_standard_codes() {
         -32601
     );
 }
+/// Mirrors Python `test_api_socket.py::test_invalid_request_error_messages`.
+#[tokio::test]
+async fn invalid_requests_preserve_python_error_classes() {
+    let service = service();
+    let batch = socket::respond(&service, json!([])).await.unwrap();
+    assert_eq!(
+        batch["error"]["message"],
+        "batch requests are not supported"
+    );
+    let bad_id = socket::respond(&service, json!({"jsonrpc":"2.0","id":true,"method":"ping"}))
+        .await
+        .unwrap();
+    assert_eq!(bad_id["error"]["message"], "invalid request id");
+    let params = socket::respond(
+        &service,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping","params":[]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(params["error"]["code"], -32602);
+    assert_eq!(params["error"]["message"], "params must be an object");
+}
 #[tokio::test]
 async fn notifications_have_no_response_and_unknown_arguments_fail() {
     assert!(
@@ -83,6 +105,19 @@ async fn notifications_have_no_response_and_unknown_arguments_fail() {
         .unwrap()["error"]["code"],
         -32602
     );
+}
+
+/// Mirrors Python `test_api_socket.py::test_domain_errors_have_code_and_message`.
+#[tokio::test]
+async fn domain_errors_use_the_socket_domain_envelope() {
+    let response = socket::respond(
+        &service(),
+        json!({"jsonrpc":"2.0","id":1,"method":"answer","params":{"agent_id":"bad"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(response["error"].get("data").is_none());
 }
 #[tokio::test]
 async fn framing_rejects_partial_and_oversized_lines() {

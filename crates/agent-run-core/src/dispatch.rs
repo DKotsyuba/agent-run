@@ -65,11 +65,16 @@ struct Doc {
 struct Empty {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Private socket wait arguments; omission means wait without a client deadline.
 struct Wait {
     agent_id: AgentId,
-    #[serde(default, alias = "timeout_seconds")]
-    wait_seconds: Option<f64>,
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
 }
+/// Decodes and dispatches one named tool against the caller-owned service.
+///
+/// `raw` must be an object matching the named schema. Errors are typed so the
+/// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
         "start" => service.start(args::<StartRequest>(raw)?).await,
@@ -122,15 +127,26 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         // Socket-only control/discovery methods; not part of the eleven MCP tools.
         "tools" => {
             let _: Empty = args(raw)?;
-            Ok(json!({"tools":tools()}))
+            // The private socket discovery method predates MCP and returns the
+            // table itself, not an MCP-shaped wrapper.
+            Ok(Value::Array(tools()))
         }
         "ping" => {
             let _: Empty = args(raw)?;
-            Ok(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")}))
+            Ok(json!({"ok":true}))
         }
         "wait" => {
             let a: Wait = args(raw)?;
-            service.wait(&a.agent_id, a.wait_seconds).await
+            if a.timeout_seconds
+                .is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0)
+            {
+                return Err(invalid("timeout_seconds must be a positive finite number"));
+            }
+            let mut result = service.wait(&a.agent_id, a.timeout_seconds).await?;
+            if a.timeout_seconds.is_some() && result["terminal"] == false {
+                result["timed_out"] = Value::Bool(true);
+            }
+            Ok(result)
         }
         _ => Err(invalid("unknown tool")),
     }
