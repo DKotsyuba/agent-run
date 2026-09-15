@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.13] - 2026-09-15
+
+- fix(codex): preserve reviewed network rules on prepare
+
 ## [0.11.12] - 2026-09-15
 
 - feat(codex): opt into reviewed workspace network
