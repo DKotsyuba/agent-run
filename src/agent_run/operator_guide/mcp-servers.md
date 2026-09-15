@@ -34,9 +34,11 @@ workdir must resolve below that root, external read roots still fail closed, and
 read-only roles remain read-only with their exact roots. Write roles without a
 network grant use the generated native `Projects` permission profile as their
 app-server default; agent-run omits the conflicting legacy `sandbox` request and
-verifies `activePermissionProfile.id` before starting a model turn. Read-only
-and network roles keep their explicit legacy sandbox until Codex exposes an
-equivalent scoped named profile for those grants.
+verifies `activePermissionProfile.id` before starting a model turn. The
+`runtimeWorkspaceRoots` echo stays scoped to the assigned workdir, while the
+effective `sandbox.writableRoots` must contain the configured project tree.
+Read-only and network roles keep their explicit legacy sandbox until Codex
+exposes an equivalent scoped named profile for those grants.
 
 DCG needs no agent-run-specific adapter. Declare its absolute installed binary
 as a normal Codex runtime hook; install and verify that binary before enabling

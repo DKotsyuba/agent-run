@@ -555,12 +555,12 @@ class CodexAdapter:
 
         Validates request grants and runtime assets against ``role``. Network
         roles receive app-server's tagged sandbox request form. A configured
-        ``workspace_root`` replaces the per-workdir write root only for write
-        roles whose workdir is contained by that project tree; external read
-        roots remain forbidden. ``gpt-6-astra`` is limited to the public read-only
+        ``workspace_root`` replaces the per-workdir writable root for write roles
+        inside that tree; named profiles still report the workdir as their
+        runtime workspace root. External read roots remain forbidden.
+        ``gpt-6-astra`` is limited to the public read-only
         ``architect`` and ``review`` profiles. Raises ``ValidationError`` when
-        an authorization or
-        runtime constraint fails.
+        an authorization or runtime constraint fails.
         """
         if not isinstance(request, StartRequest):
             raise ValidationError("prepare requires a StartRequest")
@@ -609,6 +609,11 @@ class CodexAdapter:
             workdir, role.read_roots, config.workspace_root, effective_write
         )
         sandbox_mode = "workspace-write" if effective_write else "read-only"
+        permission_profile = PROJECTS_PROFILE if (
+            effective_write and config.workspace_root is not None and not role.network
+        ) else None
+        if permission_profile is not None:
+            roots = (str(workdir),)
 
         # ``HOME`` is part of the isolation, not a convenience: the engine
         # resolves its personal skill/plugin roots (``~/.agents/skills``,
@@ -643,9 +648,7 @@ class CodexAdapter:
             "model": request.model,
             "effort": request.effort,
             "sandbox_mode": sandbox_mode,
-            "permission_profile": PROJECTS_PROFILE
-            if effective_write and config.workspace_root is not None and not role.network
-            else None,
+            "permission_profile": permission_profile,
             **approval_fields(effective_write),
             "roots": roots,
             "writable_roots": writable_roots,

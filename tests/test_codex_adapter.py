@@ -1129,7 +1129,7 @@ env_from = ["PATH"]
         writable = self.prepare(
             self.start_request(write=True, workdir=workdir), writable_profile, config
         )
-        self.assertEqual(writable.adapter_state["roots"], (str(projects),))
+        self.assertEqual(writable.adapter_state["roots"], (str(workdir),))
         self.assertEqual(writable.adapter_state["writable_roots"], (str(projects),))
         self.assertEqual(writable.adapter_state["permission_profile"], "Projects")
 

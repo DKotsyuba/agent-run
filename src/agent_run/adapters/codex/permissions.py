@@ -26,8 +26,9 @@ class VerificationError(ValidationError):
 class EffectiveTurnParams:
     """Security-relevant parameters requested for one Codex thread.
 
-    ``model`` and ``cwd`` identify execution, ``roots`` and ``writable_roots``
-    bind filesystem scope, and ``sandbox`` records the expected effective type.
+    ``model`` and ``cwd`` identify execution, ``roots`` bind the thread's runtime
+    workspace roots, ``writable_roots`` bind its effective write scope, and
+    ``sandbox`` records the expected effective type.
     ``approval_policy`` plus optional ``permission_profile`` bind review and
     named-profile provenance. ``network_access`` requires an explicit true echo.
     Instances are immutable and contain no credentials.
@@ -93,9 +94,9 @@ def verify_effective_params(
     ``expected`` is the adapter's immutable launch contract and ``actual`` is
     the app-server thread response. Named profiles must echo the exact
     ``activePermissionProfile.id``. Sandbox type, approval policy, readable
-    roots, writable roots, and requested network access remain independently
-    verified. Any mismatch raises ``VerificationError`` through the caller's
-    shared ``ValidationError`` boundary.
+    runtime roots, writable roots, and requested network access remain
+    independently verified. Any mismatch raises ``VerificationError`` through
+    the caller's shared ``ValidationError`` boundary.
     """
 
     scalar_checks = (
