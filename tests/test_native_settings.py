@@ -487,7 +487,8 @@ class SnapshotAndScopedCopies(NativeSettingsTestCase):
         )
         restored = json.loads(snapshot.document)["runtime_config"]["native_settings"]
         self.assertEqual(restored, {"model_context_window": 250000, "tuning": {"retries": 3}})
-        CODEX_ADAPTER.materialize(scoped, scoped.home, mcp_servers={})
+        restored_config = replace(scoped, native_settings=restored)
+        CODEX_ADAPTER.materialize(restored_config, restored_config.home, mcp_servers={})
         document = tomllib.loads((scoped.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(document["model_context_window"], 250000)
         self.assertEqual(document["tuning"], {"retries": 3})
