@@ -20,13 +20,21 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+/// Maximum UTF-8 JSON-RPC line retained from an engine before failing closed.
 pub const ENGINE_FRAME: usize = 8 * 1024 * 1024;
+
+/// One bounded result from the engine stdout reader.
 #[derive(Debug)]
 pub enum Event {
+    /// A complete parsed JSON envelope.
     Json(Value),
+    /// The child closed stdout before a complete protocol terminal event.
     Eof,
+    /// Framing or JSON decoding failed without retaining unbounded input.
     Failure(&'static str),
 }
+
+/// Owns an app-server child, its bounded streams, and request correlation state.
 pub struct Process {
     pub child: Child,
     pub input: Option<ChildStdin>,
@@ -40,6 +48,7 @@ pub struct Process {
     diagnostic_tail: Arc<Mutex<DiagnosticTail>>,
 }
 impl Process {
+    /// Spawns the planned engine with isolated environment and line-framed pipes.
     pub fn spawn(plan: &LaunchPlan) -> Result<Self> {
         let redactor = Redactor::from_environment(&plan.environment);
         let mut command = Command::new(&plan.binary);
@@ -134,6 +143,7 @@ impl Process {
             .ok()
             .and_then(|tail| tail.text())
     }
+    /// Writes one bounded JSON-RPC envelope to the owned child within 15 seconds.
     pub async fn send(&mut self, message: &Value) -> Result<()> {
         let input = self
             .input
@@ -146,6 +156,7 @@ impl Process {
         .await
         .map_err(|_| Error::Runtime("engine input delivery timed out".into()))?
     }
+    /// Writes raw text for non-JSON stream engines while retaining the same deadline.
     pub async fn text(&mut self, text: &str) -> Result<()> {
         let input = self
             .input
@@ -157,6 +168,7 @@ impl Process {
         input.flush().await?;
         Ok(())
     }
+    /// Returns the next retained notification or waits for a bounded reader event.
     pub async fn next(&mut self) -> Event {
         if let Some(e) = self.backlog.pop_front() {
             e
@@ -164,11 +176,21 @@ impl Process {
             self.events.recv().await.unwrap_or(Event::Eof)
         }
     }
+    /// Sends one request, correlates its response, and retains interleaved notifications.
+    ///
+    /// Control requests are capped at one second so a nonresponsive engine cannot
+    /// delay cancellation or supervisor lifecycle work. Server-originated requests
+    /// are declined before normal notification ordering resumes.
     pub async fn rpc(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({"id":id,"method":method,"params":params}))
             .await?;
+        let timeout = if matches!(method, "turn/steer" | "turn/interrupt") {
+            timeout.min(Duration::from_secs(1))
+        } else {
+            timeout
+        };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let event = tokio::time::timeout_at(deadline, self.events.recv())
@@ -180,8 +202,15 @@ impl Process {
                     if v.get("id").and_then(Value::as_u64) == Some(id)
                         && v.get("method").is_none() =>
                 {
-                    if v.get("error").is_some() {
-                        return Err(Error::Runtime("app-server rejected RPC request".into()));
+                    if let Some(error) = v.get("error") {
+                        let code = error
+                            .get("code")
+                            .map(Value::to_string)
+                            .unwrap_or_else(|| "unknown".into());
+                        return Err(Error::Runtime(format!(
+                            "app-server rejected {method} ({})",
+                            code.chars().take(64).collect::<String>()
+                        )));
                     }
                     return v
                         .get("result")
@@ -192,7 +221,7 @@ impl Process {
                     self.deny_request(&v).await?;
                 }
                 Event::Json(v) => {
-                    if self.backlog.len() >= 16 {
+                    if self.backlog.len() >= 64 {
                         return Err(Error::Runtime("app-server startup event overflow".into()));
                     }
                     self.backlog.push_back(Event::Json(v));
@@ -202,6 +231,7 @@ impl Process {
             }
         }
     }
+    /// Declines an unsolicited server request without granting process authority.
     pub async fn deny_request(&mut self, v: &Value) -> Result<()> {
         let method = v.get("method").and_then(Value::as_str).unwrap_or("");
         let response = if method == "item/permissions/requestApproval" {
@@ -213,6 +243,7 @@ impl Process {
         };
         self.send(&response).await
     }
+    /// Waits briefly for child exit and joins reader tasks before releasing evidence.
     pub async fn reap(&mut self) -> Option<i32> {
         let code = match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
             Ok(Ok(s)) => s.code(),

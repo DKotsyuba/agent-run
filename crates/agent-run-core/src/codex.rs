@@ -8,6 +8,7 @@ use crate::{
     verify, Error, Result,
 };
 use agent_run_adapters::{
+    codex::session::{failure_kind as structured_failure_kind, Session},
     io::{Event, Process},
     EngineResult, LaunchPlan,
 };
@@ -357,27 +358,15 @@ pub fn plan(
         initial_input: None,
     })
 }
-fn failure_kind(error: &Value) -> String {
-    for key in ["kind", "code"] {
-        if let Some(s) = error.get(key).and_then(Value::as_str) {
-            return if s == "serverOverloaded" {
-                "provider_overloaded".into()
-            } else {
-                s.chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || "_-".contains(*c))
-                    .take(64)
-                    .collect()
-            };
-        }
-    }
-    match error.get("codexErrorInfo").and_then(Value::as_str) {
-        Some("serverOverloaded") => "provider_overloaded".into(),
-        Some("usageLimitExceeded") => "quota_exhausted".into(),
-        _ => "runtime_failed".into(),
-    }
-}
+/// Initializes the experimental app-server protocol required for grant echoes.
 async fn initialize(process: &mut Process) -> Result<()> {
-    process.rpc("initialize",json!({"clientInfo":{"name":"agent-run","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}),Duration::from_secs(30)).await?;
+    process
+        .rpc(
+            "initialize",
+            json!({"clientInfo":{"name":"agent-run","version":"1"},"capabilities":{"experimentalApi":true}}),
+            Duration::from_secs(30),
+        )
+        .await?;
     process.send(&json!({"method":"initialized"})).await
 }
 pub async fn models(process: &mut Process) -> Result<Vec<Value>> {
@@ -423,6 +412,8 @@ pub async fn run(
     home: &Path,
 ) -> Result<EngineResult> {
     initialize(process).await?;
+    let mut session = Session::new(record.resume_of_runtime_session_id.is_some());
+    session.initialized()?;
     let roster = models(process).await?;
     let model = roster
         .iter()
@@ -475,6 +466,7 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
+    session.thread_started(&tid)?;
     if record
         .resume_of_runtime_session_id
         .as_ref()
@@ -496,6 +488,7 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("turn start did not return an id"))?
         .to_owned();
+    session.turn_started(&turn_id)?;
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
@@ -508,25 +501,15 @@ pub async fn run(
             process.owner.refresh();
             for (cid, kind, payload) in store.pending_commands(&record.id)? {
                 if kind == "cancel" {
-                    let _ = process
+                    let result = process
                         .rpc(
                             "turn/interrupt",
                             json!({"threadId":tid,"turnId":turn_id}),
                             Duration::from_secs(1),
                         )
                         .await;
-                    store.command_done(cid, &json!({"accepted":true}))?;
-                    return Ok(EngineResult {
-                        outcome: Outcome {
-                            status: Status::Cancelled,
-                            exit_code: None,
-                            failure_kind: None,
-                            failure_text: None,
-                            runtime_session_id: Some(tid),
-                        },
-                        answer: None,
-                        usage,
-                    });
+                    store.command_done(cid, &json!({"accepted":result.is_ok()}))?;
+                    continue;
                 }
                 if kind == "steer" {
                     let text = payload
@@ -561,6 +544,9 @@ pub async fn run(
         };
         if v.get("method").is_some() && v.get("id").is_some() {
             process.deny_request(&v).await?;
+            continue;
+        }
+        if session.notification(&v)?.is_none() {
             continue;
         }
         let method = v.get("method").and_then(Value::as_str).unwrap_or("");
@@ -676,7 +662,10 @@ pub async fn run(
                         o.status = Status::Cancelled;
                         o
                     }
-                    Some("failed") => Outcome::failure(failure_kind(&turn["error"])),
+                    Some("failed") => Outcome::failure(
+                        structured_failure_kind(&turn["error"])
+                            .unwrap_or_else(|| "runtime_failed".into()),
+                    ),
                     _ => return Err(invalid("nonterminal turn/completed status")),
                 };
                 outcome.runtime_session_id = Some(tid);
