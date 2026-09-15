@@ -24,7 +24,7 @@ classifiers = [
 dependencies = [
     "psutil>=7.2.2,<8",
     "anyio>=4.15.1,<5",
-    "mcp==2.1.1",
+    "mcp==2.2.0",
 ]
 
 [project.optional-dependencies]
