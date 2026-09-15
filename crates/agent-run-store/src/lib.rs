@@ -1,5 +1,11 @@
 //! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
+/// Read-only diagnostic and active-context snapshots.
+pub mod diagnostics;
+/// Durable append-only journal operations and bounded transcript spooling.
+pub mod journal;
 pub mod migrations;
+/// Read projections, stable pages, and cursor-based transcript views.
+pub mod projections;
 use agent_run_config::config::Config;
 use agent_run_domain::{
     domain::{self, now, AgentId, Outcome, StartRequest, Status},
@@ -50,7 +56,8 @@ pub struct Record {
     pub identity: Option<Value>,
 }
 impl Record {
-    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    /// Decodes one complete agents-table row without changing the database.
+    pub(crate) fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         fn parse<T: serde::de::DeserializeOwned>(v: String) -> rusqlite::Result<T> {
             serde_json::from_str(&v).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -434,9 +441,10 @@ impl Store {
         if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
             return Err(invalid("unknown transcript role"));
         }
+        let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
         self.conn.execute(
             "INSERT INTO messages(agent_id,at,role,name,content,raw_ref) VALUES(?,?,?,?,?,?)",
-            params![id.as_str(), now(), role, name, text, raw_ref],
+            params![id.as_str(), now(), role, name, content, raw_ref],
         )?;
         Ok(())
     }
