@@ -1,0 +1,28 @@
+usage: agent-run start [-h] --runtime RUNTIME --model MODEL --profile PROFILE
+                       --task TASK [--workdir WORKDIR] [--write] [--fast]
+                       [--effort EFFORT] [--timeout TIMEOUT]
+                       [--read-root READ_ROOT] [--output-schema OUTPUT_SCHEMA]
+                       [--request-id REQUEST_ID] [--account ACCOUNT] [--wait]
+                       [--session-transport SESSION_TRANSPORT]
+                       [--session-id SESSION_ID]
+                       [--session-turn-id SESSION_TURN_ID]
+
+options:
+  -h, --help            show this help message and exit
+  --runtime RUNTIME
+  --model MODEL
+  --profile PROFILE
+  --task TASK
+  --workdir WORKDIR
+  --write
+  --fast
+  --effort EFFORT
+  --timeout TIMEOUT
+  --read-root READ_ROOT
+  --output-schema OUTPUT_SCHEMA
+  --request-id REQUEST_ID
+  --account ACCOUNT
+  --wait
+  --session-transport SESSION_TRANSPORT
+  --session-id SESSION_ID
+  --session-turn-id SESSION_TURN_ID

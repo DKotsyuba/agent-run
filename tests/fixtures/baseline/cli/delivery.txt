@@ -1,0 +1,7 @@
+usage: agent-run delivery [-h] {status,cancel,dispatch,launchd} ...
+
+positional arguments:
+  {status,cancel,dispatch,launchd}
+
+options:
+  -h, --help            show this help message and exit

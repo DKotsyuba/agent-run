@@ -1,0 +1,13 @@
+usage: agent-run transcript [-h] [--cursor CURSOR] [--limit LIMIT] [--follow |
+                            --full]
+                            agent_id
+
+positional arguments:
+  agent_id
+
+options:
+  -h, --help       show this help message and exit
+  --cursor CURSOR
+  --limit LIMIT
+  --follow
+  --full

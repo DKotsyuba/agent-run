@@ -1,0 +1,5 @@
+usage: agent-run api serve [-h] [--socket SOCKET]
+
+options:
+  -h, --help       show this help message and exit
+  --socket SOCKET

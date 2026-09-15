@@ -1,0 +1,122 @@
+[
+  {
+    "failure_block": "",
+    "id": "status-succeeded",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "notification_id": "ntf_abc",
+      "status": "succeeded"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: succeeded\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: unknown — The agent ended without a recognized failure category.\n- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.",
+    "id": "status-failed",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "notification_id": "ntf_abc",
+      "status": "failed"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: failed\n- Failure: unknown — The agent ended without a recognized failure category.\n- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: unknown — The agent exceeded its execution deadline.\n- Advice: Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID.",
+    "id": "status-timed_out",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "notification_id": "ntf_abc",
+      "status": "timed_out"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: timed_out\n- Failure: unknown — The agent exceeded its execution deadline.\n- Advice: Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "",
+    "id": "status-cancelled",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "notification_id": "ntf_abc",
+      "status": "cancelled"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: cancelled\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: unknown — The supervisor could no longer prove ownership of the running agent.\n- Advice: Inspect status and supervisor logs for process ownership or service failures; do not reuse this failed record.",
+    "id": "status-lost",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "notification_id": "ntf_abc",
+      "status": "lost"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: lost\n- Failure: unknown — The supervisor could no longer prove ownership of the running agent.\n- Advice: Inspect status and supervisor logs for process ownership or service failures; do not reuse this failed record.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: prepare_failed — Runtime preparation rejected model, profile, or workspace requirements.\n- Advice: Check model availability, profile capabilities, workdir and read-root compatibility; inspect status before retrying.",
+    "id": "failed-prepare_failed",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "failure_kind": "prepare_failed",
+      "notification_id": "ntf_abc",
+      "status": "failed"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: failed\n- Failure: prepare_failed — Runtime preparation rejected model, profile, or workspace requirements.\n- Advice: Check model availability, profile capabilities, workdir and read-root compatibility; inspect status before retrying.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: provider_overloaded — The selected provider model is temporarily at capacity.\n- Advice: Preserve the worktree and completed commits; resume later or switch models without repeating completed work.",
+    "id": "failed-provider_overloaded",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "failure_kind": "provider_overloaded",
+      "notification_id": "ntf_abc",
+      "status": "failed"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: failed\n- Failure: provider_overloaded — The selected provider model is temporarily at capacity.\n- Advice: Preserve the worktree and completed commits; resume later or switch models without repeating completed work.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: codex_futureProviderCode — The agent ended without a recognized failure category.\n- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.",
+    "id": "failed-codex_futureProviderCode",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "failure_kind": "codex_futureProviderCode",
+      "notification_id": "ntf_abc",
+      "status": "failed"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: failed\n- Failure: codex_futureProviderCode — The agent ended without a recognized failure category.\n- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "\n- Failure: unknown — The agent ended without a recognized failure category.\n- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.",
+    "id": "failed-unknown",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "failure_kind": "unknown",
+      "notification_id": "ntf_abc",
+      "status": "failed"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: failed\n- Failure: unknown — The agent ended without a recognized failure category.\n- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood.\n- Runtime/model: unknown/unknown:unspecified\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "",
+    "id": "metadata-unicode-controls",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "effort": "high low end",
+      "model": "m\r\nPWNED",
+      "notification_id": "ntf_abc",
+      "runtime": "codex\n- ID: ag-99999999-999999-ffffffffff",
+      "status": "succeeded"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: succeeded\n- Runtime/model: codex\\u000a- ID: ag-99999999-999999-ffffffffff/m\\u000d\\u000aPWNED\\u0085:high\\u2028low\\u2029end\n- Notice: [notification ntf_abc v1]"
+  },
+  {
+    "failure_block": "",
+    "id": "metadata-punctuation",
+    "input": {
+      "agent_id": "ag-20260825-120000-0123456789",
+      "effort": "med-high",
+      "model": "claude-opus-5@anthropic/ss-1:1m",
+      "notification_id": "ntf_abc",
+      "runtime": "co-dex",
+      "status": "succeeded"
+    },
+    "rendered": "agent-run/completion\n\n- ID: ag-20260825-120000-0123456789\n- Status: succeeded\n- Runtime/model: co-dex/claude-opus-5@anthropic/ss-1:1m:med-high\n- Notice: [notification ntf_abc v1]"
+  }
+]

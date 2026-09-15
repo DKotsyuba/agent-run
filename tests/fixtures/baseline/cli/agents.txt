@@ -1,0 +1,13 @@
+usage: agent-run agents [-h] [--active] [--offset OFFSET] [--limit LIMIT]
+                        [--session-transport SESSION_TRANSPORT]
+                        [--session-id SESSION_ID]
+                        [--session-turn-id SESSION_TURN_ID]
+
+options:
+  -h, --help            show this help message and exit
+  --active
+  --offset OFFSET
+  --limit LIMIT
+  --session-transport SESSION_TRANSPORT
+  --session-id SESSION_ID
+  --session-turn-id SESSION_TURN_ID

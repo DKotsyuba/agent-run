@@ -1,0 +1,14 @@
+{
+  "base_sha": "31f723ba881fe0e35146a7262103c89737dd52ef",
+  "capture_date": "2026-09-16",
+  "package_version": "0.11.15",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "python": "3.14.3 (main, Mar 20 2026, 00:20:43) [Clang 22.1.1 ]",
+  "python_sha": "c9904f9843ba4a0772bdfa8bac5259f18fad9dc3",
+  "dependencies": {
+    "anyio": "4.15.1",
+    "mcp": "2.1.1",
+    "psutil": "7.2.2",
+    "pytest": "9.1.1"
+  }
+}

@@ -1,0 +1,13 @@
+usage: agent-run bind [-h] --session-transport SESSION_TRANSPORT
+                      --session-id SESSION_ID
+                      [--session-turn-id SESSION_TURN_ID]
+                      agent_id
+
+positional arguments:
+  agent_id
+
+options:
+  -h, --help            show this help message and exit
+  --session-transport SESSION_TRANSPORT
+  --session-id SESSION_ID
+  --session-turn-id SESSION_TURN_ID

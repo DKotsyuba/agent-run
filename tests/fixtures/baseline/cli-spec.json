@@ -1,0 +1,1659 @@
+[
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "home",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--home"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "start",
+          "resume",
+          "auth",
+          "login",
+          "bind",
+          "cancel",
+          "answer",
+          "steer",
+          "agents",
+          "transcript",
+          "models",
+          "limits",
+          "context",
+          "capacity",
+          "delivery",
+          "hook",
+          "init",
+          "doctor",
+          "mcp",
+          "api",
+          "doc"
+        ],
+        "default": null,
+        "dest": "command",
+        "help": null,
+        "nargs": "A...",
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "agent-run",
+    "help": "usage: agent-run [-h] [--home HOME]\n                 {start,resume,auth,login,bind,cancel,answer,steer,agents,transcript,models,limits,context,capacity,delivery,hook,init,doctor,mcp,api,doc} ...\n\npositional arguments:\n  {start,resume,auth,login,bind,cancel,answer,steer,agents,transcript,models,limits,context,capacity,delivery,hook,init,doctor,mcp,api,doc}\n\noptions:\n  -h, --help            show this help message and exit\n  --home HOME\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "active",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--active"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": 0,
+        "dest": "offset",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--offset"
+        ],
+        "positional": false,
+        "required": false,
+        "type": "int"
+      },
+      {
+        "choices": null,
+        "default": 100,
+        "dest": "limit",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--limit"
+        ],
+        "positional": false,
+        "required": false,
+        "type": "int"
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-transport"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_turn_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-turn-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "agents",
+    "help": "usage: agent-run agents [-h] [--active] [--offset OFFSET] [--limit LIMIT]\n                        [--session-transport SESSION_TRANSPORT]\n                        [--session-id SESSION_ID]\n                        [--session-turn-id SESSION_TURN_ID]\n\noptions:\n  -h, --help            show this help message and exit\n  --active\n  --offset OFFSET\n  --limit LIMIT\n  --session-transport SESSION_TRANSPORT\n  --session-id SESSION_ID\n  --session-turn-id SESSION_TURN_ID\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "answer",
+    "help": "usage: agent-run answer [-h] agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "serve",
+          "launchd"
+        ],
+        "default": null,
+        "dest": "api_command",
+        "help": null,
+        "nargs": "A...",
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "api",
+    "help": "usage: agent-run api [-h] {serve,launchd} ...\n\npositional arguments:\n  {serve,launchd}\n\noptions:\n  -h, --help       show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "binary",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--binary"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": "com.agent-run.api",
+        "dest": "label",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--label"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "stdout_log",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--stdout-log"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "stderr_log",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--stderr-log"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "api launchd",
+    "help": "usage: agent-run api launchd [-h] --binary BINARY [--label LABEL]\n                             [--stdout-log STDOUT_LOG]\n                             [--stderr-log STDERR_LOG]\n\noptions:\n  -h, --help            show this help message and exit\n  --binary BINARY\n  --label LABEL\n  --stdout-log STDOUT_LOG\n  --stderr-log STDERR_LOG\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "socket",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--socket"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "api serve",
+    "help": "usage: agent-run api serve [-h] [--socket SOCKET]\n\noptions:\n  -h, --help       show this help message and exit\n  --socket SOCKET\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "label",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "runtime",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "auth",
+    "help": "usage: agent-run auth [-h] label runtime\n\npositional arguments:\n  label\n  runtime\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-transport"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-id"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_turn_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-turn-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "bind",
+    "help": "usage: agent-run bind [-h] --session-transport SESSION_TRANSPORT\n                      --session-id SESSION_ID\n                      [--session-turn-id SESSION_TURN_ID]\n                      agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help            show this help message and exit\n  --session-transport SESSION_TRANSPORT\n  --session-id SESSION_ID\n  --session-turn-id SESSION_TURN_ID\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "cancel",
+    "help": "usage: agent-run cancel [-h] agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "collect",
+          "order",
+          "launchd"
+        ],
+        "default": null,
+        "dest": "capacity_command",
+        "help": null,
+        "nargs": "A...",
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "capacity",
+    "help": "usage: agent-run capacity [-h] {collect,order,launchd} ...\n\npositional arguments:\n  {collect,order,launchd}\n    order               List capacity priority (first route is highest); the\n                        orchestrator still chooses a compatible role/model\n                        alias and does not launch work.\n\noptions:\n  -h, --help            show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "once",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--once"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "capacity collect",
+    "help": "usage: agent-run capacity collect [-h] --once\n\noptions:\n  -h, --help  show this help message and exit\n  --once\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "binary",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--binary"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": "com.pluto.agent-run.capacity",
+        "dest": "label",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--label"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": "/dev/null",
+        "dest": "stdout_log",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--stdout-log"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "stderr_log",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--stderr-log"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "capacity launchd",
+    "help": "usage: agent-run capacity launchd [-h] --binary BINARY [--label LABEL]\n                                  [--stdout-log STDOUT_LOG]\n                                  [--stderr-log STDERR_LOG]\n\noptions:\n  -h, --help            show this help message and exit\n  --binary BINARY\n  --label LABEL\n  --stdout-log STDOUT_LOG\n  --stderr-log STDERR_LOG\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "capacity order",
+    "help": "usage: agent-run capacity order [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-transport"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-id"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_turn_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-turn-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "context",
+    "help": "usage: agent-run context [-h] --session-transport SESSION_TRANSPORT\n                         --session-id SESSION_ID\n                         [--session-turn-id SESSION_TURN_ID]\n\noptions:\n  -h, --help            show this help message and exit\n  --session-transport SESSION_TRANSPORT\n  --session-id SESSION_ID\n  --session-turn-id SESSION_TURN_ID\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "status",
+          "cancel",
+          "dispatch",
+          "launchd"
+        ],
+        "default": null,
+        "dest": "delivery_command",
+        "help": null,
+        "nargs": "A...",
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "delivery",
+    "help": "usage: agent-run delivery [-h] {status,cancel,dispatch,launchd} ...\n\npositional arguments:\n  {status,cancel,dispatch,launchd}\n\noptions:\n  -h, --help            show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "delivery_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "delivery cancel",
+    "help": "usage: agent-run delivery cancel [-h] delivery_id\n\npositional arguments:\n  delivery_id\n\noptions:\n  -h, --help   show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "delivery dispatch",
+    "help": "usage: agent-run delivery dispatch [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "binary",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--binary"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": "com.pluto.agent-run.delivery",
+        "dest": "label",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--label"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": "/dev/null",
+        "dest": "stdout_log",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--stdout-log"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "stderr_log",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--stderr-log"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "delivery launchd",
+    "help": "usage: agent-run delivery launchd [-h] --binary BINARY [--label LABEL]\n                                  [--stdout-log STDOUT_LOG]\n                                  [--stderr-log STDERR_LOG]\n\noptions:\n  -h, --help            show this help message and exit\n  --binary BINARY\n  --label LABEL\n  --stdout-log STDOUT_LOG\n  --stderr-log STDERR_LOG\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "delivery status",
+    "help": "usage: agent-run delivery status [-h] agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "topic",
+        "help": null,
+        "nargs": "?",
+        "option_strings": [],
+        "positional": true,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "doc",
+    "help": "usage: agent-run doc [-h] [topic]\n\npositional arguments:\n  topic\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "doctor",
+    "help": "usage: agent-run doctor [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "context",
+          "bind"
+        ],
+        "default": null,
+        "dest": "hook_command",
+        "help": null,
+        "nargs": "A...",
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "hook",
+    "help": "usage: agent-run hook [-h] {context,bind} ...\n\npositional arguments:\n  {context,bind}\n\noptions:\n  -h, --help      show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "claude_uds",
+          "codex_queue"
+        ],
+        "default": "codex_queue",
+        "dest": "transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--transport"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "hook bind",
+    "help": "usage: agent-run hook bind [-h] [--transport {claude_uds,codex_queue}]\n\noptions:\n  -h, --help            show this help message and exit\n  --transport {claude_uds,codex_queue}\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": [
+          "claude_uds",
+          "codex_queue"
+        ],
+        "default": "codex_queue",
+        "dest": "transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--transport"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "hook context",
+    "help": "usage: agent-run hook context [-h] [--transport {claude_uds,codex_queue}]\n\noptions:\n  -h, --help            show this help message and exit\n  --transport {claude_uds,codex_queue}\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "init",
+    "help": "usage: agent-run init [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "limits",
+    "help": "usage: agent-run limits [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "runtime",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "account",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--account"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "login",
+    "help": "usage: agent-run login [-h] [--account ACCOUNT] runtime\n\npositional arguments:\n  runtime\n\noptions:\n  -h, --help         show this help message and exit\n  --account ACCOUNT\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "mcp",
+    "help": "usage: agent-run mcp [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "models",
+    "help": "usage: agent-run models [-h]\n\noptions:\n  -h, --help  show this help message and exit\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "task",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--task"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "task_file",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--task-file"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "timeout",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--timeout"
+        ],
+        "positional": false,
+        "required": false,
+        "type": "float"
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "request_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--request-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-transport"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_turn_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-turn-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "resume",
+    "help": "usage: agent-run resume [-h] (--task TASK | --task-file TASK_FILE)\n                        [--timeout TIMEOUT] [--request-id REQUEST_ID]\n                        [--session-transport SESSION_TRANSPORT]\n                        [--session-id SESSION_ID]\n                        [--session-turn-id SESSION_TURN_ID]\n                        agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task TASK\n  --task-file TASK_FILE\n  --timeout TIMEOUT\n  --request-id REQUEST_ID\n  --session-transport SESSION_TRANSPORT\n  --session-id SESSION_ID\n  --session-turn-id SESSION_TURN_ID\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "runtime",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--runtime"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "model",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--model"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "profile",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--profile"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "task",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--task"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": "${WORKTREE}",
+        "dest": "workdir",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--workdir"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "write",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--write"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "fast",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--fast"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "effort",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--effort"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "timeout",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--timeout"
+        ],
+        "positional": false,
+        "required": false,
+        "type": "float"
+      },
+      {
+        "choices": null,
+        "default": [],
+        "dest": "read_root",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--read-root"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "output_schema",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--output-schema"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "request_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--request-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "account",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--account"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "wait",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--wait"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_transport",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-transport"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "session_turn_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--session-turn-id"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "start",
+    "help": "usage: agent-run start [-h] --runtime RUNTIME --model MODEL --profile PROFILE\n                       --task TASK [--workdir WORKDIR] [--write] [--fast]\n                       [--effort EFFORT] [--timeout TIMEOUT]\n                       [--read-root READ_ROOT] [--output-schema OUTPUT_SCHEMA]\n                       [--request-id REQUEST_ID] [--account ACCOUNT] [--wait]\n                       [--session-transport SESSION_TRANSPORT]\n                       [--session-id SESSION_ID]\n                       [--session-turn-id SESSION_TURN_ID]\n\noptions:\n  -h, --help            show this help message and exit\n  --runtime RUNTIME\n  --model MODEL\n  --profile PROFILE\n  --task TASK\n  --workdir WORKDIR\n  --write\n  --fast\n  --effort EFFORT\n  --timeout TIMEOUT\n  --read-root READ_ROOT\n  --output-schema OUTPUT_SCHEMA\n  --request-id REQUEST_ID\n  --account ACCOUNT\n  --wait\n  --session-transport SESSION_TRANSPORT\n  --session-id SESSION_ID\n  --session-turn-id SESSION_TURN_ID\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "text",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--text"
+        ],
+        "positional": false,
+        "required": true,
+        "type": null
+      }
+    ],
+    "command": "steer",
+    "help": "usage: agent-run steer [-h] --text TEXT agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help   show this help message and exit\n  --text TEXT\n"
+  },
+  {
+    "actions": [
+      {
+        "choices": null,
+        "default": "==SUPPRESS==",
+        "dest": "help",
+        "help": "show this help message and exit",
+        "nargs": 0,
+        "option_strings": [
+          "-h",
+          "--help"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": null,
+        "dest": "agent_id",
+        "help": null,
+        "nargs": null,
+        "option_strings": [],
+        "positional": true,
+        "required": true,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": 0,
+        "dest": "cursor",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--cursor"
+        ],
+        "positional": false,
+        "required": false,
+        "type": "int"
+      },
+      {
+        "choices": null,
+        "default": 200,
+        "dest": "limit",
+        "help": null,
+        "nargs": null,
+        "option_strings": [
+          "--limit"
+        ],
+        "positional": false,
+        "required": false,
+        "type": "int"
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "follow",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--follow"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      },
+      {
+        "choices": null,
+        "default": false,
+        "dest": "full",
+        "help": null,
+        "nargs": 0,
+        "option_strings": [
+          "--full"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
+      }
+    ],
+    "command": "transcript",
+    "help": "usage: agent-run transcript [-h] [--cursor CURSOR] [--limit LIMIT] [--follow |\n                            --full]\n                            agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help       show this help message and exit\n  --cursor CURSOR\n  --limit LIMIT\n  --follow\n  --full\n"
+  }
+]

@@ -1,0 +1,7 @@
+usage: agent-run api [-h] {serve,launchd} ...
+
+positional arguments:
+  {serve,launchd}
+
+options:
+  -h, --help       show this help message and exit
