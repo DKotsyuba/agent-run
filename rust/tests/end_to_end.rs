@@ -22,7 +22,8 @@ impl Harness {
     fn new() -> Self {
         let temp = tempfile::Builder::new()
             .prefix("ar-")
-            .tempdir_in("/tmp")
+            // Short base keeps the Unix socket path under the platform limit.
+            .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
             .unwrap();
         let home = temp.path().canonicalize().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
