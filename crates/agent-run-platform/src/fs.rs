@@ -76,6 +76,17 @@ pub fn relative(path: &Path) -> Result<Vec<CString>> {
     }
     Ok(result)
 }
+/// A point in [`Dir::write_seamed`]'s temp-write/rename/parent-sync sequence
+/// where a test can inject a simulated crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultPoint {
+    /// The temp file holds the full new bytes but is not yet synced or renamed.
+    MidWrite,
+    /// The temp file is synced to disk but not yet renamed onto `path`.
+    BeforeRename,
+    /// `path` now holds the new bytes; only the parent-directory sync is left.
+    AfterRename,
+}
 pub struct Dir(File);
 impl Dir {
     pub fn open(path: &Path) -> Result<Self> {
@@ -179,6 +190,39 @@ impl Dir {
         }
     }
     pub fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        self.write_seamed(path, data, mode, None)
+    }
+    /// Same durable temp-then-rename write as [`Dir::write`], with an optional
+    /// fault hook fired at the three crash points a real publish can be
+    /// interrupted at. `fault` is always `None` on every production call
+    /// site (`write` above); tests pass a hook to prove an interruption never
+    /// exposes a partial file under `path`'s real name, mirroring
+    /// `write_managed_file` (adapters/home.py:255-322).
+    ///
+    /// When `fault` fires, this simulates the process dying at that exact
+    /// instruction: the normal temp-file cleanup below never runs, because a
+    /// real crash there would not run it either. A non-simulated I/O error
+    /// still runs cleanup, since the process is alive to attempt it.
+    pub fn write_seamed(
+        &self,
+        path: &Path,
+        data: &[u8],
+        mode: u32,
+        fault: Option<&dyn Fn(FaultPoint) -> Result<()>>,
+    ) -> Result<()> {
+        let fault_fired = std::cell::Cell::new(false);
+        let fire = |point: FaultPoint| -> Result<()> {
+            match fault {
+                Some(f) => {
+                    let outcome = f(point);
+                    if outcome.is_err() {
+                        fault_fired.set(true);
+                    }
+                    outcome
+                }
+                None => Ok(()),
+            }
+        };
         let (parent, name) = self.parent(path, true)?;
         let temporary = CString::new(format!(".agent-run-{}.tmp", uuid::Uuid::new_v4().simple()))
             .expect("ASCII UUID");
@@ -198,7 +242,11 @@ impl Dir {
         let mut file = unsafe { File::from_raw_fd(fd) };
         let result = (|| -> Result<()> {
             file.write_all(data)?;
+            // The real name is still untouched here: a crash leaves it absent
+            // or at its previous content, never a partial write of `data`.
+            fire(FaultPoint::MidWrite)?;
             file.sync_all()?;
+            fire(FaultPoint::BeforeRename)?;
             // SAFETY: both names are descriptor-relative; rename replaces, never follows, a link.
             if unsafe {
                 libc::renameat(
@@ -211,10 +259,13 @@ impl Dir {
             {
                 return Err(std::io::Error::last_os_error().into());
             }
+            // The rename already committed: `path` now holds the full new
+            // bytes even if the parent-directory sync below never runs.
+            fire(FaultPoint::AfterRename)?;
             parent.sync_all()?;
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && !fault_fired.get() {
             // SAFETY: removing only the fresh temporary name created by this invocation.
             unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
         }
@@ -227,6 +278,18 @@ impl Dir {
         let (parent, name) = self.parent(path, true)?;
         // SAFETY: NUL-terminated paths and a valid directory fd. Never overwrites an existing path.
         if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        parent.sync_all()?;
+        Ok(())
+    }
+    /// Remove one owned entry through its no-follow parent. Unlink never
+    /// dereferences the final component, so a symlink there is removed as
+    /// the link itself, matching the descriptor-anchored read/write above.
+    pub fn remove(&self, path: &Path) -> Result<()> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         parent.sync_all()?;
