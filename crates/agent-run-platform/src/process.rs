@@ -67,45 +67,11 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
         zombie: matches!(parts[0], "Z" | "X"),
     })
 }
-#[cfg(target_os = "macos")]
-mod darwin {
-    #[repr(C)]
-    #[derive(Default)]
-    pub struct BsdInfo {
-        pub flags: u32,
-        pub status: u32,
-        pub xstatus: u32,
-        pub pid: u32,
-        pub ppid: u32,
-        pub uid: u32,
-        pub gid: u32,
-        pub ruid: u32,
-        pub rgid: u32,
-        pub svuid: u32,
-        pub svgid: u32,
-        pub rfu: u32,
-        pub comm: [libc::c_char; 16],
-        pub name: [libc::c_char; 32],
-        pub nfiles: u32,
-        pub pgid: u32,
-        pub jobc: u32,
-        pub tdev: u32,
-        pub tpgid: u32,
-        pub nice: i32,
-        pub start_sec: u64,
-        pub start_usec: u64,
-    }
-    #[link(name = "proc")]
-    extern "C" {
-        pub fn proc_pidinfo(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            arg: u64,
-            buffer: *mut libc::c_void,
-            size: libc::c_int,
-        ) -> libc::c_int;
-    }
-}
+/// Read one PID's kernel start time, group and zombie state.
+///
+/// `birth` is the kernel `p_start` timeval computed exactly like psutil's
+/// `tv_sec + tv_usec / 1000000.0`, so it equals Python's stored create_time
+/// bit for bit (migration/adr/A10-spawn-backend.md).
 #[cfg(target_os = "macos")]
 pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     if pid <= 1 {
@@ -114,42 +80,129 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
             "unsafe process id",
         ));
     }
-    let mut info = darwin::BsdInfo::default();
-    let size = std::mem::size_of::<darwin::BsdInfo>();
-    // SAFETY: repr(C) buffer matches proc_bsdinfo and is sized for PROC_PIDTBSDINFO (3).
+    // SAFETY: proc_bsdinfo is plain old data, so the all-zero value is valid.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a writable proc_bsdinfo of exactly `size` bytes, as
+    // PROC_PIDTBSDINFO requires.
     let n = unsafe {
-        darwin::proc_pidinfo(
+        libc::proc_pidinfo(
             pid,
-            3,
+            libc::PROC_PIDTBSDINFO,
             0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size as i32,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
         )
     };
-    if n != size as i32 {
-        return Err(std::io::Error::last_os_error());
+    if n != size {
+        let error = std::io::Error::last_os_error();
+        // proc_pidinfo is same-user only; psutil reads every process through
+        // sysctl. Without this fallback a PID reused by another user's process
+        // would read as denied instead of reused.
+        if !matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            return Err(error);
+        }
+        let (seconds, micros) = sysctl_start_time(pid).map_err(|_| error)?;
+        // Only the start time is readable this way: relationship fields stay 0
+        // (unknown), which keeps every ownership and signal check fail-closed.
+        return Ok(Identity {
+            pid,
+            ppid: 0,
+            group: 0,
+            birth: seconds as f64 + micros as f64 / 1_000_000.,
+            token: format!("darwin:{seconds}:{micros}"),
+            zombie: false,
+        });
     }
     Ok(Identity {
         pid,
-        ppid: info.ppid as i32,
-        group: info.pgid as i32,
-        birth: info.start_sec as f64 + info.start_usec as f64 / 1_000_000.,
-        token: format!("darwin:{}:{}", info.start_sec, info.start_usec),
-        zombie: info.status == 5,
+        ppid: info.pbi_ppid as i32,
+        group: info.pbi_pgid as i32,
+        birth: info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1_000_000.,
+        token: format!("darwin:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        zombie: info.pbi_status == 5, // SZOMB
     })
 }
+/// Read one PID's start time from `KERN_PROC_PID`, exactly psutil's source.
+///
+/// `kinfo_proc` begins with `struct extern_proc`, whose first member is the
+/// `p_starttime` timeval psutil converts; only that prefix is read here.
+#[cfg(target_os = "macos")]
+fn sysctl_start_time(pid: i32) -> std::io::Result<(u64, u64)> {
+    #[repr(C)]
+    struct StartTime {
+        seconds: i64,
+        micros: i32,
+        padding: i32,
+    }
+    let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut length: libc::size_t = 0;
+    // SAFETY: `name` is a four-element MIB and `length` a valid out-parameter;
+    // a null buffer only asks for the record size.
+    let sized = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            4,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length < std::mem::size_of::<StartTime>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no kinfo_proc record",
+        ));
+    }
+    let mut record = vec![0u8; length];
+    // SAFETY: the buffer is writable for exactly `length` bytes, as reported above.
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            4,
+            record.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 || length < std::mem::size_of::<StartTime>() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `record` holds at least one whole kinfo_proc, so its first
+    // bytes are an initialized, suitably aligned (Vec<u8> from malloc) timeval.
+    let start = unsafe { &*record.as_ptr().cast::<StartTime>() };
+    let _ = start.padding;
+    Ok((start.seconds as u64, start.micros as u64))
+}
+/// Compare a PID with stored evidence; unreadable evidence is never death.
+///
+/// Rust-written `linux:`/`darwin:` tokens compare exactly. Python-written rows
+/// carry only psutil's float create_time, compared with `==` as Python does.
 pub fn observe(pid: Option<i32>, token: Option<&str>, birth: Option<f64>) -> ProcessState {
     let Some(pid) = pid else {
         return ProcessState::NotStarted;
     };
-    match inspect(pid) {
+    verdict(inspect(pid), token, birth)
+}
+/// Classify one inspection result against stored token/birth evidence.
+fn verdict(
+    observed: std::io::Result<Identity>,
+    token: Option<&str>,
+    birth: Option<f64>,
+) -> ProcessState {
+    match observed {
         Ok(actual) => {
             let matches = if let Some(token) =
                 token.filter(|s| s.starts_with("linux:") || s.starts_with("darwin:"))
             {
                 actual.token == token
             } else if let Some(birth) = birth {
-                (actual.birth - birth).abs() < 0.000_001
+                actual.birth == birth
             } else {
                 return ProcessState::Unknown;
             };
@@ -320,5 +373,33 @@ impl OwnedProcess {
             confirmed: gone,
             process_group_id: Some(self.pid),
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unreadable_evidence_is_never_death() {
+        let failed = |code| Err(std::io::Error::from_raw_os_error(code));
+        assert_eq!(
+            verdict(failed(libc::EPERM), None, Some(1.0)),
+            ProcessState::Denied
+        );
+        assert_eq!(
+            verdict(failed(libc::EACCES), None, Some(1.0)),
+            ProcessState::Denied
+        );
+        assert_eq!(
+            verdict(failed(libc::EIO), None, Some(1.0)),
+            ProcessState::Unknown
+        );
+        assert_eq!(
+            verdict(failed(libc::ESRCH), None, Some(1.0)),
+            ProcessState::Dead
+        );
+        assert_eq!(
+            verdict(failed(libc::ENOENT), None, Some(1.0)),
+            ProcessState::Dead
+        );
     }
 }

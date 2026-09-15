@@ -95,13 +95,15 @@ agent-run (CLI, MCP, socket composition)
 | Crate | Modules |
 |---|---|
 | `agent-run-domain` | `domain.rs`, `error.rs` |
-| `agent-run-platform` | `fs.rs`, `process.rs`, bounded `frame.rs`, proof primitives |
+| `agent-run-platform` | `fs.rs`, `process.rs`, `launch.rs`, bounded `frame.rs`, proof primitives |
 | `agent-run-config` | `config.rs`, `profiles.rs`, `policy.rs` |
 | `agent-run-store` | SQLite `Store`, records, and `sql/schema.sql` |
 | `agent-run-adapters` | launch plans, I/O, materialization, plugins, Codex permission rendering |
 | `agent-run-core` | service, supervisor, dispatch, capacity, delivery, engine runners, proof facade |
 | `agent-run` | `main.rs`, `cli.rs`, MCP/socket transports and fixture binary |
 | `xtask` | standard-library-only workspace checks |
+
+`launch.rs` (posix_spawn-first detached launch, the fork fallback, and the bootstrap identity/READY/error pipe protocol) lives in `agent-run-platform` alongside `process.rs`: it depends only on `process` and serde, spawns and identifies OS processes, and makes no product decision. `agent-run-core::supervisor` composes it with `Store` and the launch identity to decide *when* and *with what evidence* to spawn.
 
 Capacity and delivery depend on state and bounded native transports, never CLI argument parsing. The optional Desktop bridge owns only access to the signed host channel; notice construction and validation stay in Rust.
 
