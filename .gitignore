@@ -13,3 +13,5 @@ dist/
 build/
 *.egg-info/
 /.idea/workspace.xml
+/target/
+/.cargo-home/
