@@ -1,4 +1,5 @@
 //! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
+pub mod migrations;
 use crate::{
     config::Config,
     domain::{now, AgentId, Outcome, StartRequest, Status},
@@ -146,6 +147,13 @@ impl Store {
         if !create && !path.exists() {
             return Err(invalid("state.db is missing; run agent-run init"));
         }
+        // A database that already has content is upgraded through the numbered
+        // migration chain before this connection touches it, exactly as the
+        // Python port's `open_database`/`initialize_database` call `migrate()`
+        // first. A zero-byte file is left for the schema-init branch below.
+        if path.exists() && path.metadata()?.len() > 0 {
+            migrations::migrate(&path)?;
+        }
         let conn = Connection::open(&path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -168,10 +176,14 @@ impl Store {
             }
             conn.execute_batch("COMMIT")?;
         } else if version != VERSION {
+            // `migrations::migrate` above already brings any 1..VERSION store up
+            // to date or refuses a newer one, so this is now a defensive check:
+            // it only fires for a versionless (0) store opened with `create:
+            // false`, which has no schema for this connection to use.
             return Err(invalid(if version > VERSION {
                 "database schema is newer than this binary"
             } else {
-                "legacy schema requires the upstream migration chain; upgrade a backup to schema 16 before opening it with this port"
+                "state database has no usable schema; run agent-run init"
             }));
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
