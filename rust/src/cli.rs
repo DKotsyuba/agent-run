@@ -94,6 +94,12 @@ pub enum Command {
     #[command(name = "_supervisor", hide = true)]
     Supervisor {
         agent_id: AgentId,
+        #[arg(long)]
+        ready_fd: i32,
+        #[arg(long)]
+        identity_fd: i32,
+        #[arg(long)]
+        error_fd: i32,
     },
     #[command(name = "_deny-command", hide = true)]
     DenyCommand {
@@ -642,7 +648,12 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 emit(&json!({"backup":to,"complete":true}))?;
             }
         },
-        Command::Supervisor { agent_id } => crate::supervisor::run(&home, &agent_id).await?,
+        Command::Supervisor {
+            agent_id,
+            ready_fd,
+            identity_fd,
+            error_fd,
+        } => crate::supervisor::run(&home, &agent_id, [ready_fd, identity_fd, error_fd]).await?,
         Command::DenyCommand { name: _ } => {
             eprintln!("agent-run: command denied by the configured developer environment");
             return Ok(126);

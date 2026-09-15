@@ -4,87 +4,88 @@ use crate::{
     config::Adapter,
     domain::{AgentId, Outcome, Status},
     error::invalid,
-    fs, process,
+    fs, launch, process,
     service::LaunchIdentity,
     state::Store,
-    transport::frame,
     verify, Error, Result,
 };
 use serde_json::json;
-use std::{io::Write, path::Path, process::Stdio, time::Duration};
-use tokio::{io::BufReader, process::Command};
+use std::{ffi::OsStr, path::Path, time::Duration};
 
+/// Start one detached `_supervisor` session leader and return after its READY.
+///
+/// Spawning is `posix_spawn(POSIX_SPAWN_SETSID)`-first (`launch.rs`). A failed
+/// READY read does not cancel the already admitted durable job.
 pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg("--home")
-        .arg(home)
-        .arg("_supervisor")
-        .arg(id.as_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(false);
-    use std::os::unix::process::CommandExt;
-    // SAFETY: the pre-exec hook calls only async-signal-safe setsid. No allocation,
-    // locks, logging, or Rust runtime operation takes place in the forked child.
-    unsafe {
-        command.as_std_mut().pre_exec(|| {
-            if libc::setsid() < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut child = command.spawn()?;
-    if let Some(pid) = child.id() {
-        let evidence = process::inspect(pid as i32)
-            .ok()
-            .and_then(|p| serde_json::to_value(p).ok())
-            .unwrap_or_else(|| json!({"pid":pid}));
-        let store = Store::open(home)?;
-        store.conn.execute(
-            "UPDATE agents SET startup_owner_pid_identity=? WHERE id=? AND supervisor_pid IS NULL",
-            rusqlite::params![serde_json::to_string(&evidence)?, id.as_str()],
-        )?;
-    }
-    let output = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::Runtime("supervisor READY pipe missing".into()))?;
-    let ready = tokio::time::timeout(
-        Duration::from_secs(15),
-        frame::read(&mut BufReader::new(output), 4096),
-    )
-    .await;
-    // Reap only the supervisor process when it eventually ends; dropping a
-    // client's connection cannot abort the detached run or its ownership.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    match ready {
-        Ok(Ok(Some(bytes))) => {
-            let v: serde_json::Value = serde_json::from_slice(&bytes)?;
-            if v.get("ready").and_then(|v| v.as_bool()) != Some(true)
-                || v.get("agent_id").and_then(|v| v.as_str()) != Some(id.as_str())
-            {
-                return Err(Error::Runtime("invalid supervisor READY".into()));
-            }
+    let program = std::env::current_exe()?;
+    let (home, id) = (home.to_path_buf(), id.clone());
+    let launched = tokio::task::spawn_blocking(move || {
+        let args = [
+            OsStr::new("--home"),
+            home.as_os_str(),
+            OsStr::new("_supervisor"),
+            OsStr::new(id.as_str()),
+        ];
+        launch::launch_detached(&program, &args, launch::Timeouts::default(), |pid, backend| {
+            // Durable before any proof, so reconciliation can observe this child.
+            let mut evidence = process::inspect(pid)
+                .ok()
+                .and_then(|p| serde_json::to_value(p).ok())
+                .unwrap_or_else(|| json!({"pid": pid}));
+            evidence["spawn_backend"] = json!(backend);
+            let store = Store::open(&home).map_err(|e| e.to_string())?;
+            store
+                .conn
+                .execute(
+                    "UPDATE agents SET startup_owner_pid_identity=? WHERE id=? AND supervisor_pid IS NULL",
+                    rusqlite::params![evidence.to_string(), id.as_str()],
+                )
+                .map(drop)
+                .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(|e| Error::Runtime(format!("supervisor launch task failed: {e}")))?;
+    match launched {
+        Ok(launched) => {
+            // Exact-PID reaper; the committed owner record stands even if it cannot start.
+            let _ = launch::spawn_reaper(launched.pid);
             Ok(())
         }
-        _ => Err(Error::Runtime(
-            "supervisor ownership handoff was not observed".into(),
-        )),
+        Err(launch::LaunchError::Spawn(error)) => Err(Error::Io(error)),
+        // A child that died before its PID proof owns nothing: fail like a failed spawn.
+        Err(error @ launch::LaunchError::Bootstrap(_)) => {
+            Err(Error::Io(std::io::Error::other(error.to_string())))
+        }
+        Err(error) => Err(Error::Runtime(error.to_string())),
     }
 }
-pub async fn run(home: &Path, id: &AgentId) -> Result<()> {
-    let mut store = Store::open(home)?;
-    let owner = process::inspect(std::process::id() as i32)?;
-    store.set_owner(id, owner.pid, &owner.token, Some(owner.birth))?;
+/// Child side: prove session identity, commit ownership, then report READY.
+///
+/// `fds` are the inherited ready, identity and error descriptors.
+pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
+    let [ready_fd, identity_fd, error_fd] = fds;
+    if let Err(error) = launch::report_identity(identity_fd, error_fd) {
+        let _ = launch::report_ready(ready_fd, Err(&error.to_string()));
+        return Err(error.into());
+    }
+    let owned = (|| {
+        let store = Store::open(home)?;
+        let owner = process::inspect(std::process::id() as i32)?;
+        store.set_owner(id, owner.pid, &owner.token, Some(owner.birth))?;
+        Ok::<_, Error>(store)
+    })();
     // A disconnected READY reader cannot undo an already committed owner.
-    let _ = writeln!(std::io::stdout(), "{}", json!({"ready":true,"agent_id":id}));
-    let _ = std::io::stdout().flush();
+    let mut store = match owned {
+        Ok(store) => {
+            let _ = launch::report_ready(ready_fd, Ok(()));
+            store
+        }
+        Err(error) => {
+            let _ = launch::report_ready(ready_fd, Err(&error.to_string()));
+            return Err(error);
+        }
+    };
     match execute(home, id, &mut store).await {
         Ok(()) => Ok(()),
         Err(error) => {

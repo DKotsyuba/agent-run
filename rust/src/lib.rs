@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod domain;
 pub mod error;
 pub mod fs;
+pub mod launch;
 pub mod policy;
 pub mod process;
 pub mod profiles;
