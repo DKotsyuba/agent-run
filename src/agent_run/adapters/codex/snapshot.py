@@ -16,9 +16,13 @@ from .toml import toml_string
 def snapshot_files(config: RuntimeConfig) -> tuple[str, ...]:
     """Return adapter-owned Codex files whose exact bytes bind a snapshot.
 
-    ``config`` supplies declared command refusals, which determine generated
-    refusal wrappers. Returned paths are relative to the generated runtime
-    home; skills and plugins remain bound through managed-tree manifests.
+    Args:
+        config (RuntimeConfig): Declared command refusals determine generated
+            refusal wrappers; the configuration is not mutated.
+
+    Returns:
+        tuple[str, ...]: Paths relative to the generated runtime home. Skills
+        and plugins remain bound through managed-tree manifests. No I/O occurs.
     """
 
     denied_commands = config.environment.denied_commands if config.environment is not None else ()
@@ -33,9 +37,20 @@ def snapshot_files(config: RuntimeConfig) -> tuple[str, ...]:
 def finalize_snapshots(config: RuntimeConfig, home: Path, revision: str) -> None:
     """Bind current Codex files and the declared auth bridge to ``revision``.
 
+    Args:
+        config (RuntimeConfig): Source of command refusals and the auth bridge.
+        home (Path): Materialized runtime home whose index is rewritten.
+        revision (str): Producer revision to bind, unchanged by this helper.
+
+    Returns:
+        None: The index is updated; authentication contents are never read.
+
+    Raises:
+        OSError: Auth-link resolution or snapshot I/O fails.
+        ValidationError: The shared finalizer rejects a malformed artifact.
+
     Auth links are re-derived from ``config`` and their resolved targets are
-    included in the index. Missing auth sources therefore fail closed through
-    strict resolution in the shared snapshot finalizer.
+    included in the index. Missing auth sources fail closed.
     """
 
     bridge = auth_bridge(config)
@@ -49,10 +64,21 @@ def finalize_snapshots(config: RuntimeConfig, home: Path, revision: str) -> None
 def prepare_project_trust(home: Path, workdir: Path) -> bool:
     """Write Codex's exact trust receipt when ``workdir`` has none.
 
-    The generated config must be a valid regular TOML file and ``workdir``
-    must already be resolved. Existing receipts must equal
-    ``trust_level = "trusted"``; only newly written bytes return ``True`` so
-    the caller can rebind the snapshot index.
+    Args:
+        home (Path): Runtime home with a verified, regular TOML config file.
+        workdir (Path): Already resolved launch directory receiving trust.
+
+    Returns:
+        bool: True only when the exact receipt was added to config.toml, so
+        the caller can rebind its snapshot; False leaves existing bytes intact.
+
+    Raises:
+        ValidationError: The config is unreadable or malformed, its projects
+            table is invalid, or an existing receipt is not exactly trusted.
+        OSError: Writing the managed configuration fails.
+
+    The caller must verify the snapshot before calling this fresh-launch-only
+    helper; it does not authorize repairs of modified historical snapshots.
     """
 
     config_path = home / "config.toml"
