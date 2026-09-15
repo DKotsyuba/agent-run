@@ -148,6 +148,8 @@ class RuntimeConfig:
     explicit relative non-secret assets that a runtime may snapshot.
     ``workspace_root`` optionally caps write-capable Codex sessions to one
     operator-authorized absolute project tree; read-only sessions ignore it.
+    ``workspace_network`` opts that Codex Projects profile into shell network;
+    it defaults to false and is rejected for other runtime adapters.
     ``credential_state_home`` is an internal, service-resolved durable home
     for a runtime-owned credential store; it is never parsed from config and
     remains ``None`` outside a prepared launch.
@@ -175,6 +177,7 @@ class RuntimeConfig:
     plugin_snapshot_assets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     credential_state_home: Path | None = None
     workspace_root: Path | None = None
+    workspace_network: bool = False
 
 
 @dataclass(frozen=True)
@@ -687,8 +690,9 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
     expanded, symlinks unresolved) so a version-managed launcher symlink keeps
     anchoring its own interpreter directory; every other path field resolves.
     Optional account/auth, hook, plugin, explicit plugin snapshot asset,
-    Codex workspace root, capacity-source, and concurrency fields retain their
-    existing validation. ``workspace_root`` is accepted only by a Codex adapter.
+    Codex workspace root/network, capacity-source, and concurrency fields retain
+    their existing validation. ``workspace_root`` and ``workspace_network`` are
+    accepted only by a Codex adapter.
     A legacy ``runtimes.opencode``
     table is accepted but omitted: OpenCode is no longer a launchable runtime,
     while accepting the old table keeps state-only commands available during
@@ -720,6 +724,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         "rust",
         "environment",
         "workspace_root",
+        "workspace_network",
     }
     for name, table in _named_table(value, "runtimes").items():
         if name == "opencode":
@@ -797,6 +802,19 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             "agent_run.adapters.codex.adapter:ADAPTER",
         }:
             raise ValidationError(f"{path}.workspace_root is supported only by codex")
+        workspace_network = _bool(
+            table.get("workspace_network", False), f"{path}.workspace_network"
+        )
+        if workspace_network and (
+            adapter not in {
+                "agent_run.adapters.codex:ADAPTER",
+                "agent_run.adapters.codex.adapter:ADAPTER",
+            }
+            or workspace_root is None
+        ):
+            raise ValidationError(
+                f"{path}.workspace_network requires codex workspace_root"
+            )
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -821,6 +839,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             workspace_root=None
             if workspace_root is None
             else _path(workspace_root, f"{path}.workspace_root"),
+            workspace_network=workspace_network,
         )
         if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(

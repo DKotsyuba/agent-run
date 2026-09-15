@@ -64,8 +64,9 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
     ``config`` (``RuntimeConfig``) supplies every runtime declaration. The
     returned ``dict[str, object]`` contains only deterministic credential-free
     values. Explicit ``workspace_root`` and ``credential_state_home`` paths are
-    recorded; their absence preserves the canonical shape of snapshots created
-    before those optional declarations existed.
+    recorded; an enabled ``workspace_network`` flag is also recorded. Their
+    absence preserves the canonical shape of snapshots created before those
+    optional declarations existed.
     """
 
     auth = None
@@ -107,6 +108,8 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
         document["credential_state_home"] = str(config.credential_state_home)
     if config.workspace_root is not None:
         document["workspace_root"] = str(config.workspace_root)
+    if config.workspace_network:
+        document["workspace_network"] = True
     return document
 
 

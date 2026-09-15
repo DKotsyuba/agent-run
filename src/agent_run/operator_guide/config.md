@@ -25,6 +25,7 @@ adapter = "agent_run.adapters.codex.adapter:ADAPTER"
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
 workspace_root = "/Users/you/projects"
+workspace_network = true
 models = ["gpt-6-astra"]
 accounts = ["personal2"]
 limits_source = "codex_appserver"
@@ -40,6 +41,9 @@ asset declarations cannot be mixed.
 
 `workspace_root` affects write-capable Codex profiles only. Their workdir must
 be inside the configured tree; read-only profiles do not inherit write access.
+`workspace_network = true` explicitly enables shell network in that Projects
+profile and keeps `curl` behind Codex's normal approval reviewer; it defaults
+to false and requires `workspace_root`.
 MCP `approval_mode = "approve"` is appropriate only for a locally trusted server
 whose own runtime enforces downstream permissions.
 

@@ -141,8 +141,8 @@ def render_permission_profile(config: RuntimeConfig) -> list[str]:
 
     ``config.workspace_root`` is the operator-authorized working tree. Missing
     configuration returns an empty list. The profile inherits Codex platform
-    defaults, writes the working tree, denies common secret files, and disables
-    shell network access without a root-wide read deny.
+    defaults, writes the working tree, denies common secret files, and uses the
+    configured shell-network setting without a root-wide read deny.
     """
 
     if config.workspace_root is None:
@@ -165,7 +165,7 @@ def render_permission_profile(config: RuntimeConfig) -> list[str]:
         '"**/*.key" = "deny"',
         "",
         f"[permissions.{PROJECTS_PROFILE}.network]",
-        "enabled = false",
+        f"enabled = {str(config.workspace_network).lower()}",
         "",
     ]
 

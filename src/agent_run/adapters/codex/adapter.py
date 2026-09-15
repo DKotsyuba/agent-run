@@ -35,7 +35,7 @@ from ..base import (
     RuntimeInfo,
     RuntimeSession,
 )
-from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
+from ..command_policy import materialize_refusal_commands, render_codex_denial_rules, render_codex_review_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
 from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
@@ -381,6 +381,7 @@ class CodexAdapter:
             denied_commands,
             command_paths=tuple(command_policy.resolved_commands.values()),
         )
+        policy_text += render_codex_review_rules(("curl",), environment=policy_environment) if config.workspace_network else ""
         write_managed_file(
             home,
             "rules/agent-run-command-policy.rules",

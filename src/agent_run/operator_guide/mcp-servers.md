@@ -37,6 +37,8 @@ app-server default; agent-run omits the conflicting legacy `sandbox` request and
 verifies `activePermissionProfile.id` before starting a model turn. The
 `runtimeWorkspaceRoots` echo stays scoped to the assigned workdir, while the
 effective `sandbox.writableRoots` must contain the configured project tree.
+When `workspace_network = true`, the Projects profile permits shell network and
+the generated command policy routes `curl` through the normal approval reviewer.
 Read-only and network roles keep their explicit legacy sandbox until Codex
 exposes an equivalent scoped named profile for those grants.
 

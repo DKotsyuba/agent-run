@@ -101,6 +101,28 @@ def render_codex_denial_rules(
     ) + ("\n" if patterns else "")
 
 
+def render_codex_review_rules(
+    commands: Sequence[str], *, environment: Mapping[str, str] | None = None
+) -> str:
+    """Render Codex prompt rules for bare commands and resolved executables.
+
+    ``commands`` contains validated bare executable names. ``environment``
+    optionally supplies the PATH used to resolve absolute executable forms;
+    missing commands retain their bare rule. The returned deterministic text
+    causes the normal approval reviewer to decide before execution and performs
+    no filesystem or process mutation. Invalid names raise ``ValidationError``.
+    """
+
+    names = validate_denied_commands(commands)
+    paths = tuple(_resolve_commands(names, None, environment).values())
+    patterns = _native_command_patterns(names, paths)
+    return "\n".join(
+        'prefix_rule(pattern=[%s], decision="prompt", justification="Review network command before execution")'
+        % json.dumps(pattern)
+        for pattern in patterns
+    ) + ("\n" if patterns else "")
+
+
 def render_claude_denials(
     commands: Sequence[str], *, command_paths: Sequence[Path | str] = ()
 ) -> tuple[str, ...]:

@@ -14,6 +14,7 @@ from agent_run.adapters.command_policy import (
     materialize_refusal_commands,
     render_claude_denials,
     render_codex_denial_rules,
+    render_codex_review_rules,
     render_qwen_denials,
     validate_denied_commands,
 )
@@ -110,6 +111,20 @@ class CommandPolicyTest(unittest.TestCase):
             rules = render_codex_denial_rules(("gh",), command_paths=tuple(policy.resolved_commands.values()))
             self.assertIn(str(host / "gh"), rules)
             self.assertIn(str(target), rules)
+
+    def test_codex_review_rules_cover_bare_and_resolved_commands(self) -> None:
+        """Prompt rules cover normal PATH and absolute network-tool invocation."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "curl"
+            self._executable(executable, "exit 0")
+            rules = render_codex_review_rules(
+                ("curl",), environment={"PATH": str(root)}
+            )
+            self.assertIn('pattern=["curl"]', rules)
+            self.assertIn(f'pattern=["{executable}"]', rules)
+            self.assertIn('decision="prompt"', rules)
 
     @staticmethod
     def _executable(path: Path, body: str) -> None:

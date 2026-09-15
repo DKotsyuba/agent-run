@@ -205,6 +205,29 @@ env_from = ["PATH"]
         )
         self.assertGreaterEqual(len(generated["hooks"]["state"]), 2)
 
+    def test_materialize_network_opt_in_adds_curl_review_rules(self) -> None:
+        """Projects network is explicit and keeps curl behind native review."""
+
+        import tomllib
+
+        projects = Path(self._mkdtemp()).resolve()
+        tools = Path(self._mkdtemp()).resolve()
+        curl = tools / "curl"
+        curl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        curl.chmod(0o700)
+        config = self.runtime_config(
+            workspace_root=projects,
+            workspace_network=True,
+            environment=EnvironmentConfig(path=(tools,)),
+        )
+        ADAPTER.materialize(config, self.home, mcp_servers={})
+        generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
+        self.assertTrue(generated["permissions"]["Projects"]["network"]["enabled"])
+        rules = (self.home / "rules" / "agent-run-command-policy.rules").read_text()
+        self.assertIn('pattern=["curl"]', rules)
+        self.assertIn(f'pattern=["{curl}"]', rules)
+        self.assertIn('decision="prompt"', rules)
+
     def test_legacy_environment_only_retains_native_denial_rules(self) -> None:
         """Ignore legacy path/variables while retaining command denials."""
         tools = Path(self._mkdtemp())

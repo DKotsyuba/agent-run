@@ -354,6 +354,7 @@ adapter = "agent_run.adapters.codex:ADAPTER"
 binary = "/bin/echo"
 home = "/tmp/codex"
 workspace_root = "/Users/pluto/projects"
+workspace_network = true
 models = ["test"]
 mcp = ["agent_ide"]
 '''
@@ -363,6 +364,7 @@ mcp = ["agent_ide"]
             config.runtimes["codex"].workspace_root,
             Path("/Users/pluto/projects"),
         )
+        self.assertTrue(config.runtimes["codex"].workspace_network)
         with self.assertRaisesRegex(ValidationError, "approval_mode"):
             self.load(
                 '''schema_version = 1
@@ -370,6 +372,18 @@ mcp = ["agent_ide"]
 transport = "stdio"
 command = "/bin/echo"
 approval_mode = "always"
+'''
+            )
+        with self.assertRaisesRegex(ValidationError, "workspace_network"):
+            self.load(
+                '''schema_version = 1
+[runtimes.codex]
+enabled = true
+adapter = "agent_run.adapters.codex:ADAPTER"
+binary = "/bin/echo"
+home = "/tmp/codex"
+workspace_network = true
+models = ["test"]
 '''
             )
         with self.assertRaisesRegex(ValidationError, "workspace_root"):
