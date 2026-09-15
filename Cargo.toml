@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/agent-run-domain",
+    "crates/agent-run-platform",
+    "crates/agent-run-config",
+    "crates/agent-run-store",
+    "crates/agent-run-adapters",
+    "crates/agent-run-core",
+    "crates/agent-run",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.11.15"
+edition = "2021"
+license = "MIT"
+rust-version = "1.98.1"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+fs2 = "0.4"
+libc = "0.2"
+regex = "1.11"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.19"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros", "process", "net", "io-util", "io-std", "signal", "time", "sync"] }
+toml = "0.8"
+uuid = { version = "1.16", features = ["v4"] }
+rmcp = { version = "=1.8.0", default-features = false, features = ["server", "transport-io"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

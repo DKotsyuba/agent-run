@@ -1,0 +1,44 @@
+[package]
+name = "agent-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Durable local coding-agent supervisor — Rust migration"
+repository = "https://github.com/DKotsyuba/agent-run"
+publish = false
+
+[dependencies]
+agent-run-adapters = { path = "../agent-run-adapters" }
+agent-run-config = { path = "../agent-run-config" }
+agent-run-core = { path = "../agent-run-core" }
+agent-run-domain = { path = "../agent-run-domain" }
+agent-run-platform = { path = "../agent-run-platform" }
+agent-run-store = { path = "../agent-run-store" }
+clap.workspace = true
+fs2.workspace = true
+libc.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "agent-run"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-run-fixture"
+path = "tests/fixtures/engine.rs"
+required-features = ["test-fixtures"]
+
+[lints]
+workspace = true

@@ -2,7 +2,7 @@
 
 This board is the executable decomposition of the authoritative plan at Python baseline `0d28b79`. Task targets use the post-M05 workspace from plan §4.1; dependency direction follows plan §4.2, gates follow plan §18, and task completion follows plan §19.1/§19.4. Detailed scope, tests, status, and acceptance commands are in `migration/tasks.csv`.
 
-Current shared HEAD includes all six parity inventories, including `rust/docs/inventory/engines.md` at `522697240498a9829faf6b88e36738834c993500`; no row is `inventory-pending`. M01-M08 and M18 are already `in_progress`. M18 may port migration bodies now, but its final integration acceptance waits for M17's store/schema API.
+Current shared HEAD includes all six parity inventories, including `migration/inventory/engines.md` at `522697240498a9829faf6b88e36738834c993500`; no row is `inventory-pending`. M01-M08 and M18 are already `in_progress`. M18 may port migration bodies now, but its final integration acceptance waits for M17's store/schema API.
 
 ## Lanes and ownership
 
@@ -73,10 +73,10 @@ The priority chain is Appendix D's `M17/M19 → M23/M24 → M26-M30 → M39/M41a
 
 ## Conflicts and resolutions
 
-- OmniRoute appears in both capacity inventory WP CD-2 and engines WP EN-2. Treat them as one task, M43b, owned by capacity; adapter auth from EN-1 is launch-only and never crosses the quota-reader boundary. See `rust/docs/inventory/capacity-delivery.md` §5 and `rust/docs/inventory/engines.md` §5.
-- Codex WP CX-2 and state WP ST-10 both suggest filesystem/path work near their current modules. Plan §4.2 makes platform the owner, so M23 provides one API and adapter/store tasks only call it. See `rust/docs/inventory/codex-adapter.md` §5 and `rust/docs/inventory/state.md` §5.
+- OmniRoute appears in both capacity inventory WP CD-2 and engines WP EN-2. Treat them as one task, M43b, owned by capacity; adapter auth from EN-1 is launch-only and never crosses the quota-reader boundary. See `migration/inventory/capacity-delivery.md` §5 and `migration/inventory/engines.md` §5.
+- Codex WP CX-2 and state WP ST-10 both suggest filesystem/path work near their current modules. Plan §4.2 makes platform the owner, so M23 provides one API and adapter/store tasks only call it. See `migration/inventory/codex-adapter.md` §5 and `migration/inventory/state.md` §5.
 - State WP ST-4 could not locate the `waiting_binding` origin, while delivery WP CD-7 defines that lifecycle. M21 owns atomic store creation, M22b owns binding/receipt transitions, and M46 owns dispatch policy. See both inventories §5.
-- State reports error-wire classification as unverified and transports requires exact public errors. M11 owns machine codes/public messages; M39/M42 only map them. `AnswerIntegrityError` must not be silently collapsed to validation. See `rust/docs/inventory/state.md` §6 and `rust/docs/inventory/transports.md` §6.
+- State reports error-wire classification as unverified and transports requires exact public errors. M11 owns machine codes/public messages; M39/M42 only map them. `AnswerIntegrityError` must not be silently collapsed to validation. See `migration/inventory/state.md` §6 and `migration/inventory/transports.md` §6.
 - Current Rust detached launch uses pre-exec behavior, while plan §8 and core WP CO-3 require a `posix_spawn`-first ownership protocol. M06/M07 provide evidence, M26 owns identity/cleanup, and M28b implements the selected A10 result.
 - Engines §6 found no evidence for the suggested read-only Claude/GLM Bash gap; Python tests assert Bash exclusion. Preserve that baseline unless the owner supplies a concrete external profile and failing case.
 - Delivery currently ships a CJS Desktop bridge, but plan §1.3/§14.5 requires a native replacement for a full Rust release. M09 is a gate, not permission to retain CJS as installed runtime; M48 follows its evidence.
