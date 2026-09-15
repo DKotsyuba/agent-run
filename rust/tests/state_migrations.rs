@@ -10,7 +10,7 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
-const V1_SCHEMA: &str = include_str!("../../tests/fixtures/schema_v1.sql");
+const V1_SCHEMA: &str = include_str!("fixtures/schema_v1.sql");
 const V1_AGENTS: [&str; 3] = ["agt_alpha", "agt_beta", "agt_gamma"];
 
 /// A `state.db` built at `version` by executing the v1 fixture and then every
