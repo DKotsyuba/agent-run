@@ -38,7 +38,7 @@ from ..base import (
 )
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules, render_codex_review_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
-from ..snapshots import finalize_runtime_snapshots, snapshot_managed_tree
+from ..snapshots import runtime_snapshot_materialize_revision, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
 from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
@@ -52,6 +52,7 @@ from .environment import (
     resolved_directory,
 )
 from .skills import prune_skills
+from .snapshot import finalize_snapshots, prepare_project_trust
 from .toml import render_effective_native_settings, toml_string as _toml_string
 from .permissions import (
     launch_permissions,
@@ -393,13 +394,11 @@ class CodexAdapter:
         )
 
         auth_digest = ""
-        managed_links: tuple[tuple[str, str], ...] = ()
         if bridge is not None:
             source, target = bridge
             auth_target = str(source.expanduser().resolve(strict=True))
             create_symlink_bridge(home, target, source)
             auth_digest = auth_target
-            managed_links = ((target, auth_target),)
 
         fingerprint = "\n".join(
             [
@@ -412,17 +411,7 @@ class CodexAdapter:
             ]
         )
         revision = content_hash(fingerprint)
-        finalize_runtime_snapshots(
-            Path(home),
-            revision,
-            (
-                "config.toml",
-                "rules/agent-run-command-policy.rules",
-                "command-refusals/.agent-run-command-policy.json",
-                *(f"command-refusals/{command}" for command in sorted(denied_commands)),
-            ),
-            managed_links,
-        )
+        finalize_snapshots(config, Path(home), revision)
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
@@ -561,7 +550,9 @@ class CodexAdapter:
         roles receive app-server's tagged sandbox request form. A configured
         ``workspace_root`` replaces the per-workdir writable root for write roles
         inside that tree; named profiles still report the workdir as their
-        runtime workspace root. External read roots remain forbidden.
+        runtime workspace root. A fresh launch prewrites Codex's exact trust
+        receipt for that resolved workdir before the runtime snapshot freezes;
+        resume leaves the verified config untouched. External read roots remain forbidden.
         ``gpt-6-astra`` is limited to the public read-only
         ``architect`` and ``review`` profiles. Raises ``ValidationError`` when
         an authorization or runtime constraint fails.
@@ -609,6 +600,10 @@ class CodexAdapter:
             raise ValidationError(f"codex home is not materialized: {home_path}")
 
         workdir = resolved_directory(request.workdir, "workdir")
+        if resume_session_id is None:
+            snapshot_revision = runtime_snapshot_materialize_revision(home_path)
+            if prepare_project_trust(home_path, workdir):
+                finalize_snapshots(config, home_path, snapshot_revision)
         roots, writable_roots, permission_profile = launch_permissions(
             config, home_path, workdir, role.read_roots, effective_write, role.network
         )

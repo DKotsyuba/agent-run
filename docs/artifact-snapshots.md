@@ -67,6 +67,12 @@ and every referenced artifact to match. `inspect_config_snapshot()` likewise rea
 configuration metadata as a no-follow regular file, checks its recorded hash,
 and requires canonical version-one JSON before reuse.
 
+For Codex, preparation writes the native per-workdir `trust_level = "trusted"`
+receipt before this index is finalized. The receipt is one exact project table
+for the resolved launch directory; a continuation never adds or reseals it.
+Changes to the generated config, including hook trust receipts, still fail
+snapshot verification.
+
 Claude and GLM may snapshot explicitly declared non-secret plugin assets. The
 optional `plugin_snapshot_assets` mapping is keyed by configured plugin basename;
 each value lists exact relative files or directories. Declared directories are

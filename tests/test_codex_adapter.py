@@ -1133,6 +1133,46 @@ env_from = ["PATH"]
             sorted((str(self.workdir), str(self.auth_source_dir))),
         )
 
+    def test_prepare_seals_native_project_trust_before_snapshot(self) -> None:
+        """Preseed Codex's project receipt while retaining config and hook integrity."""
+
+        plugin = self.make_plugin()
+        config = self.runtime_config(plugins=(plugin,))
+        revision = ADAPTER.materialize(config, self.home, mcp_servers={})
+        profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
+
+        self.prepare(self.start_request(), profile, config)
+
+        generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        document = tomllib.loads(generated)
+        self.assertEqual(
+            document["projects"][str(self.workdir)], {"trust_level": "trusted"}
+        )
+        index_sha256 = runtime_snapshot_index_sha256(self.home, revision)
+        self.assertTrue(
+            inspect_runtime_snapshots(
+                self.home, revision, expected_sha256=index_sha256
+            ).verified
+        )
+
+        self.prepare(self.start_request(), profile, config)
+        self.assertEqual((self.home / "config.toml").read_text(encoding="utf-8"), generated)
+        plugin_receipt = next(
+            key
+            for key in document["hooks"]["state"]
+            if key.startswith("agent-pipline-compressor@personal:")
+        )
+        marker = f'[hooks.state."{plugin_receipt}"]\ntrusted_hash = "'
+        (self.home / "config.toml").write_text(
+            generated.replace(marker, marker + "0", 1),
+            encoding="utf-8",
+        )
+        inspection = inspect_runtime_snapshots(
+            self.home, revision, expected_sha256=index_sha256
+        )
+        self.assertFalse(inspection.verified)
+        self.assertIn("config.toml", inspection.hash_mismatches)
+
     def test_prepare_adds_fast_overrides_only_for_fast_requests(self) -> None:
         config = self.materialized()
         profile = AgentProfile("review", "body", False, (self.auth_source_dir,))
