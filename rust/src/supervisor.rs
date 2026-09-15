@@ -2,7 +2,7 @@
 use crate::{
     adapters::{self, io::Process, materialize},
     config::Adapter,
-    domain::{AgentId, Outcome, Status},
+    domain::{self, AgentId, Outcome, Status},
     error::invalid,
     fs, process,
     service::LaunchIdentity,
@@ -230,7 +230,20 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         }
         _ => None,
     };
-    let outcome = verify::completion(result.outcome, proof.as_ref(), cleanup.confirmed, cancelled);
+    let evidence = match &proof {
+        Some(p) => verify::AnswerProof::sealed(p),
+        None => verify::AnswerProof::absent(agent_dir.join("answer.md")),
+    };
+    let last_progress_at = store.last_progress(id)?;
+    let outcome = verify::verify_completion(
+        Some(result.outcome),
+        cancelled.then_some(verify::StopReason::Cancel),
+        Some(&evidence),
+        cleanup.group_gone,
+        last_progress_at,
+        domain::now(),
+        verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
+    )?;
     store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
     Ok(())
 }

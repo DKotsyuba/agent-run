@@ -1,6 +1,11 @@
 //! Exact-byte answer sealing and verification. Process exit zero is insufficient.
+mod completion;
+pub use completion::{
+    inspect_answer, silence_seconds, verify_completion, AnswerProof, StopReason, ANSWER_INCOMPLETE,
+    ANSWER_PRESENT, DEFAULT_SILENCE_THRESHOLD_SECONDS, ENGINE_VANISHED, GROUP_SURVIVED, NO_ANSWER,
+};
+
 use crate::{
-    domain::{Outcome, Status},
     error::invalid,
     fs::{self, Dir},
     Error, Result,
@@ -63,6 +68,42 @@ pub fn seal(root: &Path, relative: &Path, text: &str) -> Result<Proof> {
     dir.write(&parent.join(format!("{name}.proof.json")), &data, 0o600)?;
     Ok(proof)
 }
+/// Load and validate the `.answer-format`/`*.proof.json` sidecar pair against an
+/// already-known payload size and hash. `Ok(None)` means neither file exists
+/// (historical legacy artifact); any other mismatch is a hard error. Mirrors
+/// Python's `_load_answer_proof` (`verify.py:321-351`) minus its legacy-frame
+/// check, which callers apply separately (see `read` and `completion::inspect_answer`).
+fn load_sidecar(
+    dir: &Dir,
+    parent: &Path,
+    name: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Result<Option<Sidecar>> {
+    let marker = dir.optional(&parent.join(".answer-format"), 4096)?;
+    let sidecar = dir.optional(&parent.join(format!("{name}.proof.json")), 4096)?;
+    if marker.is_none() && sidecar.is_none() {
+        return Ok(None);
+    }
+    if marker.as_deref().is_some_and(|m| m != b"2\n") {
+        return Err(Error::Integrity("invalid answer format marker".into()));
+    }
+    let raw = sidecar.ok_or_else(|| Error::Integrity("answer proof sidecar is missing".into()))?;
+    let p: Sidecar = serde_json::from_slice(&raw)
+        .map_err(|_| Error::Integrity("malformed answer proof".into()))?;
+    if p.proof_version != 2
+        || p.kind != "agent_answer"
+        || p.media_type != MEDIA_TYPE
+        || p.answer != name
+        || p.bytes != bytes
+        || p.sha256 != sha256
+    {
+        return Err(Error::Integrity(
+            "answer sidecar contradicts the stored proof".into(),
+        ));
+    }
+    Ok(Some(p))
+}
 pub fn read(root: &Path, proof: &Proof, inline_limit: usize) -> Result<(u32, Option<String>)> {
     let relative = proof
         .path
@@ -83,35 +124,16 @@ pub fn read(root: &Path, proof: &Proof, inline_limit: usize) -> Result<(u32, Opt
         .and_then(|v| v.to_str())
         .ok_or_else(|| invalid("invalid answer filename"))?;
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    let marker = dir.optional(&parent.join(".answer-format"), 4096)?;
-    let sidecar = dir.optional(&parent.join(format!("{name}.proof.json")), 4096)?;
-    let version = if marker.is_none() && sidecar.is_none() {
-        if !bytes.ends_with(LEGACY_FRAME) {
-            return Err(Error::Integrity(
-                "legacy answer lacks exact terminal frame".into(),
-            ));
+    let version = match load_sidecar(&dir, parent, name, proof.bytes, &proof.sha256)? {
+        Some(_) => 2,
+        None => {
+            if !bytes.ends_with(LEGACY_FRAME) {
+                return Err(Error::Integrity(
+                    "legacy answer lacks exact terminal frame".into(),
+                ));
+            }
+            1
         }
-        1
-    } else {
-        if marker.as_deref().is_some_and(|m| m != b"2\n") {
-            return Err(Error::Integrity("invalid answer format marker".into()));
-        }
-        let raw =
-            sidecar.ok_or_else(|| Error::Integrity("answer proof sidecar is missing".into()))?;
-        let p: Sidecar = serde_json::from_slice(&raw)
-            .map_err(|_| Error::Integrity("malformed answer proof".into()))?;
-        if p.proof_version != 2
-            || p.kind != "agent_answer"
-            || p.media_type != MEDIA_TYPE
-            || p.answer != name
-            || p.bytes != proof.bytes
-            || p.sha256 != proof.sha256
-        {
-            return Err(Error::Integrity(
-                "answer sidecar contradicts the stored proof".into(),
-            ));
-        }
-        2
     };
     let content = if bytes.len() <= inline_limit {
         Some(if version == 1 {
@@ -143,21 +165,4 @@ pub fn error_only(text: &str) -> Option<&'static str> {
         }
     }
     None
-}
-pub fn completion(
-    mut outcome: Outcome,
-    proof: Option<&Proof>,
-    group_gone: bool,
-    cancelled: bool,
-) -> Outcome {
-    if !group_gone {
-        outcome.status = Status::Failed;
-        outcome.failure_kind = Some("engine_group_survived".into());
-    } else if cancelled {
-        outcome.status = Status::Cancelled;
-    } else if outcome.status == Status::Succeeded && proof.is_none() {
-        outcome.status = Status::Failed;
-        outcome.failure_kind = Some("no_answer".into());
-    }
-    outcome
 }

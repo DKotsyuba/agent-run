@@ -140,23 +140,29 @@ fn error_only_detection_does_not_classify_long_explanations() {
         None
     );
 }
+// The fuller decision-policy suite (matching tests/test_verify.py) lives in
+// tests/completion.rs; this smoke test just keeps the historical name.
 #[test]
 fn completion_requires_answer_and_process_cleanup() {
     let success = Outcome::success(None);
+    let complete = |group_gone: bool, cancel: bool| {
+        verify::verify_completion(
+            Some(success.clone()),
+            cancel.then_some(verify::StopReason::Cancel),
+            None,
+            group_gone,
+            None,
+            0.0,
+            60.0,
+        )
+        .unwrap()
+    };
+    assert_eq!(complete(true, false).status, Status::Failed);
     assert_eq!(
-        verify::completion(success.clone(), None, true, false).status,
-        Status::Failed
-    );
-    assert_eq!(
-        verify::completion(success.clone(), None, false, false)
-            .failure_kind
-            .as_deref(),
+        complete(false, false).failure_kind.as_deref(),
         Some("engine_group_survived")
     );
-    assert_eq!(
-        verify::completion(success, None, true, true).status,
-        Status::Cancelled
-    );
+    assert_eq!(complete(true, true).status, Status::Cancelled);
 }
 #[test]
 fn atomic_write_replaces_a_link_without_following_it() {
