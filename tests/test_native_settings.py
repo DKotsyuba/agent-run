@@ -46,6 +46,7 @@ class NativeSettingsTestCase(unittest.TestCase):
     """Shared fixtures whose temporary state is cleaned up per test."""
 
     def setUp(self) -> None:
+        """Create one temporary fixture root and register its cleanup."""
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name).resolve()
@@ -103,6 +104,7 @@ class NativeSettingsParsing(NativeSettingsTestCase):
     """Strict type, key, adapter, and reserved-root validation at load time."""
 
     def test_valid_tree_parses_immutable(self) -> None:
+        """Parsed nested options preserve values and reject in-place mutation."""
         path = self.write_config(
             self.codex_table(
                 "[runtimes.codex.native_settings]\n"
@@ -138,11 +140,13 @@ class NativeSettingsParsing(NativeSettingsTestCase):
             load_config(path)
 
     def test_blank_key_is_rejected(self) -> None:
+        """An empty native preference name fails before materialization."""
         path = self.write_config(self.codex_table('[runtimes.codex.native_settings]\n"" = 1\n'))
         with self.assertRaises(ValidationError):
             load_config(path)
 
     def test_date_value_is_rejected(self) -> None:
+        """TOML dates are rejected because native JSON cannot preserve their type."""
         path = self.write_config(
             self.codex_table("[runtimes.codex.native_settings]\nseen = 2024-01-01\n")
         )
@@ -159,6 +163,7 @@ class NativeSettingsParsing(NativeSettingsTestCase):
             validate_native_settings(None, "p.native_settings")
 
     def test_unsupported_adapter_is_rejected(self) -> None:
+        """A runtime without a native settings renderer cannot accept the table."""
         path = self.write_config(
             "schema_version = 1\n"
             "[runtimes.stub]\n"
@@ -253,12 +258,14 @@ class CodexNativeSettingsMaterialize(NativeSettingsTestCase):
         return revision, document
 
     def test_omitted_settings_preserve_current_defaults(self) -> None:
+        """Existing Codex tuning remains unchanged when no options are declared."""
         _, document = self.materialize()
         self.assertEqual(document["model_context_window"], 1000000)
         self.assertEqual(document["model_auto_compact_token_limit"], 780000)
         self.assertEqual(document["model_auto_compact_token_limit_scope"], "total")
 
     def test_declared_settings_land_and_change_fingerprint(self) -> None:
+        """Operator tuning changes both the generated values and content digest."""
         default_revision, _ = self.materialize()
         settings = {
             "model_context_window": 500000,
@@ -271,6 +278,7 @@ class CodexNativeSettingsMaterialize(NativeSettingsTestCase):
         self.assertEqual(document["tuning"], {"retries": 3, "labels": ["fast", "deep"]})
 
     def test_string_escaping_roundtrips_through_tomllib(self) -> None:
+        """Quotes, slashes and controls survive the native TOML roundtrip."""
         nasty = 'quote " backslash \\ newline \n tab \t'
         _, document = self.materialize(native_settings={"label": nasty})
         self.assertEqual(document["label"], nasty)
@@ -285,6 +293,7 @@ class CodexNativeSettingsMaterialize(NativeSettingsTestCase):
                     CODEX_ADAPTER.validate(config)
 
     def test_nested_tables_render_as_valid_inline_toml(self) -> None:
+        """Nested mappings and arrays preserve their structure in generated TOML."""
         _, document = self.materialize(
             native_settings={"outer": {"leaf": 1, "inner": {"deep": [1, 2]}}}
         )
@@ -312,12 +321,22 @@ class CodexNativeSettingsMaterialize(NativeSettingsTestCase):
         self.assertNotIn("default_permissions", document["tui"])
 
     def test_known_routing_and_reviewer_aliases_fail_closed(self) -> None:
+        """Known provider, auth and capability controls stay adapter-owned."""
         for key in (
             "model_providers",
             "openai_base_url",
             "chatgpt_base_url",
             "approvals_reviewer",
             "openai_api_key",
+            "cli_auth_credentials_store",
+            "mcp_oauth_credentials_store",
+            "forced_login_method",
+            "forced_chatgpt_workspace_id",
+            "skills",
+            "tools",
+            "agents",
+            "apps",
+            "web_search",
         ):
             with self.subTest(key=key):
                 config = self.codex_runtime(native_settings={key: {"x": 1}})
@@ -345,6 +364,7 @@ class ClaudeNativeSettings(NativeSettingsTestCase):
         return RuntimeConfig(**values)
 
     def test_declared_settings_and_hooks_coexist_in_settings_json(self) -> None:
+        """Claude tuning is added without replacing generated hook declarations."""
         config = self.claude_runtime(native_settings={"spinnerTipsEnabled": False})
         CLAUDE_ADAPTER.materialize(config, config.home, mcp_servers={})
         document = json.loads((config.home / "settings.json").read_text(encoding="utf-8"))
@@ -354,7 +374,7 @@ class ClaudeNativeSettings(NativeSettingsTestCase):
         """Both adapters sharing the Claude renderer reject the same roots."""
 
         for adapter, ref in ((CLAUDE_ADAPTER, CLAUDE_REF), (GLM_ADAPTER, GLM_REF)):
-            for key in ("hooks", "env", "statusLine", "disableAllHooks", "model"):
+            for key in ("hooks", "env", "statusLine", "disableAllHooks", "model", "agent", "autoMemoryDirectory"):
                 with self.subTest(adapter=adapter.describe().name, key=key):
                     config = self.claude_runtime(
                         adapter=ref, native_settings={key: {"anything": 1}}
@@ -398,6 +418,7 @@ class QwenNativeSettings(NativeSettingsTestCase):
         return RuntimeConfig(**values)
 
     def test_declared_settings_land_and_sandbox_stays_owned(self) -> None:
+        """Qwen receives tuning while retaining its required sandbox grant."""
         config = self.qwen_runtime(native_settings={"advance": {"thinking": True}})
         QWEN_ADAPTER.materialize(
             config, config.home, mcp_servers={}, skills_root=self.root / "skills"
@@ -409,7 +430,8 @@ class QwenNativeSettings(NativeSettingsTestCase):
         self.assertIs(document["advance"]["thinking"], True)
 
     def test_security_and_capability_roots_rejected(self) -> None:
-        for key in ("tools", "security", "context", "permissions", "skills", "model"):
+        """Qwen cannot reroute providers or enable capabilities via tuning."""
+        for key in ("tools", "security", "context", "permissions", "skills", "model", "modelProviders", "providers", "extensions"):
             with self.subTest(key=key):
                 config = self.qwen_runtime(native_settings={key: {"x": 1}})
                 with self.assertRaises(ValidationError):
@@ -425,6 +447,7 @@ class SnapshotAndScopedCopies(NativeSettingsTestCase):
         return self.codex_runtime(native_settings=settings)
 
     def test_runtime_document_records_sorted_settings(self) -> None:
+        """Snapshots store a stable plain-JSON representation of declared values."""
         document = _runtime_document(
             self.runtime({"z": 1, "a": {"nested": [1, "x"]}})
         )
@@ -439,6 +462,7 @@ class SnapshotAndScopedCopies(NativeSettingsTestCase):
         self.assertNotIn("native_settings", document)
 
     def test_settings_change_changes_document_identity(self) -> None:
+        """Changing one preference changes canonical snapshot bytes."""
         first = json.dumps(_runtime_document(self.runtime({"k": 1})), sort_keys=True)
         second = json.dumps(_runtime_document(self.runtime({"k": 2})), sort_keys=True)
         self.assertNotEqual(first, second)
