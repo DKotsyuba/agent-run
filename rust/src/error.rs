@@ -52,10 +52,19 @@ impl Error {
             Self::Sql(_) => ("StorageError", "state database operation failed".into()),
             Self::Json(_) => ("ValidationError", "invalid JSON document".into()),
         };
-        PublicError { kind, message: message.chars().take(512).collect() }
+        PublicError {
+            kind,
+            message: message.chars().take(512).collect(),
+        }
     }
     pub fn rpc_code(&self) -> i32 {
-        match self { Self::Validation(_) | Self::Json(_) => -32602, Self::BrokerUnavailable => -32001, _ => -32000 }
+        match self {
+            Self::Validation(_) | Self::Json(_) => -32602,
+            Self::BrokerUnavailable => -32001,
+            _ => -32000,
+        }
     }
 }
-pub fn invalid(message: impl Into<String>) -> Error { Error::Validation(message.into()) }
+pub fn invalid(message: impl Into<String>) -> Error {
+    Error::Validation(message.into())
+}
