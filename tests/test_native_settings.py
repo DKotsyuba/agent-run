@@ -89,13 +89,18 @@ class NativeSettingsTestCase(unittest.TestCase):
         return RuntimeConfig(**values)
 
     def codex_table(self, settings: str) -> str:
-        """Return a one-runtime config body with the raw settings block appended."""
+        """Return TOML str appending settings str and create a test-owned home.
+
+        The unique temporary directory is cleaned up with this fixture and is
+        deep enough for the adapter's default skill-root resolution on Linux.
+        """
 
         return (
             "schema_version = 1\n"
             "[runtimes.codex]\n"
             f"enabled = true\nadapter = \"{CODEX_REF}\"\n"
-            "binary = \"/bin/echo\"\nhome = \"/tmp/ar-codex\"\nmodels = [\"gpt-5\"]\n"
+            f"binary = \"/bin/echo\"\nhome = {json.dumps(str(self.workdir('codex-home')))}\n"
+            "models = [\"gpt-5\"]\n"
             f"{settings}"
         )
 
@@ -220,7 +225,7 @@ class NativeSettingsParsing(NativeSettingsTestCase):
             load_config(path)
 
     def test_model_verbosity_is_ordinary_tuning(self) -> None:
-        """No caller owns Codex model_verbosity, so it stays declarable."""
+        """Render ordinary model verbosity inside the test-owned temporary home."""
 
         path = self.write_config(
             self.codex_table(
@@ -228,6 +233,7 @@ class NativeSettingsParsing(NativeSettingsTestCase):
             )
         )
         runtime = load_config(path).runtimes["codex"]
+        self.assertTrue(runtime.home.is_relative_to(self.root))
         CODEX_ADAPTER.validate(runtime)
         CODEX_ADAPTER.materialize(runtime, runtime.home, mcp_servers={})
         document = tomllib.loads((runtime.home / "config.toml").read_text(encoding="utf-8"))
