@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.11] - 2026-09-15
+
+- fix(codex): verify named-profile runtime roots
+
 ## [0.11.10] - 2026-09-15
 
 - fix(codex): verify Projects profile on launch
