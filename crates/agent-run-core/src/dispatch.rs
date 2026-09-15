@@ -5,24 +5,12 @@ use crate::{
     service::{Query, Service},
     Result,
 };
+pub use agent_run_domain::tools::{is_tool, tool, tools_json};
 use serde::Deserialize;
 use serde_json::{json, Value};
-pub const TOOL_NAMES: [&str; 11] = [
-    "capacity_order",
-    "start",
-    "cancel",
-    "steer",
-    "list_agents",
-    "transcript",
-    "answer",
-    "resume",
-    "doc",
-    "models",
-    "limits",
-];
+/// Returns the one domain-owned, Python-compatible public discovery table.
 pub fn tools() -> Vec<Value> {
-    serde_json::from_str(include_str!("../../../assets/tools.json"))
-        .expect("packaged tool table is valid JSON")
+    tools_json()
 }
 fn args<T: serde::de::DeserializeOwned>(raw: Value) -> Result<T> {
     if !raw.is_object() {

@@ -48,8 +48,7 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
     }
     let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
     let notification = !obj.contains_key("id");
-    let known =
-        dispatch::TOOL_NAMES.contains(&method) || ["tools", "ping", "wait"].contains(&method);
+    let known = dispatch::is_tool(method) || ["tools", "ping", "wait"].contains(&method);
     let response = if !known {
         err(id, -32601, "method not found", None)
     } else {
