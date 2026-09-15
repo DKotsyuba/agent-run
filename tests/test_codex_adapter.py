@@ -191,7 +191,14 @@ env_from = ["PATH"]
             generated["permissions"]["Projects"]["workspace_roots"],
             {str(projects): True},
         )
-        self.assertNotIn(":root", generated["permissions"]["Projects"].get("filesystem", {}))
+        filesystem = generated["permissions"]["Projects"]["filesystem"]
+        self.assertNotIn(":root", filesystem)
+        for cache in (
+            ".cache/uv", ".cargo/registry", ".npm",
+            "Library/Caches/go-build", "Library/Caches/pip",
+        ):
+            self.assertEqual(filesystem[str(self.home.resolve() / cache)], "write")
+        self.assertEqual(filesystem[str(self.home.resolve() / "auth.json")], "deny")
         self.assertEqual(
             generated["mcp_servers"]["agent_lsp"]["default_tools_approval_mode"],
             "approve",

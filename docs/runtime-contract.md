@@ -26,7 +26,10 @@ turn; read-only and network roles retain the stricter legacy sandbox path. MCP
 declarations preserve native approval modes, and
 only servers explicitly set to `approve` receive the generated narrow
 PermissionRequest allow hook. Unknown tools and every shell call retain normal
-Codex review. A declared DCG `PreToolUse` hook is an additional deny-only layer.
+Codex review. The generated profile grants its isolated uv, Cargo, npm, pip, and
+Go cache directories write access so normal tests stay sandboxed instead of
+requesting a boundary escalation, while the generated auth bridge is denied to
+shell tools. A declared DCG `PreToolUse` hook is an additional deny-only layer.
 
 ## Canonical roles
 

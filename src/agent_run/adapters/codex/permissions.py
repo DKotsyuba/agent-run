@@ -136,18 +136,33 @@ def verify_effective_params(
             raise VerificationError("codex thread/start did not enable requested network access")
 
 
-def render_permission_profile(config: RuntimeConfig) -> list[str]:
-    """Return a generated ``Projects`` profile for a configured workspace root.
+def render_permission_profile(
+    config: RuntimeConfig, home: Path, auth_target: str | None
+) -> list[str]:
+    """Return a generated ``Projects`` profile for one isolated Codex home.
 
     ``config.workspace_root`` is the operator-authorized working tree. Missing
-    configuration returns an empty list. The profile inherits Codex platform
-    defaults, writes the working tree, denies common secret files, and uses the
-    configured shell-network setting without a root-wide read deny.
+    configuration returns an empty list. ``home`` is the absolute generated
+    runtime home; its test-tool cache directories are writable inside the
+    sandbox. ``auth_target`` is the validated relative credential-link target,
+    or ``None`` when the runtime has no file bridge; a present target is denied
+    to shell tools. The profile inherits Codex platform defaults, writes the
+    working tree, denies common project secrets, and uses the configured
+    shell-network setting without a root-wide read deny.
     """
 
     if config.workspace_root is None:
         return []
     root = toml_string(str(config.workspace_root))
+    runtime_home = Path(home).resolve()
+    cache_paths = (
+        runtime_home / ".cache/uv",
+        runtime_home / ".cargo/registry",
+        runtime_home / ".npm",
+        runtime_home / "Library/Caches/go-build",
+        runtime_home / "Library/Caches/pip",
+    )
+    auth_path = None if auth_target is None else runtime_home / auth_target
     return [
         f'default_permissions = "{PROJECTS_PROFILE}"',
         "",
@@ -156,6 +171,10 @@ def render_permission_profile(config: RuntimeConfig) -> list[str]:
         "",
         f"[permissions.{PROJECTS_PROFILE}.workspace_roots]",
         f"{root} = true",
+        "",
+        f"[permissions.{PROJECTS_PROFILE}.filesystem]",
+        *(f'{toml_string(str(path))} = "write"' for path in cache_paths),
+        *(() if auth_path is None else (f'{toml_string(str(auth_path))} = "deny"',)),
         "",
         f'[permissions.{PROJECTS_PROFILE}.filesystem.":workspace_roots"]',
         '"." = "write"',

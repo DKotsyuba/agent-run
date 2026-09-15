@@ -310,7 +310,10 @@ class CodexAdapter:
         prune_skills(Path(home), frozenset(config.skills))
 
         mcp_lines = render_mcp_config(config, mcp_servers)
-        permission_lines = render_permission_profile(config)
+        bridge = auth_bridge(config)
+        permission_lines = render_permission_profile(
+            config, Path(home), None if bridge is None else bridge[1]
+        )
 
         plugin_lines, plugin_digest, plugin_roots = plugin_install.install(
             Path(home), config.plugins
@@ -390,7 +393,6 @@ class CodexAdapter:
 
         auth_digest = ""
         managed_links: tuple[tuple[str, str], ...] = ()
-        bridge = auth_bridge(config)
         if bridge is not None:
             source, target = bridge
             auth_target = str(source.expanduser().resolve(strict=True))
