@@ -1,4 +1,5 @@
 //! Validated product types and transport-safe errors.
+pub mod canonical;
 pub mod domain;
 pub mod error;
 
