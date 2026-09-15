@@ -1,8 +1,12 @@
 mod common;
-use agent_run_core::capacity::{self, Key, Pool, Route, Sample, Topology};
+use agent_run_core::capacity::{
+    self,
+    ranking::{self, RouteInput},
+    Forecast, Key, Pool, Route, Sample, Topology,
+};
 use agent_run_domain::domain;
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 fn key() -> Key {
     Key {
         runtime: "mock".into(),
@@ -200,4 +204,347 @@ fn codexbar_observation_time_must_have_a_timezone() {
     let mut bad = good;
     bad["usage"]["updatedAt"] = json!("2026-09-15T12:00:00");
     assert!(capacity::sources::normalize_codexbar("mock", &bad).is_err());
+}
+
+// --- Pure ranking (`agent_run.capacity.ranking.rank_capacity_routes`) ---
+// The shared injected epoch used by every deterministic ranking test below,
+// matching `tests/test_capacity_ranking.py::_NOW`.
+const RK_NOW: f64 = 1000.0;
+
+fn rk_key(runtime: &str, lane: &str) -> Key {
+    Key {
+        runtime: runtime.into(),
+        lane: lane.into(),
+        window: "window".into(),
+        target: None,
+        source: "source".into(),
+    }
+}
+fn rk_forecast(runtime: &str, lane: &str, remaining: f64) -> Forecast {
+    Forecast {
+        key: rk_key(runtime, lane),
+        known: true,
+        remaining_percent: Some(remaining),
+        reset_at: Some(4600.0),
+        observed_at: Some(RK_NOW),
+        warmup: false,
+        burn_percent_per_hour: None,
+        sustainable_percent_per_hour: None,
+        risk: "low".into(),
+        burn_span_seconds: None,
+    }
+}
+fn rk_forecast_unknown(runtime: &str, lane: &str) -> Forecast {
+    Forecast {
+        key: rk_key(runtime, lane),
+        known: false,
+        remaining_percent: None,
+        reset_at: None,
+        observed_at: None,
+        warmup: true,
+        burn_percent_per_hour: None,
+        sustainable_percent_per_hour: None,
+        risk: "unknown".into(),
+        burn_span_seconds: None,
+    }
+}
+fn rk_route_full(
+    runtime: &str,
+    route_id: &str,
+    pool_id: &str,
+    forecasts: Vec<Forecast>,
+    account: Option<&str>,
+    quota_lane: &str,
+    reset_credits: Option<u64>,
+) -> RouteInput {
+    let keys: BTreeSet<Key> = forecasts.iter().map(|f| f.key.clone()).collect();
+    RouteInput {
+        descriptor: Route {
+            route_id: route_id.into(),
+            runtime: runtime.into(),
+            account: account.map(str::to_owned),
+            quota_lane: quota_lane.into(),
+            pool_ids: vec![pool_id.into()],
+            reset_credits,
+        },
+        pools: vec![Pool {
+            pool_id: pool_id.into(),
+            keys,
+        }],
+        forecasts,
+    }
+}
+fn rk_route(runtime: &str, route_id: &str, pool_id: &str, forecasts: Vec<Forecast>) -> RouteInput {
+    rk_route_full(runtime, route_id, pool_id, forecasts, None, "lane", None)
+}
+
+#[test]
+fn deferred_evidence_and_unavailable_runtime_are_complete() {
+    // Mirrors tests/test_capacity_ranking.py::
+    // test_deferred_evidence_and_unavailable_runtime_are_complete
+    let good = rk_route(
+        "runtime-u",
+        "good",
+        "good-pool",
+        vec![rk_forecast("runtime-u", "good", 50.0)],
+    );
+    let unknown = rk_route(
+        "runtime-x",
+        "unknown",
+        "unknown-pool",
+        vec![rk_forecast_unknown("runtime-x", "unknown")],
+    );
+    let snapshot_evidence = vec![
+        ranking::OrderEvidence {
+            runtime: "runtime-d".into(),
+            scope_id: Some("scope-d".into()),
+            route_id: None,
+            reason: "malformed".into(),
+            detail: "bad".into(),
+        },
+        ranking::OrderEvidence {
+            runtime: "runtime-u".into(),
+            scope_id: Some("scope-old".into()),
+            route_id: None,
+            reason: "expired".into(),
+            detail: "old".into(),
+        },
+    ];
+    let order = ranking::rank_capacity_routes(
+        vec![unknown, good],
+        snapshot_evidence,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        RK_NOW,
+    )
+    .unwrap();
+    let reasons: BTreeSet<_> = order.deferred.iter().map(|e| e.reason.clone()).collect();
+    assert_eq!(
+        reasons,
+        BTreeSet::from([
+            "malformed".to_string(),
+            "expired".to_string(),
+            "ranker_unknown_forecast".to_string()
+        ])
+    );
+    assert_eq!(
+        order.unavailable_runtimes,
+        vec!["runtime-d".to_string(), "runtime-x".to_string()]
+    );
+    assert_eq!(order.routes[0].runtime, "runtime-u");
+}
+
+#[test]
+fn invalid_multipliers_and_now_are_rejected() {
+    // Mirrors tests/test_capacity_ranking.py::test_invalid_arguments_raise_validation_error
+    assert!(ranking::rank_capacity_routes(
+        vec![],
+        vec![],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        -1.0
+    )
+    .is_err());
+    assert!(ranking::rank_capacity_routes(
+        vec![],
+        vec![],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        f64::NAN
+    )
+    .is_err());
+    let blank = BTreeMap::from([(String::new(), 1.0)]);
+    assert!(
+        ranking::rank_capacity_routes(vec![], vec![], &blank, &BTreeMap::new(), RK_NOW).is_err()
+    );
+    let zero = BTreeMap::from([("runtime".to_string(), 0.0)]);
+    assert!(
+        ranking::rank_capacity_routes(vec![], vec![], &zero, &BTreeMap::new(), RK_NOW).is_err()
+    );
+    let nan = BTreeMap::from([("runtime".to_string(), f64::NAN)]);
+    assert!(ranking::rank_capacity_routes(vec![], vec![], &nan, &BTreeMap::new(), RK_NOW).is_err());
+}
+
+#[test]
+fn route_multiplier_values_are_strictly_validated() {
+    // Mirrors tests/test_capacity_ranking.py::
+    // test_route_multiplier_keys_and_values_are_strictly_validated
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let route_multipliers =
+            BTreeMap::from([(("runtime".to_string(), "route".to_string()), bad)]);
+        assert!(ranking::rank_capacity_routes(
+            vec![],
+            vec![],
+            &BTreeMap::new(),
+            &route_multipliers,
+            RK_NOW
+        )
+        .is_err());
+    }
+    let blank_route = BTreeMap::from([(("runtime".to_string(), String::new()), 1.0)]);
+    assert!(
+        ranking::rank_capacity_routes(vec![], vec![], &BTreeMap::new(), &blank_route, RK_NOW)
+            .is_err()
+    );
+}
+
+#[test]
+fn manual_reset_credits_are_bounded_and_never_revive_exhaustion() {
+    // Mirrors tests/test_capacity_ranking.py::
+    // test_manual_reset_credits_are_bounded_and_never_revive_exhaustion
+    let one = rk_route_full(
+        "codex",
+        "one",
+        "one",
+        vec![rk_forecast("codex", "one", 80.0)],
+        None,
+        "lane",
+        Some(1),
+    );
+    let two = rk_route_full(
+        "codex",
+        "two",
+        "two",
+        vec![rk_forecast("codex", "two", 80.0)],
+        None,
+        "lane",
+        Some(2),
+    );
+    let exhausted = rk_route_full(
+        "codex",
+        "empty",
+        "empty",
+        vec![rk_forecast("codex", "empty", 0.0)],
+        None,
+        "lane",
+        Some(2),
+    );
+    let order = ranking::rank_capacity_routes(
+        vec![one, two, exhausted],
+        vec![],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        RK_NOW,
+    )
+    .unwrap();
+    let ids: Vec<_> = order
+        .routes
+        .iter()
+        .map(|r| r.aliases[0].route_id.clone())
+        .collect();
+    assert_eq!(ids, vec!["two".to_string(), "one".to_string()]);
+    assert!((order.routes[0].reset_credit_multiplier - (1.0 + 2.0 / 3.0)).abs() < 1e-9);
+    assert!((order.routes[1].reset_credit_multiplier - 1.5).abs() < 1e-9);
+    assert_eq!(order.omitted[0].reason, "exhausted");
+}
+
+#[test]
+fn overflowing_priority_defers_rather_than_producing_infinity() {
+    // ADR A16: large weights/overflow must be rejected/deferred with a typed
+    // reason before ranking; `Infinity` must never enter the sort or the JSON
+    // projection. No direct Python test covers this -- the Python baseline
+    // leaves it as an open decision (rust-migration-plan.md 23.2, A16).
+    let route = rk_route(
+        "codex",
+        "huge",
+        "pool",
+        vec![rk_forecast("codex", "huge", 80.0)],
+    );
+    let multipliers = BTreeMap::from([("codex".to_string(), f64::MAX)]);
+    let order =
+        ranking::rank_capacity_routes(vec![route], vec![], &multipliers, &BTreeMap::new(), RK_NOW)
+            .unwrap();
+    assert!(order.routes.is_empty());
+    assert_eq!(order.deferred[0].reason, "priority_overflow");
+    assert!(serde_json::to_value(&order).unwrap().is_object());
+}
+
+/// One golden case: Python's exact `rank_capacity_routes` input and output.
+#[derive(serde::Deserialize)]
+struct GoldenCase {
+    id: String,
+    inputs: GoldenInputs,
+    output: serde_json::Value,
+}
+#[derive(serde::Deserialize)]
+struct GoldenInputs {
+    multipliers: BTreeMap<String, f64>,
+    now: f64,
+    route_multipliers: BTreeMap<String, f64>,
+    routes: Vec<RouteInput>,
+}
+
+/// Parse Python's `str((runtime, route_id))` dict-key rendering, e.g.
+/// `"('provider-a', 'shared')"`, back into a `(runtime, route_id)` pair.
+fn parse_route_multiplier_key(raw: &str) -> (String, String) {
+    let inner = raw.trim_start_matches('(').trim_end_matches(')');
+    let mut parts = inner.splitn(2, ", ");
+    let a = parts.next().unwrap().trim_matches('\'').to_string();
+    let b = parts.next().unwrap().trim_matches('\'').to_string();
+    (a, b)
+}
+
+/// Structural JSON equality that tolerates the last-ULP float noise
+/// `serde_json`'s fast text parser introduces when reading the fixture file
+/// back in (verified directly: `serde_json::from_str("0.020000000000000018")`
+/// yields a different f64 than the literal, absent the `float_roundtrip`
+/// cargo feature). The ranking arithmetic itself never round-trips through
+/// JSON text, so this only absorbs the harness's own parse, not a ranking
+/// bug.
+fn values_close(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (actual, expected) {
+        (Value::Number(a), Value::Number(b)) => {
+            let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+            (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_close(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|w| values_close(v, w)))
+        }
+        _ => actual == expected,
+    }
+}
+
+#[test]
+fn golden_capacity_ranking_cases_match_python() {
+    // Data-driven oracle: tests/fixtures/baseline/capacity/cases.json holds
+    // exact inputs and outputs captured from the real Python
+    // `rank_capacity_routes` (migration/tools/capture_baseline.py). Every
+    // case name mirrors a test in tests/test_capacity_ranking.py.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/baseline/capacity/cases.json"
+    );
+    let text = std::fs::read_to_string(path).expect("golden capacity fixture must exist");
+    let cases: Vec<GoldenCase> =
+        serde_json::from_str(&text).expect("golden capacity fixture must parse");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let route_multipliers: BTreeMap<(String, String), f64> = case
+            .inputs
+            .route_multipliers
+            .into_iter()
+            .map(|(k, v)| (parse_route_multiplier_key(&k), v))
+            .collect();
+        let order = ranking::rank_capacity_routes(
+            case.inputs.routes,
+            vec![],
+            &case.inputs.multipliers,
+            &route_multipliers,
+            case.inputs.now,
+        )
+        .unwrap_or_else(|e| panic!("case {} failed to rank: {e}", case.id));
+        let actual = serde_json::to_value(&order).unwrap();
+        assert!(
+            values_close(&actual, &case.output),
+            "case {} produced a different projection\n  actual:   {actual}\n  expected: {}",
+            case.id,
+            case.output
+        );
+    }
 }

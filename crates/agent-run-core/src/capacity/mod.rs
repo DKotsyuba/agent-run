@@ -1,5 +1,7 @@
 //! Quota snapshots, exact physical-pool identities and pure read-only ranking.
 //! A failed collector never replaces good evidence with an invented zero.
+pub mod advice;
+pub mod ranking;
 pub mod sources;
 use crate::{config::Config, domain::now, error::invalid, state::Store, Result};
 use rusqlite::{params, TransactionBehavior};
@@ -237,7 +239,7 @@ fn history(store: &Store, retention: usize) -> Result<BTreeMap<Key, Vec<Sample>>
     }
     Ok(map)
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Forecast {
     pub key: Key,
     pub known: bool,
@@ -452,12 +454,20 @@ pub fn limits(home: &Path) -> Result<Value> {
     let items:Vec<_>=rows.iter().map(|s|json!({"key":s.key,"known":s.fresh(at),"remaining_percent":if s.fresh(at){s.remaining_percent}else{None},"reset_at":s.reset_at,"observed_at":s.observed_at,"valid_until":s.valid_until})).collect();
     Ok(json!({"observed_at":at,"items":items}))
 }
+/// Build the enabled-runtime capacity order from one persisted snapshot.
+///
+/// Mirrors Python's `build_capacity_order` + `rank_capacity_routes`: reads
+/// the persisted topology/sample history, filters to enabled runtimes,
+/// resolves each route's account/lane/runtime priority factor once
+/// (`Runtime::weight` already implements that exact precedence), and
+/// delegates ranking to [`ranking::rank_capacity_routes`] so the ordering
+/// math lives in one provider-neutral place.
 pub fn order(home: &Path) -> Result<Value> {
     let config = Config::load(home)?;
     let store = Store::open(home)?;
     let at = now();
     let series = history(&store, config.capacity.sample_retention)?;
-    let forecasts: BTreeMap<_, _> = series
+    let forecasts: BTreeMap<Key, Forecast> = series
         .iter()
         .map(|(k, s)| (k.clone(), forecast(k, s, at)))
         .collect();
@@ -473,130 +483,172 @@ pub fn order(home: &Path) -> Result<Value> {
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut deferred = Vec::new();
-    let mut parsed = Vec::new();
-    let mut definitions: BTreeMap<(String, String), BTreeSet<Key>> = BTreeMap::new();
-    let mut conflicting = BTreeSet::new();
-    let mut route_defs = BTreeMap::new();
-    let mut conflicting_routes = BTreeSet::new();
+
+    // Only enabled runtimes ever reach ranking; Python filters the whole
+    // snapshot (routes *and* evidence) to `enabled` before ranking, so a
+    // disabled runtime's rows must never surface as routes or deferred/
+    // omitted evidence either.
+    let mut snapshot_evidence: Vec<ranking::OrderEvidence> = Vec::new();
+    let mut fresh: Vec<(String, String, Topology)> = Vec::new();
     for (runtime, scope, observed, valid, payload) in rows {
-        if config.runtime(&runtime).is_err() {
+        if !config.runtime(&runtime).is_ok_and(|r| r.enabled) {
             continue;
         }
-        let topology = serde_json::from_str::<Topology>(&payload);
-        let reason =
-            if !(observed.is_finite() && valid.is_finite() && observed >= 0.0 && valid >= observed)
-            {
-                Some("malformed")
-            } else if observed > at || valid < at {
-                Some("expired")
-            } else if topology.as_ref().is_err()
-                || topology
-                    .as_ref()
-                    .is_ok_and(|t| t.validate(&runtime).is_err())
-            {
-                Some("malformed")
-            } else {
-                None
-            };
-        if let Some(reason) = reason {
-            deferred.push(json!({"runtime":runtime,"scope_id":scope,"route_id":null,"reason":reason,"detail":"quota topology is unavailable"}));
+        let evidence = |reason: &str, detail: &str| ranking::OrderEvidence {
+            runtime: runtime.clone(),
+            scope_id: Some(scope.clone()),
+            route_id: None,
+            reason: reason.into(),
+            detail: detail.into(),
+        };
+        if !(observed.is_finite() && valid.is_finite() && observed >= 0.0 && valid >= observed) {
+            snapshot_evidence.push(evidence(
+                "malformed",
+                "quota snapshot timestamps are malformed",
+            ));
             continue;
         }
-        let t = topology.map_err(|_| invalid("invalid quota topology"))?;
-        for pool in &t.pools {
-            let id = (runtime.clone(), pool.pool_id.clone());
-            if let Some(old) = definitions.get(&id) {
-                if old != &pool.keys {
-                    conflicting.insert(id);
-                }
-            } else {
-                definitions.insert(id, pool.keys.clone());
-            }
+        if observed > at || valid < at {
+            snapshot_evidence.push(evidence("expired", "topology snapshot is not fresh"));
+            continue;
         }
-        for route in &t.routes {
-            let id = (runtime.clone(), route.route_id.clone());
-            if let Some(old) = route_defs.get(&id) {
-                if old != route {
-                    conflicting_routes.insert(id);
-                }
-            } else {
-                route_defs.insert(id, route.clone());
-            }
-        }
-        parsed.push((runtime, scope, t));
-    }
-    let mut groups: BTreeMap<(String, Vec<String>), (Vec<Route>, Vec<Window>)> = BTreeMap::new();
-    for (runtime, scope, topology) in parsed {
-        for mut route in topology.routes {
-            let mut windows = BTreeMap::new();
-            let mut reason = None;
-            if conflicting_routes.contains(&(runtime.clone(), route.route_id.clone())) {
-                reason = Some("conflicting_route");
-            }
-            for id in &route.pool_ids {
-                let key = (runtime.clone(), id.clone());
-                if conflicting.contains(&key) {
-                    reason = Some("conflicting_pool");
-                    break;
-                }
-                if let Some(keys) = definitions.get(&key) {
-                    for k in keys {
-                        if let Some(w) = forecasts.get(k).and_then(|f| window(f, at)) {
-                            windows.insert(k.clone(), w);
-                        } else {
-                            reason = Some("unknown_window");
-                        }
-                    }
-                } else {
-                    reason = Some("missing_pool");
-                }
-            }
-            if let Some(reason) = reason {
-                deferred.push(json!({"runtime":runtime,"scope_id":scope,"route_id":route.route_id,"reason":reason,"detail":"all governing windows must be known"}));
+        let topology = match serde_json::from_str::<Topology>(&payload) {
+            Ok(t) if t.validate(&runtime).is_ok() => t,
+            _ => {
+                snapshot_evidence.push(evidence("malformed", "malformed persisted route snapshot"));
                 continue;
             }
-            route.pool_ids.sort();
-            let entry = groups
-                .entry((runtime.clone(), route.pool_ids.clone()))
-                .or_insert_with(|| (vec![], windows.into_values().collect()));
-            if !entry.0.iter().any(|r| r.route_id == route.route_id) {
-                entry.0.push(route);
+        };
+        fresh.push((runtime, scope, topology));
+    }
+
+    // A pool/route definition is only usable when every fresh scope that
+    // declares it agrees on its exact contents; any disagreement defers
+    // every contributing scope (never just one), matching snapshot.py.
+    let mut pool_defs: BTreeMap<(String, String), Vec<(String, Pool)>> = BTreeMap::new();
+    let mut route_defs: BTreeMap<(String, String), Vec<(String, Route)>> = BTreeMap::new();
+    for (runtime, scope, topology) in &fresh {
+        for pool in &topology.pools {
+            pool_defs
+                .entry((runtime.clone(), pool.pool_id.clone()))
+                .or_default()
+                .push((scope.clone(), pool.clone()));
+        }
+        for route in &topology.routes {
+            route_defs
+                .entry((runtime.clone(), route.route_id.clone()))
+                .or_default()
+                .push((scope.clone(), route.clone()));
+        }
+    }
+    let conflicted_pools: BTreeSet<(String, String)> = pool_defs
+        .iter()
+        .filter(|(_, v)| v.iter().any(|(_, p)| p != &v[0].1))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let conflicted_routes: BTreeSet<(String, String)> = route_defs
+        .iter()
+        .filter(|(_, v)| v.iter().any(|(_, r)| r != &v[0].1))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let pools: BTreeMap<(String, String), Pool> = pool_defs
+        .iter()
+        .filter(|(k, _)| !conflicted_pools.contains(*k))
+        .map(|(k, v)| (k.clone(), v[0].1.clone()))
+        .collect();
+
+    let mut route_inputs: Vec<ranking::RouteInput> = Vec::new();
+    for (runtime, scope, topology) in fresh {
+        for route in topology.routes {
+            let evidence = |reason: &str, detail: String| ranking::OrderEvidence {
+                runtime: runtime.clone(),
+                scope_id: Some(scope.clone()),
+                route_id: None,
+                reason: reason.into(),
+                detail,
+            };
+            if conflicted_routes.contains(&(runtime.clone(), route.route_id.clone())) {
+                snapshot_evidence.push(evidence("conflict", "conflicting route definition".into()));
+                continue;
             }
+            if route.pool_ids.iter().any(|id| {
+                conflicted_pools.contains(&(runtime.clone(), id.clone()))
+                    || !pools.contains_key(&(runtime.clone(), id.clone()))
+            }) {
+                snapshot_evidence.push(evidence(
+                    "conflict",
+                    "route references conflicted pool".into(),
+                ));
+                continue;
+            }
+            let route_pools: Vec<Pool> = route
+                .pool_ids
+                .iter()
+                .map(|id| pools[&(runtime.clone(), id.clone())].clone())
+                .collect();
+            let mut keys: Vec<Key> = route_pools
+                .iter()
+                .flat_map(|p| p.keys.iter().cloned())
+                .collect();
+            keys.sort();
+            if keys.iter().any(|k| !forecasts.contains_key(k)) {
+                snapshot_evidence.push(evidence(
+                    "missing_forecast",
+                    format!("route {} has no exact forecast", route.route_id),
+                ));
+                continue;
+            }
+            let matching: Vec<Forecast> = keys.iter().map(|k| forecasts[k].clone()).collect();
+            if matching.iter().any(|f| !f.known) {
+                snapshot_evidence.push(evidence(
+                    "unknown_forecast",
+                    format!("route {} has an unknown forecast", route.route_id),
+                ));
+                continue;
+            }
+            route_inputs.push(ranking::RouteInput {
+                descriptor: route,
+                pools: route_pools,
+                forecasts: matching,
+            });
         }
     }
-    let mut routes = Vec::new();
-    let mut omitted = Vec::new();
-    let mut usable = BTreeSet::new();
-    for ((runtime, pool_ids), (aliases, windows)) in groups {
-        if let Some(empty) = windows
-            .iter()
-            .filter(|w| w.remaining_percent <= 0.0)
-            .min_by_key(|w| w.key.clone())
-        {
-            usable.insert(runtime.clone());
-            omitted.push(json!({"runtime":runtime,"aliases":aliases,"pool_ids":pool_ids,"limiting_key":empty.key,"limiting_reset_at":empty.reset_at,"reason":"exhausted"}));
-        } else if let Some(ranked) = rank(config.runtime(&runtime)?, aliases, windows) {
-            usable.insert(runtime);
-            routes.push(ranked);
-        }
-    }
-    routes.sort_by(|a, b| {
-        b.priority
-            .total_cmp(&a.priority)
-            .then(a.runtime.cmp(&b.runtime))
-            .then(a.pool_ids.cmp(&b.pool_ids))
-    });
-    let unavailable: Vec<_> = config
+
+    let multipliers: BTreeMap<String, f64> = config
         .runtimes
         .iter()
-        .filter(|(n, r)| r.enabled && !usable.contains(*n))
-        .map(|(n, _)| n.clone())
+        .filter(|(_, r)| r.enabled)
+        .map(|(n, r)| (n.clone(), r.priority_multiplier))
         .collect();
-    let diversity = routes.len() < 2;
-    Ok(
-        json!({"observed_at":at,"routes":routes,"deferred":deferred,"omitted":omitted,"unavailable_runtimes":unavailable,"insufficient_diversity":diversity}),
-    )
+    let mut route_multipliers: BTreeMap<(String, String), f64> = BTreeMap::new();
+    for input in &route_inputs {
+        let d = &input.descriptor;
+        let weight = config
+            .runtime(&d.runtime)?
+            .weight(d.account.as_deref(), &d.quota_lane);
+        route_multipliers.insert((d.runtime.clone(), d.route_id.clone()), weight);
+    }
+    let evidenced: BTreeSet<String> = route_inputs
+        .iter()
+        .map(|r| r.descriptor.runtime.clone())
+        .chain(snapshot_evidence.iter().map(|e| e.runtime.clone()))
+        .collect();
+
+    let mut result = ranking::rank_capacity_routes(
+        route_inputs,
+        snapshot_evidence,
+        &multipliers,
+        &route_multipliers,
+        at,
+    )?;
+    let mut unavailable: BTreeSet<String> = result.unavailable_runtimes.into_iter().collect();
+    for name in multipliers.keys() {
+        if !evidenced.contains(name) {
+            unavailable.insert(name.clone());
+        }
+    }
+    result.unavailable_runtimes = unavailable.into_iter().collect();
+    Ok(serde_json::to_value(result)?)
 }
 pub async fn models(home: &Path) -> Result<Value> {
     sources::models(home).await
