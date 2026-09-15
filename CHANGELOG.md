@@ -2,6 +2,17 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.14] - 2026-09-15
+
+- test: isolate native settings runtime homes
+- fix(config): reserve native capability and auth controls
+- docs(config): clarify native preference validation
+- test(config): materialize snapshot-restored settings
+- fix(config): tighten native_settings review findings
+- feat(config): declarative native runtime settings
+- fix(codex): reuse managed permission profiles
+- fix(codex): keep runtime test caches sandboxed
+
 ## [0.11.13] - 2026-09-15
 
 - fix(codex): preserve reviewed network rules on prepare
