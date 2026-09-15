@@ -2,6 +2,10 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.12] - 2026-09-15
+
+- feat(codex): opt into reviewed workspace network
+
 ## [0.11.11] - 2026-09-15
 
 - fix(codex): verify named-profile runtime roots
