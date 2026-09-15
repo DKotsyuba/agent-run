@@ -1,8 +1,11 @@
 //! Native engines remain external tools. No Python runtime or Python fallback is used.
+pub mod auth;
 pub mod codex;
+pub mod glm;
 pub mod io;
 pub mod materialize;
 pub mod plugins;
+pub mod redact;
 use agent_run_config::{
     config::{Adapter, Config, Runtime},
     profiles::Profile,
