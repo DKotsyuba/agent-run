@@ -100,6 +100,9 @@ adapter = "agent_run.adapters.claude.adapter:ADAPTER"
 binary  = "/opt/homebrew/bin/claude"          # your engine CLI
 home    = "/Users/you/.agent-run/runtimes/claude"
 models  = ["sonnet", "opus"]
+
+[runtimes.claude.native_settings]
+spinnerTipsEnabled = false                    # optional native tuning
 ```
 
 Add more `[runtimes.<name>]` blocks for other engines (`codex`, `qwen`,
@@ -109,7 +112,11 @@ declared MCP servers, lifecycle hooks, plugins, and the limits source
 (`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
 `priority_multiplier = 1.0` is the optional positive finite weight used by
 capacity ordering; it scales only viable routes and never revives an exhausted
-window.
+window. A `native_settings` table retunes the engine's own generated config
+file — e.g. Codex `model_context_window`/compaction limits, Claude/GLM
+`settings.json` preferences — without editing Python or reinstalling; keys
+that own model/auth/sandbox/hook/MCP control are rejected, and edits apply to
+new launches after a broker restart or reload.
 
 Optional `priority_account_multipliers` and `priority_lane_multipliers` tables
 override that weight for an account or quota lane: account wins over lane,

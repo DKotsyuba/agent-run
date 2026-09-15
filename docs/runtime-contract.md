@@ -72,6 +72,32 @@ use. `default_account` is accepted only as legacy configuration and is ignored.
 Credential bytes remain in process memory or their native credential store;
 snapshots contain only the `global` choice or account label.
 
+## Native settings
+
+`runtimes.<name>.native_settings` declares tuning values merged into the
+generated native preference file (Codex `config.toml`, Claude/GLM
+`settings.json`, Qwen `.qwen/settings.json`). Values are strict
+scalar/array/table types; TOML has no null and dates, non-finite floats, and
+non-string map keys are rejected. Codex's packaged extended-context defaults
+(1,000,000-token window, 780,000-token total compaction) remain the baseline;
+declared keys override them, omitted keys keep them.
+
+Ownership is explicit: agent-run controls task model/effort, auth/provider
+routing, home/cwd, MCP/tools/skills/plugins, hook trust, sandbox/permissions/
+reviewer, and protocol/output mode. `native_settings` cannot override or
+disable any of these. Known control surfaces — including Codex
+`model_providers`/`openai_base_url`/`approvals_reviewer`/`notify`/`features`,
+Claude `apiKeyHelper`/`statusLine`/credential helpers/hook disablement, and
+Qwen `tools.sandbox`/`mcp`/`security` — fail closed with a validation error
+naming the key. Accepting an unreserved unknown key is convenience tuning, not
+a guarantee that every upstream key is safe to relax.
+
+Changes flow through scoped runtime copies and config snapshots: the snapshot
+records the declared settings (credential-free by construction), so changed
+options change snapshot identity and the next launch regenerates the native
+file. Settings apply at launch preparation; running sessions are unaffected
+until relaunch.
+
 ## Readiness
 
 `agent-run doctor` checks runtime executables, role syntax, the shared skill

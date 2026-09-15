@@ -14,6 +14,7 @@ from typing import Mapping
 from ...config import McpConfig, RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
+from ...native_settings import CLAUDE_RESERVED_ROOTS, enforce_native_settings
 from ..environment import host_environment
 from ..home import content_hash
 from ...profiles import normalize_read_roots
@@ -90,6 +91,9 @@ class ClaudeAdapter:
                 raise ValidationError(
                     f"runtimes.claude.hooks[{index}].event is not a known Claude hook event: {hook.event!r}"
                 )
+        enforce_native_settings(
+            config.native_settings, CLAUDE_RESERVED_ROOTS, "claude native_settings"
+        )
 
     def materialize(
         self,
@@ -111,7 +115,9 @@ class ClaudeAdapter:
         launch inputs and never affect the stored revision.
         """
 
-        settings_digest = render_settings(home, config.hooks)
+        settings_digest = render_settings(
+            home, config.hooks, native_settings=config.native_settings
+        )
         mcp_digest = render_mcp_config(home, config.mcp, mcp_servers)
         if skills_root is None and not config.skills:
             skills_root = Path(home)

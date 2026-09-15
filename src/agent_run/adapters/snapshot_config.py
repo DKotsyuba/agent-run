@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..config import EnvironmentConfig, RuntimeConfig
 from ..errors import ValidationError
+from ..native_settings import native_settings_json
 from ..role_plan import ResolvedRolePlan
 from .home import content_hash
 from .snapshot_runtime import _valid_sha256
@@ -64,9 +65,12 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
     ``config`` (``RuntimeConfig``) supplies every runtime declaration. The
     returned ``dict[str, object]`` contains only deterministic credential-free
     values. Explicit ``workspace_root`` and ``credential_state_home`` paths are
-    recorded; an enabled ``workspace_network`` flag is also recorded. Their
-    absence preserves the canonical shape of snapshots created before those
-    optional declarations existed.
+    recorded; an enabled ``workspace_network`` flag is also recorded. Declared
+    ``native_settings`` are recorded as a sorted JSON tree so option changes
+    change snapshot identity; reserved roots would already have failed
+    validation, and no credential values can appear there. Their absence
+    preserves the canonical shape of snapshots created before those optional
+    declarations existed.
     """
 
     auth = None
@@ -104,6 +108,8 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
         else [str(config.rust.rustup_home), str(config.rust.cargo_bin)],
         "environment": _environment_document(config.environment),
     }
+    if config.native_settings:
+        document["native_settings"] = native_settings_json(config.native_settings)
     if config.credential_state_home is not None:
         document["credential_state_home"] = str(config.credential_state_home)
     if config.workspace_root is not None:

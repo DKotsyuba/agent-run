@@ -23,6 +23,7 @@ from pydantic import (
 )
 
 from .errors import ValidationError
+from .native_settings import ADAPTER_RESERVED_ROOTS, enforce_native_settings, validate_native_settings
 
 
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
@@ -153,6 +154,11 @@ class RuntimeConfig:
     ``credential_state_home`` is an internal, service-resolved durable home
     for a runtime-owned credential store; it is never parsed from config and
     remains ``None`` outside a prepared launch.
+    ``native_settings`` maps operator-declared native preference keys to
+    strict scalar/array/table values that the packaged adapter merges into
+    the generated native config; reserved control roots (model/auth/sandbox/
+    hook ownership) are rejected at parse time. It stays empty for defaults
+    and is immutable once parsed.
     """
 
     enabled: bool
@@ -178,6 +184,7 @@ class RuntimeConfig:
     credential_state_home: Path | None = None
     workspace_root: Path | None = None
     workspace_network: bool = False
+    native_settings: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -696,7 +703,10 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
     A legacy ``runtimes.opencode``
     table is accepted but omitted: OpenCode is no longer a launchable runtime,
     while accepting the old table keeps state-only commands available during
-    migration. ``priority_multiplier`` defaults
+    migration. ``native_settings`` declares strict scalar/array/table tuning
+    values for the packaged adapter to merge into the generated native
+    config; it is rejected for adapters without a merge implementation and
+    its reserved control roots fail closed. ``priority_multiplier`` defaults
     to ``1.0`` and rejects booleans, non-numeric or non-finite values, and
     numbers less than or equal to zero. Unknown fields raise ``ValidationError``.
     """
@@ -725,6 +735,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         "environment",
         "workspace_root",
         "workspace_network",
+        "native_settings",
     }
     for name, table in _named_table(value, "runtimes").items():
         if name == "opencode":
@@ -815,6 +826,19 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             raise ValidationError(
                 f"{path}.workspace_network requires codex workspace_root"
             )
+        reserved_native = ADAPTER_RESERVED_ROOTS.get(adapter)
+        if "native_settings" in table and reserved_native is None:
+            raise ValidationError(
+                f"{path}.native_settings is supported only by the codex, "
+                "claude, glm, and qwen adapters"
+            )
+        native_settings = validate_native_settings(
+            table.get("native_settings", {}), f"{path}.native_settings"
+        )
+        if reserved_native is not None:
+            enforce_native_settings(
+                native_settings, reserved_native, f"{path}.native_settings"
+            )
         result[name] = RuntimeConfig(
             _bool(table.get("enabled"), f"{path}.enabled"),
             adapter,
@@ -840,6 +864,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
             if workspace_root is None
             else _path(workspace_root, f"{path}.workspace_root"),
             workspace_network=workspace_network,
+            native_settings=native_settings,
         )
         if result[name].limits_source not in {None, "native", "omniroute", "codexbar", "codex_appserver", "none"}:
             raise ValidationError(
