@@ -1,0 +1,8 @@
+usage: agent-run steer [-h] --text TEXT agent_id
+
+positional arguments:
+  agent_id
+
+options:
+  -h, --help   show this help message and exit
+  --text TEXT

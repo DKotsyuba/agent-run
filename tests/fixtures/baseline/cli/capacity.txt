@@ -1,0 +1,10 @@
+usage: agent-run capacity [-h] {collect,order,launchd} ...
+
+positional arguments:
+  {collect,order,launchd}
+    order               List capacity priority (first route is highest); the
+                        orchestrator still chooses a compatible role/model
+                        alias and does not launch work.
+
+options:
+  -h, --help            show this help message and exit

@@ -1,0 +1,8 @@
+usage: agent-run auth [-h] label runtime
+
+positional arguments:
+  label
+  runtime
+
+options:
+  -h, --help  show this help message and exit

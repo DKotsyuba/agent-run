@@ -1,0 +1,5 @@
+usage: agent-run hook context [-h] [--transport {claude_uds,codex_queue}]
+
+options:
+  -h, --help            show this help message and exit
+  --transport {claude_uds,codex_queue}

@@ -1,0 +1,497 @@
+[
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "answer",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "control",
+    "method": "cancel",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "capacity_order",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "doc",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "topic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "limits",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "list_agents",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "after_revision": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "offset": {
+          "type": "integer"
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transport": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "transport",
+                "external_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wait_seconds": {
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "models",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "ping",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "control",
+    "method": "resume",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transport": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "transport",
+                "external_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_id",
+        "task"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "control",
+    "method": "start",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fast": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transport": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "transport",
+                "external_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_schema": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "profile": {
+          "type": "string"
+        },
+        "read_roots": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required_constraints": {
+          "items": {
+            "enum": [
+              "web_tools_disabled",
+              "external_network_isolation",
+              "loopback_tcp_isolation",
+              "unix_ipc_isolation",
+              "mcp_ipc_isolation",
+              "filesystem_write_isolation",
+              "filesystem_read_isolation",
+              "plugin_immutability"
+            ],
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "number"
+        },
+        "workdir": {
+          "type": "string"
+        },
+        "write": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "runtime",
+        "model",
+        "profile",
+        "task",
+        "workdir"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "control",
+    "method": "steer",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id",
+        "text"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "tools",
+    "params": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "transcript",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "error_codes": {
+      "-32000": "AgentRunError",
+      "-32001": "overloaded",
+      "-32002": "deadline",
+      "-32003": "dispatcher closed",
+      "-32602": "ValidationError",
+      "-32603": "internal error"
+    },
+    "lane": "read",
+    "method": "wait",
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "type": "object"
+    }
+  }
+]

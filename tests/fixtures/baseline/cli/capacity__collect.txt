@@ -1,0 +1,5 @@
+usage: agent-run capacity collect [-h] --once
+
+options:
+  -h, --help  show this help message and exit
+  --once

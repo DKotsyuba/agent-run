@@ -1,0 +1,48 @@
+................................ [  2%]
+............................................................. [  8%]
+.......................................................... [ 13%]
+........................................................................................................................................................ [ 26%]
+.................................................................................................................. [ 36%]
+................................................................. [ 42%]
+................................................... [ 46%]
+............................................................................................................. [ 55%]
+............................................................ [ 61%]
+....................................................................................... [ 68%]
+............................................................. [ 74%]
+................................................................... [ 79%]
+...................................................... [ 84%]
+...................................................................... [ 90%]
+............................................................................s.............................           [100%]
+=============================== warnings summary ===============================
+tests/test_cli.py::PackagingTests::test_console_script_and_schema_are_present_in_sdist
+  /Users/pluto/projects/agent-run/.venv-py314/lib/python3.14/site-packages/setuptools/config/expand.py:128: SetuptoolsWarning: File '/private/var/folders/q0/8lg35149361_mmnfnwrxkkcc0000gn/T/tmpkmx6omi4/project/README.md' cannot be found
+    for path in _filter_existing_files(_filepaths)
+
+tests/test_cli.py::PackagingTests::test_console_script_and_schema_are_present_in_sdist
+  /Users/pluto/projects/agent-run/.venv-py314/lib/python3.14/site-packages/setuptools/dist.py:483: SetuptoolsDeprecationWarning: Cannot find any files for the given pattern.
+  !!
+  
+          ********************************************************************************
+          Pattern 'LICENSE' did not match any files.
+  
+          By 2027-Feb-18, you need to update your project and remove deprecated calls
+          or your builds will no longer be supported.
+          ********************************************************************************
+  
+  !!
+    for path in sorted(cls._find_pattern(pattern, enforce_match))
+
+tests/test_launch_reaper.py::ChildReaperTests::test_reaps_registered_short_lived_child_without_stealing_other_waits
+  /Users/pluto/projects/agent-run/.claude/worktrees/agent-run-tui-interface-37777e/.wt/baseline/tests/test_launch_reaper.py:16: DeprecationWarning: This process (pid=99548) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    child_pid = os.fork()
+
+tests/test_launch_reaper.py::ChildReaperTests::test_reaps_registered_short_lived_child_without_stealing_other_waits
+  /Users/pluto/projects/agent-run/.claude/worktrees/agent-run-tui-interface-37777e/.wt/baseline/tests/test_launch_reaper.py:19: DeprecationWarning: This process (pid=99548) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    unrelated_pid = os.fork()
+
+../../../../../.venv-py314/lib/python3.14/site-packages/_pytest/cacheprovider.py:469
+  /Users/pluto/projects/agent-run/.venv-py314/lib/python3.14/site-packages/_pytest/cacheprovider.py:469: PytestCacheWarning: could not create cache path /Users/pluto/projects/agent-run/.claude/worktrees/agent-run-tui-interface-37777e/.wt/baseline/.pytest_cache/v/cache/nodeids: [Errno 1] Operation not permitted: '/Users/pluto/projects/agent-run/.claude/worktrees/agent-run-tui-interface-37777e/.wt/baseline/pytest-cache-files-jvfpxjwl' -> '/Users/pluto/projects/agent-run/.claude/worktrees/agent-run-tui-interface-37777e/.wt/baseline/.pytest_cache'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1146 passed, 1 skipped, 5 warnings, 427 subtests passed in 76.93s (0:01:16)

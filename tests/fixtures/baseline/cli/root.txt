@@ -1,0 +1,9 @@
+usage: agent-run [-h] [--home HOME]
+                 {start,resume,auth,login,bind,cancel,answer,steer,agents,transcript,models,limits,context,capacity,delivery,hook,init,doctor,mcp,api,doc} ...
+
+positional arguments:
+  {start,resume,auth,login,bind,cancel,answer,steer,agents,transcript,models,limits,context,capacity,delivery,hook,init,doctor,mcp,api,doc}
+
+options:
+  -h, --help            show this help message and exit
+  --home HOME

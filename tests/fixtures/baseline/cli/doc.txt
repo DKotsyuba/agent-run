@@ -1,0 +1,7 @@
+usage: agent-run doc [-h] [topic]
+
+positional arguments:
+  topic
+
+options:
+  -h, --help  show this help message and exit

@@ -1,0 +1,10 @@
+usage: agent-run delivery launchd [-h] --binary BINARY [--label LABEL]
+                                  [--stdout-log STDOUT_LOG]
+                                  [--stderr-log STDERR_LOG]
+
+options:
+  -h, --help            show this help message and exit
+  --binary BINARY
+  --label LABEL
+  --stdout-log STDOUT_LOG
+  --stderr-log STDERR_LOG

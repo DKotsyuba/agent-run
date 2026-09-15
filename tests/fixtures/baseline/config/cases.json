@@ -1,0 +1,1013 @@
+[
+  {
+    "error_message": "profile mixed canonical fields require a revision",
+    "error_type": "ValidationError",
+    "id": "test_profiles.py:106",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_profiles.py",
+    "toml": "+++\nwrite = false\nskills = [\"code-reading\"]\n+++\nReview.\n"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "test_profiles.py:18",
+    "normalized_result_summary": {
+      "allow_external_read_roots": true,
+      "body": "Review carefully.",
+      "canonical": false,
+      "mcp": [],
+      "name": "review",
+      "network": false,
+      "read_roots": [],
+      "required_constraints": [],
+      "revision": "legacy",
+      "skills": [],
+      "write": false
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_profiles.py",
+    "toml": "+++\nwrite = false\n+++\nReview carefully.\n"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "test_profiles.py:73",
+    "normalized_result_summary": {
+      "allow_external_read_roots": true,
+      "body": "Implement and verify the requested change.",
+      "canonical": true,
+      "mcp": [
+        "agent-lsp"
+      ],
+      "name": "implement",
+      "network": false,
+      "read_roots": [],
+      "required_constraints": [
+        "plugin_immutability"
+      ],
+      "revision": "1",
+      "skills": [
+        "lsp-first",
+        "document-code"
+      ],
+      "write": true
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_profiles.py",
+    "toml": "+++\nrevision = \"1\"\nwrite = true\nnetwork = false\nallow_external_read_roots = true\nskills = [\"lsp-first\", \"document-code\"]\nmcp = [\"agent-lsp\"]\nrequired_constraints = [\"plugin_immutability\"]\n+++\nImplement and verify the requested change.\n"
+  },
+  {
+    "error_message": "runtimes.codex.binary must be an absolute path",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:117",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \"codex\"\nhome = \"${TMP_HOME}/runtime-home\"\nmodels = [\"test\"]"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:132",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {
+        "codex": {
+          "accounts": [],
+          "adapter": "example.adapter:ADAPTER",
+          "auth": null,
+          "binary": "${TMP_HOME}/tools/bin/codex",
+          "credential_state_home": null,
+          "default_account": null,
+          "enabled": true,
+          "environment": null,
+          "home": "${TMP_HOME}/runtime-home",
+          "hooks": [],
+          "limits_source": null,
+          "max_active_agents": null,
+          "mcp": [],
+          "models": [
+            "test"
+          ],
+          "native_settings": {},
+          "plugin_snapshot_assets": {},
+          "plugins": [],
+          "priority_account_multipliers": {},
+          "priority_lane_multipliers": {},
+          "priority_multiplier": 1.0,
+          "rust": null,
+          "skills": [],
+          "workspace_network": false,
+          "workspace_root": null
+        }
+      },
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \"~/tools/bin/codex\"\nhome = \"${TMP_HOME}/runtime-home\"\nmodels = [\"test\"]"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:147",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {},
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:152",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 10,
+        "context_max_chars": 100,
+        "sample_retention": 20
+      },
+      "core": {
+        "default_timeout_seconds": 30.0,
+        "max_active_agents": 2,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.8
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 3,
+        "retry_base_seconds": 1.0,
+        "retry_cap_seconds": 5.0
+      },
+      "environments": {},
+      "mcp": {
+        "agent_lsp": {
+          "approval_mode": "auto",
+          "args": [
+            "hello"
+          ],
+          "command": "/bin/echo",
+          "env_from": [
+            "PATH"
+          ],
+          "transport": "stdio"
+        }
+      },
+      "profiles": {
+        "directory": "${TMP_HOME}/profiles"
+      },
+      "runtimes": {
+        "fake": {
+          "accounts": [],
+          "adapter": "example.adapter:ADAPTER",
+          "auth": {
+            "kind": "environment",
+            "names": [
+              "TEST_TOKEN"
+            ],
+            "source": null,
+            "target": null
+          },
+          "binary": "/bin/echo",
+          "credential_state_home": null,
+          "default_account": null,
+          "enabled": true,
+          "environment": null,
+          "home": "${TMP_HOME}/runtime-home",
+          "hooks": [
+            {
+              "command": [
+                "echo",
+                "done"
+              ],
+              "event": "PostToolUse",
+              "matcher": "tool"
+            }
+          ],
+          "limits_source": null,
+          "max_active_agents": 1,
+          "mcp": [
+            "agent_lsp"
+          ],
+          "models": [
+            "test"
+          ],
+          "native_settings": {},
+          "plugin_snapshot_assets": {},
+          "plugins": [],
+          "priority_account_multipliers": {},
+          "priority_lane_multipliers": {},
+          "priority_multiplier": 1.0,
+          "rust": null,
+          "skills": [
+            "review"
+          ],
+          "workspace_network": false,
+          "workspace_root": null
+        }
+      },
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\ndefault_timeout_seconds = 30\nmax_active_agents = 2\nwarning_fraction = 0.8\n[capacity]\ncollect_interval_seconds = 10\nsample_retention = 20\ncontext_max_chars = 100\n[delivery]\nretry_base_seconds = 1\nretry_cap_seconds = 5\nmax_attempts = 3\n[profiles]\ndirectory = \"${TMP_HOME}/profiles\"\n[skills]\ndirectory = \"${TMP_HOME}/skills\"\n[mcp.agent_lsp]\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\nargs = [\"hello\"]\nenv_from = [\"PATH\"]\n[runtimes.fake]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/runtime-home\"\nmodels = [\"test\"]\nskills = [\"review\"]\nmcp = [\"agent_lsp\"]\nmax_active_agents = 1\n[runtimes.fake.auth]\nkind = \"environment\"\nnames = [\"TEST_TOKEN\"]\n[[runtimes.fake.hooks]]\nevent = \"PostToolUse\"\nmatcher = \"tool\"\ncommand = [\"echo\", \"done\"]"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:203",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {},
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.opencode]\nunexpected_legacy_field = \"retired\""
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:213",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": "/bin/echo",
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {},
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[delivery]\ncodex_queue_bin = \"/bin/echo\""
+  },
+  {
+    "error_message": "delivery.codex_queue_bin must be an absolute path",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:218",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[delivery]\ncodex_queue_bin = \"relative\""
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:223",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {
+        "fake": {
+          "accounts": [],
+          "adapter": "example.adapter:ADAPTER",
+          "auth": null,
+          "binary": "/bin/echo",
+          "credential_state_home": null,
+          "default_account": null,
+          "enabled": true,
+          "environment": null,
+          "home": "${TMP_HOME}/runtime-home",
+          "hooks": [],
+          "limits_source": null,
+          "max_active_agents": null,
+          "mcp": [],
+          "models": [
+            "test"
+          ],
+          "native_settings": {},
+          "plugin_snapshot_assets": {},
+          "plugins": [],
+          "priority_account_multipliers": {},
+          "priority_lane_multipliers": {},
+          "priority_multiplier": 1.0,
+          "rust": null,
+          "skills": [],
+          "workspace_network": false,
+          "workspace_root": null
+        }
+      },
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/runtime-home\"\nmodels = [\"test\"]"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:236",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {
+        "codex": {
+          "accounts": [
+            "personal2",
+            "work_1"
+          ],
+          "adapter": "agent_run.adapters.codex:ADAPTER",
+          "auth": {
+            "kind": "file_link",
+            "names": [],
+            "source": "${TMP_HOME}/auth.json",
+            "target": "auth.json"
+          },
+          "binary": "/bin/codex",
+          "credential_state_home": null,
+          "default_account": "personal2",
+          "enabled": true,
+          "environment": null,
+          "home": "${TMP_HOME}/codex",
+          "hooks": [],
+          "limits_source": null,
+          "max_active_agents": null,
+          "mcp": [],
+          "models": [
+            "test"
+          ],
+          "native_settings": {},
+          "plugin_snapshot_assets": {},
+          "plugins": [],
+          "priority_account_multipliers": {},
+          "priority_lane_multipliers": {},
+          "priority_multiplier": 1.0,
+          "rust": null,
+          "skills": [],
+          "workspace_network": false,
+          "workspace_root": null
+        }
+      },
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"agent_run.adapters.codex:ADAPTER\"\nbinary = \"/bin/codex\"\nhome = \"${TMP_HOME}/codex\"\nmodels = [\"test\"]\naccounts = [\"personal2\", \"work_1\"]\ndefault_account = \"personal2\"\n[runtimes.codex.auth]\nkind = \"file_link\"\nsource = \"${TMP_HOME}/auth.json\"\ntarget = \"auth.json\""
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 8, column 14)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:257",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"agent_run.adapters.codex:ADAPTER\"\nbinary = \"/bin/codex\"\nhome = \"${TMP_HOME}/codex\"\nmodels = [\"test\"]\naccounts = [\""
+  },
+  {
+    "error_message": "runtimes.fake.accounts is supported only by codex and claude adapters",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:275",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/runtime-home\"\nmodels = [\"test\"]\naccounts = [\"personal\"]"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:302",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {
+        "claude": {
+          "accounts": [
+            "personal"
+          ],
+          "adapter": "agent_run.adapters.claude.adapter:ADAPTER",
+          "auth": {
+            "kind": "environment",
+            "names": [
+              "CLAUDE_CODE_OAUTH_TOKEN"
+            ],
+            "source": null,
+            "target": null
+          },
+          "binary": "/bin/claude",
+          "credential_state_home": null,
+          "default_account": "personal",
+          "enabled": true,
+          "environment": null,
+          "home": "${TMP_HOME}/claude",
+          "hooks": [],
+          "limits_source": null,
+          "max_active_agents": null,
+          "mcp": [],
+          "models": [
+            "sonnet"
+          ],
+          "native_settings": {},
+          "plugin_snapshot_assets": {},
+          "plugins": [],
+          "priority_account_multipliers": {},
+          "priority_lane_multipliers": {},
+          "priority_multiplier": 1.0,
+          "rust": null,
+          "skills": [],
+          "workspace_network": false,
+          "workspace_root": null
+        }
+      },
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.claude]\nenabled = true\nadapter = \"agent_run.adapters.claude.adapter:ADAPTER\"\nbinary = \"/bin/claude\"\nhome = \"${TMP_HOME}/claude\"\nmodels = [\"sonnet\"]\naccounts = [\"personal\"]\ndefault_account = \"personal\"\n[runtimes.claude.auth]\nkind = \"environment\"\nnames = [\"CLAUDE_CODE_OAUTH_TOKEN\"]"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:337",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/bin/echo",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {},
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[capacity]\ncodexbar_binary = \"/bin/echo\""
+  },
+  {
+    "error_message": "capacity.codexbar_binary must be an absolute path",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:340",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[capacity]\ncodexbar_binary = \"relative\""
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:346",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {
+        "agent_ide": {
+          "approval_mode": "approve",
+          "args": [],
+          "command": "/bin/echo",
+          "env_from": [],
+          "transport": "stdio"
+        }
+      },
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {
+        "codex": {
+          "accounts": [],
+          "adapter": "agent_run.adapters.codex:ADAPTER",
+          "auth": null,
+          "binary": "/bin/echo",
+          "credential_state_home": null,
+          "default_account": null,
+          "enabled": true,
+          "environment": null,
+          "home": "${TMP_HOME}/codex",
+          "hooks": [],
+          "limits_source": null,
+          "max_active_agents": null,
+          "mcp": [
+            "agent_ide"
+          ],
+          "models": [
+            "test"
+          ],
+          "native_settings": {},
+          "plugin_snapshot_assets": {},
+          "plugins": [],
+          "priority_account_multipliers": {},
+          "priority_lane_multipliers": {},
+          "priority_multiplier": 1.0,
+          "rust": null,
+          "skills": [],
+          "workspace_network": true,
+          "workspace_root": "/Users/pluto/projects"
+        }
+      },
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[mcp.agent_ide]\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\napproval_mode = \"approve\"\n[runtimes.codex]\nenabled = true\nadapter = \"agent_run.adapters.codex:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/codex\"\nworkspace_root = \"/Users/pluto/projects\"\nworkspace_network = true\nmodels = [\"test\"]\nmcp = [\"agent_ide\"]"
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 5, column 11)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:37",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \""
+  },
+  {
+    "error_message": "mcp.bad.approval_mode must be one of approve, auto, prompt, writes",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:370",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[mcp.bad]\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\napproval_mode = \"always\""
+  },
+  {
+    "error_message": "runtimes.codex.workspace_network requires codex workspace_root",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:379",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"agent_run.adapters.codex:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/codex\"\nworkspace_network = true\nmodels = [\"test\"]"
+  },
+  {
+    "error_message": "runtimes.codex.workspace_root must be an absolute path",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:391",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \"agent_run.adapters.codex:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/codex\"\nworkspace_root = \"relative\"\nmodels = [\"test\"]"
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 6, column 9)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:404",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example.adapter:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \""
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Invalid initial character for a key part (at line 2, column 2)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:526",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n["
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:530",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 1,
+        "context_max_chars": 1,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 0.0,
+        "warning_fraction": 0.1
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {},
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\nwarning_fraction = 0.1\nstalled_after_seconds = 0\n[capacity]\ncollect_interval_seconds = 1\ncontext_max_chars = 1"
+  },
+  {
+    "error_message": null,
+    "error_type": null,
+    "id": "tests/test_config.py:544",
+    "normalized_result_summary": {
+      "capacity": {
+        "codexbar_binary": "/opt/homebrew/bin/codexbar",
+        "collect_interval_seconds": 300,
+        "context_max_chars": 2500,
+        "sample_retention": 1000
+      },
+      "core": {
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "stalled_after_seconds": 900.0,
+        "warning_fraction": 0.9
+      },
+      "delivery": {
+        "codex_queue_bin": null,
+        "max_attempts": 0,
+        "retry_base_seconds": 2.0,
+        "retry_cap_seconds": 60.0
+      },
+      "environments": {},
+      "mcp": {},
+      "profiles": {
+        "directory": "${TMP_HOME}/.agent-run/profiles"
+      },
+      "runtimes": {},
+      "schema_version": 1,
+      "skills_directory": "${TMP_HOME}/.agent-run/skills"
+    },
+    "outcome": "ok",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\nwarning_fraction = 0.9\n[capacity]\ncollect_interval_seconds = 300\ncontext_max_chars = 2500"
+  },
+  {
+    "error_message": "unknown config field: extra",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:558",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\nextra = true"
+  },
+  {
+    "error_message": "unknown config field: core.extra",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:559",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\nextra = true"
+  },
+  {
+    "error_message": "unknown config field: runtimes.fake.service_mode",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:561",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/home\"\nmodels = [\"test\"]\nservice_mode = \"managed\""
+  },
+  {
+    "error_message": "unknown config field: runtimes.fake.hooks[0].extra",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:573",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/home\"\nmodels = [\"test\"]\n[[runtimes.fake.hooks]]\nevent = \"x\"\ncommand = [\"x\"]\nextra = true"
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 3, column 10)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:597",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\nextra = \""
+  },
+  {
+    "error_message": "unsupported schema_version: 2",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:602",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 2"
+  },
+  {
+    "error_message": "unsupported schema_version: 1.0",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:604",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1.0"
+  },
+  {
+    "error_message": "mcp.bad.env_from[0] must name an environment variable, not a secret value",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:607",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[mcp.bad]\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\nenv_from = [\"sk-literal-secret\"]"
+  },
+  {
+    "error_message": "runtimes.fake.mcp[0] references unknown MCP 'undeclared'",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:616",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/home\"\nmodels = [\"test\"]\nmcp = [\"undeclared\"]"
+  },
+  {
+    "error_message": "runtimes.fake.auth.names[0] must name an environment variable, not a secret value",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:628",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/home\"\nmodels = [\"test\"]\n[runtimes.fake.auth]\nkind = \"environment\"\nnames = [\"literal-token\"]"
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 5, column 14)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:642",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[mcp.bad]\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\nenv_from = [\""
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 10, column 11)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:648",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.fake]\nenabled = true\nadapter = \"example:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/home\"\nmodels = [\"test\"]\n[runtimes.fake.auth]\nkind = \"environment\"\nnames = [\""
+  },
+  {
+    "error_message": "core.default_timeout_seconds must be a number >= 1e-06",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:665",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\ndefault_timeout_seconds = nan"
+  },
+  {
+    "error_message": "core.warning_fraction must be a number >= 0",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:666",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[core]\nwarning_fraction = nan"
+  },
+  {
+    "error_message": "capacity.collect_interval_seconds must be an integer >= 1",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:667",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[capacity]\ncollect_interval_seconds = nan"
+  },
+  {
+    "error_message": "delivery.retry_base_seconds must be a number >= 1e-06",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:668",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[delivery]\nretry_base_seconds = nan"
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 6, column 9)",
+    "error_type": "ValidationError",
+    "id": "tests/test_config.py:70",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_config.py",
+    "toml": "schema_version = 1\n[runtimes.claude]\nenabled = true\nadapter = \"agent_run.adapters.claude.adapter:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \""
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 4, column 12)",
+    "error_type": "ValidationError",
+    "id": "tests/test_native_settings.py:100",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_native_settings.py",
+    "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \""
+  },
+  {
+    "error_message": "runtimes.stub.native_settings is supported only by the codex, claude, glm, and qwen adapters",
+    "error_type": "ValidationError",
+    "id": "tests/test_native_settings.py:174",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_native_settings.py",
+    "toml": "schema_version = 1\n[runtimes.stub]\nenabled = true\nadapter = \"agent_run.adapters.stub:ADAPTER\"\nbinary = \"/bin/echo\"\nhome = \"${TMP_HOME}/ar-stub\"\nmodels = [\"m\"]\n[runtimes.stub.native_settings]\nkey = 1"
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Invalid initial character for a key part (at line 2, column 11)",
+    "error_type": "ValidationError",
+    "id": "tests/test_native_settings.py:206",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_native_settings.py",
+    "toml": "schema_version = 1\n[runtimes."
+  },
+  {
+    "error_message": "cannot load config ${TMP_HOME}/config.toml: Illegal character '\\n' (at line 4, column 12)",
+    "error_type": "ValidationError",
+    "id": "tests/test_native_settings.py:219",
+    "normalized_result_summary": null,
+    "outcome": "error",
+    "source_test": "tests/test_native_settings.py",
+    "toml": "schema_version = 1\n[runtimes.qwen]\nenabled = true\nadapter = \""
+  }
+]

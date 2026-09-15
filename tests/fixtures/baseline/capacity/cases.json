@@ -1,0 +1,2020 @@
+[
+  {
+    "id": "reliable-multiplier",
+    "inputs": {
+      "multipliers": {
+        "runtime-a": 2.0
+      },
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-b"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-b",
+            "runtime": "runtime-b"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": 0.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-b",
+                "runtime": "runtime-b",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 90.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "lane-b",
+                  "runtime": "runtime-b",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-b"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-a"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-a",
+            "runtime": "runtime-a"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": 20.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-a",
+                "runtime": "runtime-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "lane-a",
+                  "runtime": "runtime-a",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-a"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": false,
+      "observed_at": 1000.0,
+      "omitted": [],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-a"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-a",
+              "runtime": "runtime-a"
+            }
+          ],
+          "limiting_key": {
+            "lane": "lane-a",
+            "runtime": "runtime-a",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 2.0,
+          "pool_ids": [
+            "pool-a"
+          ],
+          "priority": 3.2,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime-a",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": 20.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-a",
+                "runtime": "runtime-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "projected",
+              "projected_percent": 60.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-b"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-b",
+              "runtime": "runtime-b"
+            }
+          ],
+          "limiting_key": {
+            "lane": "lane-b",
+            "runtime": "runtime-b",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 90.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool-b"
+          ],
+          "priority": 1.9,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime-b",
+          "score": 1.9,
+          "windows": [
+            {
+              "burn_percent_per_hour": 0.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-b",
+                "runtime": "runtime-b",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "projected",
+              "projected_percent": 90.0,
+              "remaining_percent": 90.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.9
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "equal-current-forecast",
+    "inputs": {
+      "multipliers": {},
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-a"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-a",
+            "runtime": "runtime-a"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": 20.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-a",
+                "runtime": "runtime-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "lane-a",
+                  "runtime": "runtime-a",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-a"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-b"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-b",
+            "runtime": "runtime-b"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": 0.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-b",
+                "runtime": "runtime-b",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "lane-b",
+                  "runtime": "runtime-b",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-b"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": false,
+      "observed_at": 1000.0,
+      "omitted": [],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-b"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-b",
+              "runtime": "runtime-b"
+            }
+          ],
+          "limiting_key": {
+            "lane": "lane-b",
+            "runtime": "runtime-b",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool-b"
+          ],
+          "priority": 1.8,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime-b",
+          "score": 1.8,
+          "windows": [
+            {
+              "burn_percent_per_hour": 0.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-b",
+                "runtime": "runtime-b",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "projected",
+              "projected_percent": 80.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.8
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-a"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-a",
+              "runtime": "runtime-a"
+            }
+          ],
+          "limiting_key": {
+            "lane": "lane-a",
+            "runtime": "runtime-a",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool-a"
+          ],
+          "priority": 1.6,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime-a",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": 20.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "lane-a",
+                "runtime": "runtime-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "projected",
+              "projected_percent": 60.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "fallback-markers",
+    "inputs": {
+      "multipliers": {},
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route",
+            "runtime": "opaque-runtime"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "warm",
+                "runtime": "opaque-runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 75.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            },
+            {
+              "burn_percent_per_hour": 5.0,
+              "burn_span_seconds": 1800.0,
+              "key": {
+                "lane": "thin",
+                "runtime": "opaque-runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 75.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            },
+            {
+              "burn_percent_per_hour": 5.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "none",
+                "runtime": "opaque-runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 75.0,
+              "reset_at": null,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "none",
+                  "runtime": "opaque-runtime",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                },
+                {
+                  "lane": "thin",
+                  "runtime": "opaque-runtime",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                },
+                {
+                  "lane": "warm",
+                  "runtime": "opaque-runtime",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": true,
+      "observed_at": 1000.0,
+      "omitted": [],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route",
+              "runtime": "opaque-runtime"
+            }
+          ],
+          "limiting_key": {
+            "lane": "thin",
+            "runtime": "opaque-runtime",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 75.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool"
+          ],
+          "priority": 1.5,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "opaque-runtime",
+          "score": 1.5,
+          "windows": [
+            {
+              "burn_percent_per_hour": 5.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "none",
+                "runtime": "opaque-runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "no_reset",
+              "projected_percent": null,
+              "remaining_percent": 75.0,
+              "reset_at": null,
+              "risk": "low",
+              "slack": 0.5
+            },
+            {
+              "burn_percent_per_hour": 5.0,
+              "burn_span_seconds": 1800.0,
+              "key": {
+                "lane": "thin",
+                "runtime": "opaque-runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "thin_evidence",
+              "projected_percent": null,
+              "remaining_percent": 75.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.5
+            },
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "warm",
+                "runtime": "opaque-runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 75.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.5
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "exhaustion-and-zero-score",
+    "inputs": {
+      "multipliers": {
+        "provider-z": 100.0
+      },
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": "b",
+            "pool_ids": [
+              "shared-pool"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-b",
+            "runtime": "provider-x"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "empty",
+                "runtime": "provider-x",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 0.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "empty",
+                  "runtime": "provider-x",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "shared-pool"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "zero-pool"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "zero",
+            "runtime": "provider-z"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": 200.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "zero",
+                "runtime": "provider-z",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 1.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": false
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "zero",
+                  "runtime": "provider-z",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "zero-pool"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "high-pool"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "high",
+            "runtime": "provider-y"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "high",
+                "runtime": "provider-y",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 1.0,
+              "reset_at": 4600.0,
+              "risk": "high",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "high",
+                  "runtime": "provider-y",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "high-pool"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": "a",
+            "pool_ids": [
+              "shared-pool"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-a",
+            "runtime": "provider-x"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "empty",
+                "runtime": "provider-x",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 0.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "empty",
+                  "runtime": "provider-x",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "shared-pool"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": false,
+      "observed_at": 1000.0,
+      "omitted": [
+        {
+          "aliases": [
+            {
+              "account": "a",
+              "pool_ids": [
+                "shared-pool"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-a",
+              "runtime": "provider-x"
+            },
+            {
+              "account": "b",
+              "pool_ids": [
+                "shared-pool"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-b",
+              "runtime": "provider-x"
+            }
+          ],
+          "limiting_key": {
+            "lane": "empty",
+            "runtime": "provider-x",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "pool_ids": [
+            "shared-pool"
+          ],
+          "reason": "exhausted",
+          "runtime": "provider-x"
+        }
+      ],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "high-pool"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "high",
+              "runtime": "provider-y"
+            }
+          ],
+          "limiting_key": {
+            "lane": "high",
+            "runtime": "provider-y",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 1.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "high-pool"
+          ],
+          "priority": 0.020000000000000018,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "provider-y",
+          "score": 0.020000000000000018,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "high",
+                "runtime": "provider-y",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 1.0,
+              "reset_at": 4600.0,
+              "risk": "high",
+              "slack": -0.98
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "zero-pool"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "zero",
+              "runtime": "provider-z"
+            }
+          ],
+          "limiting_key": {
+            "lane": "zero",
+            "runtime": "provider-z",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 1.0,
+          "multiplier": 100.0,
+          "pool_ids": [
+            "zero-pool"
+          ],
+          "priority": 0.0,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "provider-z",
+          "score": 0.0,
+          "windows": [
+            {
+              "burn_percent_per_hour": 200.0,
+              "burn_span_seconds": 7200.0,
+              "key": {
+                "lane": "zero",
+                "runtime": "provider-z",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "projected",
+              "projected_percent": -199.0,
+              "remaining_percent": 1.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": -1.0
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "alias-collapse",
+    "inputs": {
+      "multipliers": {},
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": "account-b",
+            "pool_ids": [
+              "pool"
+            ],
+            "quota_lane": "lane-b",
+            "reset_credits": null,
+            "route_id": "route-b",
+            "runtime": "provider-ζ"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "shared",
+                "runtime": "provider-ζ",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "shared",
+                  "runtime": "provider-ζ",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": "account-a",
+            "pool_ids": [
+              "pool"
+            ],
+            "quota_lane": "lane-a",
+            "reset_credits": null,
+            "route_id": "route-a",
+            "runtime": "provider-ζ"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "shared",
+                "runtime": "provider-ζ",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "shared",
+                  "runtime": "provider-ζ",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": true,
+      "observed_at": 1000.0,
+      "omitted": [],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": "account-a",
+              "pool_ids": [
+                "pool"
+              ],
+              "quota_lane": "lane-a",
+              "reset_credits": null,
+              "route_id": "route-a",
+              "runtime": "provider-ζ"
+            },
+            {
+              "account": "account-b",
+              "pool_ids": [
+                "pool"
+              ],
+              "quota_lane": "lane-b",
+              "reset_credits": null,
+              "route_id": "route-b",
+              "runtime": "provider-ζ"
+            }
+          ],
+          "limiting_key": {
+            "lane": "shared",
+            "runtime": "provider-ζ",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool"
+          ],
+          "priority": 1.6,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "provider-ζ",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "shared",
+                "runtime": "provider-ζ",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6000000000000001
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "tie-break",
+    "inputs": {
+      "multipliers": {},
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-c"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-c",
+            "runtime": "runtime"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "c",
+                "runtime": "runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 60.0,
+              "reset_at": 3000.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "c",
+                  "runtime": "runtime",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-c"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-b"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-b",
+            "runtime": "runtime"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "b",
+                "runtime": "runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 60.0,
+              "reset_at": 2000.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "b",
+                  "runtime": "runtime",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-b"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-a"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "route-a",
+            "runtime": "runtime"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "a",
+                "runtime": "runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 60.0,
+              "reset_at": 2000.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "a",
+                  "runtime": "runtime",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-a"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": false,
+      "observed_at": 1000.0,
+      "omitted": [],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-a"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-a",
+              "runtime": "runtime"
+            }
+          ],
+          "limiting_key": {
+            "lane": "a",
+            "runtime": "runtime",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 2000.0,
+          "minimum_remaining_percent": 60.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool-a"
+          ],
+          "priority": 1.2,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime",
+          "score": 1.2,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "a",
+                "runtime": "runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 60.0,
+              "reset_at": 2000.0,
+              "risk": "low",
+              "slack": 0.19999999999999996
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-b"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-b",
+              "runtime": "runtime"
+            }
+          ],
+          "limiting_key": {
+            "lane": "b",
+            "runtime": "runtime",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 2000.0,
+          "minimum_remaining_percent": 60.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool-b"
+          ],
+          "priority": 1.2,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime",
+          "score": 1.2,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "b",
+                "runtime": "runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 60.0,
+              "reset_at": 2000.0,
+              "risk": "low",
+              "slack": 0.19999999999999996
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-c"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "route-c",
+              "runtime": "runtime"
+            }
+          ],
+          "limiting_key": {
+            "lane": "c",
+            "runtime": "runtime",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 3000.0,
+          "minimum_remaining_percent": 60.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "pool-c"
+          ],
+          "priority": 1.2,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "runtime",
+          "score": 1.2,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "c",
+                "runtime": "runtime",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 60.0,
+              "reset_at": 3000.0,
+              "risk": "low",
+              "slack": 0.19999999999999996
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "route-multiplier-scope",
+    "inputs": {
+      "multipliers": {
+        "provider-a": 1.0,
+        "provider-b": 1.0
+      },
+      "now": 1000.0,
+      "route_multipliers": {
+        "('provider-a', 'alias')": 2.0,
+        "('provider-a', 'shared')": 3.0,
+        "('provider-b', 'shared')": 0.5
+      },
+      "routes": [
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-b"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "shared",
+            "runtime": "provider-b"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "b",
+                "runtime": "provider-b",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "b",
+                  "runtime": "provider-b",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-b"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-a"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "alias",
+            "runtime": "provider-a"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "a",
+                "runtime": "provider-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "a",
+                  "runtime": "provider-a",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-a"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "pool-a"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": null,
+            "route_id": "shared",
+            "runtime": "provider-a"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "a",
+                "runtime": "provider-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "a",
+                  "runtime": "provider-a",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "pool-a"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": false,
+      "observed_at": 1000.0,
+      "omitted": [],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-a"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "shared",
+              "runtime": "provider-a"
+            },
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-a"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "alias",
+              "runtime": "provider-a"
+            }
+          ],
+          "limiting_key": {
+            "lane": "a",
+            "runtime": "provider-a",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 3.0,
+          "pool_ids": [
+            "pool-a"
+          ],
+          "priority": 4.800000000000001,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "provider-a",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "a",
+                "runtime": "provider-a",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6000000000000001
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "pool-b"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": null,
+              "route_id": "shared",
+              "runtime": "provider-b"
+            }
+          ],
+          "limiting_key": {
+            "lane": "b",
+            "runtime": "provider-b",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 0.5,
+          "pool_ids": [
+            "pool-b"
+          ],
+          "priority": 0.8,
+          "reset_credit_multiplier": 1.0,
+          "reset_credits": null,
+          "runtime": "provider-b",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "b",
+                "runtime": "provider-b",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6000000000000001
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  },
+  {
+    "id": "reset-credit-bonus",
+    "inputs": {
+      "multipliers": {},
+      "now": 1000.0,
+      "route_multipliers": {},
+      "routes": [
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "one"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": 1,
+            "route_id": "one",
+            "runtime": "codex"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "one",
+                "runtime": "codex",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "one",
+                  "runtime": "codex",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "one"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "two"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": 2,
+            "route_id": "two",
+            "runtime": "codex"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "two",
+                "runtime": "codex",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "two",
+                  "runtime": "codex",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "two"
+            }
+          ]
+        },
+        {
+          "descriptor": {
+            "account": null,
+            "pool_ids": [
+              "empty"
+            ],
+            "quota_lane": "lane",
+            "reset_credits": 2,
+            "route_id": "empty",
+            "runtime": "codex"
+          },
+          "forecasts": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "empty",
+                "runtime": "codex",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "known": true,
+              "observed_at": 1000.0,
+              "remaining_percent": 0.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "sustainable_percent_per_hour": null,
+              "warmup": true
+            }
+          ],
+          "pools": [
+            {
+              "keys": [
+                {
+                  "lane": "empty",
+                  "runtime": "codex",
+                  "source": "source",
+                  "target": null,
+                  "window": "window"
+                }
+              ],
+              "pool_id": "empty"
+            }
+          ]
+        }
+      ]
+    },
+    "output": {
+      "deferred": [],
+      "insufficient_diversity": false,
+      "observed_at": 1000.0,
+      "omitted": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "empty"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": 2,
+              "route_id": "empty",
+              "runtime": "codex"
+            }
+          ],
+          "limiting_key": {
+            "lane": "empty",
+            "runtime": "codex",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "pool_ids": [
+            "empty"
+          ],
+          "reason": "exhausted",
+          "runtime": "codex"
+        }
+      ],
+      "routes": [
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "two"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": 2,
+              "route_id": "two",
+              "runtime": "codex"
+            }
+          ],
+          "limiting_key": {
+            "lane": "two",
+            "runtime": "codex",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "two"
+          ],
+          "priority": 2.6666666666666665,
+          "reset_credit_multiplier": 1.6666666666666665,
+          "reset_credits": 2,
+          "runtime": "codex",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "two",
+                "runtime": "codex",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6000000000000001
+            }
+          ]
+        },
+        {
+          "aliases": [
+            {
+              "account": null,
+              "pool_ids": [
+                "one"
+              ],
+              "quota_lane": "lane",
+              "reset_credits": 1,
+              "route_id": "one",
+              "runtime": "codex"
+            }
+          ],
+          "limiting_key": {
+            "lane": "one",
+            "runtime": "codex",
+            "source": "source",
+            "target": null,
+            "window": "window"
+          },
+          "limiting_reset_at": 4600.0,
+          "minimum_remaining_percent": 80.0,
+          "multiplier": 1.0,
+          "pool_ids": [
+            "one"
+          ],
+          "priority": 2.4000000000000004,
+          "reset_credit_multiplier": 1.5,
+          "reset_credits": 1,
+          "runtime": "codex",
+          "score": 1.6,
+          "windows": [
+            {
+              "burn_percent_per_hour": null,
+              "burn_span_seconds": null,
+              "key": {
+                "lane": "one",
+                "runtime": "codex",
+                "source": "source",
+                "target": null,
+                "window": "window"
+              },
+              "marker": "warmup",
+              "projected_percent": null,
+              "remaining_percent": 80.0,
+              "reset_at": 4600.0,
+              "risk": "low",
+              "slack": 0.6000000000000001
+            }
+          ]
+        }
+      ],
+      "unavailable_runtimes": []
+    }
+  }
+]

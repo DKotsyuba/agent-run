@@ -1,0 +1,19 @@
+usage: agent-run resume [-h] (--task TASK | --task-file TASK_FILE)
+                        [--timeout TIMEOUT] [--request-id REQUEST_ID]
+                        [--session-transport SESSION_TRANSPORT]
+                        [--session-id SESSION_ID]
+                        [--session-turn-id SESSION_TURN_ID]
+                        agent_id
+
+positional arguments:
+  agent_id
+
+options:
+  -h, --help            show this help message and exit
+  --task TASK
+  --task-file TASK_FILE
+  --timeout TIMEOUT
+  --request-id REQUEST_ID
+  --session-transport SESSION_TRANSPORT
+  --session-id SESSION_ID
+  --session-turn-id SESSION_TURN_ID

@@ -1,0 +1,7 @@
+usage: agent-run hook [-h] {context,bind} ...
+
+positional arguments:
+  {context,bind}
+
+options:
+  -h, --help      show this help message and exit

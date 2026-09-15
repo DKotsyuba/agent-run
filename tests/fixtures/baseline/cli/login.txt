@@ -1,0 +1,8 @@
+usage: agent-run login [-h] [--account ACCOUNT] runtime
+
+positional arguments:
+  runtime
+
+options:
+  -h, --help         show this help message and exit
+  --account ACCOUNT
