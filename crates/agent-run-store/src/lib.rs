@@ -1,4 +1,6 @@
 //! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
+/// Atomic durable admission, replay, and active-capacity reservation.
+pub mod admission;
 /// Read-only diagnostic and active-context snapshots.
 pub mod diagnostics;
 /// Durable append-only journal operations and bounded transcript spooling.
@@ -6,14 +8,13 @@ pub mod journal;
 pub mod migrations;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
-use agent_run_config::config::Config;
 use agent_run_domain::{
     domain::{self, now, AgentId, Outcome, StartRequest, Status},
     error::invalid,
     Error, Result,
 };
 use agent_run_platform::{
-    fs, process,
+    fs,
     verify::{self, Proof},
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -117,7 +118,7 @@ impl Record {
         })
     }
 }
-fn tx_event(
+pub(crate) fn tx_event(
     tx: &Transaction<'_>,
     id: &AgentId,
     kind: &str,
@@ -239,129 +240,6 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(id.to_string()))
-    }
-    /// Read a scoped replay before consulting mutable configuration. The
-    /// transaction in admit still resolves concurrent first submissions.
-    pub fn replay_request(&self, request: &StartRequest) -> Result<Option<Record>> {
-        let Some(id) = request.request_id.as_deref() else {
-            return Ok(None);
-        };
-        let transport = request.orchestrator.as_ref().map(|o| o.transport.as_str());
-        let session = request
-            .orchestrator
-            .as_ref()
-            .map(|o| o.external_session_id.as_str());
-        Ok(self.conn.query_row("SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id WHERE a.request_id=? AND ((? IS NULL AND a.orchestrator_session_id IS NULL) OR (o.transport=? AND o.external_session_id=?)) ORDER BY a.created_at LIMIT 1",params![id,transport,transport,session],Record::read).optional()?)
-    }
-    pub fn admit(
-        &mut self,
-        request: &StartRequest,
-        cfg: &Config,
-        identity: &Value,
-        parent: Option<&Record>,
-    ) -> Result<(AgentId, bool)> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = now();
-        let session = if let Some(o) = &request.orchestrator {
-            let sid = format!("os-{}", uuid::Uuid::new_v4().simple());
-            tx.execute("INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transport,external_session_id) DO UPDATE SET last_seen_at=excluded.last_seen_at,external_turn_id=excluded.external_turn_id",params![sid,o.transport,o.external_session_id,o.external_turn_id,current,current])?;
-            Some(tx.query_row(
-                "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
-                params![o.transport, o.external_session_id],
-                |r| r.get::<_, String>(0),
-            )?)
-        } else {
-            None
-        };
-        if let Some(rid) = &request.request_id {
-            let found=tx.query_row("SELECT * FROM agents WHERE request_id=? AND orchestrator_session_id IS ? ORDER BY created_at LIMIT 1",params![rid,session],Record::read).optional()?;
-            if let Some(found) = found {
-                let same_fingerprint = identity
-                    .get("replay_request_sha256")
-                    .and_then(Value::as_str)
-                    .zip(
-                        found
-                            .identity
-                            .as_ref()
-                            .and_then(|v| v.get("replay_request_sha256"))
-                            .and_then(Value::as_str),
-                    )
-                    .map(|(current, previous)| current == previous);
-                if !same_fingerprint.unwrap_or(found.request == *request)
-                    || found.parent_agent_id.as_ref() != parent.map(|p| &p.id)
-                {
-                    return Err(Error::Conflict);
-                }
-                tx.commit()?;
-                return Ok((found.id, false));
-            }
-        }
-        let global: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL}"),
-            [],
-            |r| r.get(0),
-        )?;
-        let runtime_count: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL} AND runtime=?"),
-            [&request.runtime],
-            |r| r.get(0),
-        )?;
-        let runtime = cfg.runtime(&request.runtime)?;
-        if global >= cfg.core.max_active_agents as i64
-            || runtime
-                .max_active_agents
-                .is_some_and(|max| runtime_count >= max as i64)
-        {
-            return Err(Error::Capacity);
-        }
-        if let Some(parent) = parent {
-            let actual = tx.query_row(
-                "SELECT * FROM agents WHERE id=?",
-                [parent.id.as_str()],
-                Record::read,
-            )?;
-            if !actual.status.terminal() || actual.runtime_session_id.is_none() {
-                return Err(invalid(
-                    "resume requires a terminal agent with native session identity",
-                ));
-            }
-            let exists: i64 = tx.query_row(
-                "SELECT count(*) FROM agents WHERE parent_agent_id=?",
-                [parent.id.as_str()],
-                |r| r.get(0),
-            )?;
-            if exists > 0 {
-                return Err(Error::Conflict);
-            }
-        }
-        let id = AgentId::new();
-        let summary: String = request
-            .task
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(160)
-            .collect();
-        let root = parent
-            .map(|p| p.root_agent_id.as_str())
-            .unwrap_or(id.as_str());
-        tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,'pending:materialization',?,?,?,?,?)",params![id.as_str(),request.request_id,session,request.runtime,request.model,request.profile,request.task,summary,request.workdir.to_string_lossy(),serde_json::to_string(request)?,current,request.timeout_seconds.unwrap_or(cfg.core.default_timeout_seconds),parent.map(|p|p.id.as_str()),root,parent.map(|p|p.sequence.checked_add(1).ok_or_else(||invalid("lineage sequence overflow"))).transpose()?.unwrap_or(1),parent.and_then(|p|p.runtime_session_id.as_deref()),serde_json::to_string(identity)?])?;
-        if let Ok(owner) = process::inspect(std::process::id() as i32) {
-            tx.execute("UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",params![serde_json::to_string(&owner)?,owner.birth,id.as_str()])?;
-        }
-        tx_event(
-            &tx,
-            &id,
-            "status",
-            Some(Status::Created),
-            Some(Status::Starting),
-            &json!({"durable_admission":true}),
-        )?;
-        tx.commit()?;
-        Ok((id, true))
     }
     pub fn event(&self, id: &AgentId, kind: &str, data: &Value) -> Result<()> {
         self.conn.execute(

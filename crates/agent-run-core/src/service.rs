@@ -4,7 +4,6 @@ use crate::{
     config::{Adapter, Config},
     domain::{now, AgentId, OrchestratorRef, Outcome, StartRequest, Status},
     error::invalid,
-    fs,
     policy::{self, EffectivePolicy},
     process::{self, ProcessState},
     profiles::{self, Profile},
@@ -13,12 +12,10 @@ use crate::{
     verify::{self, Proof},
     Error, Result,
 };
+use agent_run_config::role_plan;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,7 +103,8 @@ impl Service {
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;
-        let fingerprint = fs::sha256(&fs::canonical_json(&serde_json::to_value(&request)?)?);
+        let fingerprint =
+            agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
         {
             let store = Store::open(&self.home)?;
             if let Some(row) = store.replay_request(&request)? {
@@ -137,6 +135,26 @@ impl Service {
         request.write = profile.write;
         request.read_roots = profile.read_roots.clone();
         request.required_constraints = profile.required_constraints.clone();
+        let role_plan = profile
+            .canonical
+            .then(|| {
+                role_plan::resolve_role_plan(
+                    &profile,
+                    config.skills_dir(),
+                    &config.mcp,
+                    if request.account.is_some() {
+                        "account"
+                    } else {
+                        "global"
+                    },
+                    request.account.as_deref(),
+                )
+            })
+            .transpose()?;
+        let config_revision = role_plan
+            .as_ref()
+            .map(|plan| plan.config_revision.as_str())
+            .unwrap_or("pending:materialization");
         adapters::validate(&request, runtime, &profile)?;
         let policy = policy::evaluate(&request.runtime, runtime, &profile);
         policy.admit()?;
@@ -149,7 +167,8 @@ impl Service {
             runtime_home: None,
             snapshot_sha256: None,
         };
-        self.admit(request, &config, identity, None).await
+        self.admit(request, &config, identity, None, config_revision)
+            .await
     }
     async fn admit(
         &self,
@@ -157,10 +176,17 @@ impl Service {
         config: &Config,
         identity: LaunchIdentity,
         parent: Option<&Record>,
+        config_revision: &str,
     ) -> Result<Value> {
         let (id, created) = {
             let mut store = Store::open(&self.home)?;
-            store.admit(&request, config, &serde_json::to_value(identity)?, parent)?
+            store.admit_with_config_revision(
+                &request,
+                config,
+                config_revision,
+                &serde_json::to_value(identity)?,
+                parent,
+            )?
         };
         if created {
             // A failed READY read does not cancel an already admitted durable job.
@@ -225,7 +251,14 @@ impl Service {
             request.orchestrator = orchestrator;
         }
         request.validate()?;
-        self.admit(request, &current, identity, Some(&parent)).await
+        self.admit(
+            request,
+            &current,
+            identity,
+            Some(&parent),
+            "pending:materialization",
+        )
+        .await
     }
     pub fn cancel(&self, id: &AgentId) -> Result<Value> {
         Store::open(&self.home)?.enqueue(id, "cancel", &json!({}))
