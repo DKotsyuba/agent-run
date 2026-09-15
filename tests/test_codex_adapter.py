@@ -20,6 +20,7 @@ from agent_run.adapters.codex import adapter as codex_adapter
 from agent_run.adapters.codex.adapter import ADAPTER, _rollout_limits
 from agent_run.adapters.codex import app_server
 from agent_run.adapters.codex import environment as codex_environment
+from agent_run.adapters.codex import permissions as codex_permissions
 from agent_run.adapters.snapshots import (
     inspect_runtime_snapshots,
     runtime_snapshot_index_sha256,
@@ -33,8 +34,12 @@ from role_helpers import resolved_role
 
 class CodexAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
+        """Create isolated runtime fixtures without consulting host policy files."""
         self._stack = []
         self.agent_run_root = Path(self._mkdtemp())
+        system_patch = patch.object(codex_permissions, "SYSTEM_REQUIREMENTS", self.agent_run_root / "requirements.toml")
+        system_patch.start()
+        self.addCleanup(system_patch.stop)
         (self.agent_run_root / "skills" / "codex" / "demo").mkdir(parents=True)
         (self.agent_run_root / "skills" / "codex" / "demo" / "SKILL.md").write_text(
             "demo skill", encoding="utf-8"
@@ -240,6 +245,45 @@ env_from = ["PATH"]
         self.assertIn('pattern=["curl"]', rules)
         self.assertIn(f'pattern=["{curl}"]', rules)
         self.assertIn('decision="prompt"', rules)
+
+    def test_managed_projects_uses_one_definition_and_verifies_all_write_roots(self) -> None:
+        """Shared system policy supplies roots without colliding with child config."""
+        projects = Path(self._mkdtemp()).resolve()
+        cache = projects.parent / ".cache/uv"
+        system = projects / "requirements.toml"
+        system.write_text(
+            '[permissions.Projects]\nextends = ":workspace"\n'
+            '[permissions.Projects.workspace_roots]\n'
+            f'{json.dumps(str(projects))} = true\n'
+            '[permissions.Projects.filesystem]\n'
+            f'{json.dumps(str(cache))} = "write"\n', encoding="utf-8",
+        )
+        config = self.runtime_config(workspace_root=projects)
+        with patch.object(codex_permissions, "SYSTEM_REQUIREMENTS", system):
+            ADAPTER.materialize(config, self.home, mcp_servers={})
+            generated = tomllib.loads((self.home / "config.toml").read_text())
+            self.assertEqual(generated["default_permissions"], "Projects")
+            self.assertNotIn("permissions", generated)
+            self.assertEqual(codex_permissions.system_write_roots(config), tuple(sorted((str(projects), str(cache)))))
+            self.assertEqual(codex_permissions.system_cache_environment(config), {"UV_CACHE_DIR": str(cache)})
+            workdir = projects / "repo"
+            workdir.mkdir()
+            plan = self.prepare(self.start_request(write=True, workdir=workdir), AgentProfile("implement", "body", True, ()), config)
+            self.assertEqual(plan.adapter_state["writable_roots"], tuple(sorted((str(projects), str(cache)))))
+            self.assertEqual(plan.adapter_state["permission_profile"], "Projects")
+            readonly = self.prepare(self.start_request(workdir=workdir), AgentProfile("review", "body", False, ()), config)
+            self.assertEqual(readonly.adapter_state["permission_profile"], ":read-only")
+            self.assertEqual(readonly.adapter_state["writable_roots"], ())
+            params = codex_permissions.thread_grant_params(str(workdir), "gpt-5.6-sol", "read-only", "never", (str(workdir),), False, permission_profile=":read-only")
+            self.assertEqual(params["permissions"], ":read-only")
+            self.assertNotIn("sandbox", params)
+            with self.assertRaisesRegex(ValidationError, "not granted"):
+                codex_permissions.system_write_roots(replace(config, workspace_root=projects / "other"))
+            with self.assertRaisesRegex(ValidationError, "workspace_network"):
+                codex_permissions.system_write_roots(replace(config, workspace_network=True))
+            system.write_text("permissions = 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "permissions table"):
+                codex_permissions.system_write_roots(config)
 
     def test_legacy_environment_only_retains_native_denial_rules(self) -> None:
         """Ignore legacy path/variables while retaining command denials."""
@@ -1166,7 +1210,9 @@ env_from = ["PATH"]
             self.start_request(write=True, workdir=workdir), writable_profile, config
         )
         self.assertEqual(writable.adapter_state["roots"], (str(workdir),))
-        self.assertEqual(writable.adapter_state["writable_roots"], (str(projects),))
+        self.assertEqual(writable.adapter_state["writable_roots"], tuple(sorted((
+            str(projects), *(str(path) for path in codex_permissions.runtime_cache_paths(self.home)),
+        ))))
         self.assertEqual(writable.adapter_state["permission_profile"], "Projects")
 
         read_only_profile = AgentProfile("review", "body", False, ())

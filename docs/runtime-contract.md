@@ -31,6 +31,17 @@ Go cache directories write access so normal tests stay sandboxed instead of
 requesting a boundary escalation, while the generated auth bridge is denied to
 shell tools. A declared DCG `PreToolUse` hook is an additional deny-only layer.
 
+When the host's `/etc/codex/requirements.toml` defines `Projects`, ordinary write
+roles select it instead of generating a conflicting duplicate. The existing
+`workspace_root` must be explicitly granted by that managed profile and
+`workspace_network` must agree with it. Agent-run verifies its effective
+write roots and uses its granted uv, npm, pip, and Go cache locations; existing
+host `CARGO_HOME` forwarding remains unchanged. A mismatched policy fails the
+launch rather than silently changing its scope; without a managed definition,
+the standalone generated profile is retained. Desktop and phone
+Remote on the same host can use that same definition. This behavior does not
+select Full Access or relax a read-only role.
+
 ## Canonical roles
 
 `[profiles].directory` contains one Markdown file per role. A revisioned role is

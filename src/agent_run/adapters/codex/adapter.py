@@ -53,11 +53,12 @@ from .environment import (
 from .skills import prune_skills
 from .toml import toml_string as _toml_string
 from .permissions import (
+    launch_permissions,
+    system_cache_environment,
     PROJECTS_PROFILE,
     permission_request_hook,
     render_mcp_config,
     render_permission_profile,
-    workspace_roots,
 )
 
 
@@ -608,15 +609,10 @@ class CodexAdapter:
             raise ValidationError(f"codex home is not materialized: {home_path}")
 
         workdir = resolved_directory(request.workdir, "workdir")
-        roots, writable_roots = workspace_roots(
-            workdir, role.read_roots, config.workspace_root, effective_write
+        roots, writable_roots, permission_profile = launch_permissions(
+            config, home_path, workdir, role.read_roots, effective_write, role.network
         )
         sandbox_mode = "workspace-write" if effective_write else "read-only"
-        permission_profile = PROJECTS_PROFILE if (
-            effective_write and config.workspace_root is not None and not role.network
-        ) else None
-        if permission_profile is not None:
-            roots = (str(workdir),)
 
         # ``HOME`` is part of the isolation, not a convenience: the engine
         # resolves its personal skill/plugin roots (``~/.agents/skills``,
@@ -647,6 +643,8 @@ class CodexAdapter:
             # recovery succeeds. Write-capable agents spool natively and must
             # not get this fallback.
             environment["TOKENPIPE_POST_REPLACE"] = "1"
+        if permission_profile == PROJECTS_PROFILE:
+            environment.update(system_cache_environment(config))
         adapter_state = {
             "model": request.model,
             "effort": request.effort,

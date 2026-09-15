@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,108 @@ from .toml import toml_array, toml_string
 
 #: Shared user-visible name for the broad working-projects permission profile.
 PROJECTS_PROFILE = "Projects"
+
+#: Native system layer shared with Desktop and phone Remote on the same host.
+SYSTEM_REQUIREMENTS = Path("/etc/codex/requirements.toml")
+
+
+def system_projects() -> dict[str, object] | None:
+    """Read the system Projects definition, or return None when it is absent.
+
+    Returns a dict of non-secret policy settings only. Invalid TOML or an
+    unreadable existing file raises ValidationError; credential files are never
+    accessed. This prevents redefining a managed profile in an isolated home.
+    """
+    try:
+        data = tomllib.loads(SYSTEM_REQUIREMENTS.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise ValidationError("Cannot load system Codex permission policy") from error
+    profiles = data.get("permissions", {})
+    if not isinstance(profiles, dict):
+        raise ValidationError("Invalid system Codex permissions table")
+    profile = profiles.get(PROJECTS_PROFILE)
+    if profile is not None and not isinstance(profile, dict):
+        raise ValidationError("Invalid system Projects definition")
+    return profile
+
+
+def system_write_roots(config: RuntimeConfig) -> tuple[str, ...] | None:
+    """Return managed write roots, validating the requested RuntimeConfig scope.
+
+    None means the host has no managed definition, or no root is requested. A project
+    root must be explicitly granted by the system profile; a mismatch raises
+    ValidationError. Paths are normalized without reading their contents.
+    """
+    if config.workspace_root is None:
+        return None
+    policy = system_projects()
+    if policy is None:
+        return None
+    projects = policy.get("workspace_roots", {})
+    if not isinstance(projects, dict) or projects.get(str(config.workspace_root)) is not True:
+        raise ValidationError("Codex workspace_root is not granted by system Projects")
+    filesystem = policy.get("filesystem", {})
+    if not isinstance(filesystem, dict) or policy.get("extends") != ":workspace":
+        raise ValidationError("Unsupported system Projects filesystem policy")
+    network = policy.get("network", {})
+    if not isinstance(network, dict) or network.get("enabled", False) is not config.workspace_network:
+        raise ValidationError("Codex workspace_network differs from system Projects")
+    roots = [path for path, enabled in projects.items() if enabled is True]
+    roots.extend(path for path, access in filesystem.items() if access == "write" and not path.startswith(":"))
+    return tuple(sorted({str(Path(path).expanduser().resolve()) for path in roots}))
+
+
+def system_cache_environment(config: RuntimeConfig) -> dict[str, str]:
+    """Return test-cache environment variables for explicit managed write roots.
+
+    config (RuntimeConfig) requests an authorized workspace root. The returned
+    dict[str, str] contains only cache locations actually granted for writes;
+    absent settings yield an empty dict. Host auth/config paths are not copied.
+    """
+    roots = system_write_roots(config)
+    if roots is None:
+        return {}
+    suffixes = {
+        "UV_CACHE_DIR": "/.cache/uv", "npm_config_cache": "/.npm",
+        "PIP_CACHE_DIR": "/Library/Caches/pip", "GOCACHE": "/Library/Caches/go-build",
+    }
+    return {name: root for name, suffix in suffixes.items() for root in roots if root.endswith(suffix)}
+
+
+def runtime_cache_paths(home: Path) -> tuple[Path, ...]:
+    """Return the standalone profile's explicit cache grants below runtime home."""
+    return tuple(Path(home).resolve() / suffix for suffix in (
+        ".cache/uv", ".cargo/registry", ".npm", "Library/Caches/go-build", "Library/Caches/pip",
+    ))
+
+
+def launch_permissions(config: RuntimeConfig, home: Path, workdir: Path,
+                       read_roots: Sequence[Path], write: bool, network: bool
+                       ) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+    """Bind role scope to a named profile without allowing managed default drift.
+
+    Inputs are the validated runtime, isolated home, workdir and role grants.
+    Returns runtime roots, exact effective write roots and an optional profile
+    ID. Managed read-only roles explicitly select the native read-only profile;
+    their role cannot inherit Projects accidentally. Unsupported network grants
+    raise ValidationError rather than widening the role's filesystem access.
+    """
+    roots, writable = workspace_roots(workdir, read_roots, config.workspace_root, write)
+    managed = system_projects() is not None
+    if not write:
+        return roots, writable, ":read-only" if managed else None
+    if config.workspace_root is not None and (managed or not network):
+        if network and not config.workspace_network:
+            raise ValidationError("Network role requires workspace_network with managed Projects")
+        writable = system_write_roots(config) or tuple(sorted((
+            str(config.workspace_root), *(str(path) for path in runtime_cache_paths(home)),
+        )))
+        return (str(workdir),), writable, PROJECTS_PROFILE
+    if managed and network:
+        raise ValidationError("Network role requires workspace_root with managed Projects")
+    return roots, writable, ":workspace" if managed else None
 
 
 class VerificationError(ValidationError):
@@ -139,7 +242,7 @@ def verify_effective_params(
 def render_permission_profile(
     config: RuntimeConfig, home: Path, auth_target: str | None
 ) -> list[str]:
-    """Return a generated ``Projects`` profile for one isolated Codex home.
+    """Select managed Projects or generate a standalone isolated-home profile.
 
     ``config.workspace_root`` is the operator-authorized working tree. Missing
     configuration returns an empty list. ``home`` is the absolute generated
@@ -148,20 +251,18 @@ def render_permission_profile(
     or ``None`` when the runtime has no file bridge; a present target is denied
     to shell tools. The profile inherits Codex platform defaults, writes the
     working tree, denies common project secrets, and uses the configured
-    shell-network setting without a root-wide read deny.
+    shell-network setting without a root-wide read deny. When the host defines
+    managed Projects, validate its scope and return only the selector; the
+    system definition must not be duplicated in config.
     """
 
     if config.workspace_root is None:
         return []
+    if system_write_roots(config) is not None:
+        return [f'default_permissions = "{PROJECTS_PROFILE}"', ""]
     root = toml_string(str(config.workspace_root))
     runtime_home = Path(home).resolve()
-    cache_paths = (
-        runtime_home / ".cache/uv",
-        runtime_home / ".cargo/registry",
-        runtime_home / ".npm",
-        runtime_home / "Library/Caches/go-build",
-        runtime_home / "Library/Caches/pip",
-    )
+    cache_paths = runtime_cache_paths(runtime_home)
     auth_path = None if auth_target is None else runtime_home / auth_target
     return [
         f'default_permissions = "{PROJECTS_PROFILE}"',
@@ -201,9 +302,9 @@ def thread_grant_params(
 ) -> dict[str, object]:
     """Return thread start/resume fields for a profile or legacy sandbox.
 
-    Named ``permission_profile`` sessions omit legacy ``sandbox`` and
-    ``runtimeWorkspaceRoots`` so the generated ``default_permissions`` profile
-    remains authoritative. Legacy read-only or network sessions retain the
+    Named sessions send an explicit ``permissions`` selector so a persisted or
+    system default cannot override their role. Projects derives runtime roots
+    from cwd; built-ins retain explicit read roots. Legacy sessions retain the
     existing explicit sandbox and root contract. Reviewer routing is included
     only when configured.
     """
@@ -213,7 +314,11 @@ def thread_grant_params(
         "model": model,
         "approvalPolicy": approval_policy,
     }
-    if permission_profile is None:
+    if permission_profile is not None:
+        params["permissions"] = permission_profile
+        if permission_profile != PROJECTS_PROFILE:
+            params["runtimeWorkspaceRoots"] = list(roots)
+    else:
         params.update(
             {"sandbox": sandbox_mode, "runtimeWorkspaceRoots": list(roots)}
         )
