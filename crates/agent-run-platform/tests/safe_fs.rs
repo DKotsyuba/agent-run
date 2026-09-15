@@ -155,6 +155,18 @@ fn runtime_skills_dir_rejects_traversal() {
     assert!(paths::runtime_skills_dir("   ", home).is_err());
 }
 
+/// Mirrors `paths.py:agent_dir`'s `validate_agent_id` call: a well-formed id
+/// is accepted, and traversal or freeform text is rejected outright, not
+/// silently joined beneath `agents/`.
+#[test]
+fn agent_dir_requires_a_well_formed_agent_id() {
+    let root = tempdir();
+    let home = Some(root.path().to_path_buf());
+    assert!(paths::agent_dir("ag-20260101-000000-abcdef0123", home.clone()).is_ok());
+    assert!(paths::agent_dir("../../etc/passwd", home.clone()).is_err());
+    assert!(paths::agent_dir("not-an-agent-id", home).is_err());
+}
+
 /// Mirrors `paths.py:create_agent_dir`'s private (`0700`) directory mode on
 /// every level it creates.
 #[test]

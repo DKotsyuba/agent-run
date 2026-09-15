@@ -1,9 +1,10 @@
 //! Resolved paths below the private agent-run home, matching `paths.py`.
 use crate::fs;
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{domain::AgentId, error::invalid, Result};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
+    str::FromStr,
 };
 
 /// Root of the private agent-run home. Delegates to [`fs::home`], which
@@ -59,16 +60,18 @@ fn require_beneath(root: &Path, candidate: &Path) -> Result<()> {
 }
 
 /// The directory owned by one agent id: `<home>/agents/<agent_id>`
-/// (`paths.py:agent_dir`). `agent_id` must already be a validated
-/// `AgentId::as_str()` value; its fixed `ag-YYYYMMDD-HHMMSS-<hex10>` shape
-/// contains no path separators, so no traversal is possible through it, but
-/// `home` itself is still checked in case a caller supplied a `home` whose
-/// `agents` subdirectory (e.g. via a symlinked ancestor) would land outside it.
+/// (`paths.py:agent_dir`, which validates through `validate_agent_id`
+/// first). Rejecting anything but a well-formed `AgentId` up front, before
+/// the join, is what makes this a private per-agent directory rather than a
+/// generic freeform path; its fixed `ag-YYYYMMDD-HHMMSS-<hex10>` shape also
+/// contains no path separators, so [`require_beneath`] below can never
+/// actually fire for it, unlike [`runtime_skills_dir`]'s freeform component.
 pub fn agent_dir(agent_id: &str, home: Option<PathBuf>) -> Result<PathBuf> {
+    let id = AgentId::from_str(agent_id)?;
     let root = agent_run_home(home)?;
     let agents_root = root.join("agents");
     require_beneath(&root, &agents_root)?;
-    let candidate = agents_root.join(agent_id);
+    let candidate = agents_root.join(id.as_str());
     require_beneath(&agents_root, &candidate)?;
     Ok(candidate)
 }
