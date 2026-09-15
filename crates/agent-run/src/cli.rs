@@ -119,30 +119,14 @@ pub struct SessionArgs {
     pub session_turn_id: Option<String>,
 }
 impl SessionArgs {
-    fn resolve(&self, infer: bool) -> Result<Option<OrchestratorRef>> {
+    /// Validates and converts explicitly supplied session fields, if any.
+    fn resolve(&self) -> Result<Option<OrchestratorRef>> {
         let value = match (&self.session_transport, &self.session_id) {
             (Some(transport), Some(session)) => Some(OrchestratorRef {
                 transport: transport.clone(),
                 external_session_id: session.clone(),
                 external_turn_id: self.session_turn_id.clone(),
             }),
-            (None, None) if infer => {
-                if let Ok(id) = std::env::var("CODEX_THREAD_ID") {
-                    Some(OrchestratorRef {
-                        transport: "codex_queue".into(),
-                        external_session_id: id,
-                        external_turn_id: None,
-                    })
-                } else if let Ok(id) = std::env::var("CLAUDE_SESSION_ID") {
-                    Some(OrchestratorRef {
-                        transport: "claude_uds".into(),
-                        external_session_id: id,
-                        external_turn_id: None,
-                    })
-                } else {
-                    None
-                }
-            }
             (None, None) => None,
             _ => return Err(invalid("session transport and ID are required together")),
         };
@@ -501,7 +485,7 @@ pub fn launchd(
     let args = match kind {
         "api" => vec!["api", "serve"],
         "capacity" => vec!["capacity", "collect", "--once"],
-        "delivery" => vec!["delivery", "dispatch", "--once"],
+        "delivery" => vec!["delivery", "dispatch"],
         _ => return Err(invalid("unknown launchd job")),
     };
     let mut argv = vec![
@@ -612,7 +596,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                     .map(|p| absolute(p))
                     .collect::<Result<_>>()?,
                 output_schema: schema,
-                orchestrator: a.session.resolve(false)?,
+                orchestrator: a.session.resolve()?,
                 request_id: a.request_id,
                 account: a.account,
                 required_constraints: BTreeSet::<Constraint>::new(),
@@ -636,7 +620,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 (None, Some(path)) => read_input(&path, 1024 * 1024)?,
                 _ => return Err(invalid("provide exactly one resume task source")),
             };
-            let result=transport::socket::client(&home,"resume",json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve(false)?})).await?;
+            let result=transport::socket::client(&home,"resume",json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?})).await?;
             emit(&admission_output(&result)?)?;
         }
         Command::Cancel { agent_id } => emit(&service.cancel(&agent_id)?)?,
@@ -664,7 +648,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                     limit: a.limit,
                     after_revision: None,
                     wait_seconds: 0.0,
-                    orchestrator: a.session.resolve(false)?,
+                    orchestrator: a.session.resolve()?,
                 })
                 .await?,
         )?,
