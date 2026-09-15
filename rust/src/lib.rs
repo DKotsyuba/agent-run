@@ -3,6 +3,7 @@
 #[cfg(not(unix))]
 compile_error!("agent-run currently requires macOS or Linux (Unix sockets and process groups)");
 pub mod adapters;
+pub mod canonical;
 pub mod capacity;
 pub mod cli;
 pub mod config;

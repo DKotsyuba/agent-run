@@ -1,3 +1,12 @@
+[workspace]
+# This worktree checks out its own branch (rust/spike-canonical) with the
+# pre-workspace single-crate layout. The parent worktree's filesystem tree
+# now has its own root Cargo.toml with an unrelated `[workspace]` (a
+# concurrent Cargo-workspace restructuring on a different branch); without
+# this empty table, Cargo's upward directory search finds that file and
+# refuses to build a crate that isn't in its `members`. This does not touch
+# that other worktree's checkout.
+
 [package]
 name = "agent-run"
 version = "0.12.0-dev.1"
