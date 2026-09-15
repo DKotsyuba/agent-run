@@ -45,15 +45,30 @@ const V1_TABLES: &[&str] = &[
 /// Every migration file, ordered by the version it produces, embedded at
 /// compile time so the binary needs no data directory alongside it.
 const PENDING_FILES: &[(i64, &str)] = &[
-    (2, include_str!("../../../sql/migrations/002_workflow_tables.sql")),
-    (3, include_str!("../../../sql/migrations/003_workflow_run_plan.sql")),
-    (4, include_str!("../../../sql/migrations/004_workflow_deliveries.sql")),
-    (5, include_str!("../../../sql/migrations/005_workflow_run_result.sql")),
+    (
+        2,
+        include_str!("../../../sql/migrations/002_workflow_tables.sql"),
+    ),
+    (
+        3,
+        include_str!("../../../sql/migrations/003_workflow_run_plan.sql"),
+    ),
+    (
+        4,
+        include_str!("../../../sql/migrations/004_workflow_deliveries.sql"),
+    ),
+    (
+        5,
+        include_str!("../../../sql/migrations/005_workflow_run_result.sql"),
+    ),
     (
         6,
         include_str!("../../../sql/migrations/006_repair_workflow_foreign_keys.sql"),
     ),
-    (7, include_str!("../../../sql/migrations/007_delivery_expired_state.sql")),
+    (
+        7,
+        include_str!("../../../sql/migrations/007_delivery_expired_state.sql"),
+    ),
     (8, include_str!("../../../sql/migrations/008_run_stats.sql")),
     (
         9,
@@ -63,14 +78,26 @@ const PENDING_FILES: &[(i64, &str)] = &[
         10,
         include_str!("../../../sql/migrations/010_capacity_route_snapshots.sql"),
     ),
-    (11, include_str!("../../../sql/migrations/011_startup_owner.sql")),
+    (
+        11,
+        include_str!("../../../sql/migrations/011_startup_owner.sql"),
+    ),
     (
         12,
         include_str!("../../../sql/migrations/012_workflow_delivery_generation.sql"),
     ),
-    (13, include_str!("../../../sql/migrations/013_agent_lineage.sql")),
-    (14, include_str!("../../../sql/migrations/014_process_birth.sql")),
-    (15, include_str!("../../../sql/migrations/015_request_id_lookup.sql")),
+    (
+        13,
+        include_str!("../../../sql/migrations/013_agent_lineage.sql"),
+    ),
+    (
+        14,
+        include_str!("../../../sql/migrations/014_process_birth.sql"),
+    ),
+    (
+        15,
+        include_str!("../../../sql/migrations/015_request_id_lookup.sql"),
+    ),
     (
         16,
         include_str!("../../../sql/migrations/016_reconciliation_cursors.sql"),
