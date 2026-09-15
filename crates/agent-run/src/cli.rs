@@ -509,9 +509,14 @@ pub fn launchd(
         )
     };
     let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",xml(label),xml(&home_env),xml(&path),xml(&stdout_log.to_string_lossy()),xml(&stderr_log.to_string_lossy()));
-    Ok(json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist}))
+    Ok(if kind == "api" {
+        json!({"label":label,"argv":argv,"plist":plist})
+    } else {
+        json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
+    })
 }
-async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<i32> {
+/// Runs native provider login and returns its process code plus a safe success DTO.
+async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, Value)> {
     let cfg = Config::load(home)?;
     let runtime = cfg.runtime(name)?;
     let kind = runtime.kind()?;
@@ -552,14 +557,17 @@ async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<i32> {
         .stderr(Stdio::inherit())
         .status()
         .await?;
-    Ok(status.code().unwrap_or(1))
+    Ok((
+        status.code().unwrap_or(1),
+        json!({"account":account.unwrap_or("default"),"runtime":name,"status":"ok"}),
+    ))
 }
 /// Executes one parsed command and returns its public process exit status.
 ///
-/// Success writes JSON (except the stdio server and interactive login), while
-/// expected failures propagate as typed errors for `main` to render as the
-/// Python-compatible JSON error envelope. `start` and `resume` exclusively
-/// call the resident socket broker.
+/// Success writes JSON (except the stdio server), while expected failures
+/// propagate as typed errors for `main` to render as the Python-compatible
+/// JSON error envelope. `start` and `resume` exclusively call the resident
+/// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home)?;
     let service = Service::new(home.clone());
@@ -655,7 +663,6 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Answer { agent_id } => {
             let value = service.answer(&agent_id)?;
             emit(&value)?;
-            return Ok(result_code(&value));
         }
         Command::Transcript {
             agent_id,
@@ -782,9 +789,19 @@ pub async fn run(cli: Cli) -> Result<i32> {
             }
         },
         Command::Login { runtime, account } => {
-            return login(&home, &runtime, account.as_deref()).await
+            let (code, value) = login(&home, &runtime, account.as_deref()).await?;
+            if code == 0 {
+                emit(&value)?;
+            }
+            return Ok(code);
         }
-        Command::Auth { label, runtime } => return login(&home, &runtime, Some(&label)).await,
+        Command::Auth { label, runtime } => {
+            let (code, value) = login(&home, &runtime, Some(&label)).await?;
+            if code == 0 {
+                emit(&value)?;
+            }
+            return Ok(code);
+        }
         Command::Supervisor { agent_id } => crate::supervisor::run(&home, &agent_id).await?,
         Command::DenyCommand { name: _ } => {
             eprintln!("agent-run: command denied by the configured developer environment");
