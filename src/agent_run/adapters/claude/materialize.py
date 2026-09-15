@@ -10,10 +10,16 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 from ...config import McpConfig, RuntimeHookConfig
 from ...errors import ValidationError
+from ...native_settings import (
+    CLAUDE_RESERVED_ROOTS,
+    enforce_native_settings,
+    native_settings_json,
+)
 from ..home import content_hash, write_managed_file
 from ..snapshots import snapshot_managed_tree, snapshot_selected_assets
 
@@ -25,16 +31,34 @@ __all__ = [
 ]
 
 
-def render_settings(home: Path, hooks: tuple[RuntimeHookConfig, ...]) -> str:
-    """Write the generated settings.json holding only declared hooks."""
+def render_settings(
+    home: Path,
+    hooks: tuple[RuntimeHookConfig, ...],
+    *,
+    native_settings: Mapping[str, object] = MappingProxyType({}),
+) -> str:
+    """Write the generated settings.json holding declared hooks and tuning.
 
+    ``native_settings`` is the operator-declared preference tree, re-validated
+    against the shared Claude/GLM reserved roots so model/auth/hook/permission
+    control surfaces fail closed. Declared keys are disjoint from the
+    generated ``hooks`` document by construction, so the merge cannot
+    overwrite adapter-owned state. GLM shares this renderer and therefore the
+    same ownership contract.
+    """
+
+    validated = enforce_native_settings(
+        native_settings, CLAUDE_RESERVED_ROOTS, "claude native_settings"
+    )
     grouped: dict[str, list[dict[str, object]]] = {}
     for hook in hooks:
         entry: dict[str, object] = {"hooks": [{"type": "command", "command": shlex.join(hook.command)}]}
         if hook.matcher is not None:
             entry["matcher"] = hook.matcher
         grouped.setdefault(hook.event, []).append(entry)
-    settings = {"hooks": grouped} if grouped else {}
+    settings: dict[str, object] = native_settings_json(validated)
+    if grouped:
+        settings["hooks"] = grouped
     return write_managed_file(home, "settings.json", json.dumps(settings, sort_keys=True))
 
 

@@ -1490,6 +1490,7 @@ class PackagingTests(unittest.TestCase):
         config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(config["project"]["scripts"], {"agent-run": "agent_run.cli:main"})
         self.assertIn("schema.sql", config["tool"]["setuptools"]["package-data"]["agent_run.state"])
+        self.assertIn("*.toml", config["tool"]["setuptools"]["package-data"]["agent_run.adapters.codex"])
 
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
@@ -1514,6 +1515,7 @@ class PackagingTests(unittest.TestCase):
             with tarfile.open(archive, "r:gz") as bundle:
                 names = bundle.getnames()
                 self.assertTrue(any(name.endswith("/agent_run/state/schema.sql") for name in names))
+                self.assertTrue(any(name.endswith("/agent_run/adapters/codex/defaults.toml") for name in names))
                 entry = next(name for name in names if name.endswith(".egg-info/entry_points.txt"))
                 metadata = bundle.extractfile(entry).read().decode("utf-8")
         self.assertIn("agent-run = agent_run.cli:main", metadata)

@@ -25,6 +25,7 @@ from typing import Mapping
 from ...config import RuntimeConfig
 from ...domain import StartRequest
 from ...errors import ValidationError
+from ...native_settings import CLAUDE_RESERVED_ROOTS, enforce_native_settings
 from ...role_plan import ResolvedRolePlan
 from ..base import ADAPTER_API_VERSION, LaunchPlan, RuntimeHealth, RuntimeInfo
 from ..claude.adapter import _KNOWN_HOOK_EVENTS, ClaudeAdapter
@@ -104,6 +105,9 @@ class GlmAdapter(ClaudeAdapter):
                 raise ValidationError(
                     f"runtimes.glm.hooks[{index}].event is not a known Claude hook event: {hook.event!r}"
                 )
+        enforce_native_settings(
+            config.native_settings, CLAUDE_RESERVED_ROOTS, "glm native_settings"
+        )
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
         """Report local binary and credential availability; never calls the network."""

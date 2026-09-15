@@ -29,6 +29,10 @@ workspace_network = true
 models = ["gpt-6-astra"]
 accounts = ["personal2"]
 limits_source = "codex_appserver"
+
+[runtimes.codex.native_settings]
+model_context_window = 500000
+model_auto_compact_token_limit = 400000
 ```
 
 Revisioned Markdown profiles own write/network grants, external read-root policy,
@@ -50,6 +54,37 @@ whose own runtime enforces downstream permissions.
 Omitting an account uses native global auth. An explicit label selects separate
 credential state. Legacy `default_account`, environment, and Rust declarations
 are readable but do not provision tools or redirect unlabelled starts.
+
+`runtimes.<name>.native_settings` retunes a runtime's own generated preference
+file (Codex `config.toml`, Claude/GLM `settings.json`, Qwen `.qwen/settings.json`)
+from this common config, with no Python edits and no package reinstall. The
+table attaches to a runtime you have already declared with its mandatory
+fields; for example, under an existing claude block:
+
+```toml
+[runtimes.claude.native_settings]
+spinnerTipsEnabled = false
+```
+
+Values may be strings, booleans, integers, finite floats, arrays, or nested
+tables; keys are plain identifiers without dots. Codex defaults to a
+1,000,000-token context window and 780,000-token total compaction limit; a
+declared key overrides its default, and omitted keys keep it. Reserved control
+roots are rejected with a validation error instead of being applied: model and
+reasoning-effort selection, provider and auth routing, credentials and
+environment (including `shell_environment_policy`, `notify`, `apiKeyHelper`,
+and the AWS/GCP credential helpers), sandbox, permissions, approvals, hooks and
+hook-disablement, MCP and plugin enablement, and Qwen's `tools.sandbox`. Those
+stay owned by agent-run or the runtime's security model. An
+unknown-but-unreserved key (Codex `model_verbosity`, for instance) is accepted
+as a plain tuning value; that is a convenience, not a safety claim about every
+upstream key. Never place secret values in `native_settings`: auth and
+credential sources are never resolved through it, but the table is persisted
+verbatim in the config snapshot. Edit the TOML, parse it, run
+`agent-run doctor`, then restart or reload the broker: new launches pick up the
+settings. There is no live hot reload, and existing sessions keep the config
+they were prepared with. The config snapshot records the declared settings, so
+a change alters snapshot identity and forces regeneration on the next launch.
 
 Before restarting a service after manual edits, parse the TOML and run
 `agent-run doctor`. Doctor checks binaries and role assets; runtime start does

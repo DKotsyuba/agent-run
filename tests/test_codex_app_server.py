@@ -328,7 +328,7 @@ class VerifyEffectiveParamsTests(unittest.TestCase):
 
 
 class StartSessionTests(unittest.TestCase):
-    def test_projects_profile_uses_generated_default_without_legacy_sandbox(self) -> None:
+    def test_projects_profile_selected_explicitly_without_legacy_sandbox(self) -> None:
         """Write sessions select Projects and omit conflicting legacy fields."""
 
         cwd = Path("/work")
@@ -361,6 +361,7 @@ class StartSessionTests(unittest.TestCase):
         start_session(transport, make_plan(cwd, state), FakeSink())
 
         sent = transport.requests[1][1]
+        self.assertEqual(sent["permissions"], "Projects")
         self.assertNotIn("sandbox", sent)
         self.assertNotIn("runtimeWorkspaceRoots", sent)
         self.assertEqual(sent["approvalPolicy"], "on-request")

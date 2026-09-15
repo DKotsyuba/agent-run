@@ -30,6 +30,11 @@ from agent_run.adapters.home import content_hash, write_managed_file
 from agent_run.adapters.omniroute import pool_samples
 from agent_run.adapters.qwen import plugins as plugin_install
 from agent_run.adapters.qwen.auth import DEFAULT_BASE_URL, keychain_omniroute_api_key
+from agent_run.native_settings import (
+    QWEN_RESERVED_ROOTS,
+    enforce_native_settings,
+    native_settings_json,
+)
 from agent_run.adapters.qwen.skills import materialize_skills, skills_context_note
 from agent_run.adapters.snapshots import finalize_runtime_snapshots
 from agent_run.adapters.version import observe_binary_version
@@ -199,7 +204,7 @@ class QwenAdapter:
         return RuntimeInfo("qwen", ADAPTER_API_VERSION, _CAPABILITIES)
 
     def validate(self, config: RuntimeConfig) -> None:
-        """Validate Qwen's optional environment-auth declaration."""
+        """Validate Qwen's optional environment-auth and native declarations."""
         if config.auth is not None and config.auth.kind != "environment":
             raise ValidationError("qwen runtime auth.kind must be 'environment'")
         unknown = sorted(
@@ -207,6 +212,9 @@ class QwenAdapter:
         )
         if unknown:
             raise ValidationError(f"qwen runtime auth.names has unsupported entries: {', '.join(unknown)}")
+        enforce_native_settings(
+            config.native_settings, QWEN_RESERVED_ROOTS, "qwen native_settings"
+        )
 
     def materialize(
         self,
@@ -237,6 +245,9 @@ class QwenAdapter:
         documented precedence ranks above allow and ask entries. The native
         entries cover the bare name plus the lexical and symlink-resolved
         absolute paths of each denied command found on the final child PATH.
+        Declared ``native_settings`` are merged as additional top-level keys
+        after ownership checks; reserved capability roots (tools.sandbox,
+        mcp, security, permissions, hooks, ...) fail closed.
         """
 
         if skills_root is None:
@@ -285,6 +296,16 @@ class QwenAdapter:
         hooks_document = _hooks_document(config.hooks, plugin_roots)
         if hooks_document:
             document["hooks"] = hooks_document
+        # Declared tuning is disjoint from every adapter-owned root above by
+        # construction (reserved roots fail closed in enforce_native_settings),
+        # so a top-level merge can only add operator preferences.
+        document.update(
+            native_settings_json(
+                enforce_native_settings(
+                    config.native_settings, QWEN_RESERVED_ROOTS, "qwen native_settings"
+                )
+            )
+        )
         text = json.dumps(document, indent=2, sort_keys=True) + "\n"
         write_managed_file(Path(home), ".qwen/settings.json", text)
         fingerprint = "\n".join(

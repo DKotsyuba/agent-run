@@ -26,7 +26,21 @@ turn; read-only and network roles retain the stricter legacy sandbox path. MCP
 declarations preserve native approval modes, and
 only servers explicitly set to `approve` receive the generated narrow
 PermissionRequest allow hook. Unknown tools and every shell call retain normal
-Codex review. A declared DCG `PreToolUse` hook is an additional deny-only layer.
+Codex review. The generated profile grants its isolated uv, Cargo, npm, pip, and
+Go cache directories write access so normal tests stay sandboxed instead of
+requesting a boundary escalation, while the generated auth bridge is denied to
+shell tools. A declared DCG `PreToolUse` hook is an additional deny-only layer.
+
+When the host's `/etc/codex/requirements.toml` defines `Projects`, ordinary write
+roles select it instead of generating a conflicting duplicate. The existing
+`workspace_root` must be explicitly granted by that managed profile and
+`workspace_network` must agree with it. Agent-run verifies its effective
+write roots and uses its granted uv, npm, pip, and Go cache locations; existing
+host `CARGO_HOME` forwarding remains unchanged. A mismatched policy fails the
+launch rather than silently changing its scope; without a managed definition,
+the standalone generated profile is retained. Desktop and phone
+Remote on the same host can use that same definition. This behavior does not
+select Full Access or relax a read-only role.
 
 ## Canonical roles
 
@@ -57,6 +71,33 @@ explicit configured label selects separate credential state for multi-account
 use. `default_account` is accepted only as legacy configuration and is ignored.
 Credential bytes remain in process memory or their native credential store;
 snapshots contain only the `global` choice or account label.
+
+## Native settings
+
+`runtimes.<name>.native_settings` declares tuning values merged into the
+generated native preference file (Codex `config.toml`, Claude/GLM
+`settings.json`, Qwen `.qwen/settings.json`). Values are strict
+scalar/array/table types; TOML has no null and dates, non-finite floats, and
+non-string map keys are rejected. Codex's packaged extended-context defaults
+(1,000,000-token window, 780,000-token total compaction) remain the baseline;
+declared keys override them, omitted keys keep them.
+
+Ownership is explicit: agent-run controls task model/effort, auth/provider
+routing, home/cwd, MCP/tools/skills/plugins, hook trust, sandbox/permissions/
+reviewer, and protocol/output mode. `native_settings` cannot override or
+disable any of these. Known control surfaces — including Codex
+`model_providers`/`openai_base_url`/`approvals_reviewer`/`notify`/`features`,
+Claude `apiKeyHelper`/`statusLine`/credential helpers/hook disablement, and
+Qwen `tools.sandbox`/`mcp`/`security` — fail closed with a validation error
+naming the key. Accepting an unreserved unknown key is convenience tuning, not
+a guarantee that every upstream key is safe to relax.
+
+Changes flow through scoped runtime copies and config snapshots: the snapshot
+records the declared settings verbatim — auth and credential sources are never
+resolved, but the tree is persisted, so secret values must not be placed in it —
+and changed options change snapshot identity and the next launch regenerates
+the native file. Settings apply at launch preparation; running sessions are
+unaffected until relaunch.
 
 ## Readiness
 
