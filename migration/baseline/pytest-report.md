@@ -3,7 +3,7 @@
 Command:
 
 ```text
-PYTHONPATH=src /Users/pluto/projects/agent-run/.venv-py314/bin/python -m pytest -q --rootdir . tests
+PYTHONPATH=src python3.14 -m pytest -q --rootdir . tests
 ```
 
 Exit status: `0`

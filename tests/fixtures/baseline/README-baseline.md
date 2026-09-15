@@ -9,7 +9,7 @@ relative to that commit.
 Regenerate the assigned fixtures from the worktree root with:
 
 ```text
-PYTHONPATH=src AGENT_RUN_HOME=/private/tmp/agent-run-baseline-home HOME=/private/tmp/agent-run-baseline-home /Users/pluto/projects/agent-run/.venv-py314/bin/python migration/tools/capture_baseline.py
+PYTHONPATH=src AGENT_RUN_HOME=/private/tmp/agent-run-baseline-home HOME=/private/tmp/agent-run-baseline-home python3.14 migration/tools/capture_baseline.py
 ```
 
 The generator derives CLI nodes from the live argparse parser, copies the live
