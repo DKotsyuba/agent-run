@@ -14,7 +14,6 @@ import math
 import os
 import shlex
 import time
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -39,11 +38,7 @@ from ..base import (
 )
 from ..command_policy import materialize_refusal_commands, render_codex_denial_rules, render_codex_review_rules
 from ..home import content_hash, create_symlink_bridge, write_managed_file
-from ..snapshots import (
-    finalize_runtime_snapshots,
-    runtime_snapshot_materialize_revision,
-    snapshot_managed_tree,
-)
+from ..snapshots import runtime_snapshot_materialize_revision, snapshot_managed_tree
 from ..plugin_skills import skill_dirs
 from ..version import observe_binary_version
 from . import app_server, model_cache, plugins as plugin_install
@@ -57,6 +52,7 @@ from .environment import (
     resolved_directory,
 )
 from .skills import prune_skills
+from .snapshot import finalize_snapshots, prepare_project_trust
 from .toml import render_effective_native_settings, toml_string as _toml_string
 from .permissions import (
     launch_permissions,
@@ -75,75 +71,6 @@ _LIMITS_STALE_SECONDS = 900
 _ROLLOUT_FILES = 24
 _ROLLOUT_TAIL_BYTES = 262_144
 _ROLLOUT_TAIL_LINES = 2_048
-
-
-def _snapshot_files(config: RuntimeConfig) -> tuple[str, ...]:
-    """Return every flat Codex asset whose exact bytes bind a runtime snapshot.
-
-    ``config`` supplies the declared command refusals, which determine the
-    generated refusal wrappers included alongside the immutable configuration.
-    The returned paths are relative to the generated runtime home and are
-    intentionally limited to adapter-owned files; skills and plugins remain
-    bound through their managed-tree manifests.
-    """
-
-    denied_commands = config.environment.denied_commands if config.environment is not None else ()
-    return (
-        "config.toml",
-        "rules/agent-run-command-policy.rules",
-        "command-refusals/.agent-run-command-policy.json",
-        *(f"command-refusals/{command}" for command in sorted(denied_commands)),
-    )
-
-
-def _finalize_snapshots(config: RuntimeConfig, home: Path, revision: str) -> None:
-    """Bind the current Codex-owned files and declared auth bridge to ``revision``.
-
-    The caller invokes this after a complete materialization or after adding
-    the one native project-trust receipt that Codex would otherwise write on
-    first launch. Auth links are re-derived from ``config`` so their exact
-    target remains part of the index; a missing source fails rather than
-    weakening the link validation.
-    """
-
-    bridge = auth_bridge(config)
-    managed_links: tuple[tuple[str, str], ...] = ()
-    if bridge is not None:
-        source, target = bridge
-        managed_links = ((target, str(source.expanduser().resolve(strict=True))),)
-    finalize_runtime_snapshots(home, revision, _snapshot_files(config), managed_links)
-
-
-def _prepare_project_trust(home: Path, workdir: Path) -> bool:
-    """Write Codex's exact trust receipt for ``workdir`` when it is absent.
-
-    ``home/config.toml`` must be the generated regular file and ``workdir`` is
-    the already-resolved launch directory. Only an absent receipt is appended;
-    an existing receipt must be exactly ``trust_level = \"trusted\"`` so a
-    changed native config is never silently normalized. Returns ``True`` only
-    when bytes were written, allowing the caller to rebind the snapshot index.
-    """
-
-    config_path = home / _CONFIG_REL
-    try:
-        payload = config_path.read_text(encoding="utf-8")
-        document = tomllib.loads(payload)
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise ValidationError(f"codex generated config is unreadable: {error}") from error
-    projects = document.get("projects")
-    if projects is not None and not isinstance(projects, dict):
-        raise ValidationError("codex generated config projects table is invalid")
-    receipt = None if projects is None else projects.get(str(workdir))
-    if receipt is not None:
-        if receipt != {"trust_level": "trusted"}:
-            raise ValidationError("codex generated config project trust receipt changed")
-        return False
-    write_managed_file(
-        home,
-        _CONFIG_REL,
-        payload.rstrip() + f"\n\n[projects.{_toml_string(str(workdir))}]\ntrust_level = \"trusted\"\n",
-    )
-    return True
 
 
 def _read_json(path: Path) -> object | None:
@@ -484,7 +411,7 @@ class CodexAdapter:
             ]
         )
         revision = content_hash(fingerprint)
-        _finalize_snapshots(config, Path(home), revision)
+        finalize_snapshots(config, Path(home), revision)
         return revision
 
     def probe(self, config: RuntimeConfig, home: Path) -> RuntimeHealth:
@@ -675,8 +602,8 @@ class CodexAdapter:
         workdir = resolved_directory(request.workdir, "workdir")
         if resume_session_id is None:
             snapshot_revision = runtime_snapshot_materialize_revision(home_path)
-            if _prepare_project_trust(home_path, workdir):
-                _finalize_snapshots(config, home_path, snapshot_revision)
+            if prepare_project_trust(home_path, workdir):
+                finalize_snapshots(config, home_path, snapshot_revision)
         roots, writable_roots, permission_profile = launch_permissions(
             config, home_path, workdir, role.read_roots, effective_write, role.network
         )

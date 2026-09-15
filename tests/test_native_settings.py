@@ -15,6 +15,7 @@ import re
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -320,7 +321,8 @@ class CodexNativeSettingsMaterialize(NativeSettingsTestCase):
             workspace_root=tree,
             native_settings={"tui": {"theme": "dark"}},
         )
-        CODEX_ADAPTER.materialize(config, config.home, mcp_servers={})
+        with patch("agent_run.adapters.codex.permissions.system_projects", return_value=None):
+            CODEX_ADAPTER.materialize(config, config.home, mcp_servers={})
         document = tomllib.loads((config.home / "config.toml").read_text(encoding="utf-8"))
         self.assertEqual(document["tui"], {"theme": "dark"})
         self.assertEqual(document["default_permissions"], "Projects")
