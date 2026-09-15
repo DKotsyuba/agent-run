@@ -87,8 +87,10 @@ agent-run init
 
 ### Configure
 
-Everything lives in one fail-closed file, `~/.agent-run/config.toml`
-(unknown keys are rejected — a typo cannot silently disable a rule).
+Everything lives in one file, `~/.agent-run/config.toml`. Unknown agent-run
+keys and reserved native control fields are rejected. Keys inside
+`native_settings` use the native engine's preference names; agent-run checks
+their value shapes, not every upstream preference name.
 Minimal single-runtime example:
 
 ```toml

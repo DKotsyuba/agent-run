@@ -60,7 +60,7 @@ def _environment_document(environment: EnvironmentConfig | None) -> object:
 
 
 def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
-    """Return deterministic runtime declarations without credential bytes.
+    """Return deterministic runtime declarations without resolving credentials.
 
     ``config`` (``RuntimeConfig``) supplies every runtime declaration. The
     returned ``dict[str, object]`` contains only deterministic values; auth
