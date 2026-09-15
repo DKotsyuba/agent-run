@@ -114,10 +114,15 @@ pub fn plan(
             }
         }
         let model = if kind == Adapter::Claude && req.model == "fable" {
-            "claude-fable-5-1"
+            "claude-fable-5-1".into()
+        } else if kind == Adapter::Glm {
+            agent_run_adapters::glm::cli_model(&req.model)
         } else {
-            &req.model
+            req.model.clone()
         };
+        if kind == Adapter::Glm {
+            env.insert("ANTHROPIC_MODEL".into(), model.clone());
+        }
         let mut args = vec![
             "--print".into(),
             "--output-format".into(),
@@ -126,7 +131,7 @@ pub fn plan(
             "stream-json".into(),
             "--verbose".into(),
             "--model".into(),
-            model.into(),
+            model,
             "--permission-mode".into(),
             if role.write { "acceptEdits" } else { "default" }.into(),
             "--setting-sources".into(),
@@ -243,7 +248,7 @@ pub async fn run(
                     let accepted=kind!=Adapter::Qwen&&process.send(&json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}})).await.is_ok();
                     store.command_done(cid, &json!({"accepted":accepted}))?;
                     if accepted {
-                        journal(store, &record.id, "user", text, None, None)?;
+                        journal(store, &record.id, "user", &process.redact(text), None, None)?;
                     }
                 }
             }
@@ -258,12 +263,14 @@ pub async fn run(
                     if code != Some(0) && result.outcome.status == Status::Succeeded {
                         result.outcome.status = Status::Failed;
                         result.outcome.failure_kind = Some("nonzero_exit".into());
+                        result.outcome.failure_text = process.diagnostic_tail();
                     }
                     return Ok(result);
                 }
                 let mut outcome = Outcome::failure("missing_result");
                 outcome.exit_code = code;
                 outcome.runtime_session_id = session;
+                outcome.failure_text = process.diagnostic_tail();
                 return Ok(EngineResult {
                     outcome,
                     answer: None,
@@ -271,11 +278,15 @@ pub async fn run(
                 });
             }
             Event::Failure(e) => {
+                let code = process.reap().await;
+                let mut outcome = Outcome::failure(e);
+                outcome.exit_code = code;
+                outcome.failure_text = process.diagnostic_tail();
                 return Ok(EngineResult {
-                    outcome: Outcome::failure(e),
+                    outcome,
                     answer: None,
                     usage: None,
-                })
+                });
             }
         };
         if let Some(s) = v
@@ -297,19 +308,24 @@ pub async fn run(
                         emitted.clear();
                         saw_delta = false;
                     }
-                    Some("content_block_delta") => {
+                    Some("content_block_delta")
                         if event.pointer("/delta/type").and_then(Value::as_str)
-                            == Some("text_delta")
-                        {
-                            if let Some(text) = event.pointer("/delta/text").and_then(Value::as_str)
-                            {
-                                if emitted.len() + text.len() > verify::MAX_ANSWER {
-                                    return Err(invalid("stream output exceeds answer bound"));
-                                }
-                                saw_delta = true;
-                                emitted.push_str(text);
-                                journal(store, &record.id, "assistant", text, None, None)?;
+                            == Some("text_delta") =>
+                    {
+                        if let Some(text) = event.pointer("/delta/text").and_then(Value::as_str) {
+                            if emitted.len() + text.len() > verify::MAX_ANSWER {
+                                return Err(invalid("stream output exceeds answer bound"));
                             }
+                            saw_delta = true;
+                            emitted.push_str(text);
+                            journal(
+                                store,
+                                &record.id,
+                                "assistant",
+                                &process.redact(text),
+                                None,
+                                None,
+                            )?;
                         }
                     }
                     _ => {}
@@ -326,7 +342,9 @@ pub async fn run(
                                 store,
                                 &record.id,
                                 "tool_call",
-                                &serde_json::to_string(block.get("input").unwrap_or(&Value::Null))?,
+                                &process.redact(&serde_json::to_string(
+                                    block.get("input").unwrap_or(&Value::Null),
+                                )?),
                                 block.get("name").and_then(Value::as_str),
                                 block.get("id").and_then(Value::as_str),
                             )?,
@@ -335,10 +353,24 @@ pub async fn run(
                     }
                     if saw_delta {
                         if let Some(tail) = text.strip_prefix(&emitted) {
-                            journal(store, &record.id, "assistant", tail, None, None)?;
+                            journal(
+                                store,
+                                &record.id,
+                                "assistant",
+                                &process.redact(tail),
+                                None,
+                                None,
+                            )?;
                         }
                     } else {
-                        journal(store, &record.id, "assistant", &text, None, None)?;
+                        journal(
+                            store,
+                            &record.id,
+                            "assistant",
+                            &process.redact(&text),
+                            None,
+                            None,
+                        )?;
                     }
                     saw_delta = false;
                     emitted.clear();
@@ -359,7 +391,7 @@ pub async fn run(
                                 store,
                                 &record.id,
                                 "tool_result",
-                                &text,
+                                &process.redact(&text),
                                 None,
                                 block.get("tool_use_id").and_then(Value::as_str),
                             )?;

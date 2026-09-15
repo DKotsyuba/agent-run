@@ -1,4 +1,7 @@
-use crate::LaunchPlan;
+use crate::{
+    redact::{DiagnosticTail, Redactor},
+    LaunchPlan,
+};
 use agent_run_domain::{Error, Result};
 use agent_run_platform::{frame, process::OwnedProcess};
 use serde_json::{json, Value};
@@ -7,7 +10,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -33,9 +36,12 @@ pub struct Process {
     pub backlog: VecDeque<Event>,
     next_id: u64,
     pub stderr_bytes: Arc<AtomicU64>,
+    redactor: Redactor,
+    diagnostic_tail: Arc<Mutex<DiagnosticTail>>,
 }
 impl Process {
     pub fn spawn(plan: &LaunchPlan) -> Result<Self> {
+        let redactor = Redactor::from_environment(&plan.environment);
         let mut command = Command::new(&plan.binary);
         command
             .args(&plan.args)
@@ -88,6 +94,8 @@ impl Process {
         });
         let stderr_bytes = Arc::new(AtomicU64::new(0));
         let count = stderr_bytes.clone();
+        let diagnostic_tail = Arc::new(Mutex::new(DiagnosticTail::new(redactor.clone())));
+        let tail = diagnostic_tail.clone();
         let errors = tokio::spawn(async move {
             let mut bytes = [0u8; 8192];
             while let Ok(n) = stderr.read(&mut bytes).await {
@@ -95,6 +103,9 @@ impl Process {
                     break;
                 }
                 count.fetch_add(n as u64, Ordering::Relaxed);
+                if let Ok(mut tail) = tail.lock() {
+                    tail.push(&bytes[..n]);
+                }
             }
         });
         Ok(Self {
@@ -106,7 +117,22 @@ impl Process {
             backlog: VecDeque::new(),
             next_id: 1,
             stderr_bytes,
+            redactor,
+            diagnostic_tail,
         })
+    }
+
+    /// Redacts launch secrets from text before core code persists it.
+    pub fn redact(&self, text: &str) -> String {
+        self.redactor.redact(text)
+    }
+
+    /// Returns the redacted bounded stderr evidence retained for a failed launch.
+    pub fn diagnostic_tail(&self) -> Option<String> {
+        self.diagnostic_tail
+            .lock()
+            .ok()
+            .and_then(|tail| tail.text())
     }
     pub async fn send(&mut self, message: &Value) -> Result<()> {
         let input = self
@@ -188,10 +214,14 @@ impl Process {
         self.send(&response).await
     }
     pub async fn reap(&mut self) -> Option<i32> {
-        match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
+        let code = match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
             Ok(Ok(s)) => s.code(),
             _ => None,
+        };
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
         }
+        code
     }
 }
 impl Drop for Process {

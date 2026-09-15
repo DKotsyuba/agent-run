@@ -1,3 +1,4 @@
+use crate::{auth, redact::is_secret_name};
 use agent_run_config::{
     config::{Adapter, Auth, Config, Runtime},
     profiles::Profile,
@@ -7,10 +8,71 @@ use agent_run_platform::fs::{self, Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
+const CREDENTIAL_CARRIERS: &[&str] = &[
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AZURE_CONFIG_DIR",
+    "BOTO_CONFIG",
+    "BUNDLE_USER_CONFIG",
+    "CLOUDSDK_CONFIG",
+    "DOCKER_CONFIG",
+    "GH_CONFIG_DIR",
+    "GIT_ASKPASS",
+    "GIT_CONFIG_GLOBAL",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GNUPGHOME",
+    "KRB5CCNAME",
+    "KUBECONFIG",
+    "NETRC",
+    "NPM_CONFIG_USERCONFIG",
+    "PIP_CONFIG_FILE",
+    "PGPASSFILE",
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
+    "TF_CLI_CONFIG_FILE",
+];
+
+/// Applies Python's host-environment deny-list before adapter-owned overrides.
+///
+/// Ordinary host variables survive. Credential-shaped names and known
+/// credential carriers are omitted unless `allowed_secret_names` explicitly
+/// names them. Existing host Rust toolchain directories are retained when the
+/// corresponding variable is absent, so replacing `HOME` does not hide them.
+pub fn inherited_environment(
+    host: &BTreeMap<String, String>,
+    allowed_secret_names: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut environment: BTreeMap<_, _> = host
+        .iter()
+        .filter(|(name, _)| {
+            allowed_secret_names.contains(*name)
+                || (!CREDENTIAL_CARRIERS.contains(&name.as_str()) && !is_secret_name(name))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if let Some(home) = host.get("HOME") {
+        for (name, directory) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+            let candidate = Path::new(home).join(directory);
+            if !environment.contains_key(name) && candidate.is_dir() {
+                environment.insert(name.into(), candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    environment
+}
+
+/// Applies runtime-owned values after host inheritance so they always win.
+pub fn apply_environment_overrides(
+    environment: &mut BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
+) {
+    environment.extend(overrides);
+}
 pub const SNAPSHOT: &str = ".agent-run-rust-snapshot.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -213,29 +275,19 @@ pub fn environment(
     app_home: &Path,
 ) -> Result<BTreeMap<String, String>> {
     let kind = runtime.kind()?;
-    let mut env = BTreeMap::new();
-    for k in [
-        "PATH",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TERM",
-        "COLORTERM",
-        "TZ",
-    ] {
-        if let Ok(v) = std::env::var(k) {
-            env.insert(k.into(), v);
-        }
+    let host: BTreeMap<_, _> = std::env::vars().collect();
+    let mut names = BTreeSet::new();
+    if let Some(Auth::Environment { names: declared }) = &runtime.auth {
+        names.extend(declared.iter().cloned());
     }
-    env.entry("PATH".into())
-        .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin".into());
-    let host_home = std::env::var("HOME").map_err(|_| invalid("HOME is unavailable"))?;
+    for name in &profile.mcp {
+        names.extend(config.mcp[name].env_from.iter().cloned());
+    }
+    let mut env = inherited_environment(&host, &names);
+    let host_home = host
+        .get("HOME")
+        .cloned()
+        .ok_or_else(|| invalid("HOME is unavailable"))?;
     env.insert(
         "HOME".into(),
         if kind == Adapter::Claude && account.is_none() {
@@ -259,6 +311,7 @@ pub fn environment(
         }
     }
     let mut paths = Vec::new();
+    let mut overrides = BTreeMap::new();
     if let Some(e) = runtime
         .environment
         .as_ref()
@@ -282,9 +335,10 @@ pub fn environment(
                     "developer environment must not override private homes or embed credentials",
                 ));
             }
-            env.insert(k.clone(), v.clone());
+            overrides.insert(k.clone(), v.clone());
         }
     }
+    apply_environment_overrides(&mut env, overrides);
     let rust = runtime.rust.as_ref().or_else(|| {
         runtime
             .environment
@@ -329,14 +383,11 @@ pub fn environment(
             );
         }
     }
-    let mut names = Vec::new();
-    if let Some(Auth::Environment { names: declared }) = &runtime.auth {
-        names.extend(declared.clone());
-    }
+    let mut mcp_names = Vec::new();
     for name in &profile.mcp {
-        names.extend(config.mcp[name].env_from.clone());
+        mcp_names.extend(config.mcp[name].env_from.clone());
     }
-    for name in names {
+    for name in mcp_names {
         if [
             "HOME",
             "PATH",
@@ -352,8 +403,9 @@ pub fn environment(
                 "auth/MCP environment forwarding cannot override managed environment controls",
             ));
         }
-        let value = std::env::var(&name)
-            .map_err(|_| invalid("declared authentication/MCP environment variable is missing"))?;
+        let value = host.get(&name).cloned().ok_or_else(|| {
+            invalid("declared authentication/MCP environment variable is missing")
+        })?;
         if value.is_empty() {
             return Err(invalid(
                 "declared authentication/MCP environment variable is empty",
@@ -363,35 +415,46 @@ pub fn environment(
     }
     match kind {
         Adapter::Glm => {
-            env.insert(
-                "ANTHROPIC_BASE_URL".into(),
-                "https://api.z.ai/api/anthropic".into(),
-            );
-            if !env.contains_key("ANTHROPIC_AUTH_TOKEN") && !env.contains_key("ANTHROPIC_API_KEY") {
-                return Err(invalid(
-                    "GLM requires declared ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY",
-                ));
-            }
+            env.extend(auth::glm_environment(&host)?);
         }
         Adapter::Qwen => {
-            for key in ["OPENAI_API_KEY", "OPENAI_BASE_URL"] {
-                if !env.contains_key(key) {
-                    return Err(invalid(
-                        "Qwen requires explicitly declared OPENAI_API_KEY and OPENAI_BASE_URL",
-                    ));
+            let auth_names = match &runtime.auth {
+                Some(Auth::Environment { names }) => names.as_slice(),
+                _ => &["OPENAI_API_KEY".into(), "OPENAI_BASE_URL".into()],
+            };
+            for name in auth_names {
+                let value = auth::qwen_auth_value(name, &host).ok_or_else(|| {
+                    invalid(format!(
+                        "qwen requires environment variable {name}, which is not set"
+                    ))
+                })?;
+                env.insert(name.clone(), value);
+            }
+        }
+        Adapter::Claude => {
+            if let Some(Auth::Environment { names }) = &runtime.auth {
+                for name in names {
+                    if let Some(value) = host.get(name).filter(|value| !value.is_empty()) {
+                        env.insert(name.clone(), value.clone());
+                    }
                 }
             }
         }
-        _ => {}
-    }
-    // Never propagate host orchestration capabilities to a child agent.
-    for key in [
-        "CODEX_APP_TOOLS_PIPE_PATH",
-        "CODEX_MCP_NODE_PATH",
-        "CODEX_THREAD_ID",
-        "CLAUDE_SESSION_ID",
-    ] {
-        env.remove(key);
+        _ => {
+            if let Some(Auth::Environment { names }) = &runtime.auth {
+                for name in names {
+                    let value = host.get(name).cloned().ok_or_else(|| {
+                        invalid("declared authentication/MCP environment variable is missing")
+                    })?;
+                    if value.is_empty() {
+                        return Err(invalid(
+                            "declared authentication/MCP environment variable is empty",
+                        ));
+                    }
+                    env.insert(name.clone(), value);
+                }
+            }
+        }
     }
     Ok(env)
 }
