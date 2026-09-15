@@ -362,15 +362,27 @@ async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
 #[test]
 fn a_surviving_process_group_is_never_reported_as_finished() {
     let outcome = agent_run::domain::Outcome::success(None);
-    let proof = verify::Proof {
+    let proof = verify::AnswerProof {
         path: PathBuf::from("/tmp/does-not-matter.md"),
-        bytes: 4,
-        sha256: "deadbeef".into(),
+        exists: true,
+        size_bytes: 4,
+        sha256: Some("deadbeef".into()),
+        sentinel_found: true,
         proof_version: 2,
+        proof_error: None,
     };
     // Even a clean success outcome with a present proof must be downgraded
     // to failed the moment the process group did not actually go away.
-    let completed = verify::completion(outcome, Some(&proof), false, false);
+    let completed = verify::verify_completion(
+        Some(outcome),
+        None,
+        Some(&proof),
+        false,
+        None,
+        agent_run::domain::now(),
+        verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
+    )
+    .expect("completion policy decides without I/O");
     assert_eq!(completed.status, Status::Failed);
     assert_eq!(
         completed.failure_kind.as_deref(),
