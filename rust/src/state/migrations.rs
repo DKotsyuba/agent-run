@@ -71,7 +71,10 @@ const PENDING_FILES: &[(i64, &str)] = &[
     (13, include_str!("migrations/013_agent_lineage.sql")),
     (14, include_str!("migrations/014_process_birth.sql")),
     (15, include_str!("migrations/015_request_id_lookup.sql")),
-    (16, include_str!("migrations/016_reconciliation_cursors.sql")),
+    (
+        16,
+        include_str!("migrations/016_reconciliation_cursors.sql"),
+    ),
 ];
 
 /// Every migration file, ordered by the version it produces.
@@ -84,8 +87,9 @@ pub fn version_of(conn: &Connection) -> Result<i64> {
 }
 
 pub fn table_names(conn: &Connection) -> Result<HashSet<String>> {
-    let mut stmt =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+    )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
 }
@@ -117,14 +121,24 @@ fn refuse_newer(path: &Path, version: i64) -> Result<()> {
 /// the newer binary's in-flight snapshot out from under it.
 fn drop_stale_backups(path: &Path) {
     let Some(dir) = path.parent() else { return };
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let prefix = format!("{name}.pre-v");
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-        let Some(rest) = file_name.strip_prefix(&prefix) else { continue };
-        let Some(digits) = rest.strip_suffix(".backup") else { continue };
+        let Some(rest) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".backup") else {
+            continue;
+        };
         if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(version) = digits.parse::<i64>() {
                 if version <= super::VERSION {
@@ -140,7 +154,10 @@ struct SchemaLock(std::fs::File);
 impl SchemaLock {
     fn acquire(path: &Path) -> Result<Self> {
         use fs2::FileExt;
-        let lock_name = format!(".{}.init.lock", path.file_name().unwrap_or_default().to_string_lossy());
+        let lock_name = format!(
+            ".{}.init.lock",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
         let lock_path = path.with_file_name(lock_name);
         let file = OpenOptions::new()
             .create(true)

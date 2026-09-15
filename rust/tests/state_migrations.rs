@@ -103,7 +103,11 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
         let home = tempfile::tempdir().unwrap();
         let db_path = home.path().join("state.db");
         drop(build_fixture(&db_path, version));
-        assert_eq!(migrations::migrate(&db_path).unwrap(), VERSION, "version {version}");
+        assert_eq!(
+            migrations::migrate(&db_path).unwrap(),
+            VERSION,
+            "version {version}"
+        );
         let migrated = open_ro(&db_path);
         assert_eq!(user_version(&migrated), VERSION, "version {version}");
         assert_eq!(
@@ -135,7 +139,9 @@ fn existing_rows_survive_migration_from_v1() {
     );
     for id in V1_AGENTS {
         let status: String = conn
-            .query_row("SELECT status FROM agents WHERE id=?1", params![id], |r| r.get(0))
+            .query_row("SELECT status FROM agents WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(status, "running");
     }
@@ -155,7 +161,10 @@ fn newer_schema_is_refused_without_touching_the_store() {
     drop(build);
 
     let error = migrations::migrate(&db_path).unwrap_err();
-    assert!(error.to_string().contains("newer than this agent-run"), "{error}");
+    assert!(
+        error.to_string().contains("newer than this agent-run"),
+        "{error}"
+    );
     assert!(Store::open(home.path()).is_err());
 
     let conn = open_ro(&db_path);
