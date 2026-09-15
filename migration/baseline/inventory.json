@@ -43,7 +43,7 @@
     "path": "src/agent_run/adapters/__init__.py",
     "purpose": "Runtime adapter contracts and loading.",
     "intra_package_imports": [
-      "agent_run"
+      "agent_run.adapters.base"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/lib.rs",
@@ -78,7 +78,7 @@
     "path": "src/agent_run/adapters/claude/__init__.py",
     "purpose": "Claude Code runtime adapter package.",
     "intra_package_imports": [
-      "agent_run.adapters"
+      "agent_run.adapters.claude.adapter"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/claude",
@@ -280,9 +280,11 @@
     "purpose": "Codex runtime adapter: isolated home, app-server launch, models/limits.  Only the bounded ``--version`` health observation invokes ``codex`` here. Model rosters and capacity limits",
     "intra_package_imports": [
       "agent_run.adapters.base",
-      "agent_run.adapters.codex",
+      "agent_run.adapters.codex.app_server",
       "agent_run.adapters.codex.environment",
+      "agent_run.adapters.codex.model_cache",
       "agent_run.adapters.codex.permissions",
+      "agent_run.adapters.codex.plugins",
       "agent_run.adapters.codex.skills",
       "agent_run.adapters.codex.snapshot",
       "agent_run.adapters.codex.toml",
@@ -297,9 +299,7 @@
       "agent_run.native_settings",
       "agent_run.role_plan"
     ],
-    "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/codex/session.rs",
     "task_ids": [
       "M31a",
@@ -368,7 +368,8 @@
     "purpose": "Refresh and persist the isolated Codex model roster cache.",
     "intra_package_imports": [
       "agent_run.adapters.base",
-      "agent_run.adapters.codex",
+      "agent_run.adapters.codex.app_server",
+      "agent_run.adapters.codex.environment",
       "agent_run.config"
     ],
     "packaged_resources": [],
@@ -406,9 +407,7 @@
       "agent_run.errors",
       "agent_run.profiles"
     ],
-    "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/codex/session.rs",
     "task_ids": [
       "M31a",
@@ -426,9 +425,7 @@
       "agent_run.adapters.home",
       "agent_run.errors"
     ],
-    "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/codex/session.rs",
     "task_ids": [
       "M31a",
@@ -463,7 +460,8 @@
     "purpose": "Short-lived Codex app-server rate-limit probes owned by the adapter.",
     "intra_package_imports": [
       "agent_run.adapters.base",
-      "agent_run.adapters.codex",
+      "agent_run.adapters.codex.app_server",
+      "agent_run.adapters.codex.environment",
       "agent_run.config",
       "agent_run.errors"
     ],
@@ -506,9 +504,7 @@
       "agent_run.config",
       "agent_run.errors"
     ],
-    "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/codex/session.rs",
     "task_ids": [
       "M31a",
@@ -589,7 +585,7 @@
     "path": "src/agent_run/adapters/glm/__init__.py",
     "purpose": "GLM Coding Plan runtime adapter package.",
     "intra_package_imports": [
-      "agent_run.adapters"
+      "agent_run.adapters.glm.adapter"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/glm",
@@ -681,7 +677,7 @@
     "path": "src/agent_run/adapters/qwen/__init__.py",
     "purpose": "Qwen Code runtime adapter package.",
     "intra_package_imports": [
-      "agent_run.adapters"
+      "agent_run.adapters.qwen.adapter"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run-adapters/src/qwen",
@@ -910,7 +906,11 @@
     "path": "src/agent_run/capacity/__init__.py",
     "purpose": "Capacity intelligence: adapter-limit collection, forecast, and advice.",
     "intra_package_imports": [
-      "agent_run"
+      "agent_run.capacity.advice",
+      "agent_run.capacity.collect",
+      "agent_run.capacity.forecast",
+      "agent_run.capacity.history",
+      "agent_run.capacity.launchd"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run-core/src/capacity/mod.rs",
@@ -969,7 +969,7 @@
     "intra_package_imports": [
       "agent_run.adapters.base",
       "agent_run.adapters.registry",
-      "agent_run.capacity",
+      "agent_run.capacity.sources",
       "agent_run.capacity.topology",
       "agent_run.config",
       "agent_run.errors",
@@ -1189,7 +1189,6 @@
       "agent_run.wait"
     ],
     "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml",
       "src/agent_run/delivery/codex_desktop_host.cjs"
     ],
     "rust_target": "crates/agent-run/src/cli.rs",
@@ -1214,8 +1213,10 @@
     "path": "src/agent_run/delivery/__init__.py",
     "purpose": "Completion delivery: trusted notice, transports, and the outbox dispatcher.",
     "intra_package_imports": [
-      "agent_run",
-      "agent_run.dispatch"
+      "agent_run.delivery.base",
+      "agent_run.delivery.claude_uds",
+      "agent_run.delivery.codex_queue",
+      "agent_run.delivery.dispatch"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run-core/src/delivery/mod.rs",
@@ -1234,9 +1235,7 @@
       "agent_run.domain",
       "agent_run.errors"
     ],
-    "packaged_resources": [
-      "src/agent_run/delivery/codex_desktop_host.cjs"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-core/src/delivery/mod.rs",
     "task_ids": [
       "M46",
@@ -1252,9 +1251,7 @@
       "agent_run.domain",
       "agent_run.errors"
     ],
-    "packaged_resources": [
-      "src/agent_run/delivery/completion_notice_contract.json"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-core/src/delivery/mod.rs",
     "task_ids": [
       "M46",
@@ -1266,7 +1263,9 @@
     "path": "src/agent_run/delivery/codex_desktop_host.cjs",
     "purpose": "JavaScript transport asset for codex desktop host.",
     "intra_package_imports": [],
-    "packaged_resources": [],
+    "packaged_resources": [
+      "src/agent_run/delivery/completion_notice_contract.json"
+    ],
     "rust_target": "crates/agent-run-core/src/delivery/mod.rs",
     "task_ids": [
       "M46",
@@ -1398,22 +1397,7 @@
       "src/agent_run/operator_guide/plugins.md",
       "src/agent_run/operator_guide/releases.md",
       "src/agent_run/operator_guide/skills.md",
-      "src/agent_run/operator_guide/troubleshoot.md",
-      "src/agent_run/state/migrations/002_workflow_tables.sql",
-      "src/agent_run/state/migrations/003_workflow_run_plan.sql",
-      "src/agent_run/state/migrations/004_workflow_deliveries.sql",
-      "src/agent_run/state/migrations/005_workflow_run_result.sql",
-      "src/agent_run/state/migrations/006_repair_workflow_foreign_keys.sql",
-      "src/agent_run/state/migrations/007_delivery_expired_state.sql",
-      "src/agent_run/state/migrations/008_run_stats.sql",
-      "src/agent_run/state/migrations/009_delivery_attempt_evidence.sql",
-      "src/agent_run/state/migrations/010_capacity_route_snapshots.sql",
-      "src/agent_run/state/migrations/011_startup_owner.sql",
-      "src/agent_run/state/migrations/012_workflow_delivery_generation.sql",
-      "src/agent_run/state/migrations/013_agent_lineage.sql",
-      "src/agent_run/state/migrations/014_process_birth.sql",
-      "src/agent_run/state/migrations/015_request_id_lookup.sql",
-      "src/agent_run/state/migrations/016_reconciliation_cursors.sql"
+      "src/agent_run/operator_guide/troubleshoot.md"
     ],
     "rust_target": "crates/agent-run/src/doc.rs",
     "task_ids": [
@@ -1481,7 +1465,7 @@
     "path": "src/agent_run/hooks/__init__.py",
     "purpose": "Runtime hook entry points.",
     "intra_package_imports": [
-      "agent_run"
+      "agent_run.hooks.context"
     ],
     "packaged_resources": [],
     "rust_target": "crates/agent-run/src/hooks",
@@ -1541,9 +1525,9 @@
       "agent_run.errors"
     ],
     "packaged_resources": [],
-    "rust_target": "crates/agent-run-domain/src/lib.rs",
+    "rust_target": "crates/agent-run-platform/src/launch_evidence.rs",
     "task_ids": [
-      "M11"
+      "M28b"
     ]
   },
   {
@@ -1593,9 +1577,7 @@
     "intra_package_imports": [
       "agent_run.errors"
     ],
-    "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-config/src/native_settings.rs",
     "task_ids": [
       "M13b",
@@ -1769,9 +1751,9 @@
       "agent_run.state.db"
     ],
     "packaged_resources": [],
-    "rust_target": "crates/agent-run-domain/src/lib.rs",
+    "rust_target": "crates/agent-run-core/src/resume.rs",
     "task_ids": [
-      "M11"
+      "M38"
     ]
   },
   {
@@ -1819,9 +1801,7 @@
       "agent_run.supervisor",
       "agent_run.verify"
     ],
-    "packaged_resources": [
-      "src/agent_run/adapters/codex/defaults.toml"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-core/src/service.rs",
     "task_ids": [
       "M19",
@@ -1832,25 +1812,15 @@
     "path": "src/agent_run/state/__init__.py",
     "purpose": "Durable SQLite state.",
     "intra_package_imports": [
-      "agent_run"
+      "agent_run.state.activity",
+      "agent_run.state.db",
+      "agent_run.state.diagnostics",
+      "agent_run.state.migrations",
+      "agent_run.state.reconciliation",
+      "agent_run.state.run_stats",
+      "agent_run.state.store"
     ],
-    "packaged_resources": [
-      "src/agent_run/state/migrations/002_workflow_tables.sql",
-      "src/agent_run/state/migrations/003_workflow_run_plan.sql",
-      "src/agent_run/state/migrations/004_workflow_deliveries.sql",
-      "src/agent_run/state/migrations/005_workflow_run_result.sql",
-      "src/agent_run/state/migrations/006_repair_workflow_foreign_keys.sql",
-      "src/agent_run/state/migrations/007_delivery_expired_state.sql",
-      "src/agent_run/state/migrations/008_run_stats.sql",
-      "src/agent_run/state/migrations/009_delivery_attempt_evidence.sql",
-      "src/agent_run/state/migrations/010_capacity_route_snapshots.sql",
-      "src/agent_run/state/migrations/011_startup_owner.sql",
-      "src/agent_run/state/migrations/012_workflow_delivery_generation.sql",
-      "src/agent_run/state/migrations/013_agent_lineage.sql",
-      "src/agent_run/state/migrations/014_process_birth.sql",
-      "src/agent_run/state/migrations/015_request_id_lookup.sql",
-      "src/agent_run/state/migrations/016_reconciliation_cursors.sql"
-    ],
+    "packaged_resources": [],
     "rust_target": "crates/agent-run-store/src/lib.rs",
     "task_ids": [
       "M17",
@@ -1906,21 +1876,6 @@
       "agent_run.state.migrations"
     ],
     "packaged_resources": [
-      "src/agent_run/state/migrations/002_workflow_tables.sql",
-      "src/agent_run/state/migrations/003_workflow_run_plan.sql",
-      "src/agent_run/state/migrations/004_workflow_deliveries.sql",
-      "src/agent_run/state/migrations/005_workflow_run_result.sql",
-      "src/agent_run/state/migrations/006_repair_workflow_foreign_keys.sql",
-      "src/agent_run/state/migrations/007_delivery_expired_state.sql",
-      "src/agent_run/state/migrations/008_run_stats.sql",
-      "src/agent_run/state/migrations/009_delivery_attempt_evidence.sql",
-      "src/agent_run/state/migrations/010_capacity_route_snapshots.sql",
-      "src/agent_run/state/migrations/011_startup_owner.sql",
-      "src/agent_run/state/migrations/012_workflow_delivery_generation.sql",
-      "src/agent_run/state/migrations/013_agent_lineage.sql",
-      "src/agent_run/state/migrations/014_process_birth.sql",
-      "src/agent_run/state/migrations/015_request_id_lookup.sql",
-      "src/agent_run/state/migrations/016_reconciliation_cursors.sql",
       "src/agent_run/state/schema.sql"
     ],
     "rust_target": "crates/agent-run-store/src/lib.rs",
@@ -1983,18 +1938,11 @@
       "src/agent_run/state/migrations/013_agent_lineage.sql",
       "src/agent_run/state/migrations/014_process_birth.sql",
       "src/agent_run/state/migrations/015_request_id_lookup.sql",
-      "src/agent_run/state/migrations/016_reconciliation_cursors.sql",
-      "src/agent_run/state/schema.sql"
+      "src/agent_run/state/migrations/016_reconciliation_cursors.sql"
     ],
-    "rust_target": "crates/agent-run-store/src/lib.rs",
+    "rust_target": "crates/agent-run-store/src/migrations.rs",
     "task_ids": [
-      "M17",
-      "M19",
-      "M20a",
-      "M20b",
-      "M21",
-      "M22",
-      "M28a"
+      "M18"
     ]
   },
   {
@@ -2230,8 +2178,9 @@
       "agent_run.delivery.base",
       "agent_run.domain",
       "agent_run.errors",
-      "agent_run.state",
+      "agent_run.state.capacity",
       "agent_run.state.db",
+      "agent_run.state.delivery",
       "agent_run.state.start"
     ],
     "packaged_resources": [],

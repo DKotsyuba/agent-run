@@ -2,8 +2,7 @@
 
 Usage::
 
-    /Users/pluto/projects/agent-run/.venv-py314/bin/python \
-        migration/tools/build_inventory.py
+    python migration/tools/build_inventory.py
 
 The command must run from the repository root.  It reads the Python baseline
 from Git, maps source and test paths to the task board, detects current Rust
@@ -148,7 +147,7 @@ def _intra_imports(path: str, content: bytes, modules: set[str]) -> list[str]:
     except (SyntaxError, UnicodeDecodeError):
         return []
     current = _module_name(path) or ""
-    package = current.split(".")[:-1]
+    package = current.split(".") if Path(path).stem == "__init__" else current.split(".")[:-1]
     found: set[str] = set()
     for node in ast.walk(tree):
         candidates: list[str] = []
@@ -157,13 +156,10 @@ def _intra_imports(path: str, content: bytes, modules: set[str]) -> list[str]:
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 base = package[: max(0, len(package) - node.level + 1)]
-                prefix = ".".join(base)
-                candidates = [
-                    ".".join(part for part in (prefix, node.module or name) if part)
-                    for name in (alias.name for alias in node.names)
-                ]
-                if node.module is None:
-                    candidates = [prefix]
+                if node.module:
+                    candidates = [".".join((*base, node.module))]
+                else:
+                    candidates = [".".join((*base, alias.name)) for alias in node.names]
             elif node.module:
                 candidates = [
                     ".".join(part for part in (node.module, alias.name) if part)
@@ -249,31 +245,33 @@ def _source_owner(path: str, valid_tasks: set[str]) -> tuple[list[str], str]:
             if unknown:
                 raise ValueError(f"unknown task IDs for {path}: {sorted(unknown)}")
             return list(task_ids), target
-    return ["M02"], "migration/baseline/inventory.json"
+    return [], "unassigned"
 
 
-def _resource_paths(path: str, content: bytes, all_paths: Sequence[str]) -> list[str]:
-    """Find package resources named by one source file without reading runtime state."""
+#: Exact package resource loaders in the Python baseline.  User-home files and
+#: dynamically named test fixtures are intentionally not packaged resources.
+RESOURCE_RULES: dict[str, tuple[str, ...]] = {
+    "src/agent_run/adapters/codex/toml.py": ("src/agent_run/adapters/codex/defaults.toml",),
+    "src/agent_run/cli.py": ("src/agent_run/delivery/codex_desktop_host.cjs",),
+    "src/agent_run/delivery/codex_desktop_host.cjs": ("src/agent_run/delivery/completion_notice_contract.json",),
+    "src/agent_run/delivery/completion_notice_contract.py": ("src/agent_run/delivery/completion_notice_contract.json",),
+    "src/agent_run/doc.py": ("src/agent_run/operator_guide/",),
+    "src/agent_run/state/db.py": ("src/agent_run/state/schema.sql",),
+    "src/agent_run/state/migrations.py": ("src/agent_run/state/migrations/",),
+}
 
-    if not path.startswith("src/agent_run/") or not path.endswith(".py"):
-        return []
-    text = content.decode("utf-8", errors="ignore")
-    resources = []
-    for candidate in all_paths:
-        if not candidate.startswith("src/agent_run/") or candidate.endswith(".py"):
-            continue
-        basename = Path(candidate).name
-        if basename in text or Path(candidate).parent.name in text and Path(candidate).suffix in text:
-            resources.append(candidate)
-    if "operator_guide" in text:
-        resources.extend(
-            candidate for candidate in all_paths if candidate.startswith("src/agent_run/operator_guide/")
-        )
-    if "migrations" in text:
-        resources.extend(
-            candidate for candidate in all_paths if candidate.startswith("src/agent_run/state/migrations/")
-        )
-    return sorted(set(resources))
+
+def _resource_paths(path: str, all_paths: Sequence[str]) -> list[str]:
+    """Return exact packaged resources loaded by one baseline source file."""
+
+    resources = RESOURCE_RULES.get(path, ())
+    expanded = []
+    for resource in resources:
+        if resource.endswith("/"):
+            expanded.extend(candidate for candidate in all_paths if candidate.startswith(resource))
+        else:
+            expanded.append(resource)
+    return sorted(expanded)
 
 
 def _load_tasks() -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
@@ -305,6 +303,7 @@ def _plan_tests(task_ids: Iterable[str], tasks: dict[str, dict[str, str]]) -> li
     return sorted(tests, key=lambda item: int(item[1:]))
 
 
+#: Python test-file ownership rules, ordered from specific to broad prefixes.
 TEST_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tests/test_adapter", ("M13a", "M14a", "M14b", "M25")),
     ("tests/test_adapters_base.py", ("M13a", "M31a")),
@@ -314,6 +313,7 @@ TEST_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tests/test_broker_client.py", ("M39", "M42")),
     ("tests/test_capacity", ("M20d", "M43a", "M43b", "M43c", "M43d", "M44", "M45")),
     ("tests/test_ci.py", ("M52",)),
+    ("tests/test_cli.py", ("M41a",)),
     ("tests/test_claude", ("M35a", "M35b", "M35c")),
     ("tests/test_codex", ("M31a", "M32a", "M32b", "M32c", "M34a", "M34b", "M48")),
     ("tests/test_command_policy.py", ("M32b",)),
@@ -325,12 +325,14 @@ TEST_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tests/test_doctor.py", ("M50a",)),
     ("tests/test_domain.py", ("M11",)),
     ("tests/test_effective_policy.py", ("M15b",)),
+    ("tests/test_glm_adapter.py", ("M36",)),
     ("tests/test_launch", ("M06", "M28b", "M30c")),
     ("tests/test_lifecycle.py", ("M26", "M29", "M30b")),
     ("tests/test_logging_setup.py", ("M50a",)),
     ("tests/test_m008_integration.py", ("M54",)),
     ("tests/test_mcp.py", ("M10", "M42")),
     ("tests/test_native_settings.py", ("M13b", "M16")),
+    ("tests/test_omniroute_current_cache.py", ("M43b",)),
     ("tests/test_paths.py", ("M14a", "M23a")),
     ("tests/test_plugin_integration.py", ("M32c", "M35d")),
     ("tests/test_preparation.py", ("M28c",)),
@@ -377,14 +379,11 @@ def _test_names(root: Path) -> dict[str, list[tuple[str, str]]]:
     return result
 
 
+#: Explicit equivalences only; uncertain behavior remains planned.
 RUST_RULES: dict[str, tuple[tuple[str, str, str], ...]] = {
     "tests/test_answer_payload_proof.py": (
         ("inspect_legacy_requires", "crates/agent-run-core/tests/verification.rs", "legacy_frame_must_be_exactly_terminal_and_is_stripped_once"),
-        ("legacy_embedded_sentinel", "crates/agent-run-core/tests/verification.rs", "legacy_frame_must_be_exactly_terminal_and_is_stripped_once"),
         ("legacy_terminal_frame", "crates/agent-run-core/tests/verification.rs", "legacy_frame_must_be_exactly_terminal_and_is_stripped_once"),
-        ("malformed_or_contradicting_proof", "crates/agent-run-core/tests/verification.rs", "missing_sidecar_never_downgrades_to_legacy"),
-        ("metadata_reads_are_bounded_and_reject_symlinks", "crates/agent-run-core/tests/verification.rs", "payload_and_parent_symlinks_are_not_followed"),
-        ("metadata_symlink_swap", "crates/agent-run-core/tests/verification.rs", "payload_and_parent_symlinks_are_not_followed"),
         ("missing_proof", "crates/agent-run-core/tests/verification.rs", "missing_sidecar_never_downgrades_to_legacy"),
         ("read_answer_payload_legacy", "crates/agent-run-core/tests/verification.rs", "legacy_frame_must_be_exactly_terminal_and_is_stripped_once"),
         ("above_inline_limit", "crates/agent-run-core/tests/verification.rs", "non_inline_answer_is_still_verified"),
@@ -415,11 +414,9 @@ RUST_RULES: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("invalid_slice_does_not_abort", "crates/agent-run-core/tests/capacity.rs", "invalid_atomic_slice_does_not_erase_a_committed_snapshot"),
     ),
     "tests/test_capacity_ranking.py": (
-        ("exhaustion", "crates/agent-run-core/tests/capacity.rs", "exhausted_window_cannot_be_revived_by_weight"),
-        ("alias_weight_is_maximum", "crates/agent-run-core/tests/capacity.rs", "aliases_use_highest_absolute_weight_not_sum"),
+        ("exhaustion_is_omitted_and_multiplier_cannot_revive_zero_score", "crates/agent-run-core/tests/capacity.rs", "exhausted_window_cannot_be_revived_by_weight"),
     ),
     "tests/test_capacity_reset_identity.py": (
-        ("none_reset", "crates/agent-run-core/tests/capacity.rs", "reset_jitter_only_groups_still_open_windows"),
         ("past_reset_at", "crates/agent-run-core/tests/capacity.rs", "freshness_rejects_future_expired_reset_and_unknown_evidence"),
     ),
     "tests/test_capacity_topology.py": (
@@ -450,7 +447,6 @@ RUST_RULES: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("read_roots_are_resolved", "crates/agent-run-config/tests/domain_config.rs", "roots_form_a_minimal_antichain"),
     ),
     "tests/test_state_db.py": (
-        ("invalid_and_newer_versions", "crates/agent-run-store/tests/state.rs", "newer_database_version_is_refused_without_upgrade"),
     ),
     "tests/test_state_migrations.py": (
         ("newer_schema_is_refused", "crates/agent-run-store/tests/state_migrations.rs", "newer_schema_is_refused_without_touching_the_store"),
@@ -540,7 +536,7 @@ def _build_inventory(paths: Sequence[str], valid_tasks: set[str]) -> list[dict[s
                 "path": path,
                 "purpose": _purpose(path, content),
                 "intra_package_imports": _intra_imports(path, content, modules),
-                "packaged_resources": _resource_paths(path, content, paths),
+                "packaged_resources": _resource_paths(path, paths),
                 "rust_target": target,
                 "task_ids": task_ids,
             }
@@ -583,8 +579,9 @@ def _summary(manifest: Sequence[dict[str, object]], inventory: Sequence[dict[str
         lines.append(f"| {path} | {sum(counts.values())} | {counts['ported']} | {counts['planned']} | {counts['unassigned']} |")
     by_lane: dict[str, Counter[str]] = defaultdict(Counter)
     for record in tests:
-        for task_id in filter(None, str(record["task_ids"]).split(";")):
-            by_lane[tasks[task_id]["lane"]][str(record["status"])] += 1
+        task_ids = list(filter(None, str(record["task_ids"]).split(";")))
+        if task_ids:
+            by_lane[tasks[task_ids[0]]["lane"]][str(record["status"])] += 1
     lines.extend(["", "## Test coverage by lane", "", "| lane | status | rows |", "| --- | --- | ---: |"])
     for lane in sorted(by_lane):
         for status in ("ported", "planned", "unassigned"):
