@@ -1,0 +1,1 @@
+/Users/pluto/projects/agent-run/.claude/worktrees/agent-run-tui-interface-37777e/.wt/baseline/tests/fixtures/baseline/answers/agents/symlinked_payload/outside.md
