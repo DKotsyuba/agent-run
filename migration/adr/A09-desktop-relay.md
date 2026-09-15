@@ -175,23 +175,19 @@ inventory, response body, or environment.
 1. Prepare and verify the probe offline:
 
    ```sh
+   A09_REPO="$(pwd -P)"
    cargo test -p agent-run-core --test delivery_hosts --locked
    cargo build -p agent-run-core --example a09_desktop_probe --locked
    A09_HOME="$(mktemp -d /tmp/agent-run-a09.XXXXXX)"
    chmod 700 "$A09_HOME"
+   printf '%s\n' "$A09_REPO/target/debug/examples/a09_desktop_probe --mode direct --home $A09_HOME"
+   printf '%s\n' "$A09_REPO/target/debug/examples/a09_desktop_probe --mode signed-node-shim --home $A09_HOME"
    ```
 
 2. In a dedicated Codex Desktop test profile, create one disposable chat named
-   `A09 relay smoke`. Register the following MCP command first in direct mode,
-   then in shim mode, restarting only that temporary MCP entry between runs:
-
-   ```sh
-   /ABS/REPO/target/debug/examples/a09_desktop_probe --mode direct --home /tmp/agent-run-a09.TEST
-   /ABS/REPO/target/debug/examples/a09_desktop_probe --mode signed-node-shim --home /tmp/agent-run-a09.TEST
-   ```
-
-   Replace both placeholders with the resolved checkout and temporary directory
-   printed during preparation; do not use symlinks. Invoke the probe tool once
+   `A09 relay smoke`. Register the first exact command printed during preparation,
+   then the second, restarting only that temporary MCP entry between runs; do not
+   replace either resolved path with a symlink. Invoke the probe tool once
    per mode with distinct fixed IDs `ntf_a09_direct_1` and `ntf_a09_shim_1` and
    the exact notice `agent-run/completion\n\n- ID: ag-20000101-000000-0000000000\n- Status: succeeded\n- Runtime/model: test/test:none\n- Notice: [notification <id> v1]`.
 
