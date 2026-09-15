@@ -63,13 +63,14 @@ def _runtime_document(config: RuntimeConfig) -> dict[str, object]:
     """Return deterministic runtime declarations without credential bytes.
 
     ``config`` (``RuntimeConfig``) supplies every runtime declaration. The
-    returned ``dict[str, object]`` contains only deterministic credential-free
-    values. Explicit ``workspace_root`` and ``credential_state_home`` paths are
-    recorded; an enabled ``workspace_network`` flag is also recorded. Declared
-    ``native_settings`` are recorded as a sorted JSON tree so option changes
-    change snapshot identity; reserved roots would already have failed
-    validation, and no credential values can appear there. Their absence
-    preserves the canonical shape of snapshots created before those optional
+    returned ``dict[str, object]`` contains only deterministic values; auth
+    and credential sources are never resolved here. Explicit ``workspace_root``
+    and ``credential_state_home`` paths are recorded; an enabled
+    ``workspace_network`` flag is also recorded. Declared ``native_settings``
+    are recorded as a sorted JSON tree so option changes change snapshot
+    identity; that tree is persisted verbatim (it is not a secret scrubber),
+    so operators must not place secret values in it. Their absence preserves
+    the canonical shape of snapshots created before those optional
     declarations existed.
     """
 

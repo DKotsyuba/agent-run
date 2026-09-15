@@ -93,10 +93,11 @@ naming the key. Accepting an unreserved unknown key is convenience tuning, not
 a guarantee that every upstream key is safe to relax.
 
 Changes flow through scoped runtime copies and config snapshots: the snapshot
-records the declared settings (credential-free by construction), so changed
-options change snapshot identity and the next launch regenerates the native
-file. Settings apply at launch preparation; running sessions are unaffected
-until relaunch.
+records the declared settings verbatim — auth and credential sources are never
+resolved, but the tree is persisted, so secret values must not be placed in it —
+and changed options change snapshot identity and the next launch regenerates
+the native file. Settings apply at launch preparation; running sessions are
+unaffected until relaunch.
 
 ## Readiness
 

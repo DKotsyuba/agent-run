@@ -48,7 +48,6 @@ CODEX_RESERVED_ROOTS = frozenset(
         "model_provider",
         "model_providers",
         "model_reasoning_effort",
-        "model_verbosity",
         "openai_base_url",
         "chatgpt_base_url",
         "openai_api_key",
