@@ -11,6 +11,7 @@ from .snapshot_runtime import (
     finalize_runtime_snapshots,
     inspect_runtime_snapshots,
     runtime_snapshot_index_sha256,
+    runtime_snapshot_materialize_revision,
 )
 from .snapshot_tree import (
     RUNTIME_SNAPSHOT_INDEX,
@@ -36,6 +37,7 @@ __all__ = (
     "inspect_managed_snapshot",
     "inspect_runtime_snapshots",
     "runtime_snapshot_index_sha256",
+    "runtime_snapshot_materialize_revision",
     "snapshot_managed_tree",
     "snapshot_selected_assets",
 )

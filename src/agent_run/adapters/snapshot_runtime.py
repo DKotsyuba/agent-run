@@ -136,6 +136,29 @@ def runtime_snapshot_index_sha256(home: Path, expected_revision: str) -> str:
     return digest
 
 
+def runtime_snapshot_materialize_revision(home: Path) -> str:
+    """Return the verified producer revision recorded in ``home``'s index.
+
+    This is for a producer that must add a narrowly defined native receipt
+    before its first config snapshot. The index is verified against its own
+    digest before its revision is returned, so callers cannot reuse a malformed
+    or already-drifted index as authority to finalize replacement evidence.
+    """
+
+    raw = _read_metadata(home, RUNTIME_SNAPSHOT_INDEX)
+    try:
+        revision = json.loads(raw)["materialize_revision"]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise ValidationError("runtime snapshot index is malformed") from error
+    if not isinstance(revision, str) or not revision.strip():
+        raise ValidationError("runtime snapshot index revision is malformed")
+    if not inspect_runtime_snapshots(
+        home, revision, expected_sha256=content_hash(raw)
+    ).verified:
+        raise ValidationError("runtime snapshot index references unverified artifacts")
+    return revision
+
+
 def _valid_sha256(value: object) -> bool:
     """Return whether ``value`` is one lowercase or uppercase SHA-256 hex string."""
 
