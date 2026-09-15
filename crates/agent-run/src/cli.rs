@@ -2,7 +2,7 @@
 use crate::{
     capacity,
     config::{Adapter, Config},
-    domain::{AgentId, OrchestratorRef, StartRequest, Status},
+    domain::{AgentId, OrchestratorRef, StartRequest},
     error::invalid,
     fs,
     policy::Constraint,
@@ -10,7 +10,7 @@ use crate::{
     state::Store,
     transport, Error, Result,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
@@ -19,10 +19,15 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+/// The Python-compatible operator command line.
+///
+/// This parser is intentionally the single source of command names and flag
+/// spelling for the binary. Service calls keep their request schemas in the
+/// shared domain tool registry; this layer only adapts shell values to those
+/// schemas and never launches a one-shot start locally.
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-run",
-    version,
     about = "Durable local coding-agent supervisor (Rust migration)"
 )]
 pub struct Cli {
@@ -31,17 +36,20 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
+/// Top-level commands, including two hidden runtime implementation commands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Init,
     Doctor,
     Start(Start),
     Resume(Resume),
+    Bind(Bind),
     Cancel {
         agent_id: AgentId,
     },
     Steer {
         agent_id: AgentId,
+        #[arg(long)]
         text: String,
     },
     Agents(Agents),
@@ -56,16 +64,15 @@ pub enum Command {
         limit: usize,
         #[arg(long)]
         follow: bool,
+        #[arg(long, conflicts_with = "follow")]
+        full: bool,
     },
     Models,
     Limits,
     Doc {
         topic: Option<String>,
     },
-    Mcp {
-        #[command(flatten)]
-        session: SessionArgs,
-    },
+    Mcp,
     Api {
         #[command(subcommand)]
         command: Api,
@@ -84,12 +91,13 @@ pub enum Command {
         account: Option<String>,
     },
     Auth {
-        account: String,
+        label: String,
         runtime: String,
     },
-    State {
+    Context(Context),
+    Hook {
         #[command(subcommand)]
-        command: State,
+        command: Hook,
     },
     #[command(name = "_supervisor", hide = true)]
     Supervisor {
@@ -106,6 +114,7 @@ pub enum Command {
         name: String,
     },
 }
+/// Optional orchestrator identity shared by public tool commands.
 #[derive(Args, Debug, Default)]
 pub struct SessionArgs {
     #[arg(long, requires = "session_id")]
@@ -116,30 +125,14 @@ pub struct SessionArgs {
     pub session_turn_id: Option<String>,
 }
 impl SessionArgs {
-    fn resolve(&self, infer: bool) -> Result<Option<OrchestratorRef>> {
+    /// Validates and converts explicitly supplied session fields, if any.
+    fn resolve(&self) -> Result<Option<OrchestratorRef>> {
         let value = match (&self.session_transport, &self.session_id) {
             (Some(transport), Some(session)) => Some(OrchestratorRef {
                 transport: transport.clone(),
                 external_session_id: session.clone(),
                 external_turn_id: self.session_turn_id.clone(),
             }),
-            (None, None) if infer => {
-                if let Ok(id) = std::env::var("CODEX_THREAD_ID") {
-                    Some(OrchestratorRef {
-                        transport: "codex_queue".into(),
-                        external_session_id: id,
-                        external_turn_id: None,
-                    })
-                } else if let Ok(id) = std::env::var("CLAUDE_SESSION_ID") {
-                    Some(OrchestratorRef {
-                        transport: "claude_uds".into(),
-                        external_session_id: id,
-                        external_turn_id: None,
-                    })
-                } else {
-                    None
-                }
-            }
             (None, None) => None,
             _ => return Err(invalid("session transport and ID are required together")),
         };
@@ -149,6 +142,7 @@ impl SessionArgs {
         Ok(value)
     }
 }
+/// The resident-broker start command's shell request fields.
 #[derive(Args, Debug)]
 pub struct Start {
     #[arg(long)]
@@ -157,14 +151,8 @@ pub struct Start {
     pub model: String,
     #[arg(long)]
     pub profile: String,
-    #[arg(
-        long,
-        required_unless_present = "task_file",
-        conflicts_with = "task_file"
-    )]
-    pub task: Option<String>,
     #[arg(long)]
-    pub task_file: Option<PathBuf>,
+    pub task: String,
     #[arg(long)]
     pub workdir: Option<PathBuf>,
     #[arg(long)]
@@ -175,39 +163,86 @@ pub struct Start {
     pub effort: Option<String>,
     #[arg(
         long = "timeout",
-        alias = "timeout-seconds",
+        id = "timeout",
         help = "Legacy metadata only; does not stop execution"
     )]
     pub timeout_seconds: Option<f64>,
-    #[arg(long = "read-root")]
+    #[arg(long = "read-root", id = "read_root")]
     pub read_roots: Vec<PathBuf>,
     #[arg(long)]
-    pub output_schema: Option<PathBuf>,
+    pub output_schema: Option<String>,
     #[arg(long)]
     pub account: Option<String>,
     #[arg(long)]
     pub request_id: Option<String>,
-    #[arg(long = "required-constraint")]
-    pub required_constraints: Vec<String>,
     #[arg(long)]
     pub wait: bool,
     #[command(flatten)]
     pub session: SessionArgs,
 }
+/// The resident-broker continuation command's shell request fields.
 #[derive(Args, Debug)]
+#[command(group = ArgGroup::new("resume_task").required(true).args(["task", "task_file"]))]
 pub struct Resume {
     pub agent_id: AgentId,
     #[arg(long)]
-    pub task: String,
-    #[arg(long = "timeout", alias = "timeout-seconds")]
+    pub task: Option<String>,
+    #[arg(long)]
+    pub task_file: Option<PathBuf>,
+    #[arg(long = "timeout", id = "timeout")]
     pub timeout_seconds: Option<f64>,
     #[arg(long)]
     pub request_id: Option<String>,
-    #[arg(long)]
-    pub wait: bool,
     #[command(flatten)]
     pub session: SessionArgs,
 }
+/// A durable session binding request accepted by the Python command surface.
+#[derive(Args, Debug)]
+pub struct Bind {
+    /// Existing durable agent to bind.
+    pub agent_id: AgentId,
+    /// Orchestrator transport name.
+    #[arg(long)]
+    pub session_transport: String,
+    /// External session identity.
+    #[arg(long)]
+    pub session_id: String,
+    /// Optional external turn identity.
+    #[arg(long)]
+    pub session_turn_id: Option<String>,
+}
+
+/// A durable session context lookup request accepted by the Python surface.
+#[derive(Args, Debug)]
+pub struct Context {
+    /// Orchestrator transport name.
+    #[arg(long)]
+    pub session_transport: String,
+    /// External session identity.
+    #[arg(long)]
+    pub session_id: String,
+    /// Optional external turn identity.
+    #[arg(long)]
+    pub session_turn_id: Option<String>,
+}
+
+/// An input hook subcommand.
+#[derive(Subcommand, Debug)]
+pub enum Hook {
+    /// Render context for a user prompt hook.
+    Context(HookTransport),
+    /// Bind a completed tool invocation from a post-tool hook.
+    Bind(HookTransport),
+}
+
+/// Hook transport selection constrained to the two Python-compatible values.
+#[derive(Args, Debug)]
+pub struct HookTransport {
+    /// The delivery transport encoded by the hook payload.
+    #[arg(long, default_value = "codex_queue", value_parser = ["claude_uds", "codex_queue"])]
+    pub transport: String,
+}
+/// Paging filters for the Python-compatible agent listing command.
 #[derive(Args, Debug)]
 pub struct Agents {
     #[arg(long)]
@@ -216,55 +251,65 @@ pub struct Agents {
     pub offset: usize,
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
-    #[arg(long)]
-    pub after_revision: Option<i64>,
-    #[arg(long, default_value_t = 0.0)]
-    pub wait_seconds: f64,
     #[command(flatten)]
     pub session: SessionArgs,
 }
+/// API daemon commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Api {
-    Serve,
+    Serve {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     Launchd {
         #[arg(long)]
-        binary: Option<PathBuf>,
+        binary: PathBuf,
+        #[arg(long, default_value = "com.agent-run.api")]
+        label: String,
+        #[arg(long)]
+        stdout_log: Option<PathBuf>,
+        #[arg(long)]
+        stderr_log: Option<PathBuf>,
     },
-    Ping,
-    Tools,
 }
+/// Capacity worker commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Capacity {
     Collect {
-        #[arg(long)]
+        #[arg(long, required = true)]
         once: bool,
     },
     Order,
     Launchd {
         #[arg(long)]
-        binary: Option<PathBuf>,
+        binary: PathBuf,
+        #[arg(long, default_value = "com.pluto.agent-run.capacity")]
+        label: String,
+        #[arg(long, default_value = "/dev/null")]
+        stdout_log: PathBuf,
+        #[arg(long)]
+        stderr_log: Option<PathBuf>,
     },
 }
+/// Completion-delivery commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Delivery {
     Status {
         agent_id: AgentId,
     },
-    Dispatch {
-        #[arg(long)]
-        once: bool,
+    Cancel {
+        delivery_id: String,
     },
+    Dispatch,
     Launchd {
         #[arg(long)]
-        binary: Option<PathBuf>,
-    },
-}
-#[derive(Subcommand, Debug)]
-pub enum State {
-    Check,
-    Backup {
+        binary: PathBuf,
+        #[arg(long, default_value = "com.pluto.agent-run.delivery")]
+        label: String,
+        #[arg(long, default_value = "/dev/null")]
+        stdout_log: PathBuf,
         #[arg(long)]
-        to: PathBuf,
+        stderr_log: Option<PathBuf>,
     },
 }
 fn absolute(p: &Path) -> Result<PathBuf> {
@@ -281,6 +326,32 @@ fn read_input(p: &Path, max: usize) -> Result<String> {
     let bytes = fs::Dir::open(parent)?.read(Path::new(name), max)?;
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
 }
+/// Reads bounded UTF-8 standard input for Python-compatible `-` task values.
+fn read_stdin(max: usize) -> Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(max.min(8192));
+    std::io::stdin()
+        .lock()
+        .take(max.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(invalid("stdin exceeds the maximum input size"));
+    }
+    String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
+}
+
+/// Reads a task argument, interpreting exactly `-` as bounded standard input.
+fn task_text(value: &str, max: usize) -> Result<String> {
+    let text = if value == "-" {
+        read_stdin(max)?
+    } else {
+        value.to_owned()
+    };
+    if text.trim().is_empty() {
+        return Err(invalid("task must be nonblank"));
+    }
+    Ok(text)
+}
 pub fn emit(value: &Value) -> Result<()> {
     let encoded = serde_json::to_vec(value)?;
     if encoded.len() + 1 > transport::socket::MAX_FRAME {
@@ -293,6 +364,27 @@ pub fn emit(value: &Value) -> Result<()> {
     out.write_all(b"\n")?;
     out.flush()?;
     Ok(())
+}
+
+/// Reduces a broker admission DTO to the Python CLI's public acknowledgement.
+///
+/// Socket/MCP calls deliberately retain the full durable agent snapshot, but
+/// the shell command has historically emitted only an agent id and the replay
+/// indicator. A malformed broker result is treated as a typed validation
+/// failure rather than silently producing a partial acknowledgement.
+fn admission_output(result: &Value) -> Result<Value> {
+    let agent_id = result
+        .get("agent_id")
+        .cloned()
+        .ok_or_else(|| invalid("broker admission result has no agent_id"))?;
+    let created = result
+        .get("created")
+        .cloned()
+        .ok_or_else(|| invalid("broker admission result has no created flag"))?;
+    if !agent_id.is_string() || !created.is_boolean() {
+        return Err(invalid("broker admission result has invalid fields"));
+    }
+    Ok(json!({"agent_id":agent_id,"created":created}))
 }
 fn result_code(value: &Value) -> i32 {
     match value.get("status").and_then(Value::as_str) {
@@ -330,7 +422,8 @@ pub fn init(home: &Path) -> Result<Value> {
     }
     let _ = Config::load(home)?;
     let store = Store::initialize(home)?;
-    Ok(json!({"home":home,"initialized":true,"state":store.health()?}))
+    let _ = store.health()?;
+    Ok(json!({"home":home,"config":home.join("config.toml"),"state":home.join("state.db")}))
 }
 pub fn doc(topic: &str) -> Result<&'static str> {
     crate::dispatch::doc(topic)
@@ -384,12 +477,21 @@ fn xml(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
-pub fn launchd(home: &Path, binary: Option<PathBuf>, kind: &str, interval: u64) -> Result<String> {
-    let binary = absolute(&binary.unwrap_or(std::env::current_exe()?))?;
+/// Renders the Python-compatible launchd document and its machine-readable metadata.
+pub fn launchd(
+    home: &Path,
+    binary: PathBuf,
+    kind: &str,
+    interval: u64,
+    label: &str,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+) -> Result<Value> {
+    let binary = absolute(&binary)?;
     let args = match kind {
         "api" => vec!["api", "serve"],
         "capacity" => vec!["capacity", "collect", "--once"],
-        "delivery" => vec!["delivery", "dispatch", "--once"],
+        "delivery" => vec!["delivery", "dispatch"],
         _ => return Err(invalid("unknown launchd job")),
     };
     let mut argv = vec![
@@ -412,9 +514,15 @@ pub fn launchd(home: &Path, binary: Option<PathBuf>, kind: &str, interval: u64) 
             interval.max(1)
         )
     };
-    Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.agent-run.{kind}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",xml(&home_env),xml(&path),xml(&home.join(format!("logs/{kind}.out.log")).to_string_lossy()),xml(&home.join(format!("logs/{kind}.err.log")).to_string_lossy())))
+    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",xml(label),xml(&home_env),xml(&path),xml(&stdout_log.to_string_lossy()),xml(&stderr_log.to_string_lossy()));
+    Ok(if kind == "api" {
+        json!({"label":label,"argv":argv,"plist":plist})
+    } else {
+        json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
+    })
 }
-async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<i32> {
+/// Runs native provider login and returns its process code plus a safe success DTO.
+async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, Value)> {
     let cfg = Config::load(home)?;
     let runtime = cfg.runtime(name)?;
     let kind = runtime.kind()?;
@@ -455,8 +563,17 @@ async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<i32> {
         .stderr(Stdio::inherit())
         .status()
         .await?;
-    Ok(status.code().unwrap_or(1))
+    Ok((
+        status.code().unwrap_or(1),
+        json!({"account":account.unwrap_or("default"),"runtime":name,"status":"ok"}),
+    ))
 }
+/// Executes one parsed command and returns its public process exit status.
+///
+/// Success writes JSON (except the stdio server), while expected failures
+/// propagate as typed errors for `main` to render as the Python-compatible
+/// JSON error envelope. `start` and `resume` exclusively call the resident
+/// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home)?;
     let service = Service::new(home.clone());
@@ -468,33 +585,15 @@ pub async fn run(cli: Cli) -> Result<i32> {
             return Ok(if value["ok"] == true { 0 } else { 2 });
         }
         Command::Start(a) => {
-            let task = match (a.task, a.task_file) {
-                (Some(t), None) => t,
-                (None, Some(p)) => read_input(&p, 512 * 1024)?,
-                _ => return Err(invalid("provide exactly one task source")),
-            };
+            let task = task_text(&a.task, 1024 * 1024)?;
             let schema = if let Some(p) = a.output_schema {
                 Some(
-                    serde_json::from_str::<serde_json::Map<String, Value>>(&read_input(
-                        &p,
-                        256 * 1024,
-                    )?)
-                    .map_err(|_| invalid("output schema must be a JSON object"))?,
+                    serde_json::from_str::<serde_json::Map<String, Value>>(&p)
+                        .map_err(|_| invalid("output schema must be a JSON object"))?,
                 )
             } else {
                 None
             };
-            let constraints: BTreeSet<Constraint> = a
-                .required_constraints
-                .iter()
-                .map(|s| {
-                    serde_json::from_value(Value::String(s.clone()))
-                        .map_err(|_| invalid("unknown required constraint"))
-                })
-                .collect::<Result<_>>()?;
-            if constraints.len() != a.required_constraints.len() {
-                return Err(invalid("duplicate required constraint"));
-            }
             let mut request = StartRequest {
                 runtime: a.runtime,
                 model: a.model,
@@ -511,15 +610,15 @@ pub async fn run(cli: Cli) -> Result<i32> {
                     .map(|p| absolute(p))
                     .collect::<Result<_>>()?,
                 output_schema: schema,
-                orchestrator: a.session.resolve(false)?,
+                orchestrator: a.session.resolve()?,
                 request_id: a.request_id,
                 account: a.account,
-                required_constraints: constraints,
+                required_constraints: BTreeSet::<Constraint>::new(),
             };
             request.validate()?;
             let result =
                 transport::socket::client(&home, "start", serde_json::to_value(request)?).await?;
-            emit(&result)?;
+            emit(&admission_output(&result)?)?;
             if a.wait {
                 let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
                 let result =
@@ -529,45 +628,78 @@ pub async fn run(cli: Cli) -> Result<i32> {
             }
         }
         Command::Resume(a) => {
-            let result=transport::socket::client(&home,"resume",json!({"agent_id":a.agent_id,"task":a.task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve(false)?})).await?;
-            emit(&result)?;
-            if a.wait {
-                let result = transport::socket::client(
-                    &home,
-                    "wait",
-                    json!({"agent_id":result["agent_id"]}),
-                )
-                .await?;
-                emit(&result)?;
-                return Ok(result_code(&result));
-            }
+            let task = match (a.task, a.task_file) {
+                (Some(task), None) => task_text(&task, 1024 * 1024)?,
+                (None, Some(path)) if path == Path::new("-") => read_stdin(1024 * 1024)?,
+                (None, Some(path)) => read_input(&path, 1024 * 1024)?,
+                _ => return Err(invalid("provide exactly one resume task source")),
+            };
+            let result=transport::socket::client(&home,"resume",json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?})).await?;
+            emit(&admission_output(&result)?)?;
         }
         Command::Cancel { agent_id } => emit(&service.cancel(&agent_id)?)?,
         Command::Steer { agent_id, text } => emit(&service.steer(&agent_id, &text)?)?,
+        Command::Bind(_a) => {
+            return Err(Error::Unsupported(
+                "bind is awaiting the shared session service".into(),
+            ))
+        }
+        Command::Context(_a) => {
+            return Err(Error::Unsupported(
+                "context is awaiting the shared hook service".into(),
+            ))
+        }
+        Command::Hook { command: _command } => {
+            return Err(Error::Unsupported(
+                "hook commands are awaiting the shared hook service".into(),
+            ))
+        }
         Command::Agents(a) => emit(
             &service
                 .list(Query {
                     active: a.active,
                     offset: a.offset,
                     limit: a.limit,
-                    after_revision: a.after_revision,
-                    wait_seconds: a.wait_seconds,
-                    orchestrator: a.session.resolve(false)?,
+                    after_revision: None,
+                    wait_seconds: 0.0,
+                    orchestrator: a.session.resolve()?,
                 })
                 .await?,
         )?,
         Command::Answer { agent_id } => {
             let value = service.answer(&agent_id)?;
             emit(&value)?;
-            return Ok(result_code(&value));
         }
         Command::Transcript {
             agent_id,
             mut cursor,
             limit,
             follow,
+            full,
         } => loop {
             let page = service.transcript(&agent_id, cursor, limit)?;
+            if full {
+                let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
+                let mut page_cursor = cursor;
+                let mut pages = 1usize;
+                let mut current = page;
+                while current["complete"] != true {
+                    let next = current["next_cursor"]
+                        .as_i64()
+                        .ok_or_else(|| invalid("transcript pagination did not advance"))?;
+                    if next <= page_cursor {
+                        return Err(invalid("transcript pagination did not advance"));
+                    }
+                    page_cursor = next;
+                    current = service.transcript(&agent_id, page_cursor, limit)?;
+                    messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
+                    pages += 1;
+                }
+                emit(
+                    &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
+                )?;
+                break;
+            }
             emit(&page)?;
             if let Some(seq) = page["messages"]
                 .as_array()
@@ -590,57 +722,94 @@ pub async fn run(cli: Cli) -> Result<i32> {
             let topic = topic.as_deref().unwrap_or("index");
             emit(&json!({"topic":topic,"text":doc(topic)?}))?;
         }
-        Command::Mcp { session } => transport::mcp::serve(home, session.resolve(true)?).await?,
+        Command::Mcp => transport::mcp::serve(home, None).await?,
         Command::Api { command } => match command {
-            Api::Serve => transport::socket::serve(&home).await?,
-            Api::Launchd { binary } => print!("{}", launchd(&home, binary, "api", 0)?),
-            Api::Ping => emit(&transport::socket::client(&home, "ping", json!({})).await?)?,
-            Api::Tools => emit(&json!({"tools":crate::dispatch::tools()}))?,
+            Api::Serve { socket } => {
+                if socket.is_some() {
+                    return Err(Error::Unsupported(
+                        "custom API socket paths are not yet supported".into(),
+                    ));
+                }
+                transport::socket::serve(&home).await?
+            }
+            Api::Launchd {
+                binary,
+                label,
+                stdout_log,
+                stderr_log,
+            } => emit(&launchd(
+                &home,
+                binary,
+                "api",
+                0,
+                &label,
+                stdout_log.unwrap_or_else(|| home.join("logs/api.log")),
+                stderr_log.unwrap_or_else(|| home.join("logs/api.err.log")),
+            )?)?,
         },
         Command::Capacity { command } => match command {
             Capacity::Order => emit(&service.capacity_order()?)?,
-            Capacity::Launchd { binary } => print!(
-                "{}",
-                launchd(
-                    &home,
-                    binary,
-                    "capacity",
-                    Config::load(&home)?.capacity.collect_interval_seconds
-                )?
-            ),
-            Capacity::Collect { once } => loop {
+            Capacity::Launchd {
+                binary,
+                label,
+                stdout_log,
+                stderr_log,
+            } => emit(&launchd(
+                &home,
+                binary,
+                "capacity",
+                Config::load(&home)?.capacity.collect_interval_seconds,
+                &label,
+                stdout_log,
+                stderr_log.unwrap_or_else(|| home.join("capacity-worker.err.log")),
+            )?)?,
+            Capacity::Collect { once: _ } => {
                 let result = capacity::collect(&home).await?;
                 emit(&result)?;
-                if once {
-                    return Ok(if result["ok"] == true { 0 } else { 2 });
-                }
-                let interval = Config::load(&home)?.capacity.collect_interval_seconds;
-                tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_secs(interval))=>{}}
-            },
+                return Ok(if result["ok"] == true { 0 } else { 2 });
+            }
         },
         Command::Delivery { command } => match command {
             Delivery::Status { agent_id } => emit(&service.delivery_status(&agent_id)?)?,
-            Delivery::Launchd { binary } => print!("{}", launchd(&home, binary, "delivery", 2)?),
-            Delivery::Dispatch { once } => loop {
+            Delivery::Cancel { delivery_id: _ } => {
+                return Err(Error::Unsupported(
+                    "delivery cancel is awaiting the shared delivery service".into(),
+                ))
+            }
+            Delivery::Launchd {
+                binary,
+                label,
+                stdout_log,
+                stderr_log,
+            } => emit(&launchd(
+                &home,
+                binary,
+                "delivery",
+                2,
+                &label,
+                stdout_log,
+                stderr_log.unwrap_or_else(|| home.join("delivery-worker.err.log")),
+            )?)?,
+            Delivery::Dispatch => {
                 emit(&json!({"processed":crate::delivery::dispatch_once(&home).await?}))?;
-                if once {
-                    break;
-                }
-                tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
-            },
-        },
-        Command::Login { runtime, account } => {
-            return login(&home, &runtime, account.as_deref()).await
-        }
-        Command::Auth { account, runtime } => return login(&home, &runtime, Some(&account)).await,
-        Command::State { command } => match command {
-            State::Check => emit(&Store::open(&home)?.health()?)?,
-            State::Backup { to } => {
-                let to = absolute(&to)?;
-                Store::open(&home)?.backup(&to)?;
-                emit(&json!({"backup":to,"complete":true}))?;
             }
         },
+        Command::Login { runtime, account } => {
+            let (code, value) = login(&home, &runtime, account.as_deref()).await?;
+            if code == 0 {
+                emit(&value)?;
+            }
+            return Ok(code);
+        }
+        Command::Auth { label, runtime } => {
+            let (code, value) = login(&home, &runtime, Some(&label)).await?;
+            if code == 0 {
+                emit(&value)?;
+            }
+            return Ok(code);
+        }
+        // The supervisor is spawned by posix_spawn with three fixed bootstrap
+        // descriptors; keep that signature from the launch work.
         Command::Supervisor {
             agent_id,
             ready_fd,
