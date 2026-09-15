@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.11.15] - 2026-09-15
+
+- docs(codex): clarify snapshot helper contracts
+- refactor(codex): isolate runtime snapshot helpers
+- fix(codex): prepare project trust before sealing runtime
+
 ## [0.11.14] - 2026-09-15
 
 - test: isolate native settings runtime homes
