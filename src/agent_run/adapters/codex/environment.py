@@ -18,7 +18,11 @@ from pathlib import Path
 
 from ...config import McpConfig, RuntimeConfig
 from ...errors import ValidationError
-from ..command_policy import materialize_refusal_commands, render_codex_denial_rules
+from ..command_policy import (
+    materialize_refusal_commands,
+    render_codex_denial_rules,
+    render_codex_review_rules,
+)
 from ..environment import host_environment
 from ..home import write_managed_file
 
@@ -125,37 +129,50 @@ def prepared_environment(
     *,
     mcp_environment_names: tuple[str, ...] = (),
     denied_commands: tuple[str, ...] = (),
+    review_commands: tuple[str, ...] = (),
+    command_search_paths: tuple[Path, ...] = (),
     refresh: bool = True,
 ) -> dict[str, str]:
     """Return the Codex child environment with its managed command policy.
 
     ``mcp_environment_names`` may cross the credential filter. Optional legacy
-    command denials remain active during config migration.
+    ``denied_commands`` remain blocked during config migration, while
+    ``review_commands`` retain their native prompt rules across fresh prepares.
+    ``command_search_paths`` affects rule resolution only, never the child PATH.
     """
 
     environment = build_environment(
         binary, home, allowed_secret_names=mcp_environment_names
     )
-    if not denied_commands:
+    policy_environment = dict(environment)
+    if command_search_paths:
+        policy_environment["PATH"] = os.pathsep.join(
+            (*(str(path) for path in command_search_paths), environment["PATH"])
+        )
+    if not denied_commands and not review_commands:
         return environment
     policy_directory = home / "command-refusals"
     if refresh:
         command_policy = materialize_refusal_commands(
             denied_commands,
             policy_directory,
-            environment=environment,
+            environment=policy_environment,
         )
-        write_managed_file(
-            home,
-            "rules/agent-run-command-policy.rules",
-            render_codex_denial_rules(
-                denied_commands,
-                command_paths=tuple(command_policy.resolved_commands.values()),
-            ),
+        policy_text = render_codex_denial_rules(
+            denied_commands,
+            command_paths=tuple(command_policy.resolved_commands.values()),
         )
-    elif not policy_directory.is_dir() or any(
-        not (policy_directory / name).is_file()
-        for name in (".agent-run-command-policy.json", *denied_commands)
+        policy_text += render_codex_review_rules(
+            review_commands, environment=policy_environment
+        )
+        write_managed_file(home, "rules/agent-run-command-policy.rules", policy_text)
+    elif (
+        not policy_directory.is_dir()
+        or not (home / "rules/agent-run-command-policy.rules").is_file()
+        or any(
+            not (policy_directory / name).is_file()
+            for name in (".agent-run-command-policy.json", *denied_commands)
+        )
     ):
         raise ValidationError("codex resume command policy is missing")
     environment["PATH"] = os.pathsep.join((str(policy_directory), environment["PATH"]))

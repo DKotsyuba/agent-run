@@ -221,6 +221,12 @@ env_from = ["PATH"]
             environment=EnvironmentConfig(path=(tools,)),
         )
         ADAPTER.materialize(config, self.home, mcp_servers={})
+        workdir = projects / "repo"
+        workdir.mkdir()
+        profile = AgentProfile("implement", "body", True, ())
+        self.prepare(
+            self.start_request(write=True, workdir=workdir), profile, config
+        )
         generated = tomllib.loads((self.home / "config.toml").read_text(encoding="utf-8"))
         self.assertTrue(generated["permissions"]["Projects"]["network"]["enabled"])
         rules = (self.home / "rules" / "agent-run-command-policy.rules").read_text()

@@ -634,7 +634,7 @@ class CodexAdapter:
                     env_name for server in role.mcp for env_name in server.env_from
                 )
             ),
-            denied_commands=denied_commands,
+            denied_commands=denied_commands, review_commands=("curl",) if config.workspace_network else (), command_search_paths=() if config.environment is None else config.environment.path,
             refresh=resume_session_id is None,
         )
         if config.plugins and not effective_write:
