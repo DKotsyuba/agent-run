@@ -1,0 +1,38 @@
+# No runtime is enabled until its absolute binary/home and models are declared.
+# Secrets belong in explicitly named environment variables or native auth files.
+schema_version = 1
+
+[core]
+max_active_agents = 6
+# Legacy compatibility metadata, NOT an execution deadline:
+default_timeout_seconds = 480
+
+[capacity]
+collect_interval_seconds = 300
+sample_retention = 1000
+
+# Example (uncomment and edit all paths/model names):
+# [runtimes.codex]
+# enabled = true
+# adapter = "codex"  # original agent_run.adapters.codex.adapter:ADAPTER also works
+# binary = "/absolute/path/to/codex"
+# home = "/absolute/path/to/agent-run-rust-home/runtimes/codex"
+# models = ["an-enabled-model-from-your-account"]
+# accounts = ["personal"]
+# limits_source = "codex_appserver"
+# priority_multiplier = 1.0
+#
+# [runtimes.claude]
+# enabled = true
+# adapter = "claude"
+# binary = "/absolute/path/to/claude"
+# home = "/absolute/path/to/agent-run-rust-home/runtimes/claude"
+# models = ["sonnet", "opus"]
+# limits_source = "none"
+#
+# Native Claude quota collection requires an explicitly exported OAuth token:
+# [runtimes.claude.auth]
+# kind = "environment"
+# names = ["CLAUDE_CODE_OAUTH_TOKEN"]
+# Then set limits_source = "native" in runtimes.claude.
+# ANTHROPIC_API_KEY is not an OAuth token.

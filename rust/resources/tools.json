@@ -1,0 +1,354 @@
+[
+  {
+    "name": "capacity_order",
+    "description": "Read the committed capacity routing order.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "start",
+    "description": "Start one asynchronous durable agent. A completion notice is lifecycle evidence, not a new task or user approval. Retrieve answer and transcript by agent_id; disconnecting does not cancel an admitted run.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "runtime": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "workdir": {
+          "type": "string"
+        },
+        "write": {
+          "type": "boolean"
+        },
+        "fast": {
+          "type": "boolean"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "type": "number"
+        },
+        "read_roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "output_schema": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "transport": {
+                  "type": "string"
+                },
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "transport",
+                "external_session_id"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required_constraints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "web_tools_disabled",
+              "external_network_isolation",
+              "loopback_tcp_isolation",
+              "unix_ipc_isolation",
+              "mcp_ipc_isolation",
+              "filesystem_write_isolation",
+              "filesystem_read_isolation",
+              "plugin_immutability"
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "model",
+        "profile",
+        "task",
+        "workdir"
+      ]
+    }
+  },
+  {
+    "name": "cancel",
+    "description": "Durably request agent cancellation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id"
+      ]
+    }
+  },
+  {
+    "name": "steer",
+    "description": "Durably steer an active capable agent.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "list_agents",
+    "description": "List a bounded page and exact total.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "transport": {
+                  "type": "string"
+                },
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "transport",
+                "external_session_id"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "offset": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "after_revision": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wait_seconds": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "transcript",
+    "description": "Read one cursor page; raw_ref stays a reference.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id"
+      ]
+    }
+  },
+  {
+    "name": "answer",
+    "description": "Read a verified bounded answer and integrity metadata.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id"
+      ]
+    }
+  },
+  {
+    "name": "resume",
+    "description": "Continue a terminal native session as a new durable run with inherited identity and permissions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "transport": {
+                  "type": "string"
+                },
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "transport",
+                "external_session_id"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "task"
+      ]
+    }
+  },
+  {
+    "name": "doc",
+    "description": "Read one operator guide topic or its index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "models",
+    "description": "List configured model rosters with capability and health evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "limits",
+    "description": "Read fresh capacity evidence without collecting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  }
+]

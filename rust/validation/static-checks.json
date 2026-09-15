@@ -1,0 +1,43 @@
+{
+  "scope": "Static checks only: not Rust compilation, not Rust tests",
+  "tools": {
+    "rustc": null,
+    "cargo": null,
+    "sqlite": "3.46.1",
+    "node": "v22.16.0"
+  },
+  "schema_version": 16,
+  "application_tables": [
+    "agents",
+    "attempts",
+    "capacity_route_snapshots",
+    "capacity_samples",
+    "commands",
+    "context_receipts",
+    "deliveries",
+    "delivery_attempt_evidence",
+    "events",
+    "messages",
+    "orchestrator_sessions",
+    "reconciliation_cursors",
+    "run_stats",
+    "workflow_deliveries",
+    "workflow_runs",
+    "workflow_steps"
+  ],
+  "sqlite_quick_check": "ok",
+  "foreign_key_check_rows": [],
+  "prepared_sql_count": 58,
+  "sql_errors": [],
+  "unresolved_sql": [],
+  "rust_lexical_errors": [],
+  "missing_include_files": [],
+  "parsed_toml": [
+    "Cargo.toml",
+    "resources/config.example.toml"
+  ],
+  "shared_tools": 11,
+  "rust_files": 38,
+  "rust_test_functions": 78,
+  "current_static_sql_missing_from_inventory": []
+}
