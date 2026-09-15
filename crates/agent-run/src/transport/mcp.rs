@@ -192,7 +192,7 @@ impl ServerHandler for Proxy {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        if !dispatch::TOOL_NAMES.contains(&request.name.as_ref()) {
+        if !dispatch::is_tool(request.name.as_ref()) {
             return Ok(tool_error(
                 "unknown_tool",
                 format!("unknown tool: {}", request.name),

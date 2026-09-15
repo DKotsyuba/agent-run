@@ -3,11 +3,15 @@ pub mod canonical;
 pub mod domain;
 pub mod error;
 pub mod fsm;
+pub mod tools;
 pub mod types;
 pub mod views;
 
 pub use error::{Error, MachineCode, ProtocolMapping, PublicError, Result};
 pub use fsm::{validate_transition, ACTIVE, TERMINAL};
+pub use tools::{
+    is_tool, registry, tool, tools_json, ArgumentDefault, ArgumentDefinition, ToolDefinition,
+};
 pub use types::{
     AbsoluteDirectory, AccountLabel, AccountSelector, GlobalAccount, NonNegativeFinite,
     PositiveFinite, ProcessBirthProof, RelativeOwnedPath, RuntimeName, Sha256Digest,

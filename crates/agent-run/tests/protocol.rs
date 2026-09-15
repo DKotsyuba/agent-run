@@ -19,7 +19,13 @@ fn packaged_table_has_exactly_the_shared_eleven_tools() {
     assert_eq!(tools.len(), 11);
     let names: std::collections::BTreeSet<_> =
         tools.iter().map(|v| v["name"].as_str().unwrap()).collect();
-    assert_eq!(names, dispatch::TOOL_NAMES.into_iter().collect());
+    assert_eq!(
+        names,
+        agent_run_domain::registry()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect()
+    );
     for tool in tools {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
     }
