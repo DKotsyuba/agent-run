@@ -37,6 +37,7 @@ async fn read<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Value> {
     }
     Ok(v)
 }
+
 pub async fn send(home: &Path, thread: &str, notice: &Notice) -> Evidence {
     let mut paths: Vec<_> = std::fs::read_dir(home)
         .into_iter()
@@ -242,7 +243,14 @@ pub fn host(home: &Path) -> Result<Option<Host>> {
             tokio::spawn(async move {
                 let _permit = permit;
                 let action = async {
-                    let (thread, notice) = request(read(&mut stream).await?)?;
+                    let value = read(&mut stream).await?;
+                    let (thread, notice) = match request(value) {
+                        Ok(request) => request,
+                        Err(_) => {
+                            write(&mut stream, &json!({"outcome":"rejected"})).await?;
+                            return Ok(());
+                        }
+                    };
                     let outcome = host_send(&node, &pipe, &thread, &notice)
                         .await
                         .unwrap_or_else(|_| "ambiguous".into());
@@ -291,4 +299,17 @@ async fn host_send(node: &Path, pipe: &Path, thread: &str, notice: &Notice) -> R
         .filter(|s| ["accepted", "rejected", "ambiguous"].contains(s))
         .map(str::to_owned)
         .ok_or_else(|| invalid("malformed Desktop outcome"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_frame_bound_is_enforced`.
+    #[tokio::test]
+    async fn relay_frame_bound_is_enforced_before_writing() {
+        let mut sink = tokio::io::sink();
+        let result = write(&mut sink, &json!({"text":"x".repeat(8192)})).await;
+        assert!(result.is_err());
+    }
 }
