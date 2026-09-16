@@ -918,7 +918,7 @@ fn await_group_exit(pgid: i32, budget: Duration) -> bool {
 }
 
 /// Signal-0 group probe; EPERM means the group exists but is not ours.
-fn group_alive(pgid: i32) -> bool {
+pub fn group_alive(pgid: i32) -> bool {
     // SAFETY: signal 0 to a group id above 1 only probes existence.
     let probed = unsafe { libc::killpg(pgid, 0) };
     probed == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
