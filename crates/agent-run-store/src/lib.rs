@@ -191,6 +191,12 @@ fn decode_context_components(key: &str) -> Option<BTreeMap<String, String>> {
 }
 
 impl Store {
+    /// Returns the canonical durable database path so another thread can open
+    /// its own SQLite connection without violating connection affinity.
+    pub fn path(&self) -> PathBuf {
+        self.home.join("state.db")
+    }
+
     pub fn initialize(home: &Path) -> Result<Self> {
         fs::private_dir(home)?;
         Self::connect(home, true)

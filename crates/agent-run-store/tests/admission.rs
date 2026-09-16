@@ -116,6 +116,7 @@ fn conflicting_request_id_rolls_back_before_session_or_agent_writes() {
     );
 }
 
+/// Mirrors `tests/test_state_store.py::StateStoreTests::test_concurrent_limited_creation_allows_exactly_one_process`.
 /// Mirrors Python `test_global_runtime_caps_and_terminal_rows_release_capacity` and T20.
 #[test]
 fn parallel_admissions_share_one_active_slot() {

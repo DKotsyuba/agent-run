@@ -17,6 +17,17 @@ const V1_AGENTS: [&str; 3] = ["agt_alpha", "agt_beta", "agt_gamma"];
 /// migration file up to and including `version`, exactly as the real chain
 /// would leave a store that stopped at that version.
 fn build_fixture(path: &Path, version: i64) -> Connection {
+    if version >= 2 {
+        let fixture_name = if version == VERSION {
+            "current-v16.sqlite".to_owned()
+        } else {
+            format!("historical-v{version}.sqlite")
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../tests/fixtures/baseline/db/{fixture_name}"));
+        std::fs::copy(fixture, path).unwrap();
+        return Connection::open(path).unwrap();
+    }
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(V1_SCHEMA).unwrap();
     for (target, sql) in migrations::pending_files() {
@@ -96,6 +107,8 @@ fn fresh_schema_objects() -> Vec<(String, String, String)> {
 
 // --- (a) every historical version reaches a schema identical to fresh ---
 
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_migrated_store_is_indistinguishable_from_a_fresh_one`.
+/// Mirrors `tests/test_state_migrations.py::V2UpgradeTests::test_v2_migrated_store_is_indistinguishable_from_a_fresh_one`.
 #[test]
 fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() {
     let fresh = fresh_schema_objects();
@@ -120,6 +133,7 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
 
 // --- (b) existing rows survive migration ---
 
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_v1_home_opens_transparently_and_keeps_its_rows`.
 #[test]
 fn existing_rows_survive_migration_from_v1() {
     let home = tempfile::tempdir().unwrap();
@@ -149,6 +163,7 @@ fn existing_rows_survive_migration_from_v1() {
 
 // --- (c) a newer-than-supported database is refused without modification ---
 
+/// Mirrors `tests/test_state_migrations.py::MigrationRefusalTests::test_newer_schema_is_refused_without_touching_the_store`.
 #[test]
 fn newer_schema_is_refused_without_touching_the_store() {
     let home = tempfile::tempdir().unwrap();
@@ -176,17 +191,23 @@ fn newer_schema_is_refused_without_touching_the_store() {
 // --- (d) backup behavior: cleaned on success, retained (with rollback) on
 // failure, and stale-but-understood backups are swept on a later open ---
 
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_migration_is_idempotent_and_clears_a_stale_backup`.
 #[test]
 fn successful_migration_leaves_no_backup_files_behind() {
     let home = tempfile::tempdir().unwrap();
     let db_path = home.path().join("state.db");
     drop(build_fixture(&db_path, 1));
     assert_eq!(migrations::migrate(&db_path).unwrap(), VERSION);
+    let stale = migrations::backup_path(&db_path, VERSION);
+    std::fs::write(&stale, b"stale").unwrap();
+    assert_eq!(migrations::migrate(&db_path).unwrap(), VERSION);
+    assert!(!stale.exists());
     for version in 2..=VERSION {
         assert!(!migrations::backup_path(&db_path, version).exists());
     }
 }
 
+/// Mirrors `tests/test_state_migrations.py::MigrationRefusalTests::test_failed_migration_rolls_back_and_leaves_the_backup`.
 #[test]
 fn failed_migration_rolls_back_and_leaves_the_pre_migration_backup() {
     let home = tempfile::tempdir().unwrap();
@@ -218,6 +239,7 @@ fn failed_migration_rolls_back_and_leaves_the_pre_migration_backup() {
     assert_eq!(agent_count(&conn), V1_AGENTS.len() as i64);
 }
 
+/// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_stale_backup_cleanup_spares_newer_versions_snapshots`.
 #[test]
 fn opening_an_up_to_date_store_sweeps_understood_stale_backups_but_spares_newer_ones() {
     let home = tempfile::tempdir().unwrap();
@@ -236,6 +258,7 @@ fn opening_an_up_to_date_store_sweeps_understood_stale_backups_but_spares_newer_
 
 // --- migration 012's data transform is ported faithfully, not just its SQL shape ---
 
+/// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_v11_to_v12_snapshots_or_retires_every_existing_workflow_notice`.
 #[test]
 fn migration_012_snapshots_or_retires_every_pre_existing_workflow_notice() {
     let home = tempfile::tempdir().unwrap();
@@ -281,4 +304,239 @@ fn migration_012_snapshots_or_retires_every_pre_existing_workflow_notice() {
     assert_eq!(retired_state, "cancelled");
     assert_eq!(retired_result, None);
     assert!(last_error.contains("v12"), "{last_error}");
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_files_are_numbered_and_cover_every_version_after_one`.
+#[test]
+fn migration_registry_is_contiguous() {
+    let versions: Vec<_> = migrations::pending_files()
+        .iter()
+        .map(|(version, _)| *version)
+        .collect();
+    assert_eq!(versions, (2..=VERSION).collect::<Vec<_>>());
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_v9_to_v10_creates_bounded_route_snapshot_table`.
+#[test]
+fn migration_010_creates_a_bounded_route_snapshot_table() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    drop(build_fixture(&db_path, 9));
+    let store = Store::open(home.path()).unwrap();
+    let columns: Vec<String> = store
+        .conn
+        .prepare("PRAGMA table_info(capacity_route_snapshots)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "runtime",
+            "scope_id",
+            "observed_at",
+            "valid_until",
+            "payload_json"
+        ]
+    );
+    let error = store.conn.execute(
+        "INSERT INTO capacity_route_snapshots(runtime,scope_id,observed_at,valid_until,payload_json) VALUES('codex','oversized',1,2,?)",
+        ["x".repeat(65_537)],
+    );
+    assert!(error.is_err());
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_foreign_key_check_is_clean_after_each_migration`.
+#[test]
+fn each_migration_restores_pragmas_and_foreign_key_integrity() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    drop(build_fixture(&db_path, 1));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    conn.pragma_update(None, "legacy_alter_table", false)
+        .unwrap();
+    for (target, sql) in migrations::pending_files() {
+        migrations::apply_one(&conn, &db_path, *target, sql).unwrap();
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        let legacy_alter_table: i64 = conn
+            .pragma_query_value(None, "legacy_alter_table", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "migration v{target}");
+        assert_eq!(legacy_alter_table, 0, "migration v{target}");
+        assert!(conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_open_repairs_poisoned_v5_store_and_preserves_history`.
+#[test]
+fn opening_v5_preserves_workflow_history_after_foreign_key_repair() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    drop(build_fixture(&db_path, 5));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO workflow_runs(id,name,script_sha,status,created_at) VALUES('wf_poisoned','flow','sha','running',1)",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA user_version=5").unwrap();
+    drop(conn);
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE id='wf_poisoned'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "running"
+    );
+    assert!(store
+        .conn
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .is_empty());
+}
+
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_initialize_also_upgrades_an_existing_v1_home`.
+#[test]
+fn initialize_upgrades_an_existing_v1_store() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let conn = build_fixture(&db_path, 1);
+    insert_v1_agents(&conn);
+    drop(conn);
+    let store = Store::initialize(home.path()).unwrap();
+    assert_eq!(store.health().unwrap()["schema_version"], VERSION);
+    assert_eq!(agent_count(&store.conn), V1_AGENTS.len() as i64);
+}
+
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_concurrent_openers_migrate_a_v1_store_exactly_once`.
+#[test]
+fn concurrent_openers_migrate_a_v1_store_once() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let conn = build_fixture(&db_path, 1);
+    insert_v1_agents(&conn);
+    drop(conn);
+    let barrier = Arc::new(Barrier::new(8));
+    let paths = (0..8).map(|_| db_path.clone()).collect::<Vec<_>>();
+    let threads: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                Store::open(path.parent().unwrap())
+                    .unwrap()
+                    .health()
+                    .unwrap()["schema_version"]
+                    .as_i64()
+                    .unwrap()
+            })
+        })
+        .collect();
+    let versions: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(versions, vec![VERSION; 8]);
+    assert_eq!(agent_count(&open_ro(&db_path)), V1_AGENTS.len() as i64);
+}
+
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_workflow_status_enums_are_enforced`.
+#[test]
+fn workflow_status_enums_are_enforced_after_upgrade() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    drop(build_fixture(&db_path, 1));
+    let store = Store::open(home.path()).unwrap();
+    assert!(store.conn.execute(
+        "INSERT INTO workflow_runs(id,name,script_sha,status,created_at) VALUES('bad','flow','sha','bogus',1)",
+        [],
+    ).is_err());
+    store.conn.execute(
+        "INSERT INTO workflow_runs(id,name,script_sha,status,created_at) VALUES('good','flow','sha','running',1)",
+        [],
+    ).unwrap();
+    assert!(store.conn.execute(
+        "INSERT INTO workflow_steps(run_id,step_key,spec_json,status) VALUES('good','step','{}','bogus')",
+        [],
+    ).is_err());
+}
+
+/// Mirrors `tests/test_state_migrations.py::V2UpgradeTests::test_v2_home_opens_to_v3_with_plan_json_present`.
+#[test]
+fn v2_upgrade_adds_nullable_workflow_plan_json() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let conn = build_fixture(&db_path, 2);
+    conn.execute(
+        "INSERT INTO workflow_runs(id,name,script_sha,status,created_at) VALUES('wr_1','flow','sha','failed',1)",
+        [],
+    ).unwrap();
+    drop(conn);
+    let store = Store::open(home.path()).unwrap();
+    let columns: Vec<String> = store
+        .conn
+        .prepare("PRAGMA table_info(workflow_runs)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(columns.iter().any(|column| column == "plan_json"));
+    assert!(store
+        .conn
+        .query_row(
+            "SELECT plan_json FROM workflow_runs WHERE id='wr_1'",
+            [],
+            |row| row.get::<_, Option<String>>(0)
+        )
+        .unwrap()
+        .is_none());
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationRefusalTests::test_incomplete_store_claiming_a_version_is_refused_unmigrated`.
+#[test]
+fn incomplete_versioned_store_is_refused_without_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch("CREATE TABLE agents (id TEXT PRIMARY KEY); PRAGMA user_version=1")
+        .unwrap();
+    drop(conn);
+    assert!(Store::open(home.path()).is_err());
+    assert_eq!(user_version(&open_ro(&db_path)), 1);
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationDiagnosticsTests::test_read_only_snapshot_reports_the_pending_migration`.
+#[test]
+fn read_only_snapshot_refuses_a_pending_migration_without_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    drop(build_fixture(&db_path, 1));
+    let error = agent_run_store::diagnostics::diagnostic_snapshot(&db_path, 1.0, 256).unwrap_err();
+    assert!(error.to_string().contains("usable schema"));
+    assert_eq!(user_version(&open_ro(&db_path)), 1);
 }
