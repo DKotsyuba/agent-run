@@ -63,6 +63,7 @@ pub fn plan_with_environment(
         env.insert("OPENAI_MODEL".into(), req.model.clone());
         #[cfg(target_os = "macos")]
         {
+            // Put Xcode's Git ahead of the shim so Qwen cannot execute an untrusted Git.
             let xcode = std::process::Command::new("/usr/bin/xcrun")
                 .args(["--find", "git"])
                 .output()?;

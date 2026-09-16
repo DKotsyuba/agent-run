@@ -8,7 +8,7 @@ use agent_run_config::config::{
     Adapter, Auth, Capacity, Catalog, Config, Core, Delivery, Environment, Hook, Mcp, Runtime,
 };
 use agent_run_config::profiles::Profile;
-use agent_run_domain::domain::StartRequest;
+use agent_run_domain::{domain::StartRequest, Error};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -218,6 +218,24 @@ fn qwen_validation_accepts_environment_auth_and_rejects_foreign_grants() {
     };
     request.profile = network_role.name.clone();
     assert!(validate(&request, &runtime, &network_role).is_err());
+}
+
+/// Rejects a read-root request that is broader than the resolved Qwen role.
+// Python contract: `src/agent_run/adapters/qwen/adapter.py:386-387`.
+#[test]
+fn qwen_validation_rejects_ungranted_read_roots() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let root = temporary.path();
+    let runtime = runtime(root, None, None);
+    let (role, mut request) = role_request(root, false, vec![], vec![]);
+    request.read_roots.push(root.join("extra-read-root"));
+
+    let error = validate(&request, &runtime, &role).expect_err("ungranted read root");
+    assert!(matches!(&error, Error::Validation(_)));
+    assert_eq!(
+        error.to_string(),
+        "qwen request grants do not match the resolved role"
+    );
 }
 
 /// Confirms global Qwen authentication and host PATH inheritance are isolated.
