@@ -539,6 +539,19 @@ pub fn launchd(
         json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
     })
 }
+/// Returns one Claude account's durable credential-state home.
+///
+/// Labelled Claude state lives beside the configured runtime home, with
+/// `@<label>` appended to its final component, so an account's credentials stay
+/// with the runtime they belong to instead of under the agent-run home.
+fn account_runtime_home(runtime_home: &Path, label: &str) -> PathBuf {
+    let name = runtime_home
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    runtime_home.with_file_name(format!("{name}@{label}"))
+}
+
 /// Builds one credential-isolated native login or post-login status command.
 ///
 /// Codex scopes labelled accounts below the agent-run home and Claude scopes
@@ -553,6 +566,15 @@ fn native_login_command(
     status: bool,
 ) -> Result<tokio::process::Command> {
     let mut command = tokio::process::Command::new(&runtime.binary);
+    // Only PATH and HOME are needed to locate the provider binary and run its
+    // browser flow; every other inherited variable, including explicit
+    // credential variables, is withheld from the interactive child.
+    command.env_clear();
+    for name in ["PATH", "HOME"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     match kind {
         Adapter::Codex => {
             command.arg("login");
@@ -566,17 +588,31 @@ fn native_login_command(
             }
         }
         Adapter::Claude => {
-            command.args(["auth", "login"]);
+            // Claude verifies an existing session with `auth status --json`,
+            // a sibling of `auth login` rather than a suffix appended to it.
             if status {
-                command.args(["status", "--json"]);
-            }
-            if let Some(label) = account {
-                let path = crate::adapters::materialize::account_home(home, kind, label)
-                    .join("claude-config");
-                fs::private_dir(&path)?;
-                command.env("CLAUDE_CONFIG_DIR", path);
+                command.args(["auth", "status", "--json"]);
             } else {
-                command.env_remove("CLAUDE_CONFIG_DIR");
+                command.args(["auth", "login"]);
+            }
+            match account {
+                Some(label) => {
+                    let path = account_runtime_home(&runtime.home, label).join("claude-config");
+                    fs::private_dir(&path)?;
+                    command.env("CLAUDE_CONFIG_DIR", path);
+                }
+                // An omitted account authenticates the host CLI's native
+                // global state rather than any agent-run private directory.
+                None => {
+                    let native = std::env::var_os("CLAUDE_CONFIG_DIR")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+                        })
+                        .ok_or_else(|| invalid("HOME is missing"))?;
+                    command.env("CLAUDE_CONFIG_DIR", native);
+                }
             }
         }
         Adapter::Glm | Adapter::Qwen => {
