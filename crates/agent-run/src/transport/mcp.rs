@@ -25,14 +25,14 @@ const BROKER_UNAVAILABLE: &str =
     "agent-run broker is not running; start it with `agent-run api serve` or its launchd job";
 
 /// Bound stdin one LF-delimited MCP frame at a time for the SDK transport.
-struct BoundedStdin {
+struct BoundedReader<R> {
     /// The process stdin whose bytes are fed to the MCP SDK.
-    inner: tokio::io::Stdin,
+    inner: R,
     /// Bytes received since the most recent LF delimiter.
     line_bytes: usize,
 }
 
-impl BoundedStdin {
+impl BoundedReader<tokio::io::Stdin> {
     /// Wrap process stdin while retaining only the current frame's byte count.
     fn new() -> Self {
         Self {
@@ -42,7 +42,7 @@ impl BoundedStdin {
     }
 }
 
-impl AsyncRead for BoundedStdin {
+impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
     /// Read one chunk and reject a frame before it can grow beyond the wire limit.
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -71,6 +71,9 @@ impl AsyncRead for BoundedStdin {
         }
     }
 }
+
+/// Process-stdin specialization used by the production MCP transport.
+type BoundedStdin = BoundedReader<tokio::io::Stdin>;
 
 /// Bound stdout one LF-delimited MCP response frame before it reaches the host.
 struct BoundedStdout {
@@ -222,10 +225,12 @@ impl ServerHandler for Proxy {
                 arguments.insert("orchestrator".into(), json!(o));
             }
         }
-        match self
-            .broker
-            .call(request.name.as_ref(), Value::Object(arguments))
-            .await
+        match detached_broker_call(
+            self.broker.clone(),
+            request.name.to_string(),
+            Value::Object(arguments),
+        )
+        .await
         {
             Ok(value) => Ok(tool_result(value)),
             Err(error) => {
@@ -239,6 +244,17 @@ impl ServerHandler for Proxy {
             }
         }
     }
+}
+
+/// Admit broker work in a detached task so cancellation only abandons the MCP wait.
+async fn detached_broker_call(
+    broker: Arc<dyn CliBroker>,
+    method: String,
+    params: Value,
+) -> Result<Value> {
+    tokio::spawn(async move { broker.call(&method, params).await })
+        .await
+        .map_err(|_| Error::Runtime("broker worker failed".into()))?
 }
 
 /// Render unknown object keys with the single-quoted Python validation spelling.
@@ -312,4 +328,158 @@ where
         .await
         .map_err(|_| Error::Runtime("MCP transport ended with a protocol error".into()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoundedReader, MAX_FRAME_BYTES};
+    use crate::cli::{CliBroker, CliFuture};
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Mirrors `tests/test_mcp.py::McpSdkTests::test_pipe_reader_preserves_a_split_utf8_frame`
+    #[tokio::test]
+    async fn pipe_reader_preserves_a_split_utf8_frame() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let task = tokio::spawn(async move {
+            writer.write_all(b"{\"text\":\"\xc3").await.unwrap();
+            writer.write_all(b"\xa9\"}\n").await.unwrap();
+        });
+        let mut bounded = BoundedReader {
+            inner: reader,
+            line_bytes: 0,
+        };
+        let mut bytes = Vec::new();
+        bounded.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(bytes, b"{\"text\":\"\xc3\xa9\"}\n");
+    }
+
+    /// Mirrors `tests/test_mcp.py::McpSdkTests::test_full_one_mib_frame_completes_within_bounded_deadline`
+    #[tokio::test]
+    async fn full_one_mib_frame_completes_within_bounded_deadline() {
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            let payload = vec![b'x'; MAX_FRAME_BYTES];
+            writer.write_all(&payload).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        let mut bounded = BoundedReader {
+            inner: reader,
+            line_bytes: 0,
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let mut bytes = Vec::new();
+            bounded.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        })
+        .await
+        .expect("bounded frame deadline");
+        task.await.unwrap();
+        assert_eq!(result.len(), MAX_FRAME_BYTES + 1);
+    }
+
+    /// Mirrors `tests/test_mcp.py::McpSdkTests::test_idle_pipe_cancellation_releases_the_raw_read_worker`
+    #[tokio::test]
+    async fn idle_pipe_cancellation_releases_the_raw_read_worker() {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let bounded = BoundedReader {
+            inner: reader,
+            line_bytes: 0,
+        };
+        let read = tokio::spawn(async move {
+            let mut bounded = bounded;
+            let mut buffer = [0_u8; 1];
+            bounded.read_exact(&mut buffer).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+    }
+
+    /// Mirrors `tests/test_mcp.py::McpSdkTests::test_endless_oversized_frame_remains_cancellable`
+    #[tokio::test]
+    async fn endless_oversized_frame_remains_cancellable() {
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            loop {
+                if writer.write_all(&[b'x'; 8192]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut bounded = BoundedReader {
+            inner: reader,
+            line_bytes: 0,
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            let mut byte = [0_u8; 1];
+            bounded.read_exact(&mut byte).await
+        })
+        .await;
+        task.abort();
+        assert!(outcome.is_ok());
+    }
+
+    /// Mirrors `tests/test_mcp.py::McpSdkTests::test_cancelled_caller_does_not_cancel_admitted_broker_call`
+    #[tokio::test]
+    async fn cancelled_caller_does_not_cancel_admitted_broker_call() {
+        struct DelayedBroker {
+            admitted: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            completed: Arc<AtomicBool>,
+        }
+        impl CliBroker for DelayedBroker {
+            fn call<'a>(&'a self, _method: &'a str, _params: serde_json::Value) -> CliFuture<'a> {
+                let admitted = self.admitted.clone();
+                let release = self.release.clone();
+                let completed = self.completed.clone();
+                Box::pin(async move {
+                    admitted.notify_one();
+                    release.notified().await;
+                    completed.store(true, Ordering::Release);
+                    Ok(json!({"ok": true}))
+                })
+            }
+        }
+        let admitted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let broker = Arc::new(DelayedBroker {
+            admitted: admitted.clone(),
+            release: release.clone(),
+            completed: completed.clone(),
+        });
+        let caller = tokio::spawn(super::detached_broker_call(
+            broker,
+            "answer".into(),
+            json!({}),
+        ));
+        admitted.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        for _ in 0..20 {
+            if completed.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    /// Mirrors `tests/test_mcp.py::McpSdkTests::test_domain_error_is_an_official_tool_error_result`
+    #[test]
+    fn domain_error_is_an_official_tool_error_result() {
+        let result = super::tool_error("AgentRunError", "controlled broker failure");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["message"],
+            "controlled broker failure"
+        );
+    }
 }
