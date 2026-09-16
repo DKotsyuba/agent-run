@@ -1100,6 +1100,16 @@ mod tests {
         );
     }
 
+    /// Keeps only the newest row for each capacity identity before staleness checks.
+    #[test]
+    fn capacity_staleness_deduplicates_identity_before_reporting() {
+        assert!(capacity_lanes(&[
+            capacity_row("same", 900., Some(2_000.)),
+            capacity_row("same", 100., Some(500.)),
+        ])
+        .is_empty());
+    }
+
     /// Creates Python `HookTrustTests.setUp`'s resolved home and install root.
     fn hook_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().expect("temporary home");

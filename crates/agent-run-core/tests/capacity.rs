@@ -25,6 +25,22 @@ fn sample(remaining: f64, observed: f64, reset: f64) -> Sample {
         valid_until: Some(observed + 10000.0),
     }
 }
+
+/// Builds a forecast fixture with independently optional evidence bounds.
+fn forecast_sample(
+    remaining: Option<f64>,
+    reset_at: Option<f64>,
+    observed_at: Option<f64>,
+    valid_until: Option<f64>,
+) -> Sample {
+    Sample {
+        key: key(),
+        remaining_percent: remaining,
+        reset_at,
+        observed_at,
+        valid_until,
+    }
+}
 fn route(id: &str, account: Option<&str>) -> Route {
     Route {
         route_id: id.into(),
@@ -112,6 +128,214 @@ fn burn_and_sustainable_rate_use_the_current_cycle() {
     assert_eq!(forecast.burn_percent_per_hour, Some(20.0));
     assert_eq!(forecast.burn_span_seconds, Some(3600.0));
     assert_eq!(forecast.sustainable_percent_per_hour, Some(35.0));
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_future_observation_and_reset_boundary_are_unknown`.
+#[test]
+fn forecast_future_observation_and_reset_boundary_are_unknown() {
+    let now = 1_000.0;
+    for sample in [
+        forecast_sample(
+            Some(80.0),
+            Some(now + 900.0),
+            Some(now + 60.0),
+            Some(now + 3_600.0),
+        ),
+        forecast_sample(Some(80.0), Some(now), Some(now - 60.0), Some(now + 900.0)),
+    ] {
+        assert!(!capacity::forecast(&key(), &[sample], now).known);
+    }
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_no_samples_is_unknown_and_never_blocks`.
+#[test]
+fn forecast_no_samples_is_unknown_and_never_blocks() {
+    let forecast = capacity::forecast(&key(), &[], 1_000_000.0);
+    assert_eq!(forecast.key, key());
+    assert!(!forecast.known);
+    assert_eq!(forecast.remaining_percent, None);
+    assert!(forecast.warmup);
+    assert_eq!(forecast.risk, "unknown");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_stale_only_sample_is_unknown`.
+#[test]
+fn forecast_stale_only_sample_is_unknown() {
+    let now = 1_000_000.0;
+    let sample = forecast_sample(Some(50.0), None, Some(now - 3_600.0), Some(now - 10.0));
+    let forecast = capacity::forecast(&key(), &[sample], now);
+    assert!(!forecast.known);
+    assert_eq!(forecast.risk, "unknown");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_stale_latest_is_unknown_even_when_older_sample_is_fresh`.
+#[test]
+fn forecast_stale_latest_is_unknown_even_when_older_sample_is_fresh() {
+    let now = 1_000_000.0;
+    let samples = [
+        forecast_sample(Some(50.0), None, Some(now), Some(now - 1.0)),
+        forecast_sample(Some(60.0), None, Some(now - 3_600.0), None),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert!(!forecast.known);
+    assert_eq!(forecast.risk, "unknown");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_single_fresh_sample_is_warmup_and_uses_remaining_thresholds`.
+#[test]
+fn forecast_single_fresh_sample_is_warmup_and_uses_remaining_thresholds() {
+    let now = 1_000_000.0;
+    let sample = forecast_sample(Some(5.0), None, Some(now), None);
+    let forecast = capacity::forecast(&key(), &[sample], now);
+    assert!(forecast.known);
+    assert!(forecast.warmup);
+    assert_eq!(forecast.burn_percent_per_hour, None);
+    assert_eq!(forecast.risk, "high");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_burn_below_sustainable_pace_is_low_risk`.
+#[test]
+fn forecast_burn_below_sustainable_pace_is_low_risk() {
+    let now = 1_000_000.0;
+    let reset_at = now + 2.0 * 3_600.0;
+    let samples = [
+        forecast_sample(Some(60.0), Some(reset_at), Some(now), None),
+        forecast_sample(Some(80.0), Some(reset_at), Some(now - 3_600.0), None),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert!(!forecast.warmup);
+    assert_eq!(forecast.burn_percent_per_hour, Some(20.0));
+    assert_eq!(forecast.sustainable_percent_per_hour, Some(30.0));
+    assert_eq!(forecast.risk, "low");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_burn_above_sustainable_pace_is_medium_or_high_risk`.
+#[test]
+fn forecast_burn_above_sustainable_pace_is_medium_or_high_risk() {
+    let now = 1_000_000.0;
+    let reset_at = now + 2.0 * 3_600.0;
+    let medium = [
+        forecast_sample(Some(60.0), Some(reset_at), Some(now), None),
+        forecast_sample(Some(95.0), Some(reset_at), Some(now - 3_600.0), None),
+    ];
+    assert_eq!(capacity::forecast(&key(), &medium, now).risk, "medium");
+    let high = [
+        forecast_sample(Some(60.0), Some(reset_at), Some(now), None),
+        forecast_sample(Some(160.0), Some(reset_at), Some(now - 3_600.0), None),
+    ];
+    assert_eq!(capacity::forecast(&key(), &high, now).risk, "high");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_young_lane_with_a_scary_short_span_burn_stays_low`.
+#[test]
+fn forecast_young_lane_with_a_scary_short_span_burn_stays_low() {
+    let now = 1_000_000.0;
+    let reset_at = now + 48.0 * 3_600.0;
+    let samples = [
+        forecast_sample(Some(99.0), Some(reset_at), Some(now), None),
+        forecast_sample(Some(100.0), Some(reset_at), Some(now - 600.0), None),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert!(!forecast.warmup);
+    assert_eq!(forecast.burn_percent_per_hour, Some(6.0));
+    assert_eq!(forecast.sustainable_percent_per_hour, Some(99.0 / 48.0));
+    assert_eq!(forecast.risk, "low");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_mature_lane_with_the_same_burn_still_escalates`.
+#[test]
+fn forecast_mature_lane_with_the_same_burn_still_escalates() {
+    let now = 1_000_000.0;
+    let reset_at = now + 48.0 * 3_600.0;
+    let samples = [
+        forecast_sample(Some(88.0), Some(reset_at), Some(now), None),
+        forecast_sample(Some(100.0), Some(reset_at), Some(now - 2.0 * 3_600.0), None),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert_eq!(forecast.burn_percent_per_hour, Some(6.0));
+    assert_eq!(forecast.sustainable_percent_per_hour, Some(88.0 / 48.0));
+    assert_eq!(forecast.risk, "high");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_window_reset_starts_a_new_warmup`.
+#[test]
+fn forecast_window_reset_starts_a_new_warmup() {
+    let now = 1_000_000.0;
+    let samples = [
+        forecast_sample(Some(90.0), Some(now + 3_600.0), Some(now), None),
+        forecast_sample(Some(5.0), Some(now - 10.0), Some(now - 3_600.0), None),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert!(forecast.warmup);
+    assert_eq!(forecast.burn_percent_per_hour, None);
+    assert_eq!(forecast.remaining_percent, Some(90.0));
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_latest_sample_with_past_reset_at_is_unknown`.
+#[test]
+fn forecast_latest_sample_with_past_reset_at_is_unknown() {
+    let now = 1_000_000.0;
+    let sample = forecast_sample(Some(50.0), Some(now - 1.0), Some(now), None);
+    let forecast = capacity::forecast(&key(), &[sample], now);
+    assert!(!forecast.known);
+    assert_eq!(forecast.remaining_percent, None);
+    assert_eq!(forecast.reset_at, None);
+    assert_eq!(forecast.risk, "unknown");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_latest_sample_with_future_reset_at_is_known`.
+#[test]
+fn forecast_latest_sample_with_future_reset_at_is_known() {
+    let now = 1_000_000.0;
+    let sample = forecast_sample(Some(50.0), Some(now + 1.0), Some(now), None);
+    let forecast = capacity::forecast(&key(), &[sample], now);
+    assert!(forecast.known);
+    assert_eq!(forecast.remaining_percent, Some(50.0));
+    assert_eq!(forecast.reset_at, Some(now + 1.0));
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_latest_sample_without_reset_at_is_unaffected`.
+#[test]
+fn forecast_latest_sample_without_reset_at_is_unaffected() {
+    let now = 1_000_000.0;
+    let sample = forecast_sample(Some(50.0), None, Some(now), None);
+    let forecast = capacity::forecast(&key(), &[sample], now);
+    assert!(forecast.known);
+    assert_eq!(forecast.reset_at, None);
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_exhausted_zero_is_high_risk_even_with_zero_burn_and_pace`.
+#[test]
+fn forecast_exhausted_zero_is_high_risk_even_with_zero_burn_and_pace() {
+    let now = 1_000_000.0;
+    let reset_at = now + 3_600.0;
+    let samples = [
+        forecast_sample(Some(0.0), Some(reset_at), Some(now), None),
+        forecast_sample(Some(0.0), Some(reset_at), Some(now - 3_600.0), None),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert_eq!(forecast.burn_percent_per_hour, Some(0.0));
+    assert_eq!(forecast.sustainable_percent_per_hour, Some(0.0));
+    assert_eq!(forecast.risk, "high");
+}
+
+/// Mirrors `tests/test_capacity_forecast.py::CapacityForecastTests::test_expired_same_reset_history_still_drives_burn`.
+#[test]
+fn forecast_expired_same_reset_history_still_drives_burn() {
+    let now = 1_000_000.0;
+    let reset_at = now + 3_600.0;
+    let samples = [
+        forecast_sample(Some(60.0), Some(reset_at), Some(now), Some(now + 60.0)),
+        forecast_sample(
+            Some(80.0),
+            Some(reset_at),
+            Some(now - 3_600.0),
+            Some(now - 1.0),
+        ),
+    ];
+    let forecast = capacity::forecast(&key(), &samples, now);
+    assert!(!forecast.warmup);
+    assert_eq!(forecast.burn_percent_per_hour, Some(20.0));
 }
 #[test]
 fn thin_history_does_not_escalate_burn_risk() {
