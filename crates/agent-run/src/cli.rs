@@ -4,7 +4,7 @@ use crate::{
     config::{Adapter, Config},
     domain::{AgentId, OrchestratorRef, StartRequest},
     error::invalid,
-    fs,
+    fs, hooks,
     policy::Constraint,
     service::{Query, Service},
     state::Store,
@@ -639,20 +639,56 @@ pub async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Cancel { agent_id } => emit(&service.cancel(&agent_id)?)?,
         Command::Steer { agent_id, text } => emit(&service.steer(&agent_id, &text)?)?,
-        Command::Bind(_a) => {
-            return Err(Error::Unsupported(
-                "bind is awaiting the shared session service".into(),
-            ))
+        Command::Bind(a) => {
+            let reference = OrchestratorRef {
+                transport: a.session_transport,
+                external_session_id: a.session_id,
+                external_turn_id: a.session_turn_id,
+            };
+            let mut store = Store::open(&home)?;
+            hooks::bind::bind(
+                &mut store,
+                a.agent_id.clone(),
+                reference,
+                crate::domain::now(),
+            )?;
+            emit(&store.delivery_status(&a.agent_id)?)?;
         }
-        Command::Context(_a) => {
-            return Err(Error::Unsupported(
-                "context is awaiting the shared hook service".into(),
-            ))
+        Command::Context(a) => {
+            let reference = OrchestratorRef {
+                transport: a.session_transport,
+                external_session_id: a.session_id,
+                external_turn_id: a.session_turn_id,
+            };
+            emit(&serde_json::to_value(hooks::context::build(
+                &home, &reference, None,
+            )?)?)?;
         }
-        Command::Hook { command: _command } => {
-            return Err(Error::Unsupported(
-                "hook commands are awaiting the shared hook service".into(),
-            ))
+        Command::Hook { command } => {
+            let input = read_stdin(1024 * 1024)?;
+            let payload: Value = serde_json::from_str(&input)
+                .map_err(|_| invalid("hook payload must be a JSON object"))?;
+            match command {
+                Hook::Context(transport) => {
+                    let reference =
+                        hooks::bind::normalize(&payload, false, &transport.transport)?.reference;
+                    let context = hooks::context::build(&home, &reference, None)?;
+                    let output = if context.injected && !context.text.trim().is_empty() {
+                        json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context.text}})
+                    } else {
+                        json!({})
+                    };
+                    emit(&output)?;
+                }
+                Hook::Bind(transport) => {
+                    let mut store = Store::open(&home)?;
+                    let result =
+                        hooks::bind::run_hook(&mut store, &payload, &transport.transport, None)?;
+                    emit(
+                        &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
+                    )?;
+                }
+            }
         }
         Command::Agents(a) => emit(
             &service

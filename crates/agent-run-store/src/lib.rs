@@ -21,6 +21,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -139,6 +140,51 @@ pub(crate) fn tx_event(
     )?;
     Ok(tx.last_insert_rowid())
 }
+
+/// Finds or creates the normalized session row inside a caller-owned transaction.
+///
+/// Session identity deliberately excludes the external turn: later turns of
+/// one chat update liveness and turn metadata without splitting its durable
+/// agent and receipt scope.
+fn session_for_reference(
+    tx: &Transaction<'_>,
+    reference: &domain::OrchestratorRef,
+    at: f64,
+) -> Result<String> {
+    let candidate = format!("os-{}", uuid::Uuid::new_v4().simple());
+    tx.execute(
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transport,external_session_id) DO UPDATE SET last_seen_at=excluded.last_seen_at,external_turn_id=excluded.external_turn_id",
+        params![candidate, reference.transport, reference.external_session_id, reference.external_turn_id, at, at],
+    )?;
+    Ok(tx.query_row(
+        "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
+        params![reference.transport, reference.external_session_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Decodes only the bounded versioned component receipt representation.
+///
+/// Malformed and pre-component receipt rows are legacy state and therefore
+/// return `None`; the next visible context safely replaces them.
+fn decode_context_components(key: &str) -> Option<BTreeMap<String, String>> {
+    let value: Value = serde_json::from_str(key).ok()?;
+    if value.get("v")?.as_i64()? != 2 {
+        return None;
+    }
+    let components = value.get("components")?.as_object()?;
+    if components.is_empty() {
+        return None;
+    }
+    components
+        .iter()
+        .map(|(name, value)| {
+            let value = value.as_str()?.to_owned();
+            (!name.trim().is_empty() && !value.trim().is_empty()).then(|| (name.clone(), value))
+        })
+        .collect()
+}
+
 impl Store {
     pub fn initialize(home: &Path) -> Result<Self> {
         fs::private_dir(home)?;
@@ -247,6 +293,121 @@ impl Store {
             params![id.as_str(), now(), kind, serde_json::to_string(data)?],
         )?;
         Ok(())
+    }
+    /// Binds an existing durable agent to one immutable orchestrator session.
+    ///
+    /// The supplied reference is validated and upserted atomically after the
+    /// agent lookup, so an unknown agent cannot leave a stray session row.
+    /// Repeating the same binding succeeds; a different session is rejected.
+    /// A waiting terminal delivery is activated exactly once in that same
+    /// transaction and is never resurrected after it has progressed.
+    pub fn bind_orchestrator(
+        &mut self,
+        id: &AgentId,
+        reference: &domain::OrchestratorRef,
+        at: f64,
+    ) -> Result<String> {
+        reference.validate()?;
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("binding time must be finite and nonnegative"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = tx
+            .query_row(
+                "SELECT * FROM agents WHERE id=?",
+                [id.as_str()],
+                Record::read,
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        let session_id = session_for_reference(&tx, reference, at)?;
+        if let Some(current) = agent.orchestrator_session_id {
+            if current != session_id {
+                return Err(invalid("agent orchestration binding is immutable"));
+            }
+        } else {
+            tx.execute(
+                "UPDATE agents SET orchestrator_session_id=? WHERE id=?",
+                params![session_id, id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? WHERE agent_id=? AND state='waiting_binding'",
+                params![session_id, at, id.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(session_id)
+    }
+
+    /// Finds the existing durable session for a reference without creating one.
+    pub fn find_orchestrator_session(
+        &self,
+        reference: &domain::OrchestratorRef,
+    ) -> Result<Option<String>> {
+        reference.validate()?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
+                params![reference.transport, reference.external_session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Atomically records visible context component fingerprints for a session reference.
+    ///
+    /// Only changed names are returned.  The JSON versioned representation
+    /// preserves fingerprints for omitted components, while legacy plain keys
+    /// intentionally compare as empty and are upgraded in place.
+    pub fn record_context_components_for_ref(
+        &mut self,
+        reference: &domain::OrchestratorRef,
+        components: &BTreeMap<String, String>,
+        at: f64,
+    ) -> Result<(String, Vec<String>)> {
+        reference.validate()?;
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|(name, value)| name.trim().is_empty() || value.trim().is_empty())
+        {
+            return Err(invalid("context components must be nonblank"));
+        }
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("context time must be finite and nonnegative"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id = session_for_reference(&tx, reference, at)?;
+        let stored: BTreeMap<String, String> = tx
+            .query_row(
+                "SELECT context_key FROM context_receipts WHERE orchestrator_session_id=?",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .and_then(|key: String| decode_context_components(&key))
+            .unwrap_or_default();
+        let changed: Vec<String> = components
+            .iter()
+            .filter(|(name, value)| stored.get(*name) != Some(*value))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !changed.is_empty() {
+            let mut merged = stored;
+            merged.extend(components.clone());
+            let key = serde_json::to_string(&json!({"v": 2, "components": merged}))?;
+            tx.execute(
+                "INSERT INTO context_receipts(orchestrator_session_id,context_key,injected_at) VALUES(?,?,?) ON CONFLICT(orchestrator_session_id) DO UPDATE SET context_key=excluded.context_key,injected_at=excluded.injected_at",
+                params![session_id, key, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok((session_id, changed))
     }
     pub fn set_owner(
         &self,
@@ -388,8 +549,13 @@ impl Store {
             Some(to),
             &json!({"failure_kind":outcome.failure_kind}),
         )?;
+        let delivery_id = format!("ntf_{}", uuid::Uuid::new_v4().simple());
         if let Some(session) = row.orchestrator_session_id {
-            tx.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,?,?,'pending',?)",params![format!("ntf_{}",uuid::Uuid::new_v4().simple()),id.as_str(),session,seq,time])?;
+            tx.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,?,?,'pending',?)",params![delivery_id,id.as_str(),session,seq,time])?;
+        } else {
+            // A post-tool bind can arrive after a fast child finishes.  Keep
+            // exactly one inert durable receipt until that binding activates it.
+            tx.execute("INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES(?,?,?,'waiting_binding')",params![delivery_id,id.as_str(),seq])?;
         }
         let token = |name: &str| {
             usage
