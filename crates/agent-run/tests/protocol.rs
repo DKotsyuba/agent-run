@@ -6,13 +6,14 @@ use agent_run::{
     service::{Query, Service},
     transport::{frame, socket},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::BufReader;
 fn service() -> Service {
     Service::new(std::path::PathBuf::from(
         "/nonexistent-agent-run-protocol-fixture",
     ))
 }
+/// Mirrors Python `test_dispatch.py::test_tools_table_is_exactly_pinned`.
 #[test]
 fn packaged_table_has_exactly_the_shared_eleven_tools() {
     let tools = dispatch::tools();
@@ -30,6 +31,7 @@ fn packaged_table_has_exactly_the_shared_eleven_tools() {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
     }
 }
+/// Mirrors Python `test_api_socket.py::test_ping_and_tools_discovery`.
 #[tokio::test]
 async fn ping_and_discovery_do_not_require_database_access() {
     let response = socket::respond(&service(), json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
@@ -44,6 +46,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     .unwrap();
     assert_eq!(response["result"].as_array().unwrap().len(), 11);
 }
+/// Mirrors Python `test_api_socket.py::test_unknown_method_and_validation_error`.
 #[tokio::test]
 async fn invalid_envelopes_and_unknown_method_get_standard_codes() {
     let service = service();
@@ -89,6 +92,7 @@ async fn invalid_requests_preserve_python_error_classes() {
     assert_eq!(params["error"]["code"], -32602);
     assert_eq!(params["error"]["message"], "params must be an object");
 }
+/// Mirrors Python `test_api_socket.py::test_notification_produces_no_reply`.
 #[tokio::test]
 async fn notifications_have_no_response_and_unknown_arguments_fail() {
     assert!(
@@ -119,6 +123,7 @@ async fn domain_errors_use_the_socket_domain_envelope() {
     assert_eq!(response["error"]["code"], -32602);
     assert!(response["error"].get("data").is_none());
 }
+/// Mirrors Python `test_api_socket.py::test_oversized_line_is_rejected`.
 #[tokio::test]
 async fn framing_rejects_partial_and_oversized_lines() {
     let mut partial = BufReader::new(&b"{\"id\":1}"[..]);
@@ -138,16 +143,86 @@ async fn framing_does_not_consume_the_next_message() {
     assert_eq!(frame::read(&mut input, 10).await.unwrap().unwrap(), b"one");
     assert_eq!(frame::read(&mut input, 10).await.unwrap().unwrap(), b"two");
 }
+/// Mirrors Python `test_dispatch.py::test_list_agents_accepts_revision_long_poll_fields`.
 #[test]
 fn list_query_bounds_reject_nonfinite_or_negative_waits() {
-    let mut q = Query::default();
-    q.wait_seconds = f64::NAN;
-    assert!(q.validate().is_err());
-    q.wait_seconds = -1.0;
-    assert!(q.validate().is_err());
-    q.wait_seconds = 0.0;
-    q.limit = 1001;
-    assert!(q.validate().is_err());
+    let decoded: Query = serde_json::from_value(json!({
+        "after_revision": 12, "wait_seconds": 1.5, "limit": 7
+    }))
+    .expect("dispatch list query decodes Python long-poll fields");
+    assert_eq!(
+        (decoded.after_revision, decoded.wait_seconds, decoded.limit),
+        (Some(12), 1.5, 7)
+    );
+    assert!(Query {
+        wait_seconds: f64::NAN,
+        ..Query::default()
+    }
+    .validate()
+    .is_err());
+    assert!(Query {
+        wait_seconds: -1.0,
+        ..Query::default()
+    }
+    .validate()
+    .is_err());
+    assert!(Query {
+        limit: 1001,
+        ..Query::default()
+    }
+    .validate()
+    .is_err());
+}
+
+/// Mirrors Python `test_dispatch.py::test_removed_tools_are_rejected`.
+#[test]
+fn retired_tools_are_not_advertised_by_dispatch() {
+    for name in ["fast", "status", "list_orchestrators", "summary", "chain"] {
+        assert!(!dispatch::is_tool(name), "retired tool {name} is public");
+    }
+}
+
+/// Mirrors Python `test_dispatch.py::test_start_accepts_account`.
+#[test]
+fn start_request_decodes_an_optional_account() {
+    let workdir = std::env::current_dir().expect("worktree is a directory");
+    let request: agent_run::domain::StartRequest = serde_json::from_value(json!({
+        "runtime": "codex", "model": "fixture", "profile": "review",
+        "task": "inspect", "workdir": workdir, "account": "personal2"
+    }))
+    .expect("dispatch request schema accepts an account");
+    assert_eq!(request.account.as_deref(), Some("personal2"));
+}
+
+/// Mirrors Python `test_dispatch.py::test_start_description_includes_completion_contract_text`.
+#[test]
+fn start_tool_description_embeds_the_completion_contract() {
+    let start = dispatch::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "start")
+        .expect("start tool");
+    let description = start["description"].as_str().expect("description text");
+    assert!(description.starts_with("Start one asynchronous durable agent."));
+    assert!(description.contains(dispatch::doc("completion").expect("completion contract")));
+    for field in ["- ID:", "- Status:", "- Runtime/model:", "- Notice:"] {
+        assert!(description.contains(field), "missing {field}");
+    }
+}
+
+/// Mirrors Python `test_api_socket.py::test_wait_timeout_validation`.
+#[tokio::test]
+async fn socket_wait_rejects_nonpositive_timeouts_before_store_access() {
+    for timeout_seconds in [Value::from(0), Value::from(-1)] {
+        let response = socket::respond(
+            &service(),
+            json!({"jsonrpc":"2.0","id":1,"method":"wait","params":{
+                "agent_id":"ag-test", "timeout_seconds":timeout_seconds
+            }}),
+        )
+        .await
+        .expect("request response");
+        assert_eq!(response["error"]["code"], -32602);
+    }
 }
 #[tokio::test]
 async fn huge_wait_is_rejected_without_panicking_or_opening_state() {
