@@ -37,6 +37,15 @@ pub fn validate_runtime(runtime: &Runtime, kind: Adapter) -> Result<()> {
     {
         return Err(invalid("unknown Claude hook event"));
     }
+    if kind == Adapter::Claude {
+        let unlisted = super::plugins::unlisted_plugin_skills(&runtime.plugins, &runtime.skills);
+        if !unlisted.is_empty() {
+            return Err(invalid(format!(
+                "claude plugin skills are unlisted: {}",
+                unlisted.join(", ")
+            )));
+        }
+    }
     if kind == Adapter::Glm {
         if let Some(auth) = &runtime.auth {
             let Auth::Environment { names } = auth else {

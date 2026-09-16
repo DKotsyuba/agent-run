@@ -447,14 +447,11 @@ pub fn materialize(
         app_home.join("skills").join(&request.runtime)
     };
     for skill in &profile.skills {
-        let mut source = skill_catalog.join(skill);
-        for plugin in &runtime.plugins {
-            let candidate = plugin.join("skills").join(skill);
-            if candidate.join("SKILL.md").is_file() {
-                source = candidate;
-                break;
-            }
+        let plugin_source = super::plugins::plugin_skill_dir(&runtime.plugins, skill)?;
+        if matches!(kind, Adapter::Claude | Adapter::Glm) && plugin_source.is_some() {
+            continue;
         }
+        let source = plugin_source.unwrap_or_else(|| skill_catalog.join(skill));
         if !source.join("SKILL.md").is_file() {
             return Err(invalid("declared skill is unavailable"));
         }

@@ -15,6 +15,76 @@ pub struct Installed {
     pub trust: BTreeMap<String, String>,
     pub qwen_hooks: Value,
 }
+
+/// Returns the one declared plugin skill directory, or `None` when no plugin
+/// owns `name`; duplicate owners are rejected so skill resolution cannot pick
+/// an arbitrary source.
+pub fn plugin_skill_dir(plugins: &[PathBuf], name: &str) -> Result<Option<PathBuf>> {
+    let mut found = None;
+    for plugin in plugins {
+        let candidate = plugin.join("skills").join(name);
+        if !candidate.join("SKILL.md").is_file() {
+            continue;
+        }
+        if found.is_some() {
+            return Err(invalid(format!(
+                "skill {name:?} is shipped by two declared plugins"
+            )));
+        }
+        found = Some(candidate);
+    }
+    Ok(found)
+}
+
+/// Resolves selected names to plugin-owned or local skill directories in input
+/// order, preserving the host's deterministic selection order.
+pub fn skill_dirs(
+    plugins: &[PathBuf],
+    skills_root: &Path,
+    names: &[String],
+) -> Result<Vec<(String, PathBuf)>> {
+    names
+        .iter()
+        .map(|name| {
+            let path = plugin_skill_dir(plugins, name)?.unwrap_or_else(|| skills_root.join(name));
+            Ok((name.clone(), path))
+        })
+        .collect()
+}
+
+/// Returns selected skill names that must be copied by the runtime itself
+/// because no declared plugin provides them.
+pub fn local_skill_names(plugins: &[PathBuf], names: &[String]) -> Result<Vec<String>> {
+    names
+        .iter()
+        .filter_map(|name| match plugin_skill_dir(plugins, name) {
+            Ok(None) => Some(Ok(name.clone())),
+            Ok(Some(_)) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+/// Reports plugin-shipped skills omitted from `names`, which wholesale plugin
+/// hosts would expose unless their configuration fails closed.
+pub fn unlisted_plugin_skills(plugins: &[PathBuf], names: &[String]) -> Vec<String> {
+    let selected = names.iter().collect::<std::collections::BTreeSet<_>>();
+    let mut found = std::collections::BTreeSet::new();
+    for plugin in plugins {
+        let Ok(entries) = std::fs::read_dir(plugin.join("skills")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !selected.contains(&entry.file_name().to_string_lossy().to_string())
+                && path.join("SKILL.md").is_file()
+            {
+                found.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
 fn event_label(event: &str) -> Result<&'static str> {
     Ok(match event {
         "PreToolUse" => "pre_tool_use",
