@@ -247,6 +247,11 @@ pub fn hook_groups(runtime: &Runtime, roots: &BTreeMap<String, PathBuf>) -> Resu
     }
     Ok(Value::Object(hooks))
 }
+/// Adds generated Codex hooks, trust receipts, and enabled plugin declarations.
+///
+/// Empty generated tables are omitted to preserve the Python home shape. Hook
+/// trust derives from the exact rendered command and matcher; invalid plugin
+/// hook forms fail instead of being serialized as an untrusted capability.
 pub fn codex_config(
     doc: &mut toml::Table,
     hooks: &Value,
@@ -280,14 +285,18 @@ pub fn codex_config(
     if !state.is_empty() {
         all["state"] = Value::Object(state);
     }
-    let t = toml::Value::try_from(all).map_err(|_| invalid("cannot encode native hooks"))?;
-    doc.insert("hooks".into(), t);
+    if all.as_object().is_some_and(|hooks| !hooks.is_empty()) {
+        let t = toml::Value::try_from(all).map_err(|_| invalid("cannot encode native hooks"))?;
+        doc.insert("hooks".into(), t);
+    }
     let mut enabled = toml::Table::new();
     for name in &plugins.codex_names {
         let mut t = toml::Table::new();
         t.insert("enabled".into(), toml::Value::Boolean(true));
         enabled.insert(format!("{name}@personal"), toml::Value::Table(t));
     }
-    doc.insert("plugins".into(), toml::Value::Table(enabled));
+    if !enabled.is_empty() {
+        doc.insert("plugins".into(), toml::Value::Table(enabled));
+    }
     Ok(())
 }
