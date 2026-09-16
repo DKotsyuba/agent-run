@@ -1,7 +1,7 @@
 //! Disposable-prefix deployment, journal, backup, and explicit restore commands.
 
 use crate::release;
-use rusqlite::Connection;
+use rusqlite::{Connection, DatabaseName};
 use serde_json::json;
 use std::{
     fs,
@@ -60,14 +60,20 @@ fn switch(prefix: &Path, release: &Path) -> Result<(), String> {
     fs::rename(temporary, prefix.join("current")).map_err(|error| error.to_string())
 }
 
-/// Saves state/config and the prior pointer in a retained private backup.
+/// Saves state with SQLite's backup API, config, and the prior pointer privately.
 fn backup(prefix: &Path, home: &Path, old: Option<&Path>) -> Result<PathBuf, String> {
     let directory = prefix.join("backups").join(stamp()?);
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    for name in ["state.db", "config.toml"] {
-        if home.join(name).is_file() {
-            fs::copy(home.join(name), directory.join(name)).map_err(|error| error.to_string())?;
-        }
+    let state = home.join("state.db");
+    if state.is_file() {
+        let source = Connection::open(&state).map_err(|error| error.to_string())?;
+        source
+            .backup(DatabaseName::Main, directory.join("state.db"), None)
+            .map_err(|error| error.to_string())?;
+    }
+    if home.join("config.toml").is_file() {
+        fs::copy(home.join("config.toml"), directory.join("config.toml"))
+            .map_err(|error| error.to_string())?;
     }
     if let Some(old) = old {
         fs::write(
