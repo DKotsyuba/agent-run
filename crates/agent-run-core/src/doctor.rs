@@ -247,6 +247,10 @@ fn configuration(config: &Config, home: &Path, findings: &mut Vec<Finding>) {
         }
     }
     let canonical_roles = roles(config, home, findings);
+    let trusted = [
+        home.to_path_buf(),
+        resolved(&home.join("standalone").join("current")),
+    ];
     for (name, runtime) in config
         .runtimes
         .iter()
@@ -292,7 +296,7 @@ fn configuration(config: &Config, home: &Path, findings: &mut Vec<Finding>) {
                 "default_account is ignored; omit account for native global auth",
             );
         }
-        hooks(runtime, &component, home, findings);
+        hooks(runtime, &component, &trusted, findings);
         auth(name, runtime, &component, findings);
     }
 }
@@ -408,29 +412,294 @@ fn skills(home: &Path, name: &str, runtime: &Runtime, findings: &mut Vec<Finding
     }
 }
 
+/// System interpreters rendered hooks launch scripts with.
+///
+/// Their own absolute paths sit outside the trusted roots by design, so the
+/// trust check for such a hook applies to the script argument instead.
+const HOOK_INTERPRETERS: [&str; 4] = ["/usr/bin/python3", "/bin/sh", "/bin/zsh", "/usr/bin/env"];
+/// Python options that consume their following argv token before a script path.
+const PYTHON_OPTIONS_WITH_VALUE: [&str; 3] = ["-W", "-X", "--check-hash-based-pycs"];
+/// Short Python switches that preserve normal script execution when grouped.
+const PYTHON_SAFE_FLAG_CHARACTERS: &str = "bBdEiIOPqsuvSx";
+
+/// Expands a single leading `~` against `HOME`, mirroring Python `expanduser`.
+///
+/// A path without a leading tilde, or a missing `HOME`, is returned unchanged.
+fn expanduser(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix('~') else {
+        return path.to_path_buf();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return path.to_path_buf();
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(rest.trim_start_matches('/')),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Resolves symlinks without requiring the whole path to exist.
+///
+/// Python's `Path.resolve()` is non-strict, so a trust comparison against a
+/// not-yet-materialized script still normalizes its existing ancestors. This
+/// canonicalizes the deepest existing prefix and re-appends the remainder;
+/// a path with no resolvable ancestor is returned unchanged.
+fn resolved(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    let mut suffix = Vec::new();
+    let mut cursor = path;
+    while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
+        suffix.push(name.to_owned());
+        if let Ok(mut real) = fs::canonicalize(parent) {
+            real.extend(suffix.iter().rev());
+            return real;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
+/// Returns whether `path` resolves to `root` or somewhere beneath it.
+fn under(path: &Path, root: &Path) -> bool {
+    resolved(path).starts_with(resolved(root))
+}
+
+/// Returns whether a basename is one of Python's `python`, `python3`, `python3.14`.
+fn is_python_executable(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("python") else {
+        return false;
+    };
+    let Some(rest) = ({
+        if rest.is_empty() {
+            return true;
+        }
+        rest.strip_prefix('3')
+    }) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    rest.strip_prefix('.')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Returns uv's existing managed-install root, or `None` when there is none.
+///
+/// An explicit `UV_PYTHON_INSTALL_DIR` wins; otherwise `XDG_DATA_HOME` and then
+/// `~/.local/share` are checked, each suffixed with `uv/python`. A missing or
+/// non-directory candidate yields `None`, matching Python's strict resolve.
+fn managed_uv_python_root() -> Option<PathBuf> {
+    let configured = std::env::var_os("UV_PYTHON_INSTALL_DIR").filter(|value| !value.is_empty());
+    let candidate = match configured {
+        Some(value) => expanduser(Path::new(&value)),
+        None => {
+            let base = match std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+                Some(value) => expanduser(Path::new(&value)),
+                None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
+            };
+            base.join("uv").join("python")
+        }
+    };
+    let root = fs::canonicalize(&candidate).ok()?;
+    root.is_dir().then_some(root)
+}
+
+/// Returns whether `interpreter` safely introduces a hook script path.
+///
+/// Fixed system interpreters are accepted directly. A Python executable is
+/// accepted only when it has Python's expected basename, sits in a `bin`
+/// directory, and resolves beneath `uv_root`. This prevents an arbitrary
+/// executable merely named `python3` from changing which argv token is trusted.
+fn is_hook_interpreter(interpreter: &Path, uv_root: Option<&Path>) -> bool {
+    if HOOK_INTERPRETERS.contains(&interpreter.to_string_lossy().as_ref()) {
+        return true;
+    }
+    let Some(root) = uv_root else {
+        return false;
+    };
+    interpreter
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "bin")
+        && interpreter
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_python_executable)
+        && under(interpreter, root)
+}
+
+/// Returns a Python hook's script path only after safe interpreter options.
+///
+/// Standalone safe flags, their grouped short form, options taking one value,
+/// and `--` before a positional script are recognized. Execution modes (`-c`,
+/// `-m`), their attached or grouped forms, and unknown options return
+/// `interpreter` so a following word cannot become a trusted script path.
+fn python_hook_script(interpreter: &Path, command: &[String]) -> PathBuf {
+    let mut index = 1;
+    while index < command.len() {
+        let word = command[index].as_str();
+        if word == "--" {
+            return command
+                .get(index + 1)
+                .map_or_else(|| interpreter.to_path_buf(), |v| expanduser(Path::new(v)));
+        }
+        if PYTHON_OPTIONS_WITH_VALUE.contains(&word) {
+            if index + 1 >= command.len() {
+                return interpreter.to_path_buf();
+            }
+            index += 2;
+            continue;
+        }
+        if word.starts_with("-c") || word.starts_with("-m") {
+            return interpreter.to_path_buf();
+        }
+        if let Some(flags) = word.strip_prefix('-') {
+            if !flags.is_empty()
+                && flags
+                    .chars()
+                    .all(|c| PYTHON_SAFE_FLAG_CHARACTERS.contains(c))
+            {
+                index += 1;
+                continue;
+            }
+            return interpreter.to_path_buf();
+        }
+        return expanduser(Path::new(word));
+    }
+    interpreter.to_path_buf()
+}
+
+/// Returns the path the hook trust check should evaluate.
+///
+/// For a plain hook command that is `command[0]`. A recognized system or uv
+/// managed Python interpreter launches a script from a later argument, so the
+/// interpreter itself is not the artifact whose location matters. An
+/// interpreter without a script remains its own untrusted subject.
+fn hook_script(command: &[String], uv_root: Option<&Path>) -> PathBuf {
+    let interpreter = expanduser(Path::new(&command[0]));
+    if !is_hook_interpreter(&interpreter, uv_root) {
+        return interpreter;
+    }
+    if interpreter
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_python_executable)
+    {
+        return python_hook_script(&interpreter, command);
+    }
+    for word in &command[1..] {
+        if !word.starts_with('-') {
+            return expanduser(Path::new(word));
+        }
+    }
+    interpreter
+}
+
+/// Returns a `{plugin:NAME}/...` script token's plugin name, if it is one.
+///
+/// The token must open the path and be followed by `/` plus at least one more
+/// character, matching the Python trust check's anchored pattern.
+fn plugin_token(script: &str) -> Option<&str> {
+    let rest = script.strip_prefix("{plugin:")?;
+    let end = rest.find('}').filter(|end| *end > 0)?;
+    let mut tail = rest[end + 1..].chars();
+    (tail.next()? == '/' && tail.next().is_some()).then(|| &rest[..end])
+}
+
 /// Checks executable and trusted-location evidence for configured hooks.
-fn hooks(runtime: &Runtime, component: &str, home: &Path, findings: &mut Vec<Finding>) {
+fn hooks(runtime: &Runtime, component: &str, trusted: &[PathBuf], findings: &mut Vec<Finding>) {
+    hooks_with(
+        runtime,
+        component,
+        trusted,
+        managed_uv_python_root().as_deref(),
+        findings,
+    );
+}
+
+/// Applies the hook trust policy against one explicit uv managed-install root.
+///
+/// The executable check always targets `command[0]` -- the interpreter, when
+/// there is one -- while the trust check targets [`hook_script`], so a hook
+/// running a trusted script through a system interpreter is not flagged merely
+/// because that interpreter lives outside `trusted`. A `{plugin:NAME}` token is
+/// trusted when NAME is declared for the runtime: adapters expand it beneath
+/// the runtime home, so the declaration is the trust evidence. `uv_root` is
+/// injectable so this policy is testable without a real uv installation.
+fn hooks_with(
+    runtime: &Runtime,
+    component: &str,
+    trusted: &[PathBuf],
+    uv_root: Option<&Path>,
+    findings: &mut Vec<Finding>,
+) {
+    let declared = runtime
+        .plugins
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .collect::<std::collections::BTreeSet<_>>();
     for (index, hook) in runtime.hooks.iter().enumerate() {
-        let item = format!("{component}:hook:{index}");
         let Some(command) = hook.command.first() else {
             continue;
         };
-        let executable_path = Path::new(command);
-        if !executable(executable_path) {
-            add(findings, "hook_executable_missing", "error", &item, command);
+        let item = format!("{component}:hook:{index}");
+        let interpreter = expanduser(Path::new(command));
+        if !executable(&interpreter) {
+            add(
+                findings,
+                "hook_executable_missing",
+                "error",
+                &item,
+                interpreter.display().to_string(),
+            );
         }
-        if !executable_path.is_absolute() || !executable_path.starts_with(home) {
-            add(findings, "hook_untrusted", "warning", &item, command);
+        let script = hook_script(&hook.command, uv_root);
+        let text = script.display().to_string();
+        if plugin_token(&text).is_some_and(|name| declared.contains(name)) {
+            continue;
+        }
+        if !script.is_absolute() || !trusted.iter().any(|root| under(&script, root)) {
+            add(findings, "hook_untrusted", "warning", &item, text);
         }
     }
 }
 
 /// Checks declared environment and file-link authentication without reading credentials.
 fn auth(name: &str, runtime: &Runtime, component: &str, findings: &mut Vec<Finding>) {
+    auth_with(
+        name,
+        runtime,
+        component,
+        findings,
+        |account, service| match account {
+            Some(account) => keychain::generic_password(account, service).is_some(),
+            None => keychain::generic_password_service(service).is_some(),
+        },
+    );
+}
+
+/// Applies the auth checks against one injectable Keychain presence probe.
+///
+/// `lookup` receives only fixed Keychain selectors and returns whether a
+/// nonempty value could be read; it is consulted only when no declared
+/// environment variable is set and the runtime actually has a fallback item,
+/// so a runtime without one is never probed. Injecting it keeps this policy
+/// testable without touching an operator's Keychain.
+fn auth_with(
+    name: &str,
+    runtime: &Runtime,
+    component: &str,
+    findings: &mut Vec<Finding>,
+    lookup: impl FnOnce(Option<&str>, &str) -> bool,
+) {
     match &runtime.auth {
         Some(Auth::Environment { names })
             if !names.iter().any(|name| std::env::var_os(name).is_some())
-                && !keychain_present(name) =>
+                && !keychain_present_with(name, lookup) =>
         {
             add(
                 findings,
@@ -471,17 +740,6 @@ fn auth(name: &str, runtime: &Runtime, component: &str, findings: &mut Vec<Findi
         }
         _ => {}
     }
-}
-
-/// Returns whether a configured runtime has a readable macOS Keychain fallback.
-///
-/// Values returned by the platform helper are immediately discarded, keeping
-/// the report limited to the presence signal used by Python doctor.
-fn keychain_present(name: &str) -> bool {
-    keychain_present_with(name, |account, service| match account {
-        Some(account) => keychain::generic_password(account, service).is_some(),
-        None => keychain::generic_password_service(service).is_some(),
-    })
 }
 
 /// Applies the fallback catalog to a secret-free credential-presence probe.
@@ -649,7 +907,47 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::keychain_present_with;
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    /// A declared auth variable guaranteed absent, standing in for Python's
+    /// `mock.patch.dict(os.environ, {}, clear=True)`: Rust tests share one
+    /// process environment, so a name that is never set is the deterministic
+    /// equivalent of clearing it.
+    const ABSENT_AUTH_NAME: &str = "AGENT_RUN_DOCTOR_ABSENT_TEST_KEY";
+
+    /// Builds one enabled runtime fixture from Python-equivalent config fields.
+    fn runtime_fixture(extra: serde_json::Value) -> Runtime {
+        let mut value = json!({
+            "enabled": true,
+            "adapter": "example:ADAPTER",
+            "binary": "/usr/bin/true",
+            "home": "/tmp",
+            "models": ["model"],
+        });
+        let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) else {
+            panic!("runtime fixture takes a JSON object");
+        };
+        base.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+        serde_json::from_value(value).expect("runtime fixture deserializes")
+    }
+
+    /// Collects auth findings for one runtime name against an injected probe.
+    fn auth_findings(name: &str, lookup: impl FnOnce(Option<&str>, &str) -> bool) -> Vec<Finding> {
+        let runtime = runtime_fixture(json!({
+            "auth": {"kind": "environment", "names": [ABSENT_AUTH_NAME]},
+        }));
+        let mut findings = Vec::new();
+        auth_with(
+            name,
+            &runtime,
+            &format!("runtime:{name}"),
+            &mut findings,
+            lookup,
+        );
+        findings
+    }
 
     /// Mirrors `KeychainFallbackAuthTests.test_a_present_keychain_item_suppresses_the_warning`.
     #[test]
@@ -677,5 +975,390 @@ mod tests {
             true
         }));
         assert_eq!(seen, Some((None, "Claude Code-credentials".into())));
+    }
+
+    /// Mirrors `test_doctor.py::KeychainFallbackAuthTests::test_an_absent_keychain_item_keeps_the_warning`.
+    #[test]
+    fn python_doctor_absent_keychain_item_keeps_the_warning() {
+        let findings = auth_findings("qwen", |_, _| false);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["auth_environment_missing"]
+        );
+        assert_eq!(findings[0].severity, "warning");
+    }
+
+    /// Mirrors `test_doctor.py::KeychainFallbackAuthTests::test_a_runtime_without_a_fallback_is_never_probed`.
+    #[test]
+    fn python_doctor_runtime_without_a_fallback_is_never_probed() {
+        let probed = Cell::new(false);
+        let findings = auth_findings("codex", |_, _| {
+            probed.set(true);
+            true
+        });
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["auth_environment_missing"]
+        );
+        assert!(
+            !probed.get(),
+            "a runtime with no fallback must not be probed"
+        );
+    }
+
+    /// Mirrors `test_doctor.py::KeychainFallbackAuthTests::test_a_failing_probe_counts_as_absent`.
+    ///
+    /// Python raises `OSError` from `subprocess.run`; the Rust probe reports an
+    /// unusable Keychain as `false`, which is the same "not present" outcome.
+    #[test]
+    fn python_doctor_failing_keychain_probe_counts_as_absent() {
+        assert_eq!(
+            auth_findings("glm", |_, _| false)
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["auth_environment_missing"]
+        );
+    }
+
+    /// Mirrors `test_doctor.py::KeychainFallbackAuthTests::test_an_item_without_a_fixed_account_keeps_the_warning_when_absent`.
+    #[test]
+    fn python_doctor_account_free_keychain_item_keeps_the_warning_when_absent() {
+        let findings = auth_findings("claude", |_, _| false);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["auth_environment_missing"]
+        );
+        assert_eq!(findings[0].severity, "warning");
+    }
+
+    /// Builds one capacity snapshot row shaped like Python's `_row`.
+    fn capacity_row(lane: &str, observed_at: f64, valid_until: Option<f64>) -> Value {
+        json!({
+            "runtime": "qwen",
+            "lane": lane,
+            "window": "5h",
+            "target": null,
+            "source": "omniroute",
+            "observed_at": observed_at,
+            "valid_until": valid_until,
+        })
+    }
+
+    /// Returns the stale lanes for `rows`, mirroring Python's `_lanes`.
+    fn capacity_lanes(rows: &[Value]) -> Vec<String> {
+        let config: Config =
+            serde_json::from_value(json!({"schema_version": 1})).expect("default config");
+        let mut findings = Vec::new();
+        capacity(&config, rows, 1_000., &mut findings);
+        findings
+            .iter()
+            .map(|finding| {
+                finding
+                    .detail
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_a_sample_still_within_its_validity_is_never_stale`.
+    #[test]
+    fn python_doctor_sample_within_its_validity_is_never_stale() {
+        assert!(capacity_lanes(&[capacity_row("fresh", 100., Some(2_000.))]).is_empty());
+    }
+
+    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_an_expired_sample_is_stale_even_when_recently_observed`.
+    #[test]
+    fn python_doctor_expired_sample_is_stale_even_when_recently_observed() {
+        assert_eq!(
+            capacity_lanes(&[capacity_row("expired", 999., Some(500.))]),
+            ["expired"]
+        );
+    }
+
+    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_a_sample_without_validity_keeps_the_age_bound`.
+    #[test]
+    fn python_doctor_sample_without_validity_keeps_the_age_bound() {
+        assert_eq!(
+            capacity_lanes(&[
+                capacity_row("aged", 100., None),
+                capacity_row("recent", 900., None),
+            ]),
+            ["aged"]
+        );
+    }
+
+    /// Creates Python `HookTrustTests.setUp`'s resolved home and install root.
+    fn hook_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary home");
+        let home = temp.path().canonicalize().expect("resolved home");
+        let root = home.join("install");
+        fs::create_dir_all(root.join("hooks")).expect("hook root");
+        (temp, home, root)
+    }
+
+    /// Collects hook findings exactly as Python's `HookTrustTests._findings`.
+    fn hook_findings(
+        root: &Path,
+        home: &Path,
+        command: &[&str],
+        plugins: &[&str],
+        uv_root: Option<&Path>,
+    ) -> Vec<Finding> {
+        let runtime = runtime_fixture(json!({
+            "home": home,
+            "hooks": [{"event": "PostToolUse", "command": command}],
+            "plugins": plugins,
+        }));
+        let trusted = [
+            root.to_path_buf(),
+            resolved(&root.join("standalone").join("current")),
+        ];
+        let mut findings = Vec::new();
+        hooks_with(&runtime, "runtime:claude", &trusted, uv_root, &mut findings);
+        findings
+    }
+
+    /// Returns only the hook finding codes, mirroring Python's `_codes`.
+    fn hook_codes(
+        root: &Path,
+        home: &Path,
+        command: &[&str],
+        plugins: &[&str],
+        uv_root: Option<&Path>,
+    ) -> Vec<String> {
+        hook_findings(root, home, command, plugins, uv_root)
+            .into_iter()
+            .map(|finding| finding.code)
+            .collect()
+    }
+
+    /// Creates an executable empty file, mirroring Python's `touch(mode=0o700)`.
+    fn touch_executable(path: &Path) {
+        fs::create_dir_all(path.parent().expect("executable parent")).expect("executable parent");
+        fs::write(path, "").expect("executable file");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("executable mode");
+    }
+
+    /// The plugin-expanded hook script both trust directions are judged on.
+    const PLUGIN_SCRIPT: &str = "{plugin:agent-lsp-plugin}/hooks/guard.py";
+    /// A declared plugin whose location is deliberately outside every root.
+    const PLUGIN_DECLARATION: &str = "/anywhere/agent-lsp-plugin";
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_a_script_inside_the_trusted_roots_is_trusted`.
+    #[test]
+    fn python_doctor_script_inside_the_trusted_roots_is_trusted() {
+        let (_temp, home, root) = hook_home();
+        let script = root.join("hooks/context.py");
+        fs::write(&script, "pass\n").expect("hook script");
+        let script = script.to_string_lossy().into_owned();
+        assert!(hook_codes(
+            &root,
+            &home,
+            &["/usr/bin/python3", &script, "--event", "PostToolUse"],
+            &[],
+            None,
+        )
+        .is_empty());
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_a_script_outside_the_trusted_roots_is_untrusted`.
+    #[test]
+    fn python_doctor_script_outside_the_trusted_roots_is_untrusted() {
+        let (_temp, home, root) = hook_home();
+        let script = home.join("outside/context.py").display().to_string();
+        let findings = hook_findings(&root, &home, &["/usr/bin/python3", &script], &[], None);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["hook_untrusted"]
+        );
+        assert_eq!(findings[0].severity, "warning");
+        assert_eq!(findings[0].detail, script);
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_an_interpreter_without_a_script_stays_untrusted`.
+    #[test]
+    fn python_doctor_interpreter_without_a_script_stays_untrusted() {
+        let (_temp, home, root) = hook_home();
+        assert_eq!(
+            hook_codes(&root, &home, &["/usr/bin/python3"], &[], None),
+            ["hook_untrusted"]
+        );
+        assert_eq!(
+            hook_codes(&root, &home, &["/bin/sh", "-c", "echo hi"], &[], None),
+            ["hook_untrusted"]
+        );
+        assert_eq!(
+            hook_findings(&root, &home, &["/bin/sh", "-c", "echo hi"], &[], None)
+                .iter()
+                .map(|finding| finding.detail.as_str())
+                .collect::<Vec<_>>(),
+            ["echo hi"]
+        );
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_a_declared_plugin_token_is_trusted`.
+    #[test]
+    fn python_doctor_declared_plugin_token_is_trusted() {
+        let (_temp, home, root) = hook_home();
+        assert!(hook_codes(
+            &root,
+            &home,
+            &["/usr/bin/python3", PLUGIN_SCRIPT],
+            &[PLUGIN_DECLARATION],
+            None,
+        )
+        .is_empty());
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_an_undeclared_plugin_token_stays_untrusted`.
+    #[test]
+    fn python_doctor_undeclared_plugin_token_stays_untrusted() {
+        let (_temp, home, root) = hook_home();
+        assert_eq!(
+            hook_codes(
+                &root,
+                &home,
+                &["/usr/bin/python3", PLUGIN_SCRIPT],
+                &[],
+                None
+            ),
+            ["hook_untrusted"]
+        );
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_uv_managed_python_trusts_a_declared_plugin_script`.
+    #[test]
+    fn python_doctor_uv_managed_python_trusts_a_declared_plugin_script() {
+        let (_temp, home, root) = hook_home();
+        let install = home.join("uv/python");
+        let interpreter = install.join("cpython-3.14/bin/python3.14");
+        touch_executable(&interpreter);
+        assert!(hook_codes(
+            &root,
+            &home,
+            &[&interpreter.to_string_lossy(), PLUGIN_SCRIPT],
+            &[PLUGIN_DECLARATION],
+            Some(&install),
+        )
+        .is_empty());
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_an_arbitrary_python_named_program_does_not_trust_its_argument`.
+    #[test]
+    fn python_doctor_arbitrary_python_named_program_does_not_trust_its_argument() {
+        let (_temp, home, root) = hook_home();
+        let interpreter = home.join("outside/bin/python3.14");
+        touch_executable(&interpreter);
+        let script = root.join("hooks/context.py");
+        fs::write(&script, "pass\n").expect("hook script");
+        let findings = hook_findings(
+            &root,
+            &home,
+            &[&interpreter.to_string_lossy(), &script.to_string_lossy()],
+            &[],
+            Some(&home.join("uv/python")),
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["hook_untrusted"]
+        );
+        assert_eq!(findings[0].detail, interpreter.display().to_string());
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_python_flag_operands_are_not_trusted_as_scripts`.
+    #[test]
+    fn python_doctor_python_flag_operands_are_not_trusted_as_scripts() {
+        let (_temp, home, root) = hook_home();
+        let install = home.join("uv/python");
+        let interpreter = install.join("cpython-3.14/bin/python3.14");
+        touch_executable(&interpreter);
+        let script = root.join("hooks/context.py");
+        fs::write(&script, "pass\n").expect("hook script");
+        let findings = hook_findings(
+            &root,
+            &home,
+            &[
+                &interpreter.to_string_lossy(),
+                "-c",
+                &script.to_string_lossy(),
+            ],
+            &[],
+            Some(&install),
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["hook_untrusted"]
+        );
+        assert_eq!(findings[0].detail, interpreter.display().to_string());
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_attached_or_grouped_python_execution_modes_stay_untrusted`.
+    #[test]
+    fn python_doctor_attached_or_grouped_python_execution_modes_stay_untrusted() {
+        let (_temp, home, root) = hook_home();
+        let install = home.join("uv/python");
+        let interpreter = install.join("cpython-3.14/bin/python3.14");
+        touch_executable(&interpreter);
+        for mode in ["-cprint(1)", "-mmodule", "-Icprint(1)"] {
+            let findings = hook_findings(
+                &root,
+                &home,
+                &[&interpreter.to_string_lossy(), mode, PLUGIN_SCRIPT],
+                &[],
+                Some(&install),
+            );
+            assert_eq!(
+                findings
+                    .iter()
+                    .map(|finding| finding.code.as_str())
+                    .collect::<Vec<_>>(),
+                ["hook_untrusted"],
+                "mode {mode}"
+            );
+            assert_eq!(
+                findings[0].detail,
+                interpreter.display().to_string(),
+                "mode {mode}"
+            );
+        }
+    }
+
+    /// Mirrors `test_doctor.py::HookTrustTests::test_grouped_safe_python_flags_keep_the_plugin_script_trusted`.
+    #[test]
+    fn python_doctor_grouped_safe_python_flags_keep_the_plugin_script_trusted() {
+        let (_temp, home, root) = hook_home();
+        let install = home.join("uv/python");
+        let interpreter = install.join("cpython-3.14/bin/python3.14");
+        touch_executable(&interpreter);
+        assert!(hook_codes(
+            &root,
+            &home,
+            &[&interpreter.to_string_lossy(), "-EsS", PLUGIN_SCRIPT],
+            &[PLUGIN_DECLARATION],
+            Some(&install),
+        )
+        .is_empty());
     }
 }
