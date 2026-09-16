@@ -10,7 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Ownership metadata filename written inside each managed refusal directory.
 const MARKER: &str = ".agent-run-command-policy.json";
+/// Exact executable shell body used for every denied ordinary invocation.
 const REFUSAL: &str =
     "#!/bin/sh\nprintf '%s\\n' 'agent-run: command denied by owner policy' >&2\nexit 126\n";
 

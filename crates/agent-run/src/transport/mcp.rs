@@ -26,7 +26,7 @@ const BROKER_UNAVAILABLE: &str =
 
 /// Bound stdin one LF-delimited MCP frame at a time for the SDK transport.
 struct BoundedReader<R> {
-    /// The process stdin whose bytes are fed to the MCP SDK.
+    /// Input byte stream whose bytes are fed to the MCP SDK.
     inner: R,
     /// Bytes received since the most recent LF delimiter.
     line_bytes: usize,
@@ -428,6 +428,7 @@ mod tests {
     /// Mirrors `tests/test_mcp.py::McpSdkTests::test_cancelled_caller_does_not_cancel_admitted_broker_call`
     #[tokio::test]
     async fn cancelled_caller_does_not_cancel_admitted_broker_call() {
+        /// Broker fixture that waits for an explicit release after admission.
         struct DelayedBroker {
             admitted: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,

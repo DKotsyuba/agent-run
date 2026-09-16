@@ -11,13 +11,14 @@ use agent_run_platform::fs;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
 
-const PROFILE_NAME: fn(&str) -> bool = |value| {
+/// Return whether a profile basename is a safe configured identifier.
+fn valid_profile_name(value: &str) -> bool {
     !value.is_empty()
         && value.as_bytes()[0].is_ascii_alphanumeric()
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
-};
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -80,7 +81,7 @@ pub fn normalize_read_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 /// Resolve one configured profile file without following an escaping link.
 pub fn profile_path(directory: &std::path::Path, name: &str) -> Result<PathBuf> {
-    if !PROFILE_NAME(name) {
+    if !valid_profile_name(name) {
         return Err(invalid(
             "profile must be a configured profile name, not a path",
         ));
