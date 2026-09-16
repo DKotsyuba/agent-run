@@ -10,6 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+/// Filename of the manifest stored at the archive prefix.
 const MANIFEST: &str = "ARCHIVE-MANIFEST.json";
 
 /// One file or symbolic link recorded in an archive manifest.

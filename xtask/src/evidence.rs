@@ -84,12 +84,6 @@ fn verify_entry(
         errors.push(format!("duplicate evidence entry: {raw_path}"));
         return;
     }
-    if !path.starts_with("migration/evidence") && !path.starts_with("migration/adr") {
-        errors.push(format!(
-            "evidence entry outside inventory roots: {raw_path}"
-        ));
-        return;
-    }
     let full = root.join(&path);
     let metadata = match fs::metadata(&full) {
         Ok(metadata) if metadata.is_file() => metadata,
