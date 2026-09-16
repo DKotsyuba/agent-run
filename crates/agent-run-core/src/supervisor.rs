@@ -155,7 +155,12 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     let runtime_home = if let Some(path) = &identity.runtime_home {
         path.clone()
     } else {
-        runtime.home.join("runs").join(id.as_str())
+        match runtime.kind()? {
+            Adapter::Codex => {
+                crate::codex::runtime_home(&runtime.home, row.request.account.as_deref(), id)?
+            }
+            _ => runtime.home.join("runs").join(id.as_str()),
+        }
     };
     let snapshot = if row.parent_agent_id.is_some() {
         materialize::verify(

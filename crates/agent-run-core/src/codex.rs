@@ -5,7 +5,7 @@ use crate::{
     error::invalid,
     profiles::{self, Profile},
     state::{Record, Store},
-    verify, Error, Result,
+    verify, Result,
 };
 use agent_run_adapters::{
     codex::session::{failure_kind as structured_failure_kind, Session},
@@ -19,6 +19,30 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
+/// Returns the per-run isolated home for a global or labelled Codex account.
+///
+/// A missing label deliberately keeps `configured_home` unchanged so it uses
+/// the native global account. A label suffixes only the final component (for
+/// example `codex@work`) before adding the run identifier, matching Python's
+/// `account_runtime_home` layout without allowing path traversal in labels.
+pub fn runtime_home(
+    configured_home: &Path,
+    account: Option<&str>,
+    id: &AgentId,
+) -> Result<PathBuf> {
+    let base = match account {
+        Some(label) => configured_home.with_file_name(format!(
+            "{}@{label}",
+            configured_home
+                .file_name()
+                .ok_or_else(|| invalid("Codex runtime home has no final path component"))?
+                .to_string_lossy()
+        )),
+        None => configured_home.to_path_buf(),
+    };
+    Ok(base.join("runs").join(id.as_str()))
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Grant {
     pub model: String,
@@ -414,29 +438,22 @@ pub async fn run(
     initialize(process).await?;
     let mut session = Session::new(record.resume_of_runtime_session_id.is_some());
     session.initialized()?;
+    agent_run_adapters::codex::models::validate_cached_selection(
+        home,
+        &record.request.model,
+        record.request.effort.as_deref(),
+    )?;
     let roster = models(process).await?;
-    let model = roster
+    // Cache publication is advisory exactly as in Python: a successful live
+    // roster remains sufficient when a later local cache write is unavailable.
+    let _ = agent_run_adapters::codex::models::write_cache(home, &roster);
+    let discovered = agent_run_adapters::codex::models::parse_roster(&json!({"models":roster}))?;
+    let model = discovered
         .iter()
-        .find(|m| {
-            m.get("id")
-                .or_else(|| m.get("model"))
-                .and_then(Value::as_str)
-                == Some(record.request.model.as_str())
-        })
+        .find(|model| model.id == record.request.model)
         .ok_or_else(|| invalid("selected account did not report the configured model"))?;
     if let Some(effort) = &record.request.effort {
-        let choices = model
-            .get("supportedReasoningEfforts")
-            .or_else(|| model.get("supported_reasoning_efforts"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("model did not report effort choices"))?;
-        if !choices.iter().any(|v| {
-            v.as_str() == Some(effort)
-                || v.get("reasoningEffort")
-                    .or_else(|| v.get("reasoning_effort"))
-                    .and_then(Value::as_str)
-                    == Some(effort)
-        }) {
+        if !model.efforts.iter().any(|choice| choice == effort) {
             return Err(invalid("effort is not offered by selected account/model"));
         }
     }

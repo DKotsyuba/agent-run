@@ -1,4 +1,6 @@
 //! Codex configuration rendering that does not require persistence access.
+/// Isolated Codex model-roster cache parsing and publication.
+pub mod models;
 pub mod session;
 use agent_run_config::config::Runtime;
 use agent_run_domain::{error::invalid, Result};

@@ -282,7 +282,10 @@ impl Runtime {
         Adapter::parse(&self.adapter)
     }
     pub fn selected_account(&self, requested: Option<&str>) -> Result<Option<String>> {
-        let a = requested.or(self.default_account.as_deref());
+        // `default_account` remains readable for Python-era configurations but
+        // must never turn an omitted selector into a labelled credential. The
+        // native global Codex account is represented exclusively by `None`.
+        let a = requested;
         if let Some(a) = a {
             if !self.accounts.iter().any(|v| v == a) {
                 return Err(invalid("account is not declared for this runtime"));
