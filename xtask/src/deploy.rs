@@ -252,7 +252,7 @@ fn backup_path(prefix: &Path) -> Result<PathBuf, String> {
 
 /// Saves state with SQLite's backup API, config, and the prior pointer privately.
 fn backup_at(directory: &Path, home: &Path, old: Option<&Path>) -> Result<(), String> {
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let state = home.join("state.db");
     if state.is_file() {
         let source = Connection::open(&state).map_err(|error| error.to_string())?;
