@@ -910,6 +910,7 @@ pub async fn collect(home: &Path) -> Result<Value> {
                     Err(_) => issues.push("persist_failed".into()),
                 },
                 Err(Error::Unsupported(_)) => issues.push("source_not_ported".into()),
+                Err(Error::Validation(reason)) => issues.push(reason),
                 Err(Error::Runtime(reason)) => issues.push(reason),
                 Err(_) => issues.push("source_failed".into()),
             }
