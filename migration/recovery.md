@@ -1,6 +1,9 @@
 # Native release recovery
 
-`cargo xtask release update` first refuses durable active agents, writes
+`cargo xtask release update` first refuses durable active agents and archived
+`workflow_runs` owners whose PID cannot be proven gone (an unobservable or
+access-denied writer counts as live, exactly like the Python release script),
+writes
 `<prefix>/deploy.json`, retains a state/config backup under `<prefix>/backups`,
 then atomically switches `current`. `--force` skips only the active-agent
 query: it does not stop a daemon, cancel work, or make an unsafe deployment

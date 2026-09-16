@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+agent-run-platform = { path = "../crates/agent-run-platform" }
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
