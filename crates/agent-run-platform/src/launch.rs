@@ -341,8 +341,17 @@ pub fn report_identity(identity_fd: RawFd, error_fd: RawFd) -> io::Result<()> {
     io::Write::write_all(&mut identity, format!("{pid}\n").as_bytes())
 }
 
-/// Child half of READY: one `ready` or bounded `fail:<reason>` line, then close.
+/// Child half of READY: one `ready` or bounded nonblank `fail:<reason>` line, then close.
+///
+/// A blank failure reason is rejected before the descriptor is consumed so the
+/// parent never receives an ambiguous startup failure token.
 pub fn report_ready(ready_fd: RawFd, outcome: Result<(), &str>) -> io::Result<()> {
+    if outcome.is_err_and(|reason| reason.trim().is_empty()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "supervisor failure reason must be nonblank",
+        ));
+    }
     let mut ready = inherit(ready_fd)?;
     let line = match outcome {
         Ok(()) => format!("{READY_TOKEN}\n"),

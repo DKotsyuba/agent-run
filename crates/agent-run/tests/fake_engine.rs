@@ -212,6 +212,9 @@ async fn run_task(home: &Path, task: &str) -> Record {
     Store::open(home).unwrap().get(&id).unwrap()
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_succeeds_only_with_complete_answer_evidence`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_identity_is_durable_before_ready_and_the_group_refines_once`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_ready_follows_handlers_and_durable_starting_and_precedes_launch`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn normal_run_produces_verifiable_terminal_evidence() {
     let (_tmp, home) = home();
@@ -240,6 +243,8 @@ async fn normal_run_produces_verifiable_terminal_evidence() {
 /// A run with no streamed content at all instead classifies as `"no_answer"`
 /// (`stream.py:344`), which Rust's own EOF branch also distinguishes
 /// (`crates/agent-run-core/src/stream.rs:310-321`).
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_success_without_an_answer_stays_failed`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_success_without_sentinel_stays_failed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exit_zero_without_terminal_result_is_not_success() {
     let (_tmp, home) = home();
@@ -250,6 +255,7 @@ async fn exit_zero_without_terminal_result_is_not_success() {
     assert_eq!(answer["available"], json!(false));
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_keeps_nonzero_failure`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nonzero_exit_after_valid_result_is_marked_failed() {
     let (_tmp, home) = home();
@@ -289,6 +295,8 @@ async fn oversized_frame_fails_the_run() {
     );
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_elapsed_clock_never_stops_a_runtime`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_natural_quiesce_allows_answer_flush_without_term`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_start_delays_admission_then_succeeds_with_a_late_answer() {
     let (_tmp, home) = home();
@@ -314,6 +322,9 @@ async fn slow_start_delays_admission_then_succeeds_with_a_late_answer() {
     );
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_a_grandchild_is_killed_and_reaped_after_a_clean_exit`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_missing_leader_does_not_hide_a_surviving_descendant`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_escaped_descendant_is_reported_and_cleaned_by_fixture_owner`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn descendant_process_is_reaped_before_finish() {
     let (_tmp, home) = home();
@@ -330,6 +341,9 @@ async fn descendant_process_is_reaped_before_finish() {
     assert_eq!(cleanup["descendants_gone"], json!(true));
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_cancel_queued_before_launch_cannot_orphan_the_engine`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_cancel_accepted_at_terminal_barrier_cannot_be_lost`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_final_drain_completes_late_cancel_steer_and_unknown`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
     let (_tmp, home) = home();
@@ -356,6 +370,29 @@ async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
     assert_eq!(cleanup["signals"], json!(["SIGTERM"]));
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_cancel_queued_before_launch_cannot_orphan_the_engine`.
+///
+/// The cancellation is persisted before the real supervisor process starts;
+/// its deterministic terminal row and missing spawn phase prove no fixture
+/// engine was launched while the child still reached a reaped terminal state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_spawn_cancellation_never_launches_the_fixture_engine() {
+    let (_tmp, home) = home();
+    let id = admit(&home, "fixture:hang");
+    Service::new(home.clone()).cancel(&id).unwrap();
+    let mut child = spawn_supervisor(&home, &id);
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor subprocess timed out")
+        .expect("wait on supervisor subprocess");
+    assert!(status.success());
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
+    assert!(store.last_event(&id, "phase").unwrap().is_none());
+}
+
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_unkillable_cancel_is_failed_not_coerced_to_cancelled`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_stuck_native_interrupt_cannot_block_group_enforcement`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_ignoring_sigterm_requires_sigkill() {
     let (_tmp, home) = home();
@@ -394,6 +431,7 @@ async fn engine_ignoring_sigterm_requires_sigkill() {
 /// to the same public `AnswerIntegrityError` machine code
 /// (`error.rs:134`), so no caller-visible behavior changed, only the
 /// internal variant this test must name.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_answer_inspection_failure_after_cleanup_is_durable`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
     let (_tmp, home) = home();
@@ -418,6 +456,9 @@ async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
     assert!(matches!(error, agent_run::Error::AnswerIntegrity(_)));
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_a_surviving_group_is_stopped_before_lost_is_committed`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_surviving_nonleader_never_claims_group_gone`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_a_surviving_group_is_reported_not_gone`.
 #[test]
 fn a_surviving_process_group_is_never_reported_as_finished() {
     let outcome = agent_run::domain::Outcome::success(None);
@@ -449,6 +490,11 @@ fn a_surviving_process_group_is_never_reported_as_finished() {
     );
 }
 
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_never_cancels_or_signals_an_unverified_group`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_non_group_leader_is_never_native_cancelled_or_group_signalled`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_reused_group_id_never_receives_native_cancel_or_signal`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_an_already_dead_group_is_not_signalled`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_natural_quiesce_reaps_before_signalling`.
 #[test]
 fn signal_is_never_sent_to_an_already_dead_process() {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agent-run-fixture"))
