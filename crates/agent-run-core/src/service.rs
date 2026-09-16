@@ -308,6 +308,14 @@ impl Service {
     pub fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         Store::open(&self.home)?.delivery_status(id)
     }
+    /// Cancels one pending completion-delivery notification by durable identifier.
+    ///
+    /// A missing, delivered, or already cancelled notification returns `false` in
+    /// the Python-compatible acknowledgement; invalid identifiers are rejected.
+    pub fn delivery_cancel(&self, delivery_id: &str) -> Result<Value> {
+        let cancelled = Store::open(&self.home)?.cancel_delivery(delivery_id)?;
+        Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
+    }
     pub async fn list(&self, query: Query) -> Result<Value> {
         query.validate()?;
         let until = tokio::time::Instant::now() + Duration::from_secs_f64(query.wait_seconds);

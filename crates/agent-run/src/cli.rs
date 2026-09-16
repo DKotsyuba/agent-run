@@ -8,7 +8,7 @@ use crate::{
     policy::Constraint,
     service::{Query, Service},
     state::Store,
-    transport, Error, Result,
+    transport, Result,
 };
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -113,6 +113,7 @@ pub enum Command {
     DenyCommand {
         name: String,
     },
+    /// Runs the doctor bootstrap canary using its three inherited descriptors.
     #[command(name = "_doctor_canary", hide = true)]
     DoctorCanary {
         #[arg(long)]
@@ -121,6 +122,13 @@ pub enum Command {
         identity_fd: i32,
         #[arg(long)]
         error_fd: i32,
+    },
+    /// Privately evaluates one generated Codex trusted-MCP permission request.
+    #[command(name = "_permission-request", hide = true)]
+    PermissionRequest {
+        /// Repeated configured MCP namespaces eligible for the narrow allow decision.
+        #[arg(long = "allow-mcp", required = true)]
+        allow_mcp: Vec<String>,
     },
 }
 /// Optional orchestrator identity shared by public tool commands.
@@ -479,18 +487,78 @@ pub async fn doctor(home: &Path) -> Result<Value> {
         json!({"ok":ok,"home":home,"broker_available":broker,"checks":checks,"validation_level":"filesystem-and-configuration; provider authentication is checked at launch"}),
     )
 }
-/// Runs native provider login and returns its process code plus a safe success DTO.
-async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, Value)> {
-    let cfg = Config::load(home)?;
-    let runtime = cfg.runtime(name)?;
-    let kind = runtime.kind()?;
-    if let Some(label) = account {
-        runtime.selected_account(Some(label))?;
-    }
+/// Escapes a scalar value for insertion into a launchd plist XML text node.
+fn xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+/// Renders the Python-compatible launchd document and its machine-readable metadata.
+pub fn launchd(
+    home: &Path,
+    binary: PathBuf,
+    kind: &str,
+    interval: u64,
+    label: &str,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+) -> Result<Value> {
+    let binary = absolute(&binary)?;
+    let args = match kind {
+        "api" => vec!["api", "serve"],
+        "capacity" => vec!["capacity", "collect", "--once"],
+        "delivery" => vec!["delivery", "dispatch"],
+        _ => return Err(invalid("unknown launchd job")),
+    };
+    let mut argv = vec![
+        binary.to_string_lossy().into_owned(),
+        "--home".into(),
+        home.to_string_lossy().into_owned(),
+    ];
+    argv.extend(args.into_iter().map(str::to_owned));
+    let args = argv
+        .iter()
+        .map(|a| format!("      <string>{}</string>\n", xml(a)))
+        .collect::<String>();
+    let home_env = std::env::var("HOME").map_err(|_| invalid("HOME is missing"))?;
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+    let schedule = if kind == "api" {
+        "  <key>KeepAlive</key><true/>\n".into()
+    } else {
+        format!(
+            "  <key>StartInterval</key><integer>{}</integer>\n",
+            interval.max(1)
+        )
+    };
+    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",xml(label),xml(&home_env),xml(&path),xml(&stdout_log.to_string_lossy()),xml(&stderr_log.to_string_lossy()));
+    Ok(if kind == "api" {
+        json!({"label":label,"argv":argv,"plist":plist})
+    } else {
+        json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
+    })
+}
+/// Builds one credential-isolated native login or post-login status command.
+///
+/// Codex scopes labelled accounts below the agent-run home and Claude scopes
+/// them below the configured runtime home. `status` selects the provider's
+/// noninteractive verification invocation; both command forms retain no
+/// provider output in agent-run's JSON response.
+fn native_login_command(
+    home: &Path,
+    runtime: &crate::config::Runtime,
+    kind: Adapter,
+    account: Option<&str>,
+    status: bool,
+) -> Result<tokio::process::Command> {
     let mut command = tokio::process::Command::new(&runtime.binary);
     match kind {
         Adapter::Codex => {
             command.arg("login");
+            if status {
+                command.arg("status");
+            }
             if let Some(label) = account {
                 let path = crate::adapters::materialize::account_home(home, kind, label);
                 fs::private_dir(&path)?;
@@ -499,6 +567,9 @@ async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, V
         }
         Adapter::Claude => {
             command.args(["auth", "login"]);
+            if status {
+                command.args(["status", "--json"]);
+            }
             if let Some(label) = account {
                 let path = crate::adapters::materialize::account_home(home, kind, label)
                     .join("claude-config");
@@ -508,22 +579,61 @@ async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, V
                 command.env_remove("CLAUDE_CONFIG_DIR");
             }
         }
-        _ => {
-            return Err(Error::Unsupported(
-                "GLM/Qwen use explicitly declared environment authentication in this port".into(),
-            ))
+        Adapter::Glm | Adapter::Qwen => {
+            return Err(invalid("auth login is not supported for this runtime yet"));
         }
     }
+    Ok(command)
+}
+
+/// Runs Python-compatible native authentication and verifies its resulting state.
+///
+/// `claude_only` distinguishes the convenience `login` syntax from explicit
+/// `auth <label> <runtime>`: the former accepts only Claude, while the latter
+/// supports configured Codex accounts. Provider failures preserve their exit
+/// status, emit only a fixed diagnostic, and never expose native status output.
+async fn login(
+    home: &Path,
+    name: &str,
+    account: Option<&str>,
+    claude_only: bool,
+) -> Result<(i32, Value)> {
+    let cfg = Config::load(home)?;
+    let runtime = cfg.runtime(name)?;
+    let kind = runtime.kind()?;
+    if claude_only && kind != Adapter::Claude {
+        return Err(invalid(format!(
+            "login supports Claude only; use agent-run auth <label> {name}"
+        )));
+    }
+    let account = runtime.selected_account(account)?;
+    let account_name = account.as_deref().unwrap_or("default");
     // Interactive native authentication owns its prompts and credential storage.
-    let status = command
+    let status = native_login_command(home, runtime, kind, account.as_deref(), false)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await?;
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        eprintln!("auth login failed for {account_name} {name} (exit {code})");
+        return Ok((code, Value::Null));
+    }
+    let status = native_login_command(home, runtime, kind, account.as_deref(), true)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        eprintln!("auth login status failed for {account_name} {name} (exit {code})");
+        return Ok((code, Value::Null));
+    }
     Ok((
-        status.code().unwrap_or(1),
-        json!({"account":account.unwrap_or("default"),"runtime":name,"status":"ok"}),
+        0,
+        json!({"account":account,"runtime":if kind == Adapter::Claude {"claude"} else {name},"status":"ok"}),
     ))
 }
 /// Executes one parsed command and returns its public process exit status.
@@ -765,11 +875,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         },
         Command::Delivery { command } => match command {
             Delivery::Status { agent_id } => emit(&service.delivery_status(&agent_id)?)?,
-            Delivery::Cancel { delivery_id: _ } => {
-                return Err(Error::Unsupported(
-                    "delivery cancel is awaiting the shared delivery service".into(),
-                ))
-            }
+            Delivery::Cancel { delivery_id } => emit(&service.delivery_cancel(&delivery_id)?)?,
             Delivery::Launchd {
                 binary,
                 label,
@@ -789,14 +895,14 @@ pub async fn run(cli: Cli) -> Result<i32> {
             }
         },
         Command::Login { runtime, account } => {
-            let (code, value) = login(&home, &runtime, account.as_deref()).await?;
+            let (code, value) = login(&home, &runtime, account.as_deref(), true).await?;
             if code == 0 {
                 emit(&value)?;
             }
             return Ok(code);
         }
         Command::Auth { label, runtime } => {
-            let (code, value) = login(&home, &runtime, Some(&label)).await?;
+            let (code, value) = login(&home, &runtime, Some(&label), false).await?;
             if code == 0 {
                 emit(&value)?;
             }
@@ -819,6 +925,28 @@ pub async fn run(cli: Cli) -> Result<i32> {
             identity_fd,
             error_fd,
         } => crate::doctor::run_canary([ready_fd, identity_fd, error_fd])?,
+        Command::PermissionRequest { allow_mcp } => {
+            if allow_mcp.iter().any(|server| {
+                server.is_empty()
+                    || !server.bytes().enumerate().all(|(index, byte)| {
+                        (index == 0 && (byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+                            || byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'_')
+                    })
+            }) {
+                return Err(invalid(
+                    "--allow-mcp values must be lowercase MCP server identifiers",
+                ));
+            }
+            let payload: Value = serde_json::from_str(&read_stdin(1024 * 1024)?)?;
+            if let Some(decision) = crate::adapters::codex::permission_request_decision(
+                &payload,
+                &allow_mcp.into_iter().collect(),
+            ) {
+                emit(&decision)?;
+            }
+        }
     }
     Ok(0)
 }
