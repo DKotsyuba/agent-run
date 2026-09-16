@@ -6,7 +6,11 @@ use agent_run::{
 };
 use clap::{Command, CommandFactory, Parser};
 use serde_json::Value;
-use std::{collections::BTreeSet, process::Command as ProcessCommand};
+use std::{
+    collections::BTreeSet,
+    io::Write,
+    process::{Command as ProcessCommand, Stdio},
+};
 use tempfile::tempdir;
 
 /// Returns the parser command at one space-separated baseline command path.
@@ -199,4 +203,117 @@ fn python_init_emits_home_config_and_state_fields() {
     for field in ["home", "config", "state"] {
         assert!(value[field].is_string(), "missing JSON string {field}");
     }
+}
+
+/// Mirrors `test_cli.py::test_producer_shims_and_all_top_level_commands_parse`.
+#[test]
+fn python_delivery_cancel_returns_a_durable_acknowledgement() {
+    let home = tempdir().expect("temporary home");
+    let initialized = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args([
+            "--home",
+            home.path().to_str().expect("UTF-8 temporary path"),
+            "init",
+        ])
+        .output()
+        .expect("agent-run binary executes");
+    assert!(initialized.status.success(), "{initialized:?}");
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args([
+            "--home",
+            home.path().to_str().expect("UTF-8 temporary path"),
+            "delivery",
+            "cancel",
+            "missing-delivery",
+        ])
+        .output()
+        .expect("agent-run binary executes");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("JSON acknowledgement"),
+        serde_json::json!({"delivery_id":"missing-delivery","cancelled":false})
+    );
+}
+
+/// Mirrors `test_codex_permission_request.py::test_main_emits_allow_only_for_a_trusted_mcp`.
+#[test]
+fn python_permission_request_allows_only_proven_trusted_mcp_calls() {
+    let mut allowed = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["_permission-request", "--allow-mcp", "agent-run"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("agent-run permission helper executes");
+    allowed
+        .stdin
+        .take()
+        .expect("permission helper stdin")
+        .write_all(
+            br#"{"hook_event_name":"PermissionRequest","tool_name":"mcp__agent_run__answer"}"#,
+        )
+        .expect("permission request input writes");
+    let allowed = allowed
+        .wait_with_output()
+        .expect("permission helper completes");
+    assert_eq!(allowed.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&allowed.stdout).expect("allow JSON"),
+        serde_json::json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}})
+    );
+
+    let mut refused = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["_permission-request", "--allow-mcp", "agent-run"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("agent-run permission helper executes");
+    refused
+        .stdin
+        .take()
+        .expect("permission helper stdin")
+        .write_all(br#"{"hook_event_name":"PermissionRequest","tool_name":"Bash"}"#)
+        .expect("permission request input writes");
+    let refused = refused
+        .wait_with_output()
+        .expect("permission helper completes");
+    assert_eq!(refused.status.code(), Some(0));
+    assert!(refused.stdout.is_empty(), "unproven requests stay silent");
+}
+
+/// Mirrors `test_cli.py::test_login_claude_defaults_global_and_rejects_unsupported_runtime`.
+#[test]
+fn python_login_rejects_codex_but_auth_executes_its_declared_account() {
+    let home = tempdir().expect("temporary home");
+    let home_text = home.path().to_str().expect("UTF-8 temporary path");
+    let initialized = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["--home", home_text, "init"])
+        .output()
+        .expect("agent-run binary executes");
+    assert!(initialized.status.success(), "{initialized:?}");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "schema_version=1\n[runtimes.codex]\nenabled=true\nadapter='codex'\nbinary='/usr/bin/true'\nhome={}\nmodels=['fixture']\naccounts=['personal']\nlimits_source='none'\n",
+            toml::Value::String(home.path().join("runtime").display().to_string())
+        ),
+    )
+    .expect("fixture config writes");
+    let login = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["--home", home_text, "login", "codex"])
+        .output()
+        .expect("agent-run binary executes");
+    assert_eq!(login.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&login.stderr).contains("agent-run auth <label> codex"),
+        "{login:?}"
+    );
+    let auth = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["--home", home_text, "auth", "personal", "codex"])
+        .output()
+        .expect("agent-run binary executes");
+    assert!(auth.status.success(), "{auth:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&auth.stdout).expect("JSON acknowledgement"),
+        serde_json::json!({"account":"personal","runtime":"codex","status":"ok"})
+    );
 }

@@ -5,9 +5,9 @@
 
 use crate::Store;
 use agent_run_domain::{
-    domain::{now, AgentId, OrchestratorRef},
+    domain::{now, AgentId},
     error::invalid,
-    Error, Result,
+    Result,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
@@ -197,6 +197,27 @@ fn safe_evidence(raw: &Value) -> Result<Value> {
 }
 
 impl Store {
+    /// Cancels a nonterminal completion delivery and reports whether it changed state.
+    ///
+    /// The caller supplies one nonblank durable delivery identifier. Delivered and
+    /// already-cancelled rows remain immutable; all other delivery states lose any
+    /// active lease and scheduled retry in the same immediate transaction. Unknown
+    /// identifiers return `false` without creating state.
+    pub fn cancel_delivery(&mut self, delivery_id: &str) -> Result<bool> {
+        if delivery_id.trim().is_empty() {
+            return Err(invalid("delivery_id must be nonblank"));
+        }
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE deliveries SET state='cancelled',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL WHERE id=? AND state NOT IN ('delivered','cancelled')",
+            [delivery_id],
+        )? == 1;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
     /// Expires waiting completion notices older than the documented binding window.
     pub fn expire_unbound_deliveries(&mut self, at: f64) -> Result<Vec<String>> {
         if !at.is_finite() {
