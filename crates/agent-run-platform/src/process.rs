@@ -468,22 +468,25 @@ pub struct OwnedProcess {
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
     ///
-    /// One descendant snapshot is taken immediately, while the freshly spawned
-    /// leader is still verifiably alive, so even a child that exits before the
-    /// caller's first periodic refresh leaves verified descendant evidence
-    /// behind. A leader that is already gone or unreadable records no snapshot,
-    /// and cleanup then reports the descendant scope as unknown, never clean.
+    /// A live leader read here is itself the first verified descendant snapshot:
+    /// a process observed at the moment it is spawned cannot have descendants
+    /// yet, so its empty set is proven rather than assumed, and even a child
+    /// exiting before the caller's first periodic refresh leaves verified
+    /// evidence behind. That proof costs only the leader's own inspection; a
+    /// full process-table scan here would delay the caller's stream readers and
+    /// is not needed for an empty set. A leader that is already gone, a zombie,
+    /// or unreadable records no snapshot, and cleanup then reports the
+    /// descendant scope as unknown rather than clean.
     pub fn capture(pid: i32) -> Self {
         let leader = inspect(pid).ok();
         let known = leader.clone().into_iter().map(|p| (p.pid, p)).collect();
-        let mut owned = Self {
+        let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
+        Self {
             leader,
             pid,
             known,
-            descendants_observed: false,
-        };
-        owned.refresh();
-        owned
+            descendants_observed,
+        }
     }
     /// Record descendants visible from a complete native process snapshot.
     ///
