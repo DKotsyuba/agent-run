@@ -115,6 +115,12 @@ must not be installed over a working release.** Outstanding:
    and `cargo xtask evidence verify` are unimplemented.
    `migration/evidence/index.json` exists as a hashed inventory but is
    hand-assembled and unverified by tooling.
+
+   For precision: `xtask` itself is not absent. `xtask/src/main.rs` dispatches
+   `cargo xtask check` (fmt, clippy and the workspace test run) and
+   `cargo xtask release build|build-native|verify|install|update|rollback`, backed
+   by `xtask/src/release.rs` and `xtask/src/deploy.rs`. The missing pieces are the
+   `qualify`, `archive` and `evidence` subcommands and their modules, not the tool.
 3. **Platform support is undecided.** All testing to date ran on macOS/arm64
    only. Linux code paths exist — including the process-identity and liveness
    paths the supervision model rests on — but have never been executed. ADR A15
