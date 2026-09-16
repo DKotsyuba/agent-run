@@ -271,6 +271,12 @@ fn forecast_fresh(s: &Sample, at: f64) -> bool {
         && s.observed_at.is_none_or(|v| v <= at)
         && s.reset_at.is_none_or(|v| v > at)
 }
+/// Builds a forecast from a newest-first history for one exact capacity key.
+///
+/// The newest sample is the sole freshness gate; older samples from its reset
+/// cycle remain usable as burn evidence even when their own validity has
+/// expired. Missing observation and validity bounds are treated as absent
+/// bounds, matching the Python forecast contract.
 pub fn forecast(key: &Key, samples: &[Sample], at: f64) -> Forecast {
     let unknown = Forecast {
         key: key.clone(),
@@ -293,10 +299,7 @@ pub fn forecast(key: &Key, samples: &[Sample], at: f64) -> Forecast {
     let remaining = latest.remaining_percent.unwrap_or(0.0);
     let mut span = None;
     let mut burn = None;
-    let matching: Vec<_> = samples
-        .iter()
-        .filter(|s| s.validate().is_ok() && same_cycle(s, latest))
-        .collect();
+    let matching: Vec<_> = samples.iter().filter(|s| same_cycle(s, latest)).collect();
     if matching.len() >= 2 {
         if let Some(oldest) = matching.last() {
             if let (Some(a), Some(b), Some(old)) = (

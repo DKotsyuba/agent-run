@@ -151,8 +151,12 @@ pub fn script() -> String {
         "const D=require('/app/node_modules/better-sqlite3');",
         "const d=new D('/app/data/storage.sqlite',{readonly:true});",
         "const q=\"SELECT kv.value v FROM provider_connections c LEFT JOIN key_value kv ON kv.namespace='providerLimitsCache' AND kv.key=c.id WHERE c.provider='opencode-go' AND c.is_active=1 AND c.quota_visible=1 LIMIT 65\";",
-        "let o=[];for(const r of d.prepare(q).all()){let x={};try{x=JSON.parse(r.v)}catch(_){ }",
-        "for(const k of ['session','weekly','mcp_monthly']){let z=x&&x.quotas&&x.quotas[k];o.push({window_key:k,remaining_percentage:z&&z.remainingPercentage,next_reset_at:z&&z.resetAt,fetched_at:x&&x.fetchedAt});if(o.length>64)break}if(o.length>64)break}",
+        "const W=['session','weekly','mcp_monthly'];const I=/^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?(Z|[+-]\\d{2}:?\\d{2})?$/;",
+        "const P=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);const N=v=>typeof v==='number'&&Number.isFinite(v);",
+        "const O=v=>typeof v==='string'&&v.length<=40&&I.test(v);const F=v=>O(v)?v:null;",
+        "const R=v=>v===undefined||v===null?null:O(v)?v:'__unparseable_reset__';let o=[];memberLoop:for(const r of d.prepare(q).all()){let x=null;try{x=JSON.parse(r.v)}catch(_){}",
+        "const quotas=P(x)&&P(x.quotas)?x.quotas:null;const fetched=P(x)?F(x.fetchedAt):null;",
+        "for(const k of W){if(o.length>=64){o.push({window_key:'__overflow__',remaining_percentage:null,next_reset_at:null,fetched_at:null});break memberLoop}const z=quotas&&P(quotas[k])?quotas[k]:null;o.push({window_key:k,remaining_percentage:z&&N(z.remainingPercentage)?z.remainingPercentage:null,next_reset_at:z?R(z.resetAt):null,fetched_at:z?fetched:null})}}",
         "console.log(JSON.stringify(o));"
     ).into()
 }

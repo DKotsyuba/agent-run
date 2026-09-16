@@ -9,7 +9,7 @@ use agent_run_core::capacity::{
 };
 use agent_run_domain::Error;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, process::Command};
 
 /// Converts a compact JSON Web Token fixture into the auth-file shape used by Codex.
 fn auth_file(email: Option<&str>) -> serde_json::Value {
@@ -333,6 +333,265 @@ fn omniroute_malformed_or_overflow_rows_are_unavailable() {
     let overflow = ValueRows::overflow();
     let error = omniroute::samples(&overflow, 1.0).expect_err("row cap is bounded");
     assert_eq!(error.to_string(), "omniroute_result_overflow");
+}
+
+/// Executes the production OmniRoute sanitizer against supplied cache members.
+fn sanitized_omniroute_rows(members: &Value) -> Option<Value> {
+    let node = Command::new("node").arg("--version").output().ok()?;
+    if !node.status.success() {
+        return None;
+    }
+    let harness = format!(
+        "const __FAKE_MEMBERS__={members}; function require(_) {{ return function Database(_,_) {{ return {{ prepare(_) {{ return {{ all() {{ return __FAKE_MEMBERS__; }} }}; }} }}; }}; }}",
+        members = serde_json::to_string(members).unwrap()
+    );
+    let output = Command::new("node")
+        .args(["-e", &format!("{harness}{}", omniroute::script())])
+        .output()
+        .expect("node is available");
+    assert!(
+        output.status.success(),
+        "sanitizer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(serde_json::from_slice(&output.stdout).expect("sanitizer emits JSON"))
+}
+
+/// Returns a valid cache document containing all supported OmniRoute windows.
+fn valid_omniroute_cache() -> Value {
+    json!({
+        "quotas": {
+            "session": {"remainingPercentage": 91.0, "resetAt": "2026-08-24T19:20:58.435Z"},
+            "weekly": {"remainingPercentage": 42.5, "resetAt": "2026-08-25T00:00:00Z"},
+            "mcp_monthly": {"remainingPercentage": 10.0, "resetAt": null}
+        },
+        "fetchedAt": "2026-08-24T19:17:02.435Z",
+        "source": "scheduled"
+    })
+}
+
+/// Converts a fixed RFC-3339 fixture timestamp into epoch seconds.
+fn omniroute_at(value: &str) -> f64 {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .timestamp_millis() as f64
+        / 1000.0
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::MembersQueryTests::test_reads_the_current_cache_and_ignores_stale_unchanged_history`.
+#[test]
+fn omniroute_script_reads_current_cache_not_history() {
+    let script = omniroute::script();
+    assert!(script.contains("LEFT JOIN key_value"));
+    assert!(script.contains("providerLimitsCache"));
+    assert!(script.contains("quota_visible=1"));
+    assert!(script.contains("is_active=1"));
+    assert!(!script.contains("quota_snapshots"));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::MembersQueryTests::test_active_quota_visible_members_included_others_excluded`.
+#[test]
+fn omniroute_script_filters_active_visible_provider_members() {
+    let script = omniroute::script();
+    assert!(script.contains("provider='opencode-go'"));
+    assert!(script.contains("c.is_active=1"));
+    assert!(script.contains("c.quota_visible=1"));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::MembersQueryTests::test_left_join_keeps_an_active_member_with_no_cache_row`.
+#[test]
+fn omniroute_script_keeps_cacheless_members_in_the_left_join() {
+    assert!(omniroute::script().contains("LEFT JOIN key_value"));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::SanitizedRowContractTests::test_a_missing_or_malformed_member_cache_fails_the_whole_pool`.
+#[test]
+fn omniroute_missing_member_cache_fails_the_whole_pool() {
+    let Some(rows) = sanitized_omniroute_rows(&json!([{"v": null}])) else {
+        return;
+    };
+    assert_eq!(
+        omniroute::samples(&rows, omniroute_at("2026-08-24T19:18:02Z"))
+            .unwrap_err()
+            .to_string(),
+        "omniroute_malformed_data"
+    );
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_a_valid_current_cache_row_is_projected_for_every_window`.
+#[test]
+fn omniroute_sanitizer_projects_a_valid_cache_for_every_window() {
+    let Some(rows) = sanitized_omniroute_rows(&json!([{"v": valid_omniroute_cache().to_string()}]))
+    else {
+        return;
+    };
+    let rows = rows.as_array().expect("sanitized rows are an array");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["remaining_percentage"], 91.0);
+    assert_eq!(rows[0]["next_reset_at"], "2026-08-24T19:20:58.435Z");
+    assert_eq!(rows[2]["next_reset_at"], Value::Null);
+    let samples = omniroute::samples(
+        &Value::Array(rows.clone()),
+        omniroute_at("2026-08-24T19:20:00Z"),
+    )
+    .unwrap();
+    let session = samples
+        .iter()
+        .find(|sample| sample.key.window == "session_5h")
+        .unwrap();
+    assert_eq!(session.remaining_percent, Some(91.0));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_missing_empty_and_malformed_cache_all_poison_the_member`.
+#[test]
+fn omniroute_sanitizer_poison_rows_for_missing_empty_and_malformed_cache() {
+    for cache_json in [
+        Value::Null,
+        json!(""),
+        json!("not json"),
+        json!({"quotas":"not-an-object"}),
+    ] {
+        let Some(rows) = sanitized_omniroute_rows(&json!([{"v": cache_json}])) else {
+            return;
+        };
+        let rows = rows.as_array().expect("sanitized rows are an array");
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row["remaining_percentage"].is_null()));
+        assert_eq!(
+            omniroute::samples(
+                &Value::Array(rows.clone()),
+                omniroute_at("2026-08-24T19:18:02Z")
+            )
+            .unwrap_err()
+            .to_string(),
+            "omniroute_malformed_data"
+        );
+    }
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_quotas_as_an_array_is_rejected_not_treated_as_an_object`.
+#[test]
+fn omniroute_sanitizer_rejects_quota_arrays() {
+    let Some(rows) = sanitized_omniroute_rows(
+        &json!([{"v": json!({"quotas": [], "fetchedAt": "2026-08-24T19:17:02Z"}).to_string()}]),
+    ) else {
+        return;
+    };
+    assert!(rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["remaining_percentage"].is_null()));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_a_reset_only_change_survives_the_real_node_sanitizer`.
+#[test]
+fn omniroute_sanitizer_preserves_reset_only_changes() {
+    let cache = |reset: &str| {
+        json!({"quotas":{"session":{"remainingPercentage":80.0,"resetAt":reset}},"fetchedAt":"2026-08-24T19:17:02.435Z"}).to_string()
+    };
+    let Some(before) = sanitized_omniroute_rows(&json!([{"v": cache("2026-08-24T19:20:58.435Z")}]))
+    else {
+        return;
+    };
+    let Some(after) = sanitized_omniroute_rows(&json!([{"v": cache("2026-08-24T20:20:58.435Z")}]))
+    else {
+        return;
+    };
+    let one = |rows: Value| {
+        Value::Array(vec![rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["window_key"] == "session")
+            .unwrap()
+            .clone()])
+    };
+    let now = omniroute_at("2026-08-24T19:18:02Z");
+    let before = omniroute::samples(&one(before), now).unwrap();
+    let after = omniroute::samples(&one(after), now).unwrap();
+    assert_ne!(before[0].reset_at, after[0].reset_at);
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_sentinel_secrets_in_message_plan_and_connection_id_never_appear`.
+#[test]
+fn omniroute_sanitizer_never_emits_cache_secrets() {
+    let secret = "SECRET-do-not-leak-me";
+    let cache = json!({"quotas":{"session":{"remainingPercentage":50.0,"resetAt":null}},"fetchedAt":"2026-08-24T19:17:02Z","message":secret,"plan":secret,"connectionId":secret});
+    let Some(rows) =
+        sanitized_omniroute_rows(&json!([{"v": cache.to_string(), "connection_id": secret}]))
+    else {
+        return;
+    };
+    assert!(!rows.to_string().contains(secret));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_malformed_remaining_reset_and_fetched_are_never_emitted_raw`.
+#[test]
+fn omniroute_sanitizer_poison_marks_malformed_fields_without_leaking_them() {
+    let cache = json!({"quotas":{"session":{"remainingPercentage":{"leaked":"yes-this-should-never-cross-stdout"},"resetAt":{"leaked":"yes-this-should-never-cross-stdout"}}},"fetchedAt":{"leaked":"yes-this-should-never-cross-stdout"}});
+    let Some(rows) = sanitized_omniroute_rows(&json!([{"v": cache.to_string()}])) else {
+        return;
+    };
+    assert!(!rows.to_string().contains("leaked"));
+    let rows = rows.as_array().unwrap();
+    let session = rows
+        .iter()
+        .find(|row| row["window_key"] == "session")
+        .unwrap();
+    assert!(session["remaining_percentage"].is_null());
+    assert!(session["fetched_at"].is_null());
+    assert!(!session["next_reset_at"].is_null());
+    assert_eq!(
+        omniroute::samples(
+            &Value::Array(rows.clone()),
+            omniroute_at("2026-08-24T19:18:02Z")
+        )
+        .unwrap_err()
+        .to_string(),
+        "omniroute_malformed_data"
+    );
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_a_legitimately_absent_reset_stays_null_not_poisoned`.
+#[test]
+fn omniroute_sanitizer_keeps_absent_reset_null() {
+    let cache = json!({"quotas":{"session":{"remainingPercentage":77.0}},"fetchedAt":"2026-08-24T19:17:02Z"});
+    let Some(rows) = sanitized_omniroute_rows(&json!([{"v": cache.to_string()}])) else {
+        return;
+    };
+    let rows = rows.as_array().unwrap();
+    let session = rows
+        .iter()
+        .find(|row| row["window_key"] == "session")
+        .unwrap()
+        .clone();
+    assert!(session["next_reset_at"].is_null());
+    let samples = omniroute::samples(&json!([session]), omniroute_at("2026-08-24T19:18:02Z"));
+    assert!(samples.is_ok());
+    assert_eq!(samples.unwrap()[0].remaining_percent, Some(77.0));
+}
+
+/// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_emission_is_bounded_with_an_overflow_sentinel`.
+#[test]
+fn omniroute_sanitizer_emission_is_bounded_with_overflow() {
+    let cache = json!({"quotas":{"session":{"remainingPercentage":1.0},"weekly":{"remainingPercentage":1.0},"mcp_monthly":{"remainingPercentage":1.0}},"fetchedAt":"2026-08-24T19:17:02Z"}).to_string();
+    let members = Value::Array((0..30).map(|_| json!({"v": cache})).collect());
+    let Some(rows) = sanitized_omniroute_rows(&members) else {
+        return;
+    };
+    let rows = rows.as_array().unwrap();
+    assert!(rows.len() <= 65);
+    assert!(rows.len() > 64);
+    assert_eq!(
+        omniroute::samples(
+            &Value::Array(rows.clone()),
+            omniroute_at("2026-08-24T19:18:02Z")
+        )
+        .unwrap_err()
+        .to_string(),
+        "omniroute_result_overflow"
+    );
 }
 
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_never_makes_a_live_call`.

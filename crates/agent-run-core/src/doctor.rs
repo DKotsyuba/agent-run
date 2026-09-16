@@ -14,7 +14,7 @@ use chrono::TimeZone;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -832,7 +832,18 @@ fn keychain_present_with(name: &str, lookup: impl FnOnce(Option<&str>, &str) -> 
 /// Flags capacity samples whose validity window or age has expired.
 fn capacity(config: &Config, rows: &[Value], at: f64, findings: &mut Vec<Finding>) {
     let stale_after = config.capacity.collect_interval_seconds.max(1) as f64 * 2.0;
+    let mut latest = BTreeSet::new();
     for row in rows {
+        let identity = (
+            row.get("runtime").and_then(Value::as_str),
+            row.get("lane").and_then(Value::as_str),
+            row.get("window").and_then(Value::as_str),
+            row.get("target").and_then(Value::as_str),
+            row.get("source").and_then(Value::as_str),
+        );
+        if !latest.insert(identity) {
+            continue;
+        }
         let stale = match row.get("valid_until").and_then(Value::as_f64) {
             Some(valid_until) => valid_until < at,
             None => row
@@ -1259,6 +1270,16 @@ mod tests {
             ]),
             ["aged"]
         );
+    }
+
+    /// Keeps only the newest row for each capacity identity before staleness checks.
+    #[test]
+    fn capacity_staleness_deduplicates_identity_before_reporting() {
+        assert!(capacity_lanes(&[
+            capacity_row("same", 900., Some(2_000.)),
+            capacity_row("same", 100., Some(500.)),
+        ])
+        .is_empty());
     }
 
     /// Creates Python `HookTrustTests.setUp`'s resolved home and install root.
