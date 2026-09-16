@@ -1,5 +1,14 @@
 # Codex adapter and generated runtime-home inventory (CX)
 
+> **Historical analysis — the addresses below are not current.** This inventory
+> records the state of the port at the time it was written, when the Rust code
+> was a single `rust/` crate. That tree no longer exists; the port is now the
+> `crates/` workspace, and the parity figures quoted here were superseded long
+> ago. The addresses are kept verbatim because rewriting them would attach an
+> old measurement to code it never described. For what is covered today, see
+> `migration/status.md`, `migration/baseline/test-map.csv` and
+> `migration/evidence/qualification-scope.md`.
+
 ## 1. Summary
 
 - Estimated behavioral parity: **38%**. Rust has a usable Codex app-server launch/turn loop, model pagination, grants, and basic generated `config.toml` (`rust/src/adapters/codex.rs:378-708`, `rust/src/adapters/materialize.rs:400-544`).

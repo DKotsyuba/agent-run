@@ -1,5 +1,14 @@
 # Transports, CLI, and operations inventory
 
+> **Historical analysis — the addresses below are not current.** This inventory
+> records the state of the port at the time it was written, when the Rust code
+> was a single `rust/` crate. That tree no longer exists; the port is now the
+> `crates/` workspace, and the parity figures quoted here were superseded long
+> ago. The addresses are kept verbatim because rewriting them would attach an
+> old measurement to code it never described. For what is covered today, see
+> `migration/status.md`, `migration/baseline/test-map.csv` and
+> `migration/evidence/qualification-scope.md`.
+
 ## 1. Summary
 
 - **Estimated behavioural parity: 38%.** Rust has a compile-time shared table for the eleven public tools (`rust/src/dispatch.rs:10-25`), a newline JSON-RPC socket (`rust/src/transport/socket.rs:37-124`), and an `rmcp` stdio proxy (`rust/src/transport/mcp.rs:18-83`). This is not evidence of wire compatibility.

@@ -1,5 +1,14 @@
 # Engines inventory: Claude, GLM, Qwen adapters + shared adapter layer
 
+> **Historical analysis — the addresses below are not current.** This inventory
+> records the state of the port at the time it was written, when the Rust code
+> was a single `rust/` crate. That tree no longer exists; the port is now the
+> `crates/` workspace, and the parity figures quoted here were superseded long
+> ago. The addresses are kept verbatim because rewriting them would attach an
+> old measurement to code it never described. For what is covered today, see
+> `migration/status.md`, `migration/baseline/test-map.csv` and
+> `migration/evidence/qualification-scope.md`.
+
 Area owner: EN. Scope: `src/agent_run/adapters/{base,registry,environment,version,plugin_skills,continuation,omniroute}.py`,
 `adapters/claude/*` (not `limits.py`), `adapters/glm/*`, `adapters/qwen/*`.
 Rust counterparts actually live in `rust/src/adapters/{stream,materialize,plugins,io,mod}.rs`,

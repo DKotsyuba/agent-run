@@ -1,5 +1,14 @@
 # Inventory: durable state and domain primitives (WP prefix ST)
 
+> **Historical analysis — the addresses below are not current.** This inventory
+> records the state of the port at the time it was written, when the Rust code
+> was a single `rust/` crate. That tree no longer exists; the port is now the
+> `crates/` workspace, and the parity figures quoted here were superseded long
+> ago. The addresses are kept verbatim because rewriting them would attach an
+> old measurement to code it never described. For what is covered today, see
+> `migration/status.md`, `migration/baseline/test-map.csv` and
+> `migration/evidence/qualification-scope.md`.
+
 Scope: `src/agent_run/state/*`, `domain.py`, `errors.py`, `paths.py`,
 `process_identity.py`, `verify.py`, `launch_evidence.py` vs
 `rust/src/state/mod.rs` (+ `schema.sql`), `domain.rs`, `error.rs`, `fs.rs`,

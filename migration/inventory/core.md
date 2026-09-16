@@ -1,5 +1,14 @@
 # Core lifecycle and configuration inventory
 
+> **Historical analysis — the addresses below are not current.** This inventory
+> records the state of the port at the time it was written, when the Rust code
+> was a single `rust/` crate. That tree no longer exists; the port is now the
+> `crates/` workspace, and the parity figures quoted here were superseded long
+> ago. The addresses are kept verbatim because rewriting them would attach an
+> old measurement to code it never described. For what is covered today, see
+> `migration/status.md`, `migration/baseline/test-map.csv` and
+> `migration/evidence/qualification-scope.md`.
+
 ## 1. Summary
 
 - Estimated behavioral parity for core lifecycle/configuration: **about 43%**. Rust has typed request/status/config/profile primitives, durable admission, a separate supervisor, process identity observation, and answer/view queries (`rust/src/service.rs:107-185`, `rust/src/supervisor.rs:17-106`).
