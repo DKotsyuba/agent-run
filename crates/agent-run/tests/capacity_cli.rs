@@ -234,7 +234,10 @@ async fn test_order_emits_the_service_shape_once() {
 #[test]
 fn test_order_rejects_unexpected_arguments() {
     let parsed = Cli::try_parse_from(["agent-run", "capacity", "order", "--model", "m"]);
-    assert!(parsed.is_err(), "unexpected order flags must fail at parsing");
+    assert!(
+        parsed.is_err(),
+        "unexpected order flags must fail at parsing"
+    );
 }
 
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_real_state_reorders_and_explains_nonworking_runtimes`
@@ -288,6 +291,8 @@ async fn test_default_facade_serves_capacity_order_without_injection() {
 
     assert_eq!(code, 0);
     assert_eq!(output.lock().expect("output lock").len(), 1);
-    assert_eq!(route_runtimes(&output.lock().expect("output lock")[0]), vec!["alpha"]);
+    assert_eq!(
+        route_runtimes(&output.lock().expect("output lock")[0]),
+        vec!["alpha"]
+    );
 }
-

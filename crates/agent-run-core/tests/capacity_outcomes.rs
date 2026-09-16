@@ -166,12 +166,28 @@ async fn test_invalid_slice_does_not_abort_later_valid_slice() {
     let binary = fake_app_server(scratch.path());
     let runtimes = vec![
         runtime_fixture(scratch.path(), "bad", &binary, true, "invalid", &[]),
-        runtime_fixture(scratch.path(), "good_one", &binary, true, "backend-one", &[]),
-        runtime_fixture(scratch.path(), "good_two", &binary, true, "backend-two", &[]),
+        runtime_fixture(
+            scratch.path(),
+            "good_one",
+            &binary,
+            true,
+            "backend-one",
+            &[],
+        ),
+        runtime_fixture(
+            scratch.path(),
+            "good_two",
+            &binary,
+            true,
+            "backend-two",
+            &[],
+        ),
     ];
     write_config(scratch.path(), &runtimes);
 
-    let report = sources::collect(scratch.path()).await.expect("round completes");
+    let report = sources::collect(scratch.path())
+        .await
+        .expect("round completes");
 
     assert_eq!(result(&report, "bad")["status"], "failed");
     assert_eq!(result(&report, "good_one")["status"], "collected");
@@ -211,7 +227,9 @@ async fn test_missing_home_and_missing_binary_are_distinct() {
     ];
     write_config(scratch.path(), &runtimes);
 
-    let report = sources::collect(scratch.path()).await.expect("round completes");
+    let report = sources::collect(scratch.path())
+        .await
+        .expect("round completes");
 
     assert_eq!(result(&report, "missing_home")["issues"][0], "home_missing");
     assert_eq!(
@@ -278,7 +296,9 @@ async fn test_collect_once_reports_all_failed_codex_and_commits_later_runtime() 
     ];
     write_config(scratch.path(), &runtimes);
 
-    let report = sources::collect(scratch.path()).await.expect("round completes");
+    let report = sources::collect(scratch.path())
+        .await
+        .expect("round completes");
 
     assert_eq!(report["ok"], false);
     assert_eq!(result(&report, "codex")["status"], "failed");
@@ -288,7 +308,9 @@ async fn test_collect_once_reports_all_failed_codex_and_commits_later_runtime() 
     let store = Store::open(scratch.path()).expect("capacity store opens");
     let count: i64 = store
         .conn
-        .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| {
+            row.get(0)
+        })
         .expect("sample count reads");
     assert_eq!(count, 1);
 }
@@ -308,7 +330,9 @@ async fn test_duplicate_backend_account_id_is_skipped_without_issue() {
     )];
     write_config(scratch.path(), &runtimes);
 
-    let report = sources::collect(scratch.path()).await.expect("round completes");
+    let report = sources::collect(scratch.path())
+        .await
+        .expect("round completes");
 
     assert_eq!(result(&report, "codex")["status"], "collected");
     assert_eq!(result(&report, "codex")["sample_count"], 1);
