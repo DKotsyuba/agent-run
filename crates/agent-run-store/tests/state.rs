@@ -153,8 +153,9 @@ fn message_cursors_preserve_order_whitespace_and_repetitions() {
         .collect::<String>();
     assert_eq!(all, "x x\n");
 }
+/// Terminal runs retain an inert receipt until a late post-tool bind can activate it.
 #[test]
-fn only_bound_terminal_runs_create_deliveries() {
+fn terminal_runs_create_pending_or_waiting_binding_deliveries() {
     let h = common::Home::new();
     let mut r = h.request();
     let (a, _) = h.store().admit(&r, &h.config, &json!({}), None).unwrap();
@@ -163,7 +164,7 @@ fn only_bound_terminal_runs_create_deliveries() {
         .unwrap();
     assert_eq!(
         h.store().delivery_status(&a).unwrap()["state"],
-        "not_created"
+        "waiting_binding"
     );
     r.orchestrator = Some(OrchestratorRef {
         transport: "codex_queue".into(),
