@@ -5,7 +5,8 @@ use agent_run_adapters::{
     codex::models::{
         cache_is_fresh, parse_roster, read_cache, validate_cached_selection, write_cache,
     },
-    materialize::account_home, validate,
+    materialize::account_home,
+    validate,
 };
 use agent_run_config::config::{Adapter, Runtime};
 use agent_run_config::profiles::Profile;
