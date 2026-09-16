@@ -498,9 +498,21 @@ pub fn limits(home: &Path) -> Result<Value> {
 /// delegates ranking to [`ranking::rank_capacity_routes`] so the ordering
 /// math lives in one provider-neutral place.
 pub fn order(home: &Path) -> Result<Value> {
+    order_with_clock(home, now)
+}
+
+/// Builds capacity order after reading the ranking clock exactly once.
+pub fn order_with_clock<F>(home: &Path, clock: F) -> Result<Value>
+where
+    F: FnOnce() -> f64,
+{
+    order_at(home, clock())
+}
+
+/// Builds capacity order from one already-read ranking timestamp.
+fn order_at(home: &Path, at: f64) -> Result<Value> {
     let config = Config::load(home)?;
     let store = Store::open(home)?;
-    let at = now();
     let series = history(&store, config.capacity.sample_retention)?;
     let forecasts: BTreeMap<Key, Forecast> = series
         .iter()

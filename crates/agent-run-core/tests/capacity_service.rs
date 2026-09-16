@@ -5,6 +5,7 @@ use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::domain::now;
 use rusqlite::params;
 use serde_json::{json, Value};
+use std::cell::Cell;
 
 /// Replaces the fixture config with the three runtime states used by the service contract.
 fn config(home: &common::Home) {
@@ -60,7 +61,13 @@ fn service_reads_clock_once_and_filters_runtime_availability() {
     config(&home);
     seed(&home, "enabled", 60.0, &["route"]);
     seed(&home, "disabled", 90.0, &["disabled-route"]);
-    let result = agent_run_core::capacity::order(&home.path).unwrap();
+    let calls = Cell::new(0);
+    let result = agent_run_core::capacity::order_with_clock(&home.path, || {
+        calls.set(calls.get() + 1);
+        now()
+    })
+    .unwrap();
+    assert_eq!(calls.get(), 1);
     assert_eq!(
         result["routes"].as_array().unwrap()[0]["runtime"],
         "enabled"

@@ -35,7 +35,7 @@ fn identity(home: &common::Home) -> Value {
     .unwrap()
 }
 
-/// Mirrors `tests/test_dispatch.py::test_retained_agent_tools_dispatch`.
+/// Mirrors `tests/test_dispatch.py::test_retained_agent_tools_dispatch`
 #[tokio::test]
 async fn retained_agent_tools_dispatch() {
     let home = common::Home::new();
@@ -72,7 +72,7 @@ async fn retained_agent_tools_dispatch() {
     );
 }
 
-/// Mirrors `tests/test_dispatch.py::test_restored_operator_tools_dispatch`.
+/// Mirrors `tests/test_dispatch.py::test_restored_operator_tools_dispatch`
 #[tokio::test]
 async fn restored_operator_tools_dispatch() {
     let home = common::Home::new();
