@@ -81,6 +81,7 @@ fn window_name(minutes: f64) -> String {
         format!("min{minutes}")
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn sample(
     runtime: &str,
     lane: &str,
@@ -157,9 +158,9 @@ pub fn normalize_codex(
             let reset = number(value.get("resetsAt"));
             if used.is_none_or(|v| !(0.0..=100.0).contains(&v))
                 || minutes.is_none_or(|v| v <= 0.0)
-                || value
-                    .get("resetsAt")
-                    .is_some_and(|v| !v.is_null() && reset.is_none_or(|n| n < 0.0))
+                || value.get("resetsAt").is_some_and(|v| {
+                    !v.is_null() && reset.is_none_or(|n| n < 0.0 || n > 253_402_300_799.0)
+                })
             {
                 complete = false;
                 continue;
