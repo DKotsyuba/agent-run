@@ -5,6 +5,7 @@ pub mod delivery;
 pub mod dispatch;
 /// Session binding and per-turn context hooks shared by CLI hosts.
 pub mod hooks;
+pub mod lifecycle;
 pub mod service;
 pub mod stream;
 pub mod supervisor;
