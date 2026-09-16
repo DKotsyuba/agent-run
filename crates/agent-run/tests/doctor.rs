@@ -188,3 +188,73 @@ fn python_doctor_cli_broken_config_exits_two_with_config_invalid() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(report["findings"][0]["code"], "config_invalid");
 }
+
+/// Mirrors `tests/test_doctor.py::DoctorTests::test_canary_handshake_fail_reports_the_bootstrap_failure_kind`.
+#[test]
+fn python_doctor_canary_missing_executable_reports_the_bootstrap_failure_kind() {
+    let temp = tempfile::tempdir().expect("temporary home");
+    let home = temp.path();
+    agent_run::init::initialize(home).expect("initialize home");
+    let missing = home.join("no-such-canary");
+    let dependencies = doctor::Dependencies::new(Some(missing), Vec::new);
+    let report = doctor::run_with(home, &dependencies).expect("doctor report");
+    let canary = report
+        .findings
+        .iter()
+        .find(|finding| finding.component == "canary")
+        .expect("canary finding");
+    assert_eq!(canary.code, "supervisor_executable_missing");
+    assert_eq!(canary.severity, "error");
+    assert!(!report.ok());
+}
+
+/// Mirrors `tests/test_doctor.py::DoctorTests::test_mcp_inventory_flags_processes_older_than_the_release_switch_and_excludes_self`.
+#[test]
+fn python_doctor_mcp_inventory_flags_stale_processes_and_excludes_self() {
+    let temp = tempfile::tempdir().expect("temporary home");
+    let home = temp.path();
+    agent_run::init::initialize(home).expect("initialize home");
+    fs::create_dir_all(home.join("standalone/releases")).expect("release directory");
+    symlink(
+        home.join("standalone/releases/sha-new"),
+        home.join("standalone/current"),
+    )
+    .expect("current release link");
+    let self_pid = std::process::id() as i32;
+    let stale_pid = self_pid.saturating_add(10_000);
+    let fresh_pid = stale_pid.saturating_add(1);
+    let processes = vec![
+        doctor::McpProcess {
+            pid: self_pid,
+            started_at: Some(0.0),
+            command: "agent-run mcp".into(),
+        },
+        doctor::McpProcess {
+            pid: stale_pid,
+            started_at: Some(0.0),
+            command: "/old/release/bin/agent-run mcp".into(),
+        },
+        doctor::McpProcess {
+            pid: fresh_pid,
+            started_at: Some(4_000_000_000.0),
+            command: "/new/release/bin/agent-run mcp".into(),
+        },
+    ];
+    let dependencies = doctor::Dependencies::new(None, move || processes.clone());
+    let report = doctor::run_with(home, &dependencies).expect("doctor report");
+    let by_component = report
+        .findings
+        .iter()
+        .map(|finding| (finding.component.as_str(), finding))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(!by_component.contains_key(format!("mcp:{self_pid}").as_str()));
+    assert_eq!(
+        by_component[format!("mcp:{stale_pid}").as_str()].code,
+        "mcp_process_older_release"
+    );
+    assert_eq!(
+        by_component[format!("mcp:{fresh_pid}").as_str()].code,
+        "mcp_process"
+    );
+    assert!(by_component["mcp:self"].detail.contains("release="));
+}
