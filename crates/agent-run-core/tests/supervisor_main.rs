@@ -82,6 +82,7 @@ fn test_recorded_identity_matches_the_exec_command_line() {
     let identity = launched.leader.expect("leader identity is proven");
     assert_eq!(identity.pid, launched.pid);
     assert_eq!(identity.group, launched.pid);
+    // SAFETY: getsid reads one positive PID and takes no pointers.
     assert_eq!(unsafe { libc::getsid(launched.pid) }, launched.pid);
     assert_eq!(
         process::observe(
