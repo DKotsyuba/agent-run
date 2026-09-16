@@ -216,6 +216,42 @@ async fn wait_status(home: &Path, id: &AgentId, status: Status, timeout: Duratio
     }
 }
 
+/// Waits until the supervisor has persisted the engine's own runtime session id.
+///
+/// `Status::Running` is not engine readiness: `supervisor.rs:234` records it
+/// immediately after `Process::spawn` returns, before the fixture engine has
+/// execed, read its task from stdin, or changed any signal disposition. A test
+/// that cancels on `Running` therefore races the engine's own startup.
+///
+/// The runtime session id is different: it is persisted only from the first
+/// engine frame that carries `session_id` (`stream.rs:404-420`), which the
+/// fixture emits at `tests/fixtures/engine.rs:58`. Observing it is a
+/// happens-after proof that the fixture executed everything preceding that
+/// emit — including the `SIGTERM`/`SIG_IGN` disposition change at
+/// `tests/fixtures/engine.rs:51-57`. This mirrors the readiness-marker poll the
+/// Python reference performs before cancelling a signal-ignoring child
+/// (`tests/test_claude_session.py:455-471`).
+///
+/// `home` is the fixture home directory, `id` the admitted agent, and `timeout`
+/// the budget allowed before readiness is treated as a failure. Polls the store
+/// every 20ms and returns once the id is present; panics with the last observed
+/// status when the deadline passes.
+async fn wait_engine_ready(home: &Path, id: &AgentId, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let row = Store::open(home).unwrap().get(id).unwrap();
+        if row.runtime_session_id.is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent {id} never reported a runtime session (last status {:?})",
+            row.status
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Runs one task to completion, spawning and awaiting the real supervisor
 /// subprocess directly.
 async fn run_task(home: &Path, task: &str) -> Record {
@@ -497,7 +533,7 @@ async fn engine_ignoring_sigterm_requires_sigkill() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:ignore-sigterm");
     let mut child = spawn_supervisor(&home, &id);
-    wait_status(&home, &id, Status::Running, Duration::from_secs(10)).await;
+    wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     Service::new(home.clone()).cancel(&id).unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
