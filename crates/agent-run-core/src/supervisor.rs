@@ -1,6 +1,7 @@
 //! Separate executable process per admitted run. READY precedes authentication/materialization.
 use crate::{
     adapters::{self, io::Process, materialize},
+    commands,
     config::Adapter,
     domain::{self, AgentId, Outcome, Status},
     error::invalid,
@@ -103,6 +104,7 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
                     outcome.status = Status::Cancelled;
                 }
                 store.finish(id, &outcome, None, None)?;
+                commands::complete_terminal(&mut store, id)?;
             }
             Err(error)
         }
@@ -287,10 +289,12 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
     )?;
     store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
+    commands::complete_terminal(store, id)?;
     Ok(())
 }
 fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
     let mut outcome = Outcome::failure("cancelled_before_spawn");
     outcome.status = Status::Cancelled;
-    store.finish(id, &outcome, None, None)
+    store.finish(id, &outcome, None, None)?;
+    commands::complete_terminal(store, id)
 }

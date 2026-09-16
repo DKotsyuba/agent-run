@@ -114,16 +114,12 @@ fn commands_are_claimed_once_and_completed() {
         .store()
         .admit(&h.request(), &h.config, &json!({}), None)
         .unwrap();
-    let result = h.store().enqueue(&id, "cancel", &json!({})).unwrap();
+    h.store().enqueue(&id, "cancel", &json!({})).unwrap();
     assert!(h.store().cancel_pending(&id).unwrap());
-    let claimed = h.store().pending_commands(&id).unwrap();
-    assert_eq!(claimed.len(), 1);
-    assert!(h.store().pending_commands(&id).unwrap().is_empty());
+    let (command_id, _, _) = h.store().claim_command(&id).unwrap().unwrap();
+    assert!(h.store().claim_command(&id).unwrap().is_none());
     h.store()
-        .command_done(
-            result["command_id"].as_i64().unwrap(),
-            &json!({"accepted":true}),
-        )
+        .complete_command(&id, command_id, &json!({"accepted":true}))
         .unwrap();
     assert!(!h.store().cancel_pending(&id).unwrap());
 }

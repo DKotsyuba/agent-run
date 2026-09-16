@@ -1,4 +1,4 @@
-use crate::journal;
+use crate::{commands, journal};
 use crate::{
     config::{Adapter, Config, Runtime},
     domain::{Outcome, Status},
@@ -301,9 +301,9 @@ pub async fn run(
         let event = tokio::select! {event=process.next()=>Some(event),_=tick.tick()=>None};
         let Some(event) = event else {
             process.owner.refresh();
-            for (cid, command, payload) in store.pending_commands(&record.id)? {
+            while let Some((cid, command, payload)) = store.claim_command(&record.id)? {
                 if command == "cancel" {
-                    store.command_done(cid, &json!({"accepted":true}))?;
+                    store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     return Ok(EngineResult {
                         outcome: Outcome {
                             status: Status::Cancelled,
@@ -317,15 +317,25 @@ pub async fn run(
                     });
                 }
                 if command == "steer" {
-                    let text = payload
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| invalid("invalid steer text"))?;
-                    let accepted=kind!=Adapter::Qwen&&process.send(&json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}})).await.is_ok();
-                    store.command_done(cid, &json!({"accepted":accepted}))?;
-                    if accepted {
-                        journal(store, &record.id, "user", &process.redact(text), None, None)?;
+                    if let Some(text) = commands::steer_text(&payload) {
+                        let accepted=kind!=Adapter::Qwen&&process.send(&json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}})).await.is_ok();
+                        store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
+                        if accepted {
+                            journal(store, &record.id, "user", &process.redact(text), None, None)?;
+                        }
+                    } else {
+                        store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":false,"reason":"empty_steer_text"}),
+                        )?;
                     }
+                } else {
+                    store.complete_command(
+                        &record.id,
+                        cid,
+                        &json!({"accepted":false,"reason":"unsupported_command"}),
+                    )?;
                 }
             }
             continue;

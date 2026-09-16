@@ -10,7 +10,7 @@ use agent_run_domain::{
     Result,
 };
 use agent_run_platform::verify::{self, Proof};
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
 /// Commits one terminal result and the completion notice that announces it.
@@ -18,7 +18,10 @@ use serde_json::{json, Value};
 /// The answer proof is verified before opening the transaction. Once started,
 /// the state update, attempt close, event append, answer metadata, outbox row,
 /// and aggregate run statistics either commit together or SQLite rolls all of
-/// them back. Repeating a completion after a prior terminal commit is a no-op.
+/// them back. A pending cancel observed while a successful or timed-out run is
+/// being committed wins in this same transaction and receives its terminal
+/// command result. Repeating a completion after a prior terminal commit is a
+/// no-op.
 pub fn finish(
     store: &mut Store,
     id: &AgentId,
@@ -46,8 +49,24 @@ pub fn finish(
     if row.status.terminal() {
         return Ok(());
     }
+    let pending_cancel = if matches!(outcome.status, Status::Succeeded | Status::TimedOut) {
+        tx.query_row(
+            "SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending' ORDER BY id LIMIT 1",
+            [id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let terminal_cancel = row.status == Status::Running && pending_cancel.is_some();
+    let requested_status = if terminal_cancel {
+        Status::Cancelled
+    } else {
+        outcome.status
+    };
     let mut from = row.status;
-    if from == Status::Running && outcome.status == Status::Cancelled {
+    if from == Status::Running && requested_status == Status::Cancelled {
         tx_event(
             &tx,
             id,
@@ -58,10 +77,10 @@ pub fn finish(
         )?;
         from = Status::Cancelling;
     }
-    let to = if from == Status::Cancelling && outcome.status != Status::Cancelled {
+    let to = if from == Status::Cancelling && requested_status != Status::Cancelled {
         Status::Lost
     } else {
-        outcome.status
+        requested_status
     };
     from.transition(to)?;
     let time = now();
@@ -69,6 +88,17 @@ pub fn finish(
         "UPDATE agents SET status=?,finished_at=?,exit_code=?,failure_kind=?,failure_text=?,runtime_session_id=COALESCE(?,runtime_session_id),answer_path=?,answer_bytes=?,answer_sha256=? WHERE id=?",
         params![to.as_str(), time, outcome.exit_code, outcome.failure_kind, outcome.failure_text, outcome.runtime_session_id, proof.map(|proof| proof.path.to_string_lossy().into_owned()), proof.map(|proof| proof.bytes as i64), proof.map(|proof| proof.sha256.as_str()), id.as_str()],
     )?;
+    if let Some(command_id) = pending_cancel {
+        tx.execute(
+            "UPDATE commands SET state='completed',claimed_at=?,completed_at=?,result_json=? WHERE id=? AND state='pending'",
+            params![
+                time,
+                time,
+                serde_json::to_string(&json!({"accepted":true,"reason":"terminal_cancel"}))?,
+                command_id
+            ],
+        )?;
+    }
     tx.execute(
         "UPDATE attempts SET state=?,finished_at=? WHERE agent_id=?",
         params![to.as_str(), time, id.as_str()],

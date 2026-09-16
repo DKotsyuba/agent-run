@@ -57,3 +57,35 @@ fn python_test_state_store_commands_claim_cancel_before_steer() {
         .complete_command(&id, command, &json!({"accepted":true}))
         .unwrap();
 }
+
+/// Mirrors Python `test_supervisor.py` crash-between-claim-and-apply behavior.
+///
+/// No Unix socket is required: reopening the SQLite store models a supervisor
+/// crash. A claimed steer is not returned to a replacement supervisor, because
+/// replaying an unknown engine-side request could deliver it twice.
+#[test]
+fn python_test_supervisor_claimed_command_is_not_replayed_after_crash() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let (id, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .enqueue(&id, "steer", &json!({"text":"continue"}))
+        .unwrap();
+    let (command_id, kind, _) = store.claim_command(&id).unwrap().unwrap();
+    assert_eq!(kind, "steer");
+    drop(store);
+
+    let mut recovered = home.store();
+    assert!(recovered.claim_command(&id).unwrap().is_none());
+    let state: String = recovered
+        .conn
+        .query_row(
+            "SELECT state FROM commands WHERE id=?",
+            [command_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "claimed");
+}
