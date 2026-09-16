@@ -197,50 +197,6 @@ fn safe_evidence(raw: &Value) -> Result<Value> {
 }
 
 impl Store {
-    /// Attaches an orchestrator session and makes any waiting completion notice dispatchable.
-    pub fn bind_orchestrator(
-        &mut self,
-        id: &AgentId,
-        reference: &OrchestratorRef,
-    ) -> Result<String> {
-        reference.validate()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(Error::NotFound(id.to_string()));
-        }
-        let session_id = format!("os-{}", uuid::Uuid::new_v4().simple());
-        let at = now();
-        tx.execute(
-            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transport,external_session_id) DO UPDATE SET external_turn_id=excluded.external_turn_id,last_seen_at=excluded.last_seen_at",
-            params![session_id, reference.transport, reference.external_session_id, reference.external_turn_id, at, at],
-        )?;
-        let session_id: String = tx.query_row(
-            "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
-            params![reference.transport, reference.external_session_id],
-            |row| row.get(0),
-        )?;
-        let changed = tx.execute(
-            "UPDATE agents SET orchestrator_session_id=? WHERE id=? AND orchestrator_session_id IS NULL",
-            params![session_id, id.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(Error::Conflict);
-        }
-        tx.execute(
-            "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? WHERE agent_id=? AND state='waiting_binding'",
-            params![session_id, at, id.as_str()],
-        )?;
-        tx.commit()?;
-        Ok(session_id)
-    }
-
     /// Expires waiting completion notices older than the documented binding window.
     pub fn expire_unbound_deliveries(&mut self, at: f64) -> Result<Vec<String>> {
         if !at.is_finite() {

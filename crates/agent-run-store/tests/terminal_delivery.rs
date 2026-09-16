@@ -109,6 +109,10 @@ fn python_test_state_outbox_waiting_binding_activates_and_expires() {
                 external_session_id: "fixture-session".into(),
                 external_turn_id: None,
             },
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
         )
         .unwrap();
     assert_eq!(store.delivery_status(&bound).unwrap()["state"], "pending");
