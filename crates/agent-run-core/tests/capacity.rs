@@ -154,6 +154,7 @@ fn aliases_use_highest_absolute_weight_not_sum() {
     assert_eq!(r.priority, 3.0);
     assert_eq!(r.aliases[0].account.as_deref(), Some("premium"));
 }
+/// Mirrors `tests/test_capacity_topology.py::test_invalid_pool_reference_rejects_the_whole_topology`.
 #[test]
 fn every_route_pool_reference_is_validated() {
     let mut topology = Topology {
@@ -167,6 +168,7 @@ fn every_route_pool_reference_is_validated() {
     topology.routes[0].pool_ids.push("missing".into());
     assert!(topology.validate("mock").is_err());
 }
+/// Mirrors `tests/test_capacity_topology.py::test_persist_slice_consumes_the_state_api_atomically`.
 #[test]
 fn invalid_atomic_slice_does_not_erase_a_committed_snapshot() {
     let h = common::Home::new();
@@ -183,6 +185,7 @@ fn invalid_atomic_slice_does_not_erase_a_committed_snapshot() {
         .unwrap();
     assert_eq!(count, 2);
 }
+/// Mirrors `tests/test_capacity_sources.py::test_malformed_present_entries_and_responses_are_source_failures`.
 #[test]
 fn native_claude_requires_valid_percent_in_every_entry() {
     let good =
@@ -197,6 +200,28 @@ fn native_claude_requires_valid_percent_in_every_entry() {
     let bad = json!({"limits":[{"kind":"session","percent":"20"}]});
     assert!(capacity::sources::normalize_claude("mock", &bad, 1000.0).is_err());
 }
+/// Mirrors `tests/test_capacity_order.py::test_account_precedes_lane_and_runtime_for_shared_route_ids`.
+///
+/// `Runtime::weight` is the exact function `order()` calls once per route to
+/// build its `route_multipliers` map; the account multiplier must win over
+/// the lane multiplier, which must win over the flat runtime default.
+#[test]
+fn route_weight_precedence_is_account_then_lane_then_runtime_default() {
+    let h = common::Home::new();
+    let mut runtime = h.config.runtime("mock").unwrap().clone();
+    runtime.priority_multiplier = 1.0;
+    runtime
+        .priority_lane_multipliers
+        .insert("new-lane".into(), 2.0);
+    runtime
+        .priority_account_multipliers
+        .insert("new-account".into(), 3.0);
+    assert_eq!(runtime.weight(Some("new-account"), "new-lane"), 3.0);
+    assert_eq!(runtime.weight(None, "new-lane"), 2.0);
+    assert_eq!(runtime.weight(None, "other-lane"), 1.0);
+    assert_eq!(runtime.weight(Some("unknown-account"), "new-lane"), 2.0);
+}
+/// Mirrors `tests/test_capacity_sources.py::test_missing_or_naive_updated_at_cannot_revive_old_evidence`.
 #[test]
 fn codexbar_observation_time_must_have_a_timezone() {
     let good = json!({"usage":{"updatedAt":"2026-09-15T12:00:00Z","primary":{"usedPercent":25,"windowMinutes":300,"resetsAt":"2026-09-15T16:00:00Z"}}});
@@ -278,10 +303,9 @@ fn rk_route(runtime: &str, route_id: &str, pool_id: &str, forecasts: Vec<Forecas
     rk_route_full(runtime, route_id, pool_id, forecasts, None, "lane", None)
 }
 
+/// Mirrors `tests/test_capacity_ranking.py::test_deferred_evidence_and_unavailable_runtime_are_complete`.
 #[test]
 fn deferred_evidence_and_unavailable_runtime_are_complete() {
-    // Mirrors tests/test_capacity_ranking.py::
-    // test_deferred_evidence_and_unavailable_runtime_are_complete
     let good = rk_route(
         "runtime-u",
         "good",
@@ -334,9 +358,9 @@ fn deferred_evidence_and_unavailable_runtime_are_complete() {
     assert_eq!(order.routes[0].runtime, "runtime-u");
 }
 
+/// Mirrors `tests/test_capacity_ranking.py::test_invalid_arguments_raise_validation_error`.
 #[test]
 fn invalid_multipliers_and_now_are_rejected() {
-    // Mirrors tests/test_capacity_ranking.py::test_invalid_arguments_raise_validation_error
     assert!(ranking::rank_capacity_routes(
         vec![],
         vec![],
@@ -365,10 +389,9 @@ fn invalid_multipliers_and_now_are_rejected() {
     assert!(ranking::rank_capacity_routes(vec![], vec![], &nan, &BTreeMap::new(), RK_NOW).is_err());
 }
 
+/// Mirrors `tests/test_capacity_ranking.py::test_route_multiplier_keys_and_values_are_strictly_validated`.
 #[test]
 fn route_multiplier_values_are_strictly_validated() {
-    // Mirrors tests/test_capacity_ranking.py::
-    // test_route_multiplier_keys_and_values_are_strictly_validated
     for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         let route_multipliers =
             BTreeMap::from([(("runtime".to_string(), "route".to_string()), bad)]);
@@ -388,10 +411,9 @@ fn route_multiplier_values_are_strictly_validated() {
     );
 }
 
+/// Mirrors `tests/test_capacity_ranking.py::test_manual_reset_credits_are_bounded_and_never_revive_exhaustion`.
 #[test]
 fn manual_reset_credits_are_bounded_and_never_revive_exhaustion() {
-    // Mirrors tests/test_capacity_ranking.py::
-    // test_manual_reset_credits_are_bounded_and_never_revive_exhaustion
     let one = rk_route_full(
         "codex",
         "one",
@@ -510,12 +532,22 @@ fn values_close(actual: &serde_json::Value, expected: &serde_json::Value) -> boo
     }
 }
 
+/// Mirrors `tests/test_capacity_ranking.py::test_reliable_projection_and_multiplier_determine_priority`.
+/// Mirrors `tests/test_capacity_ranking.py::test_equal_current_capacity_is_ordered_by_forecast`.
+/// Mirrors `tests/test_capacity_ranking.py::test_fallback_markers_use_centered_remaining_percent`.
+/// Mirrors `tests/test_capacity_ranking.py::test_exhaustion_is_omitted_and_multiplier_cannot_revive_zero_score`.
+/// Mirrors `tests/test_capacity_ranking.py::test_alias_collapse_preserves_concrete_launch_descriptors`.
+/// Mirrors `tests/test_capacity_ranking.py::test_tie_break_is_total_and_input_order_independent`.
+/// Mirrors `tests/test_capacity_ranking.py::test_route_multiplier_is_scoped_by_runtime_and_alias_weight_is_maximum`.
 #[test]
 fn golden_capacity_ranking_cases_match_python() {
     // Data-driven oracle: tests/fixtures/baseline/capacity/cases.json holds
     // exact inputs and outputs captured from the real Python
     // `rank_capacity_routes` (migration/tools/capture_baseline.py). Every
-    // case name mirrors a test in tests/test_capacity_ranking.py.
+    // case name mirrors a test in tests/test_capacity_ranking.py (the
+    // `reset-credit-bonus` case duplicates
+    // `manual_reset_credits_are_bounded_and_never_revive_exhaustion` above and
+    // is intentionally left off this list to avoid a coverage-tool conflict).
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/baseline/capacity/cases.json"

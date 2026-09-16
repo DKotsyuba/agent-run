@@ -40,7 +40,12 @@ fn delivery(home: &Path, id: &str, transport: &str, state: &str) {
         .unwrap();
 }
 
-/// Mirrors `test_completion_notice_contract_cases` using every frozen Python rendering capture.
+/// Mirrors `tests/test_delivery_base.py::test_every_terminal_status_renders_its_own_line`.
+/// Mirrors `tests/test_delivery_base.py::test_failed_notice_explains_known_and_unknown_failure_categories`.
+/// Mirrors `tests/test_delivery_base.py::test_configured_identifier_punctuation_renders_verbatim`.
+/// Mirrors `tests/test_delivery_base.py::test_metadata_can_never_add_list_lines_or_commands`.
+/// Mirrors `tests/test_delivery_base.py::test_missing_metadata_renders_unknown_and_unspecified`.
+/// Replays every frozen Python rendering capture (`tests/fixtures/baseline/notices/cases.json`).
 #[test]
 fn notice_rendering_matches_python_golden_cases() {
     let cases: Vec<Value> = serde_json::from_slice(
@@ -78,7 +83,7 @@ fn notice_rendering_matches_python_golden_cases() {
     }
 }
 
-/// Mirrors `test_delivery_attempt_evidence_is_redacted_and_bounded` before database persistence.
+/// Mirrors `tests/test_codex_queue.py::test_attempt_evidence_is_bounded_redacted_and_exactly_classified`.
 #[test]
 fn evidence_redacts_secret_shaped_tails_and_caps_utf8() {
     let raw = json!({
@@ -97,7 +102,7 @@ fn evidence_redacts_secret_shaped_tails_and_caps_utf8() {
     assert!(persisted.len() <= 16 * 1024);
 }
 
-/// Mirrors `test_retry_delivery_applies_backoff_and_records_attempt_evidence` with the unavailable relay fake.
+/// Mirrors `tests/test_delivery_dispatch.py::test_missing_codex_relay_retries_then_recovers_without_queue`.
 #[tokio::test]
 async fn unavailable_queue_retries_once_with_one_evidence_row() {
     let home = common::Home::new();
@@ -125,7 +130,7 @@ async fn unavailable_queue_retries_once_with_one_evidence_row() {
     assert_eq!(evidence, 1);
 }
 
-/// Mirrors `test_ambiguous_delivery_is_recorded_and_retried` with a local fake relay.
+/// Mirrors `tests/test_delivery_dispatch.py::test_ambiguous_timeout_retries_with_capped_backoff_and_stays_durable`.
 #[tokio::test]
 async fn ambiguous_acknowledgement_is_recorded_and_retried() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,7 +162,7 @@ async fn ambiguous_acknowledgement_is_recorded_and_retried() {
     assert_eq!(row.2, "relay_ambiguous");
 }
 
-/// Mirrors `test_unknown_transport_fails_without_retry` and keeps terminal state unscheduled.
+/// Mirrors `tests/test_delivery_dispatch.py::test_unknown_transport_is_a_permanent_configuration_failure`.
 #[tokio::test]
 async fn unknown_transport_is_terminal_and_unbound_from_schedule() {
     let home = common::Home::new();
@@ -175,7 +180,7 @@ async fn unknown_transport_is_terminal_and_unbound_from_schedule() {
     assert_eq!(row.1, None);
 }
 
-/// Mirrors `test_expire_unbound_deliveries` without claiming or externally sending the delivery.
+/// Mirrors `tests/test_delivery_dispatch.py::test_never_bound_notice_for_a_terminal_agent_expires_after_the_window`.
 #[tokio::test]
 async fn unbound_terminal_delivery_expires_before_claiming() {
     let home = common::Home::new();
@@ -203,7 +208,9 @@ async fn unbound_terminal_delivery_expires_before_claiming() {
     assert_eq!(state, "expired");
 }
 
-/// Mirrors `test_delivery_fixture_rows_are_read_only` by copying the Python database before inspection.
+/// Fixture-integrity check: the frozen Python database capture is copied
+/// before inspection so this test suite never mutates a shared golden file.
+/// Not a direct port of a single Python test.
 #[test]
 fn golden_delivery_database_is_read_from_a_copy() {
     let temporary = tempfile::tempdir().unwrap();

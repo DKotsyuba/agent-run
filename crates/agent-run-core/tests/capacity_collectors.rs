@@ -8,7 +8,7 @@ use agent_run_core::capacity::{
 use serde_json::json;
 use std::collections::BTreeMap;
 
-/// Mirrors `tests/test_capacity_sources.py::test_codexbar_maps_declared_accounts`.
+/// Mirrors `tests/test_capacity_sources.py::test_declared_accounts_map_targets_and_add_all_accounts`.
 #[test]
 fn codexbar_maps_declared_accounts_without_exposing_auth_documents() {
     let mut accounts = BTreeMap::new();
@@ -36,7 +36,7 @@ fn codexbar_maps_declared_accounts_without_exposing_auth_documents() {
     assert_eq!(slice.topology.routes.len(), 2);
 }
 
-/// Mirrors `tests/test_capacity_sources.py::test_codexbar_rejects_missing_data`.
+/// Mirrors `tests/test_capacity_sources.py::test_spawn_failure_timeout_nonzero_exit_and_garbage_fail_the_round`.
 #[test]
 fn codexbar_empty_data_is_an_explicit_failure() {
     let error = normalize_codexbar_accounts("codex", &json!([]), &BTreeMap::new(), None)
@@ -84,7 +84,6 @@ fn omniroute_malformed_or_overflow_rows_are_unavailable() {
     assert_eq!(error.to_string(), "omniroute_result_overflow");
 }
 
-/// Mirrors `tests/test_capacity_sources.py::test_claude_runtime_stream_fallback`.
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_never_makes_a_live_call`.
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_missing_agents_dir_is_empty`.
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_reads_the_newest_rate_limit_event_into_two_window_samples`.
