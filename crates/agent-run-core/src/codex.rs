@@ -152,6 +152,9 @@ impl Grant {
         if role.write && !request.workdir.starts_with(root) {
             return Err(invalid("workdir is outside configured workspace_root"));
         }
+        if request.write != role.write {
+            return Err(invalid("request write grant does not match resolved role"));
+        }
         let mut seed = vec![root.to_path_buf()];
         seed.extend(role.read_roots.clone());
         let mut roots: Vec<String> = profiles::normalize_roots(&seed)
@@ -379,7 +382,7 @@ pub fn plan(
             record.request.account.as_deref(),
             app_home,
         )?,
-        initial_input: None,
+        initial_input: Some(format!("{}\n\n{}", role.body, record.request.task)),
     })
 }
 /// Initializes the experimental app-server protocol required for grant echoes.

@@ -1,4 +1,6 @@
 //! Codex configuration rendering that does not require persistence access.
+/// Bounded parsing of Codex rollout rate-limit evidence.
+pub mod limits;
 /// Isolated Codex model-roster cache parsing and publication.
 pub mod models;
 pub mod session;
