@@ -10,24 +10,6 @@
 //! lifecycle behavior is already covered by `tests/end_to_end.rs`, which
 //! does need the broker.
 //!
-//! Known environment gap: under a restrictive sandbox that denies exec of
-//! `/bin/ps` (observed in one CI/agent sandbox profile), every test here
-//! that runs a real supervised subprocess to completion fails with
-//! `failure_kind == "engine_group_survived"`, *regardless of the actual
-//! fault mode under test*. Root cause is outside this file:
-//! `agent_run_platform::process::processes()` (macOS) shells out to
-//! `/bin/ps -axo pid=`; when that exec is denied it returns `Err`, so
-//! `OwnedProcess::gone()` can never observe a fully-dead process group, and
-//! `verify::completion()` then unconditionally overwrites any outcome —
-//! success or a specific failure — with `engine_group_survived`. This is
-//! confirmed by two facts: (1) tests that avoid `processes()` (the pure
-//! `verify::completion` unit test and the single-PID `inspect()`-based
-//! reuse-guard test) pass under the same restrictive sandbox, and (2) a
-//! direct call to `agent_run::process::processes()` under that sandbox
-//! returns `Io(Os { code: 1, kind: PermissionDenied, .. })`. This affects
-//! `tests/end_to_end.rs` identically, not just this file. In an
-//! environment where `ps` is allowed, these tests assert the engine's own
-//! specific failure_kind/status.
 use agent_run::{
     adapters,
     config::Config,
