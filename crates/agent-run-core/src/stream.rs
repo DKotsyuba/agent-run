@@ -14,6 +14,13 @@ use agent_run_adapters::{
 };
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
+
+/// Resolves the adapter environment and builds one isolated stream-JSON launch plan.
+///
+/// The returned plan owns argv, CWD, input framing, and child-only
+/// environment values for `record`; configuration and role validation happen
+/// before this call. Environment-resolution failures, unsupported runtime
+/// settings, and invalid launch paths are returned without spawning a child.
 pub fn plan(
     config: &Config,
     runtime: &Runtime,
@@ -23,8 +30,7 @@ pub fn plan(
     app_home: &Path,
     snapshot: &Snapshot,
 ) -> Result<LaunchPlan> {
-    let kind = runtime.kind()?;
-    let mut env = agent_run_adapters::environment(
+    let environment = agent_run_adapters::environment(
         config,
         runtime,
         role,
@@ -32,6 +38,26 @@ pub fn plan(
         record.request.account.as_deref(),
         app_home,
     )?;
+    plan_with_environment(config, runtime, record, role, home, snapshot, environment)
+}
+
+/// Builds a Claude-family or Qwen launch after the caller has resolved its child environment.
+///
+/// `environment` must already contain the adapter's managed HOME, PATH, and
+/// credential values; this function mutates only its local copy to add
+/// launch-specific exports such as `ANTHROPIC_MODEL` or `OPENAI_MODEL`.
+/// Keeping this deterministic half separate lets fixture tests compare argv
+/// and environment ownership without probing a real Keychain or engine.
+pub fn plan_with_environment(
+    config: &Config,
+    runtime: &Runtime,
+    record: &Record,
+    role: &Profile,
+    home: &Path,
+    snapshot: &Snapshot,
+    mut env: std::collections::BTreeMap<String, String>,
+) -> Result<LaunchPlan> {
+    let kind = runtime.kind()?;
     let req = &record.request;
     let (mut args, input) = if kind == Adapter::Qwen {
         env.insert("OPENAI_MODEL".into(), req.model.clone());
@@ -204,6 +230,24 @@ fn result_text(v: &Value) -> Option<String> {
             .filter(|s| !s.is_null())
             .and_then(|s| serde_json::to_string(s).ok()),
     }
+}
+
+/// Returns Qwen's bounded provider-error line when a clean result is error-only.
+///
+/// Qwen may exit successfully after emitting a final text result beginning
+/// with `[API Error:`.  That text is not an answer: this helper retains only
+/// its first 500-character line for bounded failure evidence.  Ordinary
+/// answers, including answers that mention the marker later, return `None`.
+fn qwen_provider_error(text: Option<&str>) -> Option<String> {
+    let text = text?.trim();
+    text.starts_with("[API Error:").then(|| {
+        text.lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(500)
+            .collect()
+    })
 }
 
 /// Classifies a Claude-family terminal result without trusting its subtype alone.
@@ -484,23 +528,13 @@ pub async fn run(
                 if outcome.status == Status::Failed {
                     outcome.failure_text = text.clone();
                 }
-                if kind == Adapter::Qwen
-                    && text
-                        .as_deref()
-                        .is_some_and(|t| t.trim_start().starts_with("[API Error:"))
-                {
-                    outcome = Outcome::failure("provider_error");
-                    outcome.runtime_session_id = session.clone();
-                    outcome.failure_text = text.as_deref().map(|value| {
-                        value
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
-                            .chars()
-                            .take(500)
-                            .collect()
-                    });
-                    text = None;
+                if kind == Adapter::Qwen {
+                    if let Some(failure_text) = qwen_provider_error(text.as_deref()) {
+                        outcome = Outcome::failure("provider_error");
+                        outcome.runtime_session_id = session.clone();
+                        outcome.failure_text = Some(failure_text);
+                        text = None;
+                    }
                 }
                 if let Some(k) = text.as_deref().and_then(verify::error_only) {
                     outcome.status = Status::Failed;
@@ -541,7 +575,7 @@ fn runtime_result_usage(result: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{result_failure_kind, runtime_result_usage};
+    use super::{qwen_provider_error, result_failure_kind, runtime_result_usage};
     use serde_json::json;
 
     /// Mirrors `test_claude_stream.py::test_classify_failure_auth_markers`.
@@ -574,5 +608,18 @@ mod tests {
         assert_eq!(usage["duration_api_ms"], 75.5);
         assert_eq!(usage["ttft_ms"], 12.5);
         assert_eq!(usage["usage"]["cache_read_input_tokens"], 5);
+    }
+
+    /// Mirrors `test_qwen_adapter.py::test_error_only_result_is_provider_failure`.
+    #[test]
+    fn qwen_error_only_results_become_bounded_provider_failures() {
+        assert_eq!(
+            qwen_provider_error(Some("  [API Error: upstream unavailable\nsecret detail")),
+            Some("[API Error: upstream unavailable".into())
+        );
+        assert_eq!(
+            qwen_provider_error(Some("answer mentions [API Error:")),
+            None
+        );
     }
 }

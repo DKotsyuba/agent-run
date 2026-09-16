@@ -659,7 +659,9 @@ pub fn materialize(
         }
         Adapter::Claude | Adapter::Glm => {
             let mut settings = native;
-            settings["hooks"] = hooks.clone();
+            if !hooks.is_null() && !hooks.as_object().is_some_and(|groups| groups.is_empty()) {
+                settings["hooks"] = hooks.clone();
+            }
             p.json("settings.json", &settings)?;
             if !mcp.is_empty() {
                 p.json("mcp/mcp-config.json", &json!({"mcpServers":mcp}))?;
@@ -685,7 +687,9 @@ pub fn materialize(
                         .extend(v.as_array().cloned().unwrap_or_default());
                 }
             }
-            settings["hooks"] = qhooks;
+            if !qhooks.is_null() && !qhooks.as_object().is_some_and(|groups| groups.is_empty()) {
+                settings["hooks"] = qhooks;
+            }
             if let Some(environment) = runtime
                 .environment
                 .as_ref()
@@ -712,6 +716,9 @@ pub fn materialize(
                     "\n\nDeclared skill: {}\n",
                     home.join("skills").join(skill).join("SKILL.md").display()
                 ));
+            }
+            if !context.ends_with('\n') {
+                context.push('\n');
             }
             p.file("agent-run-context.md", context.as_bytes(), 0o600)?;
             p.json(".qwen/settings.json", &settings)?;
