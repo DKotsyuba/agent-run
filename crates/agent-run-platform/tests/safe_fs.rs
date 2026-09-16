@@ -204,3 +204,290 @@ fn config_and_state_db_paths_sit_directly_under_home() {
         root_canon.join("state.db")
     );
 }
+
+/// Returns a fault hook that fails exactly at `target`, simulating a crash there.
+fn fail_at(target: fs::FaultPoint) -> impl Fn(fs::FaultPoint) -> agent_run_domain::Result<()> {
+    move |point| {
+        if point == target {
+            Err(agent_run_domain::error::invalid("simulated crash"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Returns every `.tmp` entry left directly beneath `directory`.
+fn temporaries(directory: &Path) -> Vec<String> {
+    std::fs::read_dir(directory)
+        .expect("readable directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".tmp"))
+        .collect()
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_managed_files_are_private_atomic_and_content_hashed`
+#[test]
+fn managed_files_are_private_atomic_and_content_hashed() {
+    let root = tempdir();
+    let home = root.path().join("generated");
+    fs::private_dir(&home).unwrap();
+    let dir = fs::Dir::open(&home).unwrap();
+
+    dir.write(Path::new("settings/config.toml"), b"first", 0o600)
+        .unwrap();
+    let target = home.join("settings/config.toml");
+    // The exact digest Python records for the same payload.
+    assert_eq!(
+        fs::sha256(b"first"),
+        "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"first");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    dir.write(Path::new("settings/config.toml"), b"second", 0o600)
+        .unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"second");
+    assert!(
+        temporaries(target.parent().unwrap()).is_empty(),
+        "a completed publish leaves no temporary behind"
+    );
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_managed_paths_refuse_traversal_and_symlink_escape`
+#[test]
+fn managed_paths_refuse_traversal_and_symlink_escape() {
+    let root = tempdir();
+    let outside = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+
+    assert!(dir.write(Path::new("../outside"), b"no", 0o600).is_err());
+    assert!(dir
+        .write(Path::new("linked/outside"), b"no", 0o600)
+        .is_err());
+    assert!(
+        !outside.path().join("outside").exists(),
+        "a symlinked parent must never receive the payload"
+    );
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_new_parent_is_synced_before_file_publication`
+#[test]
+fn new_parent_is_created_before_file_publication() {
+    let root = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+    // A crash while the payload is still in its temporary file: the freshly
+    // created parent is already on disk (and, in `Dir::parent`, already synced)
+    // while the target name does not exist yet.
+    let fault = fail_at(fs::FaultPoint::MidWrite);
+    assert!(dir
+        .write_seamed(Path::new("nested/answer.md"), b"done", 0o600, Some(&fault))
+        .is_err());
+    let parent = root.path().join("nested");
+    assert!(parent.is_dir(), "the parent is created before publication");
+    assert_eq!(
+        std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(!parent.join("answer.md").exists());
+
+    dir.write(Path::new("nested/answer.md"), b"done", 0o600)
+        .unwrap();
+    assert_eq!(std::fs::read(parent.join("answer.md")).unwrap(), b"done");
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_managed_replace_fsyncs_file_then_parent_directory`
+#[test]
+fn replacement_is_published_only_after_its_own_bytes_are_durable() {
+    let root = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+    dir.write(Path::new("answer.md"), b"original", 0o600)
+        .unwrap();
+
+    // Before the rename the published name still holds the previous bytes.
+    let fault = fail_at(fs::FaultPoint::BeforeRename);
+    assert!(dir
+        .write_seamed(Path::new("answer.md"), b"done", 0o600, Some(&fault))
+        .is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("answer.md")).unwrap(),
+        b"original"
+    );
+
+    // After the rename, and before the parent directory is synced, the name
+    // already holds the complete new payload -- never a partial one.
+    let fault = fail_at(fs::FaultPoint::AfterRename);
+    assert!(dir
+        .write_seamed(Path::new("answer.md"), b"done", 0o600, Some(&fault))
+        .is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("answer.md")).unwrap(),
+        b"done"
+    );
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_rejected_parent_and_temp_creation_close_every_descriptor`
+#[test]
+fn rejected_parent_and_temp_creation_close_every_descriptor() {
+    let root = tempdir();
+    let outside = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+
+    let open_descriptors = || {
+        std::fs::read_dir("/dev/fd")
+            .expect("descriptor list")
+            .count()
+    };
+    // Descriptor counts are process-global and the sibling tests in this binary
+    // open and close files on other threads, so this bounds growth across many
+    // rejections instead of demanding exact equality: one descriptor leaked per
+    // rejection would add 200, which no amount of sibling noise accounts for.
+    let noise = 16;
+    let baseline = open_descriptors();
+    for _ in 0..200 {
+        assert!(dir.write(Path::new("linked/file"), b"no", 0o600).is_err());
+    }
+    assert!(
+        open_descriptors() <= baseline + noise,
+        "a rejected parent must not retain a descriptor"
+    );
+
+    // A parent that cannot accept a new entry fails temporary creation itself.
+    dir.directory(Path::new("locked")).unwrap();
+    let locked = root.path().join("locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let baseline = open_descriptors();
+    for _ in 0..200 {
+        assert!(dir.write(Path::new("locked/file"), b"no", 0o600).is_err());
+    }
+    assert!(
+        open_descriptors() <= baseline + noise,
+        "a failed temporary creation must not retain a descriptor"
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_failed_atomic_replace_preserves_existing_content`
+#[test]
+fn failed_atomic_replace_preserves_existing_content() {
+    let root = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+    dir.write(Path::new("settings/config.toml"), b"original", 0o600)
+        .unwrap();
+
+    let fault = fail_at(fs::FaultPoint::BeforeRename);
+    assert!(dir
+        .write_seamed(
+            Path::new("settings/config.toml"),
+            b"replacement",
+            0o600,
+            Some(&fault)
+        )
+        .is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("settings/config.toml")).unwrap(),
+        b"original"
+    );
+
+    // A live publication failure (renaming onto a directory) owns its cleanup.
+    // The fault injected above simulates a crash, which deliberately leaves its
+    // temporary behind, so this half is checked in its own directory.
+    dir.directory(Path::new("occupied/target")).unwrap();
+    assert!(dir
+        .write(Path::new("occupied/target"), b"replacement", 0o600)
+        .is_err());
+    assert!(
+        temporaries(&root.path().join("occupied")).is_empty(),
+        "a failed publish removes the temporary it owns"
+    );
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_parent_swap_cannot_redirect_managed_replace`
+#[test]
+fn parent_swap_cannot_redirect_managed_replace() {
+    let root = tempdir();
+    let outside = tempdir();
+    let parent = root.path().join("settings");
+    std::fs::create_dir(&parent).unwrap();
+    // The retained parent descriptor, not the path, is what publication uses.
+    let retained_dir = fs::Dir::open(&parent).unwrap();
+
+    let retained = root.path().join("retained-settings");
+    std::fs::rename(&parent, &retained).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+
+    retained_dir
+        .write(Path::new("config.toml"), b"retained", 0o600)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(retained.join("config.toml")).unwrap(),
+        b"retained"
+    );
+    assert!(
+        !outside.path().join("config.toml").exists(),
+        "a swapped-in symlink must never receive the publication"
+    );
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_failed_file_sync_publishes_nothing_and_cleans_its_temp`
+#[test]
+fn failed_publication_publishes_nothing_and_cleans_its_temp() {
+    let root = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+
+    // Payload failure before the rename: nothing is published under the name.
+    let fault = fail_at(fs::FaultPoint::MidWrite);
+    assert!(dir
+        .write_seamed(Path::new("answer.md"), b"replacement", 0o600, Some(&fault))
+        .is_err());
+    assert!(!root.path().join("answer.md").exists());
+
+    // A live failure (a parent that cannot accept the temporary) leaves neither
+    // a target nor an owned temporary behind.
+    dir.directory(Path::new("locked")).unwrap();
+    let locked = root.path().join("locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(dir
+        .write(Path::new("locked/answer.md"), b"replacement", 0o600)
+        .is_err());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!locked.join("answer.md").exists());
+    assert!(temporaries(&locked).is_empty());
+}
+
+/// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_unsupported_directory_sync_does_not_reject_publication`
+#[test]
+fn unsupported_directory_sync_does_not_reject_publication() {
+    // A filesystem that reports directory synchronization unsupported must not
+    // fail the publish, while a real sync failure still propagates.
+    assert!(
+        fs::tolerate_unsupported_sync(Err(std::io::Error::from_raw_os_error(libc::EINVAL))).is_ok()
+    );
+    assert!(
+        fs::tolerate_unsupported_sync(Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)))
+            .is_ok()
+    );
+    assert!(
+        fs::tolerate_unsupported_sync(Err(std::io::Error::from_raw_os_error(libc::EIO))).is_err()
+    );
+    assert!(fs::tolerate_unsupported_sync(Ok(())).is_ok());
+
+    let root = tempdir();
+    let dir = fs::Dir::open(root.path()).unwrap();
+    dir.write(Path::new("answer.md"), b"replacement", 0o600)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("answer.md")).unwrap(),
+        b"replacement"
+    );
+}

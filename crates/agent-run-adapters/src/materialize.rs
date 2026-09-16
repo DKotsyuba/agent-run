@@ -235,6 +235,12 @@ pub fn environment_with_host(
     host: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let kind = runtime.kind()?;
+    // A relative executable would put its own resolution at the mercy of the
+    // child's working directory, so Python refuses it before building any
+    // environment (`build_environment`, adapters/codex/environment.py:108-110).
+    if !runtime.binary.is_absolute() {
+        return Err(invalid("runtime binary must be an absolute path"));
+    }
     let mut names = BTreeSet::new();
     if let Some(Auth::Environment { names: declared }) = &runtime.auth {
         names.extend(declared.iter().cloned());
@@ -316,11 +322,21 @@ pub fn environment_with_host(
             );
             paths.push(r.cargo_bin.to_string_lossy().into_owned());
         }
-        if let Some(p) = runtime.binary.parent() {
-            paths.push(p.to_string_lossy().into_owned());
+        // Python's shared child environment keeps the inherited PATH exactly as
+        // the host supplied it (`build_environment`,
+        // adapters/codex/environment.py:94-115). The configured binary's own
+        // directory is never prefixed, an absent PATH is never invented, and no
+        // empty entry -- which POSIX resolves as the working directory -- is
+        // ever appended.
+        paths.retain(|entry| !entry.is_empty());
+        let prefix = paths.join(":");
+        if !prefix.is_empty() {
+            let value = match env.get("PATH") {
+                Some(host) if !host.is_empty() => format!("{prefix}:{host}"),
+                _ => prefix,
+            };
+            env.insert("PATH".into(), value);
         }
-        paths.push(env.get("PATH").cloned().unwrap_or_default());
-        env.insert("PATH".into(), paths.join(":"));
     }
     if let Some(e) = runtime
         .environment
@@ -333,10 +349,13 @@ pub fn environment_with_host(
             } else {
                 "command-refusals"
             };
-            env.insert(
-                "PATH".into(),
-                format!("{}:{}", home.join(directory).display(), env["PATH"]),
-            );
+            // An absent or empty inherited PATH must not become an empty entry.
+            let policy = home.join(directory).display().to_string();
+            let value = match env.get("PATH") {
+                Some(host) if !host.is_empty() => format!("{policy}:{host}"),
+                _ => policy,
+            };
+            env.insert("PATH".into(), value);
         }
     }
     let mut mcp_names = Vec::new();
