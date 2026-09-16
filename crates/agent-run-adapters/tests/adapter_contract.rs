@@ -62,13 +62,13 @@ fn adapter_selection_checks_identity_and_capabilities_before_runtime_use() {
     // configured name that is not one of the closed adapter kinds.
     assert!(Adapter::parse("fake_module:ADAPTER").is_err());
     assert!(Adapter::parse("codex").is_ok());
-    assert_eq!(
+    assert!(
         config("fake", "fake_module:ADAPTER", true)
             .runtime("fake")
             .expect("enabled runtime")
             .kind()
             .is_err(),
-        true
+        "a configured name outside the closed adapter set must not resolve"
     );
 
     // A capability the selected adapter does not advertise is refused before
