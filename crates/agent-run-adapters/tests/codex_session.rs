@@ -662,3 +662,25 @@ async fn python_test_codex_app_server_closed_error_does_not_wait_unboundedly() {
     assert!(started.elapsed() < Duration::from_secs(1));
     process.reap().await;
 }
+
+// Protects Process::reap from a descendant that keeps inherited stdout open.
+#[tokio::test]
+async fn process_reap_does_not_wait_for_inherited_pipe_descriptors() {
+    let mut process = Process::spawn(&transport_plan("tail -f /dev/null & exit 0")).unwrap();
+    let reap = tokio::time::timeout(Duration::from_secs(3), process.reap()).await;
+    if reap.is_err() {
+        process
+            .owner
+            .cleanup(Duration::from_millis(100))
+            .await
+            .expect("failed reap fixture cleanup");
+        panic!("reap must be bounded when a descendant keeps stdout open");
+    }
+    let code = reap.expect("reap result was checked above");
+    process
+        .owner
+        .cleanup(Duration::from_millis(100))
+        .await
+        .expect("successful reap fixture cleanup");
+    assert_eq!(code, Some(0));
+}

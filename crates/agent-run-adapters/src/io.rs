@@ -283,14 +283,20 @@ impl Process {
         };
         self.send(&response).await
     }
-    /// Waits briefly for child exit and joins reader tasks before releasing evidence.
+    /// Waits briefly for child exit and bounded reader cleanup before releasing pipes.
     pub async fn reap(&mut self) -> Option<i32> {
         let code = match tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await {
             Ok(Ok(s)) => s.code(),
             _ => None,
         };
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
+        for mut task in self.tasks.drain(..) {
+            if tokio::time::timeout(Duration::from_secs(1), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
         }
         code
     }
