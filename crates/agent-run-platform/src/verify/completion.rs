@@ -13,7 +13,7 @@
 //! back onto `Outcome` — `domain::Outcome` has no `answer_*` fields to carry
 //! them. The decision (status/failure_kind/failure_text) is otherwise exact.
 
-use super::{load_sidecar, Dir, LEGACY_FRAME, MAX_ANSWER};
+use super::{load_sidecar, Dir, MAX_ANSWER};
 use crate::fs;
 use agent_run_domain::{
     domain::{Outcome, Status},
@@ -42,9 +42,8 @@ pub const DEFAULT_SILENCE_THRESHOLD_SECONDS: f64 = 60.0;
 
 /// Why supervision stopped waiting for the engine. Python represents this as
 /// a `stop_reason: str | None` validated against two literals
-/// (`verify.py:578-579`); the enum makes the invalid third state
-/// unrepresentable, so there is no Rust equivalent of
-/// `test_unknown_stop_reason_is_refused`.
+/// (`verify.py:578-579`); the string-facing wrapper below preserves the
+/// validation error for callers crossing the transport boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     Cancel,
@@ -136,12 +135,28 @@ impl AnswerProof {
 
 /// Hash the answer file at `root/relative` and establish its completion proof.
 ///
-/// Mirrors `inspect_answer` (`verify.py:226-297`) fixed to the current
-/// sentinel (`super::LEGACY_FRAME`); Rust has no config knob to disable or
-/// customize the sentinel, so `sentinel=None`/custom-sentinel Python cases
-/// are not ported. The read is no-follow and bounded by `MAX_ANSWER`,
-/// checked from the open descriptor's metadata before any content is read.
+/// Mirrors `inspect_answer` (`verify.py:226-297`) with the default sentinel.
+/// [`inspect_answer_with_sentinel`] additionally supports Python's
+/// `sentinel=None` contract. The read is no-follow and bounded by
+/// `MAX_ANSWER`, checked from the open descriptor's metadata before content.
 pub fn inspect_answer(root: &Path, relative: &Path) -> Result<AnswerProof> {
+    inspect_answer_with_sentinel(root, relative, Some("<<<agent-run:complete>>>"))
+}
+
+/// Inspects one answer using Python's optional sentinel contract.
+///
+/// `Some` requires a nonblank UTF-8 marker in the exact terminal
+/// `newline + marker + newline` frame; `None` accepts any nonempty payload.
+/// The owned answer tree is read without following links and failures are
+/// returned as typed validation, I/O, or integrity errors.
+pub fn inspect_answer_with_sentinel(
+    root: &Path,
+    relative: &Path,
+    sentinel: Option<&str>,
+) -> Result<AnswerProof> {
+    if sentinel.is_some_and(|value| value.trim().is_empty()) {
+        return Err(invalid("sentinel must be a nonblank string or None"));
+    }
     let full = root.join(relative);
     let dir = Dir::open(root)?;
     let file = match dir.open_file(relative) {
@@ -165,7 +180,11 @@ pub fn inspect_answer(root: &Path, relative: &Path) -> Result<AnswerProof> {
         ));
     }
     let sha256 = fs::sha256(&bytes);
-    let sentinel_found = !bytes.is_empty() && bytes.ends_with(LEGACY_FRAME);
+    let sentinel_found = if let Some(value) = sentinel {
+        !bytes.is_empty() && bytes.ends_with(format!("\n{value}\n").as_bytes())
+    } else {
+        !bytes.is_empty()
+    };
     let name = relative
         .file_name()
         .and_then(|n| n.to_str())
@@ -280,4 +299,36 @@ pub fn verify_completion(
         });
     }
     Ok(outcome)
+}
+
+/// Validates Python's string stop-reason boundary before applying completion policy.
+///
+/// `stop_reason` accepts only `None`, `"cancel"`, or `"timeout"`; unknown
+/// strings are rejected before process or answer facts are evaluated. The
+/// remaining arguments and returned terminal outcome have the same semantics
+/// as [`verify_completion`].
+pub fn verify_completion_with_stop_reason(
+    session_outcome: Option<Outcome>,
+    stop_reason: Option<&str>,
+    answer: Option<&AnswerProof>,
+    group_gone: bool,
+    last_progress_at: Option<f64>,
+    now: f64,
+    silence_threshold_seconds: f64,
+) -> Result<Outcome> {
+    let parsed = match stop_reason {
+        None => None,
+        Some("cancel") => Some(StopReason::Cancel),
+        Some("timeout") => Some(StopReason::Timeout),
+        Some(_) => return Err(invalid("stop_reason must be cancel, timeout, or None")),
+    };
+    verify_completion(
+        session_outcome,
+        parsed,
+        answer,
+        group_gone,
+        last_progress_at,
+        now,
+        silence_threshold_seconds,
+    )
 }

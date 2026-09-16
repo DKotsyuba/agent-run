@@ -19,6 +19,8 @@ const LEASE_SECONDS: f64 = 30.0;
 const MAX_TAIL_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BATCH: usize = 1000;
+/// Version of the frozen completion-notice payload.
+pub const NOTICE_VERSION: u32 = 1;
 
 /// A terminal lifecycle notification containing only trusted identifiers and selectors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,31 @@ pub struct Notice {
     pub effort: Option<String>,
     /// Bounded classifier only; raw runtime failure prose is excluded.
     pub failure_kind: Option<String>,
+}
+
+/// Backward-compatible public name for the completion notice.
+pub type CompletionNotice = Notice;
+
+/// A validated acknowledgement returned by a delivery transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt {
+    /// Optional remote identifier; the identifier itself is never trusted for routing.
+    pub remote_message_id: Option<String>,
+    /// Whether delivery reached an ambiguous transport boundary.
+    pub ambiguous: bool,
+}
+
+impl Receipt {
+    /// Validates an optional remote identifier and builds one receipt.
+    pub fn new(remote_message_id: Option<&str>, ambiguous: bool) -> Result<Self> {
+        if remote_message_id.is_some_and(|id| id.is_empty() || id.len() > 512) {
+            return Err(invalid("invalid remote message id"));
+        }
+        Ok(Self {
+            remote_message_id: remote_message_id.map(str::to_owned),
+            ambiguous,
+        })
+    }
 }
 
 /// Immutable, secret-safe facts recorded for one owned Codex queue attempt.
@@ -248,6 +275,32 @@ fn guidance(status: Status, kind: Option<&str>) -> Result<Option<(String, String
 }
 
 impl Notice {
+    /// Constructs the legacy three-field completion notice.
+    pub fn legacy(notification_id: impl Into<String>, agent_id: AgentId, status: Status) -> Self {
+        Self {
+            notification_id: notification_id.into(),
+            agent_id,
+            status,
+            runtime: None,
+            model: None,
+            effort: None,
+            failure_kind: None,
+        }
+    }
+
+    /// Constructs a notice after checking the frozen payload version.
+    pub fn with_version(
+        notification_id: impl Into<String>,
+        agent_id: AgentId,
+        status: Status,
+        version: u32,
+    ) -> Result<Self> {
+        if version != NOTICE_VERSION {
+            return Err(invalid("unsupported completion notice version"));
+        }
+        Ok(Self::legacy(notification_id, agent_id, status))
+    }
+
     /// Validates terminal notice facts while excluding tasks, answers, and failure prose.
     pub fn validate(&self) -> Result<()> {
         if !self.status.terminal()

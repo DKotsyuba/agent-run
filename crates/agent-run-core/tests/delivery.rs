@@ -2,7 +2,8 @@
 
 use agent_run_core::{
     delivery::{
-        claude, dispatch, dispatch_once, dispatch_with_batch, relay, safe_evidence, Notice,
+        claude, dispatch, dispatch_once, dispatch_with_batch, relay, safe_evidence,
+        CompletionNotice, Notice, Receipt, NOTICE_VERSION,
     },
     domain::{now, AgentId, Status},
 };
@@ -278,6 +279,36 @@ fn notice() -> Notice {
         effort: None,
         failure_kind: None,
     }
+}
+
+/// Mirrors `tests/test_delivery_base.py::CompletionNoticeTests::test_positional_constructors_remain_backward_compatible`
+#[test]
+fn positional_constructors_remain_backward_compatible() {
+    let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
+    let legacy = CompletionNotice::legacy("ntf_abc", agent.clone(), Status::Succeeded);
+    let with_version =
+        CompletionNotice::with_version("ntf_abc", agent, Status::Succeeded, NOTICE_VERSION)
+            .unwrap();
+    assert_eq!(legacy.notification_id, with_version.notification_id);
+    assert_eq!(legacy.agent_id, with_version.agent_id);
+    assert_eq!(legacy.status, with_version.status);
+    assert!(legacy.runtime.is_none());
+    assert!(legacy.failure_kind.is_none());
+}
+
+/// Mirrors `tests/test_delivery_base.py::CompletionNoticeTests::test_receipt_validates_its_optional_remote_id`
+#[test]
+fn receipt_validates_its_optional_remote_id() {
+    assert_eq!(Receipt::new(None, false).unwrap().remote_message_id, None);
+    assert!(!Receipt::new(None, false).unwrap().ambiguous);
+    assert_eq!(
+        Receipt::new(Some("remote-1"), true)
+            .unwrap()
+            .remote_message_id
+            .as_deref(),
+        Some("remote-1")
+    );
+    assert!(Receipt::new(Some(""), false).is_err());
 }
 
 /// Creates a notice carrying the rich v2 selectors and v3 failure category.

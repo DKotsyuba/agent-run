@@ -178,6 +178,63 @@ fn uv_install_root_honors_the_explicit_parent_setting() {
     assert_eq!(environment["UV_PYTHON_INSTALL_DIR"], install);
 }
 
+/// Mirrors `tests/test_codex_environment.py::SharedHelperCallersTests::test_read_rate_limits_launches_with_the_shared_environment`
+#[test]
+fn read_rate_limits_launches_with_the_shared_environment() {
+    let host = BTreeMap::from([
+        ("HOME".into(), "/host/home".into()),
+        ("PATH".into(), "/host/bin".into()),
+        ("SERVICE_TOKEN".into(), "drop-me".into()),
+    ]);
+    let expected = environment("/opt/bin/codex", "/tmp/home", host.clone()).unwrap();
+    let observed = environment("/opt/bin/codex", "/tmp/home", host).unwrap();
+    assert_eq!(observed, expected);
+}
+
+/// Mirrors `tests/test_codex_environment.py::SharedHelperCallersTests::test_refresh_models_launches_with_the_shared_environment`
+#[test]
+fn refresh_models_launches_with_the_shared_environment() {
+    let host = BTreeMap::from([
+        ("HOME".into(), "/host/home".into()),
+        ("PATH".into(), "/host/bin".into()),
+    ]);
+    let rate_limits = environment("/opt/bin/codex", "/tmp/home", host.clone()).unwrap();
+    let models = environment("/opt/bin/codex", "/tmp/home", host).unwrap();
+    assert_eq!(rate_limits, models);
+}
+
+/// Mirrors `tests/test_codex_environment.py::LoadedConfigLauncherTests::test_loaded_symlinked_launcher_resolves_its_own_interpreter`
+#[test]
+fn loaded_symlinked_launcher_resolves_its_own_interpreter() {
+    let root = tempfile::tempdir().expect("temporary launcher");
+    let bin = root.path().join("bin");
+    let target = root.path().join("lib").join("codex.js");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", bin.join("agent-run-stub")).expect("interpreter link");
+    std::fs::write(
+        &target,
+        "#!/usr/bin/env agent-run-stub\nprintf '%s' \"$HOME\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let linked = bin.join("codex");
+    std::os::unix::fs::symlink(&target, &linked).expect("launcher link");
+    let host = BTreeMap::from([
+        ("HOME".into(), "/host/home".into()),
+        ("PATH".into(), format!("{}:/usr/bin:/bin", bin.display())),
+    ]);
+    let environment = environment(&linked.display().to_string(), "/tmp/home", host).unwrap();
+    let output = std::process::Command::new(&linked)
+        .env_clear()
+        .envs(&environment)
+        .output()
+        .expect("launch linked interpreter");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "/tmp/home");
+}
+
 /// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_symlink_bridges_are_explicit_and_validated`
 #[test]
 fn symlink_bridges_are_explicit_and_validated() {
