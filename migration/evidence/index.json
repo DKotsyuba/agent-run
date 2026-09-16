@@ -92,8 +92,8 @@
     {
       "path": "migration/defects-found.md",
       "kind": "evidence",
-      "bytes": 6520,
-      "sha256": "ed9ee0987d472b370a01ebd9cd58ae545e31213864b4df3beb2de90dcd66f2b3"
+      "bytes": 8261,
+      "sha256": "edd025247cadb0b414d0258a39d8ac8d660f9170c697216ed960cb4609591089"
     },
     {
       "path": "migration/evidence/coverage-2026-09-16.md",

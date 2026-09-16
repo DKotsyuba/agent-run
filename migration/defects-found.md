@@ -10,7 +10,7 @@ reviewing or extending this code.
 
 ## The pattern: four of these are the same defect
 
-Four of the seven are the same failure in different places — **Python names a
+Five of the eight are the same failure in different places — **Python names a
 deadline or refuses to answer, and the Rust port waits forever or answers
 "clean"**:
 
@@ -60,6 +60,7 @@ code.** "Deliberately" is a reason to look closer, not a reason to move on.
 | 5 | `crates/agent-run-adapters/src/io.rs:287` — reader teardown unbounded | hang | a verification run stalled once and completed once | `process_reap_does_not_wait_for_inherited_pipe_descriptors` |
 | 6 | `crates/agent-run/src/transport/socket.rs` — client `wait` unbounded | **hang, user-visible** | a search for the same shape as #5 | `wait_client_deadline_closes_when_broker_holds_response`, `timed_out_wait_retries_the_same_agent_until_terminal` |
 | 7 | `crates/agent-run-platform/src/keychain.rs`, `crates/agent-run-core/src/doctor.rs` — output drains unbounded | hang | the same search | `keychain_probe_bounds_stdout_drain`, `ps_probe_bounds_stdout_drain` |
+| 8 | `xtask/src/deploy.rs` — a preflight failure left no recovery journal at all | **lost evidence** | writing the §21.6 recovery drills | `t84_db_busy_retains_prepared_phase_and_lock_next_operation` and its three siblings |
 
 Defect 6 is the one an operator would have met: `agent-run start --wait` and the
 MCP `wait` tool hung forever if the broker died mid-wait.
@@ -93,3 +94,32 @@ immune because its deadline is 0.5 s and its poll window 0.5 s.
 Copying a literal duration without copying the ratio produces a test that agrees
 with you. The full account is in `migration/adr/A10-spawn-backend.md`, section
 "Measured cost of decision 5".
+
+## The eighth, and what it says about the pattern
+
+Defect 8 is not a missing deadline but the same habit one step further: a
+deployment that failed its preflight wrote **no journal at all**, so an operator
+arriving after the failure could learn neither the phase reached nor what to do
+next. The journal is now written before the candidate is validated, and every
+failure path records the cause together with a specific next operation — release
+the SQLite lock, restore read permission on the named asset, free disk space.
+
+So five of the eight are one habit: **where Python leaves a record or names a
+deadline, this port left nothing or waited forever.** That is worth more than
+eight separate lessons.
+
+### Three drills deliberately left open
+
+The §21.6 drills are closed for DB busy, missing assets and permission denied.
+Three are not, and each is recorded as an honest gap rather than a test that
+pretends:
+
+- **Real `ENOSPC`** cannot be produced without root or a disk image. The
+  classification path is exercised with the kernel's own message, and that is
+  labelled a substitution.
+- **Live readiness and service restore** are outside this tool by ADR A19. No
+  service manager was invented to satisfy a drill; instead the committed
+  journal now names the external post-condition the operator owns.
+- **Loss of an external auth or history path** is not drivable: `xtask` owns no
+  such path. The plan requires the check and the ADR excludes the surrounding
+  pipeline; both addresses are recorded.
