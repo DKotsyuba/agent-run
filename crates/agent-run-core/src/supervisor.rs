@@ -106,6 +106,7 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
         }
     }
 }
+/// Run one admitted agent through preparation, supervision, cleanup, and terminal storage.
 async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     if store.cancel_pending(id)? {
         return cancelled_before_spawn(id, store);
@@ -205,6 +206,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     .await;
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     let exit = process.reap().await;
+    let cleanup = cleanup?;
     store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
     let cancelled = store.cancel_pending(id)?;
     let mut result = match execution {

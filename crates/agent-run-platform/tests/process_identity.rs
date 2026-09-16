@@ -38,6 +38,15 @@ fn missing_or_unproven_identity_is_not_automatically_death() {
 }
 
 #[test]
+fn native_process_enumeration_includes_this_process() {
+    let self_pid = std::process::id() as i32;
+    assert!(process::processes()
+        .expect("native process enumeration")
+        .iter()
+        .any(|identity| identity.pid == self_pid));
+}
+
+#[test]
 fn a_legacy_float_birth_is_compared_exactly_like_python() {
     // Python rows store only psutil's create_time float and compare it with `==`.
     let identity = process::inspect(std::process::id() as i32).unwrap();

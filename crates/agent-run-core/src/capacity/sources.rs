@@ -196,7 +196,11 @@ fn probe_profile() -> Profile {
         required_constraints: BTreeSet::new(),
     }
 }
-/// Query an isolated, short-lived app-server without starting any thread or turn.
+/// Query one bounded Codex metadata endpoint in an isolated, verified process group.
+///
+/// Only the two supported metadata methods are accepted. The temporary probe home is
+/// removed after cleanup only when native group/descendant evidence confirms it; an
+/// unavailable cleanup observation returns its typed runtime error after reaping.
 pub async fn codex_probe(
     app_home: &Path,
     cfg: &Config,
@@ -273,6 +277,7 @@ pub async fn codex_probe(
     .and_then(|r| r);
     let cleanup = process.owner.cleanup(Duration::from_secs(1)).await;
     process.reap().await;
+    let cleanup = cleanup?;
     if cleanup.confirmed {
         let _ = std::fs::remove_dir_all(&home);
     } else {
@@ -291,6 +296,9 @@ fn host_environment() -> BTreeMap<String, String> {
     .collect()
 }
 /// A bounded subprocess reader shared by metadata probes and diagnostics.
+///
+/// The child runs in its own process group and is reaped before this returns;
+/// incomplete cleanup or an unavailable native observation is returned as an error.
 pub async fn capture(
     binary: &Path,
     args: &[String],
@@ -339,6 +347,7 @@ pub async fn capture(
     .and_then(|r| r);
     let clean = owner.cleanup(Duration::from_secs(1)).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let clean = clean?;
     if !clean.confirmed {
         return Err(invalid("metadata command cleanup unconfirmed"));
     }
