@@ -105,7 +105,7 @@ impl CliService for Service {
 /// Production broker client preserving the existing Unix-socket call path.
 pub(crate) struct SocketBroker {
     /// Agent-run home whose private socket receives each request.
-    home: PathBuf,
+    pub(crate) home: PathBuf,
 }
 
 impl CliBroker for SocketBroker {
