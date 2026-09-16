@@ -549,24 +549,30 @@ impl Config {
         Ok(())
     }
 }
+/// Top-level Codex settings owned by the agent-run launch/security contract.
 const CODEX_RESERVED:&str="model model_provider model_providers model_reasoning_effort cli_auth_credentials_store mcp_oauth_credentials_store forced_login_method forced_chatgpt_workspace_id openai_base_url chatgpt_base_url openai_api_key approvals_reviewer approval_policy sandbox_mode sandbox_workspace_write shell_environment_policy notify features otel profile profiles projects default_permissions permissions plugins hooks mcp_servers skills tools agents apps web_search trust auth credentials env environment provider providers web";
 const CLAUDE_RESERVED:&str="model env environment permissions sandbox credentials auth hooks mcpServers apiKeyHelper agent autoMemoryDirectory forceLoginMethod forceLoginOrgUUID disableAllHooks statusLine enableAllProjectMcpServers enabledMcpjsonServers disabledMcpjsonServers awsAuthRefresh awsCredentialExport gcpAuthRefresh enabledPlugins extraKnownMarketplaces fileSuggestion providers";
 const QWEN_RESERVED:&str="model modelProviders providers extensions env environment credentials auth tools context security permissions hooks mcpServers mcp skills sandbox";
+/// Validates unowned native tuning settings for one packaged adapter.
+///
+/// Only identifier keys and TOML values that round-trip through the generated
+/// TOML/JSON configuration are admitted. Runtime-owned roots (model, auth,
+/// permissions, sandbox, hooks, and transport controls) always fail closed so
+/// an owner's native table cannot weaken the delegated capability grant.
 pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) -> Result<()> {
     let reserved = match kind {
         Adapter::Codex => CODEX_RESERVED,
         Adapter::Claude | Adapter::Glm => CLAUDE_RESERVED,
         Adapter::Qwen => QWEN_RESERVED,
     };
+    /// Returns whether a TOML key cannot splice another generated namespace.
     fn key(k: &str) -> bool {
         !k.is_empty()
             && k.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
     }
-    fn value(v: &toml::Value, depth: usize) -> Result<()> {
-        if depth > 32 {
-            return Err(invalid("native settings nesting exceeds 32"));
-        }
+    /// Rejects values that cannot safely round-trip through native renderers.
+    fn value(v: &toml::Value) -> Result<()> {
         match v {
             toml::Value::Datetime(_) => return Err(invalid("native settings do not accept dates")),
             toml::Value::Float(v) if !v.is_finite() => {
@@ -577,12 +583,12 @@ pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) 
                     if !key(k) {
                         return Err(invalid("native setting keys must be plain identifiers"));
                     }
-                    value(v, depth + 1)?;
+                    value(v)?;
                 }
             }
             toml::Value::Array(a) => {
                 for v in a {
-                    value(v, depth + 1)?;
+                    value(v)?;
                 }
             }
             _ => {}
@@ -593,7 +599,7 @@ pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) 
         if !key(k) || reserved.split_whitespace().any(|s| s == k) {
             return Err(invalid("native setting is reserved or has an invalid key"));
         }
-        value(v, 0)?;
+        value(v)?;
     }
     Ok(())
 }

@@ -5,7 +5,7 @@ use agent_run_config::{
     profiles,
 };
 use agent_run_domain::domain::{AgentId, Status};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 #[test]
@@ -187,6 +187,22 @@ fn native_values_reject_dotted_keys_dates_and_nan() {
                 .is_err()
         );
     }
+}
+
+/// Mirrors `test_native_settings.py::CodexNativeSettingsMaterialize::test_nested_tables_render_as_valid_inline_toml`.
+#[test]
+fn native_settings_accept_nested_roundtrippable_codex_tuning() {
+    let settings = BTreeMap::from([(
+        "outer".into(),
+        toml::Value::Table(toml::map::Map::from_iter([(
+            "inner".into(),
+            toml::Value::Array(vec![
+                toml::Value::Integer(1),
+                toml::Value::String("x".into()),
+            ]),
+        )])),
+    )]);
+    assert!(config::native_settings(Adapter::Codex, &settings).is_ok());
 }
 #[test]
 fn account_labels_and_environment_names_are_strict() {
