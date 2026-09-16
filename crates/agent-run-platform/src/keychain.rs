@@ -1,6 +1,8 @@
 //! macOS Keychain access without exposing credential values in diagnostics.
 
 use std::{
+    io::{self, Read},
+    os::fd::AsRawFd,
     process::Command,
     thread,
     time::{Duration, Instant},
@@ -9,7 +11,8 @@ use std::{
 /// Reads one generic-password item from the login Keychain without logging its value.
 ///
 /// `account` and `service` select the item provisioned by the owner.  The
-/// lookup is limited to three seconds like the Python runtime and returns
+/// lookup is bounded to five seconds from spawn through output drain, like the
+/// Python runtime, and returns
 /// `None` for an unavailable, locked, missing, blank, or non-macOS Keychain.
 /// The returned text is trimmed but is otherwise never serialized or logged.
 #[cfg(target_os = "macos")]
@@ -51,18 +54,31 @@ fn lookup(service: &str, account: Option<&str>) -> Option<String> {
     if let Some(account) = account {
         command.arg("-a").arg(account);
     }
+    command.args(["-w", &path]);
+    lookup_command(command, Duration::from_secs(5))
+}
+
+/// Runs one Keychain command with a deadline covering process exit and stdout EOF.
+fn lookup_command(mut command: Command, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
     let mut child = command
-        .args(["-w", &path])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                let output = child.wait_with_output().ok()?;
-                let value = String::from_utf8(output.stdout).ok()?;
+                let output = {
+                    let stdout = child.stdout.as_mut()?;
+                    read_until(stdout, deadline)
+                };
+                let Some(output) = output else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                };
+                let value = String::from_utf8(output).ok()?;
                 return (!value.trim().is_empty()).then(|| value.trim().to_owned());
             }
             Ok(Some(_)) | Err(_) => return None,
@@ -73,6 +89,61 @@ fn lookup(service: &str, account: Option<&str>) -> Option<String> {
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+/// Drains a child stdout pipe until EOF or the shared command deadline.
+fn read_until(output: &mut (impl Read + AsRawFd), deadline: Instant) -> Option<Vec<u8>> {
+    let fd = output.as_raw_fd();
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: `pollfd` points to one valid descriptor for this call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+        if ready == 0 {
+            return None;
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        let mut chunk = [0u8; 4096];
+        match output.read(&mut chunk) {
+            Ok(0) => return Some(bytes),
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    // Protects the probe from a descendant that inherits security's stdout pipe.
+    #[test]
+    fn keychain_probe_bounds_stdout_drain() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "tail -f /dev/null & holder=$!; (sleep 1; kill $holder) & exit 0",
+        ]);
+        let started = Instant::now();
+        assert_eq!(lookup_command(command, Duration::from_millis(50)), None);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }
 

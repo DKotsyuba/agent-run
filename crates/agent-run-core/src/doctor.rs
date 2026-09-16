@@ -16,11 +16,13 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{self, Read},
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LIMIT: usize = 256;
@@ -963,7 +965,7 @@ fn process_group_alive(group: i32) -> bool {
             .unwrap_or(false)
 }
 
-/// Lists process commands and start times using two bounded-shape `ps` queries.
+/// Lists process commands and start times using two independently time-bounded `ps` queries.
 fn list_mcp_processes() -> Vec<McpProcess> {
     let commands = ps_by_pid(&["/bin/ps", "-A", "-o", "pid=,command="]);
     if commands.is_empty() {
@@ -980,13 +982,89 @@ fn list_mcp_processes() -> Vec<McpProcess> {
         .collect()
 }
 
-/// Runs one short process listing and splits only at the leading PID.
+/// Runs one two-second-bounded process listing and splits only at the leading PID.
 fn ps_by_pid(args: &[&str]) -> BTreeMap<i32, String> {
-    let Ok(output) = Command::new(args[0]).args(&args[1..]).output() else {
+    ps_by_pid_with_timeout(args, Duration::from_secs(2))
+}
+
+/// Runs one process listing with a bounded exit and stdout-drain deadline.
+fn ps_by_pid_with_timeout(args: &[&str], timeout: Duration) -> BTreeMap<i32, String> {
+    let Some(executable) = args.first() else {
         return BTreeMap::new();
     };
+    let deadline = Instant::now() + timeout;
+    let Ok(mut child) = Command::new(executable)
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return BTreeMap::new();
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let Some(stdout) = child.stdout.as_mut() else {
+                    return BTreeMap::new();
+                };
+                let Some(output) = read_until(stdout, deadline) else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return BTreeMap::new();
+                };
+                return parse_ps_output(&output);
+            }
+            Ok(Some(_)) | Err(_) => return BTreeMap::new(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return BTreeMap::new();
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Drains one process-listing pipe until EOF or the listing deadline.
+fn read_until(output: &mut (impl Read + AsRawFd), deadline: Instant) -> Option<Vec<u8>> {
+    let fd = output.as_raw_fd();
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: `pollfd` points to one valid descriptor for this call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+        if ready == 0 {
+            return None;
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        let mut chunk = [0u8; 4096];
+        match output.read(&mut chunk) {
+            Ok(0) => return Some(bytes),
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Parses process-listing bytes after the subprocess has completed.
+fn parse_ps_output(output: &[u8]) -> BTreeMap<i32, String> {
     output
-        .stdout
         .split(|byte| *byte == b'\n')
         .filter_map(|line| {
             let line = std::str::from_utf8(line).ok()?.trim();
@@ -1578,5 +1656,21 @@ mod tests {
             Some(&install),
         )
         .is_empty());
+    }
+
+    // Protects doctor from a process-listing descendant that inherits stdout.
+    #[test]
+    fn ps_probe_bounds_stdout_drain() {
+        let started = Instant::now();
+        let result = ps_by_pid_with_timeout(
+            &[
+                "/bin/sh",
+                "-c",
+                "tail -f /dev/null & holder=$!; (sleep 1; kill $holder) & exit 0",
+            ],
+            Duration::from_millis(50),
+        );
+        assert!(result.is_empty());
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }
