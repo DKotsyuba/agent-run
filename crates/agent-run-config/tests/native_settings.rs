@@ -77,6 +77,32 @@ fn dotted_key_literal_is_rejected() {
     assert!(load(&home, "[runtimes.codex.native_settings]\n\"a.b\" = 1\n").is_err());
 }
 
+// Rust-internal security coverage: config parsing validates the credential
+// reference without opening the referenced secret source.
+#[test]
+fn config_parsing_does_not_read_file_link_secret_source() {
+    let home = common::Home::new();
+    let source = home.path.join("credential-source-that-must-not-be-read");
+    std::fs::create_dir(&source).unwrap();
+    let text = format!(
+        "schema_version=1\n[runtimes.codex]\nenabled=true\nadapter=\"codex\"\nbinary=\"/bin/echo\"\nhome=\"{}\"\nmodels=[\"fixture\"]\n[runtimes.codex.auth]\nkind=\"file_link\"\nsource=\"{}\"\ntarget=\"auth.json\"\n",
+        home.path.join("runtime").display(),
+        source.display()
+    );
+    std::fs::write(home.path.join("config.toml"), text).unwrap();
+    let config = Config::load(&home.path).expect("source contents are not part of parsing");
+    assert_eq!(
+        config.runtimes["codex"]
+            .auth
+            .as_ref()
+            .and_then(|auth| match auth {
+                agent_run_config::config::Auth::FileLink { source, .. } => Some(source),
+                _ => None,
+            }),
+        Some(&source)
+    );
+}
+
 /// Mirrors `test_blank_key_is_rejected`.
 #[test]
 fn blank_key_is_rejected() {

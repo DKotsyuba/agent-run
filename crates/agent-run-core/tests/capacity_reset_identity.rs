@@ -71,11 +71,23 @@ fn jitter_under_tolerance_escalates_once_the_span_gate_opens() {
         sample(88.0, Some(JITTERED_RESETS[0]), Some(now)),
         sample(100.0, Some(JITTERED_RESETS[2]), Some(now - 2.0 * 3600.0)),
     ];
+    let raw_timestamps: Vec<_> = samples
+        .iter()
+        .map(|sample| (sample.reset_at, sample.observed_at))
+        .collect();
     let f = forecast(&key(), &samples, now);
     assert!(!f.warmup);
     assert_eq!(f.burn_percent_per_hour, Some(6.0));
     assert_eq!(f.burn_span_seconds, Some(7200.0));
     assert_eq!(f.risk, "high");
+    let after_timestamps: Vec<_> = samples
+        .iter()
+        .map(|sample| (sample.reset_at, sample.observed_at))
+        .collect();
+    assert_eq!(
+        after_timestamps, raw_timestamps,
+        "reset grouping must not rewrite raw timestamps"
+    );
 }
 
 /// Mirrors `tests/test_capacity_reset_identity.py::test_young_jittered_history_stays_below_the_span_gate`.

@@ -72,6 +72,7 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
     let fixture = common::Home::new();
     let mut request = fixture.request();
     request.workdir = PathBuf::from("/private/tmp");
+    request.request_id = Some("codex-protocol-correlation".into());
     request.validate().expect("fixture request");
     let (id, _) = fixture
         .store()
@@ -95,6 +96,12 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
     .expect("fake turn succeeds");
 
     assert_eq!(result.outcome.status, Status::Succeeded);
+    let stored = store.get(&id).expect("persisted Codex row");
+    assert_eq!(
+        stored.request.request_id.as_deref(),
+        Some("codex-protocol-correlation")
+    );
+    assert_eq!(stored.runtime_session_id.as_deref(), Some("thread"));
     assert!(app_home.join("cache/models.json").is_file());
     assert_eq!(
         store
