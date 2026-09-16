@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Records the store schema supported by binaries produced by this workspace.
+pub(crate) const SUPPORTED_SCHEMA_VERSION: u64 = 16;
+
 /// Returns a lowercase SHA-256 digest for arbitrary bytes.
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -56,7 +59,9 @@ pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, Str
     }
     fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
     fs::copy(binary, release.join("bin/agent-run")).map_err(|error| error.to_string())?;
-    let metadata = format!("{{\"version\":{version:?},\"format\":1}}\n");
+    let metadata = format!(
+        "{{\"version\":{version:?},\"format\":1,\"schema_version\":{SUPPORTED_SCHEMA_VERSION}}}\n"
+    );
     fs::write(release.join("metadata.json"), metadata).map_err(|error| error.to_string())?;
     let manifest = files(&release)
         .map_err(|error| error.to_string())?
@@ -106,7 +111,19 @@ pub fn verify(release: &Path) -> Result<(), String> {
     if !seen.contains("bin/agent-run") || !seen.contains("metadata.json") {
         return Err("sealed manifest does not cover runtime entry points".into());
     }
+    schema_version(release)?;
     Ok(())
+}
+
+/// Reads the schema version recorded by a sealed release.
+pub(crate) fn schema_version(release: &Path) -> Result<u64, String> {
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &fs::read(release.join("metadata.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("invalid release metadata: {error}"))?;
+    metadata["schema_version"]
+        .as_u64()
+        .ok_or_else(|| "release metadata has no schema_version".into())
 }
 
 #[cfg(test)]
