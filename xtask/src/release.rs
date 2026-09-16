@@ -6,9 +6,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Returns a lowercase SHA-256 digest for arbitrary bytes.
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 /// Returns a lowercase SHA-256 digest for one regular release file.
-fn digest(path: &Path) -> io::Result<String> {
-    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+pub(crate) fn digest(path: &Path) -> io::Result<String> {
+    Ok(digest_bytes(&fs::read(path)?))
 }
 
 /// Walks regular files below `root`, returning normalized relative paths.
