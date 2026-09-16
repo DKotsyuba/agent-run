@@ -104,6 +104,30 @@ fn inspect_oversized_answer_is_rejected_before_streaming() {
     assert!(verify::inspect_answer(&h.path, Path::new("answer.md")).is_err());
 }
 
+/// Mirrors `tests/test_verify.py::InspectAnswerTests::test_blank_sentinel_is_refused`
+#[test]
+fn inspect_blank_sentinel_is_refused() {
+    let h = common::Home::new();
+    write(&h.path, "body");
+    assert!(
+        verify::inspect_answer_with_sentinel(&h.path, Path::new("answer.md"), Some("   ")).is_err()
+    );
+}
+
+/// Mirrors `tests/test_verify.py::InspectAnswerTests::test_no_sentinel_required_accepts_any_nonempty_answer`
+#[test]
+fn inspect_no_sentinel_required_accepts_any_nonempty_answer() {
+    let h = common::Home::new();
+    write(&h.path, "free form");
+    let proof =
+        verify::inspect_answer_with_sentinel(&h.path, Path::new("answer.md"), None).unwrap();
+    assert!(proof.complete());
+    write(&h.path, "");
+    let empty =
+        verify::inspect_answer_with_sentinel(&h.path, Path::new("answer.md"), None).unwrap();
+    assert_eq!(empty.evidence(), NO_ANSWER);
+}
+
 // --- silence_seconds: mirrors test_verify.py::SilenceTests ---
 
 /// Mirrors `test_silence_is_measured_from_the_last_progress`.
@@ -222,6 +246,23 @@ fn timeout_without_any_answer_reports_silence() {
     assert_eq!(outcome.status, Status::TimedOut);
     assert_eq!(outcome.failure_kind.as_deref(), Some(NO_ANSWER));
     assert_eq!(outcome.failure_text.as_deref(), Some("silence=no_progress"));
+}
+
+/// Mirrors `tests/test_verify.py::VerifyCompletionTests::test_unknown_stop_reason_is_refused`
+#[test]
+fn unknown_stop_reason_is_refused() {
+    let h = common::Home::new();
+    let answer = proof(&h.path, Some("partial"));
+    assert!(verify::verify_completion_with_stop_reason(
+        None,
+        Some("unknown"),
+        Some(&answer),
+        true,
+        None,
+        0.0,
+        60.0,
+    )
+    .is_err());
 }
 
 /// Mirrors `test_timeout_with_a_silent_engine_says_silent`.

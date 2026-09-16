@@ -1,8 +1,9 @@
 //! Exact-byte answer sealing and verification. Process exit zero is insufficient.
 mod completion;
 pub use completion::{
-    inspect_answer, silence_seconds, verify_completion, AnswerProof, StopReason, ANSWER_INCOMPLETE,
-    ANSWER_PRESENT, DEFAULT_SILENCE_THRESHOLD_SECONDS, ENGINE_VANISHED, GROUP_SURVIVED, NO_ANSWER,
+    inspect_answer, inspect_answer_with_sentinel, silence_seconds, verify_completion,
+    verify_completion_with_stop_reason, AnswerProof, StopReason, ANSWER_INCOMPLETE, ANSWER_PRESENT,
+    DEFAULT_SILENCE_THRESHOLD_SECONDS, ENGINE_VANISHED, GROUP_SURVIVED, NO_ANSWER,
 };
 
 use crate::fs::{self, Dir};

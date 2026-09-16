@@ -88,6 +88,18 @@ async fn oversized_output_is_refused() {
     );
 }
 
+/// Mirrors `tests/test_adapter_versions.py::test_version_failures_are_bounded[printf 'stderr-only\n' >&2-no version]`
+#[tokio::test]
+async fn stderr_only_version_failure_is_bounded() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let binary = executable(root.path(), "printf 'stderr-only\\n' >&2");
+    let result = capture(&binary, &["--version".into()], 5, &isolated(root.path())).await;
+    assert!(
+        result.is_err(),
+        "stderr-only version output is not a version"
+    );
+}
+
 /// Mirrors `tests/test_adapter_versions.py::test_missing_and_timed_out_commands_are_reaped`
 #[tokio::test]
 async fn missing_and_timed_out_commands_are_reaped() {

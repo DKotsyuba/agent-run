@@ -340,6 +340,8 @@ fn host_environment() -> BTreeMap<String, String> {
 ///
 /// The child runs in its own process group and is reaped before this returns;
 /// incomplete cleanup or an unavailable native observation is returned as an error.
+/// Successful commands must emit at least one byte, so an empty or stderr-only
+/// version probe is classified as missing version evidence.
 pub async fn capture(
     binary: &Path,
     args: &[String],
@@ -380,6 +382,9 @@ pub async fn capture(
         let (bytes, status) = tokio::try_join!(read, child.wait())?;
         if !status.success() {
             return Err(invalid("metadata command failed"));
+        }
+        if bytes.is_empty() {
+            return Err(invalid("metadata command returned no output"));
         }
         Ok(bytes)
     })

@@ -99,6 +99,7 @@ fn answer_rechecks_persisted_proof_before_exposing_content() {
 
 /// Mirrors Python `tests/test_service.py::AgentServiceTests::test_list_has_exact_total_and_explicit_offset_completeness`.
 /// Mirrors Python `tests/test_service.py::AgentServiceTests::test_list_and_transcript_share_the_bounded_page_limit`.
+/// Mirrors `tests/test_m008_integration.py::M008IntegrationTests::test_real_service_mcp_preserves_counts_pagination_and_gate`.
 ///
 /// Pagination returns an exact durable total and makes both the next offset
 /// and completeness explicit; invalid page bounds fail before opening state.
@@ -486,6 +487,7 @@ fn python_test_service_prepare_failure_is_durable() {
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_launch_failure_is_durable_and_idempotent_retry_never_relaunches`.
+/// Mirrors `tests/test_m008_integration.py::M008IntegrationTests::test_mcp_launch_failure_is_terminal_and_retry_does_not_relaunch`.
 #[test]
 fn python_test_service_launch_failure_is_durable_and_replayable() {
     let home = common::Home::new();
@@ -609,6 +611,7 @@ fn python_test_service_binding_does_not_change_replay_namespace() {
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_steer_is_capability_gated_before_enqueue_and_errors_stay_typed`.
+/// Mirrors `tests/test_m008_integration.py::M008IntegrationTests::test_async_start_supervisor_late_bind_and_one_trusted_dispatch`.
 #[test]
 fn python_test_service_commands_are_typed_and_terminal_cancel_is_refused() {
     let home = common::Home::new();
