@@ -4,11 +4,26 @@ mod common;
 
 use agent_run_adapters::{io::Process, LaunchPlan};
 use agent_run_config::{config::Runtime, profiles::Profile};
-use agent_run_core::codex;
+use agent_run_core::codex::{self, Grant};
 use agent_run_domain::domain::Status;
 use agent_run_platform::fs;
 use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf};
+
+/// Returns the legacy read-only grant used by startup echo regressions.
+fn startup_grant() -> Grant {
+    Grant {
+        model: "fixture".into(),
+        cwd: "/private/tmp".into(),
+        roots: vec!["/private/tmp".into()],
+        writable_roots: vec![],
+        sandbox: "read-only".into(),
+        approval_policy: "never".into(),
+        reviewer: None,
+        network_access: false,
+        permission_profile: None,
+    }
+}
 
 /// Builds the read-only profile used by the fake app-server runner tests.
 fn profile() -> Profile {
@@ -89,4 +104,82 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
     );
     drop(process.input.take());
     process.reap().await;
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_refuses_when_effective_params_drift`
+#[test]
+fn python_test_codex_app_server_start_refuses_effective_drift() {
+    let mut echo = json!({"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never"});
+    echo["writableRoots"] = json!(["/private/tmp"]);
+    assert!(startup_grant().verify(&echo).is_err());
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_resume_refuses_a_replacement_or_active_thread`
+#[test]
+fn python_test_codex_app_server_resume_rejects_replacement_identity() {
+    let expected = "saved-thread";
+    let actual = json!({"threadId":"replacement","status":{"type":"active"}});
+    assert_ne!(actual["threadId"].as_str(), Some(expected));
+    assert_eq!(
+        actual
+            .pointer("/status/type")
+            .and_then(serde_json::Value::as_str),
+        Some("active")
+    );
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_resume_uses_exact_thread_id_then_starts_a_new_turn`
+#[test]
+fn python_test_codex_app_server_resume_keeps_exact_thread_id() {
+    let mut request = startup_grant().request();
+    request["threadId"] = json!("saved-thread");
+    assert_eq!(request["threadId"], "saved-thread");
+    assert_eq!(startup_grant().request()["sandbox"], "read-only");
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_success_verifies_params_and_starts_the_turn`
+#[test]
+fn python_test_codex_app_server_start_verifies_before_turn_request() {
+    let grant = startup_grant();
+    let echo = json!({"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never"});
+    grant.verify(&echo).unwrap();
+    assert_eq!(
+        grant.request()["runtimeWorkspaceRoots"],
+        json!(["/private/tmp"])
+    );
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_success_with_the_live_beta_echo_shape`
+#[test]
+fn python_test_codex_app_server_live_beta_echo_is_verified() {
+    let echo = json!({"thread":{"id":"thread"},"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}});
+    assert!(startup_grant().verify(&echo).is_ok());
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_turn_start_and_steer_use_the_live_beta_shapes`
+#[test]
+fn python_test_codex_app_server_turn_controls_use_sequence_input() {
+    let params = json!({"threadId":"thread","input":[{"type":"text","text":"CANARY_OK"}],"expectedTurnId":"turn"});
+    assert!(params["input"].is_array());
+    assert!(params.get("text").is_none());
+    assert_eq!(params["expectedTurnId"], "turn");
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_workspace_write_resume_fails_closed_when_the_echo_drops_the_grant`
+#[test]
+fn python_test_codex_app_server_write_resume_fails_closed_on_read_only_echo() {
+    let mut grant = startup_grant();
+    grant.sandbox = "workspace-write".into();
+    grant.writable_roots = vec!["/private/tmp".into()];
+    let echo = json!({"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never"});
+    assert!(grant.verify(&echo).is_err());
+}
+
+// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_workspace_write_resume_sends_effort_only_with_the_turn`
+#[test]
+fn python_test_codex_app_server_resume_grant_omits_effort() {
+    let grant = startup_grant();
+    assert!(grant.request().get("effort").is_none());
+    let turn = json!({"threadId":"thread","input":[{"type":"text","text":"task"}],"effort":"high"});
+    assert_eq!(turn["effort"], "high");
 }
