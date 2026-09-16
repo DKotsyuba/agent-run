@@ -25,9 +25,12 @@ pub struct LaunchPlan {
     pub environment: BTreeMap<String, String>,
     pub initial_input: Option<String>,
 }
+
+/// Validate one request, runtime, profile, and all adapter-owned settings.
 pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) -> Result<()> {
     let kind = runtime.kind()?;
     claude::validate_runtime(runtime, kind)?;
+    agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     if !runtime.models.contains(&request.model) {
         return Err(invalid("model is not configured for this runtime"));
     }

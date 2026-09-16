@@ -2,7 +2,10 @@
 
 use regex::Regex;
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::LazyLock,
+};
 
 static SECRET_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("(?i)(key|token|secret|password|credential)").expect("valid regex")
@@ -26,9 +29,19 @@ pub struct Redactor {
 impl Redactor {
     /// Builds a redactor from nonblank values whose environment names are secret-shaped.
     pub fn from_environment(environment: &BTreeMap<String, String>) -> Self {
+        Self::from_environment_with_secret_names(environment, &BTreeSet::new())
+    }
+
+    /// Builds a redactor while extending the secret-name allow-list for declared auth values.
+    pub fn from_environment_with_secret_names(
+        environment: &BTreeMap<String, String>,
+        secret_names: &BTreeSet<String>,
+    ) -> Self {
         let mut literals: Vec<_> = environment
             .iter()
-            .filter(|(name, value)| is_secret_name(name) && !value.is_empty())
+            .filter(|(name, value)| {
+                (is_secret_name(name) || secret_names.contains(*name)) && !value.is_empty()
+            })
             .map(|(_, value)| value.clone())
             .collect();
         literals.sort_by_key(|value| std::cmp::Reverse(value.len()));

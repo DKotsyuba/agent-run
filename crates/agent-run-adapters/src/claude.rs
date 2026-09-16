@@ -1,6 +1,6 @@
 //! Claude-family runtime validation shared by Claude and GLM.
 
-use agent_run_config::config::{Adapter, Runtime};
+use agent_run_config::config::{Adapter, Auth, Runtime};
 use agent_run_domain::{error::invalid, Result};
 use std::path::Path;
 
@@ -19,7 +19,7 @@ const KNOWN_HOOK_EVENTS: &[&str] = &[
     "Stop",
 ];
 
-/// Rejects Claude hook names and GLM whole-plugin skills that Python rejects.
+/// Rejects Claude hook names, GLM auth declarations, and GLM whole-plugin skills.
 ///
 /// Claude Code accepts only the documented hook event names. GLM loads every
 /// declared plugin as a whole, so every plugin skill with a `SKILL.md` must be
@@ -36,6 +36,22 @@ pub fn validate_runtime(runtime: &Runtime, kind: Adapter) -> Result<()> {
         .any(|hook| !KNOWN_HOOK_EVENTS.contains(&hook.event.as_str()))
     {
         return Err(invalid("unknown Claude hook event"));
+    }
+    if kind == Adapter::Glm {
+        if let Some(auth) = &runtime.auth {
+            let Auth::Environment { names } = auth else {
+                return Err(invalid("glm runtime auth.kind must be 'environment'"));
+            };
+            let unknown: Vec<_> = names
+                .iter()
+                .filter(|name| {
+                    !["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"].contains(&name.as_str())
+                })
+                .collect();
+            if !unknown.is_empty() {
+                return Err(invalid("glm runtime auth.names has unsupported entries"));
+            }
+        }
     }
     if kind == Adapter::Glm {
         for plugin in &runtime.plugins {
