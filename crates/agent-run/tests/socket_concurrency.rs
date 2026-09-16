@@ -180,7 +180,8 @@ async fn request(path: &Path, value: serde_json::Value) -> serde_json::Value {
     .unwrap()
 }
 
-/// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_shutdown_closes_each_owner_service_once_in_its_thread`.
+// Rust-internal assertion: SIGTERM must let admitted requests finish before
+// the broker exits and leave the state store reopenable by its owner context.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn python_sigterm_completes_admitted_requests_and_releases_the_store() {
     let temp = tempfile::tempdir().expect("temporary home");
