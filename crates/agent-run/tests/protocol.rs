@@ -167,6 +167,10 @@ fn notice() -> Notice {
         failure_kind: None,
     }
 }
+/// Mirrors Python `tests/test_delivery_base.py::test_untrusted_or_nonterminal_values_are_refused`
+/// (`src/agent_run/delivery/base.py:186-191` `_trusted_id` only rejects blank or oversized ids —
+/// there is no `ntf_` prefix format rule in `CompletionNotice`, only in the unrelated Node relay
+/// host's own request parsing) and its nonterminal-status branch (`base.py:265-266`).
 #[test]
 fn notices_escape_controls_and_never_accept_arbitrary_lifecycle() {
     let mut n = notice();
@@ -174,26 +178,54 @@ fn notices_escape_controls_and_never_accept_arbitrary_lifecycle() {
     let text = n.render().unwrap();
     assert!(text.contains("model\\u000aforged-header\\u2028x"));
     assert!(!text.contains("\nforged-header"));
-    n.notification_id = "ntf_".into();
+    n.notification_id = "   ".into();
+    assert!(n.validate().is_err());
+    n.notification_id = "n".repeat(513);
     assert!(n.validate().is_err());
     n.notification_id = "ntf_x".into();
     n.status = Status::Running;
     assert!(n.validate().is_err());
 }
+/// Mirrors Python `DeliveryAttemptEvidence.from_payload` (`src/agent_run/delivery/base.py:121-156`),
+/// which accepts exactly its 14 declared fields and rejects any payload whose key set differs
+/// (`base.py:136`: `set(value) != expected`). `accepted`/`ambiguous` are derived Rust-side methods,
+/// not stored fields, so a payload carrying only them was never a valid shape in either language.
 #[test]
 fn evidence_does_not_accept_extra_private_fields() {
-    let mut v =
-        json!({"classifier":"relay_accepted","duration_ms":1,"accepted":true,"ambiguous":false});
+    let mut v = json!({
+        "classifier": "relay_accepted",
+        "executable": "desktop-relay",
+        "argv_shape": ["relay"],
+        "duration_ms": 1,
+        "returncode": null,
+        "spawn_errno": null,
+        "error_class": null,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "message_id_present": true
+    });
     assert!(agent_run::delivery::safe_evidence(&v).is_some());
     v["secret"] = json!("must-not-pass");
     assert!(agent_run::delivery::safe_evidence(&v).is_none());
 }
+/// Mirrors Python fixture case `failed-codex_futureProviderCode` in
+/// `tests/fixtures/baseline/notices/cases.json` and `completion_notice_contract.py:97-110`: an
+/// unrecognized failure kind still renders as its own (escaped) label, paired with the
+/// package-owned `default_failure` reason/advice — never a caller-supplied reason or advice string.
 #[test]
-fn unknown_failure_categories_do_not_leak_provider_prose_in_notices() {
+fn unknown_failure_categories_render_with_package_owned_default_guidance() {
     let mut n = notice();
     n.status = Status::Failed;
-    n.failure_kind = Some("secret-provider-error-text".into());
+    n.failure_kind = Some("codex_futureProviderCode".into());
     let text = n.render().unwrap();
-    assert!(!text.contains("secret-provider-error-text"));
-    assert!(text.contains("verified successful outcome"));
+    assert!(text.contains(
+        "- Failure: codex_futureProviderCode — The agent ended without a recognized failure category."
+    ));
+    assert!(text.contains(
+        "- Advice: Inspect list_agents, transcript, and supervisor logs for this ID; retry only with a fresh ID after the cause is understood."
+    ));
 }

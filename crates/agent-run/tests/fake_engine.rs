@@ -226,12 +226,23 @@ async fn normal_run_produces_verifiable_terminal_evidence() {
     assert_eq!(answer["content"], json!("fixture final answer\n"));
 }
 
+/// Mirrors Python `adapters/claude/stream.py:335-349` (`StreamDecoder.finalize`)
+/// and `adapters/claude/session.py:344-349`: the fixture engine emits one
+/// "assistant" text line before exiting 0 with no terminal "result" line
+/// (`crates/agent-run/tests/fixtures/engine.rs:58-61,101-103`), so
+/// `_saw_assistant_text` is true and `finalize()` reports subtype `"cut_off"`
+/// — a mid-turn cutoff, not the unrelated invented label `"missing_result"`
+/// (never present in Python; verified live via `StreamDecoder(...).finalize()`
+/// under python3.14, which returns `subtype="cut_off"` for this exact input).
+/// A run with no streamed content at all instead classifies as `"no_answer"`
+/// (`stream.py:344`), which Rust's own EOF branch also distinguishes
+/// (`crates/agent-run-core/src/stream.rs:310-321`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exit_zero_without_terminal_result_is_not_success() {
     let (_tmp, home) = home();
     let row = run_task(&home, "fixture:missing-result").await;
     assert_eq!(row.status, Status::Failed);
-    assert_eq!(row.failure_kind.as_deref(), Some("missing_result"));
+    assert_eq!(row.failure_kind.as_deref(), Some("cut_off"));
     let answer = Service::new(home.clone()).answer(&row.id).unwrap();
     assert_eq!(answer["available"], json!(false));
 }
@@ -365,6 +376,21 @@ async fn engine_ignoring_sigterm_requires_sigkill() {
     assert_eq!(cleanup["confirmed"], json!(true));
 }
 
+/// Mirrors Python `verify.py:505` (`read_answer_payload`), which raises
+/// `AnswerTamperedError` — an `AnswerError` subclass, `verify.py:70` — for
+/// exactly this message, `"answer artifact hash does not match its recorded
+/// proof"`. The answer-proof work landed on this branch tonight
+/// (`b7553f2`, "verify and seal answer proofs against the Python corpus")
+/// and moved `verify::read`'s hash-mismatch branch from the old generic
+/// `Error::Integrity` to `Error::AnswerIntegrity`
+/// (`crates/agent-run-platform/src/verify/mod.rs:242-245`), which is also
+/// the variant every other answer/proof check in that module now uses.
+/// `crates/agent-run-domain/src/error.rs:92-97` documents the direction
+/// explicitly: `AnswerIntegrity` is the live variant, `Integrity` is
+/// "retained temporarily for existing migration callers" — both still map
+/// to the same public `AnswerIntegrityError` machine code
+/// (`error.rs:134`), so no caller-visible behavior changed, only the
+/// internal variant this test must name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
     let (_tmp, home) = home();
@@ -386,7 +412,7 @@ async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
     std::fs::write(&path, b"corrupted answer bytes").unwrap();
     let error = verify::read(&root, &proof, verify::INLINE_ANSWER)
         .expect_err("corrupted bytes must not verify");
-    assert!(matches!(error, agent_run::Error::Integrity(_)));
+    assert!(matches!(error, agent_run::Error::AnswerIntegrity(_)));
 }
 
 #[test]
