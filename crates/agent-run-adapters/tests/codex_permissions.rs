@@ -8,7 +8,7 @@ use agent_run_adapters::{
     materialize,
 };
 use agent_run_config::{
-    config::{Adapter, Capacity, Catalog, Config, Core, Delivery, Runtime},
+    config::{Adapter, Capacity, Catalog, Config, Core, Delivery, Mcp, Runtime},
     profiles::Profile,
 };
 use agent_run_domain::domain::StartRequest;
@@ -241,4 +241,80 @@ fn python_test_codex_adapter_projects_refuses_an_unproven_managed_root() {
     let home = root.join("home");
     assert!(materialize::materialize(&config, &runtime, &request, &profile, &home, &root).is_err());
     assert_eq!(runtime.kind().expect("Codex kind"), Adapter::Codex);
+}
+
+/// Mirrors `test_codex_adapter.py::test_materialize_approves_only_configured_mcp_and_adds_narrow_hook`.
+#[test]
+fn python_test_codex_adapter_materializes_only_declared_mcp_approval() {
+    let root = temporary_directory();
+    let (mut config, runtime, request, mut profile) = fixture(&root, false);
+    config.mcp.insert(
+        "approved".into(),
+        Mcp {
+            transport: "stdio".into(),
+            command: Path::new("/bin/true").into(),
+            args: vec!["--fixture".into()],
+            env_from: vec!["PATH".into()],
+            approval_mode: "approve".into(),
+        },
+    );
+    profile.mcp = vec!["approved".into()];
+    let home = root.join("home");
+
+    materialize::materialize(&config, &runtime, &request, &profile, &home, &root)
+        .expect("materialize Codex home");
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(home.join("config.toml")).expect("generated config"),
+    )
+    .expect("valid generated TOML");
+    assert_eq!(
+        config
+            .get("mcp_servers")
+            .and_then(|servers| servers.get("approved"))
+            .and_then(|server| server.get("default_tools_approval_mode"))
+            .and_then(toml::Value::as_str),
+        Some("approve")
+    );
+    let hooks = config
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PermissionRequest"))
+        .and_then(toml::Value::as_array)
+        .expect("narrow permission hook");
+    assert_eq!(hooks.len(), 1);
+    assert!(hooks[0]
+        .get("matcher")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|matcher| matcher.contains("mcp__approved__")));
+}
+
+/// Mirrors `test_codex_adapter.py::test_materialize_uses_only_each_explicit_service_skill_root`.
+/// Mirrors `test_codex_adapter.py::test_materialize_fails_for_missing_skill_or_unresolved_mcp`.
+#[test]
+fn python_test_codex_adapter_materializes_only_declared_service_skills() {
+    let root = temporary_directory();
+    let (config, runtime, request, mut profile) = fixture(&root, false);
+    let skill = root.join("skills/codex/declared");
+    std::fs::create_dir_all(&skill).expect("skill root");
+    std::fs::write(skill.join("SKILL.md"), "declared skill\n").expect("skill body");
+    profile.skills = vec!["declared".into()];
+    let home = root.join("home");
+
+    materialize::materialize(&config, &runtime, &request, &profile, &home, &root)
+        .expect("declared skill materializes");
+    assert_eq!(
+        std::fs::read_to_string(home.join("skills/declared/SKILL.md")).expect("copied skill"),
+        "declared skill\n"
+    );
+
+    profile.skills = vec!["missing".into()];
+    assert!(materialize::materialize(
+        &config,
+        &runtime,
+        &request,
+        &profile,
+        &root.join("missing-home"),
+        &root,
+    )
+    .is_err());
 }

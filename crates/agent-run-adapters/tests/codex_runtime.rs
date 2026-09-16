@@ -1,12 +1,14 @@
 //! Python-parity tests for Codex account selection and roster cache behavior.
 
 use agent_run_adapters::{
+    capabilities,
     codex::models::{
         cache_is_fresh, parse_roster, read_cache, validate_cached_selection, write_cache,
     },
-    materialize::account_home,
+    materialize::account_home, validate,
 };
 use agent_run_config::config::{Adapter, Runtime};
+use agent_run_config::profiles::Profile;
 use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
 
@@ -15,7 +17,7 @@ fn runtime() -> Runtime {
     Runtime {
         enabled: true,
         adapter: "codex".into(),
-        binary: PathBuf::from("/bin/true"),
+        binary: PathBuf::from("/usr/bin/true"),
         home: PathBuf::from("/tmp/codex"),
         models: vec!["fixture".into()],
         skills: vec![],
@@ -136,4 +138,77 @@ fn python_test_codex_adapter_models_with_unreadable_cache_falls_back_to_config_o
     std::fs::write(home.path().join("cache/models.json"), b"not JSON").unwrap();
     assert_eq!(read_cache(home.path()), None);
     assert!(validate_cached_selection(home.path(), "configured-model", Some("high")).is_ok());
+}
+
+/// Builds an execution profile for adapter admission tests.
+fn profile(name: &str, write: bool, network: bool) -> Profile {
+    Profile {
+        name: name.into(),
+        body: "Fixture role.".into(),
+        write,
+        network,
+        revision: "fixture".into(),
+        canonical: false,
+        allow_external_read_roots: true,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec![],
+        required_constraints: Default::default(),
+    }
+}
+
+/// Builds a minimal request accepted by the adapter validation boundary.
+fn request(model: &str) -> agent_run_domain::domain::StartRequest {
+    serde_json::from_value(json!({
+        "runtime": "codex",
+        "model": model,
+        "profile": "review",
+        "task": "fixture",
+        "workdir": "/private/tmp",
+    }))
+    .expect("valid request fixture")
+}
+
+/// Mirrors `test_codex_adapter.py::test_describe_reports_expected_capabilities`.
+/// Mirrors `test_codex_adapter.py::test_prepare_refuses_network_without_write`.
+/// Mirrors `test_codex_adapter.py::test_prepare_limits_gpt_6_astra_to_public_read_only_profiles`.
+/// Mirrors `test_codex_adapter.py::test_prepare_refuses_output_schema`.
+#[test]
+fn python_test_codex_adapter_admission_keeps_capabilities_and_roles_closed() {
+    assert!(capabilities(Adapter::Codex).contains(&"steer"));
+    assert!(capabilities(Adapter::Codex).contains(&"mcp"));
+    assert!(!capabilities(Adapter::Codex).contains(&"output_schema"));
+
+    let runtime = runtime();
+    assert!(validate(
+        &request("fixture"),
+        &runtime,
+        &profile("review", false, false)
+    )
+    .is_ok());
+    assert!(validate(
+        &request("fixture"),
+        &runtime,
+        &profile("review", false, true)
+    )
+    .is_err());
+
+    let mut schema = request("fixture");
+    schema.output_schema = Some(serde_json::Map::new());
+    assert!(validate(&schema, &runtime, &profile("review", false, false)).is_err());
+
+    let mut astra_runtime = runtime.clone();
+    astra_runtime.models = vec!["gpt-6-astra".into()];
+    assert!(validate(
+        &request("gpt-6-astra"),
+        &astra_runtime,
+        &profile("review", false, false),
+    )
+    .is_ok());
+    assert!(validate(
+        &request("gpt-6-astra"),
+        &astra_runtime,
+        &profile("implement", true, false),
+    )
+    .is_err());
 }
