@@ -1,15 +1,15 @@
 {
   "index_version": 1,
-  "generated_for_commit": "b5486780008d603a21c25b5303ea81e1291d7fcb",
-  "generated_at": "2026-09-16T05:44:48+00:00",
-  "note": "Inventory of migration evidence and decisions with content hashes. Hand-assembled for board task M56; `xtask evidence verify` does not exist yet and must regenerate and check this file rather than trust it.",
+  "generated_for_commit": "afc080f32d72dd2531b78d354ab6dd9cf16b631b",
+  "generated_at": "2026-09-16T06:06:43+00:00",
+  "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
   "entry_count": 26,
   "entries": [
     {
       "path": "migration/evidence/coverage-2026-09-16.md",
       "kind": "evidence",
-      "bytes": 10361,
-      "sha256": "9b2140c9d12f89ffd6509c907d88d544a6ce31467cbd0acc66578b8251f4e7a1"
+      "bytes": 15470,
+      "sha256": "fbfdf8449fe22e83f7445e93b14efdb94192d960075f2d2655a65b87434dbe26"
     },
     {
       "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
@@ -146,8 +146,8 @@
     {
       "path": "migration/baseline/test-map.csv",
       "kind": "ledger",
-      "bytes": 388382,
-      "sha256": "5e67beecd5043cdcbba190d4285179b5bda779b64b362bea42025553edbf9df9"
+      "bytes": 388373,
+      "sha256": "857e7fc66cc5821252ea65422119f03ab46bc32961627bec737662ca3c3a796b"
     },
     {
       "path": "migration/baseline/divergences.csv",
@@ -158,8 +158,8 @@
     {
       "path": "migration/tasks.csv",
       "kind": "ledger",
-      "bytes": 25642,
-      "sha256": "5dab16c0e6a906c8b866bee7fe5f1bcb55455e737f3bb1d670c4dc052c1827ed"
+      "bytes": 25662,
+      "sha256": "53a417bddd78d7e5e65ad36f15da15c7ede0fb03122b6b7807e515f9b19411df"
     }
   ]
 }
