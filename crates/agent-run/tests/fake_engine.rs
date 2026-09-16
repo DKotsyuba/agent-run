@@ -196,12 +196,23 @@ async fn normal_run_produces_verifiable_terminal_evidence() {
     assert_eq!(answer["content"], json!("fixture final answer\n"));
 }
 
+/// Mirrors Python `adapters/claude/stream.py:335-349` (`StreamDecoder.finalize`)
+/// and `adapters/claude/session.py:344-349`: the fixture engine emits one
+/// "assistant" text line before exiting 0 with no terminal "result" line
+/// (`crates/agent-run/tests/fixtures/engine.rs:58-61,101-103`), so
+/// `_saw_assistant_text` is true and `finalize()` reports subtype `"cut_off"`
+/// — a mid-turn cutoff, not the unrelated invented label `"missing_result"`
+/// (never present in Python; verified live via `StreamDecoder(...).finalize()`
+/// under python3.14, which returns `subtype="cut_off"` for this exact input).
+/// A run with no streamed content at all instead classifies as `"no_answer"`
+/// (`stream.py:344`), which Rust's own EOF branch also distinguishes
+/// (`crates/agent-run-core/src/stream.rs:310-321`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exit_zero_without_terminal_result_is_not_success() {
     let (_tmp, home) = home();
     let row = run_task(&home, "fixture:missing-result").await;
     assert_eq!(row.status, Status::Failed);
-    assert_eq!(row.failure_kind.as_deref(), Some("missing_result"));
+    assert_eq!(row.failure_kind.as_deref(), Some("cut_off"));
     let answer = Service::new(home.clone()).answer(&row.id).unwrap();
     assert_eq!(answer["available"], json!(false));
 }
