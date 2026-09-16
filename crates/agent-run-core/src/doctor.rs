@@ -146,7 +146,7 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
                 "state_migration_pending",
                 "error",
                 "state",
-                &error.to_string(),
+                error.to_string(),
             );
             return Ok(report);
         }
