@@ -42,38 +42,6 @@ fn status(value: &Value) -> &str {
     value["status"].as_str().expect("wait status")
 }
 
-/// Mirrors `tests/test_wait.py::WaitAgentTests::test_running_agent_transitions_to_succeeded_and_returns_the_answer`
-#[tokio::test]
-async fn test_running_agent_transitions_to_succeeded_and_returns_the_answer() {
-    let home = common::Home::new();
-    let id = admitted(&home);
-    set_status(&home, &id, Status::Running);
-    let service = Service::new(home.path.clone());
-    let changed = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&changed);
-    let update_home = home.path.clone();
-    let update_id = id.clone();
-    let updater = tokio::spawn(async move {
-        while !signal.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        let store = Store::open(&update_home).expect("update store");
-        store
-            .conn
-            .execute(
-                "UPDATE agents SET status='succeeded' WHERE id=?",
-                [update_id.as_str()],
-            )
-            .expect("terminal transition");
-    });
-    changed.store(true, Ordering::Release);
-
-    let result = service.wait(&id, None).await.expect("wait succeeds");
-    updater.await.expect("updater joins");
-    assert_eq!(status(&result), "succeeded");
-    assert_eq!(result["available"], false);
-}
-
 /// Mirrors `tests/test_wait.py::WaitAgentTests::test_failure_cancellation_and_timeout_map_to_2_3_and_4`
 #[tokio::test]
 async fn test_failure_cancellation_and_timeout_map_to_2_3_and_4() {

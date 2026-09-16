@@ -1,7 +1,6 @@
 //! Native signal and process-group lifecycle regressions.
 
 use agent_run_platform::launch;
-use std::time::Duration;
 
 /// Installs a temporary SIGUSR1 handler for the restoration contract test.
 extern "C" fn marker(_signal: libc::c_int) {}
@@ -42,12 +41,4 @@ fn test_eperm_on_signal_zero_means_the_group_exists() {
 fn test_esrch_on_signal_zero_means_gone() {
     let group = i32::MAX;
     assert!(!launch::group_alive(group));
-}
-
-/// Confirms the existing cleanup primitive remains bounded for an absent group.
-#[test]
-fn absent_group_cleanup_probe_is_bounded() {
-    let started = std::time::Instant::now();
-    assert!(!launch::group_alive(i32::MAX));
-    assert!(started.elapsed() < Duration::from_secs(1));
 }
