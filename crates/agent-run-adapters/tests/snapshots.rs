@@ -70,6 +70,143 @@ fn python_test_sources_reject_symlinks() {
     assert!(matches!(error, agent_run_domain::Error::Validation(_)));
 }
 
+/// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_selected_assets_preserve_layout_without_copying_other_files`
+#[test]
+fn selected_assets_preserve_layout_without_copying_other_files() {
+    let temporary = TempDir::new().unwrap();
+    let source = source(temporary.path());
+    stdfs::write(source.join("unselected.txt"), "do not copy").unwrap();
+    snapshot_tree::snapshot_selected_assets(
+        &temporary.path().join("home"),
+        Path::new("declared-plugins/demo"),
+        &source,
+        &["SKILL.md".into(), "scripts".into()],
+    )
+    .unwrap();
+    let copied = temporary.path().join("home/declared-plugins/demo");
+    assert!(copied.join("SKILL.md").is_file());
+    assert!(copied.join("scripts/run.sh").is_file());
+    assert!(!copied.join("unselected.txt").exists());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        stdfs::metadata(copied.join("scripts/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+/// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_runtime_index_detects_an_entire_missing_snapshot_root`
+#[test]
+fn runtime_index_detects_an_entire_missing_snapshot_root() {
+    let temporary = TempDir::new().unwrap();
+    let source = source(temporary.path());
+    let home = temporary.path().join("home");
+    snapshot_tree::snapshot_managed_tree(&home, Path::new("skills/demo"), &source, None).unwrap();
+    stdfs::write(home.join("settings.json"), "{}").unwrap();
+    let digest =
+        snapshot_tree::finalize_runtime_snapshots(&home, "files-1", &["settings.json".into()], &[])
+            .unwrap();
+    stdfs::remove_dir_all(home.join("skills/demo")).unwrap();
+    let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
+    assert!(!inspection.verified);
+    assert!(inspection
+        .missing
+        .iter()
+        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+}
+
+/// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_runtime_index_binds_each_root_manifest_revision`
+#[test]
+fn runtime_index_binds_each_root_manifest_revision() {
+    let temporary = TempDir::new().unwrap();
+    let source = source(temporary.path());
+    let home = temporary.path().join("home");
+    snapshot_tree::snapshot_managed_tree(&home, Path::new("skills/demo"), &source, None).unwrap();
+    let digest = snapshot_tree::finalize_runtime_snapshots(&home, "files-1", &[], &[]).unwrap();
+    let finalized = stdfs::read(home.join(RUNTIME_SNAPSHOT_INDEX)).unwrap();
+    stdfs::write(source.join("SKILL.md"), "replacement").unwrap();
+    snapshot_tree::snapshot_managed_tree(&home, Path::new("skills/demo"), &source, None).unwrap();
+    stdfs::write(home.join(RUNTIME_SNAPSHOT_INDEX), finalized).unwrap();
+    let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
+    assert!(!inspection.verified);
+    assert!(inspection
+        .hash_mismatches
+        .iter()
+        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+}
+
+/// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_symlinked_manifest_is_a_type_mismatch`
+#[test]
+fn symlinked_manifest_is_a_type_mismatch() {
+    let temporary = TempDir::new().unwrap();
+    let source = source(temporary.path());
+    let home = temporary.path().join("home");
+    snapshot_tree::snapshot_managed_tree(&home, Path::new("skills/demo"), &source, None).unwrap();
+    let digest = snapshot_tree::finalize_runtime_snapshots(&home, "files-1", &[], &[]).unwrap();
+    let manifest = home.join("skills/demo").join(SNAPSHOT_MANIFEST);
+    stdfs::remove_file(&manifest).unwrap();
+    std::os::unix::fs::symlink(source.join("SKILL.md"), &manifest).unwrap();
+    let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
+    assert!(inspection
+        .type_mismatches
+        .iter()
+        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+    assert!(!inspection
+        .missing
+        .iter()
+        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+}
+
+/// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_flat_file_classification_never_follows_an_intermediate_symlink`
+#[test]
+fn flat_file_classification_never_follows_an_intermediate_symlink() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    stdfs::create_dir_all(home.join("nested")).unwrap();
+    stdfs::write(home.join("nested/settings.json"), "{}").unwrap();
+    let digest = snapshot_tree::finalize_runtime_snapshots(
+        &home,
+        "files-1",
+        &["nested/settings.json".into()],
+        &[],
+    )
+    .unwrap();
+    stdfs::rename(home.join("nested"), home.join("nested.retained")).unwrap();
+    let outside = temporary.path().join("outside");
+    stdfs::create_dir(&outside).unwrap();
+    stdfs::write(outside.join("settings.json"), "outside").unwrap();
+    std::os::unix::fs::symlink(&outside, home.join("nested")).unwrap();
+    let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
+    assert!(inspection
+        .type_mismatches
+        .iter()
+        .any(|path| path == "nested/settings.json"));
+    assert!(!inspection
+        .missing
+        .iter()
+        .any(|path| path == "nested/settings.json"));
+}
+
+/// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_runtime_hash_reader_rejects_incomplete_index_shape`
+#[test]
+fn runtime_hash_reader_rejects_incomplete_index_shape() {
+    let temporary = TempDir::new().unwrap();
+    stdfs::create_dir(temporary.path().join("home")).unwrap();
+    stdfs::write(
+        temporary.path().join("home/.agent-run-snapshots.json"),
+        "{\"materialize_revision\":\"files-1\"}\n",
+    )
+    .unwrap();
+    assert!(snapshot_tree::runtime_snapshot_index_sha256(
+        &temporary.path().join("home"),
+        "files-1"
+    )
+    .is_err());
+}
+
 /// Mirrors `test_snapshots.py::test_interrupted_metadata_and_recovery_states_never_verify`.
 #[test]
 fn python_test_tamper_missing_extra_symlink_and_partial_are_refused() {

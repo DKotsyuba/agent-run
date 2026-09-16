@@ -365,6 +365,20 @@ pub fn snapshot_managed_tree(
     })
 }
 
+/// Copy only explicitly selected files or directories into a managed snapshot.
+///
+/// Selection is relative to `source`, preserves the selected layout below
+/// `relative_root`, rejects links and missing entries, and leaves unrelated
+/// source files out of the generated home.
+pub fn snapshot_selected_assets(
+    home: &Path,
+    relative_root: &Path,
+    source: &Path,
+    selected: &[String],
+) -> Result<TreeSnapshot> {
+    snapshot_managed_tree(home, relative_root, source, Some(selected))
+}
+
 /// Inspect one published tree without deleting, rewriting, or following links.
 pub fn inspect_managed_snapshot(home: &Path, relative_root: &Path) -> Result<SnapshotInspection> {
     relative(relative_root, "snapshot destination")?;
@@ -712,6 +726,22 @@ pub fn inspect_runtime_snapshots(
         && result.owned_temps.is_empty()
         && result.orphans.is_empty();
     Ok(result)
+}
+
+/// Return the hash of a complete, verified runtime snapshot index.
+pub fn runtime_snapshot_index_sha256(home: &Path, expected_revision: &str) -> Result<String> {
+    let directory = Dir::open(home)?;
+    let raw = directory
+        .optional(Path::new(RUNTIME_SNAPSHOT_INDEX), MAX_METADATA)?
+        .ok_or_else(|| invalid("runtime snapshot index is missing"))?;
+    let digest = fs::sha256(&raw);
+    let inspection = inspect_runtime_snapshots(home, expected_revision, &digest)?;
+    if !inspection.verified {
+        return Err(invalid(
+            "runtime snapshot index references unverified artifacts",
+        ));
+    }
+    Ok(digest)
 }
 
 /// Return whether a string is a Python-compatible SHA-256 hexadecimal value.
