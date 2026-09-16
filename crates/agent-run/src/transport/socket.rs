@@ -24,6 +24,31 @@ const MAX_PENDING_REQUESTS: usize = 64;
 const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 const CONTROL_METHODS: &[&str] = &["start", "resume", "cancel", "steer"];
 
+/// Bounds one socket server's connections, request queue, and frame deadlines.
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    /// Maximum simultaneous client handlers, including the reserved control slot.
+    pub max_connections: usize,
+    /// Maximum pending requests per ordinary/control lane.
+    pub max_pending_requests: usize,
+    /// Absolute execution deadline for one request.
+    pub request_timeout: Duration,
+    /// Absolute deadline for receiving the next ordinary frame.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ServeOptions {
+    /// Returns the production limits matching the Python socket server.
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_CONNECTIONS,
+            max_pending_requests: MAX_PENDING_REQUESTS,
+            request_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Bounded ownership lanes for ordinary requests.
 ///
 /// Admission and lifecycle commands use `control`; all other ordinary calls
@@ -38,10 +63,11 @@ struct Lanes {
 
 impl Lanes {
     /// Creates the two independently bounded Python-compatible work queues.
-    fn new() -> Self {
+    fn new(max_pending_requests: usize) -> Self {
+        let capacity = max_pending_requests.saturating_add(1);
         Self {
-            control: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
-            read: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
+            control: Arc::new(Semaphore::new(capacity)),
+            read: Arc::new(Semaphore::new(capacity)),
         }
     }
 
@@ -158,6 +184,7 @@ async fn connection(
     service: Service,
     lanes: Lanes,
     control_only: bool,
+    options: ServeOptions,
 ) -> Result<()> {
     // SAFETY: geteuid has no arguments or memory safety preconditions.
     let uid = unsafe { libc::geteuid() };
@@ -170,7 +197,7 @@ async fn connection(
         let deadline = if control_only {
             CONTROL_FRAME_DEADLINE
         } else {
-            Duration::from_secs(120)
+            options.idle_timeout
         };
         let raw = match tokio::time::timeout(deadline, frame::read(&mut input, MAX_FRAME)).await {
             Ok(Ok(Some(raw))) => raw,
@@ -212,7 +239,19 @@ async fn connection(
                     if long_poll {
                         respond(&service, value).await
                     } else if let Some(_permit) = lanes.try_acquire(method) {
-                        respond(&service, value).await
+                        let request_id = value.get("id").cloned().unwrap_or(Value::Null);
+                        let has_id = value.get("id").is_some();
+                        match tokio::time::timeout(
+                            options.request_timeout,
+                            respond(&service, value),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => has_id.then(|| {
+                                err(request_id, -32002, "API request deadline exceeded", None)
+                            }),
+                        }
                     } else {
                         let id = value.get("id").cloned().unwrap_or(Value::Null);
                         if value.get("id").is_some() {
@@ -257,6 +296,21 @@ pub async fn serve(home: &Path) -> Result<()> {
 /// listener lifetime. Shutdown stops accepts and gives admitted handlers five
 /// seconds to finish before refusing remaining work by closing their streams.
 pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
+    serve_at_with_options(home, socket_path, ServeOptions::default()).await
+}
+
+/// Serves one selected socket with explicit bounded connection and deadline options.
+pub async fn serve_at_with_options(
+    home: &Path,
+    socket_path: &Path,
+    options: ServeOptions,
+) -> Result<()> {
+    if options.max_connections == 0 || options.max_pending_requests == 0 {
+        return Err(crate::error::invalid("socket limits must be positive"));
+    }
+    if options.request_timeout.is_zero() || options.idle_timeout.is_zero() {
+        return Err(crate::error::invalid("socket deadlines must be positive"));
+    }
     let _ = crate::config::Config::load(home)?;
     let _ = crate::state::Store::open(home)?;
     let directory = std::fs::symlink_metadata(home)?;
@@ -342,9 +396,10 @@ pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
             }
         }
     });
-    let gate = Arc::new(Semaphore::new(MAX_CONNECTIONS - 1));
-    let control_gate = Arc::new(Semaphore::new(1));
-    let lanes = Lanes::new();
+    let reserved = usize::from(options.max_connections > 1);
+    let gate = Arc::new(Semaphore::new(options.max_connections - reserved));
+    let control_gate = Arc::new(Semaphore::new(reserved));
+    let lanes = Lanes::new(options.max_pending_requests);
     let mut handlers = JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -365,7 +420,8 @@ pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
                 };
                 let service=service.clone();
                 let lanes=lanes.clone();
-                handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only).await; });
+                let options = options.clone();
+                handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only,options).await; });
             }
         }
     }
