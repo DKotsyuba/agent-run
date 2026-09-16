@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 fs2.workspace = true
+libc.workspace = true
 agent-run-config = { path = "../agent-run-config" }
 agent-run-domain = { path = "../agent-run-domain" }
 agent-run-platform = { path = "../agent-run-platform" }

@@ -1,22 +1,25 @@
 //! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
 /// Atomic durable admission, replay, and active-capacity reservation.
 pub mod admission;
+/// Durable delivery outbox rows, binding, expiry, and evidence verdicts.
+pub mod delivery;
 /// Read-only diagnostic and active-context snapshots.
 pub mod diagnostics;
 /// Durable append-only journal operations and bounded transcript spooling.
 pub mod journal;
+/// Resume-parent proof and one-child lineage admission helpers.
+pub mod lineage;
 pub mod migrations;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
+/// Atomic terminal lifecycle transitions and their durable completion notices.
+pub mod terminal;
 use agent_run_domain::{
     domain::{self, now, AgentId, Outcome, StartRequest, Status},
     error::invalid,
     Error, Result,
 };
-use agent_run_platform::{
-    fs,
-    verify::{self, Proof},
-};
+use agent_run_platform::{fs, verify::Proof};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -333,77 +336,7 @@ impl Store {
         proof: Option<&Proof>,
         usage: Option<&Value>,
     ) -> Result<()> {
-        if !outcome.status.terminal() {
-            return Err(invalid("outcome must be terminal"));
-        }
-        if outcome.status == Status::Succeeded && proof.is_none() {
-            return Err(invalid("success requires a sealed answer proof"));
-        }
-        if let Some(proof) = proof {
-            verify::read(&self.home.join("agents").join(id.as_str()), proof, 0)?;
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row(
-            "SELECT * FROM agents WHERE id=?",
-            [id.as_str()],
-            Record::read,
-        )?;
-        if row.status.terminal() {
-            return Ok(());
-        }
-        let mut from = row.status;
-        if from == Status::Running && outcome.status == Status::Cancelled {
-            tx_event(
-                &tx,
-                id,
-                "status",
-                Some(from),
-                Some(Status::Cancelling),
-                &json!({}),
-            )?;
-            from = Status::Cancelling;
-        }
-        let to = if from == Status::Cancelling && outcome.status != Status::Cancelled {
-            Status::Lost
-        } else {
-            outcome.status
-        };
-        from.transition(to)?;
-        if to == Status::Succeeded && proof.is_none() {
-            return Err(Error::Integrity("success requires answer proof".into()));
-        }
-        let time = now();
-        tx.execute("UPDATE agents SET status=?,finished_at=?,exit_code=?,failure_kind=?,failure_text=?,runtime_session_id=COALESCE(?,runtime_session_id),answer_path=?,answer_bytes=?,answer_sha256=? WHERE id=?",params![to.as_str(),time,outcome.exit_code,outcome.failure_kind,outcome.failure_text,outcome.runtime_session_id,proof.map(|p|p.path.to_string_lossy().into_owned()),proof.map(|p|p.bytes as i64),proof.map(|p|p.sha256.as_str()),id.as_str()])?;
-        tx.execute(
-            "UPDATE attempts SET state=?,finished_at=? WHERE agent_id=?",
-            params![to.as_str(), time, id.as_str()],
-        )?;
-        let seq = tx_event(
-            &tx,
-            id,
-            "status",
-            Some(from),
-            Some(to),
-            &json!({"failure_kind":outcome.failure_kind}),
-        )?;
-        if let Some(session) = row.orchestrator_session_id {
-            tx.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,?,?,'pending',?)",params![format!("ntf_{}",uuid::Uuid::new_v4().simple()),id.as_str(),session,seq,time])?;
-        }
-        let token = |name: &str| {
-            usage
-                .and_then(|v| v.get(name))
-                .and_then(Value::as_i64)
-                .filter(|v| *v >= 0)
-        };
-        let cost = usage
-            .and_then(|v| v.get("cost_usd"))
-            .and_then(Value::as_f64)
-            .filter(|v| v.is_finite() && *v >= 0.);
-        tx.execute("INSERT OR REPLACE INTO run_stats(agent_id,runtime,model,profile,status,failure_kind,started_at,finished_at,duration_seconds,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,total_tokens,num_turns,cost_usd,usage_source,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![id.as_str(),row.request.runtime,row.request.model,row.request.profile,to.as_str(),outcome.failure_kind,row.started_at,time,row.started_at.map(|s|(time-s).max(0.)),token("input_tokens"),token("output_tokens"),token("cache_read_tokens"),token("cache_write_tokens"),token("reasoning_tokens"),token("total_tokens"),token("num_turns"),cost,if usage.and_then(|v|v.get("_source")).and_then(Value::as_str)==Some("token_usage_updated"){"token_usage_updated"}else if usage.is_some(){"runtime_result"}else{"none"},time])?;
-        tx.commit()?;
-        Ok(())
+        terminal::finish(self, id, outcome, proof, usage)
     }
     pub fn enqueue(&mut self, id: &AgentId, kind: &str, payload: &Value) -> Result<Value> {
         if !["cancel", "steer"].contains(&kind) {
