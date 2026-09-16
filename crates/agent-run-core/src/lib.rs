@@ -3,6 +3,8 @@ pub mod capacity;
 pub mod codex;
 pub mod delivery;
 pub mod dispatch;
+pub mod doc;
+pub mod doctor;
 /// Session binding and per-turn context hooks shared by CLI hosts.
 pub mod hooks;
 pub mod lifecycle;

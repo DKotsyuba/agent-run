@@ -578,11 +578,12 @@ pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home)?;
     let service = Service::new(home.clone());
     match cli.command {
-        Command::Init => emit(&init(&home)?)?,
+        Command::Init => emit(&crate::init::initialize(&home)?)?,
         Command::Doctor => {
-            let value = doctor(&home).await?;
-            emit(&value)?;
-            return Ok(if value["ok"] == true { 0 } else { 2 });
+            let report = crate::doctor::run(&home)?;
+            let ok = report.ok();
+            emit(&serde_json::to_value(report)?)?;
+            return Ok(if ok { 0 } else { 2 });
         }
         Command::Start(a) => {
             let task = task_text(&a.task, 1024 * 1024)?;
@@ -756,7 +757,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Limits => emit(&service.limits()?)?,
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
-            emit(&json!({"topic":topic,"text":doc(topic)?}))?;
+            emit(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;
         }
         Command::Mcp => transport::mcp::serve(home, None).await?,
         Command::Api { command } => match command {

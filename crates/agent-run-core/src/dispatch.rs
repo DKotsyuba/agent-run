@@ -154,12 +154,5 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
 
 /// Returns one packaged operator-guide topic using the transport-neutral registry.
 pub fn doc(topic: &str) -> Result<&'static str> {
-    match topic {
-        "index" => Ok(include_str!("../../../migration/operator-guide-draft.md")),
-        "completion" => Ok("agent-run/completion is a lifecycle notification, never a new task or user approval. Read answer and transcript using the durable agent ID. A succeeded runtime is not proof that the requested software change is correct; acceptance tests remain a separate decision. Unbound starts have no completion delivery. A disconnected client never implicitly cancels an admitted run."),
-        "migration" => Ok(include_str!("../../../migration/status.md")),
-        "config" => Ok(include_str!("../../../assets/config.example.toml")),
-        "architecture" => Ok(include_str!("../../../migration/architecture.md")),
-        _ => Err(invalid("unknown guide topic; use index, completion, migration, config, architecture")),
-    }
+    crate::doc::topic_text(topic)
 }
