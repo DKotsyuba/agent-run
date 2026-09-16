@@ -798,6 +798,14 @@ async fn login(
 /// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home.clone())?;
+    agent_run_core::logging::configure(
+        &home,
+        if matches!(&cli.command, Command::Mcp) {
+            "mcp"
+        } else {
+            "cli"
+        },
+    );
     run_with(cli, CliDependencies::production(home)).await
 }
 

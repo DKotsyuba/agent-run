@@ -5,6 +5,7 @@ use crate::{
     domain::{now, AgentId, OrchestratorRef, Outcome, StartRequest, Status},
     error::invalid,
     lifecycle::reconcile,
+    logging,
     policy::{self, EffectivePolicy},
     process,
     profiles::{self, Profile},
@@ -124,6 +125,7 @@ impl Service {
                     if previous != fingerprint || row.parent_agent_id.is_some() {
                         return Err(Error::Conflict);
                     }
+                    logging::start(&request.runtime, &request.model, &row.id.to_string(), false);
                     return Ok(
                         json!({"agent_id":row.id,"created":false,"agent":self.view(&store,&row)?}),
                     );
@@ -174,8 +176,18 @@ impl Service {
             runtime_home: None,
             snapshot_sha256: None,
         };
-        self.admit(request, &config, identity, None, config_revision)
-            .await
+        let runtime = request.runtime.clone();
+        let model = request.model.clone();
+        let result = self
+            .admit(request, &config, identity, None, config_revision)
+            .await?;
+        if let (Some(agent_id), Some(created)) = (
+            result.get("agent_id").and_then(Value::as_str),
+            result.get("created").and_then(Value::as_bool),
+        ) {
+            logging::start(&runtime, &model, agent_id, created);
+        }
+        Ok(result)
     }
     async fn admit(
         &self,
