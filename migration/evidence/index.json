@@ -86,8 +86,8 @@
     {
       "path": "migration/adr/A10-spawn-backend.md",
       "kind": "decision",
-      "bytes": 8044,
-      "sha256": "34c497f421e6871fec38f2575e098005acd334c1f5c51dfebed2bd038fd22cd7"
+      "bytes": 10746,
+      "sha256": "9fea24b41e9cd262cdd5151f65d88e56d8e6d3782e4eeb373535224dac4ae1c5"
     },
     {
       "path": "migration/adr/A11-required-constraints.md",

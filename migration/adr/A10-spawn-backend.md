@@ -123,3 +123,53 @@ start in this sandbox, reproduced outside cargo with
    seconds after a wall-clock step; rows written by such a Python process will
    not compare equal to the raw kernel value. Rust-written rows carry the token
    and are immune; legacy rows are not.
+
+## Measured cost of decision 5: an escaped grandchild survives cleanup
+
+Decision 5 says only a verified-`Alive` leader-owned group is ever signalled.
+That rule has a price, and it is the one Python behavior this port does not
+reproduce:
+`tests/test_adapter_versions.py::test_grandchild_holding_stdout_cannot_outlive_the_deadline`.
+
+The behavior is **composite**, and only half of it is in question:
+
+| Obligation | State |
+|---|---|
+| The deadline fires and the call returns promptly, even while a grandchild holds stdout open | satisfied — `capture` bounds the join, and `Process::reap` now bounds reader teardown |
+| The grandchild is dead or a zombie once cleanup returns | **not satisfied** — Python kills the whole process group; this port signals only a verified leader |
+
+### The measurement
+
+Run against `capacity::sources::capture` (`crates/agent-run-core/src/capacity/sources.rs`),
+mirroring Python's fixture: a `/bin/sh` probe starts a background descendant that
+inherits stdout, records its PID, prints a version and exits; `capture` is given a
+one-second deadline; the test then polls the descendant with `kill(pid, 0)`.
+
+- Descendant sleeping **6 s** (Python's own figure): **test passes**. It is a
+  false pass. `capture` can spend up to four seconds of bounded waiting, the poll
+  window adds two more, and the descendant reaches its natural exit inside that
+  window. Nothing was killed; the sleep simply ended.
+- Descendant sleeping **60 s**: **test fails** —
+  `grandchild survived group cleanup: pid … still signalable`.
+
+Python does not have this problem with a 6 s fixture because its deadline is
+0.5 s and its poll window 0.5 s, so natural exit cannot fall inside it. Copying
+the literal `6` without copying the ratio is what produced the false pass. Any
+future test of this behavior must keep the descendant's lifetime far outside the
+sum of the deadline and the poll window.
+
+### The choice this leaves open
+
+The two implementations make different promises, and neither is strictly safer:
+
+- **Python** promises that a descendant cannot outlive cleanup. It kills the
+  recorded process group unconditionally.
+- **This port** promises that no unverified process is ever signalled. If the
+  leader is gone, the group id may already belong to something else, so it
+  refuses to signal and reports the descendant set as unknown rather than clean.
+
+Adopting Python's guarantee means accepting that a reused group id can be
+signalled. Keeping decision 5 means accepting that an escaped descendant can
+outlive a probe. **This is an owner decision, not an implementation gap**, and it
+is the reason the behavior above is carried as unported rather than silently
+reclassified.
