@@ -8,7 +8,7 @@ and each now has a test that fails if it returns.
 They are collected here because they share a shape worth knowing before
 reviewing or extending this code.
 
-## The pattern: four of these are the same defect
+## The pattern: five of these are the same defect
 
 Five of the eight are the same failure in different places — **Python names a
 deadline or refuses to answer, and the Rust port waits forever or answers

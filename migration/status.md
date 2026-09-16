@@ -102,8 +102,8 @@ yourself.
 
 ## Defects this migration found in itself
 
-Seven correctness defects were found in the Rust implementation while closing
-the qualification gaps, and all are fixed and merged. Four are the same failure
+Eight correctness defects were found in the Rust implementation while closing
+the qualification gaps, and all are fixed and merged. Five are the same failure
 in different places: **Python names a deadline or refuses to answer, and this
 port waited forever or reported "clean" from an observation it could not make.**
 Two of those sites carried a comment asserting a bound the code did not
