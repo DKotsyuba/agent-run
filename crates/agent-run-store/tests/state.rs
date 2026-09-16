@@ -9,6 +9,9 @@ use agent_run_store::Store;
 use serde_json::json;
 use std::path::Path;
 
+/// Mirrors `test_state_db.py::test_fresh_init_and_reopen_apply_schema_pragmas_and_private_modes`.
+///
+/// Initialization and a second connection retain the durable schema and WAL safety settings.
 #[test]
 fn schema_initialization_and_reopen() {
     let h = common::Home::new();
@@ -17,6 +20,28 @@ fn schema_initialization_and_reopen() {
     assert_eq!(a["schema_version"], 16);
     assert_eq!(a["tables"], 16);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
+    let store = h.store();
+    assert_eq!(
+        store
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    assert_eq!(
+        store
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 #[test]
 fn admission_is_durable_and_replay_is_exact() {
@@ -209,6 +234,9 @@ fn backup_is_openable_and_never_overwrites_an_existing_file() {
         16
     );
 }
+/// Mirrors `test_state_db.py::test_invalid_and_newer_versions_refuse_without_schema_mutation`.
+///
+/// A newer schema version is rejected without being changed by this binary.
 #[test]
 fn newer_database_version_is_refused_without_upgrade() {
     let h = common::Home::new();

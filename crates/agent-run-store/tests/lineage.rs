@@ -116,16 +116,29 @@ fn python_test_resume_lineage_has_one_concurrent_latest_child() {
     assert_eq!(inherited, "fixture-session");
 }
 
+/// Copies a committed SQLite fixture before opening it so SQLite sidecars stay disposable.
+fn copied_golden_database() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/baseline/db/current-v16.sqlite"
+        ),
+        home.path().join("state.db"),
+    )
+    .unwrap();
+    home
+}
+
 /// Mirrors the golden rows used by Python `test_state_outbox.py` and `test_resume.py` without mutating the fixture.
 #[test]
 fn python_golden_v16_lineage_and_outbox_rows_remain_readable() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/baseline/db/current-v16.sqlite"
-    );
-    let connection =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
+    let home = copied_golden_database();
+    let connection = rusqlite::Connection::open_with_flags(
+        home.path().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
     let delivery: (String, String, u32) = connection
         .query_row(
             "SELECT id,state,attempts FROM deliveries WHERE id='delivery-succeeded'",

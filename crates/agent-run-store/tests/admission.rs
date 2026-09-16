@@ -182,6 +182,9 @@ fn crash_worker_dies_between_admission_writes() {
 }
 
 /// Mirrors Python `test_create_agent_is_atomic_when_event_insert_crashes`.
+/// Mirrors Python `test_state_store.py::test_admission_rolls_back_fault_or_commits_complete_starting_owner`.
+///
+/// A killed writer leaves neither the agent row nor its initial journal rows visible.
 #[test]
 fn process_death_mid_transaction_leaves_no_partial_admission() {
     let home = common::Home::new();
