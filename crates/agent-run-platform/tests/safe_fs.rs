@@ -167,6 +167,54 @@ fn agent_dir_requires_a_well_formed_agent_id() {
     assert!(paths::agent_dir("not-an-agent-id", home).is_err());
 }
 
+/// Mirrors `tests/test_paths.py::PathTests::test_agent_directory_rejects_traversal_id`
+#[test]
+fn agent_directory_rejects_traversal_id() {
+    let root = tempdir();
+    assert!(paths::agent_dir("../outside", Some(root.path().to_path_buf())).is_err());
+}
+
+/// Mirrors `tests/test_paths.py::PathTests::test_agent_directory_cannot_escape_through_symlink`
+#[test]
+fn agent_directory_cannot_escape_through_symlink() {
+    let root = tempdir();
+    let outside = tempdir();
+    std::fs::create_dir(root.path().join("agents")).unwrap();
+    std::fs::remove_dir(root.path().join("agents")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("agents")).unwrap();
+    assert!(paths::agent_dir(
+        "ag-20260101-000000-abcdef0123",
+        Some(root.path().to_path_buf())
+    )
+    .is_err());
+}
+
+/// Mirrors `tests/test_paths.py::PathTests::test_blank_and_unresolved_home_are_rejected`
+#[test]
+fn blank_and_unresolved_home_are_rejected() {
+    assert!(paths::agent_run_home(Some(Path::new("").to_path_buf())).is_err());
+    assert!(fs::expand(Path::new("relative-home")).is_err());
+}
+
+/// Mirrors `tests/test_paths.py::PathTests::test_home_uses_environment_and_returns_resolved_paths`
+#[test]
+fn home_uses_environment_and_returns_resolved_paths() {
+    let root = tempdir();
+    let expected = root.path().canonicalize().unwrap();
+    assert_eq!(
+        paths::agent_run_home(Some(root.path().to_path_buf())).unwrap(),
+        expected
+    );
+    assert_eq!(
+        paths::config_path(Some(root.path().to_path_buf())).unwrap(),
+        expected.join("config.toml")
+    );
+    assert_eq!(
+        paths::state_db_path(Some(root.path().to_path_buf())).unwrap(),
+        expected.join("state.db")
+    );
+}
+
 /// Mirrors `paths.py:create_agent_dir`'s private (`0700`) directory mode on
 /// every level it creates.
 #[test]

@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod claude;
 pub mod codex;
+pub mod command_policy;
 pub mod glm;
 pub mod io;
 pub mod materialize;

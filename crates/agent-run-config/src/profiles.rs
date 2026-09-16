@@ -10,6 +10,14 @@ use agent_run_domain::{
 use agent_run_platform::fs;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
+
+const PROFILE_NAME: fn(&str) -> bool = |value| {
+    !value.is_empty()
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -46,6 +54,63 @@ pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     b
+}
+
+/// Resolve existing absolute directories and retain only the minimal antichain.
+///
+/// Symlink aliases are canonicalized before deduplication. Relative, missing,
+/// non-directory, and otherwise unresolvable inputs are rejected so a profile
+/// never grants a path whose ownership cannot be proven.
+pub fn normalize_read_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut resolved = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !root.is_absolute() {
+            return Err(invalid("read root must be an absolute existing directory"));
+        }
+        let path = root
+            .canonicalize()
+            .map_err(|_| invalid("read root must be an absolute existing directory"))?;
+        if !path.is_dir() {
+            return Err(invalid("read root must be an absolute existing directory"));
+        }
+        resolved.push(path);
+    }
+    Ok(normalize_roots(&resolved))
+}
+
+/// Resolve one configured profile file without following an escaping link.
+pub fn profile_path(directory: &std::path::Path, name: &str) -> Result<PathBuf> {
+    if !PROFILE_NAME(name) {
+        return Err(invalid(
+            "profile must be a configured profile name, not a path",
+        ));
+    }
+    if !directory.is_absolute() {
+        return Err(invalid(
+            "profiles.directory must be an absolute existing directory",
+        ));
+    }
+    let root = directory
+        .canonicalize()
+        .map_err(|_| invalid("profiles.directory must be an absolute existing directory"))?;
+    if !root.is_dir() {
+        return Err(invalid(
+            "profiles.directory must be an absolute existing directory",
+        ));
+    }
+    let candidate = root.join(format!("{name}.md"));
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| invalid(format!("profile does not exist: {name}")))?;
+    if !resolved.starts_with(&root) {
+        return Err(agent_run_domain::Error::PathEscape(format!(
+            "profile escapes configured directory: {name}"
+        )));
+    }
+    if !resolved.is_file() {
+        return Err(invalid(format!("profile is not a file: {name}")));
+    }
+    Ok(resolved)
 }
 pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
     let (meta, body) = if let Some(rest) = text.strip_prefix("+++\n") {
@@ -109,7 +174,7 @@ pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
         revision,
         canonical,
         allow_external_read_roots,
-        read_roots: normalize_roots(&request.read_roots),
+        read_roots: normalize_read_roots(&request.read_roots)?,
         skills: meta.skills.unwrap_or_default(),
         mcp: meta.mcp.unwrap_or_default(),
         required_constraints,
@@ -120,7 +185,9 @@ pub fn load(cfg: &Config, rt: &Runtime, request: &StartRequest) -> Result<Profil
         return Err(invalid("profile must be a configured name, not a path"));
     }
     let raw = fs::Dir::open(cfg.profiles_dir())?.read(
-        std::path::Path::new(&format!("{}.md", request.profile)),
+        profile_path(cfg.profiles_dir(), &request.profile)?
+            .strip_prefix(cfg.profiles_dir())
+            .map_err(|_| invalid("profile escapes configured directory"))?,
         1024 * 1024,
     )?;
     let mut p = parse(

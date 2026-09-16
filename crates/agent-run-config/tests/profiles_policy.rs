@@ -8,7 +8,10 @@ use agent_run_config::{
     policy::{self, Constraint, DeclaredCapability, Enforcement},
     profiles,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 /// Mirrors `test_profiles.py::test_named_profile_body_and_write_can_only_narrow`
 /// and `test_canonical_role_owns_every_grant_and_asset_selection`: a legacy
@@ -71,6 +74,101 @@ fn unknown_or_invalid_role_declarations_are_rejected() {
     assert!(incomplete.to_string().contains("incomplete"));
 }
 
+/// Mirrors `tests/test_profiles.py::ProfileTests::test_profile_names_and_symlink_escape_are_rejected`
+#[test]
+fn profile_names_and_symlink_escape_are_rejected() {
+    let home = common::Home::new();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("role.md"), "Outside").unwrap();
+    std::fs::create_dir_all(home.config.profiles_dir()).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("role.md"),
+        home.config.profiles_dir().join("linked.md"),
+    )
+    .unwrap();
+    assert!(profiles::profile_path(home.config.profiles_dir(), "../role").is_err());
+    assert!(matches!(
+        profiles::profile_path(home.config.profiles_dir(), "linked"),
+        Err(agent_run_domain::Error::PathEscape(_))
+    ));
+}
+
+/// Mirrors `tests/test_profiles.py::ProfileTests::test_read_roots_are_resolved_deduplicated_and_minimal`
+#[test]
+fn read_roots_are_resolved_deduplicated_and_minimal() {
+    let home = common::Home::new();
+    let child = home.path.join("child");
+    std::fs::create_dir(&child).unwrap();
+    let alias = home.path.join("alias");
+    std::os::unix::fs::symlink(&child, &alias).unwrap();
+    assert_eq!(
+        profiles::normalize_read_roots(&[child, alias, home.path.clone()]).unwrap(),
+        vec![home.path.clone()]
+    );
+    assert!(profiles::normalize_read_roots(&[PathBuf::from("relative")]).is_err());
+    assert!(profiles::normalize_read_roots(&[home.path.join("missing")]).is_err());
+}
+
+/// Mirrors `tests/test_profiles.py::ProfileTests::test_canonical_role_owns_every_grant_and_asset_selection`
+#[test]
+fn canonical_role_owns_every_grant_and_asset_selection() {
+    let home = common::Home::new();
+    let mut request = home.request();
+    request.profile = "implement".into();
+    let role = profiles::parse(
+        "+++
+revision = \"1\"
+write = true
+network = false
+allow_external_read_roots = true
+skills = [\"lsp-first\", \"document-code\"]
+mcp = [\"agent-lsp\"]
+required_constraints = [\"plugin_immutability\"]
++++
+Implement and verify the requested change.
+",
+        &request,
+    )
+    .unwrap();
+    assert!(role.canonical && role.write && role.revision == "1");
+    assert_eq!(role.skills, vec!["lsp-first", "document-code"]);
+    assert_eq!(role.mcp, vec!["agent-lsp"]);
+    assert!(role
+        .required_constraints
+        .contains(&Constraint::PluginImmutability));
+}
+
+/// Mirrors `tests/test_profiles.py::ProfileTests::test_incomplete_or_unrevisioned_canonical_role_is_rejected`
+#[test]
+fn incomplete_or_unrevisioned_canonical_role_is_rejected() {
+    let home = common::Home::new();
+    let request = home.request();
+    assert!(profiles::parse(
+        "+++
+write = false
+skills = [\"code-reading\"]
++++
+Review.
+",
+        &request
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("revision"));
+    assert!(profiles::parse(
+        "+++
+revision = \"1\"
+write = false
++++
+Review.
+",
+        &request
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("incomplete"));
+}
+
 /// Mirrors `test_effective_policy.py::test_only_explicit_required_unsupported_constraints_reject`:
 /// a required, unsupported constraint denies admission with named evidence.
 #[test]
@@ -97,6 +195,150 @@ fn admission_denies_with_evidence_when_a_required_isolation_constraint_is_unsupp
     assert!(!evidence.supported);
     assert!(!evidence.reason.is_empty());
     assert!(policy.admit().is_err());
+}
+
+/// Mirrors `tests/test_effective_policy.py::test_network_boundaries_are_independent_and_legacy_admission_stays_open`
+#[test]
+fn network_boundaries_are_independent_and_legacy_admission_stays_open() {
+    let home = common::Home::new();
+    let profile = profiles::parse("Implement.", &home.request()).unwrap();
+    let policy = policy::effective_policy(
+        &profile,
+        "claude",
+        "darwin",
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+    );
+    let web = policy
+        .constraints
+        .iter()
+        .find(|item| item.constraint == Constraint::WebToolsDisabled)
+        .unwrap();
+    assert!(web.supported && web.enforcement == Enforcement::ToolFilter);
+    for constraint in [
+        Constraint::ExternalNetworkIsolation,
+        Constraint::LoopbackTcpIsolation,
+        Constraint::UnixIpcIsolation,
+        Constraint::McpIpcIsolation,
+    ] {
+        let evidence = policy
+            .constraints
+            .iter()
+            .find(|item| item.constraint == constraint)
+            .unwrap();
+        assert!(!evidence.supported && evidence.enforcement == Enforcement::Unsupported);
+        assert_eq!(evidence.platform, "darwin");
+        assert!(!evidence.reason.is_empty());
+    }
+    assert!(policy::admission_decision(&policy).allowed);
+}
+
+/// Mirrors `tests/test_effective_policy.py::test_platform_scopes_are_applied_without_upgrading_configuration`
+#[test]
+fn platform_scopes_are_applied_without_upgrading_configuration() {
+    let home = common::Home::new();
+    let profile = profiles::parse(
+        "+++
+write = false
+network = false
++++
+Read.",
+        &home.request(),
+    )
+    .unwrap();
+    let required = BTreeSet::from([Constraint::FilesystemWriteIsolation]);
+    let capabilities = BTreeMap::from([(
+        Constraint::FilesystemWriteIsolation,
+        DeclaredCapability {
+            enforcement: Enforcement::OsEnforced,
+            scope: "writes outside selected roots".into(),
+            reason: "Linux sandbox probe passed".into(),
+            platforms: BTreeSet::from(["linux".into()]),
+        },
+    )]);
+    let policy = policy::effective_policy(&profile, "codex", "darwin", &capabilities, &required);
+    let write = policy
+        .constraints
+        .iter()
+        .find(|item| item.constraint == Constraint::FilesystemWriteIsolation)
+        .unwrap();
+    assert_eq!(write.enforcement, Enforcement::Unsupported);
+    assert_eq!(write.platform, "darwin");
+    assert!(write.reason.contains("linux"));
+    assert_eq!(
+        policy::admission_decision(&policy).unsupported_required,
+        vec![Constraint::FilesystemWriteIsolation]
+    );
+}
+
+/// Mirrors `tests/test_effective_policy.py::test_required_input_is_strictly_typed[required0]`
+#[test]
+fn required_input_is_strictly_typed_empty_set() {
+    let home = common::Home::new();
+    let profile = profiles::parse("Implement.", &home.request()).unwrap();
+    let required: BTreeSet<Constraint> = BTreeSet::new();
+    let policy =
+        policy::effective_policy(&profile, "claude", "darwin", &BTreeMap::new(), &required);
+    assert!(policy::admission_decision(&policy).allowed);
+}
+
+/// Mirrors `tests/test_effective_policy.py::test_required_input_is_strictly_typed[required1]`
+#[test]
+fn required_input_is_strictly_typed_constraint_set() {
+    let home = common::Home::new();
+    let profile = profiles::parse("Implement.", &home.request()).unwrap();
+    let required: BTreeSet<Constraint> = BTreeSet::from([Constraint::PluginImmutability]);
+    let policy =
+        policy::effective_policy(&profile, "claude", "darwin", &BTreeMap::new(), &required);
+    assert!(!policy::admission_decision(&policy).allowed);
+}
+
+/// Mirrors `tests/test_effective_policy.py::test_required_isolation_rejects_insufficient_levels[advisory]`
+#[test]
+fn required_advisory_isolation_is_rejected() {
+    assert_insufficient_isolation(Enforcement::Advisory);
+}
+
+/// Mirrors `tests/test_effective_policy.py::test_required_isolation_rejects_insufficient_levels[tool_filter]`
+#[test]
+fn required_tool_filter_isolation_is_rejected() {
+    assert_insufficient_isolation(Enforcement::ToolFilter);
+}
+
+/// Check one weak enforcement declaration in required and legacy modes.
+fn assert_insufficient_isolation(enforcement: Enforcement) {
+    let home = common::Home::new();
+    let profile = profiles::parse("Implement.", &home.request()).unwrap();
+    let capabilities = BTreeMap::from([(
+        Constraint::ExternalNetworkIsolation,
+        DeclaredCapability {
+            enforcement,
+            scope: "prompt or tool surface only".into(),
+            reason: "no socket enforcement".into(),
+            platforms: BTreeSet::new(),
+        },
+    )]);
+    let required = BTreeSet::from([Constraint::ExternalNetworkIsolation]);
+    let policy = policy::effective_policy(&profile, "claude", "darwin", &capabilities, &required);
+    let external = policy
+        .constraints
+        .iter()
+        .find(|item| item.constraint == Constraint::ExternalNetworkIsolation)
+        .unwrap();
+    assert_eq!(external.enforcement, enforcement);
+    assert!(!external.supported);
+    assert_eq!(
+        policy::admission_decision(&policy).unsupported_required,
+        vec![Constraint::ExternalNetworkIsolation]
+    );
+    let legacy = policy::effective_policy(
+        &profile,
+        "claude",
+        "darwin",
+        &capabilities,
+        &BTreeSet::new(),
+    );
+    assert!(policy::admission_decision(&legacy).allowed);
 }
 
 /// Mirrors `test_effective_policy.py::test_required_isolation_rejects_insufficient_levels`:

@@ -59,6 +59,40 @@ fn require_beneath(root: &Path, candidate: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve every existing component of `path` while retaining missing suffixes.
+///
+/// Existing symlinks are resolved before the caller applies its containment
+/// check; a missing final agent directory remains a lexical child of the
+/// resolved existing parent. Filesystem errors other than a missing suffix are
+/// returned so callers never turn an unreadable path into an admission.
+fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
+    let mut suffix = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(_) => {
+                let mut resolved = cursor.canonicalize()?;
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = cursor
+                    .file_name()
+                    .ok_or_else(|| invalid("path has no existing parent"))?
+                    .to_os_string();
+                suffix.push(component);
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| invalid("path has no existing parent"))?
+                    .to_path_buf();
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// The directory owned by one agent id: `<home>/agents/<agent_id>`
 /// (`paths.py:agent_dir`, which validates through `validate_agent_id`
 /// first). Rejecting anything but a well-formed `AgentId` up front, before
@@ -69,9 +103,9 @@ fn require_beneath(root: &Path, candidate: &Path) -> Result<()> {
 pub fn agent_dir(agent_id: &str, home: Option<PathBuf>) -> Result<PathBuf> {
     let id = AgentId::from_str(agent_id)?;
     let root = agent_run_home(home)?;
-    let agents_root = root.join("agents");
+    let agents_root = resolve_existing_prefix(&root.join("agents"))?;
     require_beneath(&root, &agents_root)?;
-    let candidate = agents_root.join(id.as_str());
+    let candidate = resolve_existing_prefix(&agents_root.join(id.as_str()))?;
     require_beneath(&agents_root, &candidate)?;
     Ok(candidate)
 }
