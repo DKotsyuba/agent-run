@@ -33,7 +33,7 @@ defaults. No dependency was added.
 ## Evidence
 
 Python transcripts in `tests/fixtures/baseline/mcp/` were captured through the
-actual CLI and temporary real broker. `rust/tests/mcp_parity.rs` compares four
+actual CLI and temporary real broker. `crates/agent-run/tests/mcp_parity.rs` compares four
 handshakes, tool schemas, success, validation, unknown tool, cancellation,
 broker unavailable, and EOF against that corpus. This satisfies migration plan
 M10 / inventory TR-3 test T67 for the handshake-era stdio contract.

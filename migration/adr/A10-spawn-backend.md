@@ -6,7 +6,7 @@ Platform of record for this spike: macOS 27.0.0 (Darwin, arm64), rustc 1.99.0-ni
 ## Decision
 
 1. **Spawn backend: `posix_spawn` with `POSIX_SPAWN_SETSID`, via `libc`.**
-   `rust/src/launch.rs` builds argv, an environment snapshot, file actions and
+   `crates/agent-run-platform/src/launch.rs` builds argv, an environment snapshot, file actions and
    spawn attributes in the parent and lets the kernel create the session. No
    Rust code runs in the child between fork and exec, which is what the
    multithreaded daemon requires (AGENTS.md invariant, plan §8.3).
@@ -31,7 +31,7 @@ Platform of record for this spike: macOS 27.0.0 (Darwin, arm64), rustc 1.99.0-ni
 3. **Chosen path is recorded as launch evidence.** `SpawnBackend` serializes as
    `posix_spawn_setsid` / `fork_setsid` and is written into
    `agents.startup_owner_pid_identity` next to the provisional PID identity,
-   before any proof (`rust/src/supervisor.rs`).
+   before any proof (`crates/agent-run-core/src/supervisor.rs`).
 4. **Process birth identity: kernel start time, Python-compatible.**
    macOS reads `proc_pidinfo(PROC_PIDTBSDINFO)` and falls back to
    `sysctl(KERN_PROC_PID)` — psutil's own source — when that is denied;
@@ -99,7 +99,7 @@ returns `EPERM` for another user's process, so before the `sysctl` fallback a
 PID reused by a root process read as `Denied` instead of `Reused` — safe
 against signalling, but it would have hidden real PID reuse from reconciliation.
 
-Session/group and cleanup evidence comes from `rust/tests/launch.rs`
+Session/group and cleanup evidence comes from `crates/agent-run-platform/tests/launch.rs`
 (`getsid(pid) == getpgid(pid) == pid`, wrapper plus grandchild killed on READY
 timeout, exact `WEXITSTATUS` from the reaper, no signal for a stale identity).
 
