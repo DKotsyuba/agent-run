@@ -133,7 +133,30 @@ must not be installed over a working release.** Outstanding:
 5. **Live engine and notification-host smoke tests** against real installed
    engines have not been authorized or run.
 
-A reviewed `Cargo.lock` is committed and the toolchain is pinned to Rust 1.98.1.
+A reviewed `Cargo.lock` is committed (224 packages, lock version 4) and the
+toolchain is pinned to Rust 1.98.1.
+
+**Verifying `--locked` offline: filter by platform, or it will look broken.**
+`cargo metadata --locked --offline` without a platform filter fails with
+
+```
+error: failed to download `android_system_properties v0.1.6`
+Caused by: attempting to make an HTTP request, but --offline was specified
+```
+
+That is **not** a stale lockfile. `cargo metadata` resolves dependencies for
+every platform at once, and `android_system_properties` is an Android-only
+transitive dependency of `iana-time-zone`; it is absent from the offline
+registry because a macOS build never needs it. Resolution restricted to the
+host target succeeds:
+
+```
+cargo metadata --locked --offline --filter-platform aarch64-apple-darwin
+```
+
+So the committed lock is consistent for the supported target. Anyone auditing
+the lockfile offline should use the filtered form; the unfiltered failure is an
+artifact of cross-platform resolution without network access.
 
 ## Structured output clarification
 
