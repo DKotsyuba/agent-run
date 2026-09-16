@@ -1,6 +1,6 @@
 //! Bounded LF-delimited JSON-RPC 2.0 over a private same-user Unix socket.
 use super::frame;
-use crate::{dispatch, fs, service::Service, Error, Result};
+use crate::{dispatch, service::Service, Error, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
@@ -13,9 +13,49 @@ use std::{
 use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream},
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
 };
+
+/// Python-compatible upper bound for one newline-delimited JSON RPC message.
 pub const MAX_FRAME: usize = 1024 * 1024;
+const MAX_CONNECTIONS: usize = 32;
+const MAX_PENDING_REQUESTS: usize = 64;
+const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
+const CONTROL_METHODS: &[&str] = &["start", "resume", "cancel", "steer"];
+
+/// Bounded ownership lanes for ordinary requests.
+///
+/// Admission and lifecycle commands use `control`; all other ordinary calls
+/// use `read`. Long polls deliberately acquire neither permit: their service
+/// opens and drops SQLite connections around each poll, so no transaction is
+/// retained while sleeping.
+#[derive(Clone)]
+struct Lanes {
+    control: Arc<Semaphore>,
+    read: Arc<Semaphore>,
+}
+
+impl Lanes {
+    /// Creates the two independently bounded Python-compatible work queues.
+    fn new() -> Self {
+        Self {
+            control: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
+            read: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
+        }
+    }
+
+    /// Reserves a lane without queueing a socket handler behind overload.
+    fn try_acquire(&self, method: &str) -> Option<OwnedSemaphorePermit> {
+        let lane = if CONTROL_METHODS.contains(&method) {
+            &self.control
+        } else {
+            &self.read
+        };
+        lane.clone().try_acquire_owned().ok()
+    }
+}
+/// Removes only the listener inode this broker created while retaining its lock.
 struct SocketGuard {
     path: PathBuf,
     device: u64,
@@ -31,43 +71,78 @@ impl Drop for SocketGuard {
         }
     }
 }
+/// Builds a JSON-RPC error, omitting `data` when this failure class has none.
 fn err(id: Value, code: i32, message: &str, data: Option<Value>) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message,"data":data}})
+    let mut error = json!({"code":code,"message":message});
+    if let Some(data) = data {
+        error["data"] = data;
+    }
+    json!({"jsonrpc":"2.0","id":id,"error":error})
 }
+/// Turns one domain failure into the Python socket's stable domain envelope.
+fn domain_err(id: Value, error: &Error) -> Value {
+    let public = error.public();
+    err(
+        id,
+        -32000,
+        &public.message,
+        Some(json!({"code":public.kind,"message":public.message})),
+    )
+}
+/// Validates and dispatches one decoded JSON-RPC object without socket I/O.
+///
+/// Notifications return `None`; malformed requests use the JSON-RPC envelope
+/// required by the Python broker. The caller owns `service` and therefore the
+/// SQLite connection lifetime remains outside this pure transport boundary.
 pub async fn respond(service: &Service, v: Value) -> Option<Value> {
+    if v.is_array() {
+        return Some(err(
+            Value::Null,
+            -32600,
+            "batch requests are not supported",
+            None,
+        ));
+    }
     let Some(obj) = v.as_object() else {
-        return Some(err(Value::Null, -32600, "request must be an object", None));
+        return Some(err(Value::Null, -32600, "invalid request", None));
     };
+    let absent_id = !obj.contains_key("id");
     let id = obj.get("id").cloned().unwrap_or(Value::Null);
     let valid_id = id.is_null() || id.is_string() || id.is_number();
-    if !valid_id
-        || obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+    if !valid_id {
+        return Some(err(Value::Null, -32600, "invalid request id", None));
+    }
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || !obj.get("method").is_some_and(Value::is_string)
     {
-        return Some(err(Value::Null, -32600, "invalid JSON-RPC request", None));
+        return if absent_id {
+            None
+        } else {
+            Some(err(id, -32600, "invalid request", None))
+        };
     }
     let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
-    let notification = !obj.contains_key("id");
+    let notification = absent_id;
+    let params = obj.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return if notification {
+            None
+        } else {
+            Some(err(id, -32602, "params must be an object", None))
+        };
+    }
     let known = dispatch::is_tool(method) || ["tools", "ping", "wait"].contains(&method);
     let response = if !known {
         err(id, -32601, "method not found", None)
     } else {
-        match dispatch::call(
-            service,
-            method,
-            obj.get("params").cloned().unwrap_or_else(|| json!({})),
-        )
-        .await
-        {
+        match dispatch::call(service, method, params).await {
             Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
             Err(e) => {
-                let public = e.public();
-                err(
-                    id,
-                    e.rpc_code(),
-                    &public.message,
-                    Some(json!({"kind":public.kind})),
-                )
+                if e.rpc_code() == -32602 {
+                    err(id, -32602, &e.public().message, None)
+                } else {
+                    domain_err(id, &e)
+                }
             }
         }
     };
@@ -77,7 +152,13 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
         Some(response)
     }
 }
-async fn connection(stream: UnixStream, service: Service) -> Result<()> {
+/// Runs one connection with framed parsing, lane admission, and ordered writes.
+async fn connection(
+    stream: UnixStream,
+    service: Service,
+    lanes: Lanes,
+    control_only: bool,
+) -> Result<()> {
     // SAFETY: geteuid has no arguments or memory safety preconditions.
     let uid = unsafe { libc::geteuid() };
     if stream.peer_cred()?.uid() != uid {
@@ -86,23 +167,63 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
     let (input, mut output) = stream.into_split();
     let mut input = BufReader::new(input);
     loop {
-        let raw = match tokio::time::timeout(
-            Duration::from_secs(120),
-            frame::read(&mut input, MAX_FRAME),
-        )
-        .await
-        {
+        let deadline = if control_only {
+            CONTROL_FRAME_DEADLINE
+        } else {
+            Duration::from_secs(120)
+        };
+        let raw = match tokio::time::timeout(deadline, frame::read(&mut input, MAX_FRAME)).await {
             Ok(Ok(Some(raw))) => raw,
             Ok(Ok(None)) => return Ok(()),
-            _ => {
-                return Err(crate::error::invalid(
-                    "socket input ended or exceeded its bound",
-                ))
+            Ok(Err(_)) => {
+                let _ = frame::write(
+                    &mut output,
+                    &err(Value::Null, -32700, "request exceeds maximum size", None),
+                    MAX_FRAME,
+                )
+                .await;
+                return Ok(());
             }
+            Err(_) => return Ok(()),
         };
-        let response = match serde_json::from_slice(&raw) {
-            Ok(value) => respond(&service, value).await,
-            Err(_) => Some(err(Value::Null, -32700, "invalid JSON", None)),
+        let response = match serde_json::from_slice::<Value>(&raw) {
+            Ok(value) => {
+                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                if control_only && !CONTROL_METHODS.contains(&method) {
+                    let id = value.get("id").cloned().unwrap_or(Value::Null);
+                    if value.get("id").is_some() {
+                        Some(err(
+                            id,
+                            -32001,
+                            "API capacity is reserved for control requests",
+                            None,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    let long_poll = method == "wait"
+                        || (method == "list_agents"
+                            && value
+                                .get("params")
+                                .and_then(|params| params.get("wait_seconds"))
+                                .and_then(Value::as_f64)
+                                .is_some_and(|seconds| seconds > 0.0));
+                    if long_poll {
+                        respond(&service, value).await
+                    } else if let Some(_permit) = lanes.try_acquire(method) {
+                        respond(&service, value).await
+                    } else {
+                        let id = value.get("id").cloned().unwrap_or(Value::Null);
+                        if value.get("id").is_some() {
+                            Some(err(id, -32001, "API request queue is full", None))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+            Err(_) => Some(err(Value::Null, -32700, "parse error", None)),
         };
         if let Some(mut response) = response {
             if serde_json::to_vec(&response)?.len() + 1 > MAX_FRAME {
@@ -120,9 +241,22 @@ async fn connection(stream: UnixStream, service: Service) -> Result<()> {
             .await
             .map_err(|_| crate::error::invalid("socket output timeout"))??;
         }
+        if control_only {
+            return Ok(());
+        }
     }
 }
+/// Serves the default `<home>/api.sock` broker endpoint until a termination signal.
 pub async fn serve(home: &Path) -> Result<()> {
+    serve_at(home, &home.join("api.sock")).await
+}
+
+/// Serves one selected private socket until SIGINT or SIGTERM.
+///
+/// The adjacent lock fences stale-socket probing and binding for the complete
+/// listener lifetime. Shutdown stops accepts and gives admitted handlers five
+/// seconds to finish before refusing remaining work by closing their streams.
+pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
     let _ = crate::config::Config::load(home)?;
     let _ = crate::state::Store::open(home)?;
     let directory = std::fs::symlink_metadata(home)?;
@@ -137,16 +271,29 @@ pub async fn serve(home: &Path) -> Result<()> {
             "agent-run home must be an owned mode-0700 directory",
         ));
     }
+    let path = socket_path.to_path_buf();
+    let lock_path = path.with_file_name(format!(
+        ".{}.lock",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("api.sock")
+    ));
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(home.join("api.lock"))?;
+        .open(&lock_path)?;
+    let lock_meta = lock.metadata()?;
+    if !lock_meta.is_file() || lock_meta.uid() != uid {
+        return Err(crate::error::invalid(
+            "API startup lock is not a private owned file",
+        ));
+    }
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
     lock.try_lock_exclusive()
-        .map_err(|_| crate::error::invalid("another broker holds api.lock"))?;
-    let path = home.join("api.sock");
+        .map_err(|_| crate::error::invalid("API socket is already in use"))?;
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
         if !meta.file_type().is_socket() || meta.uid() != uid {
             return Err(crate::error::invalid(
@@ -158,6 +305,15 @@ pub async fn serve(home: &Path) -> Result<()> {
             Err(e)
                 if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)].contains(&e.raw_os_error()) =>
             {
+                let current = std::fs::symlink_metadata(&path)?;
+                if current.dev() != meta.dev()
+                    || current.ino() != meta.ino()
+                    || !current.file_type().is_socket()
+                {
+                    return Err(crate::error::invalid(
+                        "API socket changed during stale reclaim",
+                    ));
+                }
                 std::fs::remove_file(&path)?
             }
             Err(e) => return Err(e.into()),
@@ -186,19 +342,45 @@ pub async fn serve(home: &Path) -> Result<()> {
             }
         }
     });
-    let gate = Arc::new(Semaphore::new(128));
+    let gate = Arc::new(Semaphore::new(MAX_CONNECTIONS - 1));
+    let control_gate = Arc::new(Semaphore::new(1));
+    let lanes = Lanes::new();
+    let mut handlers = JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>break,
             _=term.recv()=>break,
             accepted=listener.accept()=>{
-                let(stream,_)=accepted?;let Ok(permit)=gate.clone().try_acquire_owned()else{drop(stream);continue;};let service=service.clone();
-                tokio::spawn(async move{let _permit=permit;let _=connection(stream,service).await;});
+                let(mut stream,_)=accepted?;
+                let (permit, control_only) = match gate.clone().try_acquire_owned() {
+                    Ok(permit) => (permit, false),
+                    Err(_) => match control_gate.clone().try_acquire_owned() {
+                        Ok(permit) => (permit, true),
+                        Err(_) => {
+                            let _ = frame::write(&mut stream, &err(Value::Null, -32001, "API connection limit reached", None), MAX_FRAME).await;
+                            continue;
+                        }
+                    },
+                };
+                let service=service.clone();
+                let lanes=lanes.clone();
+                handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only).await; });
             }
         }
     }
     worker.abort();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !handlers.is_empty() && tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if tokio::time::timeout(remaining, handlers.join_next())
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    handlers.abort_all();
     Ok(())
 }
 /// A separate connection for every call; no shared response-routing state.

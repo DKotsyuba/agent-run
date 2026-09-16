@@ -725,12 +725,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Mcp => transport::mcp::serve(home, None).await?,
         Command::Api { command } => match command {
             Api::Serve { socket } => {
-                if socket.is_some() {
-                    return Err(Error::Unsupported(
-                        "custom API socket paths are not yet supported".into(),
-                    ));
+                if let Some(socket) = socket {
+                    transport::socket::serve_at(&home, &socket).await?
+                } else {
+                    transport::socket::serve(&home).await?
                 }
-                transport::socket::serve(&home).await?
             }
             Api::Launchd {
                 binary,
