@@ -311,8 +311,17 @@ impl Config {
         if let Some(t) = raw.get_mut("runtimes").and_then(toml::Value::as_table_mut) {
             t.remove("opencode");
         }
-        let mut cfg: Self = raw
-            .try_into()
+        // Re-render to TOML text and re-parse from there rather than calling
+        // `raw.try_into()` directly: converting a parsed `toml::Value` into
+        // another type through serde's generic Value-to-Value path silently
+        // decays `Datetime` values to plain strings (verified against the
+        // `toml` crate actually in use), which would let a TOML date sneak
+        // past every `toml::Value::Datetime` rejection in this module (most
+        // importantly `native_settings`, whose Python counterpart rejects
+        // dates explicitly because they cannot round-trip through JSON).
+        // Re-parsing from text keeps the parser's own datetime handling.
+        let rewritten = toml::to_string(&raw).map_err(|_| invalid("invalid config TOML"))?;
+        let mut cfg: Self = toml::from_str(&rewritten)
             .map_err(|_| invalid("invalid config shape, type, or unknown field"))?;
         cfg.validate(home)?;
         Ok(cfg)
@@ -433,7 +442,13 @@ impl Config {
             if !name(n) {
                 return Err(invalid("invalid runtime name"));
             }
-            let kind = r.kind()?;
+            // Python's `_parse_runtimes` only checks the adapter string's
+            // `module:attribute` shape at config-load time; a foreign (but
+            // well-formed) adapter reference is accepted and every other
+            // field is still validated normally. Only fail closed here on
+            // features whose semantics are actually adapter-specific
+            // (scoped accounts, Codex workspace controls, native settings).
+            let kind = Adapter::parse(&r.adapter).ok();
             r.binary = fs::expand(&r.binary)?;
             expand(&mut r.home)?;
             unique(&r.models, "models")?;
@@ -447,7 +462,8 @@ impl Config {
             }
             unique(&r.accounts, "accounts")?;
             if r.accounts.iter().any(|a| !account(a))
-                || (!r.accounts.is_empty() && !matches!(kind, Adapter::Codex | Adapter::Claude))
+                || (!r.accounts.is_empty()
+                    && !matches!(kind, Some(Adapter::Codex) | Some(Adapter::Claude)))
             {
                 return Err(invalid("invalid scoped accounts declaration"));
             }
@@ -496,12 +512,12 @@ impl Config {
                 }
             }
             if let Some(p) = &mut r.workspace_root {
-                if kind != Adapter::Codex {
+                if kind != Some(Adapter::Codex) {
                     return Err(invalid("workspace_root requires codex"));
                 }
                 expand(p)?;
             }
-            if r.workspace_network && (kind != Adapter::Codex || r.workspace_root.is_none()) {
+            if r.workspace_network && (kind != Some(Adapter::Codex) || r.workspace_root.is_none()) {
                 return Err(invalid("workspace_network requires codex workspace_root"));
             }
             if let Some(roots) = &mut r.rust {
@@ -547,7 +563,18 @@ impl Config {
                     return Err(invalid("unknown limits source"));
                 }
             }
-            native_settings(kind, &r.native_settings)?;
+            match kind {
+                Some(k) => native_settings(k, &r.native_settings)?,
+                // Mirrors Python's `ADAPTER_RESERVED_ROOTS.get(adapter) is
+                // None` fail-closed path: an adapter Rust does not ship a
+                // merge implementation for cannot accept tuning at all.
+                None if !r.native_settings.is_empty() => {
+                    return Err(invalid(
+                        "native_settings is supported only by the codex, claude, glm, and qwen adapters",
+                    ));
+                }
+                None => {}
+            }
         }
         Ok(())
     }
