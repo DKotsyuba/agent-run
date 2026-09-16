@@ -73,6 +73,12 @@ fn capacity_samples_and_route_snapshots_commit_as_one_batch() {
     let mut broken = slice("mock", 2.0);
     broken.samples.push(broken.samples[0].clone());
     assert!(persist(home.path(), &broken, 10).is_err());
+    let mut invalid_sample = slice("mock", 3.0);
+    invalid_sample.samples[0].remaining_percent = Some(101.0);
+    assert!(persist(home.path(), &invalid_sample, 10).is_err());
+    let mut expired = slice("mock", 4.0);
+    expired.valid_until = 3.0;
+    assert!(persist(home.path(), &expired, 10).is_err());
     let store = agent_run_store::Store::open(home.path()).unwrap();
     assert_eq!(
         store
@@ -102,6 +108,34 @@ fn capacity_persistence_rejects_cross_runtime_and_oversized_payloads() {
         valid_until: 2.0,
     };
     assert!(persist(home.path(), &slice, 10).is_err());
+    let key = key();
+    let oversized = Topology {
+        pools: vec![Pool {
+            pool_id: "pool".into(),
+            keys: [key.clone()].into_iter().collect(),
+        }],
+        routes: (0..3_000)
+            .map(|index| Route {
+                route_id: format!("route-{index}"),
+                ..route("route", None)
+            })
+            .collect(),
+    };
+    let oversized = Slice {
+        runtime: "mock".into(),
+        scope_id: "main".into(),
+        samples: vec![Sample {
+            key,
+            remaining_percent: Some(50.0),
+            reset_at: None,
+            observed_at: Some(1.0),
+            valid_until: Some(2.0),
+        }],
+        topology: oversized,
+        observed_at: 1.0,
+        valid_until: 2.0,
+    };
+    assert!(persist(home.path(), &oversized, 10).is_err());
 }
 
 /// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_history_survives_successful_appends`.
