@@ -61,8 +61,7 @@ fn runtime_document(config: &Config, runtime: &Runtime) -> Result<Value> {
             "rust": environment.rust.as_ref().map(|roots| json!([roots.rustup_home, roots.cargo_bin])),
         }),
     };
-    let native_settings = serde_json::to_value(&runtime.native_settings)?;
-    Ok(json!({
+    let mut document = json!({
         "enabled": runtime.enabled,
         "adapter": runtime.adapter,
         "binary": runtime.binary,
@@ -83,10 +82,17 @@ fn runtime_document(config: &Config, runtime: &Runtime) -> Result<Value> {
         "priority_lane_multipliers": runtime.priority_lane_multipliers,
         "rust": runtime.rust.as_ref().map(|roots| json!([roots.rustup_home, roots.cargo_bin])),
         "environment": environment,
-        "native_settings": native_settings,
-        "workspace_root": runtime.workspace_root,
-        "workspace_network": runtime.workspace_network,
-    }))
+    });
+    if !runtime.native_settings.is_empty() {
+        document["native_settings"] = serde_json::to_value(&runtime.native_settings)?;
+    }
+    if let Some(workspace_root) = &runtime.workspace_root {
+        document["workspace_root"] = json!(workspace_root);
+    }
+    if runtime.workspace_network {
+        document["workspace_network"] = Value::Bool(true);
+    }
+    Ok(document)
 }
 
 /// Build Python-v1 effective configuration evidence without persisting secrets.
