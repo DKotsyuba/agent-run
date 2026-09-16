@@ -85,6 +85,14 @@ fn omniroute_malformed_or_overflow_rows_are_unavailable() {
 }
 
 /// Mirrors `tests/test_capacity_sources.py::test_claude_runtime_stream_fallback`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_never_makes_a_live_call`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_missing_agents_dir_is_empty`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_reads_the_newest_rate_limit_event_into_two_window_samples`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_prefers_the_newest_agent_directory`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_stale_event_has_unknown_remaining`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_malformed_or_shape_mismatched_events_yield_no_samples`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_never_leaks_unrelated_fields_into_samples`.
+/// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_limits_considers_only_the_newest_bounded_agent_files`.
 #[test]
 fn claude_runtime_stream_is_local_fallback() {
     let home = tempfile::tempdir().expect("temporary home");

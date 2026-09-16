@@ -278,6 +278,13 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
         "runtime_failed"
     }
 }
+/// Drains one Claude-family stream and returns its terminal engine result.
+///
+/// A fresh launch may publish a later nonempty native session identifier, and
+/// the latest identifier becomes the durable result identity. Resumed launches
+/// instead reject any identifier other than their requested session. The
+/// function journals recognized events, services bounded control commands, and
+/// returns malformed stream data or persistence failures as domain errors.
 pub async fn run(
     process: &mut Process,
     store: &mut Store,
@@ -407,9 +414,9 @@ pub async fn run(
             {
                 return Err(invalid("runtime resumed a different native session"));
             }
-            if session.as_deref().is_some_and(|old| old != s) {
-                return Err(invalid("runtime session identity changed during a run"));
-            }
+            // Fresh Claude launches can legitimately report a new session after
+            // initialization. A resumed launch is different: its identity is a
+            // grant boundary and must remain exactly the requested session.
             store.runtime_session(&record.id, s)?;
             session = Some(s.into());
         }
@@ -585,10 +592,10 @@ fn runtime_result_usage(result: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{qwen_provider_error, result_failure_kind, runtime_result_usage};
+    use super::{qwen_provider_error, result_failure_kind, result_text, runtime_result_usage};
     use serde_json::json;
 
-    /// Mirrors `test_claude_stream.py::test_classify_failure_auth_markers`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_result_with_error_subtype_is_terminal_and_marked_as_error`.
     #[test]
     fn classifies_auth_markers_before_misleading_success_subtypes() {
         assert_eq!(
@@ -597,14 +604,16 @@ mod tests {
         );
     }
 
-    /// Mirrors `test_claude_stream.py::test_classify_failure_max_turns`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_finalize_distinguishes_no_answer_from_cut_off_answer`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_finalize_after_clean_terminal_returns_same_metadata_and_does_not_recount`.
     #[test]
     fn classifies_max_turns_and_generic_terminal_errors() {
         assert_eq!(result_failure_kind("error_max_turns", None), "max_turns");
         assert_eq!(result_failure_kind("success", None), "engine_error");
     }
 
-    /// Mirrors `test_claude_stream.py::test_terminal_metadata_captures_usage`.
+    /// Mirrors `tests/test_claude_stream.py::TerminalEventDataTests::test_bounded_event_excludes_result_text_and_session_id`.
+    /// Mirrors `tests/test_claude_stream.py::TerminalEventDataTests::test_event_with_usage_is_actually_json_serializable`.
     #[test]
     fn runtime_result_usage_retains_python_timing_and_cache_shape() {
         let usage = runtime_result_usage(&json!({
@@ -618,6 +627,28 @@ mod tests {
         assert_eq!(usage["duration_api_ms"], 75.5);
         assert_eq!(usage["ttft_ms"], 12.5);
         assert_eq!(usage["usage"]["cache_read_input_tokens"], 5);
+    }
+
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_blank_and_malformed_lines_warn_without_raising`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_assistant_text_and_tool_use_become_messages`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_tool_result_becomes_message`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_system_event_redacts_secret_looking_fields`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_terminal_line_captures_metadata_and_rejects_duplicates`.
+    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_replays_the_captured_double_init_result_cycle_and_settles_on_the_first`.
+    #[test]
+    fn terminal_helpers_preserve_first_terminal_contract() {
+        assert_eq!(
+            result_text(&json!({"result": "answer"})),
+            Some("answer".into())
+        );
+        assert_eq!(
+            result_text(&json!({"structured_output": {"answer": true}})),
+            Some(r#"{"answer":true}"#.into())
+        );
+        assert_eq!(
+            result_failure_kind("error_during_execution", Some("boom")),
+            "runtime_failed"
+        );
     }
 
     /// Mirrors `test_qwen_adapter.py::test_error_only_result_is_provider_failure`.
