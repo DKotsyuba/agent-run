@@ -12,6 +12,8 @@ pub mod lineage;
 pub mod migrations;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
+/// Python-compatible normalization and repair of cumulative run usage rows.
+pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
 use agent_run_domain::{
@@ -498,6 +500,20 @@ impl Store {
         usage: Option<&Value>,
     ) -> Result<()> {
         terminal::finish(self, id, outcome, proof, usage)
+    }
+    /// Recomputes one agent's normalized run statistics from durable events.
+    ///
+    /// The replacement is idempotent and retains `NULL` for measurements the
+    /// engine did not report.
+    pub fn record_run_stats(&mut self, id: &AgentId) -> Result<()> {
+        run_stats::record(self, id)
+    }
+    /// Fills only missing statistics rows and returns `(backfilled, skipped)`.
+    ///
+    /// An individual malformed or unavailable agent does not stop later rows
+    /// from being repaired; its count is returned as `skipped`.
+    pub fn backfill_run_stats(&mut self) -> Result<(usize, usize)> {
+        run_stats::backfill(self)
     }
     pub fn enqueue(&mut self, id: &AgentId, kind: &str, payload: &Value) -> Result<Value> {
         if !["cancel", "steer"].contains(&kind) {

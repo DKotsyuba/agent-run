@@ -510,10 +510,7 @@ pub async fn run(
                 if text.as_ref().is_some_and(|s| s.len() > verify::MAX_ANSWER) {
                     return Err(invalid("result exceeds answer size bound"));
                 }
-                let u = &v["usage"];
-                let input = u.get("input_tokens").and_then(Value::as_i64);
-                let output = u.get("output_tokens").and_then(Value::as_i64);
-                let usage = json!({"input_tokens":input,"output_tokens":output,"cache_read_tokens":u["cache_read_input_tokens"],"cache_write_tokens":u["cache_creation_input_tokens"],"total_tokens":input.zip(output).and_then(|(a,b)|if a>=0&&b>=0{a.checked_add(b)}else{None}),"duration_ms":v["duration_ms"],"num_turns":v["num_turns"],"cost_usd":v["total_cost_usd"]});
+                let usage = runtime_result_usage(&v);
                 if record.resume_of_runtime_session_id.is_some()
                     && outcome.runtime_session_id != record.resume_of_runtime_session_id
                 {
@@ -534,9 +531,18 @@ pub async fn run(
     }
 }
 
+/// Retains only the Python `runtime_result` fields used for durable statistics.
+///
+/// Values deliberately remain unvalidated JSON here: the store applies the
+/// shared numeric/nullability rules after the terminal event is durable.
+fn runtime_result_usage(result: &Value) -> Value {
+    json!({"duration_ms":result["duration_ms"],"duration_api_ms":result["duration_api_ms"],"num_turns":result["num_turns"],"ttft_ms":result["ttft_ms"],"total_cost_usd":result["total_cost_usd"],"usage":result["usage"]})
+}
+
 #[cfg(test)]
 mod tests {
-    use super::result_failure_kind;
+    use super::{result_failure_kind, runtime_result_usage};
+    use serde_json::json;
 
     /// Mirrors `test_claude_stream.py::test_classify_failure_auth_markers`.
     #[test]
@@ -552,5 +558,21 @@ mod tests {
     fn classifies_max_turns_and_generic_terminal_errors() {
         assert_eq!(result_failure_kind("error_max_turns", None), "max_turns");
         assert_eq!(result_failure_kind("success", None), "engine_error");
+    }
+
+    /// Mirrors `test_claude_stream.py::test_terminal_metadata_captures_usage`.
+    #[test]
+    fn runtime_result_usage_retains_python_timing_and_cache_shape() {
+        let usage = runtime_result_usage(&json!({
+            "duration_ms": 100,
+            "duration_api_ms": 75.5,
+            "ttft_ms": 12.5,
+            "num_turns": 2,
+            "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 10, "cache_read_input_tokens": 5}
+        }));
+        assert_eq!(usage["duration_api_ms"], 75.5);
+        assert_eq!(usage["ttft_ms"], 12.5);
+        assert_eq!(usage["usage"]["cache_read_input_tokens"], 5);
     }
 }
