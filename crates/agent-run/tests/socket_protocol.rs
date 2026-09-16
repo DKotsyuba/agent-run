@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::{io::BufReader, net::UnixStream};
 
-/// Mirrors Python `test_socket_mode_and_stale_socket_replacement`'s live bind.
+/// Mirrors `test_api_socket.py::test_socket_mode_and_stale_socket_replacement`.
 #[tokio::test]
 async fn python_socket_binds_custom_path_and_answers_ping() {
     let temp = tempfile::tempdir().expect("temporary home");

@@ -2,7 +2,7 @@
 
 use std::{env, process::Command};
 
-/// Mirrors Python `test_doc.py::test_every_topic_loads_and_is_bounded`.
+/// Mirrors `test_doc.py::test_every_topic_loads_and_is_bounded`.
 #[test]
 fn python_doc_topics_are_embedded_and_bounded() {
     for topic in [
@@ -23,13 +23,13 @@ fn python_doc_topics_are_embedded_and_bounded() {
     }
 }
 
-/// Mirrors Python `test_doc.py::test_topic_text_rejects_unknown_topic`.
+/// Mirrors `test_doc.py::test_topic_text_rejects_unknown_topic`.
 #[test]
 fn python_doc_rejects_unknown_topic() {
     assert!(agent_run::dispatch::doc("not-a-real-topic").is_err());
 }
 
-/// Mirrors Python `test_doc.py::test_doc_with_topic_returns_that_topic`.
+/// Mirrors `test_doc.py::test_doc_with_topic_returns_that_topic`.
 #[test]
 fn doc_works_outside_the_checkout() {
     let directory = tempfile::tempdir().expect("unrelated current directory");
@@ -50,7 +50,7 @@ fn doc_works_outside_the_checkout() {
         .is_some_and(|text| text.contains("opencode/")));
 }
 
-/// Mirrors Python `test_doc.py::test_topic_text_completion_is_contract_template`.
+/// Mirrors `test_doc.py::test_topic_text_completion_is_contract_template`.
 #[test]
 fn completion_topic_contains_the_shared_notice_template() {
     let text = agent_run::dispatch::doc("completion").expect("completion topic");
@@ -58,7 +58,7 @@ fn completion_topic_contains_the_shared_notice_template() {
     assert!(text.contains("- Notice:"));
 }
 
-/// Mirrors Python `test_doc.py::test_doc_with_no_topic_returns_index`.
+/// Mirrors `test_doc.py::test_doc_with_no_topic_returns_index`.
 #[test]
 fn doc_cli_without_topic_returns_the_index() {
     let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -73,7 +73,7 @@ fn doc_cli_without_topic_returns_the_index() {
         .is_some_and(|text| text.contains("agent-run")));
 }
 
-/// Mirrors Python `test_doc.py::test_doc_with_completion_topic_returns_contract_text`.
+/// Mirrors `test_doc.py::test_doc_with_completion_topic_returns_contract_text`.
 #[test]
 fn doc_cli_returns_the_completion_contract() {
     let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -88,7 +88,7 @@ fn doc_cli_returns_the_completion_contract() {
         .is_some_and(|text| text.contains("agent-run/completion")));
 }
 
-/// Mirrors Python `test_doc.py::test_doc_with_unknown_topic_is_refused`.
+/// Mirrors `test_doc.py::test_doc_with_unknown_topic_is_refused`.
 #[test]
 fn doc_cli_rejects_an_unknown_topic() {
     let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))

@@ -155,7 +155,7 @@ fn initialize(version: &str) -> Value {
 }
 
 /// Compare every observable non-time-dependent exchange from one captured Python session.
-/// Mirrors Python `test_mcp.py::test_official_client_negotiates_lists_and_calls_over_stdio`.
+/// Mirrors `test_mcp.py::test_official_client_negotiates_lists_and_calls_over_stdio`.
 #[test]
 fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
     for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
@@ -235,7 +235,7 @@ fn mcp_broker_unavailable_matches_python_tool_error() {
 }
 
 /// Reject an oversized pre-initialize frame instead of buffering it without bound.
-/// Mirrors Python `test_mcp.py::test_oversized_stdio_frame_stays_bounded_and_uses_sdk_error_path`.
+/// Mirrors `test_mcp.py::test_oversized_stdio_frame_stays_bounded_and_uses_sdk_error_path`.
 #[test]
 fn mcp_rejects_oversized_stdio_frame() {
     let harness = Harness::new();

@@ -53,7 +53,7 @@ fn argument_for<'a>(command: &'a Command, action: &Value) -> Option<&'a clap::Ar
         .find(|argument| argument.get_id().as_str() == destination)
 }
 
-/// Mirrors Python `test_cli.py::test_producer_shims_and_all_top_level_commands_parse`.
+/// Mirrors `test_cli.py::test_producer_shims_and_all_top_level_commands_parse`.
 #[test]
 fn python_cli_spec_command_surface_is_present() {
     let root = Cli::command();
@@ -151,7 +151,7 @@ fn python_cli_spec_command_surface_is_present() {
     }
 }
 
-/// Mirrors Python `test_cli.py::test_one_shot_start_uses_resident_broker_without_ephemeral_runtime`.
+/// Mirrors `test_cli.py::test_one_shot_start_uses_resident_broker_without_ephemeral_runtime`.
 #[tokio::test]
 async fn python_start_refuses_a_missing_broker() {
     let home = tempdir().expect("temporary home");
@@ -173,7 +173,7 @@ async fn python_start_refuses_a_missing_broker() {
     assert!(matches!(run(cli).await, Err(Error::BrokerUnavailable)));
 }
 
-/// Mirrors Python `test_cli.py::test_expected_errors_are_stable_json_but_unexpected_faults_propagate`.
+/// Mirrors `test_cli.py::test_expected_errors_are_stable_json_but_unexpected_faults_propagate`.
 #[test]
 fn python_cli_validation_error_uses_the_expected_json_field_names() {
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -186,7 +186,7 @@ fn python_cli_validation_error_uses_the_expected_json_field_names() {
     assert!(value["error"]["message"].is_string());
 }
 
-/// Mirrors Python `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`.
+/// Mirrors `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`.
 #[test]
 fn python_init_emits_home_config_and_state_fields() {
     let home = tempdir().expect("temporary home");
@@ -205,7 +205,7 @@ fn python_init_emits_home_config_and_state_fields() {
     }
 }
 
-/// Mirrors Python `test_cli.py::test_producer_shims_and_all_top_level_commands_parse`.
+/// Mirrors `test_cli.py::test_producer_shims_and_all_top_level_commands_parse`.
 #[test]
 fn python_delivery_cancel_returns_a_durable_acknowledgement() {
     let home = tempdir().expect("temporary home");
@@ -280,7 +280,7 @@ fn python_permission_request_allows_only_proven_trusted_mcp_calls() {
     assert!(refused.stdout.is_empty(), "unproven requests stay silent");
 }
 
-/// Mirrors Python `test_cli.py::test_login_claude_defaults_global_and_rejects_unsupported_runtime`.
+/// Mirrors `test_cli.py::test_login_claude_defaults_global_and_rejects_unsupported_runtime`.
 #[test]
 fn python_login_rejects_codex_but_auth_executes_its_declared_account() {
     let home = tempdir().expect("temporary home");

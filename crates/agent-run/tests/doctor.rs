@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::{symlink, MetadataExt, PermissionsExt},
 };
 
-/// Mirrors Python `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`.
+/// Mirrors `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`.
 #[test]
 fn python_init_bootstraps_a_private_minimal_home_idempotently() {
     let temp = tempfile::tempdir().expect("temporary parent");
@@ -53,7 +53,7 @@ fn python_init_refuses_a_symlinked_config() {
     assert_eq!(error.to_string(), "config.toml must not be a symlink");
 }
 
-/// Mirrors Python `test_doctor.py::test_plaintext_secret_is_named_but_never_returned`.
+/// Mirrors `test_doctor.py::test_plaintext_secret_is_named_but_never_returned`.
 #[test]
 fn python_doctor_names_plaintext_secret_without_its_value() {
     let temp = tempfile::tempdir().expect("temporary home");
@@ -72,7 +72,7 @@ fn python_doctor_names_plaintext_secret_without_its_value() {
         .contains("must-not-leak"));
 }
 
-/// Mirrors Python `test_doctor.py::test_reports_bounded_metadata_without_mutating_state`.
+/// Mirrors `test_doctor.py::test_reports_bounded_metadata_without_mutating_state`.
 #[test]
 fn python_doctor_reports_missing_static_runtime_artifacts() {
     let temp = tempfile::tempdir().expect("temporary home");
@@ -110,7 +110,7 @@ fn python_doctor_reports_missing_static_runtime_artifacts() {
     assert!(!report.ok());
 }
 
-/// Mirrors Python `test_doctor.py::test_canonical_role_readiness_uses_shared_catalog_without_runtime_home`.
+/// Mirrors `test_doctor.py::test_canonical_role_readiness_uses_shared_catalog_without_runtime_home`.
 #[test]
 fn python_doctor_validates_canonical_roles_from_shared_catalogs() {
     let temp = tempfile::tempdir().expect("temporary home");
@@ -148,7 +148,7 @@ fn python_doctor_validates_canonical_roles_from_shared_catalogs() {
     assert!(!codes.contains("mixed_role_assets"), "{codes:?}");
 }
 
-/// Mirrors Python `test_doctor.py::test_canary_handshake_ok_reports_a_completed_real_handshake`.
+/// Mirrors `test_doctor.py::test_canary_handshake_ok_reports_a_completed_real_handshake`.
 #[test]
 fn python_doctor_cli_canary_proves_the_production_ready_handshake() {
     let temp = tempfile::tempdir().expect("temporary home");

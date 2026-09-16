@@ -10,7 +10,7 @@ use agent_run::{
 use serde_json::{json, Value};
 use tokio::{io::BufReader, net::UnixListener};
 
-/// Mirrors Python `test_broker_client.py::test_validation_error_mapping`.
+/// Mirrors `test_broker_client.py::test_validation_error_mapping`.
 #[tokio::test]
 async fn client_maps_a_validation_envelope_to_a_typed_error() {
     let home = tempfile::tempdir().expect("temporary home");
