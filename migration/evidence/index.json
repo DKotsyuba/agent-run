@@ -1,0 +1,159 @@
+{
+  "index_version": 1,
+  "generated_for_commit": "7adf0d1e5ab5d5659d9bed4fb463052d5e998ea5",
+  "generated_at": "2026-09-16T05:34:49+00:00",
+  "note": "Inventory of migration evidence and decisions with content hashes. Produced by hand for board task M56; `xtask evidence verify` does not exist yet and must regenerate and check this file rather than trust it.",
+  "entry_count": 25,
+  "entries": [
+    {
+      "path": "migration/evidence/coverage-2026-09-16.md",
+      "kind": "evidence",
+      "bytes": 10361,
+      "sha256": "9b2140c9d12f89ffd6509c907d88d544a6ce31467cbd0acc66578b8251f4e7a1"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
+      "kind": "evidence",
+      "bytes": 5339,
+      "sha256": "a943e87d2a67469c0ba10a513becf3e6250681b081049fb2e1bef5e43a0b2b5c"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/REPORT.md",
+      "kind": "evidence",
+      "bytes": 3986,
+      "sha256": "d18a3bf24b093bc53faf4c1e8490d89b1adb66e9141c3d45d515266a89080811"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/SOURCE_BASELINE.json",
+      "kind": "evidence",
+      "bytes": 654,
+      "sha256": "9c1980b9c72d4268138d9dd7e95cd7a44149a7a1956a7caee61d5732f8b20323"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/node-transport-tests.tap",
+      "kind": "evidence",
+      "bytes": 1612,
+      "sha256": "18e4b40776524e191db1dfc37d3f529ec727d1a36541e2cb5471d92d82b8711e"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/prepared-sql.json",
+      "kind": "evidence",
+      "bytes": 10810,
+      "sha256": "92e07c50c15f096ccff3388684786e16571118ae8dd111992a31997470584433"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/static-checks.json",
+      "kind": "evidence",
+      "bytes": 978,
+      "sha256": "e1450ab2ec46bf64d82ac9e166f0e96c9df13c4eabecc88ccd7055569758b810"
+    },
+    {
+      "path": "migration/evidence/python-baseline-pytest.log",
+      "kind": "evidence",
+      "bytes": 4081,
+      "sha256": "7d4e0eb8344e0dd9c1b08bf3c513961132b942c7e19925ba837380354a173b9b"
+    },
+    {
+      "path": "migration/evidence/verification-2026-09-16.md",
+      "kind": "evidence",
+      "bytes": 3954,
+      "sha256": "0ca02a5945b1c736d8d9e193a8ef05a0e25af2ac2dd57aadaa85a7ab608c29c4"
+    },
+    {
+      "path": "migration/evidence/verification-final-2026-09-16.md",
+      "kind": "evidence",
+      "bytes": 4864,
+      "sha256": "b46aa092bd648d2299d0a9b3eedbc1a77dc3931935ce6f306d7c11f4950dfdf5"
+    },
+    {
+      "path": "migration/adr/A09-desktop-relay.md",
+      "kind": "decision",
+      "bytes": 20886,
+      "sha256": "1b45a2e68446afd8601278cc589d03c07ee64e676b670f73a21292c9b72d4ead"
+    },
+    {
+      "path": "migration/adr/A10-spawn-backend.md",
+      "kind": "decision",
+      "bytes": 7985,
+      "sha256": "4c529bf8acb8012ff4b3afd3352737333ea289ad602e08743587009191fd6f12"
+    },
+    {
+      "path": "migration/adr/A11-required-constraints.md",
+      "kind": "decision",
+      "bytes": 4660,
+      "sha256": "61a543f09bcd4182be5a968672f4bd85aa4c685a0e15cf96238ffa5ea22e31f3"
+    },
+    {
+      "path": "migration/adr/A12-canonical-json.md",
+      "kind": "decision",
+      "bytes": 11493,
+      "sha256": "6488d5f7785ac9762a37e2029cc90a0e1827a8fccc0468fe4ae39b9913bc6974"
+    },
+    {
+      "path": "migration/adr/A14-mcp-sdk.md",
+      "kind": "decision",
+      "bytes": 1873,
+      "sha256": "4a46a68e8ee1d503801bc51832319fc13e2c307dc28fcd4465bebae050f7afb8"
+    },
+    {
+      "path": "migration/adr/A15-platforms.md",
+      "kind": "decision",
+      "bytes": 3932,
+      "sha256": "4f5ea7bf0ff3688a6abd3b1e6c0f1f1779c93cb52d0bcd64e4f5c69e00f080f5"
+    },
+    {
+      "path": "migration/adr/A17-notice-contract.md",
+      "kind": "decision",
+      "bytes": 12729,
+      "sha256": "82b669737dc498f82e83cbcbcddfead2f6462a4ab21880fcccecf2b1e4a51a4a"
+    },
+    {
+      "path": "migration/adr/A18-python-run-continuation.md",
+      "kind": "decision",
+      "bytes": 2643,
+      "sha256": "4c4d092aaac2c0e00d3ff807620d24ae447b1f94564e9420d57c96da703ef2ba"
+    },
+    {
+      "path": "migration/adr/A19-release-and-deploy-divergence.md",
+      "kind": "decision",
+      "bytes": 5955,
+      "sha256": "442e2c8d6060608e5e5bd7e595cea7051abb79b499ebab5ff654a9ddecbd4cf0"
+    },
+    {
+      "path": "migration/adr/A20-supervisor-architecture-divergence.md",
+      "kind": "decision",
+      "bytes": 3874,
+      "sha256": "5893acdace56b9db04d74e8beb5e4cad48780a0d2140c3a227ca6b3960509054"
+    },
+    {
+      "path": "migration/adr/A21-runtime-platform-divergence.md",
+      "kind": "decision",
+      "bytes": 1133,
+      "sha256": "f5bba39c765cccd393559e69d0248ca7c1534d328eff523c3552d04f69e95312"
+    },
+    {
+      "path": "migration/adr/cli-extensions.md",
+      "kind": "decision",
+      "bytes": 1195,
+      "sha256": "2fde5ded01f0bdc2c22c978a496f8dfa0676b3889da8713319958895232b49ee"
+    },
+    {
+      "path": "migration/baseline/test-map.csv",
+      "kind": "ledger",
+      "bytes": 388382,
+      "sha256": "5e67beecd5043cdcbba190d4285179b5bda779b64b362bea42025553edbf9df9"
+    },
+    {
+      "path": "migration/baseline/divergences.csv",
+      "kind": "ledger",
+      "bytes": 4900,
+      "sha256": "5dfd375853cff0c4f3e7299a997cac3423a13df21ad2de884532cd07397d3598"
+    },
+    {
+      "path": "migration/tasks.csv",
+      "kind": "ledger",
+      "bytes": 25642,
+      "sha256": "5dab16c0e6a906c8b866bee7fe5f1bcb55455e737f3bb1d670c4dc052c1827ed"
+    }
+  ]
+}
