@@ -111,6 +111,7 @@ dependencies = [
  "agent-run-domain",
  "agent-run-platform",
  "fs2",
+ "libc",
  "regex",
  "rusqlite",
  "serde",

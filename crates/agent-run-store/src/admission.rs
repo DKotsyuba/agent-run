@@ -5,11 +5,10 @@
 //! `created` and `start_accepted` events. Its `IMMEDIATE` transaction makes
 //! those facts visible together or not at all.
 
-use crate::{tx_event, Record, Store, ACTIVE_SQL};
+use crate::{lineage, tx_event, Record, Store, ACTIVE_SQL};
 use agent_run_config::config::Config;
 use agent_run_domain::{
     domain::{now, AgentId, StartRequest, Status},
-    error::invalid,
     Error, Result,
 };
 use agent_run_platform::process;
@@ -114,7 +113,9 @@ pub fn admit_with_config_revision(
         return Err(Error::Capacity);
     }
 
-    let parent = validate_parent(&tx, parent)?;
+    let lineage = parent
+        .map(|record| lineage::resume_parent(&tx, &record.id))
+        .transpose()?;
     let session = upsert_session(&tx, &checked, accepted_at)?;
     let id = AgentId::new();
     let summary = checked
@@ -125,21 +126,31 @@ pub fn admit_with_config_revision(
         .chars()
         .take(160)
         .collect::<String>();
-    let root = parent
+    let root = lineage
         .as_ref()
-        .map(|record| record.root_agent_id.as_str())
+        .map(|lineage| lineage.root_agent_id.as_str())
         .unwrap_or(id.as_str());
-    let sequence = parent
+    let sequence = lineage
         .as_ref()
-        .map(|record| {
-            record
-                .sequence
-                .checked_add(1)
-                .ok_or_else(|| invalid("lineage sequence overflow"))
-        })
-        .transpose()?
+        .map(|lineage| lineage.sequence)
         .unwrap_or(1);
-    tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,?,?,?,?,?,?)", params![id.as_str(), checked.request_id, session, checked.runtime, checked.model, checked.profile, checked.task, summary, checked.workdir.to_string_lossy(), serde_json::to_string(&checked)?, accepted_at, checked.timeout_seconds.unwrap_or(config.core.default_timeout_seconds), config_revision, parent.as_ref().map(|record| record.id.as_str()), root, sequence, parent.as_ref().and_then(|record| record.runtime_session_id.as_deref()), serde_json::to_string(identity)?])?;
+    let resume_session = lineage
+        .as_ref()
+        .map(|lineage| lineage.runtime_session_id.as_str());
+    let inserted = tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,?,?,?,?,?,?)", params![id.as_str(), checked.request_id, session, checked.runtime, checked.model, checked.profile, checked.task, summary, checked.workdir.to_string_lossy(), serde_json::to_string(&checked)?, accepted_at, checked.timeout_seconds.unwrap_or(config.core.default_timeout_seconds), config_revision, parent.map(|record| record.id.as_str()), root, sequence, resume_session, serde_json::to_string(identity)?]);
+    if let Err(error) = inserted {
+        let latest: Option<String> = tx
+            .query_row(
+                "SELECT id FROM agents WHERE parent_agent_id=? ORDER BY sequence DESC LIMIT 1",
+                [parent.map(|record| record.id.as_str())],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest.is_some() {
+            return Err(Error::Conflict);
+        }
+        return Err(error.into());
+    }
     if let Ok(owner) = process::inspect(std::process::id() as i32) {
         tx.execute(
             "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
@@ -217,35 +228,6 @@ fn ensure_same_replay(
         return Err(Error::Conflict);
     }
     Ok(())
-}
-
-/// Confirm a resume parent remains terminal, session-bearing, and childless.
-fn validate_parent(
-    tx: &rusqlite::Transaction<'_>,
-    parent: Option<&Record>,
-) -> Result<Option<Record>> {
-    let Some(parent) = parent else {
-        return Ok(None);
-    };
-    let actual = tx.query_row(
-        "SELECT * FROM agents WHERE id=?",
-        [parent.id.as_str()],
-        Record::read,
-    )?;
-    if !actual.status.terminal() || actual.runtime_session_id.is_none() {
-        return Err(invalid(
-            "resume requires a terminal agent with native session identity",
-        ));
-    }
-    let child_exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents WHERE parent_agent_id=?)",
-        [actual.id.as_str()],
-        |row| row.get(0),
-    )?;
-    if child_exists {
-        return Err(Error::Conflict);
-    }
-    Ok(Some(actual))
 }
 
 /// Upsert the session only for a new admission, after replay and capacity pass.
