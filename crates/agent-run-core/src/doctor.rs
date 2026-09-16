@@ -10,12 +10,16 @@ use agent_run_platform::{
     keychain,
     process::{self, ProcessState},
 };
+use chrono::TimeZone;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -45,6 +49,48 @@ pub struct Report {
     pub findings: Vec<Finding>,
 }
 
+/// One process record needed to diagnose stale MCP sessions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpProcess {
+    /// Operating-system process identifier.
+    pub pid: i32,
+    /// Process start time in Unix seconds, when it could be parsed.
+    pub started_at: Option<f64>,
+    /// Bounded command line reported by the process lister.
+    pub command: String,
+}
+
+/// Injectable native probes used by [`run_with`].
+pub struct Dependencies {
+    /// Executable used for the detached canary; `None` uses this executable.
+    pub canary_executable: Option<PathBuf>,
+    /// Process inventory provider; production uses bounded `ps` snapshots.
+    pub process_lister: Arc<dyn Fn() -> Vec<McpProcess> + Send + Sync>,
+}
+
+impl Default for Dependencies {
+    /// Select the same executable and native process inventory as production doctor.
+    fn default() -> Self {
+        Self {
+            canary_executable: None,
+            process_lister: Arc::new(list_mcp_processes),
+        }
+    }
+}
+
+impl Dependencies {
+    /// Builds doctor probes with an optional canary executable and process lister.
+    pub fn new(
+        canary_executable: Option<PathBuf>,
+        process_lister: impl Fn() -> Vec<McpProcess> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            canary_executable,
+            process_lister: Arc::new(process_lister),
+        }
+    }
+}
+
 impl Report {
     /// Returns whether the report contains no error-severity finding.
     pub fn ok(&self) -> bool {
@@ -61,6 +107,11 @@ impl Report {
 /// In particular, process identity is read through the native platform layer;
 /// an unreadable process is never classified as dead or as an MCP server.
 pub fn run(home: &Path) -> Result<Report> {
+    run_with(home, &Dependencies::default())
+}
+
+/// Runs doctor with injectable canary and process-inventory probes.
+pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     let home = home.to_path_buf();
     let mut report = Report {
         home,
@@ -107,8 +158,16 @@ pub fn run(home: &Path) -> Result<Report> {
         &mut report.findings,
     );
     supervisors(&snapshot.agents, &mut report.findings);
-    canary(&report.home, &mut report.findings);
-    mcp_self(&report.home, &mut report.findings);
+    canary(
+        &report.home,
+        dependencies.canary_executable.as_deref(),
+        &mut report.findings,
+    );
+    mcp_inventory(
+        &report.home,
+        &mut report.findings,
+        dependencies.process_lister.as_ref(),
+    );
     Ok(report)
 }
 
@@ -118,20 +177,23 @@ pub fn run(home: &Path) -> Result<Report> {
 /// It proves session identity and READY through the production launch helper,
 /// then exits without opening state, materializing an adapter, or contacting a
 /// provider.  Launch failures are represented as a bounded type name only.
-fn canary(home: &Path, findings: &mut Vec<Finding>) {
+fn canary(home: &Path, configured_executable: Option<&Path>, findings: &mut Vec<Finding>) {
     let started = Instant::now();
-    let executable = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(_) => {
-            add(
-                findings,
-                "supervisor_canary_failed",
-                "error",
-                "canary",
-                "IOError",
-            );
-            return;
-        }
+    let executable = match configured_executable {
+        Some(path) => path.to_path_buf(),
+        None => match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => {
+                add(
+                    findings,
+                    "supervisor_canary_failed",
+                    "error",
+                    "canary",
+                    "IOError",
+                );
+                return;
+            }
+        },
     };
     let args = [
         std::ffi::OsStr::new("--home"),
@@ -157,6 +219,13 @@ fn canary(home: &Path, findings: &mut Vec<Finding>) {
                 ),
             );
         }
+        Err(agent_run_platform::launch::LaunchError::Bootstrap(failure)) => add(
+            findings,
+            failure.failure_kind,
+            "error",
+            "canary",
+            failure.message,
+        ),
         Err(_) => add(
             findings,
             "supervisor_canary_failed",
@@ -873,14 +942,56 @@ fn process_group_alive(group: i32) -> bool {
             .unwrap_or(false)
 }
 
-/// Emits the Python inventory self entry after a bounded native process snapshot.
+/// Lists process commands and start times using two bounded-shape `ps` queries.
+fn list_mcp_processes() -> Vec<McpProcess> {
+    let commands = ps_by_pid(&["/bin/ps", "-A", "-o", "pid=,command="]);
+    if commands.is_empty() {
+        return Vec::new();
+    }
+    let starts = ps_by_pid(&["/bin/ps", "-A", "-o", "pid=,lstart="]);
+    commands
+        .into_iter()
+        .map(|(pid, command)| McpProcess {
+            pid,
+            started_at: starts.get(&pid).and_then(|raw| parse_lstart(raw)),
+            command,
+        })
+        .collect()
+}
+
+/// Runs one short process listing and splits only at the leading PID.
+fn ps_by_pid(args: &[&str]) -> BTreeMap<i32, String> {
+    let Ok(output) = Command::new(args[0]).args(&args[1..]).output() else {
+        return BTreeMap::new();
+    };
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let line = std::str::from_utf8(line).ok()?.trim();
+            let (pid, value) = line.split_once(char::is_whitespace)?;
+            Some((pid.trim().parse().ok()?, value.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// Parses the platform `ps lstart` representation into Unix seconds.
+fn parse_lstart(raw: &str) -> Option<f64> {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let parsed = chrono::NaiveDateTime::parse_from_str(&normalized, "%a %b %d %H:%M:%S %Y").ok()?;
+    Some(
+        chrono::Local
+            .from_local_datetime(&parsed)
+            .single()?
+            .timestamp() as f64,
+    )
+}
+
+/// Emits release inventory evidence and flags MCP processes older than `current`.
 ///
-/// The platform intentionally does not expose argv for arbitrary processes.
-/// Consequently this check never labels an unrelated PID as MCP merely from
-/// its identity; a failed or opaque enumeration is the same no-finding result
-/// as Python's unavailable `ps` command.
-fn mcp_self(home: &Path, findings: &mut Vec<Finding>) {
-    let _ = process::processes();
+/// Process identity alone is never enough to classify a process as MCP: the
+/// command line must name both the MCP subcommand and agent-run entry point.
+fn mcp_inventory(home: &Path, findings: &mut Vec<Finding>, lister: &dyn Fn() -> Vec<McpProcess>) {
     let executable = std::env::current_exe()
         .ok()
         .map(|path| path.display().to_string())
@@ -896,6 +1007,56 @@ fn mcp_self(home: &Path, findings: &mut Vec<Finding>) {
         "mcp:self",
         format!("release={executable} current_target={current}"),
     );
+    let self_pid = std::process::id() as i32;
+    let switch_epoch = fs::symlink_metadata(home.join("standalone/current"))
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs_f64());
+    for process in lister().into_iter().take(LIMIT) {
+        if process.pid == self_pid || !looks_like_mcp(&process.command) {
+            continue;
+        }
+        let started = process
+            .started_at
+            .map(|time| time.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let release = process
+            .command
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown");
+        if switch_epoch.is_some_and(|switch| process.started_at.is_some_and(|start| start < switch))
+        {
+            add(
+                findings,
+                "mcp_process_older_release",
+                "warning",
+                &format!("mcp:{}", process.pid),
+                format!("started={started} release={release}; started before the current release switch and may run older code -- reconnect MCP in this session before pruning releases"),
+            );
+        } else {
+            add(
+                findings,
+                "mcp_process",
+                "info",
+                &format!("mcp:{}", process.pid),
+                format!("started={started} release={release}"),
+            );
+        }
+    }
+}
+
+/// Recognizes only command lines that name the agent-run MCP entry point.
+fn looks_like_mcp(command: &str) -> bool {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    tokens.contains(&"mcp")
+        && tokens.iter().any(|token| {
+            *token == "agent_run.cli"
+                || Path::new(token)
+                    .file_name()
+                    .is_some_and(|name| name == "agent-run")
+        })
 }
 
 /// Returns whether a configured path is an absolute executable regular file.

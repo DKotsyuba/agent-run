@@ -98,6 +98,18 @@ pub enum Error {
     /// A safe runtime error message.
     #[error("{0}")]
     Runtime(String),
+    /// A detached supervisor failed before ownership handoff with bounded evidence.
+    #[error("{message}")]
+    Bootstrap {
+        /// Agent admitted before supervisor bootstrap failed.
+        agent_id: String,
+        /// Stable bootstrap failure category.
+        failure_kind: String,
+        /// Optional named child bootstrap stage.
+        failure_stage: Option<String>,
+        /// Secret-safe failure summary.
+        message: String,
+    },
     /// A source-bearing local I/O failure whose public rendering is generic.
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -118,6 +130,15 @@ pub struct PublicError {
     pub kind: &'static str,
     /// Human-readable, bounded, secret-safe message.
     pub message: String,
+    /// Agent associated with a detached bootstrap failure, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Bootstrap failure category, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    /// Bootstrap failure stage, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<String>,
 }
 impl Error {
     /// Returns the stable machine code without formatting untrusted source diagnostics.
@@ -133,6 +154,7 @@ impl Error {
             Self::BrokerUnavailable => MachineCode::BrokerUnavailable,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
             Self::Runtime(_) => MachineCode::RuntimeError,
+            Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
             Self::Sql(_) => MachineCode::StorageError,
         }
@@ -163,6 +185,7 @@ impl Error {
             | Self::AnswerIntegrity(s)
             | Self::Integrity(s)
             | Self::Runtime(s) => s.clone(),
+            Self::Bootstrap { message, .. } => message.clone(),
             // Parser/OS/database diagnostics can contain configured secret values.
             Self::Io(_) => "local I/O operation failed".into(),
             Self::Sql(_) => "state database operation failed".into(),
@@ -172,6 +195,18 @@ impl Error {
         PublicError {
             kind: self.machine_code().as_str(),
             message: message.chars().take(512).collect(),
+            agent_id: match self {
+                Self::Bootstrap { agent_id, .. } => Some(agent_id.clone()),
+                _ => None,
+            },
+            failure_kind: match self {
+                Self::Bootstrap { failure_kind, .. } => Some(failure_kind.clone()),
+                _ => None,
+            },
+            failure_stage: match self {
+                Self::Bootstrap { failure_stage, .. } => failure_stage.clone(),
+                _ => None,
+            },
         }
     }
     /// Returns the socket JSON-RPC code from the shared protocol mapping.

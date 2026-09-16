@@ -1,5 +1,5 @@
 //! Rust MCP stdio compatibility proxy; durable execution stays in the broker.
-use crate::{dispatch, domain::OrchestratorRef, Error, Result};
+use crate::{cli::CliBroker, dispatch, domain::OrchestratorRef, Error, Result};
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -152,7 +153,11 @@ impl AsyncWrite for BoundedStdout {
 /// Retain the broker location and optional host binding for one MCP session.
 #[derive(Clone)]
 pub struct Proxy {
+    /// Resident broker used for tool calls.
+    pub broker: Arc<dyn CliBroker>,
+    /// Agent-run home retained for relay setup and diagnostics.
     pub home: PathBuf,
+    /// Optional orchestrator binding added to admission requests.
     pub orchestrator: Option<OrchestratorRef>,
 }
 impl ServerHandler for Proxy {
@@ -217,7 +222,9 @@ impl ServerHandler for Proxy {
                 arguments.insert("orchestrator".into(), json!(o));
             }
         }
-        match super::socket::client(&self.home, request.name.as_ref(), Value::Object(arguments))
+        match self
+            .broker
+            .call(request.name.as_ref(), Value::Object(arguments))
             .await
         {
             Ok(value) => Ok(tool_result(value)),
@@ -259,11 +266,47 @@ fn tool_error(code: impl Into<String>, message: impl Into<String>) -> CallToolRe
 
 /// Run the stdio server until EOF while retaining no local execution capability.
 pub async fn serve(home: PathBuf, orchestrator: Option<OrchestratorRef>) -> Result<()> {
+    let broker = Arc::new(crate::cli::SocketBroker { home: home.clone() });
+    serve_with(home, orchestrator, broker).await
+}
+
+/// Run the stdio server with an injected broker while retaining the production defaults.
+pub async fn serve_with(
+    home: PathBuf,
+    orchestrator: Option<OrchestratorRef>,
+    broker: Arc<dyn CliBroker>,
+) -> Result<()> {
+    serve_io(
+        home,
+        orchestrator,
+        broker,
+        BoundedStdin::new(),
+        BoundedStdout::new(),
+    )
+    .await
+}
+
+/// Run MCP over caller-owned streams while retaining the same broker and protocol implementation.
+pub async fn serve_io<R, W>(
+    home: PathBuf,
+    orchestrator: Option<OrchestratorRef>,
+    broker: Arc<dyn CliBroker>,
+    input: R,
+    output: W,
+) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
     let _relay = crate::delivery::relay::host(&home)?;
-    let service = Proxy { home, orchestrator }
-        .serve((BoundedStdin::new(), BoundedStdout::new()))
-        .await
-        .map_err(|_| Error::Runtime("MCP protocol initialization failed".into()))?;
+    let service = Proxy {
+        broker,
+        home,
+        orchestrator,
+    }
+    .serve((input, output))
+    .await
+    .map_err(|_| Error::Runtime("MCP protocol initialization failed".into()))?;
     service
         .waiting()
         .await
