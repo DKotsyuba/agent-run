@@ -19,7 +19,7 @@ fn main() {
     }
     if arguments.first().map(String::as_str) != Some("check") {
         eprintln!(
-            "usage: cargo xtask check | release build|build-native|verify|install|update|rollback | archive --verify | evidence verify"
+            "usage: cargo xtask check | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify | evidence verify"
         );
         std::process::exit(2);
     }
@@ -176,6 +176,24 @@ fn release_command(arguments: &[String]) {
                 .unwrap_or_default(),
             force,
         ),
+        Some("recover") => deploy::recover(
+            &value("--prefix")
+                .ok_or("--prefix is required")
+                .unwrap_or_default(),
+            &value("--home")
+                .ok_or("--home is required")
+                .unwrap_or_default(),
+            force,
+        ),
+        Some("roll-forward") => deploy::roll_forward(
+            &value("--prefix")
+                .ok_or("--prefix is required")
+                .unwrap_or_default(),
+            &value("--home")
+                .ok_or("--home is required")
+                .unwrap_or_default(),
+            force,
+        ),
         Some("rollback") => deploy::rollback(
             &value("--prefix")
                 .ok_or("--prefix is required")
@@ -186,7 +204,7 @@ fn release_command(arguments: &[String]) {
             force,
         ),
         _ => Err(
-            "usage: cargo xtask release build|build-native|verify|install|update|rollback".into(),
+            "usage: cargo xtask release build|build-native|verify|install|update|recover|roll-forward|rollback".into(),
         ),
     };
     if let Err(error) = result {
