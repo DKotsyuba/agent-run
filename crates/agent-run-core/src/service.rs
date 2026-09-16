@@ -14,6 +14,7 @@ use crate::{
     Error, Result,
 };
 use agent_run_config::role_plan;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
@@ -104,6 +105,11 @@ impl Service {
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;
+        if request.runtime == "opencode" {
+            return Err(invalid(
+                "runtime 'opencode' is no longer supported; remove [runtimes.opencode] from config.toml",
+            ));
+        }
         let fingerprint =
             agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
         {
@@ -211,6 +217,11 @@ impl Service {
         let row = store.get(&id)?;
         Ok(json!({"agent_id":id,"created":created,"agent":self.view(&store,&row)?}))
     }
+    /// Admits one native continuation after proving terminal lineage and snapshot identity.
+    ///
+    /// The parent must be terminal with a native session and a sealed Rust launch
+    /// identity. Snapshot continuations retain the parent's immutable revision;
+    /// legacy revisions remain pending until their supervisor rematerializes them.
     pub async fn resume(
         &self,
         id: &AgentId,
@@ -241,6 +252,12 @@ impl Service {
         if !active.models.contains(&parent.request.model) {
             return Err(invalid("parent model is no longer enabled"));
         }
+        let recorded = identity.config.runtime(&parent.request.runtime)?;
+        if active.home != recorded.home
+            || serde_json::to_value(&active.auth)? != serde_json::to_value(&recorded.auth)?
+        {
+            return Err(invalid("runtime identity changed since the parent ran"));
+        }
         if let Some(account) = parent.request.account.as_deref() {
             active.selected_account(Some(account))?;
         }
@@ -252,14 +269,36 @@ impl Service {
             request.orchestrator = orchestrator;
         }
         request.validate()?;
-        self.admit(
-            request,
-            &current,
-            identity,
-            Some(&parent),
-            "pending:materialization",
-        )
-        .await
+        let config_revision: String = Store::open(&self.home)?.conn.query_row(
+            "SELECT config_revision FROM agents WHERE id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        let child_revision = if config_revision.starts_with("snapshot:v1:") {
+            config_revision.as_str()
+        } else {
+            "pending:materialization"
+        };
+        match self
+            .admit(request, &current, identity, Some(&parent), child_revision)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(Error::Conflict) => {
+                let winner: Option<String> = Store::open(&self.home)?.conn.query_row(
+                    "SELECT id FROM agents WHERE parent_agent_id=? ORDER BY sequence DESC LIMIT 1",
+                    [id.as_str()],
+                    |row| row.get(0),
+                ).optional()?;
+                match winner {
+                    Some(winner) => Err(invalid(format!(
+                        "agent {id} has already been resumed by {winner}"
+                    ))),
+                    None => Err(Error::Conflict),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
     pub fn cancel(&self, id: &AgentId) -> Result<Value> {
         Store::open(&self.home)?.enqueue(id, "cancel", &json!({}))

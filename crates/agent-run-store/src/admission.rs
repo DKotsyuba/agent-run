@@ -33,7 +33,23 @@ pub fn replay_request(store: &Store, request: &StartRequest) -> Result<Option<Re
         .orchestrator
         .as_ref()
         .map(|item| item.external_session_id.as_str());
-    Ok(store.conn.query_row("SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id WHERE a.request_id=? AND ((? IS NULL AND a.orchestrator_session_id IS NULL) OR (o.transport=? AND o.external_session_id=?)) ORDER BY a.created_at LIMIT 1", params![request_id, transport, transport, session], Record::read).optional()?)
+    let sql = if request.orchestrator.is_none() {
+        "SELECT a.* FROM agents a WHERE a.request_id=? AND (a.orchestrator_session_id IS NULL OR json_extract(a.request_json,'$.orchestrator') IS NULL) ORDER BY a.created_at LIMIT 1"
+    } else {
+        "SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id WHERE a.request_id=? AND o.transport=? AND o.external_session_id=? ORDER BY a.created_at LIMIT 1"
+    };
+    let row = if request.orchestrator.is_none() {
+        store
+            .conn
+            .query_row(sql, params![request_id], Record::read)
+            .optional()?
+    } else {
+        store
+            .conn
+            .query_row(sql, params![request_id, transport, session], Record::read)
+            .optional()?
+    };
+    Ok(row)
 }
 
 /// Atomically create one `starting` agent or return its exact request replay.
@@ -196,13 +212,20 @@ fn replay_in_transaction(
     let Some(request_id) = request.request_id.as_deref() else {
         return Ok(None);
     };
-    Ok(tx
-        .query_row(
+    let row = if session.is_none() {
+        tx.query_row(
+            "SELECT * FROM agents WHERE request_id=? AND (orchestrator_session_id IS NULL OR json_extract(request_json,'$.orchestrator') IS NULL) ORDER BY created_at LIMIT 1",
+            params![request_id],
+            Record::read,
+        ).optional()?
+    } else {
+        tx.query_row(
             "SELECT * FROM agents WHERE request_id=? AND orchestrator_session_id IS ? ORDER BY created_at LIMIT 1",
             params![request_id, session],
             Record::read,
-        )
-        .optional()?)
+        ).optional()?
+    };
+    Ok(row)
 }
 
 /// Reject a request id if its immutable request hash or resume parent differs.
