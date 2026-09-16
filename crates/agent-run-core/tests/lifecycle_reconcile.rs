@@ -185,7 +185,7 @@ fn python_test_state_outbox_reconciliation_requires_valid_supplied_proof() {
     assert!(reconcile_reaped_agent(&mut store, &id, 1, 3.0).is_err());
     assert_eq!(store.get(&id).unwrap().status, Status::Starting);
     active(&store, &id, 100, "pid100:start1", 20.0);
-    assert!(reconcile_reaped_agent(&mut store, &id, 101, 3.0).unwrap() == false);
+    assert!(!reconcile_reaped_agent(&mut store, &id, 101, 3.0).unwrap());
     assert_eq!(store.get(&id).unwrap().status, Status::Running);
     assert!(
         reconcile_with(&mut store, 10, |_, _, _| ProcessState::Unknown)

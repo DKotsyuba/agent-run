@@ -62,6 +62,16 @@ pub struct Record {
     pub resume_of_runtime_session_id: Option<String>,
     pub identity: Option<Value>,
 }
+
+/// Captures persisted supervisor identity fields for immutable ownership checks.
+type SupervisorOwnership = (
+    String,
+    Option<i32>,
+    Option<String>,
+    Option<i32>,
+    Option<f64>,
+);
+
 impl Record {
     /// Decodes one complete agents-table row without changing the database.
     pub(crate) fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -510,7 +520,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<(String, Option<i32>, Option<String>, Option<i32>, Option<f64>)> = tx
+        let current: Option<SupervisorOwnership> = tx
             .query_row("SELECT status,supervisor_pid,supervisor_identity,process_group_id,supervisor_birth_time FROM agents WHERE id=?", [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
             .optional()?;
         let Some((status, old_pid, old_identity, old_group, old_birth)) = current else {
@@ -801,6 +811,7 @@ impl Store {
     }
 
     /// Schedules one owned outbox retry with bounded exponential backoff.
+    #[allow(clippy::too_many_arguments)] // Mirrors the explicit Python retry contract.
     pub fn retry_delivery(
         &mut self,
         delivery_id: &str,

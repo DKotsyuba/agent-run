@@ -295,6 +295,7 @@ fn owned_attempt(
 }
 
 /// Finishes a live delivery claim while preserving the strongest prior ambiguity flag.
+#[allow(clippy::too_many_arguments)] // Mirrors the explicit Python delivery-finalization contract.
 fn finish_claim(
     tx: &Transaction<'_>,
     delivery_id: &str,
@@ -382,6 +383,7 @@ pub(crate) fn fail(
 }
 
 /// Schedules an exponential-backoff retry for one live delivery claim.
+#[allow(clippy::too_many_arguments)] // Mirrors the explicit Python retry contract.
 pub(crate) fn retry(
     store: &mut Store,
     delivery_id: &str,

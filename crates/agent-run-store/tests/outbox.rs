@@ -122,7 +122,7 @@ fn python_test_state_outbox_retry_backoff_and_cancellation_preserve_terminal_res
     let delivery = store.claim_delivery("worker", 5.0, 10.0).unwrap().unwrap();
     let next = store
         .retry_delivery(
-            &delivery["id"].as_str().unwrap(),
+            delivery["id"].as_str().unwrap(),
             "worker",
             "ambiguous timeout",
             6.0,
