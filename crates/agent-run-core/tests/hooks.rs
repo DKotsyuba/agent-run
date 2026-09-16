@@ -102,17 +102,14 @@ fn active_agent(home: &common::Home, reference: &OrchestratorRef) {
     store.running(&id, 1234).expect("active transition");
 }
 
-/// Mirrors Python `test_bind_hook.py::test_binding_is_immutable_empty_then_same_target_but_never_another`.
+/// Mirrors `tests/test_bind_hook.py::BindHookTests::test_bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it`.
 #[test]
-fn python_bind_hook_is_idempotent_and_activates_late_delivery() {
+fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
     let home = common::Home::new();
     let (agent_id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
         .expect("fake durable admission");
-    home.store()
-        .finish(&agent_id, &Outcome::failure("fixture"), None, None)
-        .expect("terminal receipt waits for post-tool binding");
     let payload = json!({
         "session_id":"session-1",
         "hook_event_name":"PostToolUse",
@@ -120,6 +117,9 @@ fn python_bind_hook_is_idempotent_and_activates_late_delivery() {
     });
     let first = bind::run_hook(&mut home.store(), &payload, "codex_queue", Some(5.0))
         .expect("raw post-tool hook binds");
+    home.store()
+        .finish(&agent_id, &Outcome::failure("fixture"), None, None)
+        .expect("bound terminal receipt");
     let second = bind::run_hook(&mut home.store(), &payload, "codex_queue", Some(6.0))
         .expect("same target is idempotent");
     assert_eq!(first.session_id, second.session_id);
@@ -143,6 +143,36 @@ fn python_bind_hook_is_idempotent_and_activates_late_delivery() {
     .expect_err("different session is refused loudly");
     assert!(conflict.to_string().contains("NOT confirmed"));
     assert!(conflict.to_string().contains("immutable"));
+}
+
+/// Mirrors `tests/test_bind_hook.py::BindHookTests::test_unbound_terminal_agent_never_gets_a_notice_row`.
+#[test]
+fn unbound_terminal_agent_never_gets_a_notice_row() {
+    let home = common::Home::new();
+    let (agent_id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .expect("durable admission");
+    home.store()
+        .finish(&agent_id, &Outcome::failure("fixture"), None, None)
+        .expect("terminal transition");
+
+    let store = home.store();
+    assert_eq!(
+        store.delivery_status(&agent_id).unwrap()["state"],
+        "not_created"
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+                [agent_id.as_str()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
 }
 
 /// Mirrors Python `test_context_hook.py::test_first_prompt_creates_receipt_dedups_and_reuses_later_binding`.

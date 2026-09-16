@@ -13,9 +13,15 @@ use std::path::Path;
 #[test]
 fn python_test_state_store_terminal_transition_is_atomic() {
     let home = common::Home::new();
+    let mut request = home.request();
+    request.orchestrator = Some(OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "fixture-session".into(),
+        external_turn_id: None,
+    });
     let (id, _) = home
         .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
+        .admit(&request, &home.config, &json!({}), None)
         .unwrap();
     let mut store = home.store();
     store.running(&id, 42).unwrap();
@@ -89,13 +95,19 @@ fn python_test_state_store_terminal_success_loses_to_pending_cancel_atomically()
     assert_eq!(result, r#"{"accepted":true,"reason":"terminal_cancel"}"#);
 }
 
-/// Mirrors `test_state_outbox.py::test_terminal_before_binding_activates_once_and_expired_lease_reclaims_once`.
+/// Mirrors `tests/test_state_outbox.py::test_terminal_before_binding_activates_once_and_expired_lease_reclaims_once`.
 #[test]
 fn python_test_state_outbox_waiting_binding_activates_and_expires() {
     let home = common::Home::new();
+    let mut request = home.request();
+    request.orchestrator = Some(OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "fixture-session".into(),
+        external_turn_id: None,
+    });
     let (id, _) = home
         .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
+        .admit(&request, &home.config, &json!({}), None)
         .unwrap();
     let mut store = home.store();
     store
@@ -109,49 +121,43 @@ fn python_test_state_outbox_waiting_binding_activates_and_expires() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(
-        store
-            .conn
-            .query_row(
-                "SELECT state FROM deliveries WHERE id=?",
-                [&delivery],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        "waiting_binding"
-    );
-    assert!(store
-        .expire_unbound_deliveries(event_at + 3599.0)
+    let first = store
+        .claim_delivery("worker-1", event_at, 10.0)
         .unwrap()
-        .is_empty());
-    assert_eq!(
-        store.expire_unbound_deliveries(event_at + 3601.0).unwrap(),
-        vec![delivery]
-    );
-
-    let (bound, _) = home
-        .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
         .unwrap();
-    let mut store = home.store();
-    store
-        .finish(&bound, &Outcome::failure("fixture"), None, None)
+    assert_eq!(first["id"], delivery);
+    assert_eq!(first["attempts"], 1);
+    assert!(store
+        .claim_delivery("worker-2", event_at + 9.0, 10.0)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .complete_delivery(&delivery, "worker-1", event_at + 10.0, None, false, None)
+        .is_err());
+    let reclaimed = store
+        .claim_delivery("worker-2", event_at + 10.0, 10.0)
+        .unwrap()
         .unwrap();
+    assert_eq!(reclaimed["id"], delivery);
+    assert_eq!(reclaimed["attempts"], 2);
+    assert!(store
+        .claim_delivery("worker-3", event_at + 10.0, 10.0)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .complete_delivery(&delivery, "worker-1", event_at + 11.0, None, false, None)
+        .is_err());
     store
-        .bind_orchestrator(
-            &bound,
-            &OrchestratorRef {
-                transport: "codex_queue".into(),
-                external_session_id: "fixture-session".into(),
-                external_turn_id: None,
-            },
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
+        .complete_delivery(
+            &delivery,
+            "worker-2",
+            event_at + 11.0,
+            Some("remote-1"),
+            false,
+            None,
         )
         .unwrap();
-    assert_eq!(store.delivery_status(&bound).unwrap()["state"], "pending");
+    assert_eq!(store.delivery_status(&id).unwrap()["state"], "delivered");
 }
 
 /// Mirrors `test_state_outbox.py::test_delivery_attempt_evidence_is_immutable_and_latest_is_validated`.
