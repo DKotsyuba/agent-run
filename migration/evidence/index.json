@@ -1,9 +1,9 @@
 {
   "index_version": 1,
-  "generated_for_commit": "afc080f32d72dd2531b78d354ab6dd9cf16b631b",
-  "generated_at": "2026-09-16T06:06:43+00:00",
+  "generated_for_commit": "ab2159ea5a3924e1587fd961897e93e5971587b9",
+  "generated_at": "2026-09-16T06:11:59+00:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
-  "entry_count": 26,
+  "entry_count": 27,
   "entries": [
     {
       "path": "migration/evidence/coverage-2026-09-16.md",
@@ -52,6 +52,12 @@
       "kind": "evidence",
       "bytes": 4081,
       "sha256": "7d4e0eb8344e0dd9c1b08bf3c513961132b942c7e19925ba837380354a173b9b"
+    },
+    {
+      "path": "migration/evidence/qualification-scope.md",
+      "kind": "evidence",
+      "bytes": 40601,
+      "sha256": "d3b96b1f56fea6c7a4da35e6023061e44da307c3f14f95210da2423c57f2b202"
     },
     {
       "path": "migration/evidence/verification-2026-09-16.md",
