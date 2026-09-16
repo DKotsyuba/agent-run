@@ -3,3 +3,4 @@ pub mod config;
 pub mod policy;
 pub mod profiles;
 pub mod role_plan;
+pub mod snapshot;
