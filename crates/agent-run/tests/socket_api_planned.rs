@@ -97,6 +97,20 @@ async fn request(path: &Path, value: Value) -> Value {
     .unwrap()
 }
 
+/// Sends one raw newline-delimited request and returns its typed JSON-RPC reply.
+async fn raw_request(path: &Path, frame_bytes: &[u8]) -> Value {
+    let mut stream = UnixStream::connect(path).await.unwrap();
+    stream.write_all(frame_bytes).await.unwrap();
+    let mut input = BufReader::new(stream);
+    serde_json::from_slice(
+        &frame::read(&mut input, socket::MAX_FRAME)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 /// Stops a broker task and releases its temporary home.
 async fn stop(task: tokio::task::JoinHandle<agent_run::Result<()>>) {
     task.abort();
@@ -225,6 +239,27 @@ async fn python_oversized_frame_is_rejected() {
     )
     .unwrap();
     assert_eq!(response["error"]["code"], -32700);
+    stop(task).await;
+    drop(home);
+}
+
+// No single Python test sends all three raw frames; this protects the live
+// Rust socket's parse, request-id, and batch-array error mapping together.
+#[tokio::test]
+async fn python_ndjson_bad_id_and_batch_errors_are_typed_on_the_wire() {
+    let (home, path, task) = broker().await;
+    let cases: &[(&[u8], i64)] = &[
+        (b"not-json\n", -32700),
+        (b"[]\n", -32600),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}\n",
+            -32600,
+        ),
+    ];
+    for (frame_bytes, code) in cases {
+        let response = raw_request(&path, frame_bytes).await;
+        assert_eq!(response["error"]["code"], *code, "response={response}");
+    }
     stop(task).await;
     drop(home);
 }

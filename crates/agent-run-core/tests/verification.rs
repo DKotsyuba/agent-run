@@ -1,5 +1,8 @@
 mod common;
-use agent_run_domain::domain::{Outcome, Status};
+use agent_run_domain::{
+    domain::{Outcome, Status},
+    Error,
+};
 use agent_run_platform::{
     fs::{self, Dir},
     verify::{self, Proof},
@@ -41,6 +44,19 @@ fn same_length_tampering_is_detected_by_hash() {
     let proof = verify::seal(&h.path, Path::new("answer.md"), "alpha").unwrap();
     std::fs::write(&proof.path, "omega").unwrap();
     assert!(verify::read(&h.path, &proof, 1024).is_err());
+}
+/// Mirrors `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_tampered_payload_raises_typed_error`.
+#[test]
+fn shrink_and_growth_are_classified_as_size_mismatch() {
+    let h = common::Home::new();
+    let proof = verify::seal(&h.path, Path::new("answer.md"), "alpha").unwrap();
+    for replacement in ["a", "alphabet"] {
+        std::fs::write(&proof.path, replacement).unwrap();
+        let error = verify::read(&h.path, &proof, 1024).unwrap_err();
+        assert!(
+            matches!(error, Error::AnswerIntegrity(message) if message == "answer artifact size does not match its recorded proof")
+        );
+    }
 }
 #[test]
 fn legacy_frame_must_be_exactly_terminal_and_is_stripped_once() {
