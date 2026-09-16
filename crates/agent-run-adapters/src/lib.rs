@@ -1,5 +1,6 @@
 //! Native engines remain external tools. No Python runtime or Python fallback is used.
 pub mod auth;
+pub mod claude;
 pub mod codex;
 pub mod glm;
 pub mod io;
@@ -26,6 +27,7 @@ pub struct LaunchPlan {
 }
 pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) -> Result<()> {
     let kind = runtime.kind()?;
+    claude::validate_runtime(runtime, kind)?;
     if !runtime.models.contains(&request.model) {
         return Err(invalid("model is not configured for this runtime"));
     }

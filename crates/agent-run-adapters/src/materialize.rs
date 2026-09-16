@@ -373,13 +373,14 @@ pub fn environment(
             }
         }
         if !e.denied_commands.is_empty() {
+            let directory = if kind == Adapter::Qwen {
+                ".qwen/denied-commands"
+            } else {
+                "command-refusals"
+            };
             env.insert(
                 "PATH".into(),
-                format!(
-                    "{}:{}",
-                    home.join("command-refusals").display(),
-                    env["PATH"]
-                ),
+                format!("{}:{}", home.join(directory).display(), env["PATH"]),
             );
         }
     }
@@ -467,6 +468,7 @@ pub fn materialize(
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
     let kind = runtime.kind()?;
+    super::claude::validate_runtime(runtime, kind)?;
     let mut p = Publisher::new(home)?;
     let plugins = super::plugins::install(&mut p, runtime, kind)?;
     p.snapshot.plugin_paths = plugins.paths.clone();
@@ -607,7 +609,9 @@ pub fn materialize(
             let mut settings = native;
             settings["hooks"] = hooks.clone();
             p.json("settings.json", &settings)?;
-            p.json("mcp/mcp-config.json", &json!({"mcpServers":mcp}))?;
+            if !mcp.is_empty() {
+                p.json("mcp/mcp-config.json", &json!({"mcpServers":mcp}))?;
+            }
             if let Some(Auth::FileLink { source, target }) = &runtime.auth {
                 p.link(target, source)?;
             }
@@ -630,6 +634,26 @@ pub fn materialize(
                 }
             }
             settings["hooks"] = qhooks;
+            if let Some(environment) = runtime
+                .environment
+                .as_ref()
+                .and_then(|name| config.environments.get(name))
+            {
+                let host_path = std::env::var("PATH").unwrap_or_default();
+                let mut patterns = Vec::new();
+                for command in &environment.denied_commands {
+                    patterns.push(command.clone());
+                    if let Some(path) = resolve_executable(command, &host_path) {
+                        patterns.push(path.to_string_lossy().into_owned());
+                    }
+                }
+                patterns.sort();
+                patterns.dedup();
+                settings["permissions"] = json!({"deny":patterns
+                    .iter()
+                    .flat_map(|pattern| [format!("Bash({pattern})"), format!("Bash({pattern} *)")])
+                    .collect::<Vec<_>>()});
+            }
             let mut context = profile.body.clone();
             for skill in &profile.skills {
                 context.push_str(&format!(
@@ -639,6 +663,21 @@ pub fn materialize(
             }
             p.file("agent-run-context.md", context.as_bytes(), 0o600)?;
             p.json(".qwen/settings.json", &settings)?;
+            let commands = runtime
+                .environment
+                .as_ref()
+                .and_then(|name| config.environments.get(name))
+                .map(|environment| environment.denied_commands.as_slice())
+                .unwrap_or(&[]);
+            let marker = format!(
+                "{{\"version\": 1, \"commands\": {}}}\n",
+                serde_json::to_string(commands)?
+            );
+            p.file(
+                ".qwen/denied-commands/.agent-run-command-policy.json",
+                marker.as_bytes(),
+                0o600,
+            )?;
         }
     }
     if let Some(env) = runtime
@@ -654,11 +693,12 @@ pub fn materialize(
                 shell_quote(&exe.to_string_lossy()),
                 shell_quote(name)
             );
-            p.file(
-                &format!("command-refusals/{name}"),
-                wrapper.as_bytes(),
-                0o700,
-            )?;
+            let directory = if kind == Adapter::Qwen {
+                ".qwen/denied-commands"
+            } else {
+                "command-refusals"
+            };
+            p.file(&format!("{directory}/{name}"), wrapper.as_bytes(), 0o700)?;
             let host_path = std::env::var("PATH").unwrap_or_default();
             let mut commands = vec![name.clone()];
             if let Some(path) = resolve_executable(name, &host_path) {
@@ -680,4 +720,120 @@ pub fn materialize(
         }
     }
     p.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_run_config::config::{Capacity, Catalog, Config, Core, Delivery, Environment};
+    use agent_run_config::profiles::Profile;
+    use agent_run_domain::domain::StartRequest;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Builds the isolated Qwen fixture configuration used for home assertions.
+    fn qwen_fixture(root: &Path) -> (Config, Runtime, StartRequest, Profile) {
+        let runtime: Runtime = serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "qwen",
+            "binary": "/bin/true",
+            "home": root.join("runtime"),
+            "models": ["fixture"],
+            "environment": "developer",
+        }))
+        .expect("fixture runtime");
+        let config = Config {
+            schema_version: 1,
+            core: Core::default(),
+            capacity: Capacity::default(),
+            delivery: Delivery::default(),
+            profiles: Catalog::default(),
+            skills: Catalog::default(),
+            mcp: BTreeMap::new(),
+            environments: BTreeMap::from([(
+                "developer".into(),
+                Environment {
+                    denied_commands: vec!["git".into()],
+                    ..Environment::default()
+                },
+            )]),
+            runtimes: BTreeMap::new(),
+        };
+        let request: StartRequest = serde_json::from_value(json!({
+            "runtime": "qwen", "model": "fixture", "profile": "review",
+            "task": "fixture", "workdir": root,
+        }))
+        .expect("fixture request");
+        let profile = Profile {
+            name: "review".into(),
+            body: "Fixture role.".into(),
+            write: false,
+            network: false,
+            revision: "fixture".into(),
+            canonical: false,
+            allow_external_read_roots: true,
+            read_roots: vec![],
+            skills: vec![],
+            mcp: vec![],
+            required_constraints: BTreeSet::new(),
+        };
+        (config, runtime, request, profile)
+    }
+
+    /// Mirrors `test_qwen_adapter.py::test_materialize_denied_commands`.
+    #[test]
+    fn qwen_home_contains_native_denials_and_python_policy_marker() {
+        let root = std::env::temp_dir().join(format!("agent-run-qwen-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("owned test root");
+        let (config, runtime, request, profile) = qwen_fixture(&root);
+        materialize(
+            &config,
+            &runtime,
+            &request,
+            &profile,
+            &root.join("home"),
+            &root,
+        )
+        .expect("materialize Qwen home");
+        let settings: Value = serde_json::from_slice(
+            &std::fs::read(root.join("home/.qwen/settings.json")).expect("settings"),
+        )
+        .expect("settings JSON");
+        assert!(settings
+            .pointer("/permissions/deny")
+            .and_then(Value::as_array)
+            .expect("deny array")
+            .iter()
+            .any(|entry| entry.as_str() == Some("Bash(git)")));
+        assert_eq!(
+            std::fs::read_to_string(
+                root.join("home/.qwen/denied-commands/.agent-run-command-policy.json")
+            )
+            .expect("policy marker"),
+            "{\"version\": 1, \"commands\": [\"git\"]}\n"
+        );
+        std::fs::remove_dir_all(root).expect("remove owned test root");
+    }
+
+    /// Mirrors the empty-MCP case in `test_claude_developer_environment.py`.
+    #[test]
+    fn claude_home_omits_empty_mcp_configuration() {
+        let root = std::env::temp_dir().join(format!("agent-run-claude-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("owned test root");
+        let (mut config, mut runtime, request, profile) = qwen_fixture(&root);
+        runtime.adapter = "claude".into();
+        runtime.auth = None;
+        config.environments.clear();
+        materialize(
+            &config,
+            &runtime,
+            &request,
+            &profile,
+            &root.join("home"),
+            &root,
+        )
+        .expect("materialize Claude home");
+        assert!(!root.join("home/mcp/mcp-config.json").exists());
+        std::fs::remove_dir_all(root).expect("remove owned test root");
+    }
 }

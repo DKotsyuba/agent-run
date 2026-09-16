@@ -139,13 +139,18 @@ pub fn plan(
             "--strict-mcp-config".into(),
             "--settings".into(),
             home.join("settings.json").to_string_lossy().into_owned(),
+        ];
+        for root in &role.read_roots {
+            args.extend(["--add-dir".into(), root.to_string_lossy().into_owned()]);
+        }
+        args.extend([
             "--tools".into(),
             tools.join(","),
             "--allowedTools".into(),
             allowed.join(","),
             "--disallowedTools".into(),
             denied.join(","),
-        ];
+        ]);
         if !role.mcp.is_empty() {
             args.extend([
                 "--mcp-config".into(),
@@ -156,9 +161,6 @@ pub fn plan(
         }
         for plugin in &snapshot.plugin_paths {
             args.extend(["--plugin-dir".into(), plugin.to_string_lossy().into_owned()]);
-        }
-        for root in &role.read_roots {
-            args.extend(["--add-dir".into(), root.to_string_lossy().into_owned()]);
         }
         if let Some(effort) = &req.effort {
             args.extend(["--effort".into(), effort.clone()]);
@@ -203,6 +205,35 @@ fn result_text(v: &Value) -> Option<String> {
             .and_then(|s| serde_json::to_string(s).ok()),
     }
 }
+
+/// Classifies a Claude-family terminal result without trusting its subtype alone.
+///
+/// The native CLI occasionally labels an authentication error as `success`.
+/// This mirrors Python's marker-first classification, while preserving an
+/// engine-provided non-success subtype such as `error_max_turns`.
+fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
+    let text = text.unwrap_or("").to_ascii_lowercase();
+    if [
+        "failed to authenticate",
+        "oauth access token has expired",
+        "oauth token has expired",
+        "authentication_error",
+        "invalid api key",
+        "invalid bearer token",
+        "please run /login",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        "auth_failed"
+    } else if subtype == "error_max_turns" {
+        "max_turns"
+    } else if matches!(subtype.trim(), "" | "success" | "none") {
+        "engine_error"
+    } else {
+        "runtime_failed"
+    }
+}
 pub async fn run(
     process: &mut Process,
     store: &mut Store,
@@ -219,6 +250,7 @@ pub async fn run(
     let mut final_result: Option<EngineResult> = None;
     let mut emitted = String::new();
     let mut saw_delta = false;
+    let mut saw_answer = false;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -265,12 +297,32 @@ pub async fn run(
                         result.outcome.failure_kind = Some("nonzero_exit".into());
                         result.outcome.failure_text = process.diagnostic_tail();
                     }
+                    if code == Some(0)
+                        && result.outcome.status == Status::Succeeded
+                        && result.answer.is_none()
+                    {
+                        result.outcome.status = Status::Failed;
+                        result.outcome.failure_kind = Some("empty_result".into());
+                    }
                     return Ok(result);
                 }
-                let mut outcome = Outcome::failure("missing_result");
+                let diagnostic = process.diagnostic_tail();
+                let kind = if saw_answer {
+                    "cut_off"
+                } else if diagnostic
+                    .as_deref()
+                    .is_some_and(|text| result_failure_kind("", Some(text)) == "auth_failed")
+                {
+                    "auth_failed"
+                } else if diagnostic.is_some() {
+                    "provider_error"
+                } else {
+                    "no_answer"
+                };
+                let mut outcome = Outcome::failure(kind);
                 outcome.exit_code = code;
                 outcome.runtime_session_id = session;
-                outcome.failure_text = process.diagnostic_tail();
+                outcome.failure_text = diagnostic;
                 return Ok(EngineResult {
                     outcome,
                     answer: None,
@@ -294,6 +346,13 @@ pub async fn run(
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
         {
+            if record
+                .resume_of_runtime_session_id
+                .as_deref()
+                .is_some_and(|expected| expected != s)
+            {
+                return Err(invalid("runtime resumed a different native session"));
+            }
             if session.as_deref().is_some_and(|old| old != s) {
                 return Err(invalid("runtime session identity changed during a run"));
             }
@@ -317,6 +376,7 @@ pub async fn run(
                                 return Err(invalid("stream output exceeds answer bound"));
                             }
                             saw_delta = true;
+                            saw_answer = true;
                             emitted.push_str(text);
                             journal(
                                 store,
@@ -336,8 +396,12 @@ pub async fn run(
                     let mut text = String::new();
                     for block in content {
                         match block.get("type").and_then(Value::as_str) {
-                            Some("text") => text
-                                .push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
+                            Some("text") => {
+                                let block_text =
+                                    block.get("text").and_then(Value::as_str).unwrap_or("");
+                                saw_answer |= !block_text.is_empty();
+                                text.push_str(block_text);
+                            }
                             Some("tool_use") => journal(
                                 store,
                                 &record.id,
@@ -401,7 +465,7 @@ pub async fn run(
             }
             Some("result") => {
                 if final_result.is_some() {
-                    return Err(invalid("engine emitted more than one terminal result"));
+                    continue;
                 }
                 let mut text = result_text(&v);
                 let is_error = match v.get("is_error") {
@@ -414,13 +478,12 @@ pub async fn run(
                 let mut outcome = if !is_error && subtype == "success" {
                     Outcome::success(session.clone())
                 } else {
-                    Outcome::failure(if subtype == "error_max_turns" {
-                        "max_turns"
-                    } else {
-                        "runtime_failed"
-                    })
+                    Outcome::failure(result_failure_kind(subtype, text.as_deref()))
                 };
                 outcome.runtime_session_id = session.clone();
+                if outcome.status == Status::Failed {
+                    outcome.failure_text = text.clone();
+                }
                 if kind == Adapter::Qwen
                     && text
                         .as_deref()
@@ -428,6 +491,15 @@ pub async fn run(
                 {
                     outcome = Outcome::failure("provider_error");
                     outcome.runtime_session_id = session.clone();
+                    outcome.failure_text = text.as_deref().map(|value| {
+                        value
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(500)
+                            .collect()
+                    });
                     text = None;
                 }
                 if let Some(k) = text.as_deref().and_then(verify::error_only) {
@@ -441,7 +513,14 @@ pub async fn run(
                 let u = &v["usage"];
                 let input = u.get("input_tokens").and_then(Value::as_i64);
                 let output = u.get("output_tokens").and_then(Value::as_i64);
-                let usage = json!({"input_tokens":input,"output_tokens":output,"cache_read_tokens":u["cache_read_input_tokens"],"cache_write_tokens":u["cache_creation_input_tokens"],"total_tokens":input.zip(output).and_then(|(a,b)|if a>=0&&b>=0{a.checked_add(b)}else{None}),"num_turns":v["num_turns"],"cost_usd":v["total_cost_usd"]});
+                let usage = json!({"input_tokens":input,"output_tokens":output,"cache_read_tokens":u["cache_read_input_tokens"],"cache_write_tokens":u["cache_creation_input_tokens"],"total_tokens":input.zip(output).and_then(|(a,b)|if a>=0&&b>=0{a.checked_add(b)}else{None}),"duration_ms":v["duration_ms"],"num_turns":v["num_turns"],"cost_usd":v["total_cost_usd"]});
+                if record.resume_of_runtime_session_id.is_some()
+                    && outcome.runtime_session_id != record.resume_of_runtime_session_id
+                {
+                    return Err(invalid(
+                        "runtime did not confirm the resumed native session",
+                    ));
+                }
                 final_result = Some(EngineResult {
                     outcome,
                     answer: text.filter(|s| !s.is_empty()),
@@ -452,5 +531,26 @@ pub async fn run(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::result_failure_kind;
+
+    /// Mirrors `test_claude_stream.py::test_classify_failure_auth_markers`.
+    #[test]
+    fn classifies_auth_markers_before_misleading_success_subtypes() {
+        assert_eq!(
+            result_failure_kind("success", Some("OAuth token has expired")),
+            "auth_failed"
+        );
+    }
+
+    /// Mirrors `test_claude_stream.py::test_classify_failure_max_turns`.
+    #[test]
+    fn classifies_max_turns_and_generic_terminal_errors() {
+        assert_eq!(result_failure_kind("error_max_turns", None), "max_turns");
+        assert_eq!(result_failure_kind("success", None), "engine_error");
     }
 }
