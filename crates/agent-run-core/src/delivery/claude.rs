@@ -52,7 +52,17 @@ pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
     );
     match tokio::time::timeout(Duration::from_secs(5), stream.write_all(frames.as_bytes())).await {
         Ok(Ok(())) => Evidence::new("uds_written", true, false),
-        _ => Evidence::new("uds_ambiguous", false, true),
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Evidence::new("uds_ambiguous", false, true)
+        }
+        Ok(Err(_)) | Err(_) => Evidence::new("uds_unavailable", false, false),
     }
 }
 

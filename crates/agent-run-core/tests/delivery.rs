@@ -349,6 +349,7 @@ async fn claude_uds_writes_auth_then_trusted_notice_to_fake_socket() {
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_missing_or_unreadable_auth_token_is_a_clean_refusal`.
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_registry_miss_is_session_gone_not_ambiguous`.
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_stale_descriptor_with_a_dead_socket_is_session_gone`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_missing_session_fails_and_no_replacement_is_started`.
 /// Unix socket test: the stale path is a nonexistent temporary endpoint.
 #[tokio::test]
 async fn claude_uds_classifies_registry_and_auth_failures_without_host_contact() {
@@ -379,6 +380,92 @@ async fn claude_uds_classifies_registry_and_auth_failures_without_host_contact()
         claude::send(&registry, "stale", &notice()).await.classifier,
         "uds_session_gone"
     );
+}
+
+/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_unreachable_socket_and_foreign_target_are_delivery_errors`.
+/// Unix socket test: a non-socket endpoint exercises the unavailable delivery class.
+#[tokio::test]
+async fn claude_uds_classifies_unreachable_endpoint_as_unavailable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let endpoint = temporary.path().join("endpoint-directory");
+    std::fs::create_dir(&endpoint).unwrap();
+    claude_descriptor(&registry, "unavailable", &endpoint);
+    assert_eq!(
+        claude::send(&registry, "unavailable", &notice())
+            .await
+            .classifier,
+        "uds_unavailable"
+    );
+}
+
+/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_validate_and_arguments_are_checked`.
+#[tokio::test]
+async fn claude_uds_rejects_unbounded_arguments_without_socket_contact() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    assert_eq!(
+        claude::send(&registry, "", &notice()).await.classifier,
+        "uds_rejected"
+    );
+    assert_eq!(
+        claude::send(&registry, &"x".repeat(513), &notice())
+            .await
+            .classifier,
+        "uds_rejected"
+    );
+    let mut invalid = notice();
+    invalid.runtime = Some(" ".into());
+    assert_eq!(
+        claude::send(&registry, "session", &invalid)
+            .await
+            .classifier,
+        "uds_rejected"
+    );
+}
+
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_a_write_that_never_completes_becomes_an_ambiguous_delivery`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_ambiguous_timeout_is_at_least_once_not_a_failure`.
+/// Unix socket test: the peer closes before the unauthenticated write can be acknowledged.
+#[tokio::test]
+async fn claude_uds_peer_close_is_ambiguous() {
+    use std::os::fd::AsRawFd;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "ambiguous", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: the accepted stream owns this valid socket descriptor until drop.
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+        drop(stream);
+    });
+    let send = tokio::spawn({
+        let registry = registry.clone();
+        async move { claude::send(&registry, "ambiguous", &notice()).await }
+    });
+    let evidence = send.await.unwrap();
+    peer.await.unwrap();
+    assert_eq!(evidence.classifier, "uds_ambiguous");
+    assert_eq!(evidence.error_class.as_deref(), Some("ambiguous"));
 }
 
 /// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v2_advertised_endpoint_receives_the_exact_rich_payload`.

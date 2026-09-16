@@ -98,6 +98,16 @@ pub enum Error {
     /// A safe runtime error message.
     #[error("{0}")]
     Runtime(String),
+    /// A domain error returned by the resident broker, retaining its stable broker code.
+    #[error("{message}")]
+    Broker {
+        /// Bounded human-readable broker message.
+        message: String,
+        /// Optional domain code carried in the broker error data object.
+        broker_error_code: Option<String>,
+        /// Optional bounded broker error data for callers that need structured details.
+        broker_error_data: Option<serde_json::Value>,
+    },
     /// A detached supervisor failed before ownership handoff with bounded evidence.
     #[error("{message}")]
     Bootstrap {
@@ -153,7 +163,7 @@ impl Error {
             Self::Unsupported(_) => MachineCode::Unsupported,
             Self::BrokerUnavailable => MachineCode::BrokerUnavailable,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
-            Self::Runtime(_) => MachineCode::RuntimeError,
+            Self::Runtime(_) | Self::Broker { .. } => MachineCode::RuntimeError,
             Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
             Self::Sql(_) => MachineCode::StorageError,
@@ -185,6 +195,7 @@ impl Error {
             | Self::AnswerIntegrity(s)
             | Self::Integrity(s)
             | Self::Runtime(s) => s.clone(),
+            Self::Broker { message, .. } => message.clone(),
             Self::Bootstrap { message, .. } => message.clone(),
             // Parser/OS/database diagnostics can contain configured secret values.
             Self::Io(_) => "local I/O operation failed".into(),

@@ -1,13 +1,17 @@
 //! Bounded LF-delimited JSON-RPC 2.0 over a private same-user Unix socket.
 use super::frame;
 use crate::{dispatch, service::Service, Error, Result};
+use agent_run_domain::types::StartRequest;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -16,6 +20,248 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
+
+/// Default deadline for one reusable broker-client call, in seconds.
+const CLIENT_DEFAULT_TIMEOUT: f64 = 600.0;
+
+/// A reusable, serialized client session for the resident Unix-socket broker.
+pub struct BrokerClient {
+    /// Private broker endpoint owned by the selected agent-run home.
+    socket_path: PathBuf,
+    /// Monotonic request identity and cancellation state for this client.
+    next_id: AtomicU64,
+    aborted: AtomicBool,
+    wake: Arc<tokio::sync::Notify>,
+    /// One connection is shared by sequential calls and never by concurrent requests.
+    connection: tokio::sync::Mutex<Option<ClientConnection>>,
+}
+
+/// The broker's minimal asynchronous start acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerStartResult {
+    /// Durable id assigned by the broker.
+    pub agent_id: String,
+    /// Whether this request admitted a new row rather than replaying one.
+    pub created: bool,
+}
+
+/// The split broker stream retained by one [`BrokerClient`] session.
+struct ClientConnection {
+    /// Framed request writer.
+    output: tokio::net::unix::OwnedWriteHalf,
+    /// Framed response reader.
+    input: BufReader<tokio::net::unix::OwnedReadHalf>,
+}
+
+/// Failure classes used to retry transport loss without retrying domain errors.
+enum ClientAttemptError {
+    /// The socket or response was lost before a usable broker envelope arrived.
+    Transport,
+    /// The broker returned a typed protocol/domain error.
+    Domain(Error),
+    /// The caller explicitly aborted this client.
+    Cancelled,
+}
+
+impl BrokerClient {
+    /// Creates a lazy broker client; no socket is opened until its first call.
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            next_id: AtomicU64::new(1),
+            aborted: AtomicBool::new(false),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            connection: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Sends one object-valued request using Python's default 600-second deadline.
+    pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.call_with_timeout(method, params, CLIENT_DEFAULT_TIMEOUT)
+            .await
+    }
+
+    /// Sends one request after validating method, object parameters, and deadline.
+    pub async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout_seconds: f64,
+    ) -> Result<Value> {
+        if method.is_empty() {
+            return Err(crate::error::invalid("method must be a nonblank string"));
+        }
+        if params.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(crate::error::invalid("params must be an object or null"));
+        }
+        if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
+            return Err(crate::error::invalid("timeout must be positive and finite"));
+        }
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(Error::Runtime("broker call cancelled".into()));
+        }
+        let mut connection = self.connection.lock().await;
+        for attempt in 0..2 {
+            if connection.is_none() {
+                match self.connect(timeout_seconds).await {
+                    Ok(value) => *connection = Some(value),
+                    Err(Error::BrokerUnavailable) if attempt == 0 => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            match self
+                .request(&mut connection, id, method, params.clone(), timeout_seconds)
+                .await
+            {
+                Ok(value) => return Ok(value),
+                Err(ClientAttemptError::Domain(error)) => return Err(error),
+                Err(ClientAttemptError::Cancelled) => {
+                    *connection = None;
+                    return Err(Error::Runtime("broker call cancelled".into()));
+                }
+                Err(ClientAttemptError::Transport) => {
+                    *connection = None;
+                    if self.aborted.load(Ordering::Acquire) {
+                        return Err(Error::Runtime("broker call cancelled".into()));
+                    }
+                    if attempt == 1 {
+                        return Err(Error::BrokerUnavailable);
+                    }
+                }
+            }
+        }
+        unreachable!("the bounded broker retry loop always returns")
+    }
+
+    /// Serializes a typed start request and rejects malformed broker acknowledgements.
+    pub async fn start(&self, request: &StartRequest) -> Result<BrokerStartResult> {
+        let params = serde_json::to_value(request)?;
+        let result = self.call("start", Some(params)).await?;
+        let Some(object) = result.as_object() else {
+            return Err(Error::Runtime(
+                "broker returned an invalid start result".into(),
+            ));
+        };
+        let Some(agent_id) = object.get("agent_id").and_then(Value::as_str) else {
+            return Err(Error::Runtime(
+                "broker returned an invalid start result".into(),
+            ));
+        };
+        let Some(created) = object.get("created").and_then(Value::as_bool) else {
+            return Err(Error::Runtime(
+                "broker returned an invalid start result".into(),
+            ));
+        };
+        Ok(BrokerStartResult {
+            agent_id: agent_id.into(),
+            created,
+        })
+    }
+
+    /// Aborts an in-flight connect/read and prevents later calls from opening work.
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    /// Closes the retained stream while leaving this client available for reconnects.
+    pub async fn close(&self) {
+        *self.connection.lock().await = None;
+    }
+
+    /// Opens and authenticates one broker stream, interruptible by [`Self::abort`].
+    async fn connect(&self, timeout_seconds: f64) -> Result<ClientConnection> {
+        let notified = self.wake.notified();
+        let stream = tokio::select! {
+            _ = notified => return Err(Error::Runtime("broker call cancelled".into())),
+            result = tokio::time::timeout(Duration::from_secs_f64(timeout_seconds), UnixStream::connect(&self.socket_path)) => {
+                result.map_err(|_| Error::BrokerUnavailable)?.map_err(|_| Error::BrokerUnavailable)?
+            }
+        };
+        // SAFETY: geteuid is a read-only process identity query.
+        if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+            return Err(crate::error::invalid("broker belongs to another user"));
+        }
+        let (input, output) = stream.into_split();
+        Ok(ClientConnection {
+            output,
+            input: BufReader::new(input),
+        })
+    }
+
+    /// Writes one request and maps the matching response envelope to a value.
+    async fn request(
+        &self,
+        connection: &mut Option<ClientConnection>,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        timeout_seconds: f64,
+    ) -> std::result::Result<Value, ClientAttemptError> {
+        let Some(connection) = connection.as_mut() else {
+            return Err(ClientAttemptError::Transport);
+        };
+        let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params.unwrap_or_else(|| json!({}))});
+        let notified = self.wake.notified();
+        let written = tokio::select! {
+            _ = notified => return Err(ClientAttemptError::Cancelled),
+            result = tokio::time::timeout(Duration::from_secs_f64(timeout_seconds), frame::write(&mut connection.output, &request, MAX_FRAME)) => result,
+        };
+        match written {
+            Ok(Ok(())) => {}
+            _ => return Err(ClientAttemptError::Transport),
+        }
+        let notified = self.wake.notified();
+        let raw = tokio::select! {
+            _ = notified => return Err(ClientAttemptError::Cancelled),
+            result = tokio::time::timeout(Duration::from_secs_f64(timeout_seconds), frame::read(&mut connection.input, MAX_FRAME)) => result,
+        };
+        let raw = match raw {
+            Ok(Ok(Some(raw))) => raw,
+            _ => return Err(ClientAttemptError::Transport),
+        };
+        let value: Value =
+            serde_json::from_slice(&raw).map_err(|_| ClientAttemptError::Transport)?;
+        if value.get("id") != Some(&json!(id))
+            || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        {
+            return Err(ClientAttemptError::Transport);
+        }
+        if let Some(error) = value.get("error") {
+            let Some(object) = error.as_object() else {
+                return Err(ClientAttemptError::Transport);
+            };
+            let message = object
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("broker request failed")
+                .to_owned();
+            if object.get("code").and_then(Value::as_i64) == Some(-32602) {
+                return Err(ClientAttemptError::Domain(Error::Validation(message)));
+            }
+            let (broker_error_code, broker_error_data) = object
+                .get("data")
+                .and_then(Value::as_object)
+                .map(|data| {
+                    (
+                        data.get("code").and_then(Value::as_str).map(str::to_owned),
+                        Some(Value::Object(data.clone())),
+                    )
+                })
+                .unwrap_or((None, None));
+            return Err(ClientAttemptError::Domain(Error::Broker {
+                message,
+                broker_error_code,
+                broker_error_data,
+            }));
+        }
+        value
+            .get("result")
+            .cloned()
+            .ok_or(ClientAttemptError::Transport)
+    }
+}
 
 /// Python-compatible upper bound for one newline-delimited JSON RPC message.
 pub const MAX_FRAME: usize = 1024 * 1024;
@@ -257,6 +503,7 @@ pub async fn serve(home: &Path) -> Result<()> {
 /// listener lifetime. Shutdown stops accepts and gives admitted handlers five
 /// seconds to finish before refusing remaining work by closing their streams.
 pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
+    agent_run_core::logging::configure(home, "api");
     let _ = crate::config::Config::load(home)?;
     let _ = crate::state::Store::open(home)?;
     let directory = std::fs::symlink_metadata(home)?;

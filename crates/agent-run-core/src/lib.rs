@@ -10,6 +10,7 @@ pub mod doctor;
 /// Session binding and per-turn context hooks shared by CLI hosts.
 pub mod hooks;
 pub mod lifecycle;
+pub mod logging;
 pub mod service;
 pub mod stream;
 pub mod supervisor;

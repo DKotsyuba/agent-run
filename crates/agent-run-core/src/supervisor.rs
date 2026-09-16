@@ -67,6 +67,7 @@ pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
 /// `fds` are the inherited ready, identity and error descriptors.  The first
 /// heartbeat makes the complete ownership record eligible for later recovery.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
+    crate::logging::configure(home, "supervisor");
     let [ready_fd, identity_fd, error_fd] = fds;
     if let Err(error) = launch::report_identity(identity_fd, error_fd) {
         let _ = launch::report_ready(ready_fd, Err(&error.to_string()));
