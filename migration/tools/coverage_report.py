@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_MAP_CSV = REPO_ROOT / "migration/baseline/test-map.csv"
 TASKS_CSV = REPO_ROOT / "migration/tasks.csv"
 EVIDENCE_DIR = REPO_ROOT / "migration/evidence"
+DIVERGENCES_CSV = REPO_ROOT / "migration/baseline/divergences.csv"
 
 # Workspace member package name -> crate directory (Cargo.toml [workspace]).
 PKG_TO_DIR = {
@@ -382,10 +383,34 @@ def apply_legacy_seed(
     return notes
 
 
-def compute_status(t: PyTest, assigned: dict[str, str]) -> tuple[str, str]:
+def load_divergences() -> dict[str, tuple[str, str]]:
+    """Behaviors the Rust implementation deliberately does not have.
+
+    Each row names a Python test_id, the ADR that decided it, and a short
+    reason class. These are not migration debt: they are excluded from the
+    uncovered totals and clusters so that a permanent architectural choice
+    cannot masquerade as remaining work. A declared id that is nevertheless
+    matched to a Rust test still counts as `ported` -- the decision is a
+    default, not an override."""
+    if not DIVERGENCES_CSV.is_file():
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    with DIVERGENCES_CSV.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            tid = (row.get("test_id") or "").strip()
+            if tid:
+                out[tid] = ((row.get("adr") or "").strip(), (row.get("reason") or "").strip())
+    return out
+
+
+def compute_status(
+    t: PyTest, assigned: dict[str, str], divergences: dict[str, tuple[str, str]]
+) -> tuple[str, str]:
     rust_test = assigned.get(t.test_id, "")
     if rust_test:
         return rust_test, "ported"
+    if t.test_id in divergences:
+        return "", "divergent"
     if t.task_ids.strip():
         return "", "planned"
     return "", "unassigned"
@@ -399,10 +424,14 @@ def primary_lane(task_ids: str, tasks: dict[str, dict[str, str]]) -> str | None:
     return None
 
 
-def write_test_map(py_tests: list[PyTest], assigned: dict[str, str]) -> list[dict[str, str]]:
+def write_test_map(
+    py_tests: list[PyTest],
+    assigned: dict[str, str],
+    divergences: dict[str, tuple[str, str]],
+) -> list[dict[str, str]]:
     rows = []
     for t in py_tests:
-        rust_test, status = compute_status(t, assigned)
+        rust_test, status = compute_status(t, assigned, divergences)
         rows.append(
             {
                 "test_id": t.test_id,
@@ -426,8 +455,9 @@ def render_report(
     warnings: list[str],
     legacy_notes: list[str],
     rust_test_total: int,
+    divergences: dict[str, tuple[str, str]],
 ) -> str:
-    after_counts: dict[str, int] = {"ported": 0, "planned": 0, "unassigned": 0}
+    after_counts: dict[str, int] = {"ported": 0, "planned": 0, "divergent": 0, "unassigned": 0}
     for r in rows:
         after_counts[r["status"]] += 1
 
@@ -441,6 +471,8 @@ def render_report(
         bucket = area_rows.setdefault(lane, {"ported": 0, "uncovered": 0})
         if r["status"] == "ported":
             bucket["ported"] += 1
+        elif r["status"] == "divergent":
+            continue
         else:
             bucket["uncovered"] += 1
 
@@ -451,7 +483,7 @@ def render_report(
     file_task = {}
     file_owner_tasks: dict[str, set[str]] = defaultdict(set)
     for r in rows:
-        if r["status"] == "ported":
+        if r["status"] in ("ported", "divergent"):
             continue
         file_uncovered[r["python_file"]] += 1
         for tid in r["task_ids"].split(";"):
@@ -475,7 +507,7 @@ def render_report(
         statuses = task_test_status.get(tid, [])
         if not statuses:
             continue
-        n_uncovered = sum(1 for s in statuses if s != "ported")
+        n_uncovered = sum(1 for s in statuses if s not in ("ported", "divergent"))
         n_ported = sum(1 for s in statuses if s == "ported")
         if task["status"] == "implemented" and n_uncovered > 0:
             implemented_but_uncovered.append((tid, task["title"], n_uncovered, len(statuses)))
@@ -495,7 +527,7 @@ def render_report(
     lines.append("")
     lines.append("| status | before | after |")
     lines.append("| --- | ---: | ---: |")
-    for s in ("ported", "planned", "unassigned"):
+    for s in ("ported", "planned", "divergent", "unassigned"):
         lines.append(f"| {s} | {before_counts.get(s, 0)} | {after_counts.get(s, 0)} |")
     lines.append(f"| **total** | **{sum(before_counts.values())}** | **{len(rows)}** |")
     lines.append("")
@@ -519,6 +551,26 @@ def render_report(
     for pyfile, count in top_clusters:
         owners = ";".join(sorted(file_owner_tasks.get(pyfile, []))) or "*(none)*"
         lines.append(f"| {pyfile} | {count} | {owners} |")
+    lines.append("")
+    lines.append("## Declared divergences (not migration debt)")
+    lines.append("")
+    divergent_rows = [r for r in rows if r["status"] == "divergent"]
+    if divergent_rows:
+        lines.append(
+            "Behaviors the Rust implementation deliberately does not have. They are "
+            "excluded from the uncovered totals and clusters above; see `migration/adr/`."
+        )
+        lines.append("")
+        by_reason = Counter(
+            (divergences.get(r["test_id"], ("", ""))[0], divergences.get(r["test_id"], ("", ""))[1])
+            for r in divergent_rows
+        )
+        lines.append("| ADR | reason | behaviors |")
+        lines.append("| --- | --- | ---: |")
+        for (adr, reason), n in sorted(by_reason.items(), key=lambda x: (-x[1], x[0])):
+            lines.append(f"| {adr or '*(none)*'} | {reason or '*(none)*'} | {n} |")
+    else:
+        lines.append("None declared.")
     lines.append("")
     lines.append("## Python behaviors with no owning task at all")
     lines.append("")
@@ -592,7 +644,8 @@ def main() -> int:
     assigned, warnings = match_rust_tests(rust_tests, py_tests)
     legacy_notes = apply_legacy_seed(py_tests, assigned, rust_ids)
 
-    rows = write_test_map(py_tests, assigned)
+    divergences = load_divergences()
+    rows = write_test_map(py_tests, assigned, divergences)
 
     report = render_report(
         date=args.date,
@@ -603,6 +656,7 @@ def main() -> int:
         warnings=warnings,
         legacy_notes=legacy_notes,
         rust_test_total=len(rust_tests),
+        divergences=divergences,
     )
 
     report_path = EVIDENCE_DIR / f"coverage-{args.date}.md"
@@ -632,7 +686,7 @@ def main() -> int:
     print(f"wrote {TEST_MAP_CSV.relative_to(REPO_ROOT)} ({len(rows)} rows)")
     print(f"wrote {report_path.relative_to(REPO_ROOT)}")
     print(f"before: {before_counts}")
-    after_counts = {"ported": 0, "planned": 0, "unassigned": 0}
+    after_counts = {"ported": 0, "planned": 0, "divergent": 0, "unassigned": 0}
     for r in rows:
         after_counts[r["status"]] += 1
     print(f"after:  {after_counts}")
