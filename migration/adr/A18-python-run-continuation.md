@@ -29,8 +29,8 @@ resolved `Profile`, `EffectivePolicy`, and sealed runtime-home/digest
 that exact sealed home before admitting the child
 ([service.rs](../../crates/agent-run-core/src/service.rs:227)); it then uses
 the recorded lineage session in `thread/resume` and rejects a changed returned
-thread identity ([codex.rs](../../crates/agent-run-core/src/codex.rs:468),
-[codex.rs](../../crates/agent-run-core/src/codex.rs:493)). The two identities
+thread identity ([codex.rs](../../crates/agent-run-core/src/codex.rs:462),
+[codex.rs](../../crates/agent-run-core/src/codex.rs:487)). The two identities
 therefore cannot establish the same immutable grant or snapshot proof. The
 Python request replay also re-resolves its profile from its own snapshot,
 whereas Rust clones a successfully decoded Rust `StartRequest`
