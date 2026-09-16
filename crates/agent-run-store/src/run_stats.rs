@@ -238,9 +238,10 @@ pub fn backfill(store: &mut Store) -> Result<(usize, usize)> {
     let mut backfilled = 0;
     let mut skipped = 0;
     for raw in ids {
-        let id = raw
-            .parse()
-            .expect("durable agent ids were validated on admission");
+        let Ok(id) = raw.parse::<AgentId>() else {
+            skipped += 1;
+            continue;
+        };
         match record(store, &id) {
             Ok(()) => backfilled += 1,
             Err(_) => skipped += 1,
