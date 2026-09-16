@@ -1,8 +1,8 @@
 //! Completion delivery parity fixtures for Python's delivery dispatcher and notice contract.
 
 use agent_run_core::{
-    delivery::{dispatch_once, safe_evidence, Notice},
-    domain::{now, AgentId},
+    delivery::{claude, dispatch_once, relay, safe_evidence, Notice},
+    domain::{now, AgentId, Status},
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -237,4 +237,229 @@ fn golden_delivery_database_is_read_from_a_copy() {
         .unwrap();
     assert_eq!(rows, 2);
     assert_eq!(state, "delivered");
+}
+
+/// Builds a valid notice without any task, answer, or host-provided text.
+fn notice() -> Notice {
+    Notice {
+        notification_id: "ntf_test".into(),
+        agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
+        status: Status::Succeeded,
+        runtime: None,
+        model: None,
+        effort: None,
+        failure_kind: None,
+    }
+}
+
+/// Writes a fake Claude descriptor and its paired inbox key under a temporary registry.
+fn claude_descriptor(registry: &Path, session: &str, socket: &Path) {
+    std::fs::write(
+        registry.join("41.json"),
+        json!({"sessionId":session,"messagingSocketPath":socket,"pid":41}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        registry.join("41.fixture.key"),
+        r#"{"peerToken":"fixture-token"}"#,
+    )
+    .unwrap();
+}
+
+/// Mirrors `tests/test_delivery_base.py::test_metadata_must_be_bounded_strings_or_none`.
+/// Mirrors `tests/test_delivery_base.py::test_success_and_cancelled_notices_reject_failure_categories`.
+/// Mirrors `tests/test_delivery_base.py::test_render_is_the_exact_structured_list`.
+/// Mirrors `tests/test_delivery_base.py::test_rendered_message_repeats_only_payload_facts`.
+/// Mirrors `tests/test_delivery_base.py::test_notice_carries_trusted_fields_and_a_frozen_legacy_payload`.
+#[test]
+fn notice_rejects_invalid_metadata_and_contains_only_trusted_facts() {
+    let mut invalid = notice();
+    invalid.runtime = Some(" ".into());
+    assert!(invalid.validate().is_err());
+    invalid.runtime = Some("x".repeat(129));
+    assert!(invalid.validate().is_err());
+    invalid.runtime = None;
+    invalid.failure_kind = Some("prepare_failed".into());
+    assert!(invalid.validate().is_err());
+    let rendered = notice().render().unwrap();
+    assert_eq!(rendered.lines().count(), 6);
+    assert!(rendered.contains("- Notice: [notification ntf_test v1]"));
+    assert!(!rendered.contains("task"));
+    assert!(!rendered.contains("answer"));
+}
+
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_clean_send_writes_the_auth_line_then_the_user_line`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_send_injects_the_fixed_trusted_message_without_a_remote_id`.
+/// Unix socket test: the endpoint is a private temporary fake, never a live Claude socket.
+#[tokio::test]
+async fn claude_uds_writes_auth_then_trusted_notice_to_fake_socket() {
+    use tokio::io::AsyncReadExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let receiver = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).await.unwrap();
+        received
+    });
+    let evidence = claude::send(&registry, "session-1", &notice()).await;
+    let received = receiver.await.unwrap();
+    let lines = received.lines().collect::<Vec<_>>();
+    assert_eq!(evidence.classifier, "uds_written");
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[0]).unwrap(),
+        json!({"token":"fixture-token","type":"auth"})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[1]).unwrap()["message"]["content"],
+        notice().render().unwrap()
+    );
+}
+
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_malformed_descriptors_are_skipped_not_fatal`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_missing_or_unreadable_auth_token_is_a_clean_refusal`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_registry_miss_is_session_gone_not_ambiguous`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_stale_descriptor_with_a_dead_socket_is_session_gone`.
+/// Unix socket test: the stale path is a nonexistent temporary endpoint.
+#[tokio::test]
+async fn claude_uds_classifies_registry_and_auth_failures_without_host_contact() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    std::fs::write(registry.join("broken.json"), "not json").unwrap();
+    assert_eq!(
+        claude::send(&registry, "missing", &notice())
+            .await
+            .classifier,
+        "uds_session_gone"
+    );
+    let dead = temporary.path().join("dead.sock");
+    std::fs::write(
+        registry.join("1.json"),
+        json!({"sessionId":"missing-key","messagingSocketPath":dead,"pid":1}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        claude::send(&registry, "missing-key", &notice())
+            .await
+            .classifier,
+        "uds_rejected"
+    );
+    claude_descriptor(&registry, "stale", &dead);
+    assert_eq!(
+        claude::send(&registry, "stale", &notice()).await.classifier,
+        "uds_session_gone"
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v2_advertised_endpoint_receives_the_exact_rich_payload`.
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v3_endpoint_receives_failure_category_without_error_prose`.
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v3_endpoints_are_preferred_over_v2_and_legacy`.
+/// Unix socket test: the endpoint is a private temporary fake Desktop relay.
+#[tokio::test]
+async fn desktop_relay_prefers_v3_and_preserves_the_versioned_wire_contract() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let v3 = temporary.path().join("ar-cdx-v3-fake.sock");
+    let v2 = temporary.path().join("ar-cdx-v2-unused.sock");
+    let listener = tokio::net::UnixListener::bind(&v3).unwrap();
+    let _unused = tokio::net::UnixListener::bind(&v2).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        stream.write_all(&(22_u32).to_le_bytes()).await.unwrap();
+        stream
+            .write_all(br#"{"outcome":"accepted"}"#)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    let mut rich = notice();
+    rich.status = Status::Failed;
+    rich.runtime = Some("codex".into());
+    rich.model = Some("gpt-5".into());
+    rich.effort = Some("high".into());
+    rich.failure_kind = Some("prepare_failed".into());
+    let evidence = relay::send(temporary.path(), "thread-test", &rich).await;
+    let request = peer.await.unwrap();
+    assert_eq!(evidence.classifier, "relay_accepted");
+    assert_eq!(request["version"], 3);
+    assert_eq!(request["failure_kind"], "prepare_failed");
+    assert_eq!(request["runtime"], "codex");
+}
+
+/// Mirrors `tests/test_delivery_dispatch.py::test_attempt_evidence_follows_retry_and_success_transactions`.
+/// Mirrors `tests/test_delivery_dispatch.py::test_bound_deliveries_are_never_expired_by_the_sweep`.
+/// Mirrors `tests/test_delivery_dispatch.py::test_corrupt_request_json_still_delivers_with_unspecified_effort`.
+/// Mirrors `tests/test_delivery_dispatch.py::test_delivered_notice_carries_launch_metadata_from_the_row`.
+/// Mirrors `tests/test_delivery_dispatch.py::test_pending_notice_is_delivered_once_and_the_outbox_then_rests`.
+/// Unix socket test: the fake relay is private to this temporary home.
+#[tokio::test]
+async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_once", "codex_queue", "pending");
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE agents SET runtime='codex',model='gpt-5',request_json='{broken'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let socket = home.path.join("ar-cdx-v3-accepted.sock");
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        stream.write_all(&(22_u32).to_le_bytes()).await.unwrap();
+        stream
+            .write_all(br#"{"outcome":"accepted"}"#)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE deliveries SET next_attempt_at=? WHERE id='ntf_once'",
+            [now() - 1.0],
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = peer.await.unwrap();
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let row: (String, i64, Option<f64>) = connection
+        .query_row(
+            "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_once'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let evidence: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_attempt_evidence WHERE delivery_id='ntf_once'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(row, ("delivered".into(), 2, None));
+    assert_eq!(evidence, 2);
+    assert_eq!(request["runtime"], "codex");
+    assert_eq!(request["model"], "gpt-5");
+    assert!(request["effort"].is_null());
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
 }
