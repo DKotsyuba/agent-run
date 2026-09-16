@@ -37,3 +37,4 @@ tests/test_supervisor.py::SupervisorTests::test_a_base_exception_during_launch_i
 tests/test_supervisor.py::SupervisorTests::test_invalid_settings_are_refused_before_adapter_launch,A20,no-supervisor-settings
 tests/test_supervisor.py::SupervisorTests::test_shared_service_row_keeps_the_supervisor_group,A20,always-owns-spawned-group
 tests/test_supervisor.py::SupervisorTests::test_shared_service_session_is_never_signalled_or_reaped,A20,always-owns-spawned-group
+tests/test_domain.py::DomainTests::test_python_version_gate_refuses_unsupported_version,A21,no-interpreter-to-gate

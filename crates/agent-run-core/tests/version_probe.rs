@@ -88,7 +88,7 @@ async fn oversized_output_is_refused() {
     );
 }
 
-/// Mirrors `tests/test_adapter_versions.py::test_version_failures_are_bounded[printf 'stderr-only\n' >&2-no version]`
+/// Mirrors `tests/test_adapter_versions.py::test_version_failures_are_bounded[printf 'stderr-only\\n' >&2-no version]`
 #[tokio::test]
 async fn stderr_only_version_failure_is_bounded() {
     let root = tempfile::tempdir().expect("temporary root");
