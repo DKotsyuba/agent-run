@@ -645,6 +645,25 @@ mod tests {
         assert_eq!(result_failure_kind("success", None), "engine_error");
     }
 
+    // GLM deliberately uses the Claude-family stream runner; this Rust-internal
+    // assertion keeps its provider response and authentication failure classes
+    // coupled to the shared classifier. No Python test isolates this call path.
+    #[test]
+    fn glm_uses_claude_response_and_failure_classification() {
+        assert_eq!(
+            result_text(&json!({"result": "ready"})),
+            Some("ready".into())
+        );
+        assert_eq!(
+            result_failure_kind("success", Some("OAuth token has expired")),
+            "auth_failed"
+        );
+        assert_eq!(
+            result_failure_kind("error_during_execution", Some("provider rejected request")),
+            "runtime_failed"
+        );
+    }
+
     /// Mirrors `tests/test_claude_stream.py::TerminalEventDataTests::test_bounded_event_excludes_result_text_and_session_id`.
     /// Mirrors `tests/test_claude_stream.py::TerminalEventDataTests::test_event_with_usage_is_actually_json_serializable`.
     #[test]

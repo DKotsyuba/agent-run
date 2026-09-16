@@ -5,7 +5,7 @@ use agent_run_adapters::{
     materialize,
 };
 use agent_run_config::{
-    config::{Config, Runtime},
+    config::{Auth, Config, Hook, Runtime},
     profiles::Profile,
 };
 use agent_run_core::codex::{self, Grant};
@@ -353,6 +353,44 @@ fn python_codex_prepare_seals_project_trust_receipt() {
     assert!(std::fs::read_to_string(home.join("config.toml"))
         .unwrap()
         .contains("projects"));
+}
+
+/// Mirrors `tests/test_codex_adapter.py::CodexAdapterTests::test_prepare_seals_native_project_trust_before_snapshot`.
+#[test]
+fn python_codex_prepare_freezes_trust_and_refuses_tampered_resume() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let mut rt = runtime(temporary.path());
+    let auth = temporary.path().join("auth.json");
+    std::fs::write(&auth, "{}").unwrap();
+    rt.auth = Some(Auth::FileLink {
+        source: auth,
+        target: "auth.json".into(),
+    });
+    rt.hooks.push(Hook {
+        event: "PreToolUse".into(),
+        command: vec!["/bin/echo".into(), "trusted".into()],
+        matcher: Some("^Bash$".into()),
+    });
+    let cfg = config();
+    let req = request(temporary.path(), false);
+    let role = profile("review", false, false, vec![]);
+    let (_, digest) = materialize::materialize(&cfg, &rt, &req, &role, &home, temporary.path())
+        .expect("fresh Codex home materializes");
+    let generated = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(generated.contains("trust_level = \"trusted\""));
+    assert!(materialize::verify(&home, &digest).is_ok());
+
+    let marker = "trusted_hash = \"";
+    let start = generated.find(marker).expect("hook trust receipt") + marker.len();
+    let mut tampered = generated.clone();
+    tampered.replace_range(start..start + 1, "0");
+    std::fs::write(home.join("config.toml"), &tampered).unwrap();
+    assert!(materialize::verify(&home, &digest).is_err());
+    assert_eq!(
+        std::fs::read_to_string(home.join("config.toml")).unwrap(),
+        tampered
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_prepare_unions_request_roots_into_a_normalized_antichain`.

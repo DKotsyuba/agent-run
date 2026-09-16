@@ -119,6 +119,27 @@ fn unknown_config_fields_fail_closed() {
         assert!(Config::load(&h.path).is_err());
     }
 }
+
+/// Mirrors `tests/test_config.py::ConfigTests::test_validation_errors_do_not_echo_rejected_values`.
+#[test]
+fn unknown_config_diagnostics_never_echo_secret_values() {
+    let h = common::Home::new();
+    let secret = "sk-rust-config-diagnostic-secret";
+    for text in [
+        format!("schema_version=1\nunknown=\"{secret}\""),
+        format!("schema_version=1\n[core]\nunknown=\"{secret}\""),
+        format!(
+            "schema_version=1\n[runtimes.codex]\nenabled=true\nadapter=\"codex\"\nbinary=\"/bin/echo\"\nhome=\"/tmp/codex\"\nmodels=[\"fixture\"]\nunknown=\"{secret}\""
+        ),
+        format!(
+            "schema_version=1\n[runtimes.codex]\nenabled=true\nadapter=\"codex\"\nbinary=\"/bin/echo\"\nhome=\"/tmp/codex\"\nmodels=[\"fixture\"]\n[[runtimes.codex.hooks]]\nevent=\"PostToolUse\"\ncommand=[\"/bin/echo\"]\nunknown=\"{secret}\""
+        ),
+    ] {
+        std::fs::write(h.path.join("config.toml"), text).unwrap();
+        let diagnostic = Config::load(&h.path).unwrap_err().to_string();
+        assert!(!diagnostic.contains(secret), "diagnostic leaked a secret");
+    }
+}
 #[test]
 fn packaged_adapter_aliases_are_accepted_not_dynamic_imports() {
     assert_eq!(

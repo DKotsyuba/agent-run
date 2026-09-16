@@ -51,6 +51,30 @@ fn doc_works_outside_the_checkout() {
         .is_some_and(|text| text.contains("opencode/")));
 }
 
+/// Mirrors `test_doc.py::test_doc_with_topic_returns_that_topic`.
+#[test]
+fn release_candidate_runs_without_python_or_cjs_runtime_lookup() {
+    let directory = tempfile::tempdir().expect("unrelated current directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .current_dir(directory.path())
+        .env_clear()
+        .env("HOME", directory.path())
+        .env("PATH", "")
+        .args(["doc", "models"])
+        .output()
+        .expect("native release candidate runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON response");
+    assert_eq!(value["topic"], "models");
+    assert!(value["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("opencode/")));
+}
+
 /// Mirrors `test_doc.py::test_topic_text_completion_is_contract_template`.
 #[test]
 fn completion_topic_contains_the_shared_notice_template() {

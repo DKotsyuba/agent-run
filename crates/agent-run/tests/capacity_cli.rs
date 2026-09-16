@@ -12,6 +12,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -294,5 +295,44 @@ async fn test_default_facade_serves_capacity_order_without_injection() {
     assert_eq!(
         route_runtimes(&output.lock().expect("output lock")[0]),
         vec!["alpha"]
+    );
+}
+
+/// Mirrors `tests/test_capacity_outcomes.py::CapacityOutcomeRegressionTests::test_capacity_collect_cli_preserves_status_counts_and_degraded_exit`.
+#[test]
+fn collect_once_prints_the_report_and_returns_degraded_exit_status() {
+    let scratch = tempfile::tempdir().expect("capacity home");
+    let auth = scratch.path().join("auth.json");
+    std::fs::write(&auth, "{}").expect("fixture auth source");
+    let missing_home = scratch.path().join("missing-runtime-home");
+    std::fs::write(
+        scratch.path().join("config.toml"),
+        format!(
+            "schema_version=1\n[runtimes.codex]\nenabled=true\nadapter=\"codex\"\nbinary=\"/bin/true\"\nhome=\"{}\"\nmodels=[\"fixture\"]\nlimits_source=\"codex_appserver\"\n[runtimes.codex.auth]\nkind=\"file_link\"\nsource=\"{}\"\ntarget=\"auth.json\"\n",
+            missing_home.display(),
+            auth.display()
+        ),
+    )
+    .expect("collect config writes");
+    Store::initialize(scratch.path()).expect("capacity store initializes");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args([
+            "--home",
+            scratch.path().to_str().expect("home path"),
+            "capacity",
+            "collect",
+            "--once",
+        ])
+        .output()
+        .expect("collect CLI starts");
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("printed report");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["results"][0]["status"], "failed");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {:?}",
+        output.stderr
     );
 }

@@ -42,6 +42,34 @@ fn python_init_bootstraps_a_private_minimal_home_idempotently() {
     assert_eq!(fs::metadata(home.join("config.toml")).unwrap().ino(), inode);
 }
 
+/// Mirrors `tests/test_cli.py::CliTests::test_init_bootstraps_private_minimal_home_without_credentials`.
+/// Mirrors `tests/test_doctor.py::DoctorTests::test_canary_handshake_ok_reports_a_completed_real_handshake`.
+#[test]
+fn python_init_preserves_config_and_optional_integrations_are_not_mandatory() {
+    let temp = tempfile::tempdir().expect("temporary parent");
+    let home = temp.path().join("configured");
+    fs::create_dir_all(&home).unwrap();
+    let config = home.join("config.toml");
+    let original = "schema_version = 1\n[core]\nmax_active_agents = 5\n";
+    fs::write(&config, original).unwrap();
+
+    agent_run::init::initialize(&home).expect("initialize preserves config");
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    fs::create_dir_all(home.join("profiles")).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["--home", home.to_str().unwrap(), "doctor"])
+        .output()
+        .expect("doctor CLI starts");
+    assert_eq!(output.status.code(), Some(0), "doctor: {:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|finding| finding["severity"] != "error"));
+}
+
 /// Mirrors the unsafe-config refusal in Python `_initialize`.
 #[test]
 fn python_init_refuses_a_symlinked_config() {
