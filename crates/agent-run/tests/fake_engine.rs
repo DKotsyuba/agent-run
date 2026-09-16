@@ -376,6 +376,21 @@ async fn engine_ignoring_sigterm_requires_sigkill() {
     assert_eq!(cleanup["confirmed"], json!(true));
 }
 
+/// Mirrors Python `verify.py:505` (`read_answer_payload`), which raises
+/// `AnswerTamperedError` — an `AnswerError` subclass, `verify.py:70` — for
+/// exactly this message, `"answer artifact hash does not match its recorded
+/// proof"`. The answer-proof work landed on this branch tonight
+/// (`b7553f2`, "verify and seal answer proofs against the Python corpus")
+/// and moved `verify::read`'s hash-mismatch branch from the old generic
+/// `Error::Integrity` to `Error::AnswerIntegrity`
+/// (`crates/agent-run-platform/src/verify/mod.rs:242-245`), which is also
+/// the variant every other answer/proof check in that module now uses.
+/// `crates/agent-run-domain/src/error.rs:92-97` documents the direction
+/// explicitly: `AnswerIntegrity` is the live variant, `Integrity` is
+/// "retained temporarily for existing migration callers" — both still map
+/// to the same public `AnswerIntegrityError` machine code
+/// (`error.rs:134`), so no caller-visible behavior changed, only the
+/// internal variant this test must name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
     let (_tmp, home) = home();
@@ -397,7 +412,7 @@ async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
     std::fs::write(&path, b"corrupted answer bytes").unwrap();
     let error = verify::read(&root, &proof, verify::INLINE_ANSWER)
         .expect_err("corrupted bytes must not verify");
-    assert!(matches!(error, agent_run::Error::Integrity(_)));
+    assert!(matches!(error, agent_run::Error::AnswerIntegrity(_)));
 }
 
 #[test]

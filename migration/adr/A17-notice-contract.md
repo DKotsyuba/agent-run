@@ -1,9 +1,11 @@
-# A17 — Completion notice and delivery evidence contract
+# A17 — Completion notice, delivery evidence, and failure-kind contract
 
 Status: accepted. Resolves three pre-existing `crates/agent-run/tests/protocol.rs`
-failures introduced by the blind port, before any test had been run against the
-real Python release, by checking each assertion against `src/agent_run/delivery/`
-and its own tests, and correcting the invented ones.
+failures and two `crates/agent-run/tests/fake_engine.rs` failures (the latter
+surfaced by same-night merges landing the answer-proof work), all introduced by
+the blind port before any test had been run against the real Python release, by
+checking each assertion against the actual Python source and its own tests, and
+correcting the invented ones.
 
 ## Method
 
@@ -138,9 +140,73 @@ was needed.
   a strict superset of Python's `set(value) != expected` check in `from_payload`
   (`base.py:136`).
 
+### 4. `fake_engine.rs::exit_zero_without_terminal_result_is_not_success` — test corrected
+
+Old assertion: exit code 0 with no terminal result classifies as `failure_kind ==
+"missing_result"`.
+
+The fixture engine for this scenario (`crates/agent-run/tests/fixtures/engine.rs:58-61,101-103`)
+emits one `"assistant"` text line (`"fixture partial\n"`) *before* returning
+without ever writing a `"result"` line. Python's `StreamDecoder.finalize()`
+(`src/agent_run/adapters/claude/stream.py:335-349`) distinguishes exactly this:
+`subtype = "cut_off" if self._saw_assistant_text else "no_answer"` — an engine
+that streamed content and then stopped short is `"cut_off"`; an engine that
+produced nothing at all is `"no_answer"`. `session.py:344-349` then passes an
+unrecognized/non-`"no_answer"` subtype straight through `classify_failure`
+(`stream.py:220-236`) as the literal `failure_kind`. `"missing_result"` does not
+exist anywhere in `src/agent_run/`. This was independently verified by feeding
+the exact same two lines the fixture emits into a live `StreamDecoder` under
+`/Users/pluto/projects/agent-run/.venv-py314/bin/python` (3.14.3,
+`PYTHONPATH=src`): `finalize().subtype == "cut_off"` and
+`classify_failure(...) == "cut_off"`.
+
+Rust's own EOF handler in `crates/agent-run-core/src/stream.rs:309-321` already
+implements the identical `saw_answer` (`"cut_off"`) vs. no-diagnostic
+(`"no_answer"`) vs. diagnostic-classified (`"auth_failed"`/`"provider_error"`)
+branching, so it already computed `"cut_off"` for this fixture correctly.
+
+Verdict: the test encoded an invented label. Corrected the expected value to
+`"cut_off"`; the `"no_answer"` branch (no streamed content at all) is exercised
+by Rust's EOF-without-`saw_answer` path and needed no new test, since Python's
+own distinguishing input (some vs. no assistant text) is what the fixture's
+behavior already selects.
+
+### 5. `fake_engine.rs::corrupted_answer_proof_is_rejected_even_after_a_real_seal` — test corrected
+
+Old assertion: a post-seal digest mismatch surfaces as `agent_run::Error::Integrity(_)`.
+
+Python raises `AnswerTamperedError` (`src/agent_run/verify.py:70`, an
+`AnswerError` subclass) for exactly this condition —
+`raise AnswerTamperedError("answer artifact hash does not match its recorded
+proof")` at `verify.py:505`. The answer-proof work that landed on this branch
+the same night (`b7553f2`, "verify and seal answer proofs against the Python
+corpus") rewrote `crates/agent-run-platform/src/verify/mod.rs`'s `read()` to
+raise `Error::AnswerIntegrity("answer artifact hash does not match its recorded
+proof")` for this exact case (`mod.rs:242-245`), and moved every other
+answer/proof check in that module (missing artifact, oversized, size mismatch,
+non-UTF-8, malformed/missing/contradicting sidecar) onto the same
+`AnswerIntegrity` variant. `crates/agent-run-domain/src/error.rs:92-97` states
+the direction directly: `AnswerIntegrity` is documented as the live variant
+("Verified-answer evidence failed an integrity contract"), while `Integrity` is
+"Legacy integrity name retained temporarily for existing migration callers."
+Both map to the identical public `MachineCode::AnswerIntegrityError`
+(`error.rs:134`) and identical `public()` message handling (`error.rs:163-164`),
+so no caller-visible JSON-RPC/MCP/CLI behavior changed — only the internal
+variant name the test must match moved with the rest of the module.
+
+Verdict: the test was correct at the moment it was written but was overtaken by
+this branch's own subsequent migration progress, not by an invented rule.
+Corrected the expected variant to `agent_run::Error::AnswerIntegrity(_)`,
+matching both the current implementation and Python's `AnswerTamperedError`
+naming intent.
+
 ## Outcome
 
-All three tests were rewritten to assert the verified Python contract; no
-production code in `crates/agent-run-core/src/delivery/` changed, since the
-existing Rust implementation already matched Python. `cargo test --test protocol`
-is green (13/13).
+All five tests were rewritten to assert the verified Python contract; no
+production code changed for items 1-3 (delivery notices/evidence), since the
+existing Rust implementation already matched Python. Items 4-5 needed no
+implementation change either — `crates/agent-run-core/src/stream.rs`'s EOF
+classifier and `crates/agent-run-platform/src/verify/mod.rs`'s `AnswerIntegrity`
+migration were already correct; only the tests, written before either landed or
+before Python was run, lagged behind. `cargo test --test protocol --test
+fake_engine` is green (13/13 and 13/13).
