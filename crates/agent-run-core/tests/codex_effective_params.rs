@@ -1,7 +1,10 @@
 //! App-server echo verification coverage using only in-memory protocol frames.
 
+use agent_run_config::{config::Runtime, profiles::Profile};
 use agent_run_core::codex::Grant;
+use agent_run_domain::domain::StartRequest;
 use serde_json::{json, Value};
+use std::{collections::BTreeSet, path::PathBuf};
 
 /// Returns the baseline read-only grant used by the app-server echo tests.
 fn read_only_grant() -> Grant {
@@ -258,4 +261,111 @@ fn python_test_codex_app_server_beta_writable_roots_unexpected_entry_is_reported
         "sandbox": {"type": "workspaceWrite", "writableRoots": ["/other"], "networkAccess": false}
     });
     assert!(grant.verify(&actual).is_err());
+}
+
+/// Builds the read-only role for request-grant construction tests.
+fn read_only_profile(read_roots: Vec<PathBuf>) -> Profile {
+    Profile {
+        name: "review".into(),
+        body: "Review the fixture.".into(),
+        write: false,
+        network: false,
+        revision: "fixture".into(),
+        canonical: false,
+        allow_external_read_roots: true,
+        read_roots,
+        skills: vec![],
+        mcp: vec![],
+        required_constraints: BTreeSet::new(),
+    }
+}
+
+/// Builds a minimal admitted Codex request without invoking a live adapter.
+fn grant_request(workdir: &str, write: bool) -> StartRequest {
+    serde_json::from_value(json!({
+        "runtime": "codex",
+        "model": "fixture",
+        "profile": if write { "implement" } else { "review" },
+        "task": "fixture",
+        "workdir": workdir,
+        "write": write,
+    }))
+    .expect("valid request fixture")
+}
+
+/// Builds a runtime with no ambient permissions or credentials.
+fn grant_runtime(workspace_root: Option<&str>) -> Runtime {
+    serde_json::from_value(json!({
+        "enabled": true,
+        "adapter": "codex",
+        "binary": "/bin/true",
+        "home": "/private/tmp/codex-runtime",
+        "models": ["fixture"],
+        "workspace_root": workspace_root,
+    }))
+    .expect("valid runtime fixture")
+}
+
+/// Mirrors `test_codex_adapter.py::test_prepare_accepts_a_request_read_root_as_the_only_filesystem_grant`.
+/// Mirrors `test_codex_adapter.py::test_prepare_grants_write_root_only_when_the_request_asks_for_it`.
+#[test]
+fn python_test_codex_adapter_grant_keeps_read_and_write_authority_separate() {
+    let request = grant_request("/private/tmp/work", false);
+    let grant = Grant::new(
+        &grant_runtime(None),
+        &request,
+        &read_only_profile(vec![PathBuf::from("/private/tmp/read")]),
+        PathBuf::from("/private/tmp/home").as_path(),
+    )
+    .expect("read-only grant");
+    assert_eq!(grant.roots, vec!["/private/tmp/read", "/private/tmp/work"]);
+    assert!(grant.writable_roots.is_empty());
+    assert_eq!(grant.sandbox, "read-only");
+
+    let write_request = grant_request("/private/tmp/work", true);
+    let write = Profile {
+        name: "implement".into(),
+        write: true,
+        ..read_only_profile(vec![])
+    };
+    let grant = Grant::new(
+        &grant_runtime(None),
+        &write_request,
+        &write,
+        PathBuf::from("/private/tmp/home").as_path(),
+    )
+    .expect("write grant");
+    assert_eq!(grant.roots, vec!["/private/tmp/work"]);
+    assert_eq!(grant.writable_roots, vec!["/private/tmp/work"]);
+    assert_eq!(grant.sandbox, "workspace-write");
+}
+
+/// Mirrors `test_codex_adapter.py::test_prepare_refuses_external_read_roots_with_write`.
+/// Mirrors `test_codex_adapter.py::test_prepare_rejects_write_workdir_outside_configured_project_root`.
+#[test]
+fn python_test_codex_adapter_grant_refuses_authority_outside_the_workspace() {
+    let request = grant_request("/private/tmp/project/work", true);
+    let write_with_read = Profile {
+        name: "implement".into(),
+        write: true,
+        ..read_only_profile(vec![PathBuf::from("/private/tmp/read")])
+    };
+    assert!(Grant::new(
+        &grant_runtime(Some("/private/tmp/project")),
+        &request,
+        &write_with_read,
+        PathBuf::from("/private/tmp/home").as_path(),
+    )
+    .is_err());
+    assert!(Grant::new(
+        &grant_runtime(Some("/private/tmp/project")),
+        &grant_request("/private/tmp/elsewhere", true),
+        &Profile {
+            name: "implement".into(),
+            write: true,
+            ..read_only_profile(vec![])
+        },
+        PathBuf::from("/private/tmp/home").as_path(),
+    )
+    .is_err());
 }

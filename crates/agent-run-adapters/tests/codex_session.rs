@@ -129,7 +129,7 @@ async fn python_test_codex_app_server_engine_exit_before_turn_completion() {
     process.reap().await;
 }
 
-/// Mirrors `test_codex_app_server.py::test_terminal_error_classification`.
+/// Mirrors `test_codex_app_server.py::test_structured_provider_errors_preserve_precedence_and_overload`.
 #[test]
 fn python_test_codex_app_server_error_classifications() {
     assert_eq!(
@@ -137,6 +137,10 @@ fn python_test_codex_app_server_error_classifications() {
         Some("auth_failed".into())
     );
     assert_eq!(failure_kind(&json!({"code":"quota"})), Some("quota".into()));
+    assert_eq!(
+        failure_kind(&json!({"kind":"auth_failed", "code":"quota"})),
+        Some("auth_failed".into())
+    );
     assert_eq!(
         failure_kind(&json!({"codexErrorInfo":"serverOverloaded"})),
         Some("provider_overloaded".into())
