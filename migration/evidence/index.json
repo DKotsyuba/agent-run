@@ -3,80 +3,8 @@
   "generated_for_commit": "fe72daaee497ff7f74a3c930d4e9862792af2bb3",
   "generated_at": "2026-09-16T09:24:55+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
-  "entry_count": 27,
+  "entry_count": 28,
   "entries": [
-    {
-      "path": "migration/evidence/coverage-2026-09-16.md",
-      "kind": "evidence",
-      "bytes": 18269,
-      "sha256": "8fc76e66f37fc8c994df1476d5b9eea56b5b33cc4141b1a143cf0e6aa1e41e7a"
-    },
-    {
-      "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
-      "kind": "evidence",
-      "bytes": 5339,
-      "sha256": "a943e87d2a67469c0ba10a513becf3e6250681b081049fb2e1bef5e43a0b2b5c"
-    },
-    {
-      "path": "migration/evidence/port-snapshot/REPORT.md",
-      "kind": "evidence",
-      "bytes": 3986,
-      "sha256": "d18a3bf24b093bc53faf4c1e8490d89b1adb66e9141c3d45d515266a89080811"
-    },
-    {
-      "path": "migration/evidence/port-snapshot/SOURCE_BASELINE.json",
-      "kind": "evidence",
-      "bytes": 654,
-      "sha256": "9c1980b9c72d4268138d9dd7e95cd7a44149a7a1956a7caee61d5732f8b20323"
-    },
-    {
-      "path": "migration/evidence/port-snapshot/node-transport-tests.tap",
-      "kind": "evidence",
-      "bytes": 1612,
-      "sha256": "18e4b40776524e191db1dfc37d3f529ec727d1a36541e2cb5471d92d82b8711e"
-    },
-    {
-      "path": "migration/evidence/port-snapshot/prepared-sql.json",
-      "kind": "evidence",
-      "bytes": 10810,
-      "sha256": "92e07c50c15f096ccff3388684786e16571118ae8dd111992a31997470584433"
-    },
-    {
-      "path": "migration/evidence/port-snapshot/static-checks.json",
-      "kind": "evidence",
-      "bytes": 978,
-      "sha256": "e1450ab2ec46bf64d82ac9e166f0e96c9df13c4eabecc88ccd7055569758b810"
-    },
-    {
-      "path": "migration/evidence/python-baseline-pytest.log",
-      "kind": "evidence",
-      "bytes": 4081,
-      "sha256": "7d4e0eb8344e0dd9c1b08bf3c513961132b942c7e19925ba837380354a173b9b"
-    },
-    {
-      "path": "migration/evidence/qualification-scope.md",
-      "kind": "evidence",
-      "bytes": 43067,
-      "sha256": "899aaeff31aff35a9f60b6c5e9c8885b7d8b180bee043f2b490419c5d3b18a38"
-    },
-    {
-      "path": "migration/evidence/verification-2026-09-16.md",
-      "kind": "evidence",
-      "bytes": 3954,
-      "sha256": "0ca02a5945b1c736d8d9e193a8ef05a0e25af2ac2dd57aadaa85a7ab608c29c4"
-    },
-    {
-      "path": "migration/evidence/verification-final-2026-09-16.md",
-      "kind": "evidence",
-      "bytes": 4864,
-      "sha256": "b46aa092bd648d2299d0a9b3eedbc1a77dc3931935ce6f306d7c11f4950dfdf5"
-    },
-    {
-      "path": "migration/evidence/verification-final-2026-09-16b.md",
-      "kind": "evidence",
-      "bytes": 3126,
-      "sha256": "b5d06fbcd09d972446b02b8ff144063813bffd81a2f1cc425b19d24116ed5983"
-    },
     {
       "path": "migration/adr/A09-desktop-relay.md",
       "kind": "decision",
@@ -150,16 +78,94 @@
       "sha256": "2fde5ded01f0bdc2c22c978a496f8dfa0676b3889da8713319958895232b49ee"
     },
     {
+      "path": "migration/baseline/divergences.csv",
+      "kind": "ledger",
+      "bytes": 4900,
+      "sha256": "5dfd375853cff0c4f3e7299a997cac3423a13df21ad2de884532cd07397d3598"
+    },
+    {
       "path": "migration/baseline/test-map.csv",
       "kind": "ledger",
       "bytes": 388397,
       "sha256": "1c3cb0d712cc7d2a3432c48502815d5de4fe90ab3945e2d36854f56c70b43375"
     },
     {
-      "path": "migration/baseline/divergences.csv",
-      "kind": "ledger",
-      "bytes": 4900,
-      "sha256": "5dfd375853cff0c4f3e7299a997cac3423a13df21ad2de884532cd07397d3598"
+      "path": "migration/evidence/coverage-2026-09-16.md",
+      "kind": "evidence",
+      "bytes": 18269,
+      "sha256": "8fc76e66f37fc8c994df1476d5b9eea56b5b33cc4141b1a143cf0e6aa1e41e7a"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
+      "kind": "evidence",
+      "bytes": 5339,
+      "sha256": "a943e87d2a67469c0ba10a513becf3e6250681b081049fb2e1bef5e43a0b2b5c"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/REPORT.md",
+      "kind": "evidence",
+      "bytes": 3986,
+      "sha256": "d18a3bf24b093bc53faf4c1e8490d89b1adb66e9141c3d45d515266a89080811"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/SOURCE_BASELINE.json",
+      "kind": "evidence",
+      "bytes": 654,
+      "sha256": "9c1980b9c72d4268138d9dd7e95cd7a44149a7a1956a7caee61d5732f8b20323"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/node-transport-tests.tap",
+      "kind": "evidence",
+      "bytes": 1612,
+      "sha256": "18e4b40776524e191db1dfc37d3f529ec727d1a36541e2cb5471d92d82b8711e"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/prepared-sql.json",
+      "kind": "evidence",
+      "bytes": 10810,
+      "sha256": "92e07c50c15f096ccff3388684786e16571118ae8dd111992a31997470584433"
+    },
+    {
+      "path": "migration/evidence/port-snapshot/static-checks.json",
+      "kind": "evidence",
+      "bytes": 978,
+      "sha256": "e1450ab2ec46bf64d82ac9e166f0e96c9df13c4eabecc88ccd7055569758b810"
+    },
+    {
+      "path": "migration/evidence/python-baseline-pytest.log",
+      "kind": "evidence",
+      "bytes": 4081,
+      "sha256": "7d4e0eb8344e0dd9c1b08bf3c513961132b942c7e19925ba837380354a173b9b"
+    },
+    {
+      "path": "migration/evidence/qualification-scope.md",
+      "kind": "evidence",
+      "bytes": 43067,
+      "sha256": "899aaeff31aff35a9f60b6c5e9c8885b7d8b180bee043f2b490419c5d3b18a38"
+    },
+    {
+      "path": "migration/evidence/verification-2026-09-16.md",
+      "kind": "evidence",
+      "bytes": 3954,
+      "sha256": "0ca02a5945b1c736d8d9e193a8ef05a0e25af2ac2dd57aadaa85a7ab608c29c4"
+    },
+    {
+      "path": "migration/evidence/verification-final-2026-09-16.md",
+      "kind": "evidence",
+      "bytes": 4864,
+      "sha256": "b46aa092bd648d2299d0a9b3eedbc1a77dc3931935ce6f306d7c11f4950dfdf5"
+    },
+    {
+      "path": "migration/evidence/verification-final-2026-09-16b.md",
+      "kind": "evidence",
+      "bytes": 3126,
+      "sha256": "b5d06fbcd09d972446b02b8ff144063813bffd81a2f1cc425b19d24116ed5983"
+    },
+    {
+      "path": "migration/review-checklist.md",
+      "kind": "review",
+      "bytes": 7937,
+      "sha256": "5f4db552058f853225607ec153c09a7f25ad3d7fce7c07a47506d1e8ce285d18"
     },
     {
       "path": "migration/tasks.csv",
