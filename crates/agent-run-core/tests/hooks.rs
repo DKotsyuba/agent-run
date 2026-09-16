@@ -535,6 +535,8 @@ fn python_context_hook_cli_delivers_once_then_on_change() {
     let third =
         context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
     assert!(third.injected && third.text.contains("beta"));
+}
+
 /// Returns the fixed host session identity used by the hook parity tests.
 fn reference() -> OrchestratorRef {
     OrchestratorRef {
@@ -544,29 +546,56 @@ fn reference() -> OrchestratorRef {
     }
 }
 
-/// Mirrors `tests/test_bind_hook.py::BindHookTests::test_unbound_running_agent_keeps_running_without_a_delivery`
+/// Admits one active agent attributed to the shared host session.
 ///
-/// Binding a live agent only routes its future completion: it must neither
-/// disturb the run nor manufacture a notice before there is a terminal result.
+/// The configuration is re-read from the home on every call so a test that
+/// raises an admission limit before admitting sees that limit.
+fn active_agent_row(home: &common::Home, task: &str, request_id: &str) -> AgentId {
+    let config = agent_run_config::config::Config::load(&home.path).expect("home configuration");
+    let mut request = home.request();
+    request.task = task.into();
+    request.request_id = Some(request_id.into());
+    request.orchestrator = Some(reference());
+    home.store()
+        .admit(&request, &config, &json!({}), None)
+        .unwrap()
+        .0
+}
+
+/// Mirrors `tests/test_bind_hook.py::BindHookTests::test_bind_rejects_arguments_that_are_not_the_declared_contract`
+///
+/// Python passes a foreign object where a store belongs and a raw mapping where
+/// an orchestrator reference belongs; Rust's signature makes both unrepresentable,
+/// so the same "only the declared contract is accepted" rule is asserted at the
+/// payload boundary that does accept untyped input.
 #[test]
-fn unbound_running_agent_keeps_running_without_a_delivery() {
-    let home = common::Home::new();
-    let (agent_id, _) = home
-        .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
-        .unwrap();
-    let mut store = home.store();
-    store.running(&agent_id, std::process::id() as i32).unwrap();
-    assert_eq!(
-        store.delivery_status(&agent_id).unwrap()["state"],
-        "not_created"
+fn bind_rejects_arguments_that_are_not_the_declared_contract() {
+    let listed = json!([["agent_id", "ag-20260916-120000-0123456789"]]);
+    assert!(
+        bind::normalize(&listed, true, "codex_queue").is_err(),
+        "a non-object payload is not the declared contract"
     );
-    bind::bind(&mut store, agent_id.clone(), reference(), 5.0).unwrap();
-    assert_eq!(store.get(&agent_id).unwrap().status, Status::Running);
-    assert_eq!(
-        store.delivery_status(&agent_id).unwrap()["state"],
-        "not_created",
-        "a running agent has no completion to announce yet"
+    let surprising = json!({
+        "agent_id": "ag-20260916-120000-0123456789",
+        "transport": "codex_queue",
+        "external_session_id": "session-1",
+        "surprise": 1,
+    });
+    assert!(
+        bind::normalize(&surprising, true, "codex_queue").is_err(),
+        "undeclared keys are refused"
+    );
+    let incomplete =
+        json!({"agent_id": "ag-20260916-120000-0123456789", "transport": "codex_queue"});
+    assert!(bind::normalize(&incomplete, true, "codex_queue").is_err());
+    let unknown_transport = json!({
+        "agent_id": "ag-20260916-120000-0123456789",
+        "transport": "codex_queue",
+        "external_session_id": "session-1",
+    });
+    assert!(
+        bind::normalize(&unknown_transport, true, "smoke_signal").is_err(),
+        "only declared host transports may bind"
     );
 }
 
@@ -617,57 +646,30 @@ fn bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it() {
     );
 }
 
-/// Mirrors `tests/test_bind_hook.py::BindHookTests::test_bind_rejects_arguments_that_are_not_the_declared_contract`
+/// Mirrors `tests/test_bind_hook.py::BindHookTests::test_unbound_running_agent_keeps_running_without_a_delivery`
 ///
-/// Python passes a foreign object where a store belongs and a raw mapping where
-/// an orchestrator reference belongs; Rust's signature makes both unrepresentable,
-/// so the same "only the declared contract is accepted" rule is asserted at the
-/// payload boundary that does accept untyped input.
+/// Binding a live agent only routes its future completion: it must neither
+/// disturb the run nor manufacture a notice before there is a terminal result.
 #[test]
-fn bind_rejects_arguments_that_are_not_the_declared_contract() {
-    let listed = json!([["agent_id", "ag-20260916-120000-0123456789"]]);
-    assert!(
-        bind::normalize(&listed, true, "codex_queue").is_err(),
-        "a non-object payload is not the declared contract"
+fn unbound_running_agent_keeps_running_without_a_delivery() {
+    let home = common::Home::new();
+    let (agent_id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    store.running(&agent_id, std::process::id() as i32).unwrap();
+    assert_eq!(
+        store.delivery_status(&agent_id).unwrap()["state"],
+        "not_created"
     );
-    let surprising = json!({
-        "agent_id": "ag-20260916-120000-0123456789",
-        "transport": "codex_queue",
-        "external_session_id": "session-1",
-        "surprise": 1,
-    });
-    assert!(
-        bind::normalize(&surprising, true, "codex_queue").is_err(),
-        "undeclared keys are refused"
+    bind::bind(&mut store, agent_id.clone(), reference(), 5.0).unwrap();
+    assert_eq!(store.get(&agent_id).unwrap().status, Status::Running);
+    assert_eq!(
+        store.delivery_status(&agent_id).unwrap()["state"],
+        "not_created",
+        "a running agent has no completion to announce yet"
     );
-    let incomplete =
-        json!({"agent_id": "ag-20260916-120000-0123456789", "transport": "codex_queue"});
-    assert!(bind::normalize(&incomplete, true, "codex_queue").is_err());
-    let unknown_transport = json!({
-        "agent_id": "ag-20260916-120000-0123456789",
-        "transport": "codex_queue",
-        "external_session_id": "session-1",
-    });
-    assert!(
-        bind::normalize(&unknown_transport, true, "smoke_signal").is_err(),
-        "only declared host transports may bind"
-    );
-}
-
-/// Admits one active agent attributed to the shared host session.
-///
-/// The configuration is re-read from the home on every call so a test that
-/// raises an admission limit before admitting sees that limit.
-fn active_agent(home: &common::Home, task: &str, request_id: &str) -> AgentId {
-    let config = agent_run_config::config::Config::load(&home.path).expect("home configuration");
-    let mut request = home.request();
-    request.task = task.into();
-    request.request_id = Some(request_id.into());
-    request.orchestrator = Some(reference());
-    home.store()
-        .admit(&request, &config, &json!({}), None)
-        .unwrap()
-        .0
 }
 
 /// Mirrors `tests/test_context_hook.py::ContextHookTests::test_bounds_and_dedup_key_is_stable_until_agent_state_changes`
@@ -678,7 +680,7 @@ fn active_agent(home: &common::Home, task: &str, request_id: &str) -> AgentId {
 #[test]
 fn context_bounds_and_dedup_key_is_stable_until_agent_state_changes() {
     let home = common::Home::new();
-    let agent_id = active_agent(&home, &format!("summary {}", "x".repeat(100)), "req-bounds");
+    let agent_id = active_agent_row(&home, &format!("summary {}", "x".repeat(100)), "req-bounds");
     let first = context::build(&home.path, &reference(), Some(1000.0)).expect("first context");
     assert!(first.orchestrator_session_id.is_some());
     assert!(first.injected);
@@ -717,7 +719,7 @@ fn context_budget_is_never_exceeded_with_many_active_agents() {
     let original = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, format!("{original}\n[core]\nmax_active_agents=32\n")).unwrap();
     for index in 0..12 {
-        active_agent(&home, &format!("task {index}"), &format!("req-{index}"));
+        active_agent_row(&home, &format!("task {index}"), &format!("req-{index}"));
     }
     let result = context::build(&home.path, &reference(), Some(2000.0)).expect("crowded context");
     assert!(result.text.contains("Active agents (12)"));
@@ -736,7 +738,7 @@ fn context_budget_is_never_exceeded_with_many_active_agents() {
 #[test]
 fn context_warning_and_silence_use_events_and_latest_message_time() {
     let home = common::Home::new();
-    let agent_id = active_agent(&home, "summary task", "req-silence");
+    let agent_id = active_agent_row(&home, "summary task", "req-silence");
     let mut store = home.store();
     store.running(&agent_id, std::process::id() as i32).unwrap();
     let started = now();
