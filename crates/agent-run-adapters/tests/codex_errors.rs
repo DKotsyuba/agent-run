@@ -23,6 +23,7 @@ fn current_model_list_shape_preserves_description_and_efforts() {
 }
 
 /// Mirrors `tests/test_codex_adapter.py::CodexAdapterTests::test_models_normalizes_real_cache_and_keeps_present_cache_strict`
+// The malformed-entry cases also protect the Rust parser's fail-soft cache contract; no single Python test isolates those entries.
 #[test]
 fn real_cache_shape_deduplicates_efforts_and_ignores_malformed_entries() {
     let models = parse_roster(&json!({
@@ -41,7 +42,7 @@ fn real_cache_shape_deduplicates_efforts_and_ignores_malformed_entries() {
     assert_eq!(models[0].efforts, ["low", "high"]);
 }
 
-/// Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_structured_provider_errors_preserve_precedence_and_overload`
+/// Mirrors `tests/test_codex_app_server.py::CodexAppServerSessionTests::test_structured_provider_errors_preserve_precedence_and_overload`
 #[test]
 fn structured_provider_errors_keep_precedence_and_bound_diagnostics() {
     assert_eq!(
