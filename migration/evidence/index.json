@@ -1,9 +1,9 @@
 {
   "index_version": 1,
-  "generated_for_commit": "7adf0d1e5ab5d5659d9bed4fb463052d5e998ea5",
-  "generated_at": "2026-09-16T05:34:49+00:00",
-  "note": "Inventory of migration evidence and decisions with content hashes. Produced by hand for board task M56; `xtask evidence verify` does not exist yet and must regenerate and check this file rather than trust it.",
-  "entry_count": 25,
+  "generated_for_commit": "b5486780008d603a21c25b5303ea81e1291d7fcb",
+  "generated_at": "2026-09-16T05:44:48+00:00",
+  "note": "Inventory of migration evidence and decisions with content hashes. Hand-assembled for board task M56; `xtask evidence verify` does not exist yet and must regenerate and check this file rather than trust it.",
+  "entry_count": 26,
   "entries": [
     {
       "path": "migration/evidence/coverage-2026-09-16.md",
@@ -64,6 +64,12 @@
       "kind": "evidence",
       "bytes": 4864,
       "sha256": "b46aa092bd648d2299d0a9b3eedbc1a77dc3931935ce6f306d7c11f4950dfdf5"
+    },
+    {
+      "path": "migration/evidence/verification-final-2026-09-16b.md",
+      "kind": "evidence",
+      "bytes": 3126,
+      "sha256": "b5d06fbcd09d972446b02b8ff144063813bffd81a2f1cc425b19d24116ed5983"
     },
     {
       "path": "migration/adr/A09-desktop-relay.md",
