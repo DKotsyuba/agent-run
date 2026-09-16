@@ -9,6 +9,7 @@ use crate::{
     state::Store,
     verify, Error, Result,
 };
+use rusqlite::{params, TransactionBehavior};
 use serde_json::json;
 use std::{ffi::OsStr, path::Path, time::Duration};
 
@@ -60,9 +61,10 @@ pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
         Err(error) => Err(Error::Runtime(error.to_string())),
     }
 }
-/// Child side: prove session identity, commit ownership, then report READY.
+/// Child side: prove session identity, commit ownership and heartbeat, then report READY.
 ///
-/// `fds` are the inherited ready, identity and error descriptors.
+/// `fds` are the inherited ready, identity and error descriptors.  The first
+/// heartbeat makes the complete ownership record eligible for later recovery.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     let [ready_fd, identity_fd, error_fd] = fds;
     if let Err(error) = launch::report_identity(identity_fd, error_fd) {
@@ -70,9 +72,9 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
         return Err(error.into());
     }
     let owned = (|| {
-        let store = Store::open(home)?;
+        let mut store = Store::open(home)?;
         let owner = process::inspect(std::process::id() as i32)?;
-        store.set_owner(id, owner.pid, &owner.token, Some(owner.birth))?;
+        record_owner(&mut store, id, &owner)?;
         Ok::<_, Error>(store)
     })();
     // A disconnected READY reader cannot undo an already committed owner.
@@ -105,6 +107,38 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             Err(error)
         }
     }
+}
+
+/// Atomically bind the supervising process and its first recovery heartbeat.
+///
+/// `owner` is the inspected current supervisor, whose PID/token/birth values
+/// become immutable ownership evidence.  The row must still be an unowned
+/// `starting` admission or this returns `Conflict`; no partial owner row is
+/// committed if the accompanying event cannot be appended.
+fn record_owner(store: &mut Store, id: &AgentId, owner: &process::Identity) -> Result<()> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let heartbeat = domain::now();
+    let changed = tx.execute(
+        "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=?,heartbeat_at=? \
+         WHERE id=? AND status='starting' AND supervisor_pid IS NULL",
+        params![owner.pid, owner.token, owner.birth, heartbeat, id.as_str()],
+    )?;
+    if changed != 1 {
+        return Err(Error::Conflict);
+    }
+    tx.execute(
+        "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
+        params![
+            id.as_str(),
+            heartbeat,
+            "supervisor_ready",
+            json!({"pid":owner.pid}).to_string()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 /// Run one admitted agent through preparation, supervision, cleanup, and terminal storage.
 async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {

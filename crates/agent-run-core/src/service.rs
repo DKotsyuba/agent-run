@@ -4,8 +4,9 @@ use crate::{
     config::{Adapter, Config},
     domain::{now, AgentId, OrchestratorRef, Outcome, StartRequest, Status},
     error::invalid,
+    lifecycle::reconcile,
     policy::{self, EffectivePolicy},
-    process::{self, ProcessState},
+    process,
     profiles::{self, Profile},
     state::{Record, Store},
     supervisor,
@@ -341,6 +342,12 @@ impl Service {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
+    /// Wait for a terminal durable revision or this observer's optional deadline.
+    ///
+    /// The run itself is never given an execution deadline here: `seconds`
+    /// bounds only this observer.  Each read opens and drops its own
+    /// thread-affine store connection before the Tokio sleep, allowing another
+    /// process to commit the terminal status that supplies the answer envelope.
     pub async fn wait(&self, id: &AgentId, seconds: Option<f64>) -> Result<Value> {
         if seconds.is_some_and(|n| !n.is_finite() || n < 0.0) {
             return Err(invalid("wait_seconds must be finite and nonnegative"));
@@ -355,7 +362,10 @@ impl Service {
             })
             .transpose()?;
         loop {
-            let row = Store::open(&self.home)?.get(id)?;
+            // This scope drops the thread-affine connection before the await.
+            // A waiter therefore owns neither a SQLite transaction nor a socket
+            // lane while another process commits the terminal revision.
+            let row = { Store::open(&self.home)?.get(id)? };
             if row.status.terminal() {
                 return self.answer(id);
             }
@@ -364,7 +374,15 @@ impl Service {
                     json!({"agent_id":id,"status":row.status,"terminal":false,"available":false}),
                 );
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let poll = Duration::from_millis(200);
+            let sleep = until
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(poll)
+                })
+                .unwrap_or(poll);
+            tokio::time::sleep(sleep).await;
         }
     }
     pub fn view(&self, store: &Store, row: &Record) -> Result<Value> {
@@ -400,47 +418,13 @@ impl Service {
             "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending"}),
         )
     }
+    /// Reconcile a bounded fair page of rows whose recorded ownership is proven gone.
+    ///
+    /// Native process observation is performed by the lifecycle module and
+    /// never treats unavailable OS evidence as a terminal outcome.
     pub fn reconcile(&self) -> Result<usize> {
         let mut store = Store::open(&self.home)?;
-        let (rows, _) = store.list(true, 0, 1000, None)?;
-        let mut changed = 0;
-        for row in rows {
-            let state = if row.supervisor_pid.is_some() {
-                process::observe(
-                    row.supervisor_pid,
-                    row.supervisor_identity.as_deref(),
-                    row.supervisor_birth_time,
-                )
-            } else {
-                use rusqlite::OptionalExtension;
-                let raw: Option<String> = store
-                    .conn
-                    .query_row(
-                        "SELECT startup_owner_pid_identity FROM agents WHERE id=?",
-                        [row.id.as_str()],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                match raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
-                    Some(p) => process::observe(
-                        p.get("pid")
-                            .and_then(Value::as_i64)
-                            .and_then(|n| i32::try_from(n).ok()),
-                        p.get("token").and_then(Value::as_str),
-                        p.get("birth").and_then(Value::as_f64),
-                    ),
-                    None => ProcessState::Unknown,
-                }
-            };
-            if matches!(state, ProcessState::Dead | ProcessState::Reused) {
-                let mut out = Outcome::failure("supervisor_lost");
-                out.status = Status::Lost;
-                store.finish(&row.id, &out, None, None)?;
-                changed += 1;
-            }
-        }
-        Ok(changed)
+        Ok(reconcile::reconcile(&mut store, 100)?.len())
     }
     pub async fn models(&self) -> Result<Value> {
         crate::capacity::models(&self.home).await
