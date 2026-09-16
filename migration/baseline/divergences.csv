@@ -32,3 +32,8 @@ tests/test_adapters_base.py::AdapterTests::test_launch_plan_payload_preserves_by
 tests/test_adapters_base.py::AdapterTests::test_launch_plan_resume_session_id_round_trips_and_defaults_absent_key,A10,no-payload-pipe
 tests/test_adapters_base.py::AdapterTests::test_registry_preloads_enabled_adapter_modules_and_surfaces_errors,A10,closed-adapter-enum
 tests/test_adapters_base.py::AdapterTests::test_materialize_requires_mcp_mapping_and_prepare_requires_role,A10,closed-adapter-enum
+tests/test_supervisor.py::SupervisorTests::test_a_base_exception_after_launch_is_durable_and_re_raised,A20,base-exception-unwind
+tests/test_supervisor.py::SupervisorTests::test_a_base_exception_during_launch_is_durable_and_re_raised,A20,base-exception-unwind
+tests/test_supervisor.py::SupervisorTests::test_invalid_settings_are_refused_before_adapter_launch,A20,no-supervisor-settings
+tests/test_supervisor.py::SupervisorTests::test_shared_service_row_keeps_the_supervisor_group,A20,always-owns-spawned-group
+tests/test_supervisor.py::SupervisorTests::test_shared_service_session_is_never_signalled_or_reaped,A20,always-owns-spawned-group
