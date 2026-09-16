@@ -8,7 +8,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 /// Names the deterministic cutover boundaries used by the crash-drill tests.
@@ -150,7 +150,7 @@ fn quiescent(home: &Path, force: bool) -> Result<(), String> {
     if !state.exists() || force {
         return Ok(());
     }
-    let connection = Connection::open(state).map_err(|error| error.to_string())?;
+    let connection = open_state(&state)?;
     let agents: i64 = connection.query_row("SELECT COUNT(*) FROM agents WHERE status NOT IN ('succeeded','failed','lost','timed_out','cancelled')", [], |row| row.get(0)).map_err(|error| error.to_string())?;
     let writers = live_writers(&connection)?;
     if agents == 0 && writers == 0 {
@@ -160,6 +160,15 @@ fn quiescent(home: &Path, force: bool) -> Result<(), String> {
             "refusing switch with {agents} active agents and {writers} live workflow writers; --force skips the quiescence check only"
         ))
     }
+}
+
+/// Opens a deployment state database with a short busy deadline so recovery diagnostics stay prompt.
+fn open_state(path: &Path) -> Result<Connection, String> {
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(Duration::from_millis(100))
+        .map_err(|error| error.to_string())?;
+    Ok(connection)
 }
 
 /// Atomically replaces the prefix `current` symlink with a verified release.
@@ -215,7 +224,7 @@ fn state_schema(home: &Path) -> Result<Option<u64>, String> {
     if !state.is_file() {
         return Ok(None);
     }
-    let connection = Connection::open(state).map_err(|error| error.to_string())?;
+    let connection = open_state(&state)?;
     connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u64>(0))
         .map(Some)
@@ -236,10 +245,14 @@ fn schema_compatible(home: &Path, release: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Chooses a private, not-yet-created directory for one deployment backup.
+fn backup_path(prefix: &Path) -> Result<PathBuf, String> {
+    Ok(prefix.join("backups").join(stamp()?))
+}
+
 /// Saves state with SQLite's backup API, config, and the prior pointer privately.
-fn backup(prefix: &Path, home: &Path, old: Option<&Path>) -> Result<PathBuf, String> {
-    let directory = prefix.join("backups").join(stamp()?);
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+fn backup_at(directory: &Path, home: &Path, old: Option<&Path>) -> Result<(), String> {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let state = home.join("state.db");
     if state.is_file() {
         let source = Connection::open(&state).map_err(|error| error.to_string())?;
@@ -258,7 +271,63 @@ fn backup(prefix: &Path, home: &Path, old: Option<&Path>) -> Result<PathBuf, Str
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(directory)
+    Ok(())
+}
+
+/// Verifies a candidate and turns common sealed-release defects into operator-facing errors.
+fn verify_candidate(release: &Path) -> Result<(), String> {
+    match release::verify(release) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            for relative in ["COMPLETE", "SHA256SUMS", "bin/agent-run", "metadata.json"] {
+                if !release.join(relative).exists() {
+                    return Err(format!("candidate release is missing asset {relative}"));
+                }
+            }
+            if error.to_ascii_lowercase().contains("permission denied") {
+                Err(format!(
+                    "candidate release asset access was denied: {error}"
+                ))
+            } else {
+                Err(format!("candidate release is corrupt: {error}"))
+            }
+        }
+    }
+}
+
+/// Selects a concrete corrective operation for a failed deployment boundary.
+fn next_operation(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if error.contains("missing asset") {
+        "restore the named asset or rebuild the sealed candidate, then rerun `release deploy`"
+    } else if error.contains("asset access was denied") {
+        "restore read permission on the named candidate asset, then rerun `release deploy`"
+    } else if lower.contains("database is locked") || lower.contains("database is busy") {
+        "release the SQLite lock held by another writer, then rerun `release deploy`"
+    } else if lower.contains("no space left on device") {
+        "free disk space in the deployment home, then rerun `release deploy`"
+    } else if lower.contains("not a database") {
+        "repair the corrupt state database or restore a valid copy, then rerun `release deploy`"
+    } else if error.contains("newer schema") {
+        "use a release compatible with the recorded schema, then rerun `release recover`"
+    } else if error.contains("active agents") || error.contains("live workflow writers") {
+        "stop or wait for the named active agents and workflow writers, then rerun `release deploy`"
+    } else if lower.contains("permission denied") {
+        "restore read/write permission for the deployment path, then rerun `release deploy`"
+    } else {
+        "correct the reported deployment error, inspect the retained journal, then rerun `release deploy`"
+    }
+}
+
+/// Retains a failed phase and appends a specific next operation to its journal.
+fn failed_deployment(prefix: &Path, mut journal: serde_json::Value, error: String) -> String {
+    let next = next_operation(&error);
+    journal["error"] = json!(error);
+    journal["next_operation"] = json!(next);
+    if let Err(journal_error) = write_journal(prefix, &journal) {
+        return format!("{error}; next operation: {next}; journal update failed: {journal_error}");
+    }
+    format!("{error}; next operation: {next}")
 }
 
 /// Installs or updates `prefix` from a sealed release after a quiescent backup.
@@ -285,43 +354,70 @@ fn deploy_inner(
     force: bool,
     failure: Option<CutoverStage>,
 ) -> Result<(), String> {
-    release::verify(release)?;
-    schema_compatible(home, release)?;
-    quiescent(home, force)?;
     fs::create_dir_all(prefix).map_err(|error| error.to_string())?;
     let old = current(prefix)?;
-    let backup = backup(prefix, home, old.as_deref())?;
-    let old_schema = old.as_deref().map(release::schema_version).transpose()?;
-    let new_schema = release::schema_version(release)?;
-    let journal = json!({
+    let backup = backup_path(prefix)?;
+    let mut journal = json!({
         "phase":"prepared",
+        "old_release":old,
+        "new_release":release,
+        "backup":backup,
+        "old_schema":null,
+        "new_schema":null,
+        "force_skips":"quiescence only",
+        "next_operation":"verify the candidate, database, and quiescence before switching the current pointer"
+    });
+    write_journal(prefix, &journal)?;
+
+    let (old_schema, new_schema) = match (|| {
+        verify_candidate(release)?;
+        schema_compatible(home, release)?;
+        quiescent(home, force)?;
+        let old_schema = old.as_deref().map(release::schema_version).transpose()?;
+        let new_schema = release::schema_version(release)?;
+        backup_at(&backup, home, old.as_deref())?;
+        Ok::<_, String>((old_schema, new_schema))
+    })() {
+        Ok(schemas) => schemas,
+        Err(error) => return Err(failed_deployment(prefix, journal, error)),
+    };
+    journal["old_schema"] = json!(old_schema);
+    journal["new_schema"] = json!(new_schema);
+    journal["next_operation"] =
+        json!("atomically switch the current pointer to the verified immutable release");
+    if let Err(error) = write_journal(prefix, &journal) {
+        return Err(failed_deployment(prefix, journal, error));
+    }
+    if failure == Some(CutoverStage::Before) {
+        return Err(failed_deployment(
+            prefix,
+            journal,
+            "injected cutover failure before swap".into(),
+        ));
+    }
+    if let Err(error) = switch_with_failure(prefix, release, failure) {
+        return Err(failed_deployment(prefix, journal, error));
+    }
+    if failure == Some(CutoverStage::After) {
+        return Err(failed_deployment(
+            prefix,
+            journal,
+            "injected cutover failure after swap".into(),
+        ));
+    }
+    let committed = json!({
+        "phase":"committed",
         "old_release":old,
         "new_release":release,
         "backup":backup,
         "old_schema":old_schema,
         "new_schema":new_schema,
-        "force_skips":"quiescence only"
+        "force_skips":"quiescence only",
+        "next_operation":"outside xtask, restore services/jobs, verify API readiness and capability discovery, then run the isolated release smoke"
     });
-    write_journal(prefix, &journal)?;
-    if failure == Some(CutoverStage::Before) {
-        return Err("injected cutover failure before swap".into());
+    if let Err(error) = write_journal(prefix, &committed) {
+        return Err(failed_deployment(prefix, journal, error));
     }
-    switch_with_failure(prefix, release, failure)?;
-    if failure == Some(CutoverStage::After) {
-        return Err("injected cutover failure after swap".into());
-    }
-    write_journal(
-        prefix,
-        &json!({
-            "phase":"committed",
-            "old_release":old,
-            "new_release":release,
-            "backup":backup,
-            "old_schema":old_schema,
-            "new_schema":new_schema,
-            "force_skips":"quiescence only"
-        }),
-    )?;
     Ok(())
 }
 
@@ -367,6 +463,9 @@ pub fn recover(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
     let mut recovered = journal;
     recovered["phase"] = json!("recovered");
     recovered["current_release"] = json!(compatible);
+    recovered["next_operation"] = json!(
+        "outside xtask, restore services/jobs, verify API readiness and capability discovery, then run the isolated release smoke"
+    );
     write_journal(prefix, &recovered)
 }
 
@@ -385,6 +484,9 @@ pub fn roll_forward(prefix: &Path, home: &Path, force: bool) -> Result<(), Strin
     let mut forwarded = journal;
     forwarded["phase"] = json!("rolled_forward");
     forwarded["current_release"] = json!(target);
+    forwarded["next_operation"] = json!(
+        "outside xtask, restore services/jobs, verify API readiness and capability discovery, then run the isolated release smoke"
+    );
     write_journal(prefix, &forwarded)
 }
 
@@ -409,6 +511,9 @@ pub fn rollback(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
     let mut rolled_back = journal;
     rolled_back["phase"] = json!("rolled_back");
     rolled_back["current_release"] = json!(old);
+    rolled_back["next_operation"] = json!(
+        "outside xtask, restore compatible services/jobs and verify API readiness before reconnecting hosts"
+    );
     write_journal(prefix, &rolled_back)
 }
 
@@ -567,5 +672,16 @@ mod tests {
         )
         .expect("journal remains valid");
         assert_eq!(journal["phase"], "rolled_back");
+    }
+
+    // Rust-only: the ENOSPC substitution keeps the real corrective operation specific.
+    #[test]
+    fn t84_insufficient_disk_substitution_names_free_space_operation() {
+        // A portable unprivileged test cannot fill the host filesystem safely; this
+        // exercises the same journal classification with the kernel's ENOSPC text.
+        assert_eq!(
+            super::next_operation("No space left on device"),
+            "free disk space in the deployment home, then rerun `release deploy`"
+        );
     }
 }

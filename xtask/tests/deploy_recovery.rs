@@ -20,6 +20,8 @@
 
 use agent_run_platform::process::{inspect, ProcessState};
 use rusqlite::{params, Connection};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -387,19 +389,224 @@ fn python_refused_deploy_takes_no_backup_and_leaves_the_journal() {
     connection
         .execute("INSERT INTO agents(status) VALUES ('running')", [])
         .expect("insert active agent row");
-    assert!(
-        deploy::deploy(&prefix, &home, &second, false).is_err(),
-        "active work must refuse the switch"
-    );
+    let error = deploy::deploy(&prefix, &home, &second, false)
+        .expect_err("active work must refuse the switch");
+    assert!(error.contains(
+        "next operation: stop or wait for the named active agents and workflow writers, then rerun `release deploy`"
+    ));
     assert_eq!(backups(), taken, "a refused deploy must not take a backup");
+    let refused_journal: serde_json::Value = serde_json::from_slice(
+        &fs::read(prefix.join("deploy.json")).expect("journal after refusal"),
+    )
+    .expect("refusal journal is readable");
+    let original_journal: serde_json::Value =
+        serde_json::from_slice(&journal).expect("original journal is readable");
+    assert_eq!(refused_journal["phase"], "prepared");
     assert_eq!(
-        fs::read(prefix.join("deploy.json")).expect("journal after refusal"),
-        journal,
-        "a refused deploy must not advance the journal"
+        refused_journal["old_release"],
+        original_journal["new_release"]
+    );
+    assert_eq!(
+        refused_journal["new_release"],
+        second.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        refused_journal["next_operation"],
+        "stop or wait for the named active agents and workflow writers, then rerun `release deploy`"
     );
     assert_eq!(
         fs::read_link(prefix.join("current")).expect("current pointer"),
         first,
         "a refused deploy must not move the current pointer"
     );
+}
+
+// Protects the C2 boundary: a real SQLite writer lock must leave a readable
+// prepared journal and tell the operator to release that lock.
+#[test]
+fn t84_db_busy_retains_prepared_phase_and_lock_next_operation() {
+    let (_temporary, prefix, home, old, new) = {
+        let temporary = tempdir().expect("temporary prefix");
+        let prefix = temporary.path().join("standalone");
+        let home = temporary.path().join("home");
+        fs::create_dir_all(&home).expect("temporary home");
+        fs::write(home.join("config.toml"), "fixture\n").expect("configuration fixture");
+        Connection::open(home.join("state.db"))
+            .expect("state fixture")
+            .execute("CREATE TABLE agents (status TEXT NOT NULL)", [])
+            .expect("agent fixture table");
+        let old_binary = temporary.path().join("old");
+        let new_binary = temporary.path().join("new");
+        fs::write(&old_binary, "old binary").expect("old binary");
+        fs::write(&new_binary, "new binary").expect("new binary");
+        let old = release::build(&prefix, "old", &old_binary).expect("old release");
+        let new = release::build(&prefix, "new", &new_binary).expect("new release");
+        deploy::deploy(&prefix, &home, &old, false).expect("baseline install");
+        (temporary, prefix, home, old, new)
+    };
+    let lock = Connection::open(home.join("state.db")).expect("lock connection");
+    lock.execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold an exclusive SQLite lock");
+    let backups_before = fs::read_dir(prefix.join("backups"))
+        .expect("baseline backups")
+        .count();
+    let candidate_manifest = fs::read(new.join("SHA256SUMS")).expect("candidate manifest");
+
+    let expected =
+        "next operation: release the SQLite lock held by another writer, then rerun `release deploy`";
+    let error = deploy::deploy(&prefix, &home, &new, false).expect_err("locked DB must refuse");
+    assert!(
+        error.contains("database is locked"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains(expected),
+        "unexpected next operation: {error}"
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(prefix.join("deploy.json")).expect("retained journal"))
+            .expect("journal is readable");
+    assert_eq!(journal["phase"], "prepared");
+    assert_eq!(
+        journal["next_operation"],
+        expected.strip_prefix("next operation: ").unwrap()
+    );
+
+    let retry = deploy::deploy(&prefix, &home, &new, false).expect_err("lock is still held");
+    assert!(
+        retry.contains(expected),
+        "retry must name lock operation: {retry}"
+    );
+    assert_eq!(
+        fs::read_link(prefix.join("current")).expect("current pointer"),
+        old
+    );
+    assert_eq!(
+        fs::read_dir(prefix.join("backups"))
+            .expect("backups after refusal")
+            .count(),
+        backups_before
+    );
+    assert_eq!(
+        fs::read(new.join("SHA256SUMS")).expect("candidate manifest after refusal"),
+        candidate_manifest
+    );
+}
+
+// Protects C3: removing a named sealed-release asset must not move current or
+// turn a missing candidate into a generic retry instruction.
+#[test]
+fn t84_missing_release_asset_retains_prepared_phase_and_asset_next_operation() {
+    let (_temporary, prefix, home, old, new) = cutover_fixture_for_recovery();
+    fs::remove_file(new.join("bin/agent-run")).expect("remove named release asset");
+    let expected =
+        "next operation: restore the named asset or rebuild the sealed candidate, then rerun `release deploy`";
+    let error = deploy::deploy(&prefix, &home, &new, false).expect_err("missing asset must refuse");
+    assert!(error.contains("candidate release is missing asset bin/agent-run"));
+    assert!(
+        error.contains(expected),
+        "unexpected next operation: {error}"
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(prefix.join("deploy.json")).expect("retained journal"))
+            .expect("journal is readable");
+    assert_eq!(journal["phase"], "prepared");
+    assert_eq!(
+        journal["next_operation"],
+        expected.strip_prefix("next operation: ").unwrap()
+    );
+    let retry = deploy::deploy(&prefix, &home, &new, false).expect_err("candidate remains broken");
+    assert!(
+        retry.contains(expected),
+        "retry must name asset operation: {retry}"
+    );
+    assert_eq!(
+        fs::read_link(prefix.join("current")).expect("current pointer"),
+        old
+    );
+    assert!(!new.join("bin/agent-run").exists());
+}
+
+#[cfg(unix)]
+// Protects C3: a real mode-000 candidate asset must fail closed and identify
+// the permission repair required before a retry.
+#[test]
+fn t84_permission_denied_release_asset_retains_prepared_phase_and_permission_next_operation() {
+    let (_temporary, prefix, home, old, new) = cutover_fixture_for_recovery();
+    let complete = new.join("COMPLETE");
+    fs::set_permissions(&complete, fs::Permissions::from_mode(0o000))
+        .expect("deny candidate asset read permission");
+    let expected =
+        "next operation: restore read permission on the named candidate asset, then rerun `release deploy`";
+    let error = deploy::deploy(&prefix, &home, &new, false)
+        .expect_err("permission-denied asset must refuse");
+    assert!(error.contains("candidate release asset access was denied"));
+    assert!(
+        error.contains(expected),
+        "unexpected next operation: {error}"
+    );
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(prefix.join("deploy.json")).expect("retained journal"))
+            .expect("journal is readable");
+    assert_eq!(journal["phase"], "prepared");
+    assert_eq!(
+        journal["next_operation"],
+        expected.strip_prefix("next operation: ").unwrap()
+    );
+    let retry = deploy::deploy(&prefix, &home, &new, false).expect_err("permission remains denied");
+    assert!(
+        retry.contains(expected),
+        "retry must name permission operation: {retry}"
+    );
+    assert_eq!(
+        fs::read_link(prefix.join("current")).expect("current pointer"),
+        old
+    );
+    assert_eq!(
+        fs::metadata(&complete)
+            .expect("candidate asset remains present")
+            .permissions()
+            .mode()
+            & 0o777,
+        0
+    );
+    fs::set_permissions(&complete, fs::Permissions::from_mode(0o644))
+        .expect("restore candidate asset permission");
+}
+
+// Protects C4/C9: once xtask has switched its pointer, the journal must name
+// the service/readiness/smoke work it cannot perform instead of implying full deployment success.
+#[test]
+fn t84_committed_journal_names_external_postcondition_operation() {
+    let (_temporary, prefix, home, _old, new) = cutover_fixture_for_recovery();
+    deploy::deploy(&prefix, &home, &new, false).expect("pointer cutover");
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(prefix.join("deploy.json")).expect("retained journal"))
+            .expect("journal is readable");
+    assert_eq!(journal["phase"], "committed");
+    assert_eq!(
+        journal["next_operation"],
+        "outside xtask, restore services/jobs, verify API readiness and capability discovery, then run the isolated release smoke"
+    );
+}
+
+/// Builds the common old/current/new release fixture for integration recovery drills.
+fn cutover_fixture_for_recovery() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let temporary = tempdir().expect("temporary prefix");
+    let prefix = temporary.path().join("standalone");
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&home).expect("temporary home");
+    fs::write(home.join("config.toml"), "fixture\n").expect("configuration fixture");
+    Connection::open(home.join("state.db"))
+        .expect("state fixture")
+        .execute("CREATE TABLE agents (status TEXT NOT NULL)", [])
+        .expect("agent fixture table");
+    let old_binary = temporary.path().join("old");
+    let new_binary = temporary.path().join("new");
+    fs::write(&old_binary, "old binary").expect("old binary");
+    fs::write(&new_binary, "new binary").expect("new binary");
+    let old = release::build(&prefix, "old", &old_binary).expect("old release");
+    let new = release::build(&prefix, "new", &new_binary).expect("new release");
+    deploy::deploy(&prefix, &home, &old, false).expect("baseline install");
+    (temporary, prefix, home, old, new)
 }
