@@ -535,7 +535,9 @@ fn native_topology_ignores_sample_input_order() {
     .unwrap();
     assert_eq!(forward.topology.pools, backward.topology.pools);
     assert_eq!(forward.topology.routes, backward.topology.routes);
-    assert_eq!(forward.topology.pools.len(), 1);
+    // One pool per sample identity, exactly as Python's `pools_from_samples`
+    // groups them: the shared session window and the scoped weekly window.
+    assert_eq!(forward.topology.pools.len(), 2);
 }
 
 /// Mirrors `tests/test_capacity_topology.py::SourceTopologyTests::test_legacy_samples_and_collect_samples_are_unchanged`.

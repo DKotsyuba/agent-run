@@ -154,8 +154,20 @@ pub struct Slice {
 }
 /// None is a different identity from every possible account label.
 pub fn account_token(account: Option<&str>) -> String {
+    account_token_with(account, "base")
+}
+/// Encodes a nullable account label so it can never collide with a literal one.
+///
+/// Mirrors Python's `capacity.topology.account_token`. `absent` is the
+/// source-defined token standing for "no account"; it must not itself start
+/// with `@`, because every present label is rendered as `@` followed by the
+/// label with every character outside the unreserved set `A-Za-z0-9-._~`
+/// percent-encoded. The mapping is injective: `None` and the literal label
+/// equal to `absent` produce different tokens, and the result never contains
+/// a `:` separator, so it is safe to embed in a colon-joined identifier.
+pub fn account_token_with(account: Option<&str>, absent: &str) -> String {
     match account {
-        None => "base".into(),
+        None => absent.into(),
         Some(a) => {
             let mut encoded = String::from("@");
             for b in a.bytes() {
@@ -230,6 +242,26 @@ pub fn persist(home: &Path, slice: &Slice, retention: usize) -> Result<usize> {
     tx.execute("DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?)",[retention as i64])?;
     tx.commit()?;
     Ok(slice.samples.len())
+}
+/// Trims the durable sample history to the newest `retention` rows.
+///
+/// `home` is the agent-run home whose store is trimmed and `retention` is the
+/// positive bound on retained rows; ordering is newest `observed_at` first,
+/// breaking ties on insertion id. Mirrors Python's
+/// `StateStore.prune_capacity_samples`, which `collect_once` calls once per
+/// round **regardless of whether any runtime collected**, so a round in which
+/// every runtime failed still enforces the global bound. A zero `retention` is
+/// a `Validation` error rather than a silent history wipe.
+pub fn prune(home: &Path, retention: usize) -> Result<()> {
+    if retention == 0 {
+        return Err(invalid("invalid quota retention"));
+    }
+    let store = Store::open(home)?;
+    store.conn.execute(
+        "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?)",
+        [retention as i64],
+    )?;
+    Ok(())
 }
 fn row_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sample> {
     Ok(Sample {
