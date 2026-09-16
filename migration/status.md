@@ -134,6 +134,39 @@ The ledger — site, class, how it surfaced, and the test that guards it now —
 `migration/defects-found.md`. Read it before extending this code; the same shape
 is worth hunting elsewhere.
 
+## Cutover runbook: rehearsed once, outside fixtures
+
+The §21 runbook was exercised end to end on a disposable home and prefix, using
+the real commands rather than the fixture functions the recovery tests call.
+Every `xtask` deploy subcommand requires `--prefix` and `--home` explicitly and
+none reads `$HOME`, so a rehearsal cannot reach an installed home by accident.
+
+Sealed a release, verified it, installed it, updated onto a second release,
+rolled back, rolled forward, and ran `recover`. After all of it the `current`
+pointer still named a sealed release, both releases and both backups survived —
+retention deleted nothing in use — and the journal stayed readable at every
+step. A rollback with no previous release **refused** with `journal has no
+previous release` and exit 2 rather than inventing an empty restore.
+
+The journal also names the external boundary itself: *"outside xtask, restore
+services/jobs, verify API readiness and capability discovery, then run the
+isolated release smoke."* That is ADR A19's divergence stated in the artifact an
+operator reads at the moment of cutover.
+
+**One weakness found, not yet fixed.** Running `rollback` a second time returns
+exit 0 and reports success although there was nothing left to roll back: the
+phase stays `rolled_back` and the pointer does not move. It performs no work,
+which is correct, but it does not say that no work was done — unlike the
+no-predecessor case, which refuses explicitly. Plan §21.6 requires a repeated
+command to recognise its phase and not declare success over unfinished work. An
+operator who repeats a rollback after a dropped connection cannot tell which
+invocation acted.
+
+This rehearsal is **not** a substitute for the §21.6 drill set or for a
+production cutover. It shows the switch, rollback and roll-forward mechanics
+work on real files; it says nothing about services, readiness or smoke, which
+are the operator's half of the runbook.
+
 ## Known differences and unsupported paths
 
 1. Python-created runs cannot be resumed by this implementation (ADR A18). A
