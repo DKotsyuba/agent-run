@@ -1,4 +1,4 @@
-use crate::journal;
+use crate::{commands, journal};
 use crate::{
     config::{Config, Runtime},
     domain::{AgentId, Outcome, StartRequest, Status},
@@ -516,28 +516,56 @@ pub async fn run(
         let event = tokio::select! {event=process.next()=>Some(event),_=tick.tick()=>None};
         let Some(event) = event else {
             process.owner.refresh();
-            for (cid, kind, payload) in store.pending_commands(&record.id)? {
+            while let Some((cid, kind, payload)) = store.claim_command(&record.id)? {
                 if kind == "cancel" {
-                    let result = process
+                    // App-server interruption is advisory.  Once the durable
+                    // command is claimed, return to the supervisor so its
+                    // verified process-group cleanup enforces cancellation
+                    // and escalates only after the documented grace period.
+                    let _ = process
                         .rpc(
                             "turn/interrupt",
                             json!({"threadId":tid,"turnId":turn_id}),
                             Duration::from_secs(1),
                         )
                         .await;
-                    store.command_done(cid, &json!({"accepted":result.is_ok()}))?;
-                    continue;
+                    store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
+                    return Ok(EngineResult {
+                        outcome: Outcome {
+                            status: Status::Cancelled,
+                            exit_code: None,
+                            failure_kind: None,
+                            failure_text: None,
+                            runtime_session_id: Some(tid.clone()),
+                        },
+                        answer: None,
+                        usage,
+                    });
                 }
                 if kind == "steer" {
-                    let text = payload
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| invalid("malformed steer command"))?;
-                    let result=process.rpc("turn/steer",json!({"threadId":tid,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),Duration::from_secs(30)).await;
-                    store.command_done(cid, &json!({"accepted":result.is_ok()}))?;
-                    if result.is_ok() {
-                        journal(store, &record.id, "user", text, None, None)?;
+                    if let Some(text) = commands::steer_text(&payload) {
+                        let result=process.rpc("turn/steer",json!({"threadId":tid,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),Duration::from_secs(30)).await;
+                        store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":result.is_ok()}),
+                        )?;
+                        if result.is_ok() {
+                            journal(store, &record.id, "user", text, None, None)?;
+                        }
+                    } else {
+                        store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":false,"reason":"empty_steer_text"}),
+                        )?;
                     }
+                } else {
+                    store.complete_command(
+                        &record.id,
+                        cid,
+                        &json!({"accepted":false,"reason":"unsupported_command"}),
+                    )?;
                 }
             }
             continue;

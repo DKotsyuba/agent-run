@@ -1,6 +1,8 @@
 //! Orchestration layer coordinating configuration, persistence, and engines.
 pub mod capacity;
 pub mod codex;
+/// Durable command result handling shared by supervisor and engine runners.
+pub mod commands;
 pub mod delivery;
 pub mod dispatch;
 pub mod doc;

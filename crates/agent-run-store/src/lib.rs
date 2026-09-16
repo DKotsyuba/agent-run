@@ -522,38 +522,6 @@ impl Store {
         tx.commit()?;
         Ok(json!({"command_id":cid,"agent_id":id,"kind":kind,"state":"pending"}))
     }
-    pub fn pending_commands(&mut self, id: &AgentId) -> Result<Vec<(i64, String, Value)>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commands = {
-            let mut stmt=tx.prepare("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' ORDER BY id LIMIT 64")?;
-            let rows = stmt
-                .query_map([id.as_str()], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            rows
-        };
-        let mut result = Vec::new();
-        for (cid, kind, payload) in commands {
-            tx.execute(
-                "UPDATE commands SET state='claimed',claimed_at=? WHERE id=? AND state='pending'",
-                params![now(), cid],
-            )?;
-            result.push((cid, kind, serde_json::from_str(&payload)?));
-        }
-        tx.commit()?;
-        Ok(result)
-    }
-    pub fn command_done(&self, cid: i64, result: &Value) -> Result<()> {
-        self.conn.execute("UPDATE commands SET state='completed',completed_at=?,result_json=? WHERE id=? AND state='claimed'",params![now(),serde_json::to_string(result)?,cid])?;
-        Ok(())
-    }
     pub fn cancel_pending(&self, id: &AgentId) -> Result<bool> {
         Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='cancel' AND state IN ('pending','claimed'))",[id.as_str()],|r|r.get(0))?)
     }

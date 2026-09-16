@@ -2,8 +2,10 @@
 
 mod common;
 
-use agent_run_domain::domain::{OrchestratorRef, Outcome};
+use agent_run_domain::domain::{OrchestratorRef, Outcome, Status};
+use agent_run_platform::{fs, verify};
 use serde_json::json;
+use std::path::Path;
 
 /// Mirrors `test_state_store.py` terminal completion: a delivery-insert fault rolls back every terminal fact.
 #[test]
@@ -51,6 +53,36 @@ fn python_test_state_store_terminal_transition_is_atomic() {
             .unwrap(),
         0
     );
+}
+
+/// Mirrors Python `test_state_store.py::test_terminal_transition_consumes_pending_cancel`.
+#[test]
+fn python_test_state_store_terminal_success_loses_to_pending_cancel_atomically() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    store.running(&id, 42).unwrap();
+    let root = home.path.join("agents").join(id.as_str());
+    fs::private_dir(&root).unwrap();
+    let proof = verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
+    store.enqueue(&id, "cancel", &json!({})).unwrap();
+    store
+        .finish(&id, &Outcome::success(None), Some(&proof), None)
+        .unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
+    let (state, result): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT state,result_json FROM commands WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "completed");
+    assert_eq!(result, r#"{"accepted":true,"reason":"terminal_cancel"}"#);
 }
 
 /// Mirrors `test_state_outbox.py::test_terminal_before_binding_activates_once_and_expired_lease_reclaims_once`.
