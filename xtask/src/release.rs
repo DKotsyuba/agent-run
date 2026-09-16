@@ -1,0 +1,124 @@
+//! Immutable native release directory creation and manifest verification.
+
+use sha2::{Digest, Sha256};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+/// Returns a lowercase SHA-256 digest for one regular release file.
+fn digest(path: &Path) -> io::Result<String> {
+    Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+}
+
+/// Walks regular files below `root`, returning normalized relative paths.
+fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    /// Recurses through one immutable release directory.
+    fn visit(root: &Path, directory: &Path, result: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, result)?;
+            } else if path.is_file() {
+                result.push(path.strip_prefix(root).expect("descendant").to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut result = Vec::new();
+    visit(root, root, &mut result)?;
+    result.sort();
+    Ok(result)
+}
+
+/// Creates a sealed release from an already-built native binary.
+///
+/// The resulting `releases/<version>` contains only the binary, metadata,
+/// SHA256SUMS and COMPLETE marker. Existing complete releases are verified and
+/// reused; incomplete candidates are rejected to retain forensic evidence.
+pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, String> {
+    if version.trim().is_empty() || version.contains('/') {
+        return Err("version must be a nonblank path component".into());
+    }
+    if !binary.is_file() {
+        return Err(format!("binary is not a file: {}", binary.display()));
+    }
+    let release = output.join("releases").join(version);
+    if release.exists() {
+        verify(&release)?;
+        return Ok(release);
+    }
+    fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
+    fs::copy(binary, release.join("bin/agent-run")).map_err(|error| error.to_string())?;
+    let metadata = format!("{{\"version\":{version:?},\"format\":1}}\n");
+    fs::write(release.join("metadata.json"), metadata).map_err(|error| error.to_string())?;
+    let manifest = files(&release)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|relative| {
+            let path = release.join(&relative);
+            Ok(format!(
+                "{}  {}\n",
+                digest(&path).map_err(|error| error.to_string())?,
+                relative.display()
+            ))
+        })
+        .collect::<Result<String, String>>()?;
+    fs::write(release.join("SHA256SUMS"), manifest).map_err(|error| error.to_string())?;
+    fs::write(release.join("COMPLETE"), "complete\n").map_err(|error| error.to_string())?;
+    verify(&release)?;
+    Ok(release)
+}
+
+/// Validates a sealed release before it can become a `current` target.
+pub fn verify(release: &Path) -> Result<(), String> {
+    if fs::read_to_string(release.join("COMPLETE")).map_err(|error| error.to_string())?
+        != "complete\n"
+    {
+        return Err("release is incomplete".into());
+    }
+    let manifest =
+        fs::read_to_string(release.join("SHA256SUMS")).map_err(|error| error.to_string())?;
+    let mut seen = std::collections::BTreeSet::new();
+    for line in manifest.lines() {
+        let (hash, name) = line.split_once("  ").ok_or("invalid sealed manifest")?;
+        let relative = Path::new(name);
+        if hash.len() != 64
+            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || !seen.insert(name)
+        {
+            return Err("unsafe or duplicate sealed manifest path".into());
+        }
+        if digest(&release.join(relative)).map_err(|error| error.to_string())? != hash {
+            return Err(format!("corrupt sealed release file: {name}"));
+        }
+    }
+    if !seen.contains("bin/agent-run") || !seen.contains("metadata.json") {
+        return Err("sealed manifest does not cover runtime entry points".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build, verify};
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Mirrors `tests/test_release_script.py` sealed manifest verification.
+    #[test]
+    fn python_release_script_seals_and_rejects_tampering() {
+        let temporary = tempdir().expect("temporary directory");
+        let binary = temporary.path().join("agent-run");
+        fs::write(&binary, "native binary").expect("fixture binary");
+        let release = build(temporary.path(), "0.11.15", &binary).expect("sealed release");
+        verify(&release).expect("valid manifest");
+        fs::write(release.join("bin/agent-run"), "changed").expect("tamper fixture");
+        assert!(verify(&release).is_err());
+    }
+}

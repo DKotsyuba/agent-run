@@ -470,57 +470,6 @@ pub async fn doctor(home: &Path) -> Result<Value> {
         json!({"ok":ok,"home":home,"broker_available":broker,"checks":checks,"validation_level":"filesystem-and-configuration; provider authentication is checked at launch"}),
     )
 }
-fn xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-/// Renders the Python-compatible launchd document and its machine-readable metadata.
-pub fn launchd(
-    home: &Path,
-    binary: PathBuf,
-    kind: &str,
-    interval: u64,
-    label: &str,
-    stdout_log: PathBuf,
-    stderr_log: PathBuf,
-) -> Result<Value> {
-    let binary = absolute(&binary)?;
-    let args = match kind {
-        "api" => vec!["api", "serve"],
-        "capacity" => vec!["capacity", "collect", "--once"],
-        "delivery" => vec!["delivery", "dispatch"],
-        _ => return Err(invalid("unknown launchd job")),
-    };
-    let mut argv = vec![
-        binary.to_string_lossy().into_owned(),
-        "--home".into(),
-        home.to_string_lossy().into_owned(),
-    ];
-    argv.extend(args.into_iter().map(str::to_owned));
-    let args = argv
-        .iter()
-        .map(|a| format!("      <string>{}</string>\n", xml(a)))
-        .collect::<String>();
-    let home_env = std::env::var("HOME").map_err(|_| invalid("HOME is missing"))?;
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
-    let schedule = if kind == "api" {
-        "  <key>KeepAlive</key><true/>\n".into()
-    } else {
-        format!(
-            "  <key>StartInterval</key><integer>{}</integer>\n",
-            interval.max(1)
-        )
-    };
-    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",xml(label),xml(&home_env),xml(&path),xml(&stdout_log.to_string_lossy()),xml(&stderr_log.to_string_lossy()));
-    Ok(if kind == "api" {
-        json!({"label":label,"argv":argv,"plist":plist})
-    } else {
-        json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
-    })
-}
 /// Runs native provider login and returns its process code plus a safe success DTO.
 async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, Value)> {
     let cfg = Config::load(home)?;
@@ -773,7 +722,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 label,
                 stdout_log,
                 stderr_log,
-            } => emit(&launchd(
+            } => emit(&crate::launchd::render(
                 &home,
                 binary,
                 "api",
@@ -790,7 +739,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 label,
                 stdout_log,
                 stderr_log,
-            } => emit(&launchd(
+            } => emit(&crate::launchd::render(
                 &home,
                 binary,
                 "capacity",
@@ -817,11 +766,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 label,
                 stdout_log,
                 stderr_log,
-            } => emit(&launchd(
+            } => emit(&crate::launchd::render(
                 &home,
                 binary,
                 "delivery",
-                2,
+                Config::load(&home)?.delivery.retry_base_seconds.ceil() as u64,
                 &label,
                 stdout_log,
                 stderr_log.unwrap_or_else(|| home.join("delivery-worker.err.log")),
