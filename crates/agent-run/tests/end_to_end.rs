@@ -19,6 +19,7 @@ struct Harness {
     broker: Option<Child>,
 }
 impl Harness {
+    /// Builds a broker fixture with the explicitly provisioned profile Python init omits.
     fn new() -> Self {
         let temp = tempfile::Builder::new()
             .prefix("ar-")
@@ -37,6 +38,8 @@ impl Harness {
         );
         let config=format!("schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary={}\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",toml::Value::String(env!("CARGO_BIN_EXE_agent-run-fixture").into()),toml::Value::String(home.join("runtime").to_string_lossy().into_owned()));
         std::fs::write(home.join("config.toml"), config).unwrap();
+        std::fs::create_dir(home.join("profiles")).unwrap();
+        std::fs::write(home.join("profiles/review.md"), "Review.\n").unwrap();
         Self {
             temp,
             home,

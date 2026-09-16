@@ -3,6 +3,8 @@ pub mod capacity;
 pub mod codex;
 pub mod delivery;
 pub mod dispatch;
+pub mod doc;
+pub mod doctor;
 pub mod service;
 pub mod stream;
 pub mod supervisor;

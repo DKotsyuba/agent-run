@@ -46,6 +46,7 @@ fn bootstrap_fd() -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(duplicated) }
 }
 
+/// Builds a fixture home with the explicitly provisioned profile Python init omits.
 fn home() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::Builder::new()
         .prefix("ar-fe-")
@@ -67,6 +68,8 @@ fn home() -> (tempfile::TempDir, PathBuf) {
         toml::Value::String(home.join("runtime").to_string_lossy().into_owned()),
     );
     std::fs::write(home.join("config.toml"), config).unwrap();
+    std::fs::create_dir(home.join("profiles")).unwrap();
+    std::fs::write(home.join("profiles/review.md"), "Review.\n").unwrap();
     (temp, home)
 }
 
