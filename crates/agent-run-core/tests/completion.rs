@@ -360,7 +360,3 @@ fn an_engine_failure_is_passed_through() {
     assert_eq!(outcome.failure_kind, failure.failure_kind);
     assert_eq!(outcome.exit_code, failure.exit_code);
 }
-
-// Python's `test_unknown_stop_reason_is_refused` has no Rust equivalent:
-// `StopReason` is a two-variant enum, so an invalid third stop reason is not
-// a representable value in the first place.
