@@ -427,6 +427,13 @@ pub async fn models(process: &mut Process) -> Result<Vec<Value>> {
     }
     Err(invalid("model roster exceeds page bound"))
 }
+/// Runs one admitted Codex turn through its owned app-server process.
+///
+/// The runner verifies the live model roster and the echoed grant before it
+/// starts a turn, journals recognized transcript data, and persists valid
+/// unconsumed app-server notifications as durable events. It returns a
+/// terminal engine outcome, or fails closed on malformed protocol data,
+/// grant drift, unavailable models, and nonterminal completion statuses.
 pub async fn run(
     process: &mut Process,
     store: &mut Store,
@@ -591,15 +598,13 @@ pub async fn run(
             process.deny_request(&v).await?;
             continue;
         }
-        if session.notification(&v)?.is_none() {
-            continue;
-        }
         let method = v.get("method").and_then(Value::as_str).unwrap_or("");
         let p = &v["params"];
         if p.get("threadId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != tid)
         {
+            store.event(&record.id, method, p)?;
             continue;
         }
         let event_turn = p
@@ -607,12 +612,16 @@ pub async fn run(
             .or_else(|| p.pointer("/turn/id"))
             .and_then(Value::as_str);
         if event_turn.is_some_and(|id| id != turn_id) {
+            store.event(&record.id, method, p)?;
             continue;
         }
         if record.resume_of_runtime_session_id.is_some()
             && method.starts_with("item/")
             && event_turn.is_none()
         {
+            continue;
+        }
+        if session.notification(&v)?.is_none() {
             continue;
         }
         match method {
@@ -659,6 +668,8 @@ pub async fn run(
                         Some("command"),
                         Some(key),
                     )?;
+                } else {
+                    store.event(&record.id, method, p)?;
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -727,7 +738,7 @@ pub async fn run(
                     usage,
                 });
             }
-            _ => {}
+            _ => store.event(&record.id, method, p)?,
         }
     }
 }

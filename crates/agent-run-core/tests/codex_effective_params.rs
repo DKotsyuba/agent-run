@@ -39,6 +39,63 @@ fn python_test_codex_app_server_matching_params_pass() {
         .is_ok());
 }
 
+/// Mirrors `test_codex_app_server.py::test_non_network_sandbox_mode_is_sent_as_a_plain_string`.
+/// Mirrors `test_codex_app_server.py::test_read_only_thread_start_preserves_every_workspace_root`.
+#[test]
+fn python_test_codex_app_server_read_only_grant_request_is_complete() {
+    let mut grant = read_only_grant();
+    grant.roots.push("/another-read-root".into());
+    assert_eq!(
+        grant.request(),
+        json!({
+            "cwd": "/work",
+            "model": "gpt-5.6-sol",
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "runtimeWorkspaceRoots": ["/work", "/another-read-root"],
+        })
+    );
+}
+
+/// Mirrors `test_codex_app_server.py::test_network_grant_is_sent_as_a_workspace_write_config_flag`.
+#[test]
+fn python_test_codex_app_server_networked_workspace_grant_enables_only_the_native_flag() {
+    let mut grant = read_only_grant();
+    grant.sandbox = "workspace-write".into();
+    grant.approval_policy = "on-request".into();
+    grant.writable_roots = vec!["/work".into()];
+    grant.network_access = true;
+    grant.reviewer = Some("auto_review".into());
+    assert_eq!(
+        grant.request(),
+        json!({
+            "cwd": "/work",
+            "model": "gpt-5.6-sol",
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+            "runtimeWorkspaceRoots": ["/work"],
+            "approvalsReviewer": "auto_review",
+            "config": {"sandbox_workspace_write": {"network_access": true}},
+        })
+    );
+}
+
+/// Mirrors `test_codex_app_server.py::test_projects_profile_selected_explicitly_without_legacy_sandbox`.
+#[test]
+fn python_test_codex_app_server_permission_profile_replaces_legacy_sandbox_fields() {
+    let mut grant = read_only_grant();
+    grant.permission_profile = Some("Projects".into());
+    assert_eq!(
+        grant.request(),
+        json!({
+            "cwd": "/work",
+            "model": "gpt-5.6-sol",
+            "approvalPolicy": "never",
+            "permissions": "Projects",
+        })
+    );
+}
+
 /// Mirrors `test_codex_app_server.py::test_read_root_leaking_into_writable_roots_is_refused`.
 #[test]
 fn python_test_codex_app_server_read_root_leaking_into_writable_roots_is_refused() {
