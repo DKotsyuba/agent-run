@@ -221,55 +221,262 @@ fn verdict(
         },
     }
 }
+
+/// Return whether an exact PID observation proves the captured process exited.
+fn identity_gone(state: ProcessState) -> bool {
+    state == ProcessState::Dead
+}
+
+/// Return whether an exact PID observation permits an ownership signal.
+fn signal_allowed(state: ProcessState) -> bool {
+    state == ProcessState::Alive
+}
+
+/// Native observation of the original owned process group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupObservation {
+    /// The original group has no remaining members.
+    Gone,
+    /// The original group still has a member.
+    Alive,
+    /// The leader or group could not be observed safely.
+    Unknown,
+}
+/// Enumerate every process whose identity can be observed without spawning a child.
+///
+/// Linux obtains candidate PIDs directly from `/proc`; macOS asks the kernel for
+/// `KERN_PROC_ALL` records. A process which exits during this snapshot is omitted,
+/// but any other unreadable identity aborts the snapshot so cleanup cannot mistake
+/// an unknown group member for a dead one.
 pub fn processes() -> Result<Vec<Identity>> {
     #[cfg(target_os = "linux")]
-    let ids: Vec<i32> = std::fs::read_dir("/proc")?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .collect();
+    let ids = proc_ids()?;
     #[cfg(target_os = "macos")]
-    let ids: Vec<i32> = {
-        let out = std::process::Command::new("/bin/ps")
-            .args(["-axo", "pid="])
-            .output()?;
-        if !out.status.success() {
-            return Err(Error::Runtime("process observation unavailable".into()));
+    let ids = sysctl_process_ids()?;
+
+    let mut observed = Vec::with_capacity(ids.len());
+    for pid in ids {
+        match inspect(pid) {
+            Ok(identity) => observed.push(identity),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) => {}
+            Err(error) => return Err(error.into()),
         }
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
-    Ok(ids
-        .into_iter()
-        .filter_map(|pid| inspect(pid).ok())
+    }
+    Ok(observed)
+}
+
+/// List numeric process directory names from Linux's native procfs.
+#[cfg(target_os = "linux")]
+fn proc_ids() -> std::io::Result<Vec<i32>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        {
+            ids.push(pid);
+        }
+    }
+    Ok(ids)
+}
+
+/// Prefix of Darwin's `struct extern_proc` ending at its stable PID field.
+///
+/// `KERN_PROC_ALL` returns full `kinfo_proc` records. Their total size is
+/// runtime-discovered below because Apple can extend the trailing fields; this
+/// fixed ABI prefix is sufficient to read `extern_proc.p_pid` from each record.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct KernProcPrefix {
+    /// `extern_proc.p_un`, either two links or one `timeval`.
+    _links_or_start: [usize; 2],
+    /// `extern_proc.p_vmspace`.
+    _vmspace: *mut libc::c_void,
+    /// `extern_proc.p_sigacts`.
+    _sigacts: *mut libc::c_void,
+    /// `extern_proc.p_flag`.
+    _flags: libc::c_int,
+    /// `extern_proc.p_stat`.
+    _status: libc::c_char,
+    /// C ABI padding before the following `pid_t`.
+    _padding: [u8; 3],
+    /// `extern_proc.p_pid`, the process identifier in this record.
+    pid: libc::pid_t,
+}
+
+/// Read a Darwin sysctl payload, retrying once if process creation grew it.
+#[cfg(target_os = "macos")]
+fn sysctl_bytes(name: &mut [libc::c_int]) -> std::io::Result<Vec<u8>> {
+    for _ in 0..2 {
+        let mut length: libc::size_t = 0;
+        // SAFETY: `name` is a valid mutable MIB, `length` is a valid out-pointer,
+        // and a null output buffer requests the exact payload size without writing.
+        if unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut bytes = vec![0u8; length.saturating_add(4096)];
+        let mut capacity = bytes.len();
+        // SAFETY: `bytes` owns a writable buffer of exactly `capacity` bytes;
+        // `capacity` is passed to the kernel and returned with the initialized
+        // payload length, while `name` remains a valid MIB for this call.
+        if unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as libc::c_uint,
+                bytes.as_mut_ptr().cast(),
+                &mut capacity,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            bytes.truncate(capacity);
+            return Ok(bytes);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+}
+
+/// List PIDs from Darwin's `KERN_PROC_ALL` records without invoking `ps`.
+#[cfg(target_os = "macos")]
+fn sysctl_process_ids() -> std::io::Result<Vec<i32>> {
+    match sysctl_process_ids_inner() {
+        Ok(ids) => Ok(ids),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) => {
+            proc_list_all_pids()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Read Darwin `KERN_PROC_ALL` records and extract their stable PID prefix.
+#[cfg(target_os = "macos")]
+fn sysctl_process_ids_inner() -> std::io::Result<Vec<i32>> {
+    let mut one = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        std::process::id() as i32,
+    ];
+    let record_size = sysctl_bytes(&mut one)?.len();
+    if record_size < std::mem::size_of::<KernProcPrefix>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "short kinfo_proc record",
+        ));
+    }
+    let mut all = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    let records = sysctl_bytes(&mut all)?;
+    if records.len() % record_size != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "partial kinfo_proc record",
+        ));
+    }
+    const PID_OFFSET: usize = std::mem::offset_of!(KernProcPrefix, pid);
+    Ok(records
+        .chunks_exact(record_size)
+        .filter_map(|record| {
+            let bytes: [u8; std::mem::size_of::<libc::pid_t>()] = record
+                .get(PID_OFFSET..PID_OFFSET + std::mem::size_of::<libc::pid_t>())?
+                .try_into()
+                .ok()?;
+            let pid = libc::pid_t::from_ne_bytes(bytes);
+            (pid > 1).then_some(pid)
+        })
         .collect())
 }
+
+/// List Darwin PIDs through libproc when a sandbox denies the sysctl snapshot.
+#[cfg(target_os = "macos")]
+fn proc_list_all_pids() -> std::io::Result<Vec<i32>> {
+    // SAFETY: a null buffer and zero size only ask libproc for the required byte count.
+    let bytes = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if bytes < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut ids = vec![0i32; bytes as usize / std::mem::size_of::<libc::pid_t>()];
+    // SAFETY: `ids` owns exactly its byte length as writable `pid_t` storage, and
+    // libproc writes at most the supplied byte count before returning that count.
+    let read = unsafe {
+        libc::proc_listallpids(
+            ids.as_mut_ptr().cast(),
+            (ids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if read < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    ids.truncate(read as usize / std::mem::size_of::<libc::pid_t>());
+    ids.retain(|pid| *pid > 1);
+    Ok(ids)
+}
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Process-group and descendant cleanup evidence for one owned runtime.
 pub struct Cleanup {
+    /// Signals successfully delivered to the verified process group.
     pub signals: Vec<String>,
+    /// Scope of the descendant evidence.
     pub scope: String,
+    /// Whether native group observation proved the original group absent.
     pub group_gone: bool,
+    /// Whether every captured descendant identity is gone, or unavailable.
     pub descendants_gone: Option<bool>,
+    /// Whether both group and descendant observations confirm cleanup.
     pub confirmed: bool,
+    /// Original process-group identifier, when safe to report.
     pub process_group_id: Option<i32>,
 }
+/// PID-reuse-aware ownership evidence for one child process group.
 pub struct OwnedProcess {
+    /// Captured identity of the group leader, when readable at spawn time.
     pub leader: Option<Identity>,
+    /// Expected process-group identifier, equal to the spawned leader PID.
     pub pid: i32,
+    /// Captured leader and observed descendants indexed by PID.
     known: BTreeMap<i32, Identity>,
+    /// Whether at least one full native descendant snapshot completed.
+    descendants_observed: bool,
 }
 impl OwnedProcess {
+    /// Capture the spawned leader identity without assuming failure is death.
     pub fn capture(pid: i32) -> Self {
         let leader = inspect(pid).ok();
         let known = leader.clone().into_iter().map(|p| (p.pid, p)).collect();
-        Self { leader, pid, known }
+        Self {
+            leader,
+            pid,
+            known,
+            descendants_observed: false,
+        }
     }
+    /// Record descendants visible from a complete native process snapshot.
     pub fn refresh(&mut self) {
         let Ok(all) = processes() else {
             return;
         };
-        let leader_alive = self.leader.as_ref().is_some_and(|p| {
-            observe(Some(p.pid), Some(&p.token), Some(p.birth)) == ProcessState::Alive
+        self.descendants_observed = true;
+        let leader_owned = self.leader.as_ref().is_some_and(|p| {
+            matches!(
+                observe(Some(p.pid), Some(&p.token), Some(p.birth)),
+                ProcessState::Alive | ProcessState::Dead
+            )
         });
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {
@@ -279,7 +486,7 @@ impl OwnedProcess {
                     observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
                         == ProcessState::Alive
                 });
-                let in_group = leader_alive && p.group == self.pid;
+                let in_group = leader_owned && p.group == self.pid;
                 if (child || in_group) && !self.known.contains_key(&p.pid) {
                     self.known.insert(p.pid, p.clone());
                     changed = true;
@@ -290,12 +497,13 @@ impl OwnedProcess {
             }
         }
     }
+    /// Signal only a currently verified owned process group.
     pub fn signal(&mut self, sig: i32) -> Result<bool> {
         self.refresh();
         let mut signalled = false;
         if let Some(p) = &self.leader {
             if p.group == self.pid
-                && observe(Some(p.pid), Some(&p.token), Some(p.birth)) == ProcessState::Alive
+                && signal_allowed(observe(Some(p.pid), Some(&p.token), Some(p.birth)))
             {
                 // SAFETY: signal only the verified child-created process group; never group 0/1.
                 let code = unsafe { libc::kill(-self.pid, sig) };
@@ -306,46 +514,69 @@ impl OwnedProcess {
                 }
             }
         }
-        for p in self.known.values() {
-            if p.pid > 1
-                && observe(Some(p.pid), Some(&p.token), Some(p.birth)) == ProcessState::Alive
-            {
-                // SAFETY: the immutable birth token was checked immediately before this signal.
-                let code = unsafe { libc::kill(p.pid, sig) };
-                if code == 0 {
-                    signalled = true;
-                }
-            }
-        }
         Ok(signalled)
     }
+    /// Return whether the leader and its original group are both proven absent.
     pub fn gone(&self) -> bool {
-        let leader = match &self.leader {
-            Some(p) => matches!(
-                observe(Some(p.pid), Some(&p.token), Some(p.birth)),
-                ProcessState::Dead
-            ),
-            None => match inspect(self.pid) {
-                Err(e) => matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)),
-                Ok(p) => p.zombie,
-            },
-        };
-        if !leader {
-            return false;
-        }
-        let Ok(all) = processes() else {
-            return false;
-        };
-        !all.iter().any(|p| p.group == self.pid && !p.zombie)
-            && self.known.values().all(|p| {
-                matches!(
-                    observe(Some(p.pid), Some(&p.token), Some(p.birth)),
-                    ProcessState::Dead
-                )
-            })
+        self.group_observation() == GroupObservation::Gone
     }
-    pub async fn cleanup(&mut self, grace: std::time::Duration) -> Cleanup {
+    /// Observe the captured leader and its original group without sending a signal.
+    fn group_observation(&self) -> GroupObservation {
+        match &self.leader {
+            Some(p) => {
+                let state = observe(Some(p.pid), Some(&p.token), Some(p.birth));
+                if signal_allowed(state) {
+                    return GroupObservation::Alive;
+                }
+                if !identity_gone(state) && state != ProcessState::Reused {
+                    return GroupObservation::Unknown;
+                }
+            }
+            None => match inspect(self.pid) {
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) => {}
+                Err(_) => return GroupObservation::Unknown,
+                Ok(identity) if identity.zombie => {}
+                Ok(_) => return GroupObservation::Unknown,
+            },
+        }
+        if self.pid <= 1 {
+            return GroupObservation::Unknown;
+        }
+        if let Ok(processes) = processes() {
+            return if processes
+                .iter()
+                .any(|process| process.group == self.pid && !process.zombie)
+            {
+                GroupObservation::Alive
+            } else {
+                GroupObservation::Gone
+            };
+        }
+        // SAFETY: signal 0 observes only the explicitly captured process group;
+        // `pid > 1` prevents the wildcard and this supervisor's own group.
+        match unsafe { libc::kill(-self.pid, 0) } {
+            // Without the native snapshot, signal 0 cannot distinguish a live
+            // member from an unreaped zombie, so it is not completion evidence.
+            0 => GroupObservation::Unknown,
+            _ => match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => GroupObservation::Gone,
+                // POSIX signal 0 with EPERM proves the group exists but does
+                // not grant permission to signal it, matching Python's group_alive.
+                Some(libc::EPERM) | Some(libc::EACCES) => GroupObservation::Alive,
+                _ => GroupObservation::Unknown,
+            },
+        }
+    }
+    /// Terminate the verified group and return separate group/descendant evidence.
+    pub async fn cleanup(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
+        self.refresh();
+        if self.group_observation() == GroupObservation::Unknown {
+            return Err(Error::Runtime(
+                "process cleanup observation unavailable".into(),
+            ));
+        }
         if !self.gone() {
             if self.signal(libc::SIGTERM).unwrap_or(false) {
                 signals.push("SIGTERM".into());
@@ -364,15 +595,38 @@ impl OwnedProcess {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
-        let gone = self.gone();
-        Cleanup {
+        let group = self.group_observation();
+        if group == GroupObservation::Unknown {
+            return Err(Error::Runtime(
+                "process cleanup observation unavailable".into(),
+            ));
+        }
+        let group_gone = group == GroupObservation::Gone;
+        let descendants_gone = self.descendants_observed.then(|| {
+            let mut unknown = false;
+            for process in self
+                .known
+                .values()
+                .filter(|process| process.pid != self.pid)
+            {
+                match observe(Some(process.pid), Some(&process.token), Some(process.birth)) {
+                    ProcessState::Dead | ProcessState::Reused => {}
+                    ProcessState::Alive => return false,
+                    ProcessState::Unknown | ProcessState::Denied | ProcessState::NotStarted => {
+                        unknown = true;
+                    }
+                }
+            }
+            !unknown
+        });
+        Ok(Cleanup {
             signals,
             scope: "verified_descendants".into(),
-            group_gone: gone,
-            descendants_gone: Some(gone),
-            confirmed: gone,
+            group_gone,
+            descendants_gone,
+            confirmed: group_gone && descendants_gone == Some(true),
             process_group_id: Some(self.pid),
-        }
+        })
     }
 }
 #[cfg(test)]
@@ -401,5 +655,13 @@ mod tests {
             verdict(failed(libc::ENOENT), None, Some(1.0)),
             ProcessState::Dead
         );
+    }
+
+    #[test]
+    fn unknown_or_denied_identity_is_never_gone_or_signallable() {
+        for state in [ProcessState::Unknown, ProcessState::Denied] {
+            assert!(!identity_gone(state));
+            assert!(!signal_allowed(state));
+        }
     }
 }
