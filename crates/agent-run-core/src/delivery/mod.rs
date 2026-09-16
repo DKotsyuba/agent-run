@@ -9,14 +9,16 @@ use crate::{
     state::Store,
     Result,
 };
+use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::{fs::File, path::Path};
 
 const LEASE_SECONDS: f64 = 30.0;
 const MAX_TAIL_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
+const DEFAULT_MAX_BATCH: usize = 1000;
 
 /// A terminal lifecycle notification containing only trusted identifiers and selectors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +300,40 @@ struct Claim {
     notice: Notice,
 }
 
+/// Counts one bounded outbox drain and reports whether another process owns it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchResult {
+    /// Number of notices claimed by this drain.
+    pub claimed: usize,
+    /// Number of claims completed successfully.
+    pub delivered: usize,
+    /// Number of claims left scheduled for retry.
+    pub retried: usize,
+    /// Number of claims made terminally failed.
+    pub failed: usize,
+    /// Number of attempts whose acceptance was ambiguous.
+    pub ambiguous: usize,
+    /// Number of claims whose lease was lost before completion.
+    pub claim_lost: usize,
+    /// Whether another drain already holds the dispatcher lock.
+    pub locked_out: bool,
+}
+
+/// Opens the home-owned nonblocking dispatcher lock.
+fn dispatcher_lock(home: &Path) -> Result<Option<File>> {
+    let locks = home.join("locks");
+    std::fs::create_dir_all(&locks)?;
+    let file = File::options()
+        .create(true)
+        .append(true)
+        .open(locks.join("delivery-dispatcher.lock"))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Expires terminal deliveries that were never bound during the documented binding window.
 fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
     tx.execute(
@@ -454,14 +490,14 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
 }
 
 /// Claims and attempts one completion delivery, using an ephemeral lease owner identity.
-pub async fn dispatch_once(home: &Path) -> Result<usize> {
+async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
     let owner = format!(
         "disp-{}-{}",
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     );
     let Some(claim) = claim(home, &owner)? else {
-        return Ok(0);
+        return Ok(None);
     };
     let started = std::time::Instant::now();
     let mut evidence = match claim.transport.as_str() {
@@ -471,7 +507,53 @@ pub async fn dispatch_once(home: &Path) -> Result<usize> {
     };
     evidence.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     complete(home, &claim, &evidence)?;
-    Ok(1)
+    let result = Store::open(home)?.conn.query_row(
+        "SELECT state,ambiguous_result FROM deliveries WHERE id=?",
+        [&claim.delivery_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+    )?;
+    Ok(Some(result))
+}
+
+/// Claims and attempts one completion delivery without draining the backlog.
+pub async fn dispatch_once(home: &Path) -> Result<usize> {
+    let Some(_lock) = dispatcher_lock(home)? else {
+        return Ok(0);
+    };
+    Ok(dispatch_one(home).await?.is_some() as usize)
+}
+
+/// Drains at most `max_batch` due notices while holding one nonblocking lock.
+pub async fn dispatch_with_batch(home: &Path, max_batch: usize) -> Result<DispatchResult> {
+    if max_batch == 0 {
+        return Err(invalid("max_batch must be at least 1"));
+    }
+    let Some(_lock) = dispatcher_lock(home)? else {
+        return Ok(DispatchResult {
+            locked_out: true,
+            ..DispatchResult::default()
+        });
+    };
+    let mut result = DispatchResult::default();
+    while result.claimed < max_batch {
+        let Some((state, ambiguous)) = dispatch_one(home).await? else {
+            break;
+        };
+        result.claimed += 1;
+        result.ambiguous += ambiguous as usize;
+        match state.as_str() {
+            "delivered" => result.delivered += 1,
+            "retry_wait" => result.retried += 1,
+            "failed" => result.failed += 1,
+            _ => result.claim_lost += 1,
+        }
+    }
+    Ok(result)
+}
+
+/// Drains the due delivery outbox using the default bounded batch size.
+pub async fn dispatch(home: &Path) -> Result<DispatchResult> {
+    dispatch_with_batch(home, DEFAULT_MAX_BATCH).await
 }
 
 /// Resolves the Claude session registry, permitting a process-scoped test override.
