@@ -659,6 +659,8 @@ async fn steer_commands_are_answered_by_the_runtime_capability() {
     .unwrap();
     // The Qwen adapter validates its configured environment credential before
     // it reaches the fixture process; this value is never persisted.
+    // SAFETY: this test-only credential is scoped to the fixture process
+    // configuration and is not read by another test in this process.
     unsafe { std::env::set_var("OPENAI_API_KEY", "fixture-key") };
     let id = admit_runtime(&home, "qwen", "fixture:command-flood");
     let mut store = Store::open(&home).unwrap();
