@@ -7,4 +7,5 @@
 pub mod archive;
 pub mod deploy;
 pub mod evidence;
+pub mod qualify;
 pub mod release;
