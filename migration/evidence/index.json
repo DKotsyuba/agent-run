@@ -3,7 +3,7 @@
   "generated_for_commit": "fe72daaee497ff7f74a3c930d4e9862792af2bb3",
   "generated_at": "2026-09-16T09:24:55+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
-  "entry_count": 29,
+  "entry_count": 30,
   "entries": [
     {
       "path": "migration/adr/A09-desktop-relay.md",
@@ -166,6 +166,12 @@
       "kind": "evidence",
       "bytes": 3126,
       "sha256": "b5d06fbcd09d972446b02b8ff144063813bffd81a2f1cc425b19d24116ed5983"
+    },
+    {
+      "path": "migration/post-cutover-report.md",
+      "kind": "review",
+      "bytes": 5452,
+      "sha256": "df80ffd98ae43e7bacc17e049c36ffc97f61d1eff053272e891dbc4732227ccc"
     },
     {
       "path": "migration/review-checklist.md",
