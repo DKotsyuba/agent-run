@@ -215,8 +215,26 @@ pub fn environment(
     account: Option<&str>,
     app_home: &Path,
 ) -> Result<BTreeMap<String, String>> {
-    let kind = runtime.kind()?;
     let host: BTreeMap<_, _> = std::env::vars().collect();
+    environment_with_host(config, runtime, profile, home, account, app_home, &host)
+}
+
+/// Resolves one adapter environment from an explicitly supplied host snapshot.
+///
+/// The production wrapper supplies the process environment; tests and callers
+/// that already captured a host snapshot can use this deterministic variant.
+/// Qwen ignores legacy developer preset paths, variables, and required-command
+/// probes while retaining its native command-denial shims.
+pub fn environment_with_host(
+    config: &Config,
+    runtime: &Runtime,
+    profile: &Profile,
+    home: &Path,
+    account: Option<&str>,
+    app_home: &Path,
+    host: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let kind = runtime.kind()?;
     let mut names = BTreeSet::new();
     if let Some(Auth::Environment { names: declared }) = &runtime.auth {
         names.extend(declared.iter().cloned());
@@ -224,7 +242,7 @@ pub fn environment(
     for name in &profile.mcp {
         names.extend(config.mcp[name].env_from.iter().cloned());
     }
-    let mut env = inherited_environment(&host, &names);
+    let mut env = inherited_environment(host, &names);
     let host_home = host
         .get("HOME")
         .cloned()
@@ -253,56 +271,57 @@ pub fn environment(
     }
     let mut paths = Vec::new();
     let mut overrides = BTreeMap::new();
-    if let Some(e) = runtime
-        .environment
-        .as_ref()
-        .and_then(|n| config.environments.get(n))
-    {
-        paths.extend(e.path.iter().map(|p| p.to_string_lossy().into_owned()));
-        for (k, v) in &e.variables {
-            if [
-                "HOME",
-                "PATH",
-                "CODEX_HOME",
-                "CLAUDE_CONFIG_DIR",
-                "AGENT_RUN_HOME",
-            ]
-            .contains(&k.as_str())
-                || ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "CREDENTIAL"]
-                    .iter()
-                    .any(|s| k.contains(s))
-            {
-                return Err(invalid(
-                    "developer environment must not override private homes or embed credentials",
-                ));
-            }
-            overrides.insert(k.clone(), v.clone());
-        }
-    }
-    apply_environment_overrides(&mut env, overrides);
-    let rust = runtime.rust.as_ref().or_else(|| {
-        runtime
+    if kind != Adapter::Qwen {
+        if let Some(e) = runtime
             .environment
             .as_ref()
             .and_then(|n| config.environments.get(n))
-            .and_then(|e| e.rust.as_ref())
-    });
-    if let Some(r) = rust {
-        env.insert(
-            "RUSTUP_HOME".into(),
-            r.rustup_home.to_string_lossy().into_owned(),
-        );
-        env.insert(
-            "CARGO_HOME".into(),
-            home.join(".cargo").to_string_lossy().into_owned(),
-        );
-        paths.push(r.cargo_bin.to_string_lossy().into_owned());
+        {
+            paths.extend(e.path.iter().map(|p| p.to_string_lossy().into_owned()));
+            for (k, v) in &e.variables {
+                if [
+                    "HOME",
+                    "PATH",
+                    "CODEX_HOME",
+                    "CLAUDE_CONFIG_DIR",
+                    "AGENT_RUN_HOME",
+                ]
+                .contains(&k.as_str())
+                    || ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "CREDENTIAL"]
+                        .iter()
+                        .any(|s| k.contains(s))
+                {
+                    return Err(invalid(
+                        "developer environment must not override private homes or embed credentials",
+                    ));
+                }
+                overrides.insert(k.clone(), v.clone());
+            }
+        }
+        apply_environment_overrides(&mut env, overrides);
+        if let Some(r) = runtime.rust.as_ref().or_else(|| {
+            runtime
+                .environment
+                .as_ref()
+                .and_then(|n| config.environments.get(n))
+                .and_then(|e| e.rust.as_ref())
+        }) {
+            env.insert(
+                "RUSTUP_HOME".into(),
+                r.rustup_home.to_string_lossy().into_owned(),
+            );
+            env.insert(
+                "CARGO_HOME".into(),
+                home.join(".cargo").to_string_lossy().into_owned(),
+            );
+            paths.push(r.cargo_bin.to_string_lossy().into_owned());
+        }
+        if let Some(p) = runtime.binary.parent() {
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        paths.push(env.get("PATH").cloned().unwrap_or_default());
+        env.insert("PATH".into(), paths.join(":"));
     }
-    if let Some(p) = runtime.binary.parent() {
-        paths.push(p.to_string_lossy().into_owned());
-    }
-    paths.push(env.get("PATH").cloned().unwrap_or_default());
-    env.insert("PATH".into(), paths.join(":"));
     if let Some(e) = runtime
         .environment
         .as_ref()
@@ -352,7 +371,7 @@ pub fn environment(
     }
     match kind {
         Adapter::Glm => {
-            env.extend(auth::glm_environment(&host)?);
+            env.extend(auth::glm_environment(host)?);
         }
         Adapter::Qwen => {
             let auth_names = match &runtime.auth {
@@ -360,7 +379,7 @@ pub fn environment(
                 _ => &["OPENAI_API_KEY".into(), "OPENAI_BASE_URL".into()],
             };
             for name in auth_names {
-                let value = auth::qwen_auth_value(name, &host).ok_or_else(|| {
+                let value = auth::qwen_auth_value(name, host).ok_or_else(|| {
                     invalid(format!(
                         "qwen requires environment variable {name}, which is not set"
                     ))

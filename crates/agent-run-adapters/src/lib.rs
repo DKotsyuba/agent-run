@@ -8,7 +8,7 @@ pub mod materialize;
 pub mod plugins;
 pub mod redact;
 use agent_run_config::{
-    config::{Adapter, Config, Runtime},
+    config::{Adapter, Auth, Config, Runtime},
     profiles::Profile,
 };
 use agent_run_domain::{
@@ -25,9 +25,28 @@ pub struct LaunchPlan {
     pub environment: BTreeMap<String, String>,
     pub initial_input: Option<String>,
 }
+/// Validates one request against the selected adapter's closed capability set.
+///
+/// The runtime model, profile grants, authentication shape, and executable
+/// path are checked without spawning a child or consulting provider state.
 pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) -> Result<()> {
     let kind = runtime.kind()?;
     claude::validate_runtime(runtime, kind)?;
+    if kind == Adapter::Qwen {
+        match &runtime.auth {
+            Some(Auth::Environment { names })
+                if names
+                    .iter()
+                    .all(|name| matches!(name.as_str(), "OPENAI_API_KEY" | "OPENAI_BASE_URL")) => {}
+            Some(Auth::Environment { .. }) => {
+                return Err(invalid("qwen runtime auth.names has unsupported entries"));
+            }
+            Some(Auth::FileLink { .. }) => {
+                return Err(invalid("qwen runtime auth.kind must be 'environment'"));
+            }
+            None => {}
+        }
+    }
     if !runtime.models.contains(&request.model) {
         return Err(invalid("model is not configured for this runtime"));
     }
@@ -83,6 +102,8 @@ pub fn capabilities(kind: Adapter) -> Vec<&'static str> {
     ];
     if kind != Adapter::Qwen {
         c.extend(["steer", "effort"]);
+    } else {
+        c.push("live_limits");
     }
     if matches!(kind, Adapter::Claude | Adapter::Glm) {
         c.push("output_schema");

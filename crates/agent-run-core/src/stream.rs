@@ -651,16 +651,25 @@ mod tests {
         );
     }
 
-    /// Mirrors `test_qwen_adapter.py::test_error_only_result_is_provider_failure`.
+    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_error_only_400_result_fails_with_provider_error`.
+    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_error_only_500_result_fails_with_provider_error`.
+    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_error_mention_inside_real_content_stays_succeeded`.
+    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_claude_session_semantics_are_unchanged`.
+    /// Qwen's clean provider-error result is failure evidence, while embedded
+    /// error text and shared Claude classification remain ordinary content.
     #[test]
     fn qwen_error_only_results_become_bounded_provider_failures() {
-        assert_eq!(
-            qwen_provider_error(Some("  [API Error: upstream unavailable\nsecret detail")),
-            Some("[API Error: upstream unavailable".into())
-        );
+        let error_400 = "[API Error: 400 opencode-go/deepseek-v4-pro-high: model]";
+        let error_500 = "[API Error: 500 opencode-go/mimo-v2.5-max: provider]";
+        assert_eq!(qwen_provider_error(Some(error_400)), Some(error_400.into()));
+        assert_eq!(qwen_provider_error(Some(error_500)), Some(error_500.into()));
         assert_eq!(
             qwen_provider_error(Some("answer mentions [API Error:")),
             None
+        );
+        assert_eq!(
+            result_failure_kind("success", Some(error_400)),
+            "engine_error"
         );
     }
 }

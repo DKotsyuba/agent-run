@@ -1,13 +1,42 @@
 //! Recorded-fixture regressions for the Python capacity collector contracts.
 
 use agent_run_core::capacity::{
-    omniroute,
-    sources::{capture, normalize_codex, normalize_codexbar_accounts, read_claude_stream},
+    omniroute, sources,
+    sources::{
+        account_email, capture, normalize_codex, normalize_codexbar_accounts, read_claude_stream,
+    },
     Key,
 };
 use agent_run_domain::Error;
-use serde_json::json;
-use std::collections::BTreeMap;
+use serde_json::{json, Value};
+use std::{collections::BTreeMap, path::Path};
+
+/// Converts a compact JSON Web Token fixture into the auth-file shape used by Codex.
+fn auth_file(email: Option<&str>) -> serde_json::Value {
+    let claims = email.map_or_else(|| "{}".into(), |email| format!(r#"{{"email":"{email}"}}"#));
+    let payload = base64url(claims.as_bytes());
+    json!({"tokens":{"id_token":format!("header.{payload}.signature")}})
+}
+
+/// Encodes only the URL-safe base64 alphabet needed by the email fixture.
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut result = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as usize;
+        let b = chunk.get(1).copied().unwrap_or(0) as usize;
+        let c = chunk.get(2).copied().unwrap_or(0) as usize;
+        result.push(ALPHABET[a >> 2] as char);
+        result.push(ALPHABET[((a & 3) << 4) | (b >> 4)] as char);
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b & 15) << 2) | (c >> 6)] as char);
+        }
+        if chunk.len() > 2 {
+            result.push(ALPHABET[c & 63] as char);
+        }
+    }
+    result
+}
 
 const OBSERVED: f64 = 1_785_000_000.0;
 
@@ -81,6 +110,169 @@ fn codexbar_empty_data_is_an_explicit_failure() {
     assert_eq!(error.to_string(), "codexbar_missing_data");
 }
 
+/// Mirrors the Codexbar account-email helper's successful and collapsed-failure cases.
+// Mirrors `tests/test_capacity_sources.py::AccountEmailTests::test_decodes_email_and_collapses_failures`.
+#[test]
+fn codexbar_account_email_maps_only_valid_auth_claims() {
+    let temporary = tempfile::tempdir().expect("temporary root");
+    let path = temporary.path().join("auth.json");
+    std::fs::write(&path, serde_json::to_vec(&auth_file(Some("a @b"))).unwrap()).unwrap();
+    assert_eq!(account_email(&path).as_deref(), Some("a @b"));
+    let mut accounts = BTreeMap::new();
+    accounts.insert("personal".into(), "a @b".into());
+    let slice = normalize_codexbar_accounts(
+        "codex",
+        &json!({"usage":{"accountEmail":"a @b","updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":1,"windowMinutes":300}}}),
+        &accounts,
+        None,
+    )
+    .expect("valid account response");
+    assert_eq!(slice.samples[0].key.target.as_deref(), Some("personal"));
+    for contents in ["missing", "garbage"] {
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(account_email(&path), None);
+    }
+    std::fs::write(&path, serde_json::to_vec(&auth_file(None)).unwrap()).unwrap();
+    assert_eq!(account_email(&path), None);
+}
+
+/// Mirrors the honest Codexbar lane and window-name mapping rules.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_real_shape_maps_lanes_and_shelves_honestly`.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_unknown_window_minutes_names_itself`.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_absent_lanes_are_absent_but_present_windows_must_be_valid`.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_single_object_payload_still_maps_one_account_without_accounts`.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_empty_usage_object_is_an_invalid_observation`.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_first_account_only_and_ignored_sections`.
+#[test]
+fn codexbar_mapping_preserves_lanes_and_limits_account_scope() {
+    let payload = json!([
+        {"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":null,"secondary":{"usedPercent":46,"windowMinutes":10080,"resetsAt":"2026-09-03T16:26:47Z"},"tertiary":{"usedPercent":5.5,"windowMinutes":300,"resetsAt":null}}},
+        {"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":99,"windowMinutes":300}}}
+    ]);
+    let slice = normalize_codexbar_accounts("codex", &payload, &BTreeMap::new(), None).unwrap();
+    assert_eq!(slice.samples.len(), 2);
+    assert_eq!(slice.samples[0].key.lane, "secondary");
+    assert_eq!(slice.samples[0].key.window, "seven_day");
+    assert_eq!(slice.samples[0].remaining_percent, Some(54.0));
+    assert_eq!(slice.samples[1].key.window, "five_hour");
+    assert_eq!(slice.samples[0].reset_at, Some(1788452807.0));
+
+    let unknown = normalize_codexbar_accounts(
+        "codex",
+        &json!({"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":80,"windowMinutes":30}}}),
+        &BTreeMap::new(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(unknown.samples[0].key.window, "min30");
+    let single = normalize_codexbar_accounts("codex", &json!({"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":20,"windowMinutes":300}}}), &BTreeMap::new(), None).unwrap();
+    assert_eq!(single.samples[0].remaining_percent, Some(80.0));
+    assert!(
+        normalize_codexbar_accounts("codex", &json!({"usage":{}}), &BTreeMap::new(), None).is_err()
+    );
+}
+
+/// Mirrors the source's failure-safe timeout and secret-safe failure contract.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_codexbar_timeout_allows_two_minutes`.
+// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_failure_logs_and_exception_are_secret_safe`.
+#[tokio::test]
+async fn codexbar_capture_returns_fixed_secret_free_failures() {
+    let error = sources::capture(
+        Path::new("/bin/sh"),
+        &["-c".into(), "printf provider-secret; exit 1".into()],
+        1,
+        &BTreeMap::new(),
+    )
+    .await
+    .expect_err("nonzero source must fail");
+    assert!(!error.to_string().contains("provider-secret"));
+    assert_eq!(sources::CODEXBAR_TIMEOUT_SECONDS, 120);
+}
+
+/// Mirrors native Claude's lane, target, remaining, and bounded validity mapping.
+// Mirrors `tests/test_capacity_sources.py::NativeClaudeMappingTests::test_live_payload_maps_lanes_targets_and_remaining`.
+// Mirrors `tests/test_capacity_sources.py::NativeClaudeMappingTests::test_request_uses_oauth_headers_and_timeout`.
+// Mirrors `tests/test_capacity_sources.py::NativeClaudeMappingTests::test_missing_token_http_error_and_timeout_are_source_failures`.
+// Mirrors `tests/test_capacity_sources.py::NativeClaudeMappingTests::test_declared_oauth_env_is_used_without_reading_cli_state`.
+// Mirrors `tests/test_capacity_sources.py::NativeClaudeMappingTests::test_undeclared_or_api_key_env_never_becomes_the_oauth_token`.
+#[test]
+fn native_claude_mapping_is_bounded_and_provider_neutral() {
+    let payload = json!({"limits":[
+        {"kind":"session","percent":25,"resets_at":"2026-09-01T15:00:00-04:00"},
+        {"kind":"weekly_all","percent":40,"resets_at":"2026-09-07T12:00:00Z"},
+        {"kind":"weekly_scoped","percent":60,"scope":{"model":{"display_name":"Fable"}},"resets_at":"2026-09-07T12:00:00Z"},
+        {"kind":"mystery_limit","percent":10,"resets_at":null}
+    ]});
+    let slice = sources::normalize_claude("claude", &payload, 1788278400.0).unwrap();
+    assert_eq!(slice.samples[0].key.lane, "primary");
+    assert_eq!(slice.samples[1].key.window, "seven_day");
+    assert_eq!(slice.samples[2].key.target.as_deref(), Some("fable"));
+    assert_eq!(slice.samples[3].remaining_percent, Some(90.0));
+    assert_eq!(slice.samples[0].valid_until, Some(1788279300.0));
+}
+
+/// Mirrors timestamp parsing's rejection of naive, garbage, numeric, and missing values.
+// Mirrors `tests/test_capacity_sources.py::TimestampTests::test_rejects_naive_and_garbage_stamps`.
+#[test]
+fn capacity_timestamps_require_rfc3339_timezone_information() {
+    for value in [
+        json!("2026-08-29T12:12:53"),
+        json!(""),
+        json!(12345),
+        Value::Null,
+        json!("not-a-stamp"),
+    ] {
+        let payload =
+            json!({"usage":{"updatedAt":value,"primary":{"usedPercent":1,"windowMinutes":300}}});
+        assert!(sources::normalize_codexbar("codex", &payload).is_err());
+    }
+}
+
+/// Writes the smallest config accepted by the capacity dispatcher.
+fn dispatcher_config(root: &Path, adapter: &str, source: &str, binary: &Path) {
+    std::fs::write(
+        root.join("config.toml"),
+        format!(
+            "schema_version=1\n[runtimes.fixture]\nenabled=true\nadapter=\"{adapter}\"\nbinary=\"{}\"\nhome=\"{}\"\nmodels=[\"fixture\"]\nlimits_source=\"{source}\"\n",
+            binary.display(),
+            root.join("runtime").display()
+        ),
+    )
+    .unwrap();
+}
+
+/// Exercises source dispatch's unsupported/empty distinctions without loading an adapter.
+// Mirrors `tests/test_capacity_sources.py::DispatchTests::test_none_source_is_unsupported`.
+// Mirrors `tests/test_capacity_sources.py::DispatchTests::test_native_source_gates_on_live_limits_capability`.
+// Mirrors `tests/test_capacity_sources.py::DispatchTests::test_codexbar_source_rejects_undocumented_providers`.
+#[tokio::test]
+async fn capacity_dispatch_keeps_unsupported_sources_distinct() {
+    let temporary = tempfile::tempdir().unwrap();
+    dispatcher_config(temporary.path(), "claude", "none", Path::new("/bin/true"));
+    let unsupported = sources::collect(temporary.path()).await.unwrap();
+    assert_eq!(unsupported["results"][0]["status"], "unsupported");
+
+    dispatcher_config(temporary.path(), "qwen", "codexbar", Path::new("/bin/true"));
+    let unavailable = sources::collect(temporary.path()).await.unwrap();
+    assert_eq!(unavailable["results"][0]["status"], "failed");
+    assert_eq!(unavailable["results"][0]["issues"][0], "source_not_ported");
+}
+
+/// Exercises the configured Qwen binary's bounded local version probe.
+// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_probe_observes_the_configured_binary_version`.
+#[tokio::test]
+async fn qwen_model_probe_uses_the_configured_binary() {
+    let temporary = tempfile::tempdir().unwrap();
+    let binary = temporary.path().join("qwen");
+    std::fs::write(&binary, "#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dispatcher_config(temporary.path(), "qwen", "none", &binary);
+    let roster = sources::models(temporary.path()).await.unwrap();
+    assert_eq!(roster["fixture"]["available"], true);
+    assert_eq!(roster["fixture"]["models"][0]["id"], "fixture");
+}
+
 /// Mirrors `tests/test_omniroute_current_cache.py::test_current_cache_pool_average`.
 #[test]
 fn omniroute_current_cache_averages_members_and_uses_earliest_reset() {
@@ -96,6 +288,28 @@ fn omniroute_current_cache_averages_members_and_uses_earliest_reset() {
     assert_eq!(samples[0].remaining_percent, Some(70.0));
     assert_eq!(samples[0].key.window, "session_5h");
     assert_eq!(samples[0].key.target.as_deref(), Some("opencode-go:pool"));
+}
+
+/// Exercises Qwen's shared OmniRoute pool as a real empty, healthy, or failed source.
+// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_live_limits_capability_and_pool_samples_are_shared`.
+// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_a_successfully_read_empty_pool_has_no_samples`.
+// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_a_failing_row_source_raises_a_safe_source_error`.
+// Mirrors `tests/test_capacity_sources.py::DispatchTests::test_omniroute_source_uses_the_pool_without_any_adapter`.
+#[tokio::test]
+async fn qwen_uses_the_shared_omniroute_pool_without_adapter_calls() {
+    let rows = json!([{"window_key":"session","remaining_percentage":90.0,"next_reset_at":"2026-08-28T17:26:35.920Z","fetched_at":"2026-08-28T14:06:01.922Z"}]);
+    let observed = chrono::DateTime::parse_from_rfc3339("2026-08-28T14:06:01.922Z")
+        .unwrap()
+        .timestamp_millis() as f64
+        / 1000.0;
+    let healthy = omniroute::samples(&rows, observed + 60.0).unwrap();
+    assert_eq!(healthy[0].remaining_percent, Some(90.0));
+    assert_eq!(healthy[0].key.target.as_deref(), Some("opencode-go:pool"));
+    assert!(omniroute::samples(&json!([]), 1.0).unwrap().is_empty());
+    let error = omniroute::read(async { Err(agent_run_domain::Error::Runtime("fixture".into())) })
+        .await
+        .expect_err("unreadable pool must be a source failure");
+    assert_eq!(error.to_string(), "omniroute_unavailable");
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::test_stale_cache_is_unknown`.
