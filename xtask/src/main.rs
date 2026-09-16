@@ -1,7 +1,6 @@
 //! Repository-local verification and sealed native release entry point.
-mod deploy;
-mod release;
 use std::{env, path::PathBuf, process::Command};
+use xtask::{deploy, release};
 
 /// Runs the Rust workspace's formatter, linter, and test gates.
 fn main() {

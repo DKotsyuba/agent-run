@@ -77,10 +77,14 @@ pub fn render(
     }
     let schedule = match kind {
         "api" => "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n".to_owned(),
-        _ => format!(
-            "  <key>StartInterval</key><integer>{}</integer>\n  <key>RunAtLoad</key><false/>\n",
-            interval.max(1)
-        ),
+        _ => {
+            if interval == 0 {
+                return Err(invalid("interval_seconds must be an integer of at least 1"));
+            }
+            format!(
+                "  <key>StartInterval</key><integer>{interval}</integer>\n  <key>RunAtLoad</key><false/>\n"
+            )
+        }
     };
     let limits = if kind == "api" {
         "  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>\n"
@@ -91,6 +95,6 @@ pub fn render(
     Ok(if kind == "api" {
         json!({"label":label,"argv":argv,"plist":plist})
     } else {
-        json!({"label":label,"interval_seconds":interval.max(1),"argv":argv,"plist":plist})
+        json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
     })
 }
