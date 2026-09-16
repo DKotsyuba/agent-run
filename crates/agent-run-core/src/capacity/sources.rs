@@ -112,6 +112,62 @@ fn sample(
         valid_until: Some(observed + TTL),
     }
 }
+/// One sample's own declared shelf life in seconds, or `None` when it declares none.
+///
+/// Rust stores a sample's shelf life materialized as `valid_until`, which is
+/// exactly what Python's `persist_slice` writes for a sample carrying
+/// `valid_for_seconds`; the declared duration is therefore
+/// `valid_until - observed_at`. A sample missing either bound declares no
+/// shelf life, and so does a non-positive or non-finite span -- mirroring
+/// Python's `sample.valid_for_seconds and sample.valid_for_seconds > 0`
+/// filter, under which absent, zero, and negative values are all ignored
+/// rather than shortening the slice.
+fn shelf_life(sample: &Sample) -> Option<f64> {
+    let span = sample.valid_until? - sample.observed_at?;
+    (span.is_finite() && span > 0.0).then_some(span)
+}
+/// Builds one collection slice whose bounds come from the samples it carries.
+///
+/// Mirrors Python's `capacity.collect._slice_from_samples`. `runtime` and
+/// `scope_id` are the slice's non-empty identities, `samples` are the already
+/// normalized measurements (moved into the slice unchanged), `topology` is the
+/// source's declared pool/route shape, and `started` is the round's epoch used
+/// only as a fallback.
+///
+/// The slice observes the newest positive per-sample `observed_at`, falling
+/// back to `started` when no sample carries one, and expires after the
+/// **shortest positive** per-sample shelf life so no pool outlives its
+/// least-fresh constituent. When no sample declares a shelf life the bounded
+/// [`TTL`] default applies; a weekly provider reset therefore never keeps a
+/// topology snapshot fresh for days. This function performs no validation:
+/// [`super::persist`] checks the whole slice before anything is written.
+pub fn slice_from_samples(
+    runtime: &str,
+    scope_id: &str,
+    samples: Vec<Sample>,
+    topology: Topology,
+    started: f64,
+) -> Slice {
+    let newest = samples
+        .iter()
+        .filter_map(|sample| sample.observed_at)
+        .filter(|observed| *observed > 0.0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let observed_at = if newest.is_finite() { newest } else { started };
+    let shortest = samples
+        .iter()
+        .filter_map(shelf_life)
+        .fold(f64::INFINITY, f64::min);
+    let valid_for = if shortest.is_finite() { shortest } else { TTL };
+    Slice {
+        runtime: runtime.into(),
+        scope_id: scope_id.into(),
+        samples,
+        topology,
+        observed_at,
+        valid_until: observed_at + valid_for,
+    }
+}
 pub fn normalize_codex(
     runtime: &str,
     account: Option<&str>,
@@ -211,14 +267,13 @@ pub fn normalize_codex(
     }
     topology.validate(runtime)?;
     Ok((
-        Slice {
-            runtime: runtime.into(),
-            scope_id: format!("codex:{}", account_token(account)),
+        slice_from_samples(
+            runtime,
+            &format!("codex:{}", account_token(account)),
             samples,
             topology,
-            observed_at: observed,
-            valid_until: observed + TTL,
-        },
+            observed,
+        ),
         backend,
     ))
 }
@@ -394,27 +449,135 @@ pub async fn capture(
     }
     result
 }
-fn conservative_topology(runtime: &str, samples: &[Sample], account: Option<&str>) -> Topology {
-    // Every declared window governs the route; unknown scoped semantics cannot widen eligibility.
-    let keys: BTreeSet<_> = samples.iter().map(|s| s.key.clone()).collect();
-    if keys.is_empty() {
+/// Groups samples into one physical pool per distinct sample identity.
+///
+/// Mirrors Python's `capacity.topology.pools_from_samples`: the identity is
+/// the whole `(lane, window, target, source)` tuple, so samples sharing an
+/// identity share one reservoir while any difference keeps pools apart.
+/// `runtime` names the engine owning every emitted key and prefixes every pool
+/// id; the absent target is encoded with the `shared` token so it can never
+/// collide with a literal account label. The result is sorted by pool id, so
+/// the input sample order never changes it, and it is empty exactly when
+/// `samples` is.
+fn pools_from_samples(runtime: &str, samples: &[Sample]) -> Vec<Pool> {
+    let mut grouped: BTreeMap<String, BTreeSet<Key>> = BTreeMap::new();
+    for sample in samples {
+        let key = &sample.key;
+        let id = format!(
+            "{runtime}:{}:{}:{}:{}",
+            key.lane,
+            key.window,
+            super::account_token_with(key.target.as_deref(), "shared"),
+            key.source
+        );
+        grouped.entry(id).or_default().insert(key.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(pool_id, keys)| Pool { pool_id, keys })
+        .collect()
+}
+/// Composes the native source's shared default route plus one route per scope.
+///
+/// Mirrors Python's `capacity.sources._native_routes`. Target-less pools are
+/// the capacity every model shares and get one `default` route; each distinct
+/// non-empty target is a model scope whose route carries no account, takes the
+/// scope name as its quota lane, and draws on the union of the shared pools
+/// and its own. Scope names are data, not a fixed catalogue, so any discovered
+/// scope follows the same rule. `runtime` owns every id and key. A sample-free
+/// input yields an empty topology.
+///
+/// Keeping the scopes apart is what makes a runtime usable when one scoped
+/// model is exhausted or unknown: [`super::order`] drops a route whose pools
+/// hold any unknown forecast, and ranking drops a route with any exhausted
+/// window, so folding every scope into one pool would let a single scoped
+/// model disable the whole runtime.
+fn native_topology(runtime: &str, samples: &[Sample]) -> Topology {
+    let pools = pools_from_samples(runtime, samples);
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    let mut scoped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for pool in &pools {
+        for key in &pool.keys {
+            match key.target.as_deref() {
+                None => {
+                    shared.insert(pool.pool_id.clone());
+                }
+                Some(target) => {
+                    scoped
+                        .entry(target.to_owned())
+                        .or_default()
+                        .insert(pool.pool_id.clone());
+                }
+            }
+        }
+    }
+    let mut routes = Vec::new();
+    if !shared.is_empty() {
+        routes.push(Route {
+            route_id: format!("{runtime}:default"),
+            runtime: runtime.into(),
+            account: None,
+            quota_lane: "default".into(),
+            pool_ids: shared.iter().cloned().collect(),
+            reset_credits: None,
+        });
+    }
+    for (scope, own) in scoped {
+        let mut pool_ids = shared.clone();
+        pool_ids.extend(own);
+        routes.push(Route {
+            route_id: format!("{runtime}:scope:{scope}"),
+            runtime: runtime.into(),
+            account: None,
+            quota_lane: scope,
+            pool_ids: pool_ids.into_iter().collect(),
+            reset_credits: None,
+        });
+    }
+    Topology { pools, routes }
+}
+/// Composes one aggregate route over every pooled window of a shared reservoir.
+///
+/// Mirrors the `omniroute` branch of Python's `capacity.sources.sample_topology`:
+/// the provider reports one pooled quota, so there is exactly one launchable
+/// route -- id `{runtime}:aggregate`, lane `aggregate`, no account -- drawing
+/// on every pool in declaration order. `runtime` owns every id and key. A
+/// sample-free input yields an empty topology rather than a route referencing
+/// no pool, which would not validate.
+fn aggregate_topology(runtime: &str, samples: &[Sample]) -> Topology {
+    let pools = pools_from_samples(runtime, samples);
+    if pools.is_empty() {
         return Topology::default();
     }
-    let source = samples[0].key.source.as_str();
-    let id = format!("{runtime}:{source}:{}:all", account_token(account));
-    Topology {
-        pools: vec![Pool {
-            pool_id: id.clone(),
-            keys,
-        }],
-        routes: vec![Route {
-            route_id: id.clone(),
-            runtime: runtime.into(),
-            account: account.map(str::to_owned),
-            quota_lane: "all".into(),
-            pool_ids: vec![id],
-            reset_credits: None,
-        }],
+    let routes = vec![Route {
+        route_id: format!("{runtime}:aggregate"),
+        runtime: runtime.into(),
+        account: None,
+        quota_lane: "aggregate".into(),
+        pool_ids: pools.iter().map(|pool| pool.pool_id.clone()).collect(),
+        reset_credits: None,
+    }];
+    Topology { pools, routes }
+}
+/// Derives the explicit topology one source's collected samples describe.
+///
+/// Mirrors Python's `capacity.sources.sample_topology`. `runtime` owns every
+/// emitted pool and route identity, `source` is the runtime's configured
+/// limits source, and `samples` are that source's already normalized
+/// measurements, which are only read. `omniroute` reports one aggregate route
+/// over all of its pooled windows; every other source composes the native
+/// shared default route plus one route per model scope. Pools always come from
+/// the neutral per-identity grouping, so the result is canonically ordered and
+/// the input sample order never changes it. An empty `samples` yields an empty
+/// topology.
+///
+/// The `codexbar` source is deliberately not routed here: its account-scoped
+/// routing needs the configured account labels and auth-claim emails, so
+/// [`normalize_codexbar_accounts`] builds that topology directly.
+pub fn sample_topology(runtime: &str, source: &str, samples: &[Sample]) -> Topology {
+    match source {
+        "omniroute" => aggregate_topology(runtime, samples),
+        _ => native_topology(runtime, samples),
     }
 }
 pub fn normalize_claude(runtime: &str, raw: &Value, observed: f64) -> Result<Slice> {
@@ -462,26 +625,48 @@ pub fn normalize_claude(runtime: &str, raw: &Value, observed: f64) -> Result<Sli
             observed,
         ));
     }
-    let topology = conservative_topology(runtime, &samples, None);
-    Ok(Slice {
-        runtime: runtime.into(),
-        scope_id: runtime.into(),
-        samples,
-        topology,
-        observed_at: observed,
-        valid_until: observed + TTL,
-    })
+    let topology = sample_topology(runtime, "native", &samples);
+    Ok(slice_from_samples(
+        runtime, runtime, samples, topology, observed,
+    ))
 }
-async fn claude_native(runtime: &str, rt: &Runtime) -> Result<Slice> {
-    let allowed = matches!(&rt.auth,Some(Auth::Environment{names})if names.iter().any(|n|n=="CLAUDE_CODE_OAUTH_TOKEN"));
-    if !allowed {
-        return Err(invalid("claude_token_missing"));
+/// Returns the OAuth token a native Claude capacity round may use.
+///
+/// Mirrors Python's `capacity.sources._claude_oauth_token`. An exported
+/// `CLAUDE_CODE_OAUTH_TOKEN` is honoured **only** when `rt`'s auth
+/// configuration declares that exact variable: honouring an undeclared export
+/// would silently widen the configured auth bridge. An empty export counts as
+/// absent, and `ANTHROPIC_API_KEY` is an API key that is never accepted as an
+/// OAuth token. Agent-run cannot inspect Claude Code's scoped credential store
+/// without reintroducing a global-account fallback, so every other case
+/// returns `None` and the caller maps that to its fixed safe failure. Reads
+/// process environment state, so the result depends on the ambient
+/// environment at call time.
+pub fn claude_oauth_token(rt: &Runtime) -> Option<String> {
+    match &rt.auth {
+        Some(Auth::Environment { names })
+            if names.iter().any(|name| name == "CLAUDE_CODE_OAUTH_TOKEN") =>
+        {
+            std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty())
+        }
+        _ => None,
     }
-    let token =
-        std::env::var("CLAUDE_CODE_OAUTH_TOKEN").map_err(|_| invalid("claude_token_missing"))?;
-    if token.is_empty() {
-        return Err(invalid("claude_token_missing"));
-    }
+}
+/// Collects one native Claude usage round through the provider's OAuth endpoint.
+///
+/// `runtime` names the configured engine and `rt` supplies the declared auth
+/// bridge. Returns a validated slice of the reported limits. Without a
+/// declared, exported, non-empty OAuth token this fails immediately with the
+/// fixed reason `claude_token_missing` and performs **no** network request and
+/// no scoped credential read; an unreachable endpoint, a non-success status,
+/// or an oversized body yields `claude_usage_unreachable`, and unparsable or
+/// out-of-contract content yields `claude_malformed_response`. No reason ever
+/// carries provider output. Performs a bounded HTTPS request only when a token
+/// is present.
+pub async fn claude_native(runtime: &str, rt: &Runtime) -> Result<Slice> {
+    let token = claude_oauth_token(rt).ok_or_else(|| invalid("claude_token_missing"))?;
     let observed = now();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -610,26 +795,20 @@ pub fn read_claude_stream(home: &Path, runtime: &str) -> Result<Slice> {
                 });
             }
             if !samples.is_empty() {
-                let topology = conservative_topology(runtime, &samples, None);
-                return Ok(Slice {
-                    runtime: runtime.into(),
-                    scope_id: runtime.into(),
-                    samples,
-                    topology,
-                    observed_at: modified,
-                    valid_until: modified + TTL,
-                });
+                let topology = sample_topology(runtime, "native", &samples);
+                return Ok(slice_from_samples(
+                    runtime, runtime, samples, topology, modified,
+                ));
             }
         }
     }
-    Ok(Slice {
-        runtime: runtime.into(),
-        scope_id: runtime.into(),
-        samples: Vec::new(),
-        topology: Topology::default(),
-        observed_at: observed,
-        valid_until: observed + TTL,
-    })
+    Ok(slice_from_samples(
+        runtime,
+        runtime,
+        Vec::new(),
+        Topology::default(),
+        observed,
+    ))
 }
 pub fn normalize_codexbar(runtime: &str, raw: &Value) -> Result<Slice> {
     normalize_codexbar_accounts(runtime, raw, &BTreeMap::new(), None)
@@ -750,18 +929,7 @@ pub fn normalize_codexbar_accounts(
         }
     }
     topology.validate(runtime)?;
-    let observed_at = samples
-        .iter()
-        .map(|sample| sample.observed_at.unwrap_or(0.0))
-        .fold(0.0, f64::max);
-    Ok(Slice {
-        runtime: runtime.into(),
-        scope_id: runtime.into(),
-        samples,
-        topology,
-        observed_at,
-        valid_until: observed_at + TTL,
-    })
+    Ok(slice_from_samples(runtime, runtime, samples, topology, 0.0))
 }
 async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result<Slice> {
     let provider = match rt.kind()? {
@@ -841,19 +1009,8 @@ async fn omniroute(name: &str) -> Result<Slice> {
             sample
         })
         .collect::<Vec<_>>();
-    let observed_at = samples
-        .iter()
-        .filter_map(|sample| sample.observed_at)
-        .fold(0.0, f64::max);
-    let topology = conservative_topology(name, &samples, None);
-    Ok(Slice {
-        runtime: name.into(),
-        scope_id: name.into(),
-        samples,
-        topology,
-        observed_at,
-        valid_until: observed_at + super::omniroute::STALE_SECONDS,
-    })
+    let topology = sample_topology(name, "omniroute", &samples);
+    Ok(slice_from_samples(name, name, samples, topology, 0.0))
 }
 pub async fn collect(home: &Path) -> Result<Value> {
     let config = Config::load(home)?;
@@ -875,6 +1032,14 @@ pub async fn collect(home: &Path) -> Result<Value> {
             let mut seen = BTreeSet::new();
             for account in scopes {
                 let observed = now();
+                // Python classifies a scope whose home is absent as
+                // `home_missing` and reserves `probe_failed` for a home that
+                // exists but could not be probed; the two are distinct
+                // operator signals, so the scope's own home decides.
+                let scope_home = match account {
+                    None => rt.home.clone(),
+                    Some(label) => materialize::account_home(home, Adapter::Codex, label),
+                };
                 let response =
                     codex_probe(home, &config, rt, account, "account/rateLimits/read").await;
                 match response.and_then(|v| normalize_codex(name, account, &v, observed)) {
@@ -896,7 +1061,14 @@ pub async fn collect(home: &Path) -> Result<Value> {
                             Err(_) => issues.push("persist_failed".into()),
                         }
                     }
-                    Err(_) => issues.push("probe_failed".into()),
+                    Err(_) => issues.push(
+                        if scope_home.is_dir() {
+                            "probe_failed"
+                        } else {
+                            "home_missing"
+                        }
+                        .into(),
+                    ),
                 }
             }
         } else {
@@ -941,6 +1113,10 @@ pub async fn collect(home: &Path) -> Result<Value> {
         }
         results.push(json!({"runtime":name,"status":status,"sample_count":count,"error":issues.first(),"issues":issues}));
     }
+    // Retention is global and per round, not per commit: Python's
+    // `collect_once` prunes after every round, so a round in which every
+    // runtime failed still enforces the bound on already-stored history.
+    super::prune(home, config.capacity.sample_retention)?;
     Ok(
         json!({"started_at":started,"finished_at":now(),"ok":all_ok,"results":results,"over_interval":now()-started>config.capacity.collect_interval_seconds as f64}),
     )

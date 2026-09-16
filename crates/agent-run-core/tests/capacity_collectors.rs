@@ -229,6 +229,12 @@ fn capacity_timestamps_require_rfc3339_timezone_information() {
 }
 
 /// Writes the smallest config accepted by the capacity dispatcher.
+///
+/// The store is initialized too, because a collection round enforces the
+/// global sample retention once per round the way Python's `collect_once`
+/// does -- including a round in which every runtime failed -- so a collectible
+/// home is one that has durable state. `Store::initialize` is idempotent, so
+/// rewriting the config on the same root stays safe.
 fn dispatcher_config(root: &Path, adapter: &str, source: &str, binary: &Path) {
     std::fs::write(
         root.join("config.toml"),
@@ -239,6 +245,7 @@ fn dispatcher_config(root: &Path, adapter: &str, source: &str, binary: &Path) {
         ),
     )
     .unwrap();
+    agent_run_store::Store::initialize(root).unwrap();
 }
 
 /// Exercises source dispatch's unsupported/empty distinctions without loading an adapter.
