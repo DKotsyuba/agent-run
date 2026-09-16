@@ -1,8 +1,8 @@
 mod common;
 use agent_run_core::capacity::{
-    self,
+    self, persist,
     ranking::{self, RouteInput},
-    Forecast, Key, Pool, Route, Sample, Topology,
+    Forecast, Key, Pool, Route, Sample, Slice, Topology,
 };
 use agent_run_domain::domain;
 use serde_json::json;
@@ -37,6 +37,119 @@ fn route(id: &str, account: Option<&str>) -> Route {
 }
 fn response() -> serde_json::Value {
     json!({"accountId":"ephemeral-do-not-persist","rateLimitResetCredits":{"availableCount":3},"rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":20000},"secondary":{"usedPercent":10,"windowDurationMins":10080,"resetsAt":100000}}}})
+}
+
+/// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_samples_and_route_snapshots_are_atomic_and_isolated`.
+#[test]
+fn capacity_samples_and_route_snapshots_commit_as_one_batch() {
+    let home = tempfile::tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let key = key();
+    let topology = Topology {
+        pools: vec![Pool {
+            pool_id: "pool".into(),
+            keys: [key.clone()].into_iter().collect(),
+        }],
+        routes: vec![route("route", None)],
+    };
+    let slice = |runtime: &str, observed_at: f64| Slice {
+        runtime: runtime.into(),
+        scope_id: "main".into(),
+        samples: vec![Sample {
+            key: Key {
+                runtime: runtime.into(),
+                ..key.clone()
+            },
+            remaining_percent: Some(50.0),
+            reset_at: None,
+            observed_at: Some(observed_at),
+            valid_until: Some(observed_at + 10.0),
+        }],
+        topology: topology.clone(),
+        observed_at,
+        valid_until: observed_at + 10.0,
+    };
+    persist(home.path(), &slice("mock", 1.0), 10).unwrap();
+    let mut broken = slice("mock", 2.0);
+    broken.samples.push(broken.samples[0].clone());
+    assert!(persist(home.path(), &broken, 10).is_err());
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.conn.query_row("SELECT payload_json FROM capacity_route_snapshots WHERE runtime='mock' AND scope_id='main'", [], |row| row.get::<_, String>(0)).unwrap(), serde_json::to_string(&slice("mock", 1.0).topology).unwrap());
+}
+
+/// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_sample_runtime_and_payload_constraints`.
+#[test]
+fn capacity_persistence_rejects_cross_runtime_and_oversized_payloads() {
+    let home = tempfile::tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let mut cross_runtime = sample(50.0, 1.0, 100.0);
+    cross_runtime.key.runtime = "other".into();
+    let topology = Topology::default();
+    let slice = Slice {
+        runtime: "mock".into(),
+        scope_id: "main".into(),
+        samples: vec![cross_runtime],
+        topology,
+        observed_at: 1.0,
+        valid_until: 2.0,
+    };
+    assert!(persist(home.path(), &slice, 10).is_err());
+}
+
+/// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_history_survives_successful_appends`.
+#[test]
+fn capacity_history_survives_snapshot_upserts() {
+    let home = tempfile::tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let key = key();
+    let topology = Topology {
+        pools: vec![Pool {
+            pool_id: "pool".into(),
+            keys: [key.clone()].into_iter().collect(),
+        }],
+        routes: vec![route("route", None)],
+    };
+    for (remaining, observed_at) in [(50.0, 1.0), (25.0, 3.0)] {
+        persist(
+            home.path(),
+            &Slice {
+                runtime: "mock".into(),
+                scope_id: "main".into(),
+                samples: vec![Sample {
+                    key: key.clone(),
+                    remaining_percent: Some(remaining),
+                    reset_at: None,
+                    observed_at: Some(observed_at),
+                    valid_until: Some(observed_at + 10.0),
+                }],
+                topology: topology.clone(),
+                observed_at,
+                valid_until: observed_at + 10.0,
+            },
+            10,
+        )
+        .unwrap();
+    }
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let rows: Vec<(f64, f64)> = store
+        .conn
+        .prepare(
+            "SELECT remaining_percent,observed_at FROM capacity_samples ORDER BY observed_at DESC",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, [(25.0, 3.0), (50.0, 1.0)]);
 }
 #[test]
 fn nullable_account_identity_never_collides_with_a_label() {
