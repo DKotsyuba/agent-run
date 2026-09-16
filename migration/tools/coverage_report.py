@@ -86,7 +86,7 @@ TEST_MAP_FIELDS = [
 ]
 
 BINARY_HEADER_RE = re.compile(
-    r"^\s*Running (?:unittests )?(?P<path>\S+) \(.*/(?:debug|release)/deps/(?P<pkg>.+)-[0-9a-f]{16}\)\s*$"
+    r"^\s*Running (?:unittests )?(?P<path>\S+) \((?:\S*/)?target/[^()]*/(?P<pkg>.+)-[0-9a-f]{16}\)\s*$"
 )
 TEST_LINE_RE = re.compile(r"^(?P<name>[A-Za-z0-9_:<>]+): test$")
 COUNT_LINE_RE = re.compile(r"^(\d+) tests?, \d+ benchmarks?")

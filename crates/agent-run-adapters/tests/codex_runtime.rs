@@ -84,3 +84,56 @@ fn python_test_codex_roster_cache_preserves_supported_efforts_and_fails_closed()
     assert!(validate_cached_selection(temporary.path(), "gpt-fixture", Some("medium")).is_err());
     assert!(validate_cached_selection(temporary.path(), "not-configured", None).is_err());
 }
+
+/// Mirrors `test_codex_adapter.py::test_models_parses_current_model_list_shape`.
+#[test]
+fn python_test_codex_adapter_models_parses_current_model_list_shape() {
+    assert_eq!(
+        parse_roster(&json!({"data": [{
+            "id": "gpt-5.6-sol",
+            "description": "current shape",
+            "supported_reasoning_efforts": [{"reasoning_effort": "low"}, "high"]
+        }]}))
+        .unwrap(),
+        vec![agent_run_adapters::codex::models::Model {
+            id: "gpt-5.6-sol".into(),
+            description: "current shape".into(),
+            efforts: vec!["low".into(), "high".into()],
+        }]
+    );
+}
+
+/// Mirrors `test_codex_adapter.py::test_models_normalizes_real_cache_and_keeps_present_cache_strict`.
+#[test]
+fn python_test_codex_adapter_models_normalizes_real_cache_and_keeps_present_cache_strict() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("cache")).unwrap();
+    std::fs::write(
+        home.path().join("cache/models.json"),
+        r#"{"models":[{"slug":"gpt-5.6-sol","supportedReasoningEfforts":["low","low",{"effort":"high"}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        read_cache(home.path()).unwrap()[0].efforts,
+        vec!["low".to_owned(), "high".to_owned()]
+    );
+    assert!(validate_cached_selection(home.path(), "gpt-5.6-sol", Some("medium")).is_err());
+}
+
+/// Mirrors `test_codex_adapter.py::test_models_without_cache_falls_back_to_config_only`.
+#[test]
+fn python_test_codex_adapter_models_without_cache_falls_back_to_config_only() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(read_cache(home.path()), None);
+    assert!(validate_cached_selection(home.path(), "configured-model", Some("high")).is_ok());
+}
+
+/// Mirrors `test_codex_adapter.py::test_models_with_unreadable_cache_falls_back_to_config_only`.
+#[test]
+fn python_test_codex_adapter_models_with_unreadable_cache_falls_back_to_config_only() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("cache")).unwrap();
+    std::fs::write(home.path().join("cache/models.json"), b"not JSON").unwrap();
+    assert_eq!(read_cache(home.path()), None);
+    assert!(validate_cached_selection(home.path(), "configured-model", Some("high")).is_ok());
+}

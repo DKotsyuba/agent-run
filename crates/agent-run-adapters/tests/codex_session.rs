@@ -147,3 +147,117 @@ fn python_test_codex_app_server_error_classifications() {
     );
     assert_eq!(failure_kind(&json!({})), None);
 }
+
+/// Mirrors `test_codex_app_server.py::test_resumed_session_accepts_new_nested_turn_identity`.
+#[test]
+fn python_test_codex_app_server_resumed_session_accepts_new_nested_turn_identity() {
+    let mut session = Session::new(true);
+    session.initialized().unwrap();
+    session.thread_started("thread").unwrap();
+    session.turn_started("turn-new").unwrap();
+    assert!(matches!(
+        session
+            .notification(&json!({
+                "method": "turn/completed",
+                "params": {"threadId": "thread", "turn": {"id": "turn-new", "status": "completed"}}
+            }))
+            .unwrap(),
+        Some(Notification::TurnCompleted { .. })
+    ));
+}
+
+/// Mirrors `test_codex_app_server.py::test_resumed_session_ignores_replayed_completion_without_new_turn_id`.
+#[test]
+fn python_test_codex_app_server_resumed_session_ignores_replayed_completion_without_new_turn_id() {
+    let mut session = Session::new(true);
+    session.initialized().unwrap();
+    session.thread_started("thread").unwrap();
+    session.turn_started("turn-new").unwrap();
+    assert!(session
+        .notification(&json!({
+            "method": "turn/completed",
+            "params": {"threadId": "thread", "turn": {"status": "completed"}}
+        }))
+        .unwrap()
+        .is_none());
+}
+
+/// Mirrors `test_codex_app_server.py::test_item_completed_preserves_the_message_when_terminal_items_are_empty`.
+#[test]
+fn python_test_codex_app_server_item_completed_preserves_the_message_when_terminal_items_are_empty()
+{
+    let mut session = Session::new(false);
+    session.initialized().unwrap();
+    session.thread_started("thread").unwrap();
+    session.turn_started("turn").unwrap();
+    assert_eq!(
+        session
+            .notification(&json!({
+                "method": "item/completed",
+                "params": {"threadId": "thread", "turnId": "turn", "item": {"id": "message", "type": "agentMessage", "text": "answer"}}
+            }))
+            .unwrap(),
+        Some(Notification::ItemCompleted {
+            item: json!({"id": "message", "type": "agentMessage", "text": "answer"})
+        })
+    );
+}
+
+/// Mirrors `test_codex_app_server.py::test_delta_only_output_is_transcript_without_completion_proof`.
+#[test]
+fn python_test_codex_app_server_delta_only_output_is_transcript_without_completion_proof() {
+    let mut session = Session::new(false);
+    session.initialized().unwrap();
+    session.thread_started("thread").unwrap();
+    session.turn_started("turn").unwrap();
+    assert!(matches!(
+        session
+            .notification(&json!({
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread", "turnId": "turn", "itemId": "message", "delta": "partial"}
+            }))
+            .unwrap(),
+        Some(Notification::AssistantDelta { .. })
+    ));
+}
+
+/// Mirrors `test_codex_app_server.py::test_turn_only_completion_preserves_unsent_trailing_whitespace`.
+#[test]
+fn python_test_codex_app_server_turn_only_completion_preserves_unsent_trailing_whitespace() {
+    let mut session = Session::new(false);
+    session.initialized().unwrap();
+    session.thread_started("thread").unwrap();
+    session.turn_started("turn").unwrap();
+    let turn = json!({"id": "turn", "status": "completed", "items": [{"id": "message", "text": "answer  "}]});
+    assert_eq!(
+        session
+            .notification(
+                &json!({"method": "turn/completed", "params": {"threadId": "thread", "turn": turn}})
+            )
+            .unwrap(),
+        Some(Notification::TurnCompleted {
+            turn: json!({"id": "turn", "status": "completed", "items": [{"id": "message", "text": "answer  "}]})
+        })
+    );
+}
+
+/// Retains an unknown protocol event for a caller that has a diagnostics sink.
+#[test]
+fn unknown_method_retains_its_params_for_the_runner() {
+    let mut session = Session::new(false);
+    session.initialized().unwrap();
+    session.thread_started("thread").unwrap();
+    session.turn_started("turn").unwrap();
+    assert_eq!(
+        session
+            .notification(&json!({
+                "method": "turn/log",
+                "params": {"threadId": "thread", "turnId": "turn", "detail": "retained"}
+            }))
+            .unwrap(),
+        Some(Notification::Other {
+            method: "turn/log".into(),
+            params: json!({"threadId": "thread", "turnId": "turn", "detail": "retained"})
+        })
+    );
+}
