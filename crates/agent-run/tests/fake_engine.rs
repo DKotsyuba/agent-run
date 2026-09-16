@@ -135,6 +135,23 @@ fn admit(home: &Path, task: &str) -> AgentId {
     id
 }
 
+/// Removes the admitted mock runtime from one frozen launch identity.
+///
+/// This models a row accepted by an older process before its runtime was
+/// removed. The profile remains intact so the real supervisor, after recording
+/// ownership, reaches the runtime lookup as its first preparation failure.
+fn remove_frozen_runtime(home: &Path, id: &AgentId) {
+    let store = Store::open(home).unwrap();
+    let mut identity = store.get(id).unwrap().identity.expect("launch identity");
+    identity["config"]["runtimes"]
+        .as_object_mut()
+        .expect("runtime mapping")
+        .remove("mock");
+    store
+        .update_identity(id, &identity, "pending:materialization")
+        .unwrap();
+}
+
 /// Spawns the real `agent-run` binary's hidden `_supervisor` subcommand
 /// directly, the same process `supervisor::launch` spawns in production.
 /// No socket of any kind is involved.
@@ -320,6 +337,88 @@ async fn slow_start_delays_admission_then_succeeds_with_a_late_answer() {
         row.answer_path.is_some(),
         "answer sealed only after the delay"
     );
+}
+
+/// Mirrors Python `tests/test_supervisor.py::RunStatsSupervisorTests::test_a_terminal_commit_writes_the_run_stats_row`.
+///
+/// The terminal row and normalized runtime measurements must commit together;
+/// querying the durable statistics table after the real child exits proves the
+/// supervisor never leaves a completed run without its accounting row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_supervisor_commit_persists_runtime_statistics() {
+    let (_tmp, home) = home();
+    let row = run_task(&home, "hello").await;
+    let store = Store::open(&home).unwrap();
+    let stats: (String, i64, i64, i64, String) = store
+        .conn
+        .query_row(
+            "SELECT status,input_tokens,output_tokens,num_turns,usage_source FROM run_stats WHERE agent_id=?",
+            [row.id.as_str()],
+            |value| Ok((value.get(0)?, value.get(1)?, value.get(2)?, value.get(3)?, value.get(4)?)),
+        )
+        .expect("terminal run-stat row");
+    assert_eq!(
+        stats,
+        ("succeeded".into(), 2, 3, 1, "runtime_result".into())
+    );
+}
+
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_a_failed_launch_is_durable_not_a_crash`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_startup_failure_reports_ready_failure_without_launch`.
+/// Mirrors Python `tests/test_supervisor_main.py::SupervisorMainTests::test_unknown_runtime_fails_durably_after_ready`.
+///
+/// The spawned entrypoint records its own identity before a frozen runtime
+/// becomes unavailable. Its nonzero exit must therefore leave one durable
+/// failed row, a READY ownership event, and no engine-spawn phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_frozen_runtime_fails_durably_after_supervisor_ownership() {
+    let (_tmp, home) = home();
+    let id = admit(&home, "hello");
+    remove_frozen_runtime(&home, &id);
+    let mut child = spawn_supervisor(&home, &id);
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor subprocess timed out")
+        .expect("wait on supervisor subprocess");
+    assert!(
+        !exit.success(),
+        "preparation failure must reach the entrypoint"
+    );
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(row.failure_kind.as_deref(), Some("prepare_runtime_failed"));
+    assert!(
+        row.supervisor_pid.is_some(),
+        "ownership must be durable first"
+    );
+    assert!(store.last_event(&id, "supervisor_ready").unwrap().is_some());
+    assert!(store.last_event(&id, "phase").unwrap().is_none());
+}
+
+/// Mirrors Python `tests/test_supervisor_main.py::SupervisorMainTests::test_ten_consecutive_exec_launches_all_land_durably`.
+///
+/// Keep a parent SQLite connection open while ten real `_supervisor` entrypoint
+/// processes start and terminate. Every row must carry exactly one terminal
+/// status event, proving repeated exec-based supervision does not lose durable
+/// lifecycle writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ten_consecutive_supervisor_entrypoints_land_durably() {
+    let (_tmp, home) = home();
+    let parent = Store::open(&home).unwrap();
+    for round in 0..10 {
+        let row = run_task(&home, "hello").await;
+        assert_eq!(row.status, Status::Succeeded, "round {round}");
+        let terminal_events: i64 = parent
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND to_status='succeeded'",
+                [row.id.as_str()],
+                |value| value.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_events, 1, "round {round}");
+    }
 }
 
 /// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_a_grandchild_is_killed_and_reaped_after_a_clean_exit`.
