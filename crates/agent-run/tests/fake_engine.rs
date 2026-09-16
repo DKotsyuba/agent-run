@@ -24,11 +24,27 @@ use agent_run::{
 use serde_json::json;
 use std::{
     collections::BTreeSet,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use tokio::{process::Command, time::Instant};
+
+/// Open one close-on-exec descriptor above the bootstrap descriptor range.
+fn bootstrap_fd() -> OwnedFd {
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .expect("open bootstrap descriptor");
+    // SAFETY: F_DUPFD_CLOEXEC duplicates the test-owned descriptor at a number
+    // above the three bootstrap targets; the returned descriptor has one owner.
+    let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    assert!(duplicated >= 0, "duplicate bootstrap descriptor");
+    // SAFETY: fcntl returned a fresh descriptor that is not owned elsewhere.
+    unsafe { OwnedFd::from_raw_fd(duplicated) }
+}
 
 fn home() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::Builder::new()
@@ -120,13 +136,45 @@ fn admit(home: &Path, task: &str) -> AgentId {
 /// directly, the same process `supervisor::launch` spawns in production.
 /// No socket of any kind is involved.
 fn spawn_supervisor(home: &Path, id: &AgentId) -> tokio::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_agent-run"))
+    use std::os::unix::{io::AsRawFd, process::CommandExt};
+
+    let ready = bootstrap_fd();
+    let identity = bootstrap_fd();
+    let error = bootstrap_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
+    command
         .arg("--home")
         .arg(home)
-        .args(["_supervisor", id.as_str()])
+        .args([
+            "_supervisor",
+            "--ready-fd",
+            "3",
+            "--identity-fd",
+            "4",
+            "--error-fd",
+            "5",
+            id.as_str(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    let sources = [ready.as_raw_fd(), identity.as_raw_fd(), error.as_raw_fd()];
+    // SAFETY: this test-only pre-exec closure captures only raw descriptors and
+    // invokes the async-signal-safe `setsid` and `dup2` syscalls before exec.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (source, target) in sources.into_iter().zip([3, 4, 5]) {
+                if libc::dup2(source, target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command
         .kill_on_drop(true)
         .spawn()
         .expect("spawn supervisor")
