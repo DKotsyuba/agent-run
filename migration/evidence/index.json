@@ -1,15 +1,15 @@
 {
   "index_version": 1,
-  "generated_for_commit": "ab2159ea5a3924e1587fd961897e93e5971587b9",
-  "generated_at": "2026-09-16T06:11:59+00:00",
+  "generated_for_commit": "bc275c406d87f59226ce57c486d155b9d4432c73",
+  "generated_at": "2026-09-16T09:17:36+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
   "entry_count": 27,
   "entries": [
     {
       "path": "migration/evidence/coverage-2026-09-16.md",
       "kind": "evidence",
-      "bytes": 15470,
-      "sha256": "fbfdf8449fe22e83f7445e93b14efdb94192d960075f2d2655a65b87434dbe26"
+      "bytes": 18269,
+      "sha256": "8fc76e66f37fc8c994df1476d5b9eea56b5b33cc4141b1a143cf0e6aa1e41e7a"
     },
     {
       "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
@@ -56,8 +56,8 @@
     {
       "path": "migration/evidence/qualification-scope.md",
       "kind": "evidence",
-      "bytes": 40601,
-      "sha256": "d3b96b1f56fea6c7a4da35e6023061e44da307c3f14f95210da2423c57f2b202"
+      "bytes": 43067,
+      "sha256": "899aaeff31aff35a9f60b6c5e9c8885b7d8b180bee043f2b490419c5d3b18a38"
     },
     {
       "path": "migration/evidence/verification-2026-09-16.md",
@@ -152,8 +152,8 @@
     {
       "path": "migration/baseline/test-map.csv",
       "kind": "ledger",
-      "bytes": 388373,
-      "sha256": "857e7fc66cc5821252ea65422119f03ab46bc32961627bec737662ca3c3a796b"
+      "bytes": 388397,
+      "sha256": "1c3cb0d712cc7d2a3432c48502815d5de4fe90ab3945e2d36854f56c70b43375"
     },
     {
       "path": "migration/baseline/divergences.csv",
