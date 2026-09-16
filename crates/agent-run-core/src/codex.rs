@@ -635,9 +635,7 @@ pub async fn run(
             }
             "thread/tokenUsage/updated" => {
                 let u = p.pointer("/tokenUsage/total").unwrap_or(&Value::Null);
-                usage = Some(
-                    json!({"input_tokens":u["inputTokens"],"output_tokens":u["outputTokens"],"cache_read_tokens":u["cachedInputTokens"],"reasoning_tokens":u["reasoningOutputTokens"],"total_tokens":u["totalTokens"],"_source":"token_usage_updated"}),
-                );
+                usage = Some(token_usage_event(u));
             }
             "turn/completed" => {
                 if event_turn != Some(turn_id.as_str()) {
@@ -705,6 +703,15 @@ pub async fn run(
         }
     }
 }
+
+/// Wraps Codex's cumulative total in the durable Python event payload shape.
+///
+/// The returned value intentionally preserves malformed or missing fields so
+/// store-side normalization can represent them as unavailable rather than zero.
+fn token_usage_event(total: &Value) -> Value {
+    json!({"tokenUsage":{"total":total},"_source":"token_usage_updated"})
+}
+
 pub async fn query(process: &mut Process, method: &str) -> Result<Value> {
     initialize(process).await?;
     if method == "model/list" {
@@ -713,4 +720,23 @@ pub async fn query(process: &mut Process, method: &str) -> Result<Value> {
     process
         .rpc(method, json!({}), Duration::from_secs(20))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_usage_event;
+    use serde_json::json;
+
+    /// Mirrors `test_codex_app_server.py::test_token_usage_updated_is_cumulative`.
+    #[test]
+    fn token_usage_event_preserves_cache_write_and_reasoning_counters() {
+        let payload = token_usage_event(&json!({
+            "inputTokens": 10,
+            "cacheWriteInputTokens": 4,
+            "reasoningOutputTokens": 2,
+            "totalTokens": 12
+        }));
+        assert_eq!(payload["tokenUsage"]["total"]["cacheWriteInputTokens"], 4);
+        assert_eq!(payload["tokenUsage"]["total"]["reasoningOutputTokens"], 2);
+    }
 }
