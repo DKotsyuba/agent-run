@@ -7,7 +7,9 @@ use agent_run_platform::{fs, verify};
 use serde_json::json;
 use std::path::Path;
 
-/// Mirrors `test_state_store.py` terminal completion: a delivery-insert fault rolls back every terminal fact.
+/// Mirrors `test_state_store.py::test_terminal_update_rolls_back_when_delivery_activation_fails`.
+///
+/// A delivery-insert fault rolls back every terminal fact.
 #[test]
 fn python_test_state_store_terminal_transition_is_atomic() {
     let home = common::Home::new();
@@ -55,7 +57,9 @@ fn python_test_state_store_terminal_transition_is_atomic() {
     );
 }
 
-/// Mirrors Python `test_state_store.py::test_terminal_transition_consumes_pending_cancel`.
+/// Mirrors Python `test_state_store.py::test_pending_cancel_atomically_overrides_successful_terminal_commit`.
+///
+/// A pending cancellation wins an otherwise successful terminal commit in the same transaction.
 #[test]
 fn python_test_state_store_terminal_success_loses_to_pending_cancel_atomically() {
     let home = common::Home::new();

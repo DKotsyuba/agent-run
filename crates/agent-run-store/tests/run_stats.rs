@@ -178,6 +178,135 @@ fn python_test_run_stats_absent_usage_stays_null() {
     }
 }
 
+/// Mirrors `test_run_stats.py::test_a_created_agent_without_transitions_has_null_timestamps`.
+///
+/// An admitted-but-never-started run has no inferred lifecycle time or usage.
+#[test]
+fn python_test_run_stats_created_agent_has_null_timestamps() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&mut store, &home);
+
+    run_stats::record(&mut store, &id).unwrap();
+
+    let row = statistics(&store, &id);
+    assert_eq!(row["status"], "starting");
+    assert_eq!(row["usage_source"], "none");
+    assert!(row["started_at"].is_null());
+    assert!(row["finished_at"].is_null());
+    assert!(row["duration_seconds"].is_null());
+    assert!(row["recorded_at"].is_number());
+}
+
+/// Mirrors `test_run_stats.py::test_a_failed_run_keeps_its_failure_kind_and_timestamps`.
+///
+/// A failure projection retains both the failure classifier and transition-derived duration.
+#[test]
+fn python_test_run_stats_failed_run_keeps_failure_and_times() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&mut store, &home);
+    terminal(&mut store, &id, "failed");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET failure_kind='stalled' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+
+    run_stats::record(&mut store, &id).unwrap();
+
+    let row = statistics(&store, &id);
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["failure_kind"], "stalled");
+    assert_eq!(row["started_at"], 100.0);
+    assert_eq!(row["finished_at"], 110.0);
+    assert_eq!(row["duration_seconds"], 10.0);
+}
+
+/// Mirrors `test_run_stats.py::test_recording_replaces_the_row_idempotently`.
+///
+/// Re-recording replaces one projection row after later journal evidence arrives.
+#[test]
+fn python_test_run_stats_recording_replaces_one_row() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&mut store, &home);
+    terminal(&mut store, &id, "succeeded");
+
+    run_stats::record(&mut store, &id).unwrap();
+    assert_eq!(statistics(&store, &id)["usage_source"], "none");
+    store
+        .event(&id, "runtime_result", &runtime_result_payload())
+        .unwrap();
+    run_stats::record(&mut store, &id).unwrap();
+
+    assert_eq!(statistics(&store, &id)["usage_source"], "runtime_result");
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_stats WHERE agent_id=?",
+                [id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+/// Mirrors `test_run_stats.py::test_malformed_event_payloads_are_skipped_not_fatal`.
+///
+/// Corrupt historical usage JSON is ignored so its agent remains queryable.
+#[test]
+fn python_test_run_stats_skips_malformed_usage_events() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&mut store, &home);
+    terminal(&mut store, &id, "succeeded");
+    store
+        .conn
+        .execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,1.0,'runtime_result','not json')",
+            [id.as_str()],
+        )
+        .unwrap();
+
+    run_stats::record(&mut store, &id).unwrap();
+
+    assert_eq!(statistics(&store, &id)["usage_source"], "none");
+}
+
+/// Mirrors `test_run_stats.py::test_backfill_counts_a_per_agent_failure_as_skipped`.
+///
+/// A projection write failure skips just that agent instead of aborting the backfill sweep.
+#[test]
+fn python_test_run_stats_backfill_counts_per_agent_failure_as_skipped() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&mut store, &home);
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_run_stats BEFORE INSERT ON run_stats BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+        )
+        .unwrap();
+
+    assert_eq!(run_stats::backfill(&mut store).unwrap(), (0, 1));
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_stats WHERE agent_id=?",
+                [id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
 /// Mirrors Python `test_backfill_fills_missing_rows_and_is_idempotent`.
 #[test]
 fn python_test_run_stats_backfill_is_idempotent() {

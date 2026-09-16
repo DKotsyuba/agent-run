@@ -3,6 +3,9 @@ mod common;
 use serde_json::json;
 
 /// Mirrors Python `test_state_store.py::test_attempts_and_messages_require_ownership`.
+/// Mirrors Python `test_state_store.py::test_message_storage_stores_small_content_inline_and_spools_oversized_content`.
+///
+/// Attempts own their journal rows while oversized transcript bodies are durably spooled.
 #[test]
 fn python_test_state_store_attempts_messages_and_spool() {
     let home = common::Home::new();
@@ -40,6 +43,9 @@ fn python_test_state_store_attempts_messages_and_spool() {
 }
 
 /// Mirrors Python `test_state_store.py::test_claim_command_prioritizes_cancel`.
+/// Mirrors Python `test_state_store.py::test_cancel_is_claimed_before_an_older_steer_backlog`.
+///
+/// Cancellation wins the claim order even when a steering command was queued first.
 #[test]
 fn python_test_state_store_commands_claim_cancel_before_steer() {
     let home = common::Home::new();
