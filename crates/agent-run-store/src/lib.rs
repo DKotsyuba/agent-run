@@ -22,7 +22,9 @@ use agent_run_domain::{
     Error, Result,
 };
 use agent_run_platform::{fs, verify::Proof};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -241,6 +243,11 @@ impl Store {
     pub fn open(home: &Path) -> Result<Self> {
         Self::connect(home, false)
     }
+    /// Opens a thread-affine connection for `home`, migrating existing content
+    /// and initializing a new schema when `create` is true. The connection
+    /// enables WAL strictly: an already-WAL database skips conversion, while a
+    /// competing delete-to-WAL conversion is retried briefly and other modes
+    /// or SQLite errors are reported to the caller.
     fn connect(home: &Path, create: bool) -> Result<Self> {
         let path = home.join("state.db");
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -303,7 +310,32 @@ impl Store {
                 "state database has no usable schema; run agent-run init"
             }));
         }
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let journal_mode: String =
+            conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            for attempt in 0..8 {
+                match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
+                    row.get::<_, String>(0)
+                }) {
+                    Ok(mode) if mode.eq_ignore_ascii_case("wal") => break,
+                    Ok(mode) => {
+                        return Err(invalid(format!(
+                            "state database could not enable WAL mode: {mode}"
+                        )))
+                    }
+                    Err(error)
+                        if attempt < 7
+                            && matches!(
+                                error.sqlite_error_code(),
+                                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                            ) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         // Tightening modes is strict only for the creator: a store left group- or
         // world-readable at creation is a defect. For a store that already
