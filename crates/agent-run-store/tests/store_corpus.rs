@@ -325,7 +325,13 @@ fn session_lookup_and_agent_listing_are_read_only_and_composable() {
 #[test]
 fn guarded_lifecycle_transitions_create_attempts_and_terminal_delivery() {
     let home = common::Home::new();
-    let (mut store, id) = admitted(&home, &home.request());
+    let mut request = home.request();
+    request.orchestrator = Some(OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session".into(),
+        external_turn_id: None,
+    });
+    let (mut store, id) = admitted(&home, &request);
     store.running(&id, 7).unwrap();
     let attempt: String = store
         .conn

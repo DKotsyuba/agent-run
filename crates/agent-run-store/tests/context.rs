@@ -17,15 +17,15 @@ fn python_test_bind_hook_double_bind_activates_once_and_refuses_another_session(
         .admit(&home.request(), &home.config, &json!({}), None)
         .unwrap();
     let mut store = home.store();
-    store
-        .finish(&agent_id, &Outcome::failure("fixture"), None, None)
-        .unwrap();
     let first = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-one".into(),
         external_turn_id: None,
     };
     let session = store.bind_orchestrator(&agent_id, &first, 1.0).unwrap();
+    store
+        .finish(&agent_id, &Outcome::failure("fixture"), None, None)
+        .unwrap();
     assert_eq!(
         store.bind_orchestrator(&agent_id, &first, 2.0).unwrap(),
         session
