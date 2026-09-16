@@ -78,7 +78,8 @@ fn main() {
             .expect("fixture stdout");
         return;
     }
-    if task == "fixture:hang" || task == "fixture:ignore-sigterm" {
+    if task == "fixture:hang" || task == "fixture:command-flood" || task == "fixture:ignore-sigterm"
+    {
         loop {
             std::thread::sleep(Duration::from_secs(1));
         }

@@ -3,10 +3,104 @@
 mod common;
 
 use agent_run_core::{
+    capacity::{self, Key, Pool, Route, Sample, Slice, Topology},
     domain::{OrchestratorRef, Outcome},
     hooks::{bind, context},
 };
 use serde_json::json;
+use std::collections::BTreeSet;
+
+/// Persist deterministic fresh routes for context-rendering tests.
+fn routes(home: &common::Home, entries: &[(&str, f64)]) {
+    for (index, (runtime, remaining)) in entries.iter().enumerate() {
+        let mut config = std::fs::read_to_string(home.path.join("config.toml")).expect("config");
+        let section = format!("[runtimes.{}]", toml::Value::String((*runtime).into()));
+        if !config.contains(&section) {
+            config.push_str(&format!(
+                "\n{section}\nenabled=true\nadapter='claude'\nbinary='/usr/bin/true'\nhome='{}'\nmodels=['fixture']\nlimits_source='none'\n",
+                home.path.join("runtime").display()
+            ));
+            std::fs::write(home.path.join("config.toml"), config).expect("route config");
+        }
+        let observed_at = agent_run_core::domain::now();
+        let key = Key {
+            runtime: (*runtime).into(),
+            lane: "standard".into(),
+            window: "window".into(),
+            target: None,
+            source: "fixture".into(),
+        };
+        let pool_id = format!("pool-{runtime}-{index}");
+        capacity::persist(
+            &home.path,
+            &Slice {
+                runtime: (*runtime).into(),
+                scope_id: "fixture".into(),
+                samples: vec![Sample {
+                    key: key.clone(),
+                    remaining_percent: Some(*remaining),
+                    reset_at: None,
+                    observed_at: Some(observed_at),
+                    valid_until: Some(observed_at + 100_000.0),
+                }],
+                topology: Topology {
+                    pools: vec![Pool {
+                        pool_id: pool_id.clone(),
+                        keys: BTreeSet::from([key]),
+                    }],
+                    routes: vec![Route {
+                        route_id: format!("route-{index}"),
+                        runtime: (*runtime).into(),
+                        account: None,
+                        quota_lane: "standard".into(),
+                        pool_ids: vec![pool_id],
+                        reset_credits: None,
+                    }],
+                },
+                observed_at,
+                valid_until: observed_at + 100_000.0,
+            },
+            1_000,
+        )
+        .expect("fresh context route");
+    }
+}
+
+/// Change the persisted context budget for a test home.
+fn budget(home: &common::Home, chars: usize) {
+    let config = std::fs::read_to_string(home.path.join("config.toml")).expect("config");
+    let line = format!("context_max_chars={chars}");
+    let config = if config
+        .lines()
+        .any(|value| value.starts_with("context_max_chars="))
+    {
+        config
+            .lines()
+            .map(|value| {
+                if value.starts_with("context_max_chars=") {
+                    line.as_str()
+                } else {
+                    value
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        format!("{config}\n[capacity]\n{line}\n")
+    };
+    std::fs::write(home.path.join("config.toml"), config).expect("budget config");
+}
+
+/// Admit one active agent bound to the supplied orchestrator reference.
+fn active_agent(home: &common::Home, reference: &OrchestratorRef) {
+    let mut request = home.request();
+    request.orchestrator = Some(reference.clone());
+    let mut store = home.store();
+    let (id, _) = store
+        .admit(&request, &home.config, &json!({}), None)
+        .expect("active admission");
+    store.running(&id, 1234).expect("active transition");
+}
 
 /// Mirrors Python `test_bind_hook.py::test_binding_is_immutable_empty_then_same_target_but_never_another`.
 #[test]
@@ -75,7 +169,7 @@ fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
     );
 }
 
-/// Mirrors Python `test_priority_context_regressions.py::test_route_identity_is_json_safe_and_aliases_collapse_per_route`.
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_route_identity_is_json_safe_and_aliases_collapse_per_route`.
 #[test]
 fn python_context_hook_rejects_conflicting_raw_agent_ids() {
     let error = bind::normalize(
@@ -85,4 +179,360 @@ fn python_context_hook_rejects_conflicting_raw_agent_ids() {
     )
     .expect_err("conflicting ids cannot bind an arbitrary durable agent");
     assert!(error.to_string().contains("conflicting agent_id"));
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_active_appearance_keeps_the_same_priority_budget`.
+#[test]
+fn python_context_active_appearance_keeps_priority_allocation_fixed() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: Some("turn-1".into()),
+    };
+    routes(&home, &[("alpha", 90.0)]);
+    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("priority context");
+    let first_priority: String = home
+        .store()
+        .conn
+        .query_row("SELECT context_key FROM context_receipts", [], |row| {
+            row.get(0)
+        })
+        .expect("priority receipt");
+    active_agent(&home, &reference);
+    let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("active context");
+    let second_key: String = home
+        .store()
+        .conn
+        .query_row("SELECT context_key FROM context_receipts", [], |row| {
+            row.get(0)
+        })
+        .expect("active receipt");
+    let first_priority = serde_json::from_str::<serde_json::Value>(&first_priority).unwrap();
+    let second_priority = serde_json::from_str::<serde_json::Value>(&second_key).unwrap();
+    assert_eq!(
+        first_priority["components"]["priority"],
+        second_priority["components"]["priority"]
+    );
+    assert!(first.injected);
+    assert!(second.injected);
+    assert!(!second.text.contains("Runtime priorities"));
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_malformed_component_payloads_are_legacy_not_crashes`.
+#[test]
+fn python_context_malformed_component_receipts_are_replaced_safely() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    let mut store = home.store();
+    for (index, value) in [
+        json!([]),
+        json!(["x"]),
+        json!("x"),
+        json!(1),
+        json!(true),
+        json!({"p":""}),
+        json!({"":"hash"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .record_context_components_for_ref(
+                &reference,
+                &std::collections::BTreeMap::from([(format!("component-{index}"), "hash".into())]),
+                1.0,
+            )
+            .expect("legacy receipt replacement");
+        let session: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
+                ["codex_queue", "session-1"],
+                |row| row.get(0),
+            )
+            .expect("session");
+        store
+            .conn
+            .execute(
+                "UPDATE context_receipts SET context_key=? WHERE orchestrator_session_id=?",
+                [value.to_string(), session],
+            )
+            .expect("malformed receipt");
+    }
+    assert!(store
+        .record_context_components_for_ref(
+            &reference,
+            &std::collections::BTreeMap::from([(String::from("priority"), String::from("next"))]),
+            2.0,
+        )
+        .is_ok());
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_changed_only_priority_resends_after_returning_to_an_order`.
+#[test]
+fn python_context_priority_order_changes_are_a_b_a_and_then_silent() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]);
+    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("first context");
+    assert!(first.injected, "first={:?}", first);
+    routes(&home, &[("beta", 90.0), ("alpha", 50.0)]);
+    let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("second context");
+    assert!(second.injected && second.text.contains("beta"));
+    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]);
+    let third = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("third context");
+    assert!(third.injected && third.text.contains("alpha"));
+    let silent = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("silent context");
+    assert!(!silent.injected && silent.text.is_empty());
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_active_only_change_resends_the_active_block_without_priorities`.
+#[test]
+fn python_context_active_only_change_omits_priority_block() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 90.0)]);
+    active_agent(&home, &reference);
+    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("first context");
+    let second = context::build(
+        &home.path,
+        &reference,
+        Some(agent_run_core::domain::now() + 1.0),
+    )
+    .expect("unchanged context");
+    assert!(first.injected);
+    assert!(!second.injected);
+    budget(&home, 120);
+    let third = context::build(
+        &home.path,
+        &reference,
+        Some(agent_run_core::domain::now() + 2.0),
+    )
+    .expect("tight active context");
+    assert!(third.injected);
+    assert!(third.text.contains("Active agents"));
+    assert!(!third.text.contains("Runtime priorities"));
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_zero_budget_writes_no_receipt_and_restored_budget_delivers`.
+#[test]
+fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "never-bound".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 90.0)]);
+    budget(&home, 0);
+    let empty = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("zero-budget context");
+    assert_eq!((empty.text, empty.injected), (String::new(), false));
+    assert!(empty.orchestrator_session_id.is_none());
+    let store = home.store();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_receipts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    budget(&home, 2_500);
+    let restored = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("restored context");
+    assert!(restored.injected);
+    assert!(restored.text.contains("Runtime priorities"));
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_tight_budget_clips_priority_and_growth_delivers_the_full_summary`.
+#[test]
+fn python_context_tight_budget_hides_then_reveals_priority_lines() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 90.0), ("beta", 50.0), ("gamma", 10.0)]);
+    budget(&home, 1_000);
+    let clipped = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("clipped context");
+    assert!(clipped.injected);
+    assert!(clipped.text.contains("More routes omitted"));
+    assert!(clipped.text.contains("alpha"));
+    assert!(!clipped.text.contains("beta"));
+    budget(&home, 2500);
+    let grown = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("grown context");
+    assert!(grown.injected && grown.text.contains("beta"));
+    assert!(!grown.text.contains("More routes omitted"));
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_legacy_digest_receipt_is_replaced_in_place_and_components_preserved`.
+#[test]
+fn python_context_legacy_receipt_migrates_in_place_and_preserves_components() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 90.0)]);
+    active_agent(&home, &reference);
+    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .expect("first context");
+    let session = first.orchestrator_session_id.expect("session");
+    let store = home.store();
+    store
+        .conn
+        .execute(
+            "UPDATE context_receipts SET context_key=?,injected_at=500 WHERE orchestrator_session_id=?",
+            ["a".repeat(64), session.clone()],
+        )
+        .expect("legacy receipt");
+    let migrated = context::build(&home.path, &reference, Some(1001.0)).expect("migration");
+    assert!(migrated.injected);
+    let key: String = store
+        .conn
+        .query_row(
+            "SELECT context_key FROM context_receipts WHERE orchestrator_session_id=?",
+            [session.as_str()],
+            |row| row.get(0),
+        )
+        .expect("migrated key");
+    let value: serde_json::Value = serde_json::from_str(&key).expect("versioned receipt");
+    assert_eq!(value["v"], 2);
+    assert_eq!(
+        value["components"].as_object().expect("components").len(),
+        2
+    );
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_sessions_and_transports_keep_independent_receipts`.
+#[test]
+fn python_context_receipts_are_independent_per_transport_and_session() {
+    let home = common::Home::new();
+    let first = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    let transport = OrchestratorRef {
+        transport: "claude_uds".into(),
+        ..first.clone()
+    };
+    let second = OrchestratorRef {
+        external_session_id: "session-2".into(),
+        ..first.clone()
+    };
+    routes(&home, &[("alpha", 90.0)]);
+    let a = context::build(&home.path, &first, Some(agent_run_core::domain::now())).unwrap();
+    let b = context::build(&home.path, &transport, Some(agent_run_core::domain::now())).unwrap();
+    let c = context::build(&home.path, &second, Some(agent_run_core::domain::now())).unwrap();
+    assert_eq!(
+        [
+            a.orchestrator_session_id,
+            b.orchestrator_session_id,
+            c.orchestrator_session_id
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len(),
+        3
+    );
+    let store = home.store();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_receipts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_concurrent_identical_component_receipts_change_exactly_once`.
+#[test]
+fn python_context_concurrent_identical_receipt_changes_have_one_winner() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "session-1".into(),
+        external_turn_id: None,
+    };
+    let first =
+        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    let path = home.path.clone();
+    let workers = 4;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+    let handles = (0..workers)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            let reference = reference.clone();
+            std::thread::spawn(move || {
+                let mut store = agent_run_core::state::Store::open(&path).unwrap();
+                barrier.wait();
+                store
+                    .record_context_components_for_ref(
+                        &reference,
+                        &std::collections::BTreeMap::from([
+                            (String::from("priority"), String::from("p-1")),
+                            (String::from("active"), String::from("a-1")),
+                        ]),
+                        1500.0,
+                    )
+                    .unwrap()
+                    .1
+            })
+        })
+        .collect::<Vec<_>>();
+    let changed = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(first.orchestrator_session_id.is_some());
+    assert_eq!(changed.iter().filter(|names| !names.is_empty()).count(), 1);
+}
+
+/// Mirrors `tests/test_priority_context_regressions.py::HookContextCliTests::test_hook_context_delivers_changes_then_an_empty_payload`.
+#[test]
+fn python_context_hook_cli_delivers_once_then_on_change() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "external-cli-1".into(),
+        external_turn_id: None,
+    };
+    routes(&home, &[("alpha", 90.0)]);
+    let first =
+        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    let second =
+        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    assert!(first.injected && !second.injected && second.text.is_empty());
+    routes(&home, &[("beta", 50.0)]);
+    let third =
+        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    assert!(third.injected && third.text.contains("beta"));
 }

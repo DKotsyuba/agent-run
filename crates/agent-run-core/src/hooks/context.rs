@@ -330,3 +330,18 @@ fn combine_key(priority: &str, active: &str) -> String {
     )[..32]
         .into()
 }
+
+#[cfg(test)]
+mod tests {
+    /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_unicode_separators_cannot_split_a_route_line`.
+    #[test]
+    fn unicode_separators_are_escaped_inside_one_route_line() {
+        let text = format!(
+            "Runtime priorities.\n1. runtime={}",
+            super::json_ascii("name\u{2028}line")
+        );
+        assert!(!text.contains('\u{2028}'));
+        assert!(text.contains("\\u2028"));
+        assert_eq!(text.lines().count(), 2);
+    }
+}

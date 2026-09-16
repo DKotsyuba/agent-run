@@ -527,7 +527,14 @@ pub async fn run(
         let event = tokio::select! {event=process.next()=>Some(event),_=tick.tick()=>None};
         let Some(event) = event else {
             process.owner.refresh();
-            while let Some((cid, kind, payload)) = store.claim_command(&record.id)? {
+            let started = tokio::time::Instant::now();
+            for _ in 0..commands::COMMAND_PAGE_LIMIT {
+                if started.elapsed() >= Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS) {
+                    break;
+                }
+                let Some((cid, kind, payload)) = store.claim_command(&record.id)? else {
+                    break;
+                };
                 if kind == "cancel" {
                     // App-server interruption is advisory.  Once the durable
                     // command is claimed, return to the supervisor so its

@@ -308,7 +308,15 @@ pub async fn run(
         let event = tokio::select! {event=process.next()=>Some(event),_=tick.tick()=>None};
         let Some(event) = event else {
             process.owner.refresh();
-            while let Some((cid, command, payload)) = store.claim_command(&record.id)? {
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS);
+            for _ in 0..commands::COMMAND_PAGE_LIMIT {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let Some((cid, command, payload)) = store.claim_command(&record.id)? else {
+                    break;
+                };
                 if command == "cancel" {
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     return Ok(EngineResult {
@@ -325,10 +333,35 @@ pub async fn run(
                 }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let accepted=kind!=Adapter::Qwen&&process.send(&json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}})).await.is_ok();
-                        store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
-                        if accepted {
-                            journal(store, &record.id, "user", &process.redact(text), None, None)?;
+                        if kind == Adapter::Qwen {
+                            store.complete_command(
+                                &record.id,
+                                cid,
+                                &json!({"accepted":false,"reason":"capability_unavailable"}),
+                            )?;
+                        } else {
+                            let accepted = process
+                                .send_before(
+                                    &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+                                    deadline,
+                                )
+                                .await
+                                .is_ok();
+                            store.complete_command(
+                                &record.id,
+                                cid,
+                                &json!({"accepted":accepted}),
+                            )?;
+                            if accepted {
+                                journal(
+                                    store,
+                                    &record.id,
+                                    "user",
+                                    &process.redact(text),
+                                    None,
+                                    None,
+                                )?;
+                            }
                         }
                     } else {
                         store.complete_command(
