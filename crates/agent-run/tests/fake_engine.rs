@@ -652,7 +652,11 @@ async fn escaped_descendant_is_not_signalled_and_does_not_change_runtime_outcome
         .unwrap();
     // The supervisor sent only its verified group signal; the escaped child
     // remains alive until this test-owned fixture cleanup.
+    // SAFETY: `escaped` is a positive PID this test's own fixture spawned and
+    // recorded, so signal 0 addresses one process and never a group or wildcard.
     assert_eq!(unsafe { libc::kill(escaped, 0) }, 0);
+    // SAFETY: same single owned PID, proven alive by the probe above; this test
+    // owns the escaped child and is responsible for reaping it.
     assert_eq!(unsafe { libc::kill(escaped, libc::SIGKILL) }, 0);
 }
 
