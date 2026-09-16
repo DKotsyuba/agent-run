@@ -1,7 +1,7 @@
 {
   "index_version": 1,
-  "generated_for_commit": "bc275c406d87f59226ce57c486d155b9d4432c73",
-  "generated_at": "2026-09-16T09:17:36+02:00",
+  "generated_for_commit": "fe72daaee497ff7f74a3c930d4e9862792af2bb3",
+  "generated_at": "2026-09-16T09:24:55+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
   "entry_count": 27,
   "entries": [
@@ -86,8 +86,8 @@
     {
       "path": "migration/adr/A10-spawn-backend.md",
       "kind": "decision",
-      "bytes": 7985,
-      "sha256": "4c529bf8acb8012ff4b3afd3352737333ea289ad602e08743587009191fd6f12"
+      "bytes": 8044,
+      "sha256": "34c497f421e6871fec38f2575e098005acd334c1f5c51dfebed2bd038fd22cd7"
     },
     {
       "path": "migration/adr/A11-required-constraints.md",
@@ -98,14 +98,14 @@
     {
       "path": "migration/adr/A12-canonical-json.md",
       "kind": "decision",
-      "bytes": 11493,
-      "sha256": "6488d5f7785ac9762a37e2029cc90a0e1827a8fccc0468fe4ae39b9913bc6974"
+      "bytes": 12065,
+      "sha256": "6ff936b01f66c10da9a100a672a4e26f693c0e0dc7815b96ebc98f223c4dda1c"
     },
     {
       "path": "migration/adr/A14-mcp-sdk.md",
       "kind": "decision",
-      "bytes": 1873,
-      "sha256": "4a46a68e8ee1d503801bc51832319fc13e2c307dc28fcd4465bebae050f7afb8"
+      "bytes": 1885,
+      "sha256": "beabc61ce4337a6d604087220bc34b47939fceab2765be7ea922e06fc3a27abd"
     },
     {
       "path": "migration/adr/A15-platforms.md",
