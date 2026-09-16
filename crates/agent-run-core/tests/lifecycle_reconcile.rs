@@ -174,7 +174,7 @@ fn killed_supervisor_is_observed_dead_by_the_native_platform_probe() {
     );
 }
 
-/// Mirrors `test_running_agent_transitions_to_succeeded_and_returns_the_answer`.
+/// Mirrors `test_wait.py::test_running_agent_transitions_to_succeeded_and_returns_the_answer`.
 #[tokio::test]
 async fn wait_observes_a_terminal_transition_committed_by_another_connection() {
     let home = common::Home::new();
@@ -201,7 +201,7 @@ async fn wait_observes_a_terminal_transition_committed_by_another_connection() {
     assert_eq!(value["available"], false);
 }
 
-/// Mirrors `test_watcher_gives_up_with_the_current_status_and_a_note`.
+/// Mirrors `test_wait.py::test_watcher_gives_up_with_the_current_status_and_a_note`.
 #[tokio::test]
 async fn wait_honors_its_own_bound_without_using_the_legacy_run_timeout() {
     let home = common::Home::new();

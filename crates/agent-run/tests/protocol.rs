@@ -13,7 +13,7 @@ fn service() -> Service {
         "/nonexistent-agent-run-protocol-fixture",
     ))
 }
-/// Mirrors Python `test_dispatch.py::test_tools_table_is_exactly_pinned`.
+/// Mirrors `test_dispatch.py::test_tools_table_is_exactly_pinned`.
 #[test]
 fn packaged_table_has_exactly_the_shared_eleven_tools() {
     let tools = dispatch::tools();
@@ -31,7 +31,7 @@ fn packaged_table_has_exactly_the_shared_eleven_tools() {
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
     }
 }
-/// Mirrors Python `test_api_socket.py::test_ping_and_tools_discovery`.
+/// Mirrors `test_api_socket.py::test_ping_and_tools_discovery`.
 #[tokio::test]
 async fn ping_and_discovery_do_not_require_database_access() {
     let response = socket::respond(&service(), json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
@@ -46,7 +46,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     .unwrap();
     assert_eq!(response["result"].as_array().unwrap().len(), 11);
 }
-/// Mirrors Python `test_api_socket.py::test_unknown_method_and_validation_error`.
+/// Mirrors `test_api_socket.py::test_unknown_method_and_validation_error`.
 #[tokio::test]
 async fn invalid_envelopes_and_unknown_method_get_standard_codes() {
     let service = service();
@@ -70,7 +70,7 @@ async fn invalid_envelopes_and_unknown_method_get_standard_codes() {
         -32601
     );
 }
-/// Mirrors Python `test_api_socket.py::test_invalid_request_error_messages`.
+/// Mirrors `test_api_socket.py::test_invalid_request_error_messages`.
 #[tokio::test]
 async fn invalid_requests_preserve_python_error_classes() {
     let service = service();
@@ -92,7 +92,7 @@ async fn invalid_requests_preserve_python_error_classes() {
     assert_eq!(params["error"]["code"], -32602);
     assert_eq!(params["error"]["message"], "params must be an object");
 }
-/// Mirrors Python `test_api_socket.py::test_notification_produces_no_reply`.
+/// Mirrors `test_api_socket.py::test_notification_produces_no_reply`.
 #[tokio::test]
 async fn notifications_have_no_response_and_unknown_arguments_fail() {
     assert!(
@@ -111,7 +111,7 @@ async fn notifications_have_no_response_and_unknown_arguments_fail() {
     );
 }
 
-/// Mirrors Python `test_api_socket.py::test_domain_errors_have_code_and_message`.
+/// Mirrors `test_api_socket.py::test_domain_errors_have_code_and_message`.
 #[tokio::test]
 async fn domain_errors_use_the_socket_domain_envelope() {
     let response = socket::respond(
@@ -123,7 +123,7 @@ async fn domain_errors_use_the_socket_domain_envelope() {
     assert_eq!(response["error"]["code"], -32602);
     assert!(response["error"].get("data").is_none());
 }
-/// Mirrors Python `test_api_socket.py::test_oversized_line_is_rejected`.
+/// Mirrors `test_api_socket.py::test_oversized_line_is_rejected`.
 #[tokio::test]
 async fn framing_rejects_partial_and_oversized_lines() {
     let mut partial = BufReader::new(&b"{\"id\":1}"[..]);
@@ -143,7 +143,7 @@ async fn framing_does_not_consume_the_next_message() {
     assert_eq!(frame::read(&mut input, 10).await.unwrap().unwrap(), b"one");
     assert_eq!(frame::read(&mut input, 10).await.unwrap().unwrap(), b"two");
 }
-/// Mirrors Python `test_dispatch.py::test_list_agents_accepts_revision_long_poll_fields`.
+/// Mirrors `test_dispatch.py::test_list_agents_accepts_revision_long_poll_fields`.
 #[test]
 fn list_query_bounds_reject_nonfinite_or_negative_waits() {
     let decoded: Query = serde_json::from_value(json!({
@@ -174,7 +174,7 @@ fn list_query_bounds_reject_nonfinite_or_negative_waits() {
     .is_err());
 }
 
-/// Mirrors Python `test_dispatch.py::test_removed_tools_are_rejected`.
+/// Mirrors `test_dispatch.py::test_removed_tools_are_rejected`.
 #[test]
 fn retired_tools_are_not_advertised_by_dispatch() {
     for name in ["fast", "status", "list_orchestrators", "summary", "chain"] {
@@ -182,7 +182,7 @@ fn retired_tools_are_not_advertised_by_dispatch() {
     }
 }
 
-/// Mirrors Python `test_dispatch.py::test_start_accepts_account`.
+/// Mirrors `test_dispatch.py::test_start_accepts_account`.
 #[test]
 fn start_request_decodes_an_optional_account() {
     let workdir = std::env::current_dir().expect("worktree is a directory");
@@ -194,7 +194,66 @@ fn start_request_decodes_an_optional_account() {
     assert_eq!(request.account.as_deref(), Some("personal2"));
 }
 
-/// Mirrors Python `test_dispatch.py::test_start_description_includes_completion_contract_text`.
+/// Mirrors `test_dispatch.py::test_start_accepts_only_unique_known_policy_requirements`.
+#[test]
+fn start_request_accepts_only_unique_known_policy_requirements() {
+    let workdir = std::env::current_dir().expect("worktree is a directory");
+    let base = json!({
+        "runtime": "codex", "model": "fixture", "profile": "review",
+        "task": "inspect", "workdir": workdir,
+        "required_constraints": ["external_network_isolation"]
+    });
+    let request: agent_run::domain::StartRequest =
+        serde_json::from_value(base).expect("known unique constraints decode");
+    assert_eq!(request.required_constraints.len(), 1);
+    for constraints in [
+        json!(["unknown"]),
+        json!(["external_network_isolation", "external_network_isolation"]),
+        json!("external_network_isolation"),
+    ] {
+        let mut value = serde_json::to_value(&request).expect("request serializes");
+        value["required_constraints"] = constraints;
+        assert!(serde_json::from_value::<agent_run::domain::StartRequest>(value).is_err());
+    }
+}
+
+/// Mirrors `test_doc.py::test_doc_tool_call_returns_index_and_topic`.
+#[tokio::test]
+async fn doc_dispatch_returns_the_index_and_requested_topic() {
+    let service = service();
+    let index = dispatch::call(&service, "doc", json!({}))
+        .await
+        .expect("index document");
+    let models = dispatch::call(&service, "doc", json!({"topic":"models"}))
+        .await
+        .expect("models document");
+    assert_eq!(index["topic"], "index");
+    assert!(index["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("agent-run")));
+    assert_eq!(models["topic"], "models");
+    assert!(models["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("opencode/")));
+}
+
+/// Mirrors `test_doc.py::test_doc_tool_call_rejects_unknown_topic`.
+#[tokio::test]
+async fn doc_dispatch_refuses_unknown_topics() {
+    assert!(
+        dispatch::call(&service(), "doc", json!({"topic":"not-a-real-topic"}))
+            .await
+            .is_err()
+    );
+}
+
+/// Mirrors `test_doc.py::test_doc_tool_is_listed`.
+#[test]
+fn doc_is_advertised_by_the_shared_tool_table() {
+    assert!(dispatch::tools().iter().any(|tool| tool["name"] == "doc"));
+}
+
+/// Mirrors `test_dispatch.py::test_start_description_includes_completion_contract_text`.
 #[test]
 fn start_tool_description_embeds_the_completion_contract() {
     let start = dispatch::tools()
@@ -209,7 +268,7 @@ fn start_tool_description_embeds_the_completion_contract() {
     }
 }
 
-/// Mirrors Python `test_api_socket.py::test_wait_timeout_validation`.
+/// Mirrors `test_api_socket.py::test_wait_timeout_validation`.
 #[tokio::test]
 async fn socket_wait_rejects_nonpositive_timeouts_before_store_access() {
     for timeout_seconds in [Value::from(0), Value::from(-1)] {
