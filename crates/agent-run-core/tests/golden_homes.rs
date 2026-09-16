@@ -239,20 +239,21 @@ fn compare_tree(expected: &Value, home: &Path, workdir: &Path) {
             assert_eq!(normalized_actual, expected_content, "payload {path}");
         }
     }
-    let rust_snapshot: Value = serde_json::from_slice(
-        &std::fs::read(home.join(".agent-run-rust-snapshot.json")).expect("Rust integrity index"),
+    // The published runtime index now carries Python's own name and shape
+    // (snapshot_tree.py:23). The captured fixtures predate that work and never
+    // recorded publisher metadata, so the index is checked structurally here.
+    let index: Value = serde_json::from_slice(
+        &std::fs::read(home.join(".agent-run-snapshots.json")).expect("runtime snapshot index"),
     )
-    .expect("Rust integrity index JSON");
-    assert_eq!(rust_snapshot["version"], 1, "Rust integrity index version");
+    .expect("runtime snapshot index JSON");
     assert!(
-        serde_json::from_str::<Value>(
-            expected_files[".agent-run-snapshots.json"]["content"]
-                .as_str()
-                .expect("Python integrity index"),
-        )
-        .is_ok(),
-        "Python integrity index remains valid JSON",
+        index["snapshot_index_version"].is_number(),
+        "runtime index records its version",
     );
+    assert!(index["roots"].is_array(), "runtime index lists roots");
+    assert!(index["files"].is_array(), "runtime index lists files");
+    assert!(index["manifests"].is_object(), "runtime index maps manifests");
+    assert!(!index["links"].is_null(), "runtime index records links");
 }
 
 /// Extracts the capture's owned environment names, leaving host inheritance normalized but checked.
