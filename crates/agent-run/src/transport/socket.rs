@@ -691,69 +691,178 @@ pub async fn serve_at_with_options(
 }
 /// A separate connection for every call; no shared response-routing state.
 pub async fn client(home: &Path, method: &str, params: Value) -> Result<Value> {
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(3),
-        UnixStream::connect(home.join("api.sock")),
+    client_with_wait_deadlines(
+        home,
+        method,
+        params,
+        Duration::from_secs(60),
+        Duration::from_secs(65),
     )
     .await
-    .map_err(|_| Error::BrokerUnavailable)?
-    .map_err(|_| Error::BrokerUnavailable)?;
-    // SAFETY: geteuid is a read-only query.
-    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
-        return Err(crate::error::invalid("broker belongs to another user"));
+}
+
+/// Calls the broker, bounding wait observations and retrying only timed-out observations.
+async fn client_with_wait_deadlines(
+    home: &Path,
+    method: &str,
+    mut params: Value,
+    wait_seconds: Duration,
+    wait_call_timeout: Duration,
+) -> Result<Value> {
+    let is_wait = method == "wait";
+    if is_wait {
+        if let Some(object) = params.as_object_mut() {
+            object.insert("timeout_seconds".into(), json!(wait_seconds.as_secs_f64()));
+        }
     }
-    let id = uuid::Uuid::new_v4().to_string();
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        frame::write(
-            &mut stream,
-            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
-            MAX_FRAME,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        Error::Runtime("broker request write deadline exceeded; admission may be ambiguous".into())
-    })??;
-    let mut input = BufReader::new(stream);
-    // wait deliberately has no client-owned execution deadline.
-    let raw = if method == "wait" {
-        frame::read(&mut input, MAX_FRAME).await?
-    } else {
-        tokio::time::timeout(Duration::from_secs(120), frame::read(&mut input, MAX_FRAME))
+    loop {
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(3),
+            UnixStream::connect(home.join("api.sock")),
+        )
+        .await
+        .map_err(|_| Error::BrokerUnavailable)?
+        .map_err(|_| Error::BrokerUnavailable)?;
+        // SAFETY: geteuid is a read-only query.
+        if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+            return Err(crate::error::invalid("broker belongs to another user"));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            frame::write(
+                &mut stream,
+                &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+                MAX_FRAME,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            Error::Runtime(
+                "broker request write deadline exceeded; admission may be ambiguous".into(),
+            )
+        })??;
+        let mut input = BufReader::new(stream);
+        // Wait uses a finite observer deadline and a slightly longer client read deadline;
+        // timed-out observations are retried against the same durable agent.
+        let response_timeout = if is_wait {
+            wait_call_timeout
+        } else {
+            Duration::from_secs(120)
+        };
+        let raw = tokio::time::timeout(response_timeout, frame::read(&mut input, MAX_FRAME))
             .await
             .map_err(|_| {
                 Error::Runtime(
                     "broker response deadline exceeded; an admitted run is not cancelled".into(),
                 )
-            })??
-    };
-    let value: Value = serde_json::from_slice(
-        &raw.ok_or_else(|| Error::Runtime("broker disconnected before its response".into()))?,
-    )?;
-    if value.get("id").and_then(Value::as_str) != Some(id.as_str())
-        || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-    {
-        return Err(crate::error::invalid("invalid broker response identity"));
+            })??;
+        let value: Value =
+            serde_json::from_slice(&raw.ok_or_else(|| {
+                Error::Runtime("broker disconnected before its response".into())
+            })?)?;
+        if value.get("id").and_then(Value::as_str) != Some(id.as_str())
+            || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        {
+            return Err(crate::error::invalid("invalid broker response identity"));
+        }
+        if let Some(error) = value.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("broker request failed")
+                .chars()
+                .take(512)
+                .collect();
+            return Err(
+                if error.get("code").and_then(Value::as_i64) == Some(-32602) {
+                    Error::Validation(message)
+                } else {
+                    Error::Runtime(message)
+                },
+            );
+        }
+        if is_wait && value["result"]["timed_out"] == true {
+            continue;
+        }
+        return value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| crate::error::invalid("broker returned neither result nor error"));
     }
-    if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("broker request failed")
-            .chars()
-            .take(512)
-            .collect();
-        return Err(
-            if error.get("code").and_then(Value::as_i64) == Some(-32602) {
-                Error::Validation(message)
-            } else {
-                Error::Runtime(message)
-            },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    // Protects the client from a broker that holds a wait response open forever.
+    #[tokio::test]
+    async fn wait_client_deadline_closes_when_broker_holds_response() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (input, _output) = stream.into_split();
+            let mut input = BufReader::new(input);
+            frame::read(&mut input, MAX_FRAME).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let result = client_with_wait_deadlines(
+            home.path(),
+            "wait",
+            json!({"agent_id":"ag-test"}),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::Runtime(ref message)) if message.contains("deadline")),
+            "result={result:?}"
         );
+        server.abort();
     }
-    value
-        .get("result")
-        .cloned()
-        .ok_or_else(|| crate::error::invalid("broker returned neither result nor error"))
+
+    // Protects durable wait retries from changing admission or cancelling the run.
+    #[tokio::test]
+    async fn timed_out_wait_retries_the_same_agent_until_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for expected in [json!({"timed_out":true}), json!({"terminal":true})] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (input, mut output) = stream.into_split();
+                let mut input = BufReader::new(input);
+                let request: Value = serde_json::from_slice(
+                    &frame::read(&mut input, MAX_FRAME).await.unwrap().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(request["params"]["agent_id"], "ag-test");
+                assert_eq!(request["params"]["timeout_seconds"], 0.01);
+                frame::write(
+                    &mut output,
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":expected}),
+                    MAX_FRAME,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let result = client_with_wait_deadlines(
+            home.path(),
+            "wait",
+            json!({"agent_id":"ag-test"}),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["terminal"], true);
+        server.await.unwrap();
+    }
 }
