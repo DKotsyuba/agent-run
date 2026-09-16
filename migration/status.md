@@ -43,7 +43,7 @@ A substantial **native Rust development implementation**, with source, configura
 8. Inline answers are capped at 128 KiB, lower than upstream, to stay within the bounded JSON-RPC frame even under escaping. Verification remains separately bounded to 16 MiB.
 9. Delivery evidence uses a smaller safe Rust shape. Historical evidence of the Python shape is not fully projected. Notice wording and source-specific capacity output are not byte-for-byte equivalent.
 10. Process creation uses the Rust standard process API with a minimal `setsid` pre-exec step; it does not reproduce upstream's explicit `posix_spawn(setsid=True)`-first implementation. Process identity and signals require further OS-specific race review.
-12. The workspace now commits the reviewed `Cargo.lock`, pins Rust 1.98.1, and provides `cargo xtask check`; migration parity claims above remain independently gated.
+11. The workspace now commits the reviewed `Cargo.lock`, pins Rust 1.98.1, and provides `cargo xtask check`; migration parity claims above remain independently gated.
 
 ## Blocking acceptance gates
 
