@@ -1,4 +1,5 @@
 //! Durable, at-least-once completion delivery without task or credential content.
+pub mod claude;
 pub mod relay;
 
 use crate::{
@@ -465,7 +466,7 @@ pub async fn dispatch_once(home: &Path) -> Result<usize> {
     let started = std::time::Instant::now();
     let mut evidence = match claim.transport.as_str() {
         "codex_queue" => relay::send(home, &claim.session, &claim.notice).await,
-        "claude_uds" => claude_send(&claim.session, &claim.notice).await,
+        "claude_uds" => claude::send(&claude_registry(), &claim.session, &claim.notice).await,
         _ => Evidence::new("unsupported_transport", false, false),
     };
     evidence.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -473,8 +474,13 @@ pub async fn dispatch_once(home: &Path) -> Result<usize> {
     Ok(1)
 }
 
-/// Returns a safe failure without probing an owner's live Claude registry; M48 owns that transport.
-async fn claude_send(session: &str, notice: &Notice) -> Evidence {
-    let _ = (session, notice);
-    Evidence::new("uds_unavailable", false, false)
+/// Resolves the Claude session registry, permitting a process-scoped test override.
+fn claude_registry() -> std::path::PathBuf {
+    std::env::var_os("AGENT_RUN_CLAUDE_SESSION_REGISTRY")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".claude/sessions"))
+        })
+        .unwrap_or_default()
 }

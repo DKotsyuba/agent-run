@@ -1,6 +1,6 @@
 //! v1/v2/v3 interoperability with existing Desktop relays, bounded to ten seconds.
 use super::{Evidence, Notice};
-use crate::{domain::Status, error::invalid, fs, Result};
+use crate::{domain::Status, error::invalid, Result};
 use serde_json::{json, Value};
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -228,6 +228,7 @@ pub fn host(home: &Path) -> Result<Option<Host>> {
             // SAFETY: geteuid is a read-only query.
             if stream
                 .peer_cred()
+                // SAFETY: geteuid is a read-only query.
                 .map(|p| p.uid() != unsafe { libc::geteuid() })
                 .unwrap_or(true)
             {
