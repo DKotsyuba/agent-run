@@ -99,3 +99,42 @@ These decisions follow plan §23; defaults keep implementation moving but do not
 | A16 large weights/nonfinite values | Reject overflow, NaN, infinity, and unsafe magnitudes with the M11 typed validation error before ranking. |
 
 No production home, native session, credentials, or deployment target is authorized by this board. P12 cutover still requires the separate authorization in plan §18.12/§21.
+
+## `implemented` is not `verified`
+
+Plan §19.1 lists five statuses — `planned`, `in_progress`, `implemented`,
+`verified`, `blocked` — and states the rule plainly: **"`implemented` не равно
+`verified`. При отсутствии live-проверки используется явный отдельный флаг, а не
+скрытый зелёный статус."**
+
+This is that explicit flag.
+
+At this revision `migration/tasks.csv` holds 82 rows:
+80 `implemented`, 2 `planned`
+(M09, M55), and **0 `verified`**.
+
+**A count of implemented rows is therefore not a readiness figure.** "80 of
+82" says that the code exists and its own acceptance command passes. It
+does not say the behavior was confirmed against a real engine, a real
+notification host, or a second operating system.
+
+No row can honestly become `verified` yet, and the reason is not oversight:
+
+- Three qualification scenarios retain a live portion that a fixture cannot
+  supply — an installed `qwen` binary, the running ChatGPT Desktop host, and one
+  non-macOS machine. They are named in `migration/evidence/qualification-scope.md`.
+- M55 is the row that would establish that evidence, and it is `planned` because
+  live qualification needs the owner's authorization, not more implementation.
+- Risk K01 in plan §22 is blocking and states the consequence directly: without
+  that evidence, full parity is not claimed.
+
+Check the tally yourself rather than trusting this paragraph:
+
+```sh
+python3 -c "
+import csv, collections
+rows = list(csv.DictReader(open('migration/tasks.csv')))
+print(collections.Counter(r['status'] for r in rows))
+print([r['id'] for r in rows if r['status'] != 'implemented'])
+"
+```
