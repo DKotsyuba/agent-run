@@ -7,7 +7,9 @@ mod common;
 
 use agent_run_core::{
     domain::{Outcome, Status},
-    lifecycle::reconcile::{reconcile, reconcile_with},
+    lifecycle::reconcile::{
+        reconcile, reconcile_reaped_agent, reconcile_reaped_supervisor, reconcile_with,
+    },
     process::{self, ProcessState},
     service::Service,
 };
@@ -172,6 +174,211 @@ fn killed_supervisor_is_observed_dead_by_the_native_platform_probe() {
         store.get(&id).unwrap().failure_kind.as_deref(),
         Some("supervisor_dead")
     );
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_reconciliation_requires_supplied_proof_before_persisting_lost`.
+#[test]
+fn python_test_state_outbox_reconciliation_requires_valid_supplied_proof() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    assert!(reconcile_reaped_agent(&mut store, &id, 1, 3.0).is_err());
+    assert_eq!(store.get(&id).unwrap().status, Status::Starting);
+    active(&store, &id, 100, "pid100:start1", 20.0);
+    assert!(!reconcile_reaped_agent(&mut store, &id, 101, 3.0).unwrap());
+    assert_eq!(store.get(&id).unwrap().status, Status::Running);
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Unknown)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Running);
+    assert_eq!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Reused).unwrap(),
+        vec![id.clone()]
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Lost);
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_reaped_supervisor_reconciles_only_its_active_rows`.
+#[test]
+fn python_test_state_outbox_reaped_supervisor_reconciles_only_active_rows() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let dead = admitted(&home, &mut store, None);
+    let other = admitted(&home, &mut store, None);
+    let terminal = admitted(&home, &mut store, None);
+    active(&store, &dead, 100, "pid-100", 1.0);
+    active(&store, &other, 200, "pid-200", 1.0);
+    active(&store, &terminal, 100, "pid-100", 1.0);
+    store
+        .finish(&terminal, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+    assert_eq!(
+        reconcile_reaped_supervisor(&mut store, 100, agent_run_core::domain::now() + 1.0, 100)
+            .unwrap(),
+        vec![dead]
+    );
+    assert_eq!(store.get(&other).unwrap().status, Status::Running);
+    assert_eq!(store.get(&terminal).unwrap().status, Status::Failed);
+    assert!(reconcile_reaped_supervisor(&mut store, 100, 7.0, 100)
+        .unwrap()
+        .is_empty());
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_reaped_agent_closes_the_pre_identity_starting_window`.
+#[test]
+fn python_test_state_outbox_reaped_agent_closes_pre_identity_starting_window() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    assert!(reconcile_reaped_agent(&mut store, &id, 321, 3.0).unwrap());
+    assert_eq!(store.get(&id).unwrap().status, Status::Lost);
+    assert!(!reconcile_reaped_agent(&mut store, &id, 321, 4.0).unwrap());
+    let other = admitted(&home, &mut store, None);
+    active(&store, &other, 999, "pid-999", 1.0);
+    assert!(!reconcile_reaped_agent(&mut store, &other, 321, 7.0).unwrap());
+    assert_eq!(store.get(&other).unwrap().status, Status::Running);
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_supervisor_group_refines_once_from_the_supervisors_own_group`.
+#[test]
+fn python_test_state_outbox_supervisor_group_refines_once() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    store
+        .record_supervisor(&id, 100, "pid-100", 100, None, 6.0)
+        .unwrap();
+    store
+        .record_supervisor(&id, 100, "pid-100", 4242, None, 8.0)
+        .unwrap();
+    for (pid, identity, group) in [
+        (100, "pid-100", 4243),
+        (100, "pid-100", 100),
+        (101, "pid-100", 4242),
+        (100, "other", 4242),
+    ] {
+        assert!(store
+            .record_supervisor(&id, pid, identity, group, None, 9.0)
+            .is_err());
+    }
+    let row = store.get(&id).unwrap();
+    assert_eq!(
+        (
+            row.supervisor_pid,
+            row.supervisor_identity,
+            row.process_group_id
+        ),
+        (Some(100), Some("pid-100".into()), Some(4242))
+    );
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_sweep_closes_dead_supervisors_with_live_groups_without_signalling`.
+#[test]
+fn python_test_state_outbox_sweep_closes_dead_supervisors_without_signalling() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let surviving = admitted(&home, &mut store, None);
+    let foreign = admitted(&home, &mut store, None);
+    let terminal = admitted(&home, &mut store, None);
+    active(&store, &surviving, 100, "pid-100", 1.0);
+    active(&store, &foreign, 101, "pid-101", 1.0);
+    active(&store, &terminal, 102, "pid-102", 1.0);
+    store
+        .finish(&terminal, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+    let probed = std::sync::Mutex::new(Vec::new());
+    let changed = reconcile_with(&mut store, 100, |pid, _, _| {
+        probed.lock().unwrap().push(pid);
+        ProcessState::Dead
+    })
+    .unwrap();
+    assert_eq!(changed, vec![surviving.clone(), foreign.clone()]);
+    assert_eq!(*probed.lock().unwrap(), vec![Some(100), Some(101)]);
+    assert_eq!(store.get(&terminal).unwrap().status, Status::Failed);
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_sweep_reconciles_only_a_proven_reused_pid`.
+#[test]
+fn python_test_state_outbox_sweep_reconciles_only_proven_reused_pid() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let exact = admitted(&home, &mut store, None);
+    let boundary = admitted(&home, &mut store, None);
+    let unavailable = admitted(&home, &mut store, None);
+    let mismatch = admitted(&home, &mut store, None);
+    for (id, pid, birth) in [
+        (&exact, 200, 20.0),
+        (&boundary, 201, 21.0),
+        (&unavailable, 202, 22.0),
+        (&mismatch, 203, 23.0),
+    ] {
+        active(&store, id, pid, "agent-run supervisor", birth);
+    }
+    let changed = reconcile_with(&mut store, 100, |pid, _, _| match pid {
+        Some(203) => ProcessState::Reused,
+        Some(202) => ProcessState::Denied,
+        _ => ProcessState::Alive,
+    })
+    .unwrap();
+    assert_eq!(changed, vec![mismatch.clone()]);
+    assert_eq!(store.get(&exact).unwrap().status, Status::Running);
+    assert_eq!(store.get(&boundary).unwrap().status, Status::Running);
+    assert_eq!(store.get(&unavailable).unwrap().status, Status::Running);
+    assert_eq!(
+        store.get(&mismatch).unwrap().failure_kind.as_deref(),
+        Some("supervisor_identity_mismatch")
+    );
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_one_stale_row_does_not_abort_the_rest_of_the_sweep`.
+#[test]
+fn python_test_state_outbox_one_stale_row_does_not_abort_sweep() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let stale = admitted(&home, &mut store, None);
+    let healthy = admitted(&home, &mut store, None);
+    active(&store, &stale, 300, "pid-300", 1.0);
+    active(&store, &healthy, 301, "pid-301", 2.0);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET heartbeat_at=? WHERE id=?",
+            (agent_run_core::domain::now() + 100.0, stale.as_str()),
+        )
+        .unwrap();
+    let changed = reconcile_with(&mut store, 100, |_, _, _| ProcessState::Dead).unwrap();
+    assert_eq!(changed, vec![healthy.clone()]);
+    assert_eq!(store.get(&stale).unwrap().status, Status::Running);
+    assert_eq!(store.get(&healthy).unwrap().status, Status::Lost);
+}
+
+/// Mirrors `tests/test_state_outbox.py::test_each_row_is_timed_after_its_own_probe`.
+#[test]
+fn python_test_state_outbox_each_row_is_timed_after_its_probe() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let first = admitted(&home, &mut store, None);
+    let second = admitted(&home, &mut store, None);
+    active(&store, &first, 400, "pid-400", 1.0);
+    active(&store, &second, 401, "pid-401", 1.0);
+    let path = home.path.clone();
+    let changed = reconcile_with(&mut store, 100, |pid, _, _| {
+        if pid == Some(400) {
+            let heartbeat_store = Store::open(&path).unwrap();
+            heartbeat_store
+                .conn
+                .execute(
+                    "UPDATE agents SET heartbeat_at=? WHERE id=?",
+                    (agent_run_core::domain::now(), second.as_str()),
+                )
+                .unwrap();
+        }
+        ProcessState::Dead
+    })
+    .unwrap();
+    assert_eq!(changed, vec![first, second]);
 }
 
 /// Mirrors `test_wait.py::test_running_agent_transitions_to_succeeded_and_returns_the_answer`.
