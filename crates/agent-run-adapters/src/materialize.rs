@@ -429,6 +429,7 @@ pub fn materialize(
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
     let kind = runtime.kind()?;
+    agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     super::claude::validate_runtime(runtime, kind)?;
     if std::fs::symlink_metadata(home.join("skills"))
         .map(|metadata| metadata.file_type().is_symlink())

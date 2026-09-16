@@ -7,7 +7,13 @@
 //! `tests/test_native_settings.py`).
 mod common;
 
-use agent_run_config::config::{self, Adapter, Config};
+use agent_run_config::{
+    config::{self, Adapter, Config, Runtime},
+    role_plan::ResolvedRolePlan,
+    snapshot,
+};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn write(home: &common::Home, extra: &str) -> String {
     format!(
@@ -98,6 +104,205 @@ fn nonfinite_float_values_are_rejected() {
         let settings = std::collections::BTreeMap::from([("k".to_string(), toml::Value::Float(v))]);
         assert!(config::native_settings(Adapter::Codex, &settings).is_err());
     }
+}
+
+/// Mirrors `tests/test_native_settings.py::NativeSettingsParsing::test_model_verbosity_is_ordinary_tuning`.
+#[test]
+fn ordinary_model_verbosity_is_accepted() {
+    let home = common::Home::new();
+    let cfg = load(
+        &home,
+        "[runtimes.codex.native_settings]\nmodel_verbosity = \"low\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.runtimes["codex"].native_settings["model_verbosity"],
+        toml::Value::String("low".into())
+    );
+}
+
+/// Mirrors `tests/test_native_settings.py::NativeSettingsParsing::test_documented_full_config_example_loads`.
+#[test]
+fn documented_full_config_example_loads() {
+    let guide = include_str!("../../../src/agent_run/operator_guide/config.md");
+    let block = guide
+        .split_once("```toml\n")
+        .and_then(|(_, rest)| rest.split_once("```").map(|(text, _)| text))
+        .expect("operator guide must keep a TOML example");
+    let home = common::Home::new();
+    std::fs::write(home.path.join("config.toml"), block).unwrap();
+    let cfg = Config::load(&home.path).unwrap();
+    assert!(cfg.runtimes.contains_key("codex"));
+}
+
+/// Build a fixed runtime and role so canonical snapshot bytes are reproducible.
+fn role_fixture() -> ResolvedRolePlan {
+    ResolvedRolePlan {
+        role_name: "review".into(),
+        role_revision: "legacy".into(),
+        prompt: "Review carefully.".into(),
+        write: false,
+        network: false,
+        allow_external_read_roots: true,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec![],
+        required_constraints: BTreeSet::new(),
+        auth_mode: "global".into(),
+        auth_reference: None,
+        config_revision: "c".repeat(64),
+    }
+}
+
+/// Build a fixed runtime and role so canonical snapshot bytes are reproducible.
+fn snapshot_fixture(settings: BTreeMap<String, toml::Value>) -> snapshot::ConfigSnapshot {
+    let runtime: Runtime = serde_json::from_value(json!({
+        "enabled": true,
+        "adapter": "codex",
+        "binary": "/bin/true",
+        "home": "/tmp/native-settings-home",
+        "models": ["fixture"],
+        "native_settings": settings,
+    }))
+    .expect("runtime");
+    let config: Config = serde_json::from_value(json!({"schema_version": 1})).expect("config");
+    let role = role_fixture();
+    snapshot::build_config_snapshot(
+        "codex",
+        2,
+        1,
+        &"a".repeat(64),
+        &"b".repeat(64),
+        &config,
+        &runtime,
+        &role,
+        None,
+    )
+    .expect("snapshot")
+}
+
+/// Mirrors `tests/test_native_settings.py::SnapshotAndScopedCopies::test_runtime_document_records_sorted_settings`.
+#[test]
+fn runtime_snapshot_records_sorted_native_settings() {
+    let snapshot = snapshot_fixture(BTreeMap::from([
+        ("z".into(), toml::Value::Integer(1)),
+        (
+            "a".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "nested".into(),
+                toml::Value::Array(vec![
+                    toml::Value::Integer(1),
+                    toml::Value::String("x".into()),
+                ]),
+            )])),
+        ),
+    ]));
+    let document: Value = serde_json::from_slice(&snapshot.document).expect("JSON");
+    assert_eq!(
+        document["runtime_config"]["native_settings"],
+        json!({"a": {"nested": [1, "x"]}, "z": 1})
+    );
+}
+
+/// Mirrors `tests/test_native_settings.py::SnapshotAndScopedCopies::test_runtime_document_omits_empty_settings`.
+#[test]
+fn empty_native_settings_are_omitted_from_snapshot() {
+    let snapshot = snapshot_fixture(BTreeMap::new());
+    let document: Value = serde_json::from_slice(&snapshot.document).expect("JSON");
+    assert!(document["runtime_config"].get("native_settings").is_none());
+}
+
+/// Mirrors `tests/test_native_settings.py::SnapshotAndScopedCopies::test_settings_change_changes_document_identity`.
+#[test]
+fn changing_native_settings_changes_snapshot_identity() {
+    let first = snapshot_fixture(BTreeMap::from([("k".into(), toml::Value::Integer(1))]));
+    let second = snapshot_fixture(BTreeMap::from([("k".into(), toml::Value::Integer(2))]));
+    assert_ne!(first.document, second.document);
+    assert_ne!(first.sha256, second.sha256);
+}
+
+/// Mirrors `tests/test_native_settings.py::SnapshotAndScopedCopies::test_parse_scoped_snapshot_roundtrip_materializes`.
+#[test]
+fn native_settings_survive_snapshot_roundtrip() {
+    let original = BTreeMap::from([
+        ("model_context_window".into(), toml::Value::Integer(250_000)),
+        (
+            "tuning".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "retries".into(),
+                toml::Value::Integer(3),
+            )])),
+        ),
+    ]);
+    let snapshot = snapshot_fixture(original);
+    let document: Value = serde_json::from_slice(&snapshot.document).expect("JSON");
+    let restored: BTreeMap<String, toml::Value> =
+        serde_json::from_value(document["runtime_config"]["native_settings"].clone())
+            .expect("native settings");
+    assert_eq!(
+        restored["model_context_window"],
+        toml::Value::Integer(250_000)
+    );
+    assert_eq!(restored["tuning"]["retries"], toml::Value::Integer(3));
+}
+
+/// Mirrors `tests/test_native_settings.py::SnapshotAndScopedCopies::test_json_conversion_is_deterministic_for_snapshot_bytes`.
+#[test]
+fn canonical_snapshot_bytes_are_exact_and_key_sorted() {
+    let settings = BTreeMap::from([
+        (
+            "z".into(),
+            toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2)]),
+        ),
+        (
+            "a".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "b".into(),
+                toml::Value::Boolean(true),
+            )])),
+        ),
+    ]);
+    let actual = snapshot_fixture(settings).document;
+    let runtime_config = json!({
+        "adapter": "codex",
+        "auth": null,
+        "binary": "/bin/true",
+        "default_account": null,
+        "enabled": true,
+        "environment": null,
+        "hooks": [],
+        "home": "/tmp/native-settings-home",
+        "limits_source": null,
+        "mcp": [],
+        "max_active_agents": null,
+        "models": ["fixture"],
+        "native_settings": {"a": {"b": true}, "z": [1, 2]},
+        "accounts": [],
+        "plugin_snapshot_assets": {},
+        "plugins": [],
+        "priority_account_multipliers": {},
+        "priority_lane_multipliers": {},
+        "priority_multiplier": 1.0,
+        "rust": null,
+        "skills": [],
+    });
+    let runtime_hash =
+        agent_run_platform::fs::sha256(&agent_run_domain::canonical::dumps(&runtime_config, true));
+    let expected = json!({
+        "snapshot_version": 1,
+        "runtime": "codex",
+        "runtime_version": null,
+        "adapter_api_version": 2,
+        "config_schema_version": 1,
+        "runtime_config_sha256": runtime_hash,
+        "runtime_config": runtime_config,
+        "materialize_revision": "a".repeat(64),
+        "snapshot_index_sha256": "b".repeat(64),
+        "profile": role_fixture().to_payload(),
+    });
+    let mut expected_bytes = agent_run_domain::canonical::dumps(&expected, true);
+    expected_bytes.push(b'\n');
+    assert_eq!(actual, expected_bytes);
 }
 
 /// Mirrors `test_unsupported_adapter_is_rejected`: a runtime whose adapter

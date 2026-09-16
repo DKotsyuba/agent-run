@@ -32,6 +32,7 @@ pub struct LaunchPlan {
 pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) -> Result<()> {
     let kind = runtime.kind()?;
     claude::validate_runtime(runtime, kind)?;
+    agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     if kind == Adapter::Qwen {
         match &runtime.auth {
             Some(Auth::Environment { names })
