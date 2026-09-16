@@ -87,12 +87,33 @@ Measured personally on macOS (Darwin 27.0.0, arm64) at the commits noted:
 - The four acceptance commands that earlier revisions of this file called
   unproven all pass: M14a (3 tests), M28a (2), M31b (3), M33 (2).
 
-**Full-suite figure: being re-measured.** The last socket-permitted full run
-recorded 1077 passed / 0 failed / 1 ignored at commit `176c89e`. Seven merges
-have landed since, including a 217-line rewrite of the socket transport, so that
-figure no longer describes this revision and is not restated here as if it did.
-A re-measurement at the current commit is in progress and will replace this
-paragraph.
+**Full suite, measured where Unix sockets are permitted**, at commit `69258c7`
+(the `xtask` recovery drills merged after it, adding 5 tests):
+
+| Run | Result |
+| --- | --- |
+| first | **1084 passed, 0 failed, 1 ignored** across 109 targets |
+| `--locked` | **1084 passed, 0 failed, 1 ignored** — the committed lockfile resolves |
+| second | 1083 passed, **1 failed**, 1 ignored |
+
+The ignored test is a Keychain probe that needs a real keychain.
+
+**Two tests failed intermittently and are under investigation. Neither is
+dismissed as flaky.**
+
+- `command_flood_yields_after_one_bounded_page` failed once under load with 40
+  accepted commands where the page limit is 16. The paged loop is literally
+  `for _ in 0..COMMAND_PAGE_LIMIT`, so one page cannot accept 17; 40 suggests
+  three pages elapsed before the test counted. It passed 15 consecutive isolated
+  runs here. That reading is a hypothesis under active falsification, not a
+  conclusion.
+- `python_stale_socket_reclaim_requires_econnrefused` failed once in ten, on its
+  **precondition** rather than its subject: a connect issued immediately after
+  the stale listener was dropped succeeded instead of being refused, so the
+  reclaim assertion was never reached.
+
+Until both are resolved, this revision should be read as "1084 passing with two
+known intermittent test failures", not as a clean suite.
 
 A shell that forbids binding Unix domain sockets reports ~56 failures across 7
 targets. Every one is a bind denial — verified by a direct bind probe and by
