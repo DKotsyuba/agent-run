@@ -1388,17 +1388,23 @@ async fn expired_send_lease_is_claim_lost_and_reclaimable() {
 #[tokio::test]
 async fn unexpected_transport_outcome_is_sanitized_and_releases_the_claim() {
     let home = common::Home::new();
-    delivery(&home.path, "ntf_sanitized", "surprise-transport-detail", "pending");
+    delivery(
+        &home.path,
+        "ntf_sanitized",
+        "surprise-transport-detail",
+        "pending",
+    );
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let row: (String, Option<String>, Option<String>, Option<f64>) =
-        Connection::open(home.path.join("state.db"))
-            .unwrap()
-            .query_row(
-                "SELECT state,last_error,lease_owner,lease_until FROM deliveries WHERE id='ntf_sanitized'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
+    let row: (String, Option<String>, Option<String>, Option<f64>) = Connection::open(
+        home.path.join("state.db"),
+    )
+    .unwrap()
+    .query_row(
+        "SELECT state,last_error,lease_owner,lease_until FROM deliveries WHERE id='ntf_sanitized'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .unwrap();
     assert_eq!(row.0, "failed");
     let recorded = row.1.expect("an unusable transport is diagnosed");
     assert_eq!(recorded, "unsupported_transport");
@@ -1444,7 +1450,10 @@ async fn unusable_dispatcher_lock_is_loud_not_contention() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(state, "pending", "a refused lock must not consume the notice");
+    assert_eq!(
+        state, "pending",
+        "a refused lock must not consume the notice"
+    );
 }
 
 /// Mirrors `tests/test_delivery_dispatch.py::DeliveryDispatchTests::test_notice_for_tolerates_rows_without_metadata_projection`

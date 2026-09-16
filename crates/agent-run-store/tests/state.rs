@@ -361,7 +361,9 @@ fn open_refuses_v1_tables_with_corrupt_column_shapes() {
     let corrupt = rusqlite::Connection::open(home.join("state.db")).unwrap();
     for table in V1_TABLES {
         corrupt
-            .execute_batch(&format!("CREATE TABLE \"{table}\" (wrong BLOB PRIMARY KEY)"))
+            .execute_batch(&format!(
+                "CREATE TABLE \"{table}\" (wrong BLOB PRIMARY KEY)"
+            ))
             .unwrap();
     }
     corrupt.pragma_update(None, "user_version", 1).unwrap();
@@ -390,7 +392,10 @@ fn reopen_tolerates_chmod_denied_but_creation_does_not() {
         .arg(&database)
         .status()
         .expect("chflags runs");
-    assert!(immutable.success(), "test needs an undeletable-flag capable fs");
+    assert!(
+        immutable.success(),
+        "test needs an undeletable-flag capable fs"
+    );
     let reopened = Store::open(&home.path);
     let _ = std::process::Command::new("/usr/bin/chflags")
         .arg("nouchg")

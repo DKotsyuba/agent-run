@@ -236,3 +236,107 @@ fn claude_contract_exposes_no_ambient_runtime_controls() {
     assert_eq!(runtime.kind().expect("Claude adapter"), Adapter::Claude);
     assert_eq!(agent_run_adapters::glm::cli_model("glm-5.3"), "glm-5.3[1m]");
 }
+
+/// Builds a runtime of one CLI adapter family for native continuation checks.
+fn resume_runtime(root: &std::path::Path, adapter: &str) -> Runtime {
+    serde_json::from_value(json!({
+        "enabled": true,
+        "adapter": adapter,
+        "binary": "/bin/echo",
+        "home": root.join("runtime"),
+        "models": ["sonnet", "fable"],
+        "auth": {"kind": "environment", "names": ["ANTHROPIC_API_KEY"]},
+    }))
+    .expect("fixture resume runtime")
+}
+
+/// Plans one launch for an adapter family, optionally continuing a saved session.
+fn resume_plan(
+    root: &std::path::Path,
+    adapter: &str,
+    resume: Option<&str>,
+) -> agent_run_adapters::LaunchPlan {
+    let (config, _, request, profile) = fixture(root, false, false, "sonnet");
+    std::fs::create_dir_all(&request.workdir).expect("fixture workdir");
+    let runtime = resume_runtime(root, adapter);
+    let mut record = record(request);
+    record.resume_of_runtime_session_id = resume.map(str::to_owned);
+    let home = root.join("home");
+    plan_with_environment(
+        &config,
+        &runtime,
+        &record,
+        &profile,
+        &home,
+        &materialize::Snapshot {
+            plugin_paths: vec![],
+            plugin_roots: BTreeMap::new(),
+        },
+        BTreeMap::from([
+            ("HOME".into(), home.display().to_string()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]),
+    )
+    .expect("build continuation plan")
+}
+
+/// Mirrors `tests/test_resume_adapters.py::ArgumentsTests::test_resume_arguments_preserve_other_settings`
+///
+/// A continuation targets one exact saved session and changes nothing else: the
+/// fresh-session selector is gone, the native selector is last, and the model,
+/// working directory and prompt are untouched.
+#[test]
+fn resume_arguments_preserve_other_settings() {
+    let temporary = tempfile::tempdir().expect("temporary fixture root");
+    let fresh = resume_plan(temporary.path(), "claude", None);
+    assert!(
+        fresh.args.iter().any(|argument| argument == "--session-id"),
+        "a fresh launch still claims its own new session"
+    );
+    assert!(!fresh.args.iter().any(|argument| argument == "--resume"));
+
+    let resumed = resume_plan(temporary.path(), "claude", Some("saved"));
+    assert_eq!(
+        &resumed.args[resumed.args.len() - 2..],
+        ["--resume".to_owned(), "saved".to_owned()]
+    );
+    assert!(
+        !resumed
+            .args
+            .iter()
+            .any(|argument| argument == "--session-id"),
+        "a continuation must never also request a fresh session"
+    );
+    assert_eq!(flag(&resumed, "--model"), flag(&fresh, "--model"));
+    assert_eq!(resumed.cwd, fresh.cwd);
+    assert_eq!(resumed.initial_input, fresh.initial_input);
+}
+
+/// Mirrors `tests/test_resume_adapters.py::ArgumentsTests::test_adapters_pass_exact_native_resume_selector_to_process`
+///
+/// Every CLI adapter family hands the process the same exact native selector
+/// exactly once, and none of them can accidentally ask for a new session.
+#[test]
+fn adapters_pass_exact_native_resume_selector_to_process() {
+    for adapter in ["claude", "glm", "qwen"] {
+        let temporary = tempfile::tempdir().expect("temporary fixture root");
+        let plan = resume_plan(temporary.path(), adapter, Some("saved"));
+        assert_eq!(
+            &plan.args[plan.args.len() - 2..],
+            ["--resume".to_owned(), "saved".to_owned()],
+            "{adapter} must end with the exact native selector"
+        );
+        assert!(
+            !plan.args.iter().any(|argument| argument == "--session-id"),
+            "{adapter} must not request a fresh session while resuming"
+        );
+        assert_eq!(
+            plan.args
+                .iter()
+                .filter(|argument| *argument == "--resume")
+                .count(),
+            1,
+            "{adapter} must select the session exactly once"
+        );
+    }
+}

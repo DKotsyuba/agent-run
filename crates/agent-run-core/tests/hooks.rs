@@ -192,7 +192,8 @@ fn bind_rejects_arguments_that_are_not_the_declared_contract() {
         bind::normalize(&surprising, true, "codex_queue").is_err(),
         "undeclared keys are refused"
     );
-    let incomplete = json!({"agent_id": "ag-20260916-120000-0123456789", "transport": "codex_queue"});
+    let incomplete =
+        json!({"agent_id": "ag-20260916-120000-0123456789", "transport": "codex_queue"});
     assert!(bind::normalize(&incomplete, true, "codex_queue").is_err());
     let unknown_transport = json!({
         "agent_id": "ag-20260916-120000-0123456789",
