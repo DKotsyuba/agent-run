@@ -65,6 +65,17 @@ fn fake_plan() -> LaunchPlan {
     }
 }
 
+/// Builds a delayed fake app-server stream with repeated deltas and whitespace.
+fn streaming_plan() -> LaunchPlan {
+    LaunchPlan {
+        binary: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in 1) printf '%s\n' '{"id":1,"result":{}}' ;; 3) printf '%s\n' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;; 4) case "$line" in *'"permissions"'*) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;; 5) printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn"}}}'; sleep 1; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":" \\n"}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"agentMessage","id":"item","text":"samesame \\n"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;; esac; done"#.into()],
+        cwd: PathBuf::from("/private/tmp"),
+        environment: BTreeMap::new(),
+        initial_input: None,
+    }
+}
+
 /// Mirrors `test_codex_adapter.py::test_models_missing_cache_refreshes_live_roster_and_writes_cache`.
 /// Mirrors `test_codex_app_server.py::test_unknown_method_forwards_its_params`.
 #[tokio::test]
@@ -102,6 +113,53 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
             .expect("read forwarded event"),
         Some(json!({"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}))
     );
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// Mirrors `tests/test_codex_app_server.py::CodexAppServerSessionTests::test_stream_chunks_preserve_text_across_idle_polls`.
+#[tokio::test]
+async fn python_test_codex_app_server_repeated_chunks_are_journaled_after_idle_poll() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from("/private/tmp");
+    request.validate().expect("fixture request");
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .expect("admit fixture");
+    let mut store = fixture.store();
+    let record = store.get(&id).expect("admitted row");
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).expect("owned Codex home");
+    let mut process = Process::spawn(&streaming_plan()).expect("fake app-server starts");
+
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .expect("fake stream succeeds");
+
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    // Rust-internal assertion: repeated deltas must remain separate journal
+    // entries, and the canonical completion must preserve its unsent tail.
+    let transcript = store
+        .transcript(&id, 0, 10)
+        .expect("read streamed transcript");
+    let messages = transcript["messages"]
+        .as_array()
+        .expect("transcript messages")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .map(|message| message["content"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(&messages[..2], ["same", "same"]);
+    assert_eq!(messages[2].as_bytes(), [b' ', b'\\', b'n']);
     drop(process.input.take());
     process.reap().await;
 }

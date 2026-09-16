@@ -7,7 +7,7 @@ use agent_run::{
     transport::{frame, socket},
 };
 use serde_json::{json, Value};
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 fn service() -> Service {
     Service::new(std::path::PathBuf::from(
         "/nonexistent-agent-run-protocol-fixture",
@@ -136,6 +136,20 @@ async fn framing_rejects_partial_and_oversized_lines() {
         Some(b"{}".to_vec())
     );
     assert!(frame::read(&mut crlf, 10).await.unwrap().is_none());
+}
+/// The frame reader stops at the configured bound instead of consuming an
+/// arbitrarily large unterminated line into memory.
+#[tokio::test]
+async fn framing_does_not_consume_beyond_the_memory_bound() {
+    let payload = vec![b'x'; socket::MAX_FRAME * 2];
+    let mut input = BufReader::with_capacity(4096, &payload[..]);
+    assert!(frame::read(&mut input, socket::MAX_FRAME).await.is_err());
+    let mut remaining = Vec::new();
+    input.read_to_end(&mut remaining).await.unwrap();
+    assert!(
+        !remaining.is_empty(),
+        "oversized input was consumed in full"
+    );
 }
 #[tokio::test]
 async fn framing_does_not_consume_the_next_message() {
