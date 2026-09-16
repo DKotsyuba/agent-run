@@ -433,10 +433,18 @@ pub struct Cleanup {
     /// Signals successfully delivered to the verified process group.
     pub signals: Vec<String>,
     /// Scope of the descendant evidence.
+    ///
+    /// `verified_descendants` when a descendant verdict exists, otherwise
+    /// `process_group`: the group alone was observed and the descendant closure
+    /// was never verified.
     pub scope: String,
     /// Whether native group observation proved the original group absent.
     pub group_gone: bool,
-    /// Whether every captured descendant identity is gone, or unavailable.
+    /// Whether every descendant identity captured while the leader was alive is
+    /// gone, or `None` when that could not be established.
+    ///
+    /// `None` means unknown — no snapshot was ever verified, or some captured
+    /// identity was unreadable at cleanup. It never means "clean".
     pub descendants_gone: Option<bool>,
     /// Whether both group and descendant observations confirm cleanup.
     pub confirmed: bool,
@@ -451,33 +459,59 @@ pub struct OwnedProcess {
     pub pid: i32,
     /// Captured leader and observed descendants indexed by PID.
     known: BTreeMap<i32, Identity>,
-    /// Whether at least one full native descendant snapshot completed.
+    /// Whether a complete native snapshot was taken while the leader was alive.
+    ///
+    /// False means no descendant set was ever verified, so cleanup reports the
+    /// descendant scope as unknown rather than clean.
     descendants_observed: bool,
 }
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
+    ///
+    /// A live leader read here is itself the first verified descendant snapshot:
+    /// a process observed at the moment it is spawned cannot have descendants
+    /// yet, so its empty set is proven rather than assumed, and even a child
+    /// exiting before the caller's first periodic refresh leaves verified
+    /// evidence behind. That proof costs only the leader's own inspection; a
+    /// full process-table scan here would delay the caller's stream readers and
+    /// is not needed for an empty set. A leader that is already gone, a zombie,
+    /// or unreadable records no snapshot, and cleanup then reports the
+    /// descendant scope as unknown rather than clean.
     pub fn capture(pid: i32) -> Self {
         let leader = inspect(pid).ok();
         let known = leader.clone().into_iter().map(|p| (p.pid, p)).collect();
+        let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
         Self {
             leader,
             pid,
             known,
-            descendants_observed: false,
+            descendants_observed,
         }
     }
     /// Record descendants visible from a complete native process snapshot.
+    ///
+    /// Captured identities accumulate in `known` and survive later refreshes, so
+    /// a descendant seen while the leader lived is still probed individually by
+    /// `cleanup`. The snapshot counts as *verified* descendant evidence only when
+    /// the captured leader is itself observably alive: after it exits, a
+    /// descendant which left the original process group is reachable through
+    /// neither parentage nor the group, so an empty snapshot then proves nothing.
+    /// This mirrors Python's `SystemProcessOps.descendants`
+    /// (src/agent_run/lifecycle.py:134-155), which returns `None` unless the
+    /// leader identity is ALIVE. A failed `processes()` call records nothing and
+    /// leaves the existing evidence untouched.
     pub fn refresh(&mut self) {
         let Ok(all) = processes() else {
             return;
         };
-        self.descendants_observed = true;
-        let leader_owned = self.leader.as_ref().is_some_and(|p| {
-            matches!(
-                observe(Some(p.pid), Some(&p.token), Some(p.birth)),
-                ProcessState::Alive | ProcessState::Dead
-            )
-        });
+        let leader_state = self
+            .leader
+            .as_ref()
+            .map(|p| observe(Some(p.pid), Some(&p.token), Some(p.birth)));
+        if leader_state == Some(ProcessState::Alive) {
+            self.descendants_observed = true;
+        }
+        let leader_owned = matches!(leader_state, Some(ProcessState::Alive | ProcessState::Dead));
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {
             let mut changed = false;
@@ -621,7 +655,14 @@ impl OwnedProcess {
         });
         Ok(Cleanup {
             signals,
-            scope: "verified_descendants".into(),
+            // Mirrors Python's `Termination.scope` (src/agent_run/lifecycle.py:196-204):
+            // the wider scope is claimed only when a descendant verdict exists.
+            scope: if descendants_gone.is_some() {
+                "verified_descendants"
+            } else {
+                "process_group"
+            }
+            .into(),
             group_gone,
             descendants_gone,
             confirmed: group_gone && descendants_gone == Some(true),
@@ -663,5 +704,41 @@ mod tests {
             assert!(!identity_gone(state));
             assert!(!signal_allowed(state));
         }
+    }
+
+    /// A readable process table is not descendant evidence once the leader is
+    /// gone: a descendant which left the original group is then reachable
+    /// through neither parentage nor the group, so the empty result must report
+    /// unknown rather than a clean, confirmed teardown.
+    #[tokio::test]
+    async fn an_unverified_descendant_snapshot_is_unknown_not_clean() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn owned test child");
+        let pid = child.id() as i32;
+        let mut owned = OwnedProcess::capture(pid);
+        assert!(
+            owned.descendants_observed,
+            "a snapshot taken while the leader lives is verified evidence"
+        );
+        child.kill().expect("stop owned test child");
+        child.wait().expect("reap owned test child");
+        // Model an owner whose leader died before any snapshot succeeded: the
+        // process table is still readable, and that alone must not verify.
+        owned.descendants_observed = false;
+        owned.refresh();
+        assert!(
+            !owned.descendants_observed,
+            "a post-exit snapshot must never count as verification"
+        );
+        let cleanup = owned
+            .cleanup(std::time::Duration::from_millis(50))
+            .await
+            .expect("cleanup observation available");
+        assert_eq!(cleanup.descendants_gone, None);
+        assert_eq!(cleanup.scope, "process_group");
+        assert!(!cleanup.confirmed);
+        assert!(cleanup.signals.is_empty());
     }
 }

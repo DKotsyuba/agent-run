@@ -112,6 +112,30 @@ fn main() {
         // descendant while this leader is still alive.
         std::thread::sleep(Duration::from_millis(500));
     }
+    if task == "fixture:escaped-descendant" {
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().expect("fixture exe path");
+        // The escaped child must not inherit this engine's stdout: holding that
+        // pipe open would delay the supervisor's EOF until the descendant itself
+        // exits, so cleanup would always observe an already-dead descendant and
+        // the escaped-descendant scenario would never be exercised at all.
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(exe)
+            .arg("--child-sleep")
+            .arg("10")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("fixture escaped descendant spawn");
+        let marker = std::env::current_dir()
+            .expect("fixture workdir")
+            .join("escaped.pid");
+        std::fs::write(marker, child.id().to_string()).expect("fixture escaped pid");
+        std::thread::sleep(Duration::from_millis(500));
+    }
     if task == "fixture:missing-result" {
         return;
     }

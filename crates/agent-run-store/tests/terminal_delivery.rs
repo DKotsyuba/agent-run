@@ -95,6 +95,48 @@ fn python_test_state_store_terminal_success_loses_to_pending_cancel_atomically()
     assert_eq!(result, r#"{"accepted":true,"reason":"terminal_cancel"}"#);
 }
 
+/// Mirrors `tests/test_supervisor.py::SupervisorTests::test_final_drain_completes_late_cancel_steer_and_unknown`.
+///
+/// Two durable cancels are terminalized independently: the first wins the
+/// terminal transition and the duplicate receives the stable stopping result.
+#[test]
+fn duplicate_cancel_is_completed_without_breaking_the_terminal_fsm() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    store.running(&id, 42).unwrap();
+    let root = home.path.join("agents").join(id.as_str());
+    fs::private_dir(&root).unwrap();
+    let proof = verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
+    store.enqueue(&id, "cancel", &json!({})).unwrap();
+    store.enqueue(&id, "cancel", &json!({})).unwrap();
+    store
+        .finish(&id, &Outcome::success(None), Some(&proof), None)
+        .unwrap();
+    agent_run_core::commands::complete_terminal(&mut store, &id).unwrap();
+
+    assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
+    let results: Vec<(String, String)> = store
+        .conn
+        .prepare("SELECT state,result_json FROM commands WHERE agent_id=? ORDER BY id")
+        .unwrap()
+        .query_map([id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|(state, _)| state == "completed"));
+    assert!(results
+        .iter()
+        .any(|(_, result)| result == r#"{"accepted":true,"reason":"terminal_cancel"}"#));
+    assert!(results
+        .iter()
+        .any(|(_, result)| result == r#"{"accepted":true,"reason":"already_stopping"}"#));
+}
+
 /// Mirrors `tests/test_state_outbox.py::test_terminal_before_binding_activates_once_and_expired_lease_reclaims_once`.
 #[test]
 fn python_test_state_outbox_waiting_binding_activates_and_expires() {

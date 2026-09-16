@@ -16,6 +16,7 @@ dependencies = [
  "fs2",
  "libc",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

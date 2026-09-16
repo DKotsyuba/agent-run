@@ -337,14 +337,52 @@ fn resume_lineage_has_one_child_and_a_stable_root() {
 fn backup_is_openable_and_never_overwrites_an_existing_file() {
     let h = common::Home::new();
     let dst = h.path.join("backup.db");
-    h.store().backup(&dst).unwrap();
-    assert!(h.store().backup(&dst).is_err());
+    let mut store = h.store();
+    store
+        .conn
+        .pragma_update(None, "wal_autocheckpoint", 1_000_000_i64)
+        .unwrap();
+    let (id, _) = store
+        .admit(&h.request(), &h.config, &json!({}), None)
+        .unwrap();
+    store
+        .message(&id, "assistant", "committed WAL page", None, None)
+        .unwrap();
+    let wal = h.path.join("state.db-wal");
+    assert!(
+        wal.is_file() && std::fs::metadata(&wal).unwrap().len() > 0,
+        "the committed fixture row must still have a WAL page"
+    );
+    store.backup(&dst).unwrap();
+    assert!(store.backup(&dst).is_err());
     let db = rusqlite::Connection::open(dst).unwrap();
+    db.pragma_update(None, "foreign_keys", true).unwrap();
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
         16
     );
+    assert_eq!(
+        db.query_row(
+            "SELECT content FROM messages WHERE agent_id=?",
+            [id.as_str()],
+            |r| { r.get::<_, String>(0) }
+        )
+        .unwrap(),
+        "committed WAL page"
+    );
+    assert_eq!(
+        db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    let foreign_key_rows = db
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .count();
+    assert_eq!(foreign_key_rows, 0);
 }
 /// Mirrors `test_state_db.py::test_invalid_and_newer_versions_refuse_without_schema_mutation`.
 ///
@@ -458,6 +496,51 @@ fn open_refuses_missing_or_incomplete_v1_database() {
     assert!(
         Store::open(&home).is_err(),
         "a versioned but tableless database must be refused"
+    );
+}
+
+// Protects the Rust store boundary against a foreign SQLite file: Python has
+// no separate database-identity marker, so structural refusal is the identity
+// proof and the unrelated table must survive untouched.
+#[test]
+fn open_refuses_a_foreign_database_without_reinitializing_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().to_path_buf();
+    let database = home.join("state.db");
+    let foreign = rusqlite::Connection::open(&database).unwrap();
+    foreign
+        .execute_batch(
+            "CREATE TABLE foreign_records(value TEXT); \
+             INSERT INTO foreign_records VALUES('keep-me'); \
+             PRAGMA user_version=1",
+        )
+        .unwrap();
+    drop(foreign);
+
+    assert!(Store::open(&home).is_err());
+    let untouched = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        untouched
+            .query_row("SELECT value FROM foreign_records", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "keep-me"
+    );
+    assert_eq!(
+        untouched
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        untouched
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
     );
 }
 
