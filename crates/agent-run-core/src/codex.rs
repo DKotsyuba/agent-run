@@ -438,6 +438,11 @@ pub async fn run(
     initialize(process).await?;
     let mut session = Session::new(record.resume_of_runtime_session_id.is_some());
     session.initialized()?;
+    agent_run_adapters::codex::models::validate_cached_selection(
+        home,
+        &record.request.model,
+        record.request.effort.as_deref(),
+    )?;
     let roster = models(process).await?;
     // Cache publication is advisory exactly as in Python: a successful live
     // roster remains sufficient when a later local cache write is unavailable.

@@ -1,7 +1,9 @@
 //! Python-parity tests for Codex account selection and roster cache behavior.
 
 use agent_run_adapters::{
-    codex::models::{cache_is_fresh, parse_roster, read_cache, write_cache},
+    codex::models::{
+        cache_is_fresh, parse_roster, read_cache, validate_cached_selection, write_cache,
+    },
     materialize::account_home,
 };
 use agent_run_config::config::{Adapter, Runtime};
@@ -79,4 +81,6 @@ fn python_test_codex_roster_cache_preserves_supported_efforts_and_fails_closed()
             .unwrap()
             .is_empty()
     );
+    assert!(validate_cached_selection(temporary.path(), "gpt-fixture", Some("medium")).is_err());
+    assert!(validate_cached_selection(temporary.path(), "not-configured", None).is_err());
 }

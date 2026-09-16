@@ -51,6 +51,37 @@ pub fn read_cache(home: &Path) -> Option<Vec<Model>> {
     parse_roster(&payload).ok()
 }
 
+/// Rejects a model or reasoning effort disproved by fresh roster evidence.
+///
+/// Missing, stale, and unreadable caches deliberately return success so the
+/// caller can perform Python's bounded live refresh. Only a fresh cache may
+/// reject before spawn, and it uses Python's model/effort error wording rather
+/// than choosing a configured fallback model.
+pub fn validate_cached_selection(home: &Path, model_id: &str, effort: Option<&str>) -> Result<()> {
+    if !cache_is_fresh(home, SystemTime::now()) {
+        return Ok(());
+    }
+    let Some(models) = read_cache(home) else {
+        return Ok(());
+    };
+    let model = models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            invalid(format!(
+                "model is not discovered in the codex roster cache: {model_id}"
+            ))
+        })?;
+    if let Some(effort) = effort {
+        if !model.efforts.iter().any(|choice| choice == effort) {
+            return Err(invalid(format!(
+                "effort {effort:?} is not offered for model {model_id:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Publishes a validated roster atomically beneath the owned runtime home.
 ///
 /// `roster` is the exact `model/list` result received by the caller. Callers
