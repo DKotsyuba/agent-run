@@ -24,7 +24,7 @@ fn python_test_codex_account_runtime_home_is_scoped_only_for_labels() {
     );
 }
 
-/// Mirrors `test_resume.py::test_legacy_row_without_an_identity_snapshot_is_refused`.
+/// Mirrors Python `tests/test_resume.py::ResumeTests::test_legacy_row_without_an_identity_snapshot_is_refused`.
 ///
 /// Python's identity object cannot prove Rust's frozen config, role grant, or
 /// sealed runtime-home snapshot, so native continuation reports `Unsupported`
@@ -67,4 +67,26 @@ async fn python_test_python_created_codex_run_is_explicitly_refused() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(message) if message.contains("Python-created")));
+}
+
+/// Mirrors Python `tests/test_resume.py::ResumeTests::test_parent_without_a_native_session_is_refused`.
+///
+/// Refuse a terminal durable parent before interpreting its identity when it
+/// lacks the session selector required for a native continuation.
+#[tokio::test]
+async fn python_test_resume_without_native_session_is_refused() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    home.store()
+        .finish(&id, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+
+    let error = Service::new(home.path.clone())
+        .resume(&id, "continue".into(), None, None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Validation(message) if message.contains("native session ID")));
 }
