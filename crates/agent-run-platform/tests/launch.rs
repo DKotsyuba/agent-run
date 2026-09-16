@@ -151,6 +151,7 @@ fn ready_child_is_a_session_leader_and_reaped_with_its_exact_status() {
 
 /// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_readiness_timeout_kills_verified_wrapper_and_grandchild_group`.
 /// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_unread_payload_obeys_ready_deadline_and_reaps`.
+/// Mirrors Python `tests/test_lifecycle.py::ReadyChannelTests::test_a_silent_supervisor_times_out`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_term_removes_wrapper_and_grandchild_together`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_a_grandchild_that_ignores_term_is_killed`.
 #[test]

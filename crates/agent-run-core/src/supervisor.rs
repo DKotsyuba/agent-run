@@ -94,11 +94,7 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
         Err(error) => {
             let row = store.get(id)?;
             if !row.status.terminal() {
-                let mut outcome = Outcome::failure(match &error {
-                    Error::Integrity(_) => "snapshot_integrity_failed",
-                    Error::Validation(_) => "preparation_rejected",
-                    _ => "supervisor_failed",
-                });
+                let mut outcome = Outcome::failure(preparation_failure_kind(&error));
                 outcome.failure_text = Some(error.public().message);
                 if store.cancel_pending(id)? {
                     outcome.status = Status::Cancelled;
@@ -108,6 +104,23 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             }
             Err(error)
         }
+    }
+}
+
+/// Classifies a supervisor-side preparation error for the durable terminal row.
+///
+/// A frozen launch identity whose runtime was removed or disabled is a runtime
+/// preparation failure, rather than a caller-input rejection: ownership has
+/// already been committed and the supervisor must leave a diagnosable terminal
+/// row. Other validation failures remain preparation rejections.
+fn preparation_failure_kind(error: &Error) -> &'static str {
+    match error {
+        Error::Integrity(_) => "snapshot_integrity_failed",
+        Error::Validation(message) if message == "runtime is not enabled" => {
+            "prepare_runtime_failed"
+        }
+        Error::Validation(_) => "preparation_rejected",
+        _ => "supervisor_failed",
     }
 }
 
