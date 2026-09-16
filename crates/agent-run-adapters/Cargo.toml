@@ -9,6 +9,7 @@ rust-version.workspace = true
 agent-run-config = { path = "../agent-run-config" }
 agent-run-domain = { path = "../agent-run-domain" }
 agent-run-platform = { path = "../agent-run-platform" }
+chrono.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

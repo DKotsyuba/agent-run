@@ -126,6 +126,13 @@ impl Publisher {
         if !real.is_file() {
             return Err(invalid("credential source must be a regular file"));
         }
+        if let Ok(metadata) = std::fs::symlink_metadata(self.root.join(path)) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                self.dir.remove(Path::new(path))?;
+            } else {
+                return Err(invalid("credential bridge target must not be a directory"));
+            }
+        }
         self.dir.symlink(&real, Path::new(path))?;
         self.links
             .insert(path.into(), real.to_string_lossy().into_owned());
@@ -301,11 +308,6 @@ pub fn environment(
         .as_ref()
         .and_then(|n| config.environments.get(n))
     {
-        for command in &e.required_commands {
-            if resolve_executable(command, &env["PATH"]).is_none() {
-                return Err(invalid("required developer command is unavailable"));
-            }
-        }
         if !e.denied_commands.is_empty() {
             let directory = if kind == Adapter::Qwen {
                 ".qwen/denied-commands"
@@ -409,6 +411,12 @@ pub fn materialize(
 ) -> Result<(Snapshot, String)> {
     let kind = runtime.kind()?;
     super::claude::validate_runtime(runtime, kind)?;
+    if std::fs::symlink_metadata(home.join("skills"))
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(invalid("skills root must not be a symlink"));
+    }
     let mut p = Publisher::new(home)?;
     let plugins = super::plugins::install(&mut p, runtime, kind)?;
     p.snapshot.plugin_paths = plugins.paths.clone();
