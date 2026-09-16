@@ -7,7 +7,11 @@ use agent_run_domain::{
 use agent_run_platform::{fs, verify};
 use agent_run_store::Store;
 use serde_json::json;
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Barrier, Mutex},
+    thread,
+};
 
 /// Mirrors `test_state_db.py::test_fresh_init_and_reopen_apply_schema_pragmas_and_private_modes`.
 ///
@@ -147,6 +151,114 @@ fn commands_are_claimed_once_and_completed() {
         .complete_command(&id, command_id, &json!({"accepted":true}))
         .unwrap();
     assert!(!h.store().cancel_pending(&id).unwrap());
+}
+
+/// Mirrors `tests/test_supervisor.py::StoreEventSinkThreadingTests::test_sink_write_from_a_non_owner_thread_lands_durably`
+#[test]
+fn event_write_from_a_non_owner_thread_lands_durably() {
+    let h = common::Home::new();
+    let (id, _) = h
+        .store()
+        .admit(&h.request(), &h.config, &json!({}), None)
+        .unwrap();
+    let path = h.path.clone();
+    let worker_id = id.clone();
+    thread::spawn(move || {
+        Store::open(&path)
+            .unwrap()
+            .event(&worker_id, "worker_event", &json!({"from":"worker"}))
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        h.store().last_event(&id, "worker_event").unwrap().unwrap()["from"],
+        "worker"
+    );
+}
+
+/// Mirrors `tests/test_supervisor.py::StoreEventSinkThreadingTests::test_sink_message_and_session_from_a_non_owner_thread_land_durably`
+#[test]
+fn message_and_session_from_a_non_owner_thread_land_durably() {
+    let h = common::Home::new();
+    let (id, _) = h
+        .store()
+        .admit(&h.request(), &h.config, &json!({}), None)
+        .unwrap();
+    let path = h.path.clone();
+    let worker_id = id.clone();
+    thread::spawn(move || {
+        let mut store = Store::open(&path).unwrap();
+        store
+            .runtime_session(&worker_id, "runtime-session-1")
+            .unwrap();
+        store
+            .message(&worker_id, "assistant", "hello", None, None)
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    let store = h.store();
+    assert_eq!(
+        store.get(&id).unwrap().runtime_session_id.as_deref(),
+        Some("runtime-session-1")
+    );
+    assert_eq!(
+        store.last_event(&id, "runtime_session").unwrap().unwrap()["id"],
+        "runtime-session-1"
+    );
+    assert_eq!(
+        store.transcript(&id, 0, 10).unwrap()["messages"][0]["content"],
+        "hello"
+    );
+}
+
+/// Mirrors `tests/test_supervisor.py::StoreEventSinkThreadingTests::test_concurrent_sink_writes_from_two_threads_all_land_without_error`
+#[test]
+fn concurrent_event_writes_from_two_threads_all_land_without_error() {
+    let h = common::Home::new();
+    let (id, _) = h
+        .store()
+        .admit(&h.request(), &h.config, &json!({}), None)
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let workers = (0..2)
+        .map(|index| {
+            let path = h.path.clone();
+            let worker_id = id.clone();
+            let barrier = Arc::clone(&barrier);
+            let errors = Arc::clone(&errors);
+            thread::spawn(move || {
+                barrier.wait();
+                if let Err(error) = Store::open(&path).and_then(|store| {
+                    store.event(
+                        &worker_id,
+                        &format!("concurrent_event_{index}"),
+                        &json!({"index":index}),
+                    )
+                }) {
+                    errors.lock().unwrap().push(error.to_string());
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(errors.lock().unwrap().is_empty());
+    let store = h.store();
+    for index in 0..2 {
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind=?",
+                rusqlite::params![id.as_str(), format!("concurrent_event_{index}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }
 #[test]
 fn message_cursors_preserve_order_whitespace_and_repetitions() {

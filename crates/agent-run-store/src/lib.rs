@@ -72,6 +72,16 @@ type SupervisorOwnership = (
     Option<f64>,
 );
 
+/// Persisted fields used to decide whether a startup handoff may be renewed.
+type StartupHandoff = (
+    String,
+    Option<String>,
+    Option<f64>,
+    Option<i32>,
+    Option<i32>,
+    Option<String>,
+);
+
 impl Record {
     /// Decodes one complete agents-table row without changing the database.
     pub(crate) fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -526,6 +536,114 @@ impl Store {
         self.event(id, "supervisor_ready", &json!({"pid":pid}))
     }
 
+    /// Claims one starting admission for a coordinator until its bounded handoff deadline.
+    ///
+    /// The diagnostic owner string and optional process birth proof are immutable while the
+    /// row remains starting. Repeating the exact claim is idempotent; a terminal, non-starting,
+    /// or differently owned row is rejected without a partial update.
+    pub fn claim_startup(
+        &mut self,
+        id: &AgentId,
+        owner_identity: &str,
+        owner_birth_time: Option<f64>,
+        at: f64,
+        deadline_seconds: f64,
+    ) -> Result<()> {
+        domain::nonblank("startup owner identity", owner_identity)?;
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("startup claim time must be finite and nonnegative"));
+        }
+        if owner_birth_time.is_some_and(|birth| !birth.is_finite() || birth < 0.0) {
+            return Err(invalid(
+                "startup owner birth time must be finite and nonnegative",
+            ));
+        }
+        if !deadline_seconds.is_finite() || deadline_seconds <= 0.0 {
+            return Err(invalid("startup deadline must be positive and finite"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, Option<String>, Option<f64>)> = tx
+            .query_row(
+                "SELECT status,startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((status, current_owner, current_birth)) = current else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        if status != Status::Starting.as_str() {
+            return Err(Error::Transition(
+                "startup owner requires starting agent".into(),
+            ));
+        }
+        if current_owner.is_some() {
+            if current_owner.as_deref() != Some(owner_identity) || current_birth != owner_birth_time
+            {
+                return Err(Error::Transition("startup is already owned".into()));
+            }
+        } else {
+            tx.execute(
+                "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,startup_deadline_at=? WHERE id=?",
+                params![owner_identity, owner_birth_time, at + deadline_seconds, id.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Extends a still-live coordinator claim for the supervisor READY handoff.
+    ///
+    /// The matching owner must still be starting, unbound, and before its existing deadline.
+    /// A successful call replaces that deadline with `at + deadline_seconds`; elapsed time
+    /// alone is never reconciliation proof.
+    pub fn begin_supervisor_handoff(
+        &mut self,
+        id: &AgentId,
+        owner_identity: &str,
+        at: f64,
+        deadline_seconds: f64,
+    ) -> Result<bool> {
+        domain::nonblank("startup owner identity", owner_identity)?;
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("handoff time must be finite and nonnegative"));
+        }
+        if !deadline_seconds.is_finite() || deadline_seconds <= 0.0 {
+            return Err(invalid("startup deadline must be positive and finite"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<StartupHandoff> = tx
+            .query_row(
+                "SELECT status,startup_owner_pid_identity,startup_deadline_at,supervisor_pid,process_group_id,supervisor_identity FROM agents WHERE id=?",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?;
+        let Some((status, owner, deadline, pid, group, identity)) = row else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        let eligible = status == Status::Starting.as_str()
+            && owner.as_deref() == Some(owner_identity)
+            && deadline.is_some_and(|value| value > at)
+            && pid.is_none()
+            && group.is_none()
+            && identity.is_none();
+        if !eligible {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE agents SET startup_deadline_at=? WHERE id=?",
+            params![at + deadline_seconds, id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Records immutable supervisor identity and permits one process-group refinement.
     pub fn record_supervisor(
         &mut self,
@@ -626,12 +744,30 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    pub fn runtime_session(&self, id: &AgentId, session: &str) -> Result<()> {
+    /// Records a native runtime session and its durable session event atomically.
+    ///
+    /// The connection remains thread-affine; callers on another thread must open their own
+    /// [`Store`] from the same home. Repeated calls retain the latest session identity and
+    /// append the corresponding event for the lifecycle journal.
+    pub fn runtime_session(&mut self, id: &AgentId, session: &str) -> Result<()> {
         domain::external_id("runtime_session_id", session)?;
-        self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE agents SET runtime_session_id=? WHERE id=?",
             params![session, id.as_str()],
         )?;
+        tx.execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
+            params![
+                id.as_str(),
+                now(),
+                "runtime_session",
+                json!({"id":session}).to_string()
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn message(

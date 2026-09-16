@@ -13,6 +13,7 @@ use agent_run_core::{
     process::{self, ProcessState},
     service::Service,
 };
+use agent_run_domain::Error;
 use agent_run_store::Store;
 use serde_json::json;
 use std::{
@@ -33,6 +34,17 @@ fn admitted(
         .admit(&request, &home.config, &json!({}), None)
         .expect("admission succeeds")
         .0
+}
+
+/// Clears the automatic broker claim so a fixture models an identity-less start.
+fn clear_startup_claim(store: &Store, id: &agent_run_core::domain::AgentId) {
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET startup_owner_pid_identity=NULL,startup_owner_birth_time=NULL,startup_deadline_at=NULL WHERE id=?",
+            [id.as_str()],
+        )
+        .expect("clear startup claim");
 }
 
 /// Write a complete active supervisor ownership record for deterministic probes.
@@ -423,4 +435,225 @@ async fn wait_honors_its_own_bound_without_using_the_legacy_run_timeout() {
     assert!(started.elapsed() < Duration::from_millis(150));
     assert_eq!(value["terminal"], false);
     assert_eq!(value["status"], "running");
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_identity_less_starting_rows_are_never_lost_by_age`
+#[test]
+fn identity_less_starting_rows_are_never_lost_by_age() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let stale = admitted(&home, &mut store, None);
+    let recent = admitted(&home, &mut store, None);
+    let owned = admitted(&home, &mut store, None);
+    clear_startup_claim(&store, &stale);
+    clear_startup_claim(&store, &recent);
+    clear_startup_claim(&store, &owned);
+    store
+        .record_supervisor(&owned, 123, "identity", 123, None, 10.0)
+        .unwrap();
+
+    let changed = reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive).unwrap();
+
+    assert!(changed.is_empty());
+    assert_eq!(store.get(&stale).unwrap().status, Status::Starting);
+    assert_eq!(store.get(&recent).unwrap().status, Status::Starting);
+    assert_eq!(store.get(&owned).unwrap().status, Status::Starting);
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_lost_convergence_releases_active_capacity`
+#[test]
+fn lost_convergence_releases_active_capacity() {
+    let home = common::Home::new();
+    let mut config = home.config.clone();
+    config.core.max_active_agents = 1;
+    let mut store = home.store();
+    let id = store
+        .admit(&home.request(), &config, &json!({}), None)
+        .unwrap()
+        .0;
+    clear_startup_claim(&store, &id);
+    store
+        .claim_startup(&id, "123 dead-owner", Some(12.5), 10.0, 120.0)
+        .unwrap();
+    assert!(matches!(
+        store.admit(&home.request(), &config, &json!({}), None),
+        Err(Error::Capacity)
+    ));
+
+    assert_eq!(
+        reconcile_with(&mut store, 10, |pid, _, birth| {
+            assert_eq!(pid, Some(123));
+            assert_eq!(birth, Some(12.5));
+            ProcessState::Dead
+        })
+        .unwrap(),
+        vec![id]
+    );
+    assert!(store
+        .admit(&home.request(), &config, &json!({}), None)
+        .is_ok());
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_live_owner_survives_elapsed_startup_deadline`
+#[test]
+fn live_owner_survives_elapsed_startup_deadline() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    clear_startup_claim(&store, &id);
+    store
+        .claim_startup(
+            &id,
+            "123 deliberately-wrong-command",
+            Some(12.5),
+            10.0,
+            120.0,
+        )
+        .unwrap();
+
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Starting);
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_handoff_renews_deadline_until_late_supervisor_proof`
+#[test]
+fn handoff_renews_deadline_until_late_supervisor_proof() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    clear_startup_claim(&store, &id);
+    let owner = "123 detached-supervisor";
+    store
+        .claim_startup(&id, owner, Some(12.5), 10.0, 120.0)
+        .unwrap();
+    assert!(store
+        .begin_supervisor_handoff(&id, owner, 129.0, 40.0)
+        .unwrap());
+    let deadline: f64 = store
+        .conn
+        .query_row(
+            "SELECT startup_deadline_at FROM agents WHERE id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deadline, 169.0);
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .record_supervisor(&id, 123, "identity", 123, Some(12.5), 132.0)
+        .unwrap();
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Starting);
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_elapsed_handoff_with_live_owner_remains_starting`
+#[test]
+fn elapsed_handoff_with_live_owner_remains_starting() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    clear_startup_claim(&store, &id);
+    let owner = "123 detached-supervisor";
+    store
+        .claim_startup(&id, owner, Some(12.5), 10.0, 120.0)
+        .unwrap();
+    assert!(store
+        .begin_supervisor_handoff(&id, owner, 129.0, 10.0)
+        .unwrap());
+
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Starting);
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_generated_handoff_never_uses_elapsed_time_as_loss_proof`
+#[test]
+fn generated_handoff_never_uses_elapsed_time_as_loss_proof() {
+    for preparation_delay in 1..=9 {
+        for handoff_extension in 0..=10 {
+            for ready_before_expiry in [false, true] {
+                let home = common::Home::new();
+                let mut store = home.store();
+                let id = admitted(&home, &mut store, None);
+                clear_startup_claim(&store, &id);
+                let owner = "123 generated-owner";
+                store
+                    .claim_startup(&id, owner, Some(12.5), 0.0, 10.0)
+                    .unwrap();
+                let handoff_seconds = 11 - preparation_delay + handoff_extension;
+                let handoff_at = preparation_delay as f64;
+                let deadline = handoff_at + handoff_seconds as f64;
+                assert!(store
+                    .begin_supervisor_handoff(&id, owner, handoff_at, handoff_seconds as f64)
+                    .unwrap());
+                assert!(
+                    reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
+                        .unwrap()
+                        .is_empty()
+                );
+                if ready_before_expiry {
+                    store
+                        .record_supervisor(&id, 123, "identity", 123, Some(12.5), deadline - 0.5)
+                        .unwrap();
+                }
+                assert!(
+                    reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(store.get(&id).unwrap().status, Status::Starting);
+            }
+        }
+    }
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_delayed_startup_can_bind_a_supervisor`
+#[test]
+fn delayed_startup_can_bind_a_supervisor() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    clear_startup_claim(&store, &id);
+    store
+        .claim_startup(&id, "1 stale", None, 10.0, 1.0)
+        .unwrap();
+
+    store
+        .record_supervisor(&id, 123, "identity", 123, None, 11.0)
+        .unwrap();
+    assert_eq!(store.get(&id).unwrap().supervisor_pid, Some(123));
+}
+
+/// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_owned_supervisor_can_refine_its_group_after_startup_expiry`
+#[test]
+fn owned_supervisor_can_refine_its_group_after_startup_expiry() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    clear_startup_claim(&store, &id);
+    store
+        .claim_startup(&id, "1 owner", None, 10.0, 1.0)
+        .unwrap();
+    store
+        .record_supervisor(&id, 123, "identity", 123, None, 10.5)
+        .unwrap();
+    store
+        .record_supervisor(&id, 123, "identity", 456, None, 12.0)
+        .unwrap();
+    assert_eq!(store.get(&id).unwrap().process_group_id, Some(456));
 }

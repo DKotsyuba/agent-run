@@ -358,6 +358,89 @@ async fn truncated_frame_fails_the_run() {
         row.failure_kind.as_deref(),
         Some("engine_transport_failure")
     );
+    assert!(Store::open(&home)
+        .unwrap()
+        .last_event(&row.id, "process_cleanup")
+        .unwrap()
+        .is_some());
+}
+
+/// Mirrors `tests/test_supervisor.py::SupervisorTests::test_session_wait_exception_reaches_cleanup_and_durable_failure`
+/// Rust's bounded process reader reports the wait/transport fault as an engine
+/// result, then the supervisor performs the same cleanup and terminal commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_wait_failure_reaches_cleanup_and_durable_failure() {
+    let (_tmp, home) = home();
+    let row = run_task(&home, "fixture:truncated").await;
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("engine_transport_failure")
+    );
+    let cleanup = Store::open(&home)
+        .unwrap()
+        .last_event(&row.id, "process_cleanup")
+        .unwrap()
+        .expect("cleanup event");
+    assert_eq!(cleanup["confirmed"], json!(true));
+}
+
+/// Mirrors `tests/test_supervisor.py::SupervisorTests::test_running_transition_exception_reaches_cleanup_and_failure`
+/// The SQLite trigger is a test-only durable commit seam: production still uses
+/// the concrete Store, while the real supervisor must clean up after `running`
+/// is rejected and persist the resulting failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_transition_failure_reaches_cleanup_and_durable_failure() {
+    let (_tmp, home) = home();
+    let id = admit(&home, "fixture:hang");
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "CREATE TRIGGER reject_running BEFORE UPDATE OF status ON agents WHEN NEW.status='running' BEGIN SELECT RAISE(ABORT,'running rejected'); END",
+            [],
+        )
+        .unwrap();
+    let mut child = spawn_supervisor(&home, &id);
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor timed out")
+        .expect("wait on supervisor");
+    assert!(status.success());
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("runtime_transport_failed")
+    );
+    assert!(store.last_event(&id, "process_cleanup").unwrap().is_some());
+}
+
+/// Mirrors `tests/test_supervisor.py::SupervisorTests::test_commit_rejection_is_not_swallowed_while_agent_is_active`
+/// A rejected terminal update must reach the supervisor entrypoint rather than
+/// being converted into a successful child exit or an inactive row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_commit_rejection_is_not_swallowed_while_active() {
+    let (_tmp, home) = home();
+    let id = admit(&home, "hello");
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "CREATE TRIGGER reject_terminal BEFORE UPDATE OF status ON agents WHEN NEW.status IN ('succeeded','failed','timed_out','cancelled','lost') BEGIN SELECT RAISE(ABORT,'terminal rejected'); END",
+            [],
+        )
+        .unwrap();
+    let mut child = spawn_supervisor(&home, &id);
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor timed out")
+        .expect("wait on supervisor");
+    assert!(!status.success());
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Running);
+    assert!(store.last_event(&id, "process_cleanup").unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
