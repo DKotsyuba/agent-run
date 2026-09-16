@@ -23,8 +23,13 @@ fn timestamp(value: Option<&Value>) -> Option<f64> {
         return None;
     }
     chrono::DateTime::parse_from_rfc3339(text)
-        .ok()
         .map(|value| value.timestamp_millis() as f64 / 1000.0)
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f"))
+                .map(|value| value.and_utc().timestamp_millis() as f64 / 1000.0)
+        })
+        .ok()
         .filter(|value| *value >= 0.0)
 }
 
