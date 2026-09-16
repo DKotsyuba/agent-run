@@ -113,6 +113,15 @@ pub enum Command {
     DenyCommand {
         name: String,
     },
+    #[command(name = "_doctor_canary", hide = true)]
+    DoctorCanary {
+        #[arg(long)]
+        ready_fd: i32,
+        #[arg(long)]
+        identity_fd: i32,
+        #[arg(long)]
+        error_fd: i32,
+    },
 }
 /// Optional orchestrator identity shared by public tool commands.
 #[derive(Args, Debug, Default)]
@@ -805,6 +814,11 @@ pub async fn run(cli: Cli) -> Result<i32> {
             eprintln!("agent-run: command denied by the configured developer environment");
             return Ok(126);
         }
+        Command::DoctorCanary {
+            ready_fd,
+            identity_fd,
+            error_fd,
+        } => crate::doctor::run_canary([ready_fd, identity_fd, error_fd])?,
     }
     Ok(0)
 }
