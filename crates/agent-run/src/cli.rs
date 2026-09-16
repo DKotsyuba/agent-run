@@ -113,6 +113,13 @@ pub enum Command {
     DenyCommand {
         name: String,
     },
+    /// Privately evaluates one generated Codex trusted-MCP permission request.
+    #[command(name = "_permission-request", hide = true)]
+    PermissionRequest {
+        /// Repeated configured MCP namespaces eligible for the narrow allow decision.
+        #[arg(long = "allow-mcp", required = true)]
+        allow_mcp: Vec<String>,
+    },
 }
 /// Optional orchestrator identity shared by public tool commands.
 #[derive(Args, Debug, Default)]
@@ -807,11 +814,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         },
         Command::Delivery { command } => match command {
             Delivery::Status { agent_id } => emit(&service.delivery_status(&agent_id)?)?,
-            Delivery::Cancel { delivery_id: _ } => {
-                return Err(Error::Unsupported(
-                    "delivery cancel is awaiting the shared delivery service".into(),
-                ))
-            }
+            Delivery::Cancel { delivery_id } => emit(&service.delivery_cancel(&delivery_id)?)?,
             Delivery::Launchd {
                 binary,
                 label,
@@ -855,6 +858,28 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::DenyCommand { name: _ } => {
             eprintln!("agent-run: command denied by the configured developer environment");
             return Ok(126);
+        }
+        Command::PermissionRequest { allow_mcp } => {
+            if allow_mcp.iter().any(|server| {
+                server.is_empty()
+                    || !server.bytes().enumerate().all(|(index, byte)| {
+                        (index == 0 && (byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+                            || byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'_')
+                    })
+            }) {
+                return Err(invalid(
+                    "--allow-mcp values must be lowercase MCP server identifiers",
+                ));
+            }
+            let payload: Value = serde_json::from_str(&read_stdin(1024 * 1024)?)?;
+            if let Some(decision) = crate::adapters::codex::permission_request_decision(
+                &payload,
+                &allow_mcp.into_iter().collect(),
+            ) {
+                emit(&decision)?;
+            }
         }
     }
     Ok(0)
