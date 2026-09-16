@@ -259,25 +259,25 @@ async fn wait_engine_ready(home: &Path, id: &AgentId, timeout: Duration) {
     }
 }
 
-/// Wait until one durable command result reaches the requested accepted count.
-async fn wait_accepted_commands(home: &Path, id: &AgentId, count: i64) {
+/// Wait until the fixture records that the supervisor returned to engine polling.
+async fn wait_engine_poll_marker(home: &Path, id: &AgentId) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let accepted: i64 = Store::open(home)
+        let markers: i64 = Store::open(home)
             .unwrap()
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM commands WHERE agent_id=? AND state='completed' AND json_extract(result_json,'$.accepted')=1",
+                "SELECT COUNT(*) FROM messages WHERE agent_id=? AND content LIKE '%fixture poll marker%'",
                 [id.as_str()],
                 |row| row.get(0),
             )
             .unwrap();
-        if accepted >= count {
+        if markers > 0 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "only {accepted} commands accepted"
+            "fixture never observed an engine poll"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -573,7 +573,17 @@ async fn command_flood_yields_after_one_bounded_page() {
     drop(store);
     let mut child = spawn_supervisor(&home, &id);
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
-    wait_accepted_commands(&home, &id, 16).await;
+    wait_engine_poll_marker(&home, &id).await;
+    let accepted: i64 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND state='completed' AND json_extract(result_json,'$.accepted')=1",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 16);
     Service::new(home.clone()).cancel(&id).unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await

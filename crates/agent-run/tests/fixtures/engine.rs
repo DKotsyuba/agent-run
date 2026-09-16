@@ -78,6 +78,19 @@ fn main() {
             .expect("fixture stdout");
         return;
     }
+    if task == "fixture:command-flood" {
+        // Reading one control frame lets the test observe the page boundary
+        // without synchronizing on a wall-clock sleep.
+        let marker_session = session.clone();
+        std::thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut line = String::new();
+            let _ = stdin.lock().read_line(&mut line);
+            emit(
+                json!({"type":"assistant","session_id":marker_session,"message":{"content":[{"type":"text","text":"fixture poll marker\n"}]}}),
+            );
+        });
+    }
     if task == "fixture:hang" || task == "fixture:command-flood" || task == "fixture:ignore-sigterm"
     {
         loop {

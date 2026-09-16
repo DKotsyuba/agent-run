@@ -88,6 +88,7 @@ impl Default for Core {
 pub struct Capacity {
     pub collect_interval_seconds: u64,
     pub sample_retention: usize,
+    /// Maximum host-injected context characters; zero disables context injection.
     pub context_max_chars: usize,
     pub codexbar_binary: PathBuf,
 }
@@ -360,7 +361,7 @@ impl Config {
         }
         if self.capacity.collect_interval_seconds == 0
             || self.capacity.sample_retention == 0
-            || !(1..=2500).contains(&self.capacity.context_max_chars)
+            || self.capacity.context_max_chars > 2500
         {
             return Err(invalid("invalid capacity bounds"));
         }
