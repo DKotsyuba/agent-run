@@ -8,7 +8,11 @@ use agent_run_core::{
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
+};
 
 mod common;
 
@@ -276,6 +280,145 @@ fn notice() -> Notice {
     }
 }
 
+/// Creates a notice carrying the rich v2 selectors and v3 failure category.
+fn rich_notice() -> Notice {
+    Notice {
+        notification_id: "ntf_rich".into(),
+        agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
+        status: Status::Succeeded,
+        runtime: Some("codex".into()),
+        model: Some("gpt-5.2-codex".into()),
+        effort: Some("high".into()),
+        failure_kind: None,
+    }
+}
+
+/// Serves one local relay frame and returns the decoded request.
+async fn fake_relay(path: &Path, outcome: &'static str) -> tokio::task::JoinHandle<Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = serde_json::to_vec(&json!({"outcome":outcome})).unwrap();
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(&reply).await.unwrap();
+        serde_json::from_slice(&data).unwrap()
+    })
+}
+
+/// Builds a little-endian framed JSON value without the relay's local request cap.
+fn frame(value: &Value) -> Vec<u8> {
+    let data = serde_json::to_vec(value).unwrap();
+    let mut frame = (data.len() as u32).to_le_bytes().to_vec();
+    frame.extend(data);
+    frame
+}
+
+/// Reads one little-endian framed JSON value from a private fake Desktop pipe.
+async fn read_frame(stream: &mut tokio::net::UnixStream) -> Value {
+    use tokio::io::AsyncReadExt;
+    let length = stream.read_u32_le().await.unwrap() as usize;
+    let mut data = vec![0; length];
+    stream.read_exact(&mut data).await.unwrap();
+    serde_json::from_slice(&data).unwrap()
+}
+
+/// Writes one host-sized framed JSON response to a private fake Desktop pipe.
+async fn write_frame(stream: &mut tokio::net::UnixStream, value: &Value) {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(&frame(value)).await.unwrap();
+}
+
+/// Serializes tests that temporarily configure the process-wide relay paths.
+fn relay_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Runs one Rust relay host exchange against a private fake Desktop MCP pipe.
+async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
+    use tokio::io::AsyncWriteExt;
+    let _guard = relay_env_lock().lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let pipe_path = root.path().join("desktop.sock");
+    let pipe_listener = tokio::net::UnixListener::bind(&pipe_path).unwrap();
+    let mode = mode.to_owned();
+    let host_peer = tokio::spawn(async move {
+        if mode == "malformed" {
+            let _ = tokio::time::timeout(Duration::from_millis(200), pipe_listener.accept()).await;
+            return None;
+        }
+        let (mut stream, _) = pipe_listener.accept().await.unwrap();
+        let listed = read_frame(&mut stream).await;
+        assert_eq!(listed["id"], 1);
+        if mode == "precall" {
+            write_frame(&mut stream, &json!({"jsonrpc":"2.0","id":999,"result":{}})).await;
+            return None;
+        }
+        if mode == "slow" {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let inventory = json!({"jsonrpc":"2.0","id":1,"result":{"tools":[
+            {"name":"send_message_to_thread","namespace":"codex_app","description":"x".repeat(42_000)}
+        ]}});
+        write_frame(&mut stream, &inventory).await;
+        let called = read_frame(&mut stream).await;
+        assert_eq!(called["id"], 2);
+        if mode == "drop" {
+            return Some(called);
+        }
+        let response = if mode == "badid" {
+            json!({"jsonrpc":"2.0","id":999,"result":{"success":true,"contentItems":[]}})
+        } else if mode == "error" {
+            json!({"jsonrpc":"2.0","id":2,"error":{"code":-1}})
+        } else {
+            json!({"jsonrpc":"2.0","id":2,"result":{"success":mode != "false","contentItems":[]}})
+        };
+        write_frame(&mut stream, &response).await;
+        Some(called)
+    });
+    let node = [
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/bin/node",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .expect("Node is required for relay host tests");
+    // SAFETY: host tests serialize process-environment mutation with relay_env_lock.
+    unsafe {
+        std::env::set_var("CODEX_APP_TOOLS_PIPE_PATH", &pipe_path);
+        std::env::set_var("CODEX_MCP_NODE_PATH", &node);
+    }
+    let host = relay::host(root.path()).unwrap().expect("relay host");
+    let endpoint = std::fs::read_dir(root.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ar-cdx-v3-")
+        })
+        .expect("relay endpoint");
+    let mut client = tokio::net::UnixStream::connect(endpoint).await.unwrap();
+    client.write_all(&frame(&request)).await.unwrap();
+    let response = read_frame(&mut client).await;
+    let called = host_peer.await.unwrap();
+    drop(host);
+    // SAFETY: host tests serialize process-environment mutation with relay_env_lock.
+    unsafe {
+        std::env::remove_var("CODEX_APP_TOOLS_PIPE_PATH");
+        std::env::remove_var("CODEX_MCP_NODE_PATH");
+    }
+    (response, called)
+}
+
 /// Writes a fake Claude descriptor and its paired inbox key under a temporary registry.
 fn claude_descriptor(registry: &Path, session: &str, socket: &Path) {
     std::fs::write(
@@ -418,6 +561,250 @@ async fn desktop_relay_prefers_v3_and_preserves_the_versioned_wire_contract() {
     assert_eq!(request["version"], 3);
     assert_eq!(request["failure_kind"], "prepare_failed");
     assert_eq!(request["runtime"], "codex");
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_missing_relay_is_retryable`.
+#[tokio::test]
+async fn desktop_relay_missing_endpoint_is_retryable() {
+    let root = tempfile::tempdir().unwrap();
+    let evidence = relay::send(root.path(), "thread-test", &notice()).await;
+    assert_eq!(evidence.classifier, "relay_unavailable");
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_partial_send_is_ambiguous_and_stops_discovery`.
+#[tokio::test]
+async fn desktop_relay_partial_send_is_ambiguous_without_fallback() {
+    use tokio::io::AsyncReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("ar-cdx-v3-first.sock");
+    let second = root.path().join("ar-cdx-v2-second.sock");
+    let first_listener = tokio::net::UnixListener::bind(&first).unwrap();
+    let second_listener = tokio::net::UnixListener::bind(&second).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = first_listener.accept().await.unwrap();
+        let _ = stream.read_u32_le().await;
+        drop(stream);
+    });
+    let evidence = relay::send(root.path(), "thread-test", &notice()).await;
+    peer.await.unwrap();
+    assert_eq!(evidence.classifier, "relay_ambiguous");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second_listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_old_style_endpoint_receives_the_exact_legacy_six_keys`.
+#[tokio::test]
+async fn desktop_relay_legacy_endpoint_receives_exact_six_key_wire() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("ar-cdx-7.sock");
+    let peer = fake_relay(&path, "accepted").await;
+    let evidence = relay::send(root.path(), "thread-test", &rich_notice()).await;
+    let request = peer.await.unwrap();
+    assert_eq!(evidence.classifier, "relay_accepted");
+    assert_eq!(
+        request,
+        json!({"version":1,"op":"completion","thread_id":"thread-test","notification_id":"ntf_rich","agent_id":"ag-20260825-120000-0123456789","status":"succeeded"})
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v2_advertised_endpoint_receives_the_exact_rich_payload`.
+#[tokio::test]
+async fn desktop_relay_v2_endpoint_receives_exact_rich_wire() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("ar-cdx-v2-421.sock");
+    let peer = fake_relay(&path, "accepted").await;
+    let evidence = relay::send(root.path(), "thread-test", &rich_notice()).await;
+    let request = peer.await.unwrap();
+    assert_eq!(evidence.classifier, "relay_accepted");
+    assert_eq!(request["version"], 2);
+    assert_eq!(request["runtime"], "codex");
+    assert_eq!(request["model"], "gpt-5.2-codex");
+    assert_eq!(request["effort"], "high");
+    assert_eq!(request.as_object().unwrap().len(), 9);
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v2_endpoints_are_preferred_during_discovery`.
+#[tokio::test]
+async fn desktop_relay_v2_endpoint_precedes_legacy_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let v2 = root.path().join("ar-cdx-v2-2.sock");
+    let legacy = root.path().join("ar-cdx-1.sock");
+    let peer = fake_relay(&v2, "accepted").await;
+    let legacy_listener = tokio::net::UnixListener::bind(&legacy).unwrap();
+    assert_eq!(
+        relay::send(root.path(), "thread-test", &rich_notice())
+            .await
+            .classifier,
+        "relay_accepted"
+    );
+    assert_eq!(peer.await.unwrap()["version"], 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), legacy_listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+/// Returns the exact v3 wire request used by the host behavior tests.
+fn v3_request(notice: &Notice) -> Value {
+    json!({"version":3,"op":"completion","thread_id":"thread-test","notification_id":notice.notification_id,"agent_id":notice.agent_id,"status":notice.status,"runtime":notice.runtime,"model":notice.model,"effort":notice.effort,"failure_kind":notice.failure_kind})
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_large_inventory_and_exact_notice_are_accepted`.
+#[tokio::test]
+async fn desktop_relay_host_accepts_large_inventory() {
+    let response = host_exchange(v3_request(&notice()), "true").await.0;
+    assert_eq!(response, json!({"outcome":"accepted"}));
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_rich_notice_is_rendered_by_real_node_byte_for_byte`.
+#[tokio::test]
+async fn desktop_relay_host_renders_rich_notice_exactly() {
+    let rich = rich_notice();
+    let (response, called) = host_exchange(v3_request(&rich), "true").await;
+    assert_eq!(response, json!({"outcome":"accepted"}));
+    assert_eq!(
+        called.unwrap()["params"]["arguments"]["prompt"],
+        rich.render().unwrap()
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_escaped_metadata_renders_identically_on_the_real_host`.
+#[tokio::test]
+async fn desktop_relay_host_escapes_metadata_without_changing_text() {
+    let mut tricky = rich_notice();
+    tricky.status = Status::Failed;
+    tricky.runtime = Some("co\ndex".into());
+    tricky.model = Some("claude-opus-5@anthropic/ss-1:1m".into());
+    tricky.effort = Some("hi\u{2028}low\u{2029}end".into());
+    tricky.failure_kind = Some("prepare_failed".into());
+    let (response, called) = host_exchange(v3_request(&tricky), "true").await;
+    assert_eq!(response, json!({"outcome":"accepted"}));
+    assert_eq!(
+        called.unwrap()["params"]["arguments"]["prompt"],
+        tricky.render().unwrap()
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_legacy_wire_from_an_old_client_is_accepted_by_the_new_host`.
+#[tokio::test]
+async fn desktop_relay_host_accepts_legacy_wire() {
+    let legacy = notice();
+    let (response, called) = host_exchange(json!({"version":1,"op":"completion","thread_id":"thread-test","notification_id":legacy.notification_id,"agent_id":legacy.agent_id,"status":legacy.status}), "true").await;
+    assert_eq!(response, json!({"outcome":"accepted"}));
+    assert_eq!(
+        called.unwrap()["params"]["arguments"]["prompt"],
+        legacy.render().unwrap()
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_placeholder_metadata_is_literal_on_the_real_host`.
+#[tokio::test]
+async fn desktop_relay_host_keeps_placeholder_metadata_literal() {
+    let mut literal = rich_notice();
+    literal.model = Some("{agent_id}-$&-$1".into());
+    literal.effort = Some("{version}".into());
+    let (response, called) = host_exchange(v3_request(&literal), "true").await;
+    assert_eq!(response, json!({"outcome":"accepted"}));
+    assert_eq!(
+        called.unwrap()["params"]["arguments"]["prompt"],
+        literal.render().unwrap()
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_arbitrary_extra_keys_are_rejected_before_any_host_contact`.
+#[tokio::test]
+async fn desktop_relay_host_rejects_arbitrary_extra_keys_before_pipe_contact() {
+    let exact = v3_request(&notice());
+    for malformed in [
+        json!({"version":3,"op":"completion","thread_id":"thread-test","notification_id":"ntf_test","agent_id":"ag-20260825-120000-0123456789","status":"succeeded","runtime":null,"model":null,"effort":null,"failure_kind":null,"prompt":"inject"}),
+        json!({"version":3,"op":"completion","thread_id":"thread-test","notification_id":"ntf_test","agent_id":"ag-20260825-120000-0123456789","status":"succeeded","runtime":null,"model":null,"effort":null}),
+        json!({"version":3,"op":"completion","thread_id":"thread-test","notification_id":"ntf_test","agent_id":"ag-20260825-120000-0123456789","status":"succeeded","runtime":null,"model":null,"effort":null,"failure_kind":null,"task":"inject"}),
+    ] {
+        let (response, called) = host_exchange(malformed, "malformed").await;
+        assert_eq!(response, json!({"outcome":"rejected"}));
+        assert!(called.is_none());
+    }
+    let (response, _) = host_exchange(exact, "malformed").await;
+    assert_eq!(response, json!({"outcome":"rejected"}));
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_slow_discovery_exceeds_the_former_deadline_and_succeeds`.
+#[tokio::test]
+async fn desktop_relay_host_allows_slow_discovery() {
+    assert_eq!(
+        host_exchange(v3_request(&notice()), "slow").await.0,
+        json!({"outcome":"accepted"})
+    );
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_explicit_rejection_and_precall_failure_are_retryable`.
+#[tokio::test]
+async fn desktop_relay_host_classifies_pre_dispatch_failures_as_rejected() {
+    for mode in ["false", "precall"] {
+        assert_eq!(
+            host_exchange(v3_request(&notice()), mode).await.0,
+            json!({"outcome":"rejected"})
+        );
+    }
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_postcall_uncertainty_never_allows_fallback`.
+#[tokio::test]
+async fn desktop_relay_host_classifies_post_dispatch_uncertainty_as_ambiguous() {
+    for mode in ["drop", "badid", "error"] {
+        assert_eq!(
+            host_exchange(v3_request(&notice()), mode).await.0,
+            json!({"outcome":"ambiguous"})
+        );
+    }
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::ExecWrapperTests::test_missing_capability_does_not_exec`.
+#[tokio::test]
+async fn desktop_relay_host_is_not_started_without_both_capabilities() {
+    let _guard = relay_env_lock().lock().await;
+    // SAFETY: this test owns and serializes the process-wide relay environment.
+    unsafe {
+        std::env::remove_var("CODEX_APP_TOOLS_PIPE_PATH");
+        std::env::remove_var("CODEX_MCP_NODE_PATH");
+    }
+    let root = tempfile::tempdir().unwrap();
+    assert!(relay::host(root.path()).unwrap().is_none());
+}
+
+/// Mirrors `tests/test_codex_desktop_relay.py::ExecWrapperTests::test_exec_uses_exact_node_and_python_child`.
+#[tokio::test]
+async fn desktop_relay_host_uses_the_absolute_configured_node_transport() {
+    let _guard = relay_env_lock().lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let pipe = root.path().join("host.sock");
+    let node = [
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/bin/node",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .expect("Node is required for relay host tests");
+    // SAFETY: this test owns and serializes the process-wide relay environment.
+    unsafe {
+        std::env::set_var("CODEX_APP_TOOLS_PIPE_PATH", &pipe);
+        std::env::set_var("CODEX_MCP_NODE_PATH", &node);
+    }
+    let host = relay::host(root.path())
+        .unwrap()
+        .expect("configured relay host");
+    drop(host);
+    // SAFETY: this test owns and serializes the process-wide relay environment.
+    unsafe {
+        std::env::remove_var("CODEX_APP_TOOLS_PIPE_PATH");
+        std::env::remove_var("CODEX_MCP_NODE_PATH");
+    }
 }
 
 /// Mirrors `tests/test_delivery_dispatch.py::test_attempt_evidence_follows_retry_and_success_transactions`.
