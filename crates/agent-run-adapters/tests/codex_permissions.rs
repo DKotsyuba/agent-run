@@ -76,6 +76,8 @@ fn fixture(root: &Path, write: bool) -> (Config, Runtime, StartRequest, Profile)
 }
 
 /// Mirrors `test_codex_permission_request.py::test_allows_hyphen_and_underscore_namespace_variants`.
+/// Mirrors `tests/test_codex_permission_request.py::PermissionRequestTests::test_declines_shell_unknown_and_malformed_requests`.
+/// Mirrors `tests/test_codex_permission_request.py::PermissionRequestTests::test_declines_shell_unknown_and_malformed_requests`.
 #[test]
 fn python_test_codex_permission_request_allows_only_trusted_mcp_namespaces() {
     let trusted = BTreeSet::from(["agent-run".into(), "agent-ide".into()]);

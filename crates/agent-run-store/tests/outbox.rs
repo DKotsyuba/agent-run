@@ -24,15 +24,22 @@ fn bound_delivery(home: &common::Home) -> (agent_run_domain::domain::AgentId, St
     fs::private_dir(&root).unwrap();
     let proof = verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
     store.running(&id, 42).unwrap();
-    store
-        .finish(&id, &Outcome::success(None), Some(&proof), None)
-        .unwrap();
     let session = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session".into(),
         external_turn_id: Some("turn".into()),
     };
     store.bind_orchestrator(&id, &session, 5.0).unwrap();
+    store
+        .finish(&id, &Outcome::success(None), Some(&proof), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE deliveries SET next_attempt_at=5 WHERE agent_id=?",
+            [id.as_str()],
+        )
+        .unwrap();
     let delivery: String = store
         .conn
         .query_row(
@@ -65,14 +72,26 @@ fn python_test_state_outbox_claim_reclaims_expired_lease_once() {
     let proof = verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
     store.running(&id, 42).unwrap();
     store
+        .bind_orchestrator(
+            &id,
+            &OrchestratorRef {
+                transport: "codex_queue".into(),
+                external_session_id: "session".into(),
+                external_turn_id: None,
+            },
+            5.0,
+        )
+        .unwrap();
+    store
         .finish(&id, &Outcome::success(None), Some(&proof), None)
         .unwrap();
-    let reference = OrchestratorRef {
-        transport: "codex_queue".into(),
-        external_session_id: "session".into(),
-        external_turn_id: None,
-    };
-    store.bind_orchestrator(&id, &reference, 5.0).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE deliveries SET next_attempt_at=5 WHERE agent_id=?",
+            [id.as_str()],
+        )
+        .unwrap();
     let delivery: String = store
         .conn
         .query_row(

@@ -60,7 +60,9 @@ pub fn diagnostic_snapshot(
     conn.pragma_update(None, "query_only", true)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != VERSION {
-        return Err(invalid("state database has no usable schema"));
+        return Err(invalid(format!(
+            "state migration required: found v{version}, expected v{VERSION}"
+        )));
     }
     let mut agents_stmt = conn.prepare(&format!("SELECT * FROM agents WHERE status IN {ACTIVE_SQL} ORDER BY created_at DESC,id DESC LIMIT ?"))?;
     let agents = agents_stmt

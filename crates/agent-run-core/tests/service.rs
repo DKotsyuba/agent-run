@@ -472,6 +472,8 @@ fn python_test_service_capacity_refusal_creates_no_second_row() {
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_prepare_failure_is_durable_after_private_agent_directory`.
+/// Mirrors `tests/test_preparation.py::test_durable_cancel_stops_between_preparation_stages`.
+/// Mirrors `tests/test_preparation.py::test_ready_ownership_precedes_blocked_preparation_and_broker_close`.
 #[test]
 fn python_test_service_prepare_failure_is_durable() {
     let home = common::Home::new();

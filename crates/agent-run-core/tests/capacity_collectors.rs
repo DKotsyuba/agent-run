@@ -320,6 +320,7 @@ async fn qwen_uses_the_shared_omniroute_pool_without_adapter_calls() {
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::test_stale_cache_is_unknown`.
+/// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_glm_maps_to_the_zai_provider`.
 #[test]
 fn omniroute_stale_cache_is_unknown_not_zero_capacity() {
     let samples = omniroute::samples(
@@ -492,6 +493,7 @@ fn omniroute_sanitizer_rejects_quota_arrays() {
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_a_reset_only_change_survives_the_real_node_sanitizer`.
+/// Mirrors `tests/test_omniroute_current_cache.py::SanitizedRowContractTests::test_a_reset_only_change_is_visible_from_the_current_cache_alone`.
 #[test]
 fn omniroute_sanitizer_preserves_reset_only_changes() {
     let cache = |reset: &str| {

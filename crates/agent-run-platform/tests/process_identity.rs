@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Mirrors `tests/test_process_identity.py::ProcessIdentityTests::test_observations_distinguish_proof_states`.
 #[test]
 fn current_process_birth_is_observed_and_reuse_is_distinct() {
     let identity = process::inspect(std::process::id() as i32).unwrap();
@@ -61,6 +62,7 @@ fn a_legacy_float_birth_is_compared_exactly_like_python() {
     );
 }
 
+/// Mirrors `tests/test_process_identity.py::ProcessIdentityTests::test_root_owned_real_child_has_stable_birth_identity`.
 #[test]
 fn an_exited_child_is_dead_before_and_after_reaping() {
     let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();

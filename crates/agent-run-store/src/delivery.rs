@@ -22,28 +22,27 @@ pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 /// Inserts the one durable completion notice associated with a terminal event.
 ///
 /// A terminal run with an already-known orchestrator session is immediately
-/// `pending`; an otherwise equivalent run is `waiting_binding` until a later
-/// [`Store::bind_orchestrator`] attaches that session. The caller owns the
-/// surrounding transaction, so the notice cannot become visible without the
-/// terminal event it references.
+/// `pending`. A run without a session has no delivery row because no bind hook
+/// can ever activate it; callers report that absence as `not_created`. The
+/// caller owns the surrounding transaction, so the notice cannot become
+/// visible without the terminal event it references.
+/// Returns the new notification id when a row is inserted, otherwise `None`.
 pub(crate) fn insert_terminal_notice(
     tx: &Transaction<'_>,
     id: &AgentId,
     session: Option<&str>,
     terminal_event_seq: i64,
     at: f64,
-) -> Result<String> {
-    let notification_id = format!("ntf_{}", uuid::Uuid::new_v4().simple());
-    let (state, next_attempt_at) = if session.is_some() {
-        ("pending", Some(at))
-    } else {
-        ("waiting_binding", None)
+) -> Result<Option<String>> {
+    let Some(session) = session else {
+        return Ok(None);
     };
+    let notification_id = format!("ntf_{}", uuid::Uuid::new_v4().simple());
     tx.execute(
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,?,?,?,?)",
-        params![notification_id, id.as_str(), session, terminal_event_seq, state, next_attempt_at],
+        params![notification_id, id.as_str(), session, terminal_event_seq, "pending", at],
     )?;
-    Ok(notification_id)
+    Ok(Some(notification_id))
 }
 
 /// Redacts one diagnostic suffix, retaining at most [`MAX_EVIDENCE_TAIL_BYTES`] UTF-8 bytes.

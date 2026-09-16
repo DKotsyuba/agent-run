@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::{io::BufReader, net::UnixStream};
 
 /// Mirrors Python `test_live_slow_socket_is_never_reclaimed_as_stale`.
+/// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_second_owner_boot_failure_closes_the_first_owner`.
 #[tokio::test]
 async fn python_second_owner_refuses_a_live_listener() {
     let temp = tempfile::tempdir().expect("temporary home");

@@ -573,12 +573,13 @@ fn migration_waits_past_the_ordinary_busy_timeout_for_a_locked_store() {
 }
 
 /// Mirrors `tests/test_state_migrations.py::MigrationDiagnosticsTests::test_read_only_snapshot_reports_the_pending_migration`.
+/// Mirrors `tests/test_state_migrations.py::MigrationDiagnosticsTests::test_doctor_surfaces_a_pending_migration`.
 #[test]
 fn read_only_snapshot_refuses_a_pending_migration_without_mutation() {
     let home = tempfile::tempdir().unwrap();
     let db_path = home.path().join("state.db");
     drop(build_fixture(&db_path, 1));
     let error = agent_run_store::diagnostics::diagnostic_snapshot(&db_path, 1.0, 256).unwrap_err();
-    assert!(error.to_string().contains("usable schema"));
+    assert!(error.to_string().contains("state migration required"));
     assert_eq!(user_version(&open_ro(&db_path)), 1);
 }

@@ -327,6 +327,7 @@ fn the_fork_fallback_also_creates_a_session_leader_with_the_same_descriptors() {
 }
 
 /// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_post_terminal_dispatch_is_bounded_and_never_reruns_the_child`.
+/// Mirrors `tests/test_launch_reaper.py::ChildReaperTests::test_reaps_registered_short_lived_child_without_stealing_other_waits`.
 #[test]
 fn the_reaper_takes_only_its_own_registered_child() {
     let (_ready_r, ready_w) = launch::cloexec_pipe().unwrap();
