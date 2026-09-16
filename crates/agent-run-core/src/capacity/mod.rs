@@ -169,7 +169,26 @@ pub fn account_token(account: Option<&str>) -> String {
         }
     }
 }
+/// Validates an entire collection slice and commits it atomically.
+///
+/// `home` is the agent-run home whose store receives the write; `retention` is
+/// the positive bound on retained sample rows. The whole slice is checked
+/// before anything is written -- non-empty runtime and scope identities, a
+/// structurally valid topology owned by that runtime, finite epoch bounds with
+/// `valid_until >= observed_at`, per-sample validity, no duplicate or
+/// cross-runtime sample identity, and a measurement behind every pool key --
+/// so a caller either commits a wholly valid round or nothing. Samples and the
+/// route snapshot land in one immediate transaction; the snapshot upserts on
+/// `(runtime, scope_id)`, leaving other scopes of the same runtime untouched.
+/// Returns the number of samples committed. Errors are `Validation` for a
+/// malformed slice or an oversized (>64 KiB) topology payload, or the store's
+/// own error when the transaction fails.
 pub fn persist(home: &Path, slice: &Slice, retention: usize) -> Result<usize> {
+    // A blank runtime is rejected before the topology check: an empty topology
+    // would otherwise validate against it and persist an unowned snapshot row.
+    if slice.runtime.is_empty() {
+        return Err(invalid("invalid quota slice"));
+    }
     slice.topology.validate(&slice.runtime)?;
     if slice.scope_id.is_empty()
         || retention == 0
