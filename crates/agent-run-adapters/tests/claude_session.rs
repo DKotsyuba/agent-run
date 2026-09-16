@@ -60,3 +60,25 @@ async fn fake_claude_stream_is_drained_and_diagnostics_stay_secret_safe() {
         .expect("stderr evidence")
         .contains("fixture-secret"));
 }
+
+/// Mirrors `tests/test_resume_adapters.py::StreamIdentityTests::test_descriptorless_injected_stdin_accepts_initial_input`
+///
+/// Initial input is delivered through the owned pipe rather than a descriptor
+/// handshake, so a child that simply reads stdin receives it and its reply is
+/// decoded normally.
+#[tokio::test]
+async fn injected_initial_input_is_accepted_without_a_descriptor_handshake() {
+    let mut process = Process::spawn(&fake_plan(
+        "read line; printf '{\"type\":\"result\",\"result\":%s}\\n' \"$line\"",
+    ))
+    .expect("fake stream starts");
+    process
+        .text("\"initial\"\n")
+        .await
+        .expect("initial input is accepted without a descriptor");
+    let Event::Json(value) = process.next().await else {
+        panic!("the child echoes the injected initial input");
+    };
+    assert_eq!(value["result"], "initial");
+    assert_eq!(process.reap().await, Some(0));
+}

@@ -177,9 +177,20 @@ fn drop_stale_backups(path: &Path) {
 }
 
 /// Serialize schema creation and migration across processes.
-struct SchemaLock(std::fs::File);
+///
+/// The guard owns an exclusive advisory lock on a `.<store>.init.lock` file
+/// beside the store, created with owner-only permissions. It is held for the
+/// lifetime of the value and released on drop, so both first-time schema
+/// creation and the numbered migration chain can use it to exclude each other
+/// across threads and processes.
+pub(crate) struct SchemaLock(std::fs::File);
 impl SchemaLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    /// Blocks until this process owns the initialization lock beside `path`.
+    ///
+    /// `path` is the store file itself; the lock file is derived from its name
+    /// and created if absent. Returns an error only when the lock file cannot
+    /// be opened or locked, never for ordinary contention, which simply waits.
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         use fs2::FileExt;
         let lock_name = format!(
             ".{}.init.lock",

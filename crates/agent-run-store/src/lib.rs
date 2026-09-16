@@ -236,22 +236,35 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 && create {
+            // Concurrent first initializers must converge on one committed
+            // schema. The same cross-process lock the migration chain uses
+            // serializes creation, and the version and table count are re-read
+            // inside it so a loser of the race adopts the winner's schema
+            // instead of replaying schema.sql onto tables that now exist.
+            let _lock = migrations::SchemaLock::acquire(&path)?;
+            let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
             let tables: i64 = conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table'",
                 [],
                 |r| r.get(0),
             )?;
-            if tables != 0 {
+            if version == 0 {
+                if tables != 0 {
+                    return Err(invalid(
+                        "unversioned nonempty database is not safe to initialize",
+                    ));
+                }
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                if let Err(e) = conn.execute_batch(include_str!("../../../sql/schema.sql")) {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e.into());
+                }
+                conn.execute_batch("COMMIT")?;
+            } else if version != VERSION {
                 return Err(invalid(
-                    "unversioned nonempty database is not safe to initialize",
+                    "state database has no usable schema; run agent-run init",
                 ));
             }
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            if let Err(e) = conn.execute_batch(include_str!("../../../sql/schema.sql")) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e.into());
-            }
-            conn.execute_batch("COMMIT")?;
         } else if version != VERSION {
             // `migrations::migrate` above already brings any 1..VERSION store up
             // to date or refuses a newer one, so this is now a defensive check:
@@ -265,8 +278,27 @@ impl Store {
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        // Tightening modes is strict only for the creator: a store left group- or
+        // world-readable at creation is a defect. For a store that already
+        // existed the chmod is best effort, so a sandboxed reader that may not
+        // chmod a file it does not own still gets a connection. This mirrors
+        // Python's `_private_path(strict=not existed)` in state/db.py, including
+        // its tightening of the WAL and SHM siblings and its tolerance of a
+        // sibling that does not exist yet.
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let private = std::fs::Permissions::from_mode(0o600);
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            match std::fs::set_permissions(&candidate, private.clone()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if create => return Err(error.into()),
+                Err(_) => {}
+            }
+        }
         Ok(Self {
             conn,
             home: home.to_path_buf(),

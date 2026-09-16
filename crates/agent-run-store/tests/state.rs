@@ -314,3 +314,143 @@ async fn changed_start_payload_cannot_reuse_a_recorded_fingerprint() {
         Err(Error::Conflict)
     ));
 }
+
+/// The nine tables schema v1 created, used to forge structurally wrong stores.
+const V1_TABLES: [&str; 9] = [
+    "orchestrator_sessions",
+    "agents",
+    "attempts",
+    "events",
+    "messages",
+    "commands",
+    "deliveries",
+    "capacity_samples",
+    "context_receipts",
+];
+
+/// Mirrors `tests/test_state_db.py::StateDatabaseTests::test_open_refuses_missing_or_incomplete_v1_database`
+///
+/// Opening is not a creation path: neither an absent store nor one that only
+/// carries a version stamp may be silently promoted into a usable schema.
+#[test]
+fn open_refuses_missing_or_incomplete_v1_database() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().to_path_buf();
+    assert!(
+        Store::open(&home).is_err(),
+        "a missing state database must be refused, not created"
+    );
+    let stamped = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    stamped.pragma_update(None, "user_version", 1).unwrap();
+    drop(stamped);
+    assert!(
+        Store::open(&home).is_err(),
+        "a versioned but tableless database must be refused"
+    );
+}
+
+/// Mirrors `tests/test_state_db.py::StateDatabaseTests::test_open_refuses_v1_tables_with_corrupt_column_shapes`
+///
+/// Table names alone do not prove a store is ours: a v1 stamp over tables whose
+/// columns and primary keys do not match the shipped schema is refused instead
+/// of being migrated into silent corruption.
+#[test]
+fn open_refuses_v1_tables_with_corrupt_column_shapes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().to_path_buf();
+    let corrupt = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    for table in V1_TABLES {
+        corrupt
+            .execute_batch(&format!(
+                "CREATE TABLE \"{table}\" (wrong BLOB PRIMARY KEY)"
+            ))
+            .unwrap();
+    }
+    corrupt.pragma_update(None, "user_version", 1).unwrap();
+    drop(corrupt);
+    let error = Store::open(&home)
+        .err()
+        .expect("corrupt column shapes must be refused")
+        .to_string();
+    assert!(
+        error.contains("columns or primary keys") || error.contains("foreign key"),
+        "refusal must name the structural defect, got: {error}"
+    );
+}
+
+/// Mirrors `tests/test_state_db.py::StateDatabaseTests::test_reopen_tolerates_chmod_denied_but_creation_does_not`
+///
+/// Re-tightening modes is best effort for a store this process did not create,
+/// so a sandboxed reader still gets a connection; a creating caller keeps the
+/// strict behavior because a store left readable at creation is a defect.
+#[test]
+fn reopen_tolerates_chmod_denied_but_creation_does_not() {
+    let home = common::Home::new();
+    let database = home.path.join("state.db");
+    let immutable = std::process::Command::new("/usr/bin/chflags")
+        .arg("uchg")
+        .arg(&database)
+        .status()
+        .expect("chflags runs");
+    assert!(
+        immutable.success(),
+        "test needs an undeletable-flag capable fs"
+    );
+    let reopened = Store::open(&home.path);
+    let _ = std::process::Command::new("/usr/bin/chflags")
+        .arg("nouchg")
+        .arg(&database)
+        .status();
+    reopened.expect("a denied chmod must not block reopening an existing store");
+
+    let fresh = tempfile::tempdir().unwrap();
+    let blocked = fresh.path().join("state.db");
+    std::fs::write(&blocked, b"").unwrap();
+    assert!(std::process::Command::new("/usr/bin/chflags")
+        .arg("uchg")
+        .arg(&blocked)
+        .status()
+        .expect("chflags runs")
+        .success());
+    let created = Store::initialize(fresh.path());
+    let _ = std::process::Command::new("/usr/bin/chflags")
+        .arg("nouchg")
+        .arg(&blocked)
+        .status();
+    assert!(
+        created.is_err(),
+        "creation must refuse rather than leave a store it could not protect"
+    );
+}
+
+/// Mirrors `tests/test_state_db.py::StateDatabaseTests::test_concurrent_first_initializers_share_one_atomic_schema`
+///
+/// Racing first initializers must agree on one committed schema rather than
+/// letting a second creator observe or duplicate a half-built one.
+#[test]
+fn concurrent_first_initializers_share_one_atomic_schema() {
+    use std::sync::{Arc, Barrier};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("private");
+    let callers = 8;
+    let barrier = Arc::new(Barrier::new(callers));
+    let versions = (0..callers)
+        .map(|_| {
+            let home = home.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let store = Store::initialize(&home).expect("concurrent initialize");
+                store.health().expect("health")["schema_version"]
+                    .as_i64()
+                    .expect("schema version")
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().expect("initializer thread"))
+        .collect::<Vec<_>>();
+    assert_eq!(versions, vec![16; callers]);
+    Store::open(&home).expect("the shared schema is usable afterwards");
+}
