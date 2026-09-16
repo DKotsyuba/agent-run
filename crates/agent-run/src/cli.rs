@@ -8,7 +8,7 @@ use crate::{
     policy::Constraint,
     service::{Query, Service},
     state::Store,
-    transport, Error, Result,
+    transport, Result,
 };
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -528,18 +528,26 @@ pub fn launchd(
         json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
     })
 }
-/// Runs native provider login and returns its process code plus a safe success DTO.
-async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, Value)> {
-    let cfg = Config::load(home)?;
-    let runtime = cfg.runtime(name)?;
-    let kind = runtime.kind()?;
-    if let Some(label) = account {
-        runtime.selected_account(Some(label))?;
-    }
+/// Builds one credential-isolated native login or post-login status command.
+///
+/// Codex scopes labelled accounts below the agent-run home and Claude scopes
+/// them below the configured runtime home. `status` selects the provider's
+/// noninteractive verification invocation; both command forms retain no
+/// provider output in agent-run's JSON response.
+fn native_login_command(
+    home: &Path,
+    runtime: &crate::config::Runtime,
+    kind: Adapter,
+    account: Option<&str>,
+    status: bool,
+) -> Result<tokio::process::Command> {
     let mut command = tokio::process::Command::new(&runtime.binary);
     match kind {
         Adapter::Codex => {
             command.arg("login");
+            if status {
+                command.arg("status");
+            }
             if let Some(label) = account {
                 let path = crate::adapters::materialize::account_home(home, kind, label);
                 fs::private_dir(&path)?;
@@ -548,6 +556,9 @@ async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, V
         }
         Adapter::Claude => {
             command.args(["auth", "login"]);
+            if status {
+                command.args(["status", "--json"]);
+            }
             if let Some(label) = account {
                 let path = crate::adapters::materialize::account_home(home, kind, label)
                     .join("claude-config");
@@ -557,22 +568,61 @@ async fn login(home: &Path, name: &str, account: Option<&str>) -> Result<(i32, V
                 command.env_remove("CLAUDE_CONFIG_DIR");
             }
         }
-        _ => {
-            return Err(Error::Unsupported(
-                "GLM/Qwen use explicitly declared environment authentication in this port".into(),
-            ))
+        Adapter::Glm | Adapter::Qwen => {
+            return Err(invalid("auth login is not supported for this runtime yet"));
         }
     }
+    Ok(command)
+}
+
+/// Runs Python-compatible native authentication and verifies its resulting state.
+///
+/// `claude_only` distinguishes the convenience `login` syntax from explicit
+/// `auth <label> <runtime>`: the former accepts only Claude, while the latter
+/// supports configured Codex accounts. Provider failures preserve their exit
+/// status, emit only a fixed diagnostic, and never expose native status output.
+async fn login(
+    home: &Path,
+    name: &str,
+    account: Option<&str>,
+    claude_only: bool,
+) -> Result<(i32, Value)> {
+    let cfg = Config::load(home)?;
+    let runtime = cfg.runtime(name)?;
+    let kind = runtime.kind()?;
+    if claude_only && kind != Adapter::Claude {
+        return Err(invalid(format!(
+            "login supports Claude only; use agent-run auth <label> {name}"
+        )));
+    }
+    let account = runtime.selected_account(account)?;
+    let account_name = account.as_deref().unwrap_or("default");
     // Interactive native authentication owns its prompts and credential storage.
-    let status = command
+    let status = native_login_command(home, runtime, kind, account.as_deref(), false)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await?;
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        eprintln!("auth login failed for {account_name} {name} (exit {code})");
+        return Ok((code, Value::Null));
+    }
+    let status = native_login_command(home, runtime, kind, account.as_deref(), true)?
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        eprintln!("auth login status failed for {account_name} {name} (exit {code})");
+        return Ok((code, Value::Null));
+    }
     Ok((
-        status.code().unwrap_or(1),
-        json!({"account":account.unwrap_or("default"),"runtime":name,"status":"ok"}),
+        0,
+        json!({"account":account,"runtime":if kind == Adapter::Claude {"claude"} else {name},"status":"ok"}),
     ))
 }
 /// Executes one parsed command and returns its public process exit status.
@@ -834,14 +884,14 @@ pub async fn run(cli: Cli) -> Result<i32> {
             }
         },
         Command::Login { runtime, account } => {
-            let (code, value) = login(&home, &runtime, account.as_deref()).await?;
+            let (code, value) = login(&home, &runtime, account.as_deref(), true).await?;
             if code == 0 {
                 emit(&value)?;
             }
             return Ok(code);
         }
         Command::Auth { label, runtime } => {
-            let (code, value) = login(&home, &runtime, Some(&label)).await?;
+            let (code, value) = login(&home, &runtime, Some(&label), false).await?;
             if code == 0 {
                 emit(&value)?;
             }
