@@ -202,7 +202,10 @@ impl BrokerClient {
         let Some(connection) = connection.as_mut() else {
             return Err(ClientAttemptError::Transport);
         };
-        let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params.unwrap_or_else(|| json!({}))});
+        let mut request = json!({"jsonrpc":"2.0","id":id,"method":method});
+        if let Some(params) = params {
+            request["params"] = params;
+        }
         let notified = self.wake.notified();
         let written = tokio::select! {
             _ = notified => return Err(ClientAttemptError::Cancelled),
