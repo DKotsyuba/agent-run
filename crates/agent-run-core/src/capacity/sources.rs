@@ -24,10 +24,14 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, process::Command};
 const TTL: f64 = 900.0;
-const CODEXBAR_TIMEOUT_SECONDS: u64 = 120;
+/// Maximum seconds allowed for one Codexbar provider invocation.
+pub const CODEXBAR_TIMEOUT_SECONDS: u64 = 120;
 
-/// Returns the email claim embedded in a Codex auth document without exposing it.
-fn account_email(path: &Path) -> Option<String> {
+/// Extracts a nonblank email claim from a Codex auth document.
+///
+/// Malformed files, missing tokens, invalid base64url payloads, and absent or
+/// empty claims all return `None`; no parse detail or token content is exposed.
+pub fn account_email(path: &Path) -> Option<String> {
     let payload: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let token = payload.pointer("/tokens/id_token")?.as_str()?;
     let encoded = token.split('.').nth(1)?;
@@ -81,6 +85,9 @@ fn window_name(minutes: f64) -> String {
         format!("min{minutes}")
     }
 }
+// The fields intentionally mirror one provider window; grouping them would
+// obscure the direct mapping and churn every source normalizer call site.
+#[allow(clippy::too_many_arguments)]
 fn sample(
     runtime: &str,
     lane: &str,
@@ -639,7 +646,11 @@ pub fn normalize_codexbar_accounts(
     default_email: Option<&str>,
 ) -> Result<Slice> {
     let value = if let Some(list) = raw.as_array() {
-        list
+        if accounts.is_empty() {
+            list.first().map(std::slice::from_ref).unwrap_or(&[])
+        } else {
+            list
+        }
     } else {
         std::slice::from_ref(raw)
     };
@@ -892,6 +903,7 @@ pub async fn collect(home: &Path) -> Result<Value> {
             let result = match (source, rt.kind()?) {
                 ("codexbar", _) => codexbar(home, &config, name, rt).await,
                 ("omniroute", _) => omniroute(name).await,
+                ("native", Adapter::Qwen) => omniroute(name).await,
                 ("native", Adapter::Claude) => match claude_native(name, rt).await {
                     Ok(slice) => Ok(slice),
                     Err(Error::Validation(reason)) if reason == "claude_token_missing" => {
