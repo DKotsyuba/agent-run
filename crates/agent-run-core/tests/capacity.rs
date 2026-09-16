@@ -576,6 +576,7 @@ fn native_claude_requires_valid_percent_in_every_entry() {
 /// `Runtime::weight` is the exact function `order()` calls once per route to
 /// build its `route_multipliers` map; the account multiplier must win over
 /// the lane multiplier, which must win over the flat runtime default.
+/// Mirrors `tests/test_capacity_order.py::CapacityOrderTests::test_new_accounts_fallbacks_and_runtime_filtering`.
 #[test]
 fn route_weight_precedence_is_account_then_lane_then_runtime_default() {
     let h = common::Home::new();
@@ -727,6 +728,55 @@ fn deferred_evidence_and_unavailable_runtime_are_complete() {
         vec!["runtime-d".to_string(), "runtime-x".to_string()]
     );
     assert_eq!(order.routes[0].runtime, "runtime-u");
+}
+
+/// Mirrors `tests/test_capacity_ranking.py::CapacityRankingTests::test_new_forecast_snapshot_can_change_order`.
+#[test]
+fn new_forecast_snapshot_can_change_order() {
+    let first = ranking::rank_capacity_routes(
+        vec![
+            rk_route(
+                "runtime",
+                "a",
+                "pool-a",
+                vec![rk_forecast("runtime", "a", 20.0)],
+            ),
+            rk_route(
+                "runtime",
+                "b",
+                "pool-b",
+                vec![rk_forecast("runtime", "b", 80.0)],
+            ),
+        ],
+        vec![],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        RK_NOW,
+    )
+    .unwrap();
+    let second = ranking::rank_capacity_routes(
+        vec![
+            rk_route(
+                "runtime",
+                "a",
+                "pool-a",
+                vec![rk_forecast("runtime", "a", 90.0)],
+            ),
+            rk_route(
+                "runtime",
+                "b",
+                "pool-b",
+                vec![rk_forecast("runtime", "b", 10.0)],
+            ),
+        ],
+        vec![],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        RK_NOW,
+    )
+    .unwrap();
+    assert_eq!(first.routes[0].aliases[0].route_id, "b");
+    assert_eq!(second.routes[0].aliases[0].route_id, "a");
 }
 
 /// Mirrors `tests/test_capacity_ranking.py::test_invalid_arguments_raise_validation_error`.

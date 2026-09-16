@@ -3,6 +3,7 @@
 use std::{env, process::Command};
 
 /// Mirrors `test_doc.py::test_every_topic_loads_and_is_bounded`.
+/// Mirrors `tests/test_doc.py::DocTopicsTests::test_topic_text_loads_every_declared_topic`.
 #[test]
 fn python_doc_topics_are_embedded_and_bounded() {
     for topic in [
@@ -59,6 +60,7 @@ fn completion_topic_contains_the_shared_notice_template() {
 }
 
 /// Mirrors `test_doc.py::test_doc_with_no_topic_returns_index`.
+/// Mirrors `tests/test_doc.py::DocTopicsTests::test_topic_text_defaults_to_index`.
 #[test]
 fn doc_cli_without_topic_returns_the_index() {
     let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -71,6 +73,15 @@ fn doc_cli_without_topic_returns_the_index() {
     assert!(value["text"]
         .as_str()
         .is_some_and(|text| text.contains("agent-run")));
+}
+
+/// Mirrors `tests/test_cli.py::PackagingTests::test_console_script_and_schema_are_present_in_sdist`.
+#[test]
+fn packaged_binary_and_schema_asset_are_present() {
+    assert!(std::path::Path::new(env!("CARGO_BIN_EXE_agent-run")).is_file());
+    assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../sql/schema.sql")
+        .is_file());
 }
 
 /// Mirrors `test_doc.py::test_doc_with_completion_topic_returns_contract_text`.

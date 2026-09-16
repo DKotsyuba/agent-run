@@ -937,12 +937,7 @@ pub fn normalize_codexbar_accounts(
     Ok(slice_from_samples(runtime, runtime, samples, topology, 0.0))
 }
 async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result<Slice> {
-    let provider = match rt.kind()? {
-        Adapter::Codex => "codex",
-        Adapter::Claude => "claude",
-        Adapter::Glm => "zai",
-        Adapter::Qwen => return Err(Error::Unsupported("codexbar has no Qwen provider".into())),
-    };
+    let provider = codexbar_provider(rt.kind()?)?;
     let mut args = vec![
         "usage".into(),
         "--provider".into(),
@@ -983,6 +978,17 @@ async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result
         _ => None,
     };
     normalize_codexbar_accounts(name, &value, &accounts, default_email.as_deref())
+}
+
+/// Maps an adapter identity to the provider name understood by Codexbar.
+/// Qwen has no documented Codexbar provider and is rejected as unsupported.
+fn codexbar_provider(adapter: Adapter) -> Result<&'static str> {
+    match adapter {
+        Adapter::Codex => Ok("codex"),
+        Adapter::Claude => Ok("claude"),
+        Adapter::Glm => Ok("zai"),
+        Adapter::Qwen => Err(Error::Unsupported("codexbar has no Qwen provider".into())),
+    }
 }
 /// Reads the local OmniRoute current-cache into one capacity slice.
 ///
@@ -1192,4 +1198,15 @@ pub async fn models(home: &Path) -> Result<Value> {
         result.insert(name.clone(),json!({"models":roster.into_values().collect::<Vec<_>>(),"capabilities":adapters::capabilities(kind),"available":available,"reason":reason,"accounts":accounts}));
     }
     Ok(Value::Object(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_glm_maps_to_the_zai_provider`.
+    #[test]
+    fn glm_maps_to_the_zai_provider() {
+        assert_eq!(codexbar_provider(Adapter::Glm).unwrap(), "zai");
+    }
 }

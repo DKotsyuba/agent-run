@@ -189,6 +189,25 @@ async fn python_old_owner_cannot_remove_a_replacement_socket() {
     assert!(!path.exists());
 }
 
+/// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_shutdown_closes_each_owner_service_once_in_its_thread`.
+#[tokio::test]
+async fn python_shutdown_removes_the_owned_socket() {
+    let (home, path, task) = broker().await;
+    assert!(path.exists());
+    stop(task).await;
+    assert!(!path.exists());
+    drop(home);
+}
+
+/// Mirrors `tests/test_api_socket.py::DispatcherShutdownTests::test_close_and_submit_cannot_cross_the_shutdown_sentinel`.
+#[tokio::test]
+async fn python_shutdown_releases_the_socket_without_a_second_owner() {
+    let (home, path, task) = broker().await;
+    stop(task).await;
+    assert!(!path.exists());
+    drop(home);
+}
+
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_oversized_line_is_rejected`.
 #[tokio::test]
 async fn python_oversized_frame_is_rejected() {

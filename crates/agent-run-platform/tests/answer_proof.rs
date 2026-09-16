@@ -256,6 +256,31 @@ fn proof_sidecar_bound_and_symlink_are_enforced() {
     assert!(err.to_string().contains("regular file"), "{err}");
 }
 
+/// Mirrors `tests/test_answer_payload_proof.py::SealAndProofTests::test_directory_sync_failure_cannot_leave_false_legacy_completion`.
+#[test]
+fn format_marker_without_sidecar_never_looks_like_legacy_completion() {
+    let dir = tempdir();
+    let root = dir.path();
+    let owned = Dir::open(root).unwrap();
+    owned
+        .write(
+            Path::new("answer.md"),
+            b"old legacy body\n<<<agent-run:complete>>>\n",
+            0o600,
+        )
+        .unwrap();
+    owned
+        .write(Path::new(".answer-format"), b"2\n", 0o600)
+        .unwrap();
+    let inspection = verify::inspect_answer(root, Path::new("answer.md")).unwrap();
+    assert_eq!(inspection.proof_version, 2);
+    assert!(!inspection.complete());
+    assert!(inspection
+        .proof_error
+        .as_deref()
+        .is_some_and(|error| error.contains("missing")));
+}
+
 /// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_raises_distinct_typed_errors`.
 /// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_can_validate_without_retaining_content`.
 /// A

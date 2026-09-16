@@ -523,6 +523,7 @@ async fn claude_uds_writes_auth_then_trusted_notice_to_fake_socket() {
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_missing_or_unreadable_auth_token_is_a_clean_refusal`.
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_registry_miss_is_session_gone_not_ambiguous`.
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_stale_descriptor_with_a_dead_socket_is_session_gone`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_only_explicit_session_gone_is_classified_as_missing`.
 /// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_missing_session_fails_and_no_replacement_is_started`.
 /// Unix socket test: the stale path is a nonexistent temporary endpoint.
 #[tokio::test]
@@ -575,6 +576,7 @@ async fn claude_uds_classifies_unreachable_endpoint_as_unavailable() {
 }
 
 /// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_validate_and_arguments_are_checked`.
+/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_constructor_and_arguments_are_bounded_without_replacement_paths`.
 #[tokio::test]
 async fn claude_uds_rejects_unbounded_arguments_without_socket_contact() {
     let temporary = tempfile::tempdir().unwrap();
@@ -1135,6 +1137,7 @@ async fn relay_ambiguity_stops_discovery_without_a_second_path() {
 }
 
 /// Mirrors `tests/test_codex_queue.py::test_unavailable_relay_and_foreign_target_are_delivery_errors`.
+/// Mirrors `tests/test_codex_queue.py::CodexQueueTransportTests::test_unexpected_relay_exceptions_are_not_reclassified`.
 #[tokio::test]
 async fn unavailable_relay_and_unknown_transport_are_delivery_failures() {
     let home = common::Home::new();

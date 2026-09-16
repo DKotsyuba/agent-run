@@ -140,6 +140,16 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         LIMIT,
     ) {
         Ok(snapshot) => snapshot,
+        Err(error) if error.to_string().starts_with("state migration required:") => {
+            add(
+                &mut report.findings,
+                "state_migration_pending",
+                "error",
+                "state",
+                &error.to_string(),
+            );
+            return Ok(report);
+        }
         Err(_) => {
             add(
                 &mut report.findings,
@@ -1089,6 +1099,31 @@ mod tests {
     /// equivalent of clearing it.
     const ABSENT_AUTH_NAME: &str = "AGENT_RUN_DOCTOR_ABSENT_TEST_KEY";
 
+    /// Mirrors `tests/test_state_migrations.py::MigrationDiagnosticsTests::test_doctor_surfaces_a_pending_migration`.
+    #[test]
+    fn python_doctor_surfaces_a_pending_migration() {
+        let home = tempfile::tempdir().expect("temporary home");
+        std::fs::write(home.path().join("config.toml"), "schema_version = 1\n").expect("config");
+        let connection = rusqlite::Connection::open(home.path().join("state.db")).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../agent-run-store/tests/fixtures/schema_v1.sql"
+            ))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+
+        let report = run(home.path()).expect("doctor report");
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.component == "state")
+            .collect();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "state_migration_pending");
+        assert!(findings[0].detail.contains("v16"));
+        assert!(!report.ok());
+    }
+
     /// Builds one enabled runtime fixture from Python-equivalent config fields.
     fn runtime_fixture(extra: serde_json::Value) -> Runtime {
         let mut value = json!({
@@ -1273,6 +1308,7 @@ mod tests {
     }
 
     /// Keeps only the newest row for each capacity identity before staleness checks.
+    /// Mirrors `tests/test_capacity_diagnostics.py::CapacityDiagnosticTests::test_frequent_healthy_samples_do_not_hide_stale_identity`.
     #[test]
     fn capacity_staleness_deduplicates_identity_before_reporting() {
         assert!(capacity_lanes(&[
