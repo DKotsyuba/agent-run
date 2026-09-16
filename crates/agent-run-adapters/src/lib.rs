@@ -61,6 +61,13 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
     if kind == Adapter::Qwen && (profile.network || request.effort.is_some()) {
         return Err(invalid("qwen does not support network profiles or effort"));
     }
+    if kind == Adapter::Qwen
+        && (request.write != profile.write || request.read_roots != profile.read_roots)
+    {
+        return Err(invalid(
+            "qwen request grants do not match the resolved role",
+        ));
+    }
     if kind == Adapter::Codex && profile.network && !profile.write {
         return Err(invalid(
             "codex read-only sandbox cannot grant network access",

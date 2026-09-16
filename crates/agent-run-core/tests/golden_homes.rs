@@ -427,6 +427,27 @@ fn python_golden_homes_match_claude_glm_and_qwen_read_only_and_write() {
                 resolved_environment(adapter, &home),
             )
             .expect("build golden launch");
+            #[cfg(target_os = "macos")]
+            if adapter == Adapter::Qwen {
+                let xcode_git = std::process::Command::new("/usr/bin/xcrun")
+                    .args(["--find", "git"])
+                    .output()
+                    .expect("locate Xcode Git");
+                assert!(
+                    xcode_git.status.success(),
+                    "Xcode Git toolchain is installed"
+                );
+                let git_dir = Path::new(String::from_utf8_lossy(&xcode_git.stdout).trim())
+                    .parent()
+                    .expect("Xcode Git has a parent directory")
+                    .display()
+                    .to_string();
+                assert_eq!(
+                    plan.environment["PATH"],
+                    format!("{git_dir}:/usr/bin:/bin"),
+                    "Xcode Git must precede the inherited PATH"
+                );
+            }
             let expected_launch: Value = serde_json::from_slice(
                 &std::fs::read(
                     capture_root()

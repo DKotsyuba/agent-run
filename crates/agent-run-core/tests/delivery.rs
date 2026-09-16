@@ -377,49 +377,67 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     let pipe_path = root.path().join("desktop.sock");
     let pipe_listener = tokio::net::UnixListener::bind(&pipe_path).unwrap();
     let mode = mode.to_owned();
+    let peer_mode = mode.clone();
     let host_peer = tokio::spawn(async move {
-        if mode == "malformed" {
+        if peer_mode == "malformed" {
             let _ = tokio::time::timeout(Duration::from_millis(200), pipe_listener.accept()).await;
             return None;
         }
         let (mut stream, _) = pipe_listener.accept().await.unwrap();
         let listed = read_frame(&mut stream).await;
         assert_eq!(listed["id"], 1);
-        if mode == "precall" {
+        if peer_mode == "precall" {
             write_frame(&mut stream, &json!({"jsonrpc":"2.0","id":999,"result":{}})).await;
             return None;
         }
-        if mode == "slow" {
+        if peer_mode == "slow" {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        let inventory_size = if peer_mode == "oversized" {
+            8 * 1024 * 1024
+        } else {
+            42_000
+        };
         let inventory = json!({"jsonrpc":"2.0","id":1,"result":{"tools":[
-            {"name":"send_message_to_thread","namespace":"codex_app","description":"x".repeat(42_000)}
+            {"name":"send_message_to_thread","namespace":"codex_app","description":"x".repeat(inventory_size)}
         ]}});
+        if peer_mode == "oversized" {
+            let _ = stream.write_all(&frame(&inventory)).await;
+            return None;
+        }
         write_frame(&mut stream, &inventory).await;
         let called = read_frame(&mut stream).await;
         assert_eq!(called["id"], 2);
-        if mode == "drop" {
+        if peer_mode == "drop" {
             return Some(called);
         }
-        let response = if mode == "badid" {
+        let response = if peer_mode == "badid" {
             json!({"jsonrpc":"2.0","id":999,"result":{"success":true,"contentItems":[]}})
-        } else if mode == "error" {
+        } else if peer_mode == "error" {
             json!({"jsonrpc":"2.0","id":2,"error":{"code":-1}})
         } else {
-            json!({"jsonrpc":"2.0","id":2,"result":{"success":mode != "false","contentItems":[]}})
+            json!({"jsonrpc":"2.0","id":2,"result":{"success":peer_mode != "false","contentItems":[]}})
         };
         write_frame(&mut stream, &response).await;
         Some(called)
     });
-    let node = [
-        "/usr/local/bin/node",
-        "/opt/homebrew/bin/node",
-        "/usr/bin/node",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|path| path.is_file())
-    .expect("Node is required for relay host tests");
+    let node = if mode == "deadline" {
+        let path = root.path().join("blocking-node");
+        std::fs::write(&path, "#!/bin/sh\nexec /usr/bin/tail -f /dev/null\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    } else {
+        [
+            "/usr/local/bin/node",
+            "/opt/homebrew/bin/node",
+            "/usr/bin/node",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .expect("Node is required for relay host tests")
+    };
     // SAFETY: host tests serialize process-environment mutation with relay_env_lock.
     unsafe {
         std::env::set_var("CODEX_APP_TOOLS_PIPE_PATH", &pipe_path);
@@ -440,7 +458,13 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     let mut client = tokio::net::UnixStream::connect(endpoint).await.unwrap();
     client.write_all(&frame(&request)).await.unwrap();
     let response = read_frame(&mut client).await;
-    let called = host_peer.await.unwrap();
+    let called = if mode == "deadline" {
+        host_peer.abort();
+        let _ = host_peer.await;
+        None
+    } else {
+        host_peer.await.unwrap()
+    };
     drop(host);
     // SAFETY: host tests serialize process-environment mutation with relay_env_lock.
     unsafe {
@@ -780,6 +804,13 @@ async fn desktop_relay_host_accepts_large_inventory() {
     assert_eq!(response, json!({"outcome":"accepted"}));
 }
 
+/// Checks the host-side 8 MiB frame ceiling by sending a frame over it.
+#[tokio::test]
+async fn desktop_relay_host_rejects_oversized_inventory() {
+    let response = host_exchange(v3_request(&notice()), "oversized").await.0;
+    assert_eq!(response, json!({"outcome":"rejected"}));
+}
+
 /// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_rich_notice_is_rendered_by_real_node_byte_for_byte`.
 #[tokio::test]
 async fn desktop_relay_host_renders_rich_notice_exactly() {
@@ -859,6 +890,19 @@ async fn desktop_relay_host_allows_slow_discovery() {
         host_exchange(v3_request(&notice()), "slow").await.0,
         json!({"outcome":"accepted"})
     );
+}
+
+/// Checks that a child which never produces host output is cut off by host_send.
+#[tokio::test]
+async fn desktop_relay_host_deadline_expires_without_child_output() {
+    let response = tokio::time::timeout(
+        Duration::from_secs(12),
+        host_exchange(v3_request(&notice()), "deadline"),
+    )
+    .await
+    .expect("host deadline must expire before the test guard")
+    .0;
+    assert_eq!(response, json!({"outcome":"ambiguous"}));
 }
 
 /// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_explicit_rejection_and_precall_failure_are_retryable`.
