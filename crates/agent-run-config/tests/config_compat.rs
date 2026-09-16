@@ -243,6 +243,30 @@ fn run_profile_case(case: &Case) -> Result<Value, Error> {
     })
 }
 
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_accounts_parse_and_validate`,
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_accounts_require_supported_adapter_and_legacy_default_is_declared`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_claude_accounts_accept_its_scoped_environment_auth`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_codex_workspace_root_and_mcp_approval_mode_are_strict`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_core_and_capacity_bounds_fail_during_load`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_delivery_queue_binary_is_optional_and_absolute`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_legacy_opencode_runtime_is_ignored`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_limits_source_defaults_to_native_and_is_validated`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_minimal_and_consumed_configuration_load`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_nonfinite_numeric_values_are_rejected`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_plugin_snapshot_assets_are_explicit_relative_and_immutable`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_plugin_snapshot_assets_reject_ambiguous_or_unsafe_declarations`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_priority_account_and_lane_multipliers_parse_with_defaults`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_priority_maps_reject_bad_shapes_keys_and_factors`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_relative_runtime_binary_is_rejected`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_runtime_binary_expands_the_user_prefix_without_resolving`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_runtime_binary_symlink_is_kept_while_other_paths_resolve`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_runtime_plugins_default_to_none_and_must_be_existing_directories`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_runtime_priority_multiplier_is_positive_and_finite`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_runtime_rust_requires_both_paths_and_keeps_cargo_bin_lexical`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_unknown_fields_report_the_recursive_path`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_unsupported_versions_and_secret_literals_are_rejected`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_validation_errors_do_not_echo_rejected_values`.
 #[test]
 fn golden_config_cases_match_python() {
     let mut failures: Vec<String> = Vec::new();

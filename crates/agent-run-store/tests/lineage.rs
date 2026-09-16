@@ -58,7 +58,9 @@ fn python_test_resume_live_parent_group_is_refused() {
     );
 }
 
-/// Mirrors `test_resume.py::test_resume_makes_a_new_agent_that_inherits_and_attaches` and its one-child race.
+/// Mirrors Python `tests/test_resume.py::ResumeTests::test_resume_makes_a_new_agent_that_inherits_and_attaches`.
+/// Mirrors Python `tests/test_resume.py::ResumeTests::test_a_fresh_start_is_its_own_chain_root`.
+/// Mirrors Python `tests/test_resume.py::ResumeTests::test_two_processes_racing_one_parent_accept_exactly_one_child`.
 #[test]
 fn python_test_resume_lineage_has_one_concurrent_latest_child() {
     let home = common::Home::new();

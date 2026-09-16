@@ -60,8 +60,21 @@ fn actual_kind(error: &Error) -> &'static str {
     }
 }
 
-/// Mirrors the golden corpus itself (inventory `CX-2`, plan tests T37-T44)
-/// and `test_answer_payload_proof.py::test_read_answer_payload_raises_distinct_typed_errors`:
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_above_inline_limit_payload_is_still_fully_verified`,
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_answer_symlink_swap_cannot_escape_the_agent_directory`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_contradicting_proof_raises_typed_error`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_corrupted_proof_raises_typed_error_without_legacy_downgrade`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_invalid_utf8_raises_typed_error`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_legacy_descriptor_keeps_original_hash_and_strips_frame_once`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_missing_current_proof_raises_instead_of_becoming_legacy`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_missing_payload_raises_typed_error`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_new_descriptor_carries_kind_media_type_path_and_proof_version`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_non_inline_payload_still_rejects_invalid_utf8`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::AnswerServiceFormatTests::test_tampered_payload_raises_typed_error`.
+///
+/// The committed corpus carries each of the corrupt, missing, legacy, and
+/// over-inline-bound artifacts. `verify::read` composes payload and sidecar
+/// verification, so this data-driven assertion covers the service read path.
 /// `verify::read` composes payload verification with the sidecar check —
 /// matching `AgentService.answer()` in Python, which checks both before
 /// trusting a stored proof — so a case is accepted only when *both* the
@@ -108,6 +121,9 @@ fn golden_corpus_composed_read_matches_python_verdicts() {
     }
 }
 
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_malformed_or_contradicting_proof_never_downgrades`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_missing_proof_never_downgrades_a_sealed_payload`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_corrupted_format_marker_fails_closed`.
 /// Mirrors the corpus's isolated `proof` field against `load_answer_proof`
 /// (`verify.py:394-413`), decoupled from the live payload bytes — Rust's
 /// `load_sidecar` is that same decoupled check.
@@ -132,7 +148,9 @@ fn golden_corpus_proof_sidecar_matches_python() {
     }
 }
 
-/// Mirrors `test_seal_writes_clean_payload_and_versioned_proof`: sealing
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_seal_writes_clean_payload_and_versioned_proof`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_sealed_payload_may_contain_sentinel_text`.
+/// Sealing
 /// writes the exact payload bytes, a `.answer-format` marker of `"2\n"`, and
 /// a `<name>.proof.json` sidecar binding kind/media_type/answer/bytes/sha256
 /// — and the round trip through `verify::read` returns the same text.
@@ -140,7 +158,7 @@ fn golden_corpus_proof_sidecar_matches_python() {
 fn seal_round_trip_matches_python_layout() {
     let dir = tempdir();
     let root = dir.path();
-    let text = "body text";
+    let text = "body text\n<<<agent-run:complete>>>\n";
     let proof = verify::seal(root, Path::new("answer.md"), text).unwrap();
     assert_eq!(
         std::fs::read(root.join("answer.md")).unwrap(),
@@ -160,6 +178,10 @@ fn seal_round_trip_matches_python_layout() {
     assert_eq!(content.as_deref(), Some(text));
 }
 
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_inspect_legacy_requires_the_terminal_sentinel`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_legacy_embedded_sentinel_is_preserved`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_legacy_terminal_frame_is_stripped_once_exactly`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_legacy_strips_the_frame_once`.
 /// Mirrors the golden corpus's `proof-v2-valid` and `legacy-v1-valid`
 /// cases: an artifact the Python release wrote must still verify
 /// byte-for-byte in Rust, for both proof formats, with the legacy frame
@@ -195,7 +217,9 @@ fn python_written_artifacts_verify_for_both_formats() {
     }
 }
 
-/// Mirrors `test_metadata_reads_are_bounded_and_reject_symlinks`: an
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_metadata_reads_are_bounded_and_reject_symlinks`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_metadata_symlink_swap_cannot_read_an_external_proof`.
+/// An
 /// oversized proof sidecar and a symlinked proof sidecar are both refused
 /// with a labeled error, never silently accepted or downgraded to legacy.
 #[test]
@@ -232,7 +256,9 @@ fn proof_sidecar_bound_and_symlink_are_enforced() {
     assert!(err.to_string().contains("regular file"), "{err}");
 }
 
-/// Mirrors `test_read_answer_payload_raises_distinct_typed_errors`: a
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_raises_distinct_typed_errors`.
+/// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_can_validate_without_retaining_content`.
+/// A
 /// missing payload and a symlinked payload are each refused with their own
 /// distinct, labeled error, never conflated with a hash/size mismatch.
 #[test]
