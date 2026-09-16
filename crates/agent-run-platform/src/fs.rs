@@ -60,6 +60,36 @@ pub fn private_dir(path: &Path) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
+/// Accepts a directory synchronization that the filesystem reports unsupported.
+///
+/// `outcome` is the raw result of one directory `fsync`. `EINVAL` and `ENOTSUP`
+/// mean the filesystem offers no directory synchronization at all, which Python
+/// tolerates (`_fsync_directory_descriptor`, `adapters/home.py:122-129`) so a
+/// publish is never refused by a filesystem capability. Every other error
+/// propagates: a caller must not report a durable publish after an available
+/// sync operation actually failed.
+pub fn tolerate_unsupported_sync(outcome: std::io::Result<()>) -> Result<()> {
+    match outcome {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOTSUP)
+            ) =>
+        {
+            Ok(())
+        }
+        other => Ok(other?),
+    }
+}
+/// Persists one directory's entry changes through its open descriptor.
+///
+/// `directory` must be an open descriptor for the directory whose entries
+/// changed. Returns once those entries are durable, or immediately when the
+/// filesystem reports directory synchronization unsupported; see
+/// [`tolerate_unsupported_sync`] for the exact tolerated errors.
+fn sync_directory(directory: &File) -> Result<()> {
+    tolerate_unsupported_sync(directory.sync_all())
+}
 pub fn relative(path: &Path) -> Result<Vec<CString>> {
     let mut result = Vec::new();
     for c in path.components() {
@@ -244,6 +274,13 @@ impl Dir {
                 if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
                     return Err(std::io::Error::last_os_error().into());
                 }
+                if r == 0 {
+                    // Python synchronizes every directory it creates before it
+                    // descends (`_open_managed_parent`, adapters/home.py:163-168),
+                    // so a crash cannot lose the directory entry that a
+                    // published file lives in.
+                    sync_directory(&fd)?;
+                }
             }
             // SAFETY: openat only observes its valid arguments; returned fd is uniquely owned.
             let n = unsafe {
@@ -282,7 +319,7 @@ impl Dir {
         }
         // SAFETY: n is newly allocated by openat.
         let _directory = unsafe { File::from_raw_fd(n) };
-        parent.sync_all()?;
+        sync_directory(&parent)?;
         Ok(())
     }
     pub fn open_file(&self, path: &Path) -> Result<File> {
@@ -400,7 +437,7 @@ impl Dir {
             // The rename already committed: `path` now holds the full new
             // bytes even if the parent-directory sync below never runs.
             fire(FaultPoint::AfterRename)?;
-            parent.sync_all()?;
+            sync_directory(&parent)?;
             Ok(())
         })();
         if result.is_err() && !fault_fired.get() {
@@ -418,7 +455,7 @@ impl Dir {
         if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        parent.sync_all()?;
+        sync_directory(&parent)?;
         Ok(())
     }
     /// Remove one owned entry through its no-follow parent. Unlink never
@@ -430,7 +467,7 @@ impl Dir {
         if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        parent.sync_all()?;
+        sync_directory(&parent)?;
         Ok(())
     }
 }
