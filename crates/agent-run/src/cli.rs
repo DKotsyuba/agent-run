@@ -14,11 +14,129 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
+
+/// A boxed asynchronous CLI operation owned by an injected test seam.
+pub type CliFuture<'a> = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>>;
+
+/// Output callback used by [`CliDependencies`].
+pub type CliOutput = Arc<dyn Fn(&Value) -> Result<()> + Send + Sync>;
+
+/// Structured doctor callback used by [`CliDependencies`].
+pub type DoctorRunner = Arc<dyn Fn(&Path) -> Result<crate::doctor::Report> + Send + Sync>;
+
+/// Service operations used by public CLI commands.
+pub trait CliService: Send + Sync {
+    /// Cancel one durable agent and return its public view.
+    fn cancel(&self, id: &AgentId) -> Result<Value>;
+    /// Send one steering command and return its durable acknowledgement.
+    fn steer(&self, id: &AgentId, text: &str) -> Result<Value>;
+    /// List agents, optionally waiting for a durable revision.
+    fn list<'a>(&'a self, query: Query) -> CliFuture<'a>;
+    /// Read one verified answer envelope.
+    fn answer(&self, id: &AgentId) -> Result<Value>;
+    /// Read one durable agent view for follow-up terminal checks.
+    fn agent(&self, id: &AgentId) -> Result<Value>;
+    /// Read one bounded transcript page.
+    fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value>;
+    /// Return the configured model roster.
+    fn models<'a>(&'a self) -> CliFuture<'a>;
+    /// Return the configured capacity limits.
+    fn limits(&self) -> Result<Value>;
+    /// Return the ordered capacity view.
+    fn capacity_order(&self) -> Result<Value>;
+    /// Return one completion-delivery status view.
+    fn delivery_status(&self, id: &AgentId) -> Result<Value>;
+    /// Cancel one completion-delivery attempt.
+    fn delivery_cancel(&self, id: &str) -> Result<Value>;
+}
+
+/// Broker operation used by start, resume, wait, and MCP calls.
+pub trait CliBroker: Send + Sync {
+    /// Send one method and JSON object to the resident broker.
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a>;
+}
+
+impl CliService for Service {
+    fn cancel(&self, id: &AgentId) -> Result<Value> {
+        Service::cancel(self, id)
+    }
+    fn steer(&self, id: &AgentId, text: &str) -> Result<Value> {
+        Service::steer(self, id, text)
+    }
+    fn list<'a>(&'a self, query: Query) -> CliFuture<'a> {
+        Box::pin(Service::list(self, query))
+    }
+    fn answer(&self, id: &AgentId) -> Result<Value> {
+        Service::answer(self, id)
+    }
+    fn agent(&self, id: &AgentId) -> Result<Value> {
+        let store = Store::open(&self.home)?;
+        let row = store.get(id)?;
+        Service::view(self, &store, &row)
+    }
+    fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        Service::transcript(self, id, cursor, limit)
+    }
+    fn models<'a>(&'a self) -> CliFuture<'a> {
+        Box::pin(Service::models(self))
+    }
+    fn limits(&self) -> Result<Value> {
+        Service::limits(self)
+    }
+    fn capacity_order(&self) -> Result<Value> {
+        Service::capacity_order(self)
+    }
+    fn delivery_status(&self, id: &AgentId) -> Result<Value> {
+        Service::delivery_status(self, id)
+    }
+    fn delivery_cancel(&self, id: &str) -> Result<Value> {
+        Service::delivery_cancel(self, id)
+    }
+}
+
+/// Production broker client preserving the existing Unix-socket call path.
+pub(crate) struct SocketBroker {
+    /// Agent-run home whose private socket receives each request.
+    home: PathBuf,
+}
+
+impl CliBroker for SocketBroker {
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
+        Box::pin(transport::socket::client(&self.home, method, params))
+    }
+}
+
+/// Dependencies for one CLI execution, with production implementations supplied by [`run`].
+pub struct CliDependencies {
+    /// Service used by local read/write commands.
+    pub service: Arc<dyn CliService>,
+    /// Resident broker used by admission and wait commands.
+    pub broker: Arc<dyn CliBroker>,
+    /// JSON sink; production writes one newline-delimited value to stdout.
+    pub output: CliOutput,
+    /// Structured doctor report provider.
+    pub doctor: DoctorRunner,
+}
+
+impl CliDependencies {
+    /// Builds the default production dependencies for one resolved home.
+    pub fn production(home: PathBuf) -> Self {
+        Self {
+            service: Arc::new(Service::new(home.clone())),
+            broker: Arc::new(SocketBroker { home }),
+            output: Arc::new(emit),
+            doctor: Arc::new(crate::doctor::run),
+        }
+    }
+}
 /// The Python-compatible operator command line.
 ///
 /// This parser is intentionally the single source of command names and flag
@@ -679,14 +797,24 @@ async fn login(
 /// JSON error envelope. `start` and `resume` exclusively call the resident
 /// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
+    let home = fs::home(cli.home.clone())?;
+    run_with(cli, CliDependencies::production(home)).await
+}
+
+/// Executes one parsed command against explicitly supplied service, broker, and output seams.
+///
+/// The parser and command surface are unchanged. Production callers use [`run`], which supplies
+/// the real service, Unix-socket broker, and stdout sink; tests can provide fakes without opening
+/// a broker socket or constructing a local runtime. The supplied dependencies remain borrowed by
+/// asynchronous calls only for the duration of this execution.
+pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
     let home = fs::home(cli.home)?;
-    let service = Service::new(home.clone());
     match cli.command {
-        Command::Init => emit(&crate::init::initialize(&home)?)?,
+        Command::Init => (dependencies.output)(&crate::init::initialize(&home)?)?,
         Command::Doctor => {
-            let report = crate::doctor::run(&home)?;
+            let report = (dependencies.doctor)(&home)?;
             let ok = report.ok();
-            emit(&serde_json::to_value(report)?)?;
+            (dependencies.output)(&serde_json::to_value(report)?)?;
             return Ok(if ok { 0 } else { 2 });
         }
         Command::Start(a) => {
@@ -721,16 +849,20 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 required_constraints: BTreeSet::<Constraint>::new(),
             };
             request.validate()?;
-            let result =
-                transport::socket::client(&home, "start", serde_json::to_value(request)?).await?;
-            emit(&admission_output(&result)?)?;
+            let result = dependencies
+                .broker
+                .call("start", serde_json::to_value(request)?)
+                .await?;
             if a.wait {
                 let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
-                let result =
-                    transport::socket::client(&home, "wait", json!({"agent_id":id})).await?;
-                emit(&result)?;
+                let result = dependencies
+                    .broker
+                    .call("wait", json!({"agent_id": id}))
+                    .await?;
+                (dependencies.output)(&result)?;
                 return Ok(result_code(&result));
             }
+            (dependencies.output)(&admission_output(&result)?)?;
         }
         Command::Resume(a) => {
             let task = match (a.task, a.task_file) {
@@ -739,11 +871,21 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 (None, Some(path)) => read_input(&path, 1024 * 1024)?,
                 _ => return Err(invalid("provide exactly one resume task source")),
             };
-            let result=transport::socket::client(&home,"resume",json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?})).await?;
-            emit(&admission_output(&result)?)?;
+            let result = dependencies
+                .broker
+                .call(
+                    "resume",
+                    json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?}),
+                )
+                .await?;
+            (dependencies.output)(&admission_output(&result)?)?;
         }
-        Command::Cancel { agent_id } => emit(&service.cancel(&agent_id)?)?,
-        Command::Steer { agent_id, text } => emit(&service.steer(&agent_id, &text)?)?,
+        Command::Cancel { agent_id } => {
+            (dependencies.output)(&dependencies.service.cancel(&agent_id)?)?
+        }
+        Command::Steer { agent_id, text } => {
+            (dependencies.output)(&dependencies.service.steer(&agent_id, &text)?)?
+        }
         Command::Bind(a) => {
             let reference = OrchestratorRef {
                 transport: a.session_transport,
@@ -757,7 +899,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 reference,
                 crate::domain::now(),
             )?;
-            emit(&store.delivery_status(&a.agent_id)?)?;
+            (dependencies.output)(&store.delivery_status(&a.agent_id)?)?;
         }
         Command::Context(a) => {
             let reference = OrchestratorRef {
@@ -765,7 +907,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 external_session_id: a.session_id,
                 external_turn_id: a.session_turn_id,
             };
-            emit(&serde_json::to_value(hooks::context::build(
+            (dependencies.output)(&serde_json::to_value(hooks::context::build(
                 &home, &reference, None,
             )?)?)?;
         }
@@ -783,20 +925,21 @@ pub async fn run(cli: Cli) -> Result<i32> {
                     } else {
                         json!({})
                     };
-                    emit(&output)?;
+                    (dependencies.output)(&output)?;
                 }
                 Hook::Bind(transport) => {
                     let mut store = Store::open(&home)?;
                     let result =
                         hooks::bind::run_hook(&mut store, &payload, &transport.transport, None)?;
-                    emit(
+                    (dependencies.output)(
                         &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
                     )?;
                 }
             }
         }
-        Command::Agents(a) => emit(
-            &service
+        Command::Agents(a) => (dependencies.output)(
+            &dependencies
+                .service
                 .list(Query {
                     active: a.active,
                     offset: a.offset,
@@ -808,8 +951,8 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 .await?,
         )?,
         Command::Answer { agent_id } => {
-            let value = service.answer(&agent_id)?;
-            emit(&value)?;
+            let value = dependencies.service.answer(&agent_id)?;
+            (dependencies.output)(&value)?;
         }
         Command::Transcript {
             agent_id,
@@ -818,7 +961,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             follow,
             full,
         } => loop {
-            let page = service.transcript(&agent_id, cursor, limit)?;
+            let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
             if full {
                 let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
                 let mut page_cursor = cursor;
@@ -832,16 +975,18 @@ pub async fn run(cli: Cli) -> Result<i32> {
                         return Err(invalid("transcript pagination did not advance"));
                     }
                     page_cursor = next;
-                    current = service.transcript(&agent_id, page_cursor, limit)?;
+                    current = dependencies
+                        .service
+                        .transcript(&agent_id, page_cursor, limit)?;
                     messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
                     pages += 1;
                 }
-                emit(
+                (dependencies.output)(
                     &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
                 )?;
                 break;
             }
-            emit(&page)?;
+            (dependencies.output)(&page)?;
             if let Some(seq) = page["messages"]
                 .as_array()
                 .and_then(|a| a.last())
@@ -852,18 +997,27 @@ pub async fn run(cli: Cli) -> Result<i32> {
             if !follow {
                 break;
             }
-            if page["complete"] == true && Store::open(&home)?.get(&agent_id)?.status.terminal() {
+            if page["complete"] == true
+                && dependencies.service.agent(&agent_id)?["status"]
+                    .as_str()
+                    .is_some_and(|status| {
+                        matches!(
+                            status,
+                            "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
+                        )
+                    })
+            {
                 break;
             }
             tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
         },
-        Command::Models => emit(&service.models().await?)?,
-        Command::Limits => emit(&service.limits()?)?,
+        Command::Models => (dependencies.output)(&dependencies.service.models().await?)?,
+        Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
-            emit(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;
+            (dependencies.output)(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;
         }
-        Command::Mcp => transport::mcp::serve(home, None).await?,
+        Command::Mcp => transport::mcp::serve_with(home, None, dependencies.broker.clone()).await?,
         Command::Api { command } => match command {
             Api::Serve { socket } => {
                 if let Some(socket) = socket {
@@ -888,7 +1042,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
             )?)?,
         },
         Command::Capacity { command } => match command {
-            Capacity::Order => emit(&service.capacity_order()?)?,
+            Capacity::Order => (dependencies.output)(&dependencies.service.capacity_order()?)?,
             Capacity::Launchd {
                 binary,
                 label,
@@ -905,13 +1059,17 @@ pub async fn run(cli: Cli) -> Result<i32> {
             )?)?,
             Capacity::Collect { once: _ } => {
                 let result = capacity::collect(&home).await?;
-                emit(&result)?;
+                (dependencies.output)(&result)?;
                 return Ok(if result["ok"] == true { 0 } else { 2 });
             }
         },
         Command::Delivery { command } => match command {
-            Delivery::Status { agent_id } => emit(&service.delivery_status(&agent_id)?)?,
-            Delivery::Cancel { delivery_id } => emit(&service.delivery_cancel(&delivery_id)?)?,
+            Delivery::Status { agent_id } => {
+                (dependencies.output)(&dependencies.service.delivery_status(&agent_id)?)?
+            }
+            Delivery::Cancel { delivery_id } => {
+                (dependencies.output)(&dependencies.service.delivery_cancel(&delivery_id)?)?
+            }
             Delivery::Launchd {
                 binary,
                 label,
@@ -927,7 +1085,9 @@ pub async fn run(cli: Cli) -> Result<i32> {
                 stderr_log.unwrap_or_else(|| home.join("delivery-worker.err.log")),
             )?)?,
             Delivery::Dispatch => {
-                emit(&json!({"processed":crate::delivery::dispatch_once(&home).await?}))?;
+                (dependencies.output)(
+                    &json!({"processed":crate::delivery::dispatch_once(&home).await?}),
+                )?;
             }
         },
         Command::Login { runtime, account } => {
