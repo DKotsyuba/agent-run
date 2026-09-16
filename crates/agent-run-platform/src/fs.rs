@@ -2,7 +2,7 @@
 use agent_run_domain::{error::invalid, Error, Result};
 use sha2::{Digest, Sha256};
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString, OsString},
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::{
@@ -87,6 +87,18 @@ pub enum FaultPoint {
     /// `path` now holds the new bytes; only the parent-directory sync is left.
     AfterRename,
 }
+/// A no-follow classification of one entry beneath an owned directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    /// A real directory.
+    Directory,
+    /// A regular file.
+    File,
+    /// A symbolic link, never dereferenced by this module.
+    Symlink,
+    /// A device, FIFO, socket, or other unsupported entry.
+    Special,
+}
 pub struct Dir(File);
 impl Dir {
     pub fn open(path: &Path) -> Result<Self> {
@@ -95,6 +107,132 @@ impl Dir {
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(path)?;
         Ok(Self(f))
+    }
+    /// List a directory through its descriptor without following path links.
+    ///
+    /// `path` is relative to this directory; `None` lists this directory. The
+    /// names are sorted bytewise and omit `.` and `..`.
+    pub fn list(&self, path: Option<&Path>) -> Result<Vec<OsString>> {
+        let file = match path {
+            Some(path) => self.open_directory(path)?,
+            None => self.0.try_clone()?,
+        };
+        // SAFETY: `into_raw_fd` transfers the duplicate descriptor to libc;
+        // `closedir` below owns and closes it on every normal return.
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(file);
+        // SAFETY: `raw` is a valid directory descriptor owned by this call.
+        let directory = unsafe { libc::fdopendir(raw) };
+        if directory.is_null() {
+            // SAFETY: fdopendir did not take ownership on failure.
+            unsafe { libc::close(raw) };
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: errno is thread-local; clearing it distinguishes EOF
+            // from a readdir failure without observing any other thread.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            // SAFETY: errno is thread-local; see the macOS branch above.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            // SAFETY: `directory` remains valid until closed below.
+            let entry = unsafe { libc::readdir(directory) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: closes the libc-owned descriptor exactly once.
+                unsafe { libc::closedir(directory) };
+                if error.raw_os_error().is_some_and(|code| code != 0) {
+                    return Err(error.into());
+                }
+                break;
+            }
+            // SAFETY: d_name is NUL-terminated by readdir for this entry.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                use std::os::unix::ffi::OsStringExt;
+                names.push(OsString::from_vec(name.to_vec()));
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+    /// Classify a final path entry without following it or any parent link.
+    pub fn entry_type(&self, path: &Path) -> Result<EntryType> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: the descriptor/name are live and fstatat does not retain them.
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: query the final entry itself rather than following a link.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &mut status,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let kind = status.st_mode & libc::S_IFMT;
+        Ok(if kind == libc::S_IFDIR {
+            EntryType::Directory
+        } else if kind == libc::S_IFREG {
+            EntryType::File
+        } else if kind == libc::S_IFLNK {
+            EntryType::Symlink
+        } else {
+            EntryType::Special
+        })
+    }
+    /// Read a final symbolic-link target without following it or its parents.
+    pub fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let (parent, name) = self.parent(path, false)?;
+        let mut buffer = vec![0_u8; 4096];
+        // SAFETY: the descriptor/name/buffer remain valid for this call.
+        let count = unsafe {
+            libc::readlinkat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        if count as usize == buffer.len() {
+            return Err(invalid("managed link target exceeds bound"));
+        }
+        buffer.truncate(count as usize);
+        use std::os::unix::ffi::OsStringExt;
+        Ok(Some(PathBuf::from(OsString::from_vec(buffer))))
+    }
+    /// Open a real child directory through no-follow descriptors.
+    fn open_directory(&self, path: &Path) -> Result<File> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: descriptor/name remain live for this system call.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: this call owns the fresh descriptor.
+        Ok(unsafe { File::from_raw_fd(raw) })
     }
     fn parent(&self, path: &Path, create: bool) -> Result<(File, CString)> {
         let parts = relative(path)?;

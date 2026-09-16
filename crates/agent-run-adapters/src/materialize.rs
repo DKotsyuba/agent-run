@@ -4,8 +4,10 @@ use agent_run_config::{
     profiles::Profile,
 };
 use agent_run_domain::{domain::StartRequest, error::invalid, Error, Result};
-use agent_run_platform::fs::{self, Dir};
-use serde::{Deserialize, Serialize};
+use agent_run_platform::{
+    fs::{self, Dir},
+    snapshot_tree,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -73,21 +75,23 @@ pub fn apply_environment_overrides(
 ) {
     environment.extend(overrides);
 }
-pub const SNAPSHOT: &str = ".agent-run-rust-snapshot.json";
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Launch-time paths derived while materializing one generated home.
+///
+/// The durable proof is the Python-v1 runtime index; this value deliberately
+/// remains process-local because plugin launch paths are not snapshot metadata.
+#[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    pub version: u32,
-    pub files: BTreeMap<String, String>,
-    pub links: BTreeMap<String, String>,
     pub plugin_paths: Vec<PathBuf>,
     pub plugin_roots: BTreeMap<String, PathBuf>,
 }
+/// Builds one Python-v1 managed runtime home before its manifest/index freeze.
 pub struct Publisher {
     pub root: PathBuf,
     dir: Dir,
     pub snapshot: Snapshot,
     total: usize,
+    files: BTreeMap<String, String>,
+    links: BTreeMap<String, String>,
 }
 impl Publisher {
     pub fn new(root: &Path) -> Result<Self> {
@@ -95,14 +99,10 @@ impl Publisher {
         Ok(Self {
             root: root.into(),
             dir: Dir::open(root)?,
-            snapshot: Snapshot {
-                version: 1,
-                files: BTreeMap::new(),
-                links: BTreeMap::new(),
-                plugin_paths: vec![],
-                plugin_roots: BTreeMap::new(),
-            },
+            snapshot: Snapshot::default(),
             total: 0,
+            files: BTreeMap::new(),
+            links: BTreeMap::new(),
         })
     }
     pub fn file(&mut self, path: &str, bytes: &[u8], mode: u32) -> Result<()> {
@@ -111,7 +111,7 @@ impl Publisher {
             return Err(invalid("generated assets exceed 256 MiB"));
         }
         self.dir.write(Path::new(path), bytes, mode)?;
-        self.snapshot.files.insert(path.into(), fs::sha256(bytes));
+        self.files.insert(path.into(), fs::sha256(bytes));
         Ok(())
     }
     pub fn json(&mut self, path: &str, value: &Value) -> Result<()> {
@@ -127,115 +127,49 @@ impl Publisher {
             return Err(invalid("credential source must be a regular file"));
         }
         self.dir.symlink(&real, Path::new(path))?;
-        self.snapshot
-            .links
+        self.links
             .insert(path.into(), real.to_string_lossy().into_owned());
         Ok(())
     }
     pub fn tree(&mut self, source: &Path, prefix: &str, selected: Option<&[String]>) -> Result<()> {
-        let source = source.to_path_buf();
-        let input = Dir::open(&source)?;
-        fn walk(
-            p: &mut Publisher,
-            root: &Path,
-            input: &Dir,
-            relative: &Path,
-            prefix: &str,
-            selected: Option<&[String]>,
-        ) -> Result<()> {
-            let mut entries = std::fs::read_dir(root.join(relative))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            entries.sort_by_key(|e| e.file_name());
-            for entry in entries {
-                let name = entry.file_name();
-                if name == ".git" || name == "__pycache__" {
-                    continue;
-                }
-                let rel = relative.join(name);
-                let include = selected
-                    .map(|s| {
-                        s.iter()
-                            .any(|a| rel.starts_with(a) || Path::new(a).starts_with(&rel))
-                    })
-                    .unwrap_or(true);
-                if !include {
-                    continue;
-                }
-                let meta = std::fs::symlink_metadata(entry.path())?;
-                if meta.file_type().is_symlink() {
-                    return Err(invalid("snapshot source contains a symlink"));
-                }
-                let output = format!(
-                    "{prefix}/{}",
-                    rel.to_str()
-                        .ok_or_else(|| invalid("snapshot paths must be UTF-8"))?
-                );
-                if meta.is_dir() {
-                    p.dir.directory(Path::new(&output))?;
-                    walk(p, root, input, &rel, prefix, selected)?;
-                } else if meta.is_file() {
-                    let bytes = input.read(&rel, 16 * 1024 * 1024)?;
-                    p.file(
-                        &output,
-                        &bytes,
-                        if meta.permissions().mode() & 0o111 != 0 {
-                            0o700
-                        } else {
-                            0o600
-                        },
-                    )?;
-                } else {
-                    return Err(invalid("snapshot source contains a special file"));
-                }
-            }
-            Ok(())
-        }
-        if let Some(assets) = selected {
-            for a in assets {
-                fs::relative(Path::new(a))?;
-                if !source.join(a).exists() {
-                    return Err(invalid("declared plugin asset is missing"));
-                }
-            }
-        }
-        self.dir.directory(Path::new(prefix))?;
-        walk(self, &source, &input, Path::new(""), prefix, selected)
+        snapshot_tree::snapshot_managed_tree(&self.root, Path::new(prefix), source, selected)
+            .map(drop)
     }
+    /// Bind adapter-owned files and links into the Python-v1 runtime index.
     pub fn finish(self) -> Result<(Snapshot, String)> {
-        let data = serde_json::to_vec(&self.snapshot)?;
-        let sha = fs::sha256(&data);
-        self.dir.write(Path::new(SNAPSHOT), &data, 0o600)?;
-        Ok((self.snapshot, sha))
+        let revision = agent_run_domain::canonical::sha256_hex(
+            &json!({"files": self.files, "links": self.links}),
+            true,
+        );
+        let digest = snapshot_tree::finalize_runtime_snapshots(
+            &self.root,
+            &revision,
+            &self.files.into_keys().collect::<Vec<_>>(),
+            &self.links.into_iter().collect::<Vec<_>>(),
+        )?;
+        Ok((self.snapshot, digest))
     }
 }
 pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
     let dir = Dir::open(root)?;
-    let data = dir.read(Path::new(SNAPSHOT), 1024 * 1024)?;
-    if fs::sha256(&data) != expected {
+    let raw = dir.read(Path::new(snapshot_tree::RUNTIME_SNAPSHOT_INDEX), 64 * 1024)?;
+    let revision = serde_json::from_slice::<Value>(&raw)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("materialize_revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| Error::Integrity("runtime snapshot index is malformed".into()))?;
+    let inspection = snapshot_tree::inspect_runtime_snapshots(root, &revision, expected)
+        .map_err(|_| Error::Integrity("runtime snapshot index was modified".into()))?;
+    if !inspection.verified {
         return Err(Error::Integrity(
-            "runtime snapshot index was modified".into(),
+            "generated runtime snapshot was modified".into(),
         ));
     }
-    let snapshot: Snapshot = serde_json::from_slice(&data)?;
-    if snapshot.version != 1 {
-        return Err(invalid("unsupported runtime snapshot version"));
-    }
-    for (name, digest) in &snapshot.files {
-        let b = dir.read(Path::new(name), 16 * 1024 * 1024)?;
-        if fs::sha256(&b) != *digest {
-            return Err(Error::Integrity(
-                "generated runtime artifact was modified".into(),
-            ));
-        }
-    }
-    for (name, target) in &snapshot.links {
-        fs::relative(Path::new(name))?;
-        let current = std::fs::read_link(root.join(name))?;
-        if current != Path::new(target) {
-            return Err(Error::Integrity("credential bridge target changed".into()));
-        }
-    }
-    Ok(snapshot)
+    Ok(Snapshot::default())
 }
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
