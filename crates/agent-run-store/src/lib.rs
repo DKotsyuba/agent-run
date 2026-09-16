@@ -32,6 +32,23 @@ use std::{
 };
 pub const VERSION: i64 = 16;
 pub const ACTIVE_SQL: &str = "('created','starting','running','cancelling')";
+/// How long an ordinary store connection waits out a competing writer before
+/// giving up with `SQLITE_BUSY`.
+///
+/// Mirrors `PRAGMA busy_timeout=5000` in `src/agent_run/state/db.py`. It is
+/// deliberately short: a normal caller blocked this long is reporting real
+/// contention, and hiding that behind a longer wait would trade a fast, visible
+/// failure for an unbounded stall.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the schema-migration connection waits out a competing writer.
+///
+/// Mirrors `PRAGMA busy_timeout=30000` in `src/agent_run/state/migrations.py`,
+/// and is deliberately six times `BUSY_TIMEOUT`: migrations are serialized
+/// across threads and processes by `migrations::SchemaLock`, so every extra
+/// opener of an out-of-date store waits for all upgrades queued ahead of it.
+/// During a rollout that queue routinely outlasts `BUSY_TIMEOUT`, and an
+/// upgrade is the one write nobody can replay, so waiting beats failing.
+pub(crate) const MIGRATION_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Store {
     pub conn: Connection,
     pub home: PathBuf,
@@ -242,7 +259,7 @@ impl Store {
             migrations::migrate(&path)?;
         }
         let conn = Connection::open(&path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 && create {

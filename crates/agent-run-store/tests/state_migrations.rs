@@ -530,6 +530,48 @@ fn incomplete_versioned_store_is_refused_without_mutation() {
     assert_eq!(user_version(&open_ro(&db_path)), 1);
 }
 
+/// Guards the two-tier busy-timeout parity with Python, which has no single
+/// mirrored test: `src/agent_run/state/migrations.py:132` gives the migration
+/// connection `PRAGMA busy_timeout=30000`, while ordinary connections get
+/// `PRAGMA busy_timeout=5000` at `src/agent_run/state/db.py:843`.
+///
+/// A store held exclusively for longer than the ordinary ceiling but well
+/// inside the migration one must still migrate: the upgrade waits the holder
+/// out rather than failing with "database is locked". The second assertion
+/// pins the sibling value, so raising the ordinary timeout to make the first
+/// one pass is itself a failure.
+#[test]
+fn migration_waits_past_the_ordinary_busy_timeout_for_a_locked_store() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    drop(build_fixture(&db_path, 1));
+
+    let holder_path = db_path.clone();
+    let (locked, held) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let conn = Connection::open(&holder_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(6_500));
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+    held.recv().unwrap();
+
+    assert_eq!(migrations::migrate(&db_path).unwrap(), VERSION);
+    holder.join().unwrap();
+
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        5_000
+    );
+}
+
 /// Mirrors `tests/test_state_migrations.py::MigrationDiagnosticsTests::test_read_only_snapshot_reports_the_pending_migration`.
 #[test]
 fn read_only_snapshot_refuses_a_pending_migration_without_mutation() {

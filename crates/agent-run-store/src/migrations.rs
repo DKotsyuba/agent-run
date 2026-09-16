@@ -298,6 +298,13 @@ fn apply_pending(conn: &Connection, path: &Path) -> Result<i64> {
 /// Returns 0 for a database that carries no version stamp at all -- it is
 /// not an agent-run store, and the caller's schema validation owns that
 /// refusal.
+///
+/// The connection opened here waits `super::MIGRATION_BUSY_TIMEOUT` on a busy
+/// store instead of the ordinary `super::BUSY_TIMEOUT`, matching
+/// `src/agent_run/state/migrations.py`. Concurrent openers of an out-of-date
+/// store queue behind each other on [`SchemaLock`], so the last one in line
+/// waits out every upgrade ahead of it; at the ordinary ceiling that queue
+/// surfaces as a spurious `DatabaseBusy` during an otherwise healthy upgrade.
 pub fn migrate(path: &Path) -> Result<i64> {
     if !path.is_file() {
         return Err(invalid(format!(
@@ -306,6 +313,7 @@ pub fn migrate(path: &Path) -> Result<i64> {
         )));
     }
     let conn = Connection::open(path)?;
+    conn.busy_timeout(super::MIGRATION_BUSY_TIMEOUT)?;
     let version = version_of(&conn)?;
     if version == 0 {
         return Ok(0);
