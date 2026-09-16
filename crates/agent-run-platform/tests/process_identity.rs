@@ -38,6 +38,16 @@ fn missing_or_unproven_identity_is_not_automatically_death() {
     assert_eq!(process::observe(Some(0), None, None), ProcessState::Unknown);
 }
 
+// A missing OS PID is affirmative death evidence even when an old row has no
+// birth-time proof; this is distinct from an unsafe/unavailable PID probe.
+#[test]
+fn missing_pid_without_birth_is_a_dead_verdict() {
+    assert_eq!(
+        process::observe(Some(i32::MAX), None, None),
+        ProcessState::Dead
+    );
+}
+
 #[test]
 fn native_process_enumeration_includes_this_process() {
     let self_pid = std::process::id() as i32;

@@ -311,6 +311,20 @@ async fn normal_run_produces_verifiable_terminal_evidence() {
         .unwrap()
         .expect("process_cleanup event recorded");
     assert_eq!(cleanup["confirmed"], json!(true));
+    let store = Store::open(&home).unwrap();
+    let (ready_seq, preparing_seq): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT \
+                (SELECT seq FROM events WHERE agent_id=? AND kind='supervisor_ready'), \
+                (SELECT seq FROM events WHERE agent_id=? AND kind='phase' AND json_extract(data_json,'$.phase')='preparing')",
+            rusqlite::params![row.id.as_str(), row.id.as_str()],
+            |value| Ok((value.get(0)?, value.get(1)?)),
+        )
+        .unwrap();
+    assert!(ready_seq < preparing_seq, "READY must precede preparation");
+    assert!(row.supervisor_pid.is_some());
+    assert!(row.supervisor_birth_time.is_some());
     let answer = Service::new(home.clone()).answer(&row.id).unwrap();
     assert_eq!(answer["available"], json!(true));
     assert_eq!(answer["content"], json!("fixture final answer\n"));
@@ -613,6 +627,35 @@ async fn descendant_process_is_reaped_before_finish() {
     assert_eq!(cleanup["descendants_gone"], json!(true));
 }
 
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_escaped_descendant_is_reported_and_cleaned_by_fixture_owner`.
+///
+/// Group cleanup must not signal an escaped descendant individually, and its
+/// unconfirmed cleanup evidence must remain separate from the runtime result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escaped_descendant_is_not_signalled_and_does_not_change_runtime_outcome() {
+    let (_tmp, home) = home();
+    let row = run_task(&home, "fixture:escaped-descendant").await;
+    assert_eq!(row.status, Status::Succeeded);
+    let cleanup = Store::open(&home)
+        .unwrap()
+        .last_event(&row.id, "process_cleanup")
+        .unwrap()
+        .expect("process_cleanup event recorded");
+    assert_eq!(cleanup["scope"], json!("verified_descendants"));
+    assert_eq!(cleanup["group_gone"], json!(true));
+    assert_eq!(cleanup["descendants_gone"], json!(false));
+    assert_eq!(cleanup["confirmed"], json!(false));
+    let escaped: i32 = std::fs::read_to_string(home.join("escaped.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The supervisor sent only its verified group signal; the escaped child
+    // remains alive until this test-owned fixture cleanup.
+    assert_eq!(unsafe { libc::kill(escaped, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(escaped, libc::SIGKILL) }, 0);
+}
+
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_cancel_queued_before_launch_cannot_orphan_the_engine`.
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_cancel_accepted_at_terminal_barrier_cannot_be_lost`.
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_final_drain_completes_late_cancel_steer_and_unknown`.
@@ -834,6 +877,65 @@ async fn ready_accepts_a_cancelling_admission_before_engine_spawn() {
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Cancelled
     );
+}
+
+/// Mirrors `tests/test_supervisor.py::SupervisorTests::test_cancel_accepted_at_terminal_barrier_cannot_be_lost`.
+///
+/// The trigger injects a cancel during the terminal update itself, exercising
+/// the terminal barrier without depending on a wall-clock race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_race_cancel_leaves_fsm_and_cleanup_evidence_valid() {
+    let (_tmp, home) = home();
+    let id = admit(&home, "hello");
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "CREATE TRIGGER inject_terminal_cancel BEFORE UPDATE OF status ON agents \
+             WHEN NEW.status='succeeded' BEGIN \
+               INSERT INTO commands(agent_id,kind,payload_json,state,created_at) \
+               VALUES(NEW.id,'cancel','{}','pending',0); \
+             END",
+            [],
+        )
+        .unwrap();
+    let mut child = spawn_supervisor(&home, &id);
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor timed out")
+        .expect("wait on supervisor");
+    assert!(status.success());
+
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT state FROM commands WHERE agent_id=?",
+                [id.as_str()],
+                |value| value.get::<_, String>(0),
+            )
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT result_json FROM commands WHERE agent_id=?",
+                [id.as_str()],
+                |value| value.get::<_, String>(0),
+            )
+            .unwrap(),
+        r#"{"accepted":true,"reason":"already_stopping"}"#
+    );
+    let cleanup = store
+        .last_event(&id, "process_cleanup")
+        .unwrap()
+        .expect("cleanup evidence");
+    assert_eq!(cleanup["confirmed"], json!(true));
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_unkillable_cancel_is_failed_not_coerced_to_cancelled`.

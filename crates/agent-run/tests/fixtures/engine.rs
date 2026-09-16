@@ -112,6 +112,23 @@ fn main() {
         // descendant while this leader is still alive.
         std::thread::sleep(Duration::from_millis(500));
     }
+    if task == "fixture:escaped-descendant" {
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().expect("fixture exe path");
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(exe)
+            .arg("--child-sleep")
+            .arg("10")
+            .process_group(0)
+            .spawn()
+            .expect("fixture escaped descendant spawn");
+        let marker = std::env::current_dir()
+            .expect("fixture workdir")
+            .join("escaped.pid");
+        std::fs::write(marker, child.id().to_string()).expect("fixture escaped pid");
+        std::thread::sleep(Duration::from_millis(500));
+    }
     if task == "fixture:missing-result" {
         return;
     }

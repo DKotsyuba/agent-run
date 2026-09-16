@@ -7,7 +7,7 @@
 //! replayed forward), so no Python process runs at test time.
 use agent_run_store::{migrations, Store, VERSION};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, DatabaseName};
 use std::path::Path;
 
 const V1_SCHEMA: &str = include_str!("fixtures/schema_v1.sql");
@@ -237,6 +237,85 @@ fn failed_migration_rolls_back_and_leaves_the_pre_migration_backup() {
     let conn = open_ro(&db_path);
     assert_eq!(user_version(&conn), 1);
     assert_eq!(agent_count(&conn), V1_AGENTS.len() as i64);
+}
+
+/// Mirrors `tests/test_state_migrations.py::MigrationRefusalTests::test_failed_migration_rolls_back_and_leaves_the_backup`.
+/// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_migration_is_idempotent_and_clears_a_stale_backup`.
+///
+/// Exercise the durable states surrounding a commit: an uncommitted change is
+/// discarded, a killed/failed migration leaves its pre-version snapshot, and a
+/// post-commit stale snapshot is removed on the next open.
+#[test]
+fn migration_commit_boundaries_leave_consistent_recovery_state() {
+    // Before commit: closing a connection with an open migration transaction
+    // models a process crash before SQLite made the schema change durable.
+    let before = tempfile::tempdir().unwrap();
+    let before_path = before.path().join("state.db");
+    let conn = build_fixture(&before_path, 1);
+    insert_v1_agents(&conn);
+    let before_backup = migrations::backup_path(&before_path, 2);
+    conn.backup(DatabaseName::Main, &before_backup, None)
+        .unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE crash_before_commit(value TEXT)")
+        .unwrap();
+    drop(conn);
+    let before_live = open_ro(&before_path);
+    assert_eq!(user_version(&before_live), 1);
+    assert_eq!(agent_count(&before_live), V1_AGENTS.len() as i64);
+    assert!(
+        before_live
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='crash_before_commit'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 0
+    );
+    assert_eq!(user_version(&open_ro(&before_backup)), 1);
+
+    // During commit: a migration statement failure rolls back all prior DDL
+    // and retains the snapshot that explains where recovery should resume.
+    let during = tempfile::tempdir().unwrap();
+    let during_path = during.path().join("state.db");
+    let conn = build_fixture(&during_path, 1);
+    insert_v1_agents(&conn);
+    let failure = migrations::apply_one(
+        &conn,
+        &during_path,
+        2,
+        "CREATE TABLE crash_during_commit(value TEXT); SELECT no_such_function();",
+    )
+    .unwrap_err();
+    assert!(failure.to_string().contains("rolled back"));
+    assert_eq!(user_version(&conn), 1);
+    assert_eq!(agent_count(&conn), V1_AGENTS.len() as i64);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='crash_during_commit'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    assert!(migrations::backup_path(&during_path, 2).is_file());
+
+    // After commit: the current version is authoritative and a leftover
+    // pre-version snapshot is understood cleanup state, not a downgrade cue.
+    let after = tempfile::tempdir().unwrap();
+    let after_path = after.path().join("state.db");
+    drop(build_fixture(&after_path, 1));
+    assert_eq!(migrations::migrate(&after_path).unwrap(), VERSION);
+    let after_backup = migrations::backup_path(&after_path, VERSION);
+    let current = Connection::open(&after_path).unwrap();
+    current
+        .backup(DatabaseName::Main, &after_backup, None)
+        .unwrap();
+    drop(current);
+    assert_eq!(migrations::migrate(&after_path).unwrap(), VERSION);
+    assert_eq!(user_version(&open_ro(&after_path)), VERSION);
+    assert!(!after_backup.exists());
 }
 
 /// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_stale_backup_cleanup_spares_newer_versions_snapshots`.
