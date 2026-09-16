@@ -1379,3 +1379,148 @@ async fn expired_send_lease_is_claim_lost_and_reclaimable() {
         .unwrap();
     assert_eq!(state, "delivered");
 }
+
+/// Mirrors `tests/test_delivery_dispatch.py::DeliveryDispatchTests::test_unexpected_transport_error_is_sanitized_and_releases_claim`
+///
+/// A transport outcome the dispatcher does not understand is recorded as a
+/// bounded classifier rather than raw detail, and the claim it held is released
+/// so the row can never be stranded mid-send.
+#[tokio::test]
+async fn unexpected_transport_outcome_is_sanitized_and_releases_the_claim() {
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_sanitized", "surprise-transport-detail", "pending");
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let row: (String, Option<String>, Option<String>, Option<f64>) =
+        Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state,last_error,lease_owner,lease_until FROM deliveries WHERE id='ntf_sanitized'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!(row.0, "failed");
+    let recorded = row.1.expect("an unusable transport is diagnosed");
+    assert_eq!(recorded, "unsupported_transport");
+    assert!(
+        !recorded.contains("surprise-transport-detail"),
+        "the persisted diagnosis must not echo transport detail: {recorded}"
+    );
+    assert_eq!(row.2, None, "the lease owner must be released");
+    assert_eq!(row.3, None, "the lease deadline must be cleared");
+}
+
+/// Mirrors `tests/test_delivery_dispatch.py::DeliveryDispatchTests::test_unsupported_flock_is_loud_not_contention`
+///
+/// Advisory locking that cannot be performed at all is a filesystem defect, not
+/// a peer holding the dispatcher: it is raised, never silently reported as the
+/// quiet "another drain owns it" outcome that would drop the backlog forever.
+#[tokio::test]
+async fn unusable_dispatcher_lock_is_loud_not_contention() {
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_flock", "codex_queue", "pending");
+    std::fs::create_dir_all(home.path.join("locks/delivery-dispatcher.lock")).unwrap();
+    let result = dispatch(&home.path).await;
+    let error = result
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            panic!(
+                "an unusable dispatcher lock must be raised, got {:?}",
+                result.as_ref().ok()
+            )
+        });
+    assert!(!error.is_empty());
+    assert!(
+        dispatch_once(&home.path).await.is_err(),
+        "the single-shot drain must fail loudly too"
+    );
+    let state: String = Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM deliveries WHERE id='ntf_flock'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending", "a refused lock must not consume the notice");
+}
+
+/// Mirrors `tests/test_delivery_dispatch.py::DeliveryDispatchTests::test_notice_for_tolerates_rows_without_metadata_projection`
+///
+/// Launch metadata is optional decoration on an already queued notice: a row
+/// whose runtime, model, effort, and failure columns are absent or blank still
+/// projects into a valid notice and renders the unknown/unspecified placeholders
+/// instead of blocking the delivery.
+#[tokio::test]
+async fn notice_projection_tolerates_rows_without_metadata() {
+    let home = common::Home::new();
+    delivery_config(&home.path, 1.0, 1.0, 5);
+    delivery(&home.path, "ntf_bare", "codex_queue", "pending");
+    Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE agents SET runtime='',model='   ',request_json='',failure_kind=NULL WHERE id=?",
+            params!["ag-20260825-120000-0123456789"],
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_once(&home.path).await.unwrap(),
+        1,
+        "a metadata-free row is still claimed and attempted"
+    );
+    let row: (String, u32) = Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT state,attempts FROM deliveries WHERE id='ntf_bare'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        ("retry_wait".into(), 1),
+        "absent metadata must not fail the projection"
+    );
+    let bare = Notice {
+        notification_id: "ntf_old".into(),
+        agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
+        status: Status::Succeeded,
+        runtime: None,
+        model: None,
+        effort: None,
+        failure_kind: None,
+    };
+    assert!(bare
+        .render()
+        .unwrap()
+        .contains("- Runtime/model: unknown/unknown:unspecified\n"));
+}
+
+/// Mirrors `tests/test_delivery_dispatch.py::DeliveryDispatchTests::test_constructor_validates_config_and_every_transport`
+///
+/// Python validates the delivery policy once per transport object at dispatcher
+/// construction. Rust dispatches on a transport string and has no transport
+/// objects, so the equivalent gate is configuration load, which must reject a
+/// negative attempt budget and a negative retry ceiling before any drain runs.
+#[test]
+fn delivery_configuration_rejects_negative_attempt_and_retry_bounds() {
+    let home = common::Home::new();
+    let path = home.path.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    for policy in [
+        "[delivery]\nmax_attempts=-1\n",
+        "[delivery]\nretry_cap_seconds=-1\n",
+        "[delivery]\nretry_base_seconds=-1\n",
+    ] {
+        std::fs::write(&path, format!("{original}\n{policy}")).unwrap();
+        assert!(
+            agent_run_config::config::Config::load(&home.path).is_err(),
+            "invalid delivery policy accepted: {policy}"
+        );
+    }
+    std::fs::write(&path, &original).unwrap();
+    agent_run_config::config::Config::load(&home.path)
+        .expect("the baseline delivery policy stays loadable");
+}
