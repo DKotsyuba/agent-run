@@ -179,13 +179,20 @@ impl Session {
             "thread/tokenUsage/updated" => Ok(Some(Notification::TokenUsage {
                 token_usage: params.get("tokenUsage").cloned().unwrap_or(Value::Null),
             })),
-            "turn/completed" => Ok(Some(Notification::TurnCompleted {
-                turn: params
+            "turn/completed" => {
+                let turn = params
                     .get("turn")
                     .filter(|value| value.is_object())
                     .cloned()
-                    .ok_or_else(|| invalid("malformed completed Codex turn"))?,
-            })),
+                    .ok_or_else(|| invalid("malformed completed Codex turn"))?;
+                if !matches!(
+                    turn.get("status").and_then(Value::as_str),
+                    Some("completed") | Some("interrupted") | Some("failed")
+                ) {
+                    return Err(invalid("nonterminal or unknown turn status"));
+                }
+                Ok(Some(Notification::TurnCompleted { turn }))
+            }
             _ => Ok(Some(Notification::Other {
                 method: method.into(),
                 params: params.clone(),

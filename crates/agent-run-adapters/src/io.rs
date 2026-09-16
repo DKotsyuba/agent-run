@@ -145,16 +145,25 @@ impl Process {
     }
     /// Writes one bounded JSON-RPC envelope to the owned child within 15 seconds.
     pub async fn send(&mut self, message: &Value) -> Result<()> {
+        self.send_until(
+            message,
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await
+    }
+    /// Writes one frame before a caller-owned deadline, including pipe backpressure.
+    async fn send_until(&mut self, message: &Value, deadline: tokio::time::Instant) -> Result<()> {
         let input = self
             .input
             .as_mut()
             .ok_or_else(|| Error::Runtime("engine stdin is closed".into()))?;
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            frame::write(input, message, ENGINE_FRAME),
-        )
-        .await
-        .map_err(|_| Error::Runtime("engine input delivery timed out".into()))?
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Runtime("engine input delivery timed out".into()));
+        }
+        tokio::time::timeout(remaining, frame::write(input, message, ENGINE_FRAME))
+            .await
+            .map_err(|_| Error::Runtime("engine input delivery timed out".into()))?
     }
     /// Writes raw text for non-JSON stream engines while retaining the same deadline.
     pub async fn text(&mut self, text: &str) -> Result<()> {
@@ -182,16 +191,19 @@ impl Process {
     /// delay cancellation or supervisor lifecycle work. Server-originated requests
     /// are declined before normal notification ordering resumes.
     pub async fn rpc(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(&json!({"id":id,"method":method,"params":params}))
-            .await?;
+        if timeout.is_zero() {
+            return Err(Error::Validation("RPC timeout must be positive".into()));
+        }
         let timeout = if matches!(method, "turn/steer" | "turn/interrupt") {
             timeout.min(Duration::from_secs(1))
         } else {
             timeout
         };
         let deadline = tokio::time::Instant::now() + timeout;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send_until(&json!({"id":id,"method":method,"params":params}), deadline)
+            .await?;
         loop {
             let event = tokio::time::timeout_at(deadline, self.events.recv())
                 .await
@@ -226,10 +238,30 @@ impl Process {
                     }
                     self.backlog.push_back(Event::Json(v));
                 }
-                Event::Eof => return Err(Error::Runtime("app-server EOF".into())),
+                Event::Eof => return Err(self.closed_error(method).await),
                 Event::Failure(kind) => return Err(Error::Runtime(kind.into())),
             }
         }
+    }
+    /// Describes an early child exit using only bounded, redacted diagnostics.
+    async fn closed_error(&mut self, method: &str) -> Error {
+        let _ = self.child.try_wait();
+        tokio::task::yield_now().await;
+        let code = self
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .and_then(|status| status.code())
+            .map(|code| format!("exit code {code}"))
+            .unwrap_or_else(|| "unknown exit status".into());
+        let detail = self
+            .diagnostic_tail()
+            .map(|tail| format!(": {tail}"))
+            .unwrap_or_default();
+        Error::Runtime(format!(
+            "app-server closed the stream while waiting for {method}: {code}{detail}"
+        ))
     }
     /// Declines an unsolicited server request without granting process authority.
     pub async fn deny_request(&mut self, v: &Value) -> Result<()> {

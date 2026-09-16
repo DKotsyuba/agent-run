@@ -514,6 +514,7 @@ pub async fn run(
         .to_owned();
     session.turn_started(&turn_id)?;
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
+    let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
     let mut usage = None;
@@ -598,8 +599,15 @@ pub async fn run(
             process.deny_request(&v).await?;
             continue;
         }
-        let method = v.get("method").and_then(Value::as_str).unwrap_or("");
-        let p = &v["params"];
+        let Some(method) = v
+            .get("method")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            store.event(&record.id, "malformed_event", &json!({"raw": v}))?;
+            continue;
+        };
+        let p = v.get("params").unwrap_or(&Value::Null);
         if p.get("threadId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != tid)
@@ -619,9 +627,11 @@ pub async fn run(
             && method.starts_with("item/")
             && event_turn.is_none()
         {
+            store.event(&record.id, method, p)?;
             continue;
         }
         if session.notification(&v)?.is_none() {
+            store.event(&record.id, method, p)?;
             continue;
         }
         match method {
@@ -639,23 +649,38 @@ pub async fn run(
                 if text.len() + delta.len() > verify::MAX_ANSWER {
                     return Err(invalid("assistant stream exceeds bound"));
                 }
+                if !delta.trim().is_empty() && !text.trim().is_empty() {
+                    journal(store, &record.id, "assistant", text, None, Some(&key))?;
+                    emitted.entry(key.clone()).or_default().push_str(text);
+                    text.clear();
+                }
                 text.push_str(delta);
-                journal(store, &record.id, "assistant", delta, None, Some(&key))?;
             }
             "item/completed" => {
                 let item = &p["item"];
                 let key = item.get("id").and_then(Value::as_str).unwrap_or("");
                 if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                    if item
+                        .get("at")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|at| at < 0.0)
+                    {
+                        store.event(&record.id, "malformed_message", &json!({"raw": item}))?;
+                        continue;
+                    }
                     let text = item.get("text").and_then(Value::as_str).unwrap_or("");
                     if !completed.contains_key(key) {
-                        let prefix = streamed.get(key).map(String::as_str).unwrap_or("");
-                        if let Some(tail) = text.strip_prefix(prefix) {
-                            journal(store, &record.id, "assistant", tail, None, Some(key))?;
-                        } else if prefix.is_empty() {
-                            journal(store, &record.id, "assistant", text, None, Some(key))?;
-                        }
+                        let prefix = emitted.get(key).map(String::as_str).unwrap_or("");
+                        let tail = text.strip_prefix(prefix).unwrap_or(if prefix.is_empty() {
+                            text
+                        } else {
+                            ""
+                        });
+                        journal(store, &record.id, "assistant", tail, None, Some(key))?;
                         completed.insert(key.into(), text.into());
                     }
+                    streamed.remove(key);
+                    emitted.remove(key);
                     if !text.trim().is_empty() {
                         final_answer = Some(text.to_owned());
                     }
@@ -691,22 +716,22 @@ pub async fn run(
                             {
                                 let key = item.get("id").and_then(Value::as_str).unwrap_or("");
                                 if !completed.contains_key(key) {
-                                    let prefix =
-                                        streamed.get(key).map(String::as_str).unwrap_or("");
-                                    if let Some(tail) = text.strip_prefix(prefix) {
-                                        journal(
-                                            store,
-                                            &record.id,
-                                            "assistant",
-                                            tail,
-                                            None,
-                                            Some(key),
-                                        )?;
-                                    }
+                                    let prefix = emitted.get(key).map(String::as_str).unwrap_or("");
+                                    let tail = text
+                                        .strip_prefix(prefix)
+                                        .unwrap_or(if prefix.is_empty() { text } else { "" });
+                                    journal(store, &record.id, "assistant", tail, None, Some(key))?;
+                                    streamed.remove(key);
+                                    emitted.remove(key);
                                 }
                                 final_answer = Some(text.into());
                             }
                         }
+                    }
+                }
+                for (key, text) in &streamed {
+                    if !text.trim().is_empty() && !completed.contains_key(key) {
+                        journal(store, &record.id, "assistant", text, None, Some(key))?;
                     }
                 }
                 let mut outcome = match turn.get("status").and_then(Value::as_str) {
@@ -720,7 +745,10 @@ pub async fn run(
                         structured_failure_kind(&turn["error"])
                             .unwrap_or_else(|| "runtime_failed".into()),
                     ),
-                    _ => return Err(invalid("nonterminal turn/completed status")),
+                    _ => {
+                        store.event(&record.id, method, p)?;
+                        return Err(invalid("nonterminal turn/completed status"));
+                    }
                 };
                 outcome.runtime_session_id = Some(tid);
                 outcome.failure_text = turn
