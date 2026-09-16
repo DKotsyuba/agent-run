@@ -8,6 +8,11 @@
 use crate::{domain::AgentId, state::Store, Result};
 use serde_json::{json, Value};
 
+/// Maximum number of live-engine commands handled before polling resumes.
+pub const COMMAND_PAGE_LIMIT: usize = 16;
+/// Maximum elapsed monotonic time spent draining one live-engine command page.
+pub const COMMAND_PAGE_SECONDS: f64 = 1.0;
+
 /// Completes all commands that became pending after an agent reached a terminal state.
 ///
 /// The caller invokes this only after its terminal transition has committed.

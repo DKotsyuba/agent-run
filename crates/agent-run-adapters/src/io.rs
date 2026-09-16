@@ -151,6 +151,14 @@ impl Process {
         )
         .await
     }
+    /// Writes one engine envelope before a caller-owned deadline.
+    pub async fn send_before(
+        &mut self,
+        message: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.send_until(message, deadline).await
+    }
     /// Writes one frame before a caller-owned deadline, including pipe backpressure.
     async fn send_until(&mut self, message: &Value, deadline: tokio::time::Instant) -> Result<()> {
         let input = self

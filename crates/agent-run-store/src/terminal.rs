@@ -120,7 +120,10 @@ pub fn finish(
         };
         tx_event(&tx, id, kind, None, None, usage)?;
     }
-    run_stats::record_in_transaction(&tx, id, time)?;
+    // Statistics are an observability snapshot, not part of the terminal
+    // lifecycle proof. A malformed or unavailable stats table must not turn a
+    // committed engine outcome back into an active row.
+    let _stats_error = run_stats::record_in_transaction(&tx, id, time).is_err();
     tx.commit()?;
     Ok(())
 }

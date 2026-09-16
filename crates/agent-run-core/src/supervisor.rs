@@ -70,7 +70,12 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     crate::logging::configure(home, "supervisor");
     let [ready_fd, identity_fd, error_fd] = fds;
     if let Err(error) = launch::report_identity(identity_fd, error_fd) {
-        let _ = launch::report_ready(ready_fd, Err(&error.to_string()));
+        let message = if error.to_string().trim().is_empty() {
+            "OSError".to_owned()
+        } else {
+            error.to_string()
+        };
+        let _ = launch::report_ready(ready_fd, Err(&message));
         return Err(error.into());
     }
     let owned = (|| {
@@ -86,7 +91,8 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             store
         }
         Err(error) => {
-            let _ = launch::report_ready(ready_fd, Err(&error.to_string()));
+            let message = error_text(&error);
+            let _ = launch::report_ready(ready_fd, Err(&message));
             return Err(error);
         }
     };
@@ -105,6 +111,23 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             }
             Err(error)
         }
+    }
+}
+
+/// Returns a nonblank startup diagnostic even when an error carries no text.
+fn error_text(error: &Error) -> String {
+    let message = error.to_string();
+    if message.trim().is_empty() {
+        match error {
+            Error::Validation(_) => "ValidationError",
+            Error::Runtime(_) => "RuntimeError",
+            Error::Io(_) => "OSError",
+            Error::Sql(_) => "DatabaseError",
+            _ => "SupervisorError",
+        }
+        .into()
+    } else {
+        message
     }
 }
 
@@ -138,7 +161,7 @@ fn record_owner(store: &mut Store, id: &AgentId, owner: &process::Identity) -> R
     let heartbeat = domain::now();
     let changed = tx.execute(
         "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=?,heartbeat_at=? \
-         WHERE id=? AND status='starting' AND supervisor_pid IS NULL",
+         WHERE id=? AND status IN ('starting','cancelling') AND supervisor_pid IS NULL",
         params![owner.pid, owner.token, owner.birth, heartbeat, id.as_str()],
     )?;
     if changed != 1 {
@@ -311,4 +334,16 @@ fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
     outcome.status = Status::Cancelled;
     store.finish(id, &outcome, None, None)?;
     commands::complete_terminal(store, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_text;
+    use crate::Error;
+
+    /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.
+    #[test]
+    fn blank_startup_errors_report_their_error_type() {
+        assert_eq!(error_text(&Error::Runtime(String::new())), "RuntimeError");
+    }
 }
