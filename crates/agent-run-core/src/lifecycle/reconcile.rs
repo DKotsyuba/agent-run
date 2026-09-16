@@ -60,6 +60,75 @@ pub fn reconcile(store: &mut Store, limit: usize) -> Result<Vec<AgentId>> {
     reconcile_with(store, limit, process::observe)
 }
 
+/// Applies waitpid proof to one agent without probing or signalling any group.
+pub fn reconcile_reaped_agent(
+    store: &mut Store,
+    id: &AgentId,
+    supervisor_pid: i32,
+    checked_at: f64,
+) -> Result<bool> {
+    if supervisor_pid <= 1 || !checked_at.is_finite() || checked_at < 0.0 {
+        return Err(invalid("invalid reaped-agent proof"));
+    }
+    let Some(row) = read_candidates(store, "SELECT * FROM agents WHERE id=?", [id.as_str()])?
+        .into_iter()
+        .next()
+    else {
+        return Ok(false);
+    };
+    if row.supervisor_pid.is_some_and(|pid| pid != supervisor_pid) {
+        return Ok(false);
+    }
+    if row.status.terminal() {
+        return Ok(false);
+    }
+    guarded_lost(
+        store,
+        &row,
+        "supervisor_dead",
+        "detached supervisor exited",
+        json!({"verdict":"reaped","supervisor_pid":supervisor_pid}),
+        checked_at,
+    )
+}
+
+/// Marks only active rows owned by one reaped supervisor as lost.
+pub fn reconcile_reaped_supervisor(
+    store: &mut Store,
+    supervisor_pid: i32,
+    checked_at: f64,
+    limit: usize,
+) -> Result<Vec<AgentId>> {
+    if supervisor_pid <= 1 || !checked_at.is_finite() || checked_at < 0.0 {
+        return Err(invalid("invalid reaped-supervisor proof"));
+    }
+    if !(1..=1000).contains(&limit) {
+        return Err(invalid("reconciliation limit must be 1..1000"));
+    }
+    let rows = read_candidates(
+        store,
+        "SELECT * FROM agents WHERE supervisor_pid=? AND status IN ('created','starting','running','cancelling') ORDER BY created_at,id LIMIT ?",
+        params![supervisor_pid, limit as i64],
+    )?;
+    let mut changed = Vec::new();
+    for row in rows {
+        if row.process_group_id.is_none() || row.supervisor_identity.is_none() {
+            continue;
+        }
+        if guarded_lost(
+            store,
+            &row,
+            "supervisor_dead",
+            "detached supervisor exited",
+            json!({"verdict":"dead","supervisor_pid":supervisor_pid,"process_group_id":row.process_group_id}),
+            checked_at,
+        )? {
+            changed.push(row.id);
+        }
+    }
+    Ok(changed)
+}
+
 /// Reconcile rows using `observe`, which exists to make recovery evidence testable.
 ///
 /// `observe` receives the PID plus its immutable token/birth evidence and must
@@ -277,7 +346,7 @@ fn guarded_lost(
         return Ok(false);
     }
     current.status.transition(Status::Lost)?;
-    let finished_at = now();
+    let finished_at = checked_at;
     tx.execute(
         "UPDATE agents SET status='lost',finished_at=?,failure_kind=?,failure_text=? WHERE id=?",
         params![

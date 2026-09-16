@@ -10,7 +10,7 @@ use agent_run_domain::{
     Result,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// Maximum age of an unbound completion notice before it is permanently expired.
 pub const BINDING_WINDOW_SECONDS: f64 = 3600.0;
@@ -194,6 +194,251 @@ fn safe_evidence(raw: &Value) -> Result<Value> {
         return Err(invalid("delivery attempt evidence exceeds 16384 bytes"));
     }
     Ok(value)
+}
+
+/// Validates a nonblank delivery operation string and returns it unchanged.
+fn required_text(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(invalid(format!("{name} must be nonblank")));
+    }
+    Ok(())
+}
+
+/// Validates one finite nonnegative timestamp used by deterministic callers.
+fn checked_time(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(invalid(format!("{name} must be finite and nonnegative")));
+    }
+    Ok(())
+}
+
+/// Claims the oldest due delivery or reclaims one expired sending lease.
+pub(crate) fn claim(
+    store: &mut Store,
+    owner: &str,
+    at: f64,
+    lease_seconds: f64,
+) -> Result<Option<Value>> {
+    required_text("lease owner", owner)?;
+    checked_time("claim time", at)?;
+    if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
+        return Err(invalid("lease_seconds must be positive and finite"));
+    }
+    let tx = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM deliveries WHERE ((state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?) OR (state='sending' AND lease_until<=?)) ORDER BY COALESCE(next_attempt_at,lease_until,0),id LIMIT 1",
+            params![at, at],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let updated = tx.execute(
+        "UPDATE deliveries SET state='sending',attempts=attempts+1,lease_owner=?,lease_until=?,next_attempt_at=NULL WHERE id=? AND ((state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?) OR (state='sending' AND lease_until<=?))",
+        params![owner, at + lease_seconds, id, at, at],
+    )?;
+    if updated != 1 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let row = tx.query_row(
+        "SELECT d.id,d.attempts,d.orchestrator_session_id,d.agent_id,a.status AS agent_status,s.transport,s.external_session_id,s.external_turn_id FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN orchestrator_sessions s ON s.id=d.orchestrator_session_id WHERE d.id=?",
+        [&id],
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "attempts": row.get::<_, u32>(1)?,
+                "orchestrator_session_id": row.get::<_, Option<String>>(2)?,
+                "agent_id": row.get::<_, String>(3)?,
+                "agent_status": row.get::<_, String>(4)?,
+                "transport": row.get::<_, String>(5)?,
+                "external_session_id": row.get::<_, String>(6)?,
+                "external_turn_id": row.get::<_, Option<String>>(7)?,
+            }))
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(row))
+}
+
+/// Persists evidence for the caller's live attempt and returns its attempt number.
+fn owned_attempt(
+    tx: &Transaction<'_>,
+    delivery_id: &str,
+    owner: &str,
+    at: f64,
+    evidence: Option<&Value>,
+) -> Result<u32> {
+    let attempt: Option<u32> = tx
+        .query_row(
+            "SELECT attempts FROM deliveries WHERE id=? AND state='sending' AND lease_owner=? AND lease_until>?",
+            params![delivery_id, owner, at],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(attempt) = attempt else {
+        return Err(invalid("delivery lease is not owned by caller"));
+    };
+    if let Some(evidence) = evidence {
+        let evidence = safe_evidence(evidence)?;
+        tx.execute(
+            "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES(?,?,?,?)",
+            params![delivery_id, attempt, at, serde_json::to_string(&evidence)?],
+        )?;
+    }
+    Ok(attempt)
+}
+
+/// Finishes a live delivery claim while preserving the strongest prior ambiguity flag.
+fn finish_claim(
+    tx: &Transaction<'_>,
+    delivery_id: &str,
+    owner: &str,
+    state: &str,
+    at: f64,
+    error: Option<&str>,
+    ambiguous: bool,
+    next_attempt_at: Option<f64>,
+    remote_message_id: Option<&str>,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE deliveries SET state=?,remote_message_id=COALESCE(?,remote_message_id),last_error=COALESCE(?,last_error),ambiguous_result=MAX(ambiguous_result,?),next_attempt_at=?,lease_owner=NULL,lease_until=NULL WHERE id=? AND state='sending' AND lease_owner=? AND lease_until>?",
+        params![state, remote_message_id, error, ambiguous, next_attempt_at, delivery_id, owner, at],
+    )?;
+    if changed != 1 {
+        return Err(invalid("delivery lease is not owned by caller"));
+    }
+    Ok(())
+}
+
+/// Completes one live delivery claim and optionally records immutable evidence.
+pub(crate) fn complete(
+    store: &mut Store,
+    delivery_id: &str,
+    owner: &str,
+    at: f64,
+    remote_message_id: Option<&str>,
+    ambiguous: bool,
+    evidence: Option<&Value>,
+) -> Result<()> {
+    required_text("delivery_id", delivery_id)?;
+    required_text("lease owner", owner)?;
+    checked_time("completion time", at)?;
+    let tx = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    owned_attempt(&tx, delivery_id, owner, at, evidence)?;
+    finish_claim(
+        &tx,
+        delivery_id,
+        owner,
+        "delivered",
+        at,
+        None,
+        ambiguous,
+        None,
+        remote_message_id,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Marks one live delivery claim permanently failed and optionally records evidence.
+pub(crate) fn fail(
+    store: &mut Store,
+    delivery_id: &str,
+    owner: &str,
+    error: &str,
+    at: f64,
+    ambiguous: bool,
+    evidence: Option<&Value>,
+) -> Result<()> {
+    required_text("delivery_id", delivery_id)?;
+    required_text("lease owner", owner)?;
+    required_text("delivery error", error)?;
+    checked_time("failure time", at)?;
+    let tx = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    owned_attempt(&tx, delivery_id, owner, at, evidence)?;
+    finish_claim(
+        &tx,
+        delivery_id,
+        owner,
+        "failed",
+        at,
+        Some(error),
+        ambiguous,
+        None,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Schedules an exponential-backoff retry for one live delivery claim.
+pub(crate) fn retry(
+    store: &mut Store,
+    delivery_id: &str,
+    owner: &str,
+    error: &str,
+    at: f64,
+    ambiguous: bool,
+    evidence: Option<&Value>,
+    base_delay: f64,
+    max_delay: f64,
+) -> Result<f64> {
+    required_text("delivery_id", delivery_id)?;
+    required_text("lease owner", owner)?;
+    required_text("delivery error", error)?;
+    checked_time("retry time", at)?;
+    if !base_delay.is_finite() || base_delay <= 0.0 || !max_delay.is_finite() || max_delay <= 0.0 {
+        return Err(invalid("retry delays must be positive and finite"));
+    }
+    let tx = store
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let attempts = owned_attempt(&tx, delivery_id, owner, at, evidence)?;
+    let exponent = attempts.saturating_sub(1).min(20);
+    let delay = (base_delay * 2_f64.powi(exponent as i32)).min(max_delay);
+    let next = at + delay;
+    finish_claim(
+        &tx,
+        delivery_id,
+        owner,
+        "retry_wait",
+        at,
+        Some(error),
+        ambiguous,
+        Some(next),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(next)
+}
+
+/// Returns the latest validated evidence document for one delivery.
+pub(crate) fn latest(store: &Store, delivery_id: &str) -> Result<Option<Value>> {
+    required_text("delivery_id", delivery_id)?;
+    let raw: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",
+            [delivery_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|value| {
+        let parsed: Value = serde_json::from_str(&value)
+            .map_err(|_| invalid("invalid stored delivery attempt evidence"))?;
+        safe_evidence(&parsed)
+    })
+    .transpose()
 }
 
 impl Store {

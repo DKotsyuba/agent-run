@@ -420,6 +420,56 @@ impl Store {
         tx.commit()?;
         Ok((session_id, changed))
     }
+
+    /// Upserts one legacy-compatible context receipt only when its key changed.
+    pub fn record_context_receipt(
+        &mut self,
+        session_id: &str,
+        context_key: &str,
+        at: f64,
+    ) -> Result<bool> {
+        if session_id.trim().is_empty() || context_key.trim().is_empty() {
+            return Err(invalid("context receipt identifiers must be nonblank"));
+        }
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("context time must be finite and nonnegative"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "INSERT INTO context_receipts(orchestrator_session_id,context_key,injected_at) VALUES(?,?,?) ON CONFLICT(orchestrator_session_id) DO UPDATE SET context_key=excluded.context_key,injected_at=excluded.injected_at WHERE context_receipts.context_key<>excluded.context_key",
+            params![session_id, context_key, at],
+        )? == 1;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Finds or creates a session for a reference, then upserts its context key.
+    pub fn record_context_receipt_for_ref(
+        &mut self,
+        reference: &domain::OrchestratorRef,
+        context_key: &str,
+        at: f64,
+    ) -> Result<(String, bool)> {
+        reference.validate()?;
+        if context_key.trim().is_empty() {
+            return Err(invalid("context key must be nonblank"));
+        }
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("context time must be finite and nonnegative"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id = session_for_reference(&tx, reference, at)?;
+        let changed = tx.execute(
+            "INSERT INTO context_receipts(orchestrator_session_id,context_key,injected_at) VALUES(?,?,?) ON CONFLICT(orchestrator_session_id) DO UPDATE SET context_key=excluded.context_key,injected_at=excluded.injected_at WHERE context_receipts.context_key<>excluded.context_key",
+            params![session_id, context_key, at],
+        )? == 1;
+        tx.commit()?;
+        Ok((session_id, changed))
+    }
     pub fn set_owner(
         &self,
         id: &AgentId,
@@ -432,6 +482,71 @@ impl Store {
             return Err(Error::Conflict);
         }
         self.event(id, "supervisor_ready", &json!({"pid":pid}))
+    }
+
+    /// Records immutable supervisor identity and permits one process-group refinement.
+    pub fn record_supervisor(
+        &mut self,
+        id: &AgentId,
+        pid: i32,
+        identity: &str,
+        process_group_id: i32,
+        birth_time: Option<f64>,
+        at: f64,
+    ) -> Result<()> {
+        if pid <= 0
+            || process_group_id <= 0
+            || identity.trim().is_empty()
+            || !at.is_finite()
+            || at < 0.0
+        {
+            return Err(invalid("invalid supervisor ownership"));
+        }
+        if birth_time.is_some_and(|birth| !birth.is_finite() || birth < 0.0) {
+            return Err(invalid(
+                "supervisor birth time must be finite and nonnegative",
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, Option<i32>, Option<String>, Option<i32>, Option<f64>)> = tx
+            .query_row("SELECT status,supervisor_pid,supervisor_identity,process_group_id,supervisor_birth_time FROM agents WHERE id=?", [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .optional()?;
+        let Some((status, old_pid, old_identity, old_group, old_birth)) = current else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        if status.parse::<Status>()?.terminal() {
+            return Err(Error::Transition(
+                "terminal agent cannot bind a supervisor".into(),
+            ));
+        }
+        if let Some(old_pid) = old_pid {
+            if old_pid != pid
+                || old_identity.as_deref() != Some(identity)
+                || old_birth != birth_time
+                || (old_group.is_some()
+                    && old_group != Some(process_group_id)
+                    && old_group != Some(pid))
+            {
+                return Err(invalid("supervisor ownership is immutable"));
+            }
+        }
+        tx.execute(
+            "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,process_group_id=?,supervisor_birth_time=?,heartbeat_at=? WHERE id=? AND status IN ('starting','running')",
+            params![pid, identity, process_group_id, birth_time, at, id.as_str()],
+        )?;
+        tx.execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
+            params![
+                id.as_str(),
+                at,
+                "supervisor_ready",
+                json!({"pid":pid}).to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn update_identity(&self, id: &AgentId, identity: &Value, revision: &str) -> Result<()> {
         let n = self.conn.execute(
@@ -639,6 +754,80 @@ impl Store {
         Ok(
             json!({"agent_id":id,"bound":row.orchestrator_session_id.is_some(),"orchestrator_session_id":row.orchestrator_session_id,"notification_id":notification_id,"state":state,"attempts":attempts,"ambiguous":ambiguous,"last_error":last_error,"last_attempt":last_attempt}),
         )
+    }
+
+    /// Claims the oldest due outbox row or an expired sending lease.
+    pub fn claim_delivery(
+        &mut self,
+        owner: &str,
+        at: f64,
+        lease_seconds: f64,
+    ) -> Result<Option<Value>> {
+        delivery::claim(self, owner, at, lease_seconds)
+    }
+
+    /// Completes one owned outbox row and optionally stores its attempt evidence.
+    pub fn complete_delivery(
+        &mut self,
+        delivery_id: &str,
+        owner: &str,
+        at: f64,
+        remote_message_id: Option<&str>,
+        ambiguous: bool,
+        evidence: Option<&Value>,
+    ) -> Result<()> {
+        delivery::complete(
+            self,
+            delivery_id,
+            owner,
+            at,
+            remote_message_id,
+            ambiguous,
+            evidence,
+        )
+    }
+
+    /// Permanently fails one owned outbox row and optionally stores its evidence.
+    pub fn fail_delivery(
+        &mut self,
+        delivery_id: &str,
+        owner: &str,
+        error: &str,
+        at: f64,
+        ambiguous: bool,
+        evidence: Option<&Value>,
+    ) -> Result<()> {
+        delivery::fail(self, delivery_id, owner, error, at, ambiguous, evidence)
+    }
+
+    /// Schedules one owned outbox retry with bounded exponential backoff.
+    pub fn retry_delivery(
+        &mut self,
+        delivery_id: &str,
+        owner: &str,
+        error: &str,
+        at: f64,
+        ambiguous: bool,
+        evidence: Option<&Value>,
+        base_delay: f64,
+        max_delay: f64,
+    ) -> Result<f64> {
+        delivery::retry(
+            self,
+            delivery_id,
+            owner,
+            error,
+            at,
+            ambiguous,
+            evidence,
+            base_delay,
+            max_delay,
+        )
+    }
+
+    /// Returns the latest validated immutable evidence document for a delivery.
+    pub fn latest_delivery_attempt(&self, delivery_id: &str) -> Result<Option<Value>> {
+        delivery::latest(self, delivery_id)
     }
     pub fn last_progress(&self, id: &AgentId) -> Result<Option<f64>> {
         Ok(self.conn.query_row(
