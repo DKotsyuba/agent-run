@@ -39,11 +39,10 @@ A substantial **native Rust development implementation**, with source, configura
 4. macOS Keychain credential fallback is not implemented. Use configured environment/file/native login authentication in an isolated evaluation home.
 5. One optional JavaScript file remains for the signed Codex Desktop host transport. It is an external host requirement, not a Python runtime dependency; the package is not literally all-Rust source.
 6. Read-only Claude/GLM runs omit Bash. Runtime/tool preferences are not promoted to unverified OS isolation guarantees. This changes some upstream capabilities intentionally.
-7. Generated runtime snapshots use a Rust-specific manifest and currently verify recorded assets, not the complete upstream topology/recovery contract. Original Python immutable snapshots are not interchangeable.
-8. Normalized messages are persisted, but the full upstream raw-stream spool and external-payload reference contract are not reproduced. Usage/TTFT/API timing fields and detailed diagnostic views are not all equivalent.
-9. Inline answers are capped at 128 KiB, lower than upstream, to stay within the bounded JSON-RPC frame even under escaping. Verification remains separately bounded to 16 MiB.
-10. Delivery evidence uses a smaller safe Rust shape. Historical evidence of the Python shape is not fully projected. Notice wording and source-specific capacity output are not byte-for-byte equivalent.
-11. Process creation uses the Rust standard process API with a minimal `setsid` pre-exec step; it does not reproduce upstream's explicit `posix_spawn(setsid=True)`-first implementation. Process identity and signals require further OS-specific race review.
+7. Normalized messages are persisted, but the full upstream raw-stream spool and external-payload reference contract are not reproduced. Usage/TTFT/API timing fields and detailed diagnostic views are not all equivalent.
+8. Inline answers are capped at 128 KiB, lower than upstream, to stay within the bounded JSON-RPC frame even under escaping. Verification remains separately bounded to 16 MiB.
+9. Delivery evidence uses a smaller safe Rust shape. Historical evidence of the Python shape is not fully projected. Notice wording and source-specific capacity output are not byte-for-byte equivalent.
+10. Process creation uses the Rust standard process API with a minimal `setsid` pre-exec step; it does not reproduce upstream's explicit `posix_spawn(setsid=True)`-first implementation. Process identity and signals require further OS-specific race review.
 12. The workspace now commits the reviewed `Cargo.lock`, pins Rust 1.98.1, and provides `cargo xtask check`; migration parity claims above remain independently gated.
 
 ## Blocking acceptance gates
