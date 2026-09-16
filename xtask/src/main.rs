@@ -1,6 +1,6 @@
 //! Repository-local verification and sealed native release entry point.
 use std::{env, path::PathBuf, process::Command};
-use xtask::{deploy, release};
+use xtask::{archive, deploy, evidence, release};
 
 /// Runs the Rust workspace's formatter, linter, and test gates.
 fn main() {
@@ -9,9 +9,17 @@ fn main() {
         release_command(&arguments[1..]);
         return;
     }
+    if arguments.first().map(String::as_str) == Some("archive") {
+        archive_command(&arguments[1..]);
+        return;
+    }
+    if arguments.first().map(String::as_str) == Some("evidence") {
+        evidence_command(&arguments[1..]);
+        return;
+    }
     if arguments.first().map(String::as_str) != Some("check") {
         eprintln!(
-            "usage: cargo xtask check | release build|build-native|verify|install|update|rollback"
+            "usage: cargo xtask check | release build|build-native|verify|install|update|rollback | archive --verify | evidence verify"
         );
         std::process::exit(2);
     }
@@ -33,6 +41,58 @@ fn main() {
         if !status.success() {
             std::process::exit(status.code().unwrap_or(1));
         }
+    }
+}
+
+/// Builds a source archive for a revision and optionally verifies its contents.
+fn archive_command(arguments: &[String]) {
+    let value = |name: &str| {
+        arguments
+            .windows(2)
+            .find(|pair| pair[0] == name)
+            .map(|pair| PathBuf::from(&pair[1]))
+    };
+    let revision = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--revision")
+        .map(|pair| pair[1].as_str())
+        .unwrap_or("HEAD");
+    let root = env::current_dir().expect("current directory must be readable");
+    let default = archive::default_output(&root, revision);
+    let output = value("--output");
+    let result = default
+        .and_then(|default| archive::build(&root, output.as_deref().unwrap_or(&default), revision))
+        .and_then(|path| {
+            let verify = arguments.iter().any(|argument| argument == "--verify");
+            if verify {
+                archive::verify(&root, &path)?;
+            }
+            println!(
+                "archive {}: {}",
+                if verify { "verified" } else { "created" },
+                path.display()
+            );
+            Ok(())
+        });
+    if let Err(error) = result {
+        eprintln!("archive stopped: {error}");
+        std::process::exit(2);
+    }
+}
+
+/// Verifies the repository's hand-assembled migration evidence index.
+fn evidence_command(arguments: &[String]) {
+    let result = match arguments.first().map(String::as_str) {
+        Some("verify") if arguments.len() == 1 => {
+            let root = env::current_dir().expect("current directory must be readable");
+            evidence::verify(&root)
+                .map(|count| println!("evidence verify: passed ({count} entries)"))
+        }
+        _ => Err("usage: cargo xtask evidence verify".into()),
+    };
+    if let Err(error) = result {
+        eprintln!("evidence stopped: {error}");
+        std::process::exit(2);
     }
 }
 
