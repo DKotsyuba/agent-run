@@ -252,7 +252,10 @@ fn compare_tree(expected: &Value, home: &Path, workdir: &Path) {
     );
     assert!(index["roots"].is_array(), "runtime index lists roots");
     assert!(index["files"].is_array(), "runtime index lists files");
-    assert!(index["manifests"].is_object(), "runtime index maps manifests");
+    assert!(
+        index["manifests"].is_object(),
+        "runtime index maps manifests"
+    );
     assert!(!index["links"].is_null(), "runtime index records links");
 }
 
