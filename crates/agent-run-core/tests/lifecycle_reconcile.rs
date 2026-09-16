@@ -78,6 +78,7 @@ fn broker_crash_reconciles_only_a_dead_start_owner() {
 }
 
 /// Mirrors `test_reused_supervisor_is_lost_with_identity_mismatch`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_reused_group_id_never_receives_native_cancel_or_signal`.
 #[test]
 fn reused_pid_is_lost_with_identity_mismatch() {
     let home = common::Home::new();
@@ -97,6 +98,7 @@ fn reused_pid_is_lost_with_identity_mismatch() {
 }
 
 /// Mirrors `test_unavailable_startup_birth_proof_is_not_death_before_deadline`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_supervisor_identity_needs_no_process_probe`.
 #[test]
 fn unknown_observation_never_reconciles_an_active_row() {
     let home = common::Home::new();

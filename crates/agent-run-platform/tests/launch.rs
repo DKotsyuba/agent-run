@@ -8,7 +8,7 @@ use agent_run_platform::{
 use std::{
     ffi::OsStr,
     io::Read,
-    os::fd::OwnedFd,
+    os::fd::{AsRawFd, OwnedFd},
     path::Path,
     process::Command,
     time::{Duration, Instant},
@@ -73,6 +73,41 @@ fn drain(fd: OwnedFd) -> String {
     text
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_default_ready_budget_covers_observed_launchd_startup`.
+#[test]
+fn default_ready_budget_is_long_enough_for_detached_startup() {
+    assert!(Timeouts::default().ready >= Duration::from_secs(30));
+}
+
+/// Mirrors Python `tests/test_lifecycle.py::ReadyChannelTests::test_ready_token_is_reported_once`.
+/// Mirrors Python `tests/test_lifecycle.py::ReadyChannelTests::test_blank_failure_reason_is_refused`.
+#[test]
+fn ready_writer_emits_the_token_and_refuses_a_blank_failure() {
+    let (read, write) = launch::cloexec_pipe().unwrap();
+    // SAFETY: dup creates an independently owned descriptor for report_ready,
+    // which consumes and closes its raw descriptor.
+    let ready = unsafe { libc::dup(write.as_raw_fd()) };
+    assert!(ready >= 0);
+    launch::report_ready(ready, Ok(())).unwrap();
+    drop(write);
+    assert_eq!(drain(read), "ready\n");
+
+    let (_read, write) = launch::cloexec_pipe().unwrap();
+    // SAFETY: see the independent descriptor ownership above.
+    let ready = unsafe { libc::dup(write.as_raw_fd()) };
+    assert!(ready >= 0);
+    let error = launch::report_ready(ready, Err("  ")).unwrap_err();
+    // report_ready returns before adopting a blank failure descriptor.
+    // SAFETY: the rejected duplicate is still this test's exact descriptor.
+    assert_eq!(unsafe { libc::close(ready) }, 0);
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_parent_returns_after_ready_before_terminal_and_dispatches_once`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_wrapper_and_grandchild_outlive_the_returning_caller`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_fast_ready_terminal_exit_does_not_require_a_live_group_sample`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_post_reap_receives_exact_pid_and_wait_status`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_targeted_reaper_preserves_launch_evidence`.
 #[test]
 fn ready_child_is_a_session_leader_and_reaped_with_its_exact_status() {
     let temp = tempfile::tempdir().unwrap();
@@ -114,6 +149,10 @@ fn ready_child_is_a_session_leader_and_reaped_with_its_exact_status() {
     );
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_readiness_timeout_kills_verified_wrapper_and_grandchild_group`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_unread_payload_obeys_ready_deadline_and_reaps`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_term_removes_wrapper_and_grandchild_together`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_a_grandchild_that_ignores_term_is_killed`.
 #[test]
 fn readiness_timeout_kills_the_verified_wrapper_and_grandchild_group() {
     let temp = tempfile::tempdir().unwrap();
@@ -141,6 +180,10 @@ fn readiness_timeout_kills_the_verified_wrapper_and_grandchild_group() {
     wait_for("grandchild exit", || !alive(grandchild));
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_pre_ready_failure_is_reported_reaped_and_dispatches_once`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_identity_mismatch_is_refused_before_ready_is_awaited`.
+/// Mirrors Python `tests/test_lifecycle.py::ReadyChannelTests::test_failure_reason_is_raised_to_the_parent`.
+/// Mirrors Python `tests/test_lifecycle.py::ReadyChannelTests::test_a_supervisor_that_dies_before_ready_is_detected`.
 #[test]
 fn ready_eof_failure_token_and_bad_identity_are_refused_and_reaped() {
     let unused = Path::new("unused");
@@ -172,6 +215,8 @@ fn ready_eof_failure_token_and_bad_identity_are_refused_and_reaped() {
     }
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_child_dies_pre_identity_with_evidence_is_diagnosed`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_child_dies_pre_identity_without_evidence_is_diagnosed`.
 #[test]
 fn a_child_dying_before_identity_is_diagnosed_with_or_without_evidence() {
     let unused = Path::new("unused");
@@ -203,6 +248,7 @@ fn a_child_dying_before_identity_is_diagnosed_with_or_without_evidence() {
     assert!(reaped(failure.provisional_pid.unwrap()));
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_missing_executable_is_refused_before_any_fork`.
 #[test]
 fn a_missing_executable_is_refused_before_any_spawn() {
     let mut spawned = false;
@@ -226,6 +272,8 @@ fn a_missing_executable_is_refused_before_any_spawn() {
         .contains("reconnect/restart this MCP session"));
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_posix_spawn_requests_setsid_without_fork_fallback`.
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_write_exec_failure_writes_a_bounded_stage_and_errno_record`.
 #[test]
 fn spawn_errors_propagate_and_the_fork_fallback_records_exec_failure() {
     let (_ready_r, ready_w) = launch::cloexec_pipe().unwrap();
@@ -250,6 +298,7 @@ fn spawn_errors_propagate_and_the_fork_fallback_records_exec_failure() {
     assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 1);
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_explicitly_unsupported_setsid_uses_legacy_fork_path`.
 #[test]
 fn the_fork_fallback_also_creates_a_session_leader_with_the_same_descriptors() {
     let (_ready_r, ready_w) = launch::cloexec_pipe().unwrap();
@@ -276,6 +325,7 @@ fn the_fork_fallback_also_creates_a_session_leader_with_the_same_descriptors() {
     assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
 }
 
+/// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_post_terminal_dispatch_is_bounded_and_never_reruns_the_child`.
 #[test]
 fn the_reaper_takes_only_its_own_registered_child() {
     let (_ready_r, ready_w) = launch::cloexec_pipe().unwrap();
@@ -302,6 +352,9 @@ fn the_reaper_takes_only_its_own_registered_child() {
     assert!(libc::WIFEXITED(other) && libc::WEXITSTATUS(other) == 9);
 }
 
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_reused_leader_identity_never_signals_the_observed_group`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_foreign_nonleader_pid_is_never_signalled`.
+/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_dangerous_group_ids_are_refused`.
 #[test]
 fn a_stale_leader_identity_is_never_signalled() {
     use std::os::unix::process::CommandExt;

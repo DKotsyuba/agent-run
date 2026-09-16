@@ -8,6 +8,8 @@ use agent_run_core::{commands, domain::Outcome};
 use serde_json::json;
 
 /// Mirrors Python `test_supervisor.py::_drain_terminal_commands`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_final_drain_completes_late_cancel_steer_and_unknown`.
+/// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_a_steer_without_the_capability_is_refused_not_dropped`.
 #[test]
 fn python_test_supervisor_terminal_commands_get_one_durable_result() {
     let home = common::Home::new();
