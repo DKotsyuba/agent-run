@@ -24,6 +24,40 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, process::Command};
 const TTL: f64 = 900.0;
+const CODEXBAR_TIMEOUT_SECONDS: u64 = 120;
+
+/// Returns the email claim embedded in a Codex auth document without exposing it.
+fn account_email(path: &Path) -> Option<String> {
+    let payload: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let token = payload.pointer("/tokens/id_token")?.as_str()?;
+    let encoded = token.split('.').nth(1)?;
+    let mut bytes = Vec::new();
+    let mut value = 0_u32;
+    let mut bits = 0_u8;
+    for byte in encoded.bytes() {
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        value = (value << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((value >> bits) as u8);
+            value &= (1 << bits) - 1;
+        }
+    }
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("email")?
+        .as_str()
+        .filter(|email| !email.is_empty())
+        .map(str::to_owned)
+}
 const BODY_MAX: usize = 2 * 1024 * 1024;
 fn number(v: Option<&Value>) -> Option<f64> {
     v.and_then(Value::as_f64).filter(|v| v.is_finite())
@@ -474,63 +508,251 @@ async fn claude_native(runtime: &str, rt: &Runtime) -> Result<Slice> {
         serde_json::from_slice(&bytes).map_err(|_| invalid("claude_malformed_response"))?;
     normalize_claude(runtime, &value, observed)
 }
-pub fn normalize_codexbar(runtime: &str, raw: &Value) -> Result<Slice> {
-    let value = if let Some(list) = raw.as_array() {
-        list.first()
-            .ok_or_else(|| invalid("codexbar_missing_data"))?
-    } else {
-        raw
+/// Reads the newest bounded Claude runtime stream as a credential-free fallback.
+///
+/// Only regular files below the supplied agent-run home are considered. Missing,
+/// malformed, or stale stream data produces an empty slice or unknown evidence;
+/// it never manufactures a percentage and never triggers a provider request.
+pub fn read_claude_stream(home: &Path, runtime: &str) -> Result<Slice> {
+    const MAX_FILES: usize = 24;
+    const MAX_BYTES: u64 = 262_144;
+    const MAX_LINES: usize = 2_048;
+    let root = home.join("agents");
+    let mut paths = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+            })
+            .map(|entry| entry.path().join("runtime.jsonl"))
+            .filter(|path| path.is_file() && !path.is_symlink())
+            .filter_map(|path| {
+                path.metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|modified| (modified.as_secs_f64(), path))
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
     };
-    let usage = value
-        .get("usage")
-        .filter(|v| v.is_object())
-        .ok_or_else(|| invalid("codexbar_malformed_response"))?;
-    let observed =
-        timestamp(usage.get("updatedAt")).ok_or_else(|| invalid("codexbar_invalid_observed_at"))?;
-    let mut samples = Vec::new();
-    for lane in ["primary", "secondary", "tertiary"] {
-        let Some(value) = usage.get(lane).filter(|v| !v.is_null()) else {
+    paths.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let observed = now();
+    for (modified, path) in paths.into_iter().take(MAX_FILES) {
+        let Ok(mut file) = std::fs::File::open(path) else {
             continue;
         };
-        let used = number(value.get("usedPercent"))
-            .filter(|p| (0.0..=100.0).contains(p))
-            .ok_or_else(|| invalid("codexbar_invalid_window"))?;
-        let minutes = number(value.get("windowMinutes"))
-            .filter(|p| *p > 0.0)
-            .ok_or_else(|| invalid("codexbar_invalid_window"))?;
-        let reset = timestamp(value.get("resetsAt"));
-        if value.get("resetsAt").is_some_and(|v| !v.is_null()) && reset.is_none() {
-            return Err(invalid("codexbar_invalid_reset"));
+        use std::io::{Read, Seek, SeekFrom};
+        let end = file.seek(SeekFrom::End(0)).unwrap_or(0);
+        if file
+            .seek(SeekFrom::Start(end.saturating_sub(MAX_BYTES)))
+            .is_err()
+        {
+            continue;
         }
-        samples.push(sample(
-            runtime,
-            lane,
-            window_name(minutes),
-            None,
-            "codexbar",
-            100.0 - used,
-            reset,
-            observed,
-        ));
+        let mut data = Vec::new();
+        if file.take(MAX_BYTES).read_to_end(&mut data).is_err() {
+            continue;
+        }
+        let text = String::from_utf8(data).unwrap_or_default();
+        for line in text.lines().rev().take(MAX_LINES) {
+            if !line.contains("\"rate_limit_event\"") {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if event.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+                continue;
+            }
+            let Some(windows) = event
+                .pointer("/rate_limit_info/unifiedWindows")
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            let stale = observed - modified > TTL;
+            let mut samples = Vec::new();
+            for (window, entry) in windows {
+                let Some(utilization) = number(entry.get("utilization")) else {
+                    continue;
+                };
+                let reset = entry
+                    .get("resetsAt")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite() && *value >= 0.0);
+                samples.push(Sample {
+                    key: Key {
+                        runtime: runtime.into(),
+                        lane: "usage".into(),
+                        window: window.clone(),
+                        target: None,
+                        source: if stale {
+                            "unknown".into()
+                        } else {
+                            "runtime_stream_evidence".into()
+                        },
+                    },
+                    remaining_percent: (!stale)
+                        .then_some((1.0 - utilization).mul_add(100.0, 0.0).clamp(0.0, 100.0)),
+                    reset_at: reset,
+                    observed_at: Some(modified),
+                    valid_until: Some(modified + TTL),
+                });
+            }
+            if !samples.is_empty() {
+                let topology = conservative_topology(runtime, &samples, None);
+                return Ok(Slice {
+                    runtime: runtime.into(),
+                    scope_id: runtime.into(),
+                    samples,
+                    topology,
+                    observed_at: modified,
+                    valid_until: modified + TTL,
+                });
+            }
+        }
+    }
+    Ok(Slice {
+        runtime: runtime.into(),
+        scope_id: runtime.into(),
+        samples: Vec::new(),
+        topology: Topology::default(),
+        observed_at: observed,
+        valid_until: observed + TTL,
+    })
+}
+pub fn normalize_codexbar(runtime: &str, raw: &Value) -> Result<Slice> {
+    normalize_codexbar_accounts(runtime, raw, &BTreeMap::new(), None)
+}
+/// Normalizes one Codexbar payload and maps each discovered email to its route account.
+///
+/// `accounts` maps configured labels to auth-file email claims; `default_email`
+/// remains the unlabelled target. Unknown provider accounts retain evidence but
+/// receive no route, so they cannot become launchable identities.
+pub fn normalize_codexbar_accounts(
+    runtime: &str,
+    raw: &Value,
+    accounts: &BTreeMap<String, String>,
+    default_email: Option<&str>,
+) -> Result<Slice> {
+    let value = if let Some(list) = raw.as_array() {
+        list
+    } else {
+        std::slice::from_ref(raw)
+    };
+    let mut samples = Vec::new();
+    for entry in value {
+        let usage = entry
+            .get("usage")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| invalid("codexbar_malformed_response"))?;
+        let email = usage
+            .pointer("/identity/accountEmail")
+            .or_else(|| usage.get("accountEmail"))
+            .and_then(Value::as_str)
+            .filter(|email| !email.is_empty());
+        let target = if accounts.is_empty() {
+            None
+        } else if email.is_none() {
+            Some("unknown".to_owned())
+        } else if email == default_email {
+            None
+        } else {
+            Some(
+                accounts
+                    .iter()
+                    .find_map(|(label, known)| {
+                        (Some(known.as_str()) == email).then(|| label.clone())
+                    })
+                    .unwrap_or_else(|| email.unwrap_or_default().to_owned()),
+            )
+        };
+        let observed = timestamp(usage.get("updatedAt"))
+            .ok_or_else(|| invalid("codexbar_invalid_observed_at"))?;
+        for lane in ["primary", "secondary", "tertiary"] {
+            let Some(value) = usage.get(lane).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            let used = number(value.get("usedPercent"))
+                .filter(|percent| (0.0..=100.0).contains(percent))
+                .ok_or_else(|| invalid("codexbar_invalid_window"))?;
+            let minutes = number(value.get("windowMinutes"))
+                .filter(|minutes| *minutes > 0.0)
+                .ok_or_else(|| invalid("codexbar_invalid_window"))?;
+            let reset = timestamp(value.get("resetsAt"));
+            if value.get("resetsAt").is_some_and(|value| !value.is_null()) && reset.is_none() {
+                return Err(invalid("codexbar_invalid_reset"));
+            }
+            samples.push(sample(
+                runtime,
+                lane,
+                window_name(minutes),
+                target.clone(),
+                "codexbar",
+                100.0 - used,
+                reset,
+                observed,
+            ));
+        }
     }
     if samples.is_empty() {
         return Err(invalid("codexbar_missing_data"));
     }
-    let topology = conservative_topology(runtime, &samples, None);
+    let mut topology = Topology::default();
+    for (target, samples) in samples.iter().fold(
+        BTreeMap::<Option<String>, Vec<&Sample>>::new(),
+        |mut groups, sample| {
+            groups
+                .entry(sample.key.target.clone())
+                .or_default()
+                .push(sample);
+            groups
+        },
+    ) {
+        let keys = samples
+            .into_iter()
+            .map(|sample| sample.key.clone())
+            .collect();
+        let id = format!(
+            "{runtime}:codexbar:{}:all",
+            account_token(target.as_deref())
+        );
+        topology.pools.push(Pool {
+            pool_id: id.clone(),
+            keys,
+        });
+        if target
+            .as_ref()
+            .is_none_or(|target| accounts.contains_key(target))
+        {
+            topology.routes.push(Route {
+                route_id: id.clone(),
+                runtime: runtime.into(),
+                account: target,
+                quota_lane: "default".into(),
+                pool_ids: vec![id],
+                reset_credits: None,
+            });
+        }
+    }
+    topology.validate(runtime)?;
+    let observed_at = samples
+        .iter()
+        .map(|sample| sample.observed_at.unwrap_or(0.0))
+        .fold(0.0, f64::max);
     Ok(Slice {
         runtime: runtime.into(),
         scope_id: runtime.into(),
         samples,
         topology,
-        observed_at: observed,
-        valid_until: observed + TTL,
+        observed_at,
+        valid_until: observed_at + TTL,
     })
 }
 async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result<Slice> {
-    let _ = home;
-    if !rt.accounts.is_empty() {
-        return Err(Error::Unsupported("codexbar labelled-account mapping requires additional parity work; use codex_appserver for Codex".into()));
-    }
     let provider = match rt.kind()? {
         Adapter::Codex => "codex",
         Adapter::Claude => "claude",
@@ -543,19 +765,84 @@ async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result
         provider.into(),
         "--json".into(),
     ];
+    if !rt.accounts.is_empty() {
+        args.push("--all-accounts".into());
+    }
     if rt.kind()? == Adapter::Claude {
         args.extend(["--source".into(), "cli".into()]);
     }
     let bytes = capture(
         &cfg.capacity.codexbar_binary,
         &args,
-        120,
+        CODEXBAR_TIMEOUT_SECONDS,
         &host_environment(),
     )
     .await?;
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| invalid("codexbar_malformed_response"))?;
-    normalize_codexbar(name, &value)
+    let accounts = rt
+        .accounts
+        .iter()
+        .filter_map(|label| {
+            account_email(
+                &home
+                    .join("accounts")
+                    .join(name)
+                    .join(label)
+                    .join("auth.json"),
+            )
+            .map(|email| (label.clone(), email))
+        })
+        .collect();
+    let default_email = match &rt.auth {
+        Some(Auth::FileLink { source, .. }) => account_email(source),
+        _ => None,
+    };
+    normalize_codexbar_accounts(name, &value, &accounts, default_email.as_deref())
+}
+/// Reads the local OmniRoute current-cache into one capacity slice.
+///
+/// The route has one physical pool for the shared `opencode-go` capacity.
+/// Docker failures and malformed cache values propagate fixed unavailable
+/// reasons, while a healthy empty cache remains a no-data outcome.
+async fn omniroute(name: &str) -> Result<Slice> {
+    let args = vec![
+        "exec".into(),
+        "omniroute".into(),
+        "node".into(),
+        "-e".into(),
+        super::omniroute::script(),
+    ];
+    let environment = host_environment();
+    let attempt = || capture(super::omniroute::docker(), &args, 10, &environment);
+    let values = match super::omniroute::read(attempt()).await {
+        Ok(values) => values,
+        Err(Error::Runtime(reason)) if reason == "omniroute_unavailable" => {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            super::omniroute::read(attempt()).await?
+        }
+        Err(error) => return Err(error),
+    };
+    let samples = values
+        .into_iter()
+        .map(|mut sample| {
+            sample.key.runtime = name.into();
+            sample
+        })
+        .collect::<Vec<_>>();
+    let observed_at = samples
+        .iter()
+        .filter_map(|sample| sample.observed_at)
+        .fold(0.0, f64::max);
+    let topology = conservative_topology(name, &samples, None);
+    Ok(Slice {
+        runtime: name.into(),
+        scope_id: name.into(),
+        samples,
+        topology,
+        observed_at,
+        valid_until: observed_at + super::omniroute::STALE_SECONDS,
+    })
 }
 pub async fn collect(home: &Path) -> Result<Value> {
     let config = Config::load(home)?;
@@ -565,7 +852,8 @@ pub async fn collect(home: &Path) -> Result<Value> {
     for (name, rt) in config.runtimes.iter().filter(|(_, r)| r.enabled) {
         let source = rt.limits_source.as_deref().unwrap_or("native");
         let mut count = 0;
-        let mut issues: Vec<&str> = Vec::new();
+        let mut issues: Vec<String> = Vec::new();
+        let mut no_data = false;
         if source == "none" {
             results.push(json!({"runtime":name,"status":"unsupported","sample_count":0,"error":null,"issues":[]}));
             continue;
@@ -586,42 +874,53 @@ pub async fn collect(home: &Path) -> Result<Value> {
                             }
                         }
                         if slice.samples.is_empty() {
-                            issues.push("scope_empty");
+                            issues.push("scope_empty".into());
                             continue;
                         }
                         if slice.topology.routes.is_empty() {
-                            issues.push("incomplete_bucket");
+                            issues.push("incomplete_bucket".into());
                         }
                         match super::persist(home, &slice, config.capacity.sample_retention) {
                             Ok(n) => count += n,
-                            Err(_) => issues.push("persist_failed"),
+                            Err(_) => issues.push("persist_failed".into()),
                         }
                     }
-                    Err(_) => issues.push("probe_failed"),
+                    Err(_) => issues.push("probe_failed".into()),
                 }
             }
         } else {
             let result = match (source, rt.kind()?) {
                 ("codexbar", _) => codexbar(home, &config, name, rt).await,
-                ("native", Adapter::Claude) => claude_native(name, rt).await,
+                ("omniroute", _) => omniroute(name).await,
+                ("native", Adapter::Claude) => match claude_native(name, rt).await {
+                    Ok(slice) => Ok(slice),
+                    Err(Error::Validation(reason)) if reason == "claude_token_missing" => {
+                        read_claude_stream(home, name)
+                    }
+                    Err(error) => Err(error),
+                },
                 _ => Err(Error::Unsupported(
                     "selected quota source has not been ported".into(),
                 )),
             };
             match result {
-                Ok(slice) if slice.samples.is_empty() => issues.push("scope_empty"),
+                Ok(slice) if slice.samples.is_empty() => no_data = true,
                 Ok(slice) => match super::persist(home, &slice, config.capacity.sample_retention) {
                     Ok(n) => count = n,
-                    Err(_) => issues.push("persist_failed"),
+                    Err(_) => issues.push("persist_failed".into()),
                 },
-                Err(Error::Unsupported(_)) => issues.push("source_not_ported"),
-                Err(_) => issues.push("source_failed"),
+                Err(Error::Unsupported(_)) => issues.push("source_not_ported".into()),
+                Err(Error::Validation(reason)) => issues.push(reason),
+                Err(Error::Runtime(reason)) => issues.push(reason),
+                Err(_) => issues.push("source_failed".into()),
             }
         }
         let status = if issues.is_empty() && count > 0 {
             "collected"
         } else if count > 0 {
             "partial"
+        } else if no_data && issues.is_empty() {
+            "no_data"
         } else {
             "failed"
         };
