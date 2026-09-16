@@ -48,7 +48,7 @@ struct StartupOwner {
     /// Native immutable process-start token.
     token: String,
     /// Native process creation time used for legacy compatibility.
-    birth: f64,
+    birth: Option<f64>,
 }
 
 /// Reconcile up to `limit` active rows with the native PID-reuse-aware observer.
@@ -146,7 +146,7 @@ where
         let Some(owner) = startup_owner(&row) else {
             continue;
         };
-        let state = observe(Some(owner.pid), Some(&owner.token), Some(owner.birth));
+        let state = observe(Some(owner.pid), Some(&owner.token), owner.birth);
         if proved_gone(state)
             && guarded_lost(
                 store,
@@ -214,9 +214,30 @@ fn state_name(state: ProcessState) -> &'static str {
 
 /// Decode complete startup ownership evidence, preferring the JSON's exact birth.
 fn startup_owner(row: &Candidate) -> Option<StartupOwner> {
-    let owner: StartupOwner = serde_json::from_str(row.startup_owner.as_deref()?).ok()?;
-    (owner.pid > 1 && owner.birth.is_finite() && owner.birth >= 0.0 && !owner.token.is_empty())
-        .then_some(owner)
+    let raw = row.startup_owner.as_deref()?;
+    if let Ok(owner) = serde_json::from_str::<StartupOwner>(raw) {
+        return (owner.pid > 1
+            && owner
+                .birth
+                .or(row.startup_birth_time)
+                .is_some_and(|birth| birth.is_finite() && birth >= 0.0)
+            && !owner.token.is_empty())
+        .then(|| StartupOwner {
+            birth: owner.birth.or(row.startup_birth_time),
+            ..owner
+        });
+    }
+    let (pid, _) = raw.split_once(' ')?;
+    let pid = pid.parse().ok()?;
+    (pid > 1
+        && row
+            .startup_birth_time
+            .is_some_and(|birth| birth.is_finite() && birth >= 0.0))
+    .then(|| StartupOwner {
+        pid,
+        token: raw.to_owned(),
+        birth: row.startup_birth_time,
+    })
 }
 
 /// Fixed query for broker-owned starts which have not yet bound a supervisor.
