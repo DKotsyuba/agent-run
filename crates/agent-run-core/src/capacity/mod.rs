@@ -262,6 +262,15 @@ pub fn same_cycle(sample: &Sample, latest: &Sample) -> bool {
         _ => false,
     }
 }
+/// Mirrors Python's `forecast._is_fresh`: unlike [`Sample::fresh`] (used by
+/// the persisted `limits()` view), a missing `valid_until` or `observed_at`
+/// is an absent bound, not a failed one -- history rows built straight from
+/// already-validated storage may omit them without becoming unknown evidence.
+fn forecast_fresh(s: &Sample, at: f64) -> bool {
+    s.valid_until.is_none_or(|v| v >= at)
+        && s.observed_at.is_none_or(|v| v <= at)
+        && s.reset_at.is_none_or(|v| v > at)
+}
 pub fn forecast(key: &Key, samples: &[Sample], at: f64) -> Forecast {
     let unknown = Forecast {
         key: key.clone(),
@@ -275,7 +284,10 @@ pub fn forecast(key: &Key, samples: &[Sample], at: f64) -> Forecast {
         risk: "unknown".into(),
         burn_span_seconds: None,
     };
-    let Some(latest) = samples.first().filter(|s| s.fresh(at)) else {
+    let Some(latest) = samples
+        .first()
+        .filter(|s| forecast_fresh(s, at) && s.remaining_percent.is_some())
+    else {
         return unknown;
     };
     let remaining = latest.remaining_percent.unwrap_or(0.0);
