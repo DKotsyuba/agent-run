@@ -95,31 +95,3 @@ fn an_exited_child_is_dead_before_and_after_reaping() {
     child.wait().unwrap();
     assert_eq!(observe(), ProcessState::Dead);
 }
-
-/// Assert that Rust observes exactly the float psutil stored for `pid`.
-fn compare_with_psutil(pid: i32, expected: f64) {
-    let identity = process::inspect(pid)
-        .unwrap_or_else(|error| panic!("psutil read pid {pid} but Rust could not: {error}"));
-    eprintln!(
-        "pid={pid} psutil={expected:?} rust={:?} bits={:#x}/{:#x} token={}",
-        identity.birth,
-        expected.to_bits(),
-        identity.birth.to_bits(),
-        identity.token
-    );
-    assert_eq!(identity.birth.to_bits(), expected.to_bits(), "pid {pid}");
-}
-
-/// Compares an externally recorded legacy psutil birth value when supplied.
-///
-/// The optional PID and birth variables are inert recorded inputs; this Rust
-/// suite never launches a Python interpreter.
-#[test]
-fn birth_matches_recorded_psutil_value_bit_for_bit() {
-    if let (Ok(pid), Ok(birth)) = (
-        std::env::var("AGENT_RUN_DIFF_PID"),
-        std::env::var("AGENT_RUN_DIFF_BIRTH"),
-    ) {
-        compare_with_psutil(pid.trim().parse().unwrap(), birth.trim().parse().unwrap());
-    }
-}

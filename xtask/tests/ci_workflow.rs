@@ -71,3 +71,19 @@ fn release_publishes_checksummed_native_assets() {
         );
     }
 }
+
+/// Pins local check and native-release commands to warning-denied locked builds.
+#[test]
+fn xtask_denies_warnings_and_locks_native_release_resolution() {
+    let source = repository_file("xtask/src/main.rs");
+    assert!(
+        source.contains("\"--all-features\",\n            \"--\",\n            \"-D\",\n            \"warnings\","),
+        "cargo xtask check must deny clippy warnings"
+    );
+    assert!(
+        source.contains(
+            "\"build\",\n        \"--offline\",\n        \"--locked\",\n        \"--release\","
+        ),
+        "native release builds must use the committed lockfile"
+    );
+}

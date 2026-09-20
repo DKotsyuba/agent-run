@@ -194,8 +194,8 @@
     {
       "path": "migration/review-checklist.md",
       "kind": "review",
-      "bytes": 7935,
-      "sha256": "92b5808890836deedae2f7257b0f8b5473b762a70d9245d5121ab648fd311498"
+      "bytes": 7966,
+      "sha256": "5198480598495313dd2b5f4c4c565ea3f0e1b30573664effcf07493753c594e4"
     },
     {
       "path": "migration/tasks.csv",

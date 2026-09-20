@@ -35,7 +35,7 @@ revision, not to "the branch".
 | # | Command | What a pass looks like | Result |
 |---|---|---|---|
 | 1.1 | `cargo fmt --all -- --check` | exit 0, no output | |
-| 1.2 | `cargo clippy --offline --workspace --all-targets --all-features` | exit 0, **zero** warnings | |
+| 1.2 | `cargo clippy --offline --workspace --all-targets --all-features -- -D warnings` | exit 0, **zero** warnings | |
 | 1.3 | `cargo test --offline --workspace --all-features --no-fail-fast` | 0 failed. In a sandbox that forbids Unix sockets you will instead see ~56 failures across 7 targets, every one a bind denial — verify that by reading a panic message, not by counting | |
 | 1.4 | `cargo xtask qualify --release` | exit 0; reports the host platform as evidenced and names the pending live portions **without claiming them** | |
 | 1.5 | `cargo xtask archive --verify` | exit 0, names the archive it verified | |
@@ -98,12 +98,16 @@ At the time this form was written, `migration/tasks.csv` carried **no row marked
 Check this yourself:
 
 ```sh
-python3 -c "
-import csv, collections
-rows = list(csv.DictReader(open('migration/tasks.csv')))
-print(collections.Counter(r['status'] for r in rows))
-print([r['id'] for r in rows if r['status'] != 'implemented'])
-"
+awk -F, '
+  NR > 1 {
+    count[$12]++
+    if ($12 != "implemented") open = open (open ? ", " : "") $1
+  }
+  END {
+    for (status in count) print status, count[status]
+    print "not implemented:", open
+  }
+' migration/tasks.csv
 ```
 
 ---

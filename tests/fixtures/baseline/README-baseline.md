@@ -6,10 +6,14 @@ This is the sanitized Python reference corpus for Rust migration plan P0
 `31f723ba881fe0e35146a7262103c89737dd52ef`; `src/` and `tests/` were unchanged
 relative to that commit.
 
-Regenerate the assigned fixtures from the worktree root with:
+These fixtures are immutable historical inputs on the Rust-primary branch.
+Regeneration is allowed only from the frozen `archive/python-legacy` branch,
+using that branch's documented generator and an isolated temporary home. Copy
+an accepted regenerated corpus back only through a separately reviewed change.
 
 ```text
-PYTHONPATH=src AGENT_RUN_HOME=/private/tmp/agent-run-baseline-home HOME=/private/tmp/agent-run-baseline-home python3.14 migration/tools/capture_baseline.py
+git switch archive/python-legacy
+# Follow the frozen branch's baseline-corpus instructions.
 ```
 
 The generator derives CLI nodes from the live argparse parser, copies the live

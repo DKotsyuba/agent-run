@@ -1,11 +1,10 @@
-# Migration status — corpus ported and qualified on fixtures; not accepted
+# Migration status — Rust primary at 0.12.0
 
 Baseline: `DKotsyuba/agent-run` v0.11.15, commit `c9904f9843ba4a0772bdfa8bac5259f18fad9dc3`.
 
 ## Update — 20 September 2026
 
-The remaining autonomous repair work is closed in the working tree after
-`5fcf870`:
+The Rust-primary release includes:
 
 - the broker compares the exact `config.toml` SHA-256 every 60 seconds and
   loads changed valid configuration without restart; starts and continuations
@@ -23,9 +22,9 @@ The remaining autonomous repair work is closed in the working tree after
 
 The full workspace suite passed with zero failures and one ignored Keychain
 smoke. Formatting, clippy with warnings denied, release qualification, source
-archive verification, and the 30-entry evidence index all pass. Formal release
-acceptance still requires the external live portions and signed checklist
-listed under *Blocking acceptance gates*; this update does not claim them.
+archive verification, and the 33-entry evidence index all pass. Real start and
+resume canaries reached Codex, Claude, and GLM through the isolated Rust broker.
+Desktop-host delivery and a non-macOS qualification run remain unclaimed.
 
 ### Qwen removal checkpoint
 
@@ -50,18 +49,24 @@ expecting `opencode/`; both affected Rust targets now pass (22 + 9 tests).
 The clean full Python rerun passes 1118 tests / 408 subtests with one skipped
 Keychain smoke. The clean full Rust rerun passes 1076 tests with zero failures
 and one ignored Keychain smoke. Qualification accepts the explicit T57
-divergence and reports 84/84 scenarios with three remaining live resource
-classes. Independent code review found no defects; evidence review findings are
+divergence and reports 84/84 scenarios. Independent code review found no defects; evidence review findings are
 resolved. The implementation is committed as
 `93c7a8c1e106bbb9f1eeab09ec1f51b069254125`; its source archive verifies, and
-the refreshed evidence index verifies 32 entries. Remaining acceptance work is
-limited to the live resource classes and signed P12 checklist described below.
+the refreshed evidence index now verifies 33 entries.
 
 The sealed candidate at `e8d5b7d6011680f4ff79913d0c25c8d6f92a81c4`
 also passed an isolated release smoke: manifest verification, CLI, API ping and
 tool discovery, MCP initialization/listing, broker-backed fixture execution,
 verified answer proof, clean doctor, and socket cleanup. Evidence is recorded
 in `migration/evidence/release-smoke-2026-09-20.md`.
+
+The owner-terminal live run then reached all supported providers through that
+same isolated broker. Codex, Claude, and GLM each returned the exact requested
+canary sentinel, and each native session resumed to a second exact sentinel;
+answer proofs, transcripts, lineage, and process cleanup were verified. The
+record is `migration/live-canary-checkpoint-2026-09-20.md`. This closes the
+supported-engine live portions of T58–T59 without claiming Desktop T71 or a
+second operating system for T82.
 
 ## What this artifact is
 
@@ -74,11 +79,11 @@ reference throughout. Rust tests retain their baseline citations, and the final
 coverage ledger generated before archival remains in
 `migration/baseline/test-map.csv`.
 
-**What "ported" means here.** A behavior is counted only when a Rust test
+**What "ported" means here.** A behavior was counted only when a Rust test
 carrying a machine-parsed `Mirrors` citation is discovered by `cargo test
 --list`. It does not mean a human reviewed the behavior, and it does not mean
-the subsystem was qualified under load, against a real engine, or on any
-platform other than the one it was tested on. See *Blocking acceptance gates*.
+the subsystem was qualified under load or on a different platform. Live engine
+evidence is recorded separately from this historical coverage count.
 
 ## Corpus coverage
 
@@ -125,12 +130,11 @@ scenarios onto the Rust tests that assert them.
 Every cited test name was checked against `cargo test --list`, so a citation
 cannot refer to a test that does not exist.
 
-The live resource classes that no fixture can supply are exactly three, and none is a
-coding task:
+The supported-engine live start/resume portions of T58–T59 are complete. The
+remaining unclaimed resource classes are not coding tasks:
 
-1. one installed supported engine, to prove continuation behavior (T58–T59);
-2. the running ChatGPT Desktop host (T71);
-3. one non-macOS machine (T82).
+1. the running ChatGPT Desktop host (T71);
+2. one non-macOS machine (T82).
 
 `cargo xtask qualify --release` reports this state and **refuses** to certify a
 platform with no recorded evidence rather than warning about it.
@@ -141,10 +145,11 @@ Measured personally on macOS (Darwin 27.0.0, arm64) at the commits noted:
 
 - `cargo fmt --all --check`: clean.
 - `cargo clippy --workspace --all-targets --all-features`: **zero** warnings.
-- `cargo xtask qualify --release`: exit 0, 84/84 scenarios, three live portions
-  named and explicitly not claimed as run.
+- `cargo xtask qualify --release`: exit 0, 84/84 scenarios; its immutable scope
+  map still labels the live boundaries while the supported-engine run is
+  recorded separately in the live-canary checkpoint.
 - `cargo xtask archive --verify`: exit 0.
-- `cargo xtask evidence verify`: exit 0, 29 entries.
+- `cargo xtask evidence verify`: exit 0, 33 entries.
 - The four acceptance commands that earlier revisions of this file called
   unproven all pass: M14a (3 tests), M28a (2), M31b (3), M33 (2).
 
@@ -232,36 +237,27 @@ are the operator's half of the runbook.
    usage/TTFT/API timing views are not all equivalent.
 6. Delivery evidence uses a smaller Rust shape; historical Python-shaped evidence
    is not fully projected, and notice wording is not byte-for-byte equivalent.
-7. The legacy `codex queue` subprocess sender is out of scope: Python retains it
-   but its production transport never calls it (ADR A09, option C2).
+7. The legacy `codex queue` subprocess sender is out of scope: the frozen
+   `archive/python-legacy` branch retains it, but its production transport never
+   calls it (ADR A09, option C2).
 
-## Blocking acceptance gates
+## Remaining unclaimed acceptance surfaces
 
-The corpus is ported and the scenario map is closed on fixtures. **Formal
-acceptance has not been performed, and this artifact must not be installed over
-a working release.** What remains is not implementation:
+The scoped macOS/arm64 Rust-primary release has full fixture coverage, a sealed
+release smoke, and successful live Codex/Claude/GLM start and resume evidence.
+The following claims remain intentionally outside that acceptance:
 
-1. **Live qualification (board M55) has not been run and needs authorization.**
-   Three real-world resources are required, listed under *Qualification scope*.
-   `migration/evidence/qualification.md` is deliberately absent: writing it
-   without a qualification run would fabricate evidence.
-2. **Platform support is undecided.** All testing ran on macOS/arm64. Linux code
-   paths exist — including the process-identity and liveness paths the
-   supervision model rests on — and have never executed. ADR A15 records the
-   evidence and recommends declaring macOS/arm64 only; the decision is the
-   owner's. Plan risk K02 names "Mac/Linux" explicitly in its closure condition.
-3. **One blocking risk is open.** Of the seven risks the plan marks blocking,
-   six are closed by evidence. K01 — Desktop admission without a signed shim —
-   is open, and the plan states the consequence directly: without that evidence,
-   full parity is not claimed. This is the same question as board row M09 and
-   ADR A09.
-4. **The process-group kill strategy is undecided**, which is what leaves the one
-   unported behavior open. See *Corpus coverage*.
-5. **P12 is not closed by a green test run.** The plan's exit condition is a
-   signed review checklist, an evidence bundle, a release archive and a
-   post-cutover report — and before any of that, the §21 runbook exercised on a
-   **copy** of the environment, with the §21.6 recovery drills on a disposable
-   home. The unsigned checklist is `migration/review-checklist.md`.
+1. **Desktop host delivery.** T71 still needs a smoke against the real running
+   ChatGPT Desktop host. ADR A09 and board row M09 remain the controlling record.
+2. **Non-macOS support.** T82 still needs a second operating system. Version
+   0.12.0 therefore supports macOS/arm64 only; Linux CI is validation-only.
+3. **Production cutover.** A green release candidate does not authorize changing
+   a working installation. The operator must complete the signed checklist,
+   backup, pointer switch, service restart, API/MCP smoke, and rollback evidence.
+
+The A10 process-group policy is accepted as an explicit divergence: Rust never
+signals a possibly reused group after the leader identity is no longer proven.
+It is not unfinished migration work.
 
 ### What the board's numbers do not mean
 

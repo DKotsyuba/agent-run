@@ -2,7 +2,7 @@
 use std::{env, path::PathBuf, process::Command};
 use xtask::{archive, deploy, evidence, qualify, release};
 
-/// Runs the Rust workspace's formatter, linter, and test gates.
+/// Runs the Rust workspace's formatter, warning-denied linter, and test gates.
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments.first().map(String::as_str) == Some("release") {
@@ -35,6 +35,9 @@ fn main() {
             "--workspace",
             "--all-targets",
             "--all-features",
+            "--",
+            "-D",
+            "warnings",
         ],
         vec!["test", "--offline", "--workspace", "--all-features"],
     ] {
@@ -122,12 +125,19 @@ fn evidence_command(arguments: &[String]) {
 
 /// Builds the native binary for an installed Cargo target and returns its path.
 ///
-/// This is intentionally offline: target support is the set installed in the
-/// invoking toolchain, and a missing target fails before an incomplete release
-/// directory is created.
+/// This is intentionally offline and locked: target support is the set installed
+/// in the invoking toolchain, dependency resolution cannot modify `Cargo.lock`,
+/// and a missing target fails before an incomplete release directory is created.
 fn native_binary(target: Option<&str>) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
-    command.args(["build", "--offline", "--release", "-p", "agent-run"]);
+    command.args([
+        "build",
+        "--offline",
+        "--locked",
+        "--release",
+        "-p",
+        "agent-run",
+    ]);
     if let Some(target) = target {
         command.args(["--target", target]);
     }
