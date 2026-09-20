@@ -6,7 +6,6 @@
 mod common;
 
 use agent_run_adapters::{io::Process, LaunchPlan};
-use agent_run_config::config::Adapter;
 use agent_run_core::{dispatch, domain::Status, service::Service, stream};
 use serde_json::json;
 use std::{collections::BTreeMap, path::Path};
@@ -62,7 +61,7 @@ async fn resume_refuses_missing_or_wrong_stream_identity() {
         }
         let mut process =
             Process::spawn(&fake_engine(&home.path, &result.to_string())).expect("fake engine");
-        let outcome = stream::run(&mut process, &mut store, &record, Adapter::Claude, None).await;
+        let outcome = stream::run(&mut process, &mut store, &record, None).await;
         if identity == Some("saved") {
             let confirmed = outcome.expect("the requested session is confirmed");
             assert_eq!(confirmed.outcome.status, Status::Succeeded);

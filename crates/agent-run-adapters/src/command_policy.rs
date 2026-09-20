@@ -108,7 +108,7 @@ pub fn render_codex_review_rules(
     )
 }
 
-/// Render exact-command Bash denials for Claude- or Qwen-shaped settings.
+/// Render exact-command Bash denials for Claude-shaped settings.
 pub fn render_bash_denials(commands: &[String], command_paths: &[PathBuf]) -> Result<Vec<String>> {
     Ok(native_patterns(commands, command_paths)?
         .into_iter()

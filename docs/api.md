@@ -188,7 +188,7 @@ class AgentRun:
 api = AgentRun()
 started = api.call(
     "start",
-    runtime="qwen", model="opencode/MiniMaxM3", profile="review",
+    runtime="glm", model="glm-5.3", profile="review",
     task="Summarize the diff in one line.",
     workdir="/path/to/repo", timeout_seconds=600,
 )

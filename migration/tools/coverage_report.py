@@ -457,6 +457,8 @@ def render_report(
     rust_test_total: int,
     divergences: dict[str, tuple[str, str]],
 ) -> str:
+    """Render the deterministic Markdown summary with one trailing newline."""
+
     after_counts: dict[str, int] = {"ported": 0, "planned": 0, "divergent": 0, "unassigned": 0}
     for r in rows:
         after_counts[r["status"]] += 1
@@ -614,7 +616,7 @@ def render_report(
         for n in legacy_notes:
             lines.append(f"- {n}")
         lines.append("")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def main() -> int:

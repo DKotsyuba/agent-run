@@ -60,6 +60,23 @@ fn fake_codexbar(root: &Path, stdout: &str, status: i32) -> PathBuf {
     path
 }
 
+/// Writes a fake Codexbar that succeeds for Codex and emits malformed GLM data.
+fn selective_codexbar(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("selective-codexbar");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$3\" = codex ]; then printf '%s' '{}'; else printf invalid-json; fi\n",
+            RECORDED
+        ),
+    )
+    .expect("selective provider CLI writes");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("selective provider CLI is runnable");
+    path
+}
+
 /// Builds an agent-run home whose config declares `runtimes` and one retention.
 fn round_home(
     runtimes: &[Fixture<'_>],
@@ -141,16 +158,11 @@ fn stored_samples(home: &Path) -> Vec<StoredSample> {
 #[tokio::test]
 async fn partial_failure_never_blocks_healthy_runtimes() {
     let scratch = tempfile::tempdir().expect("scratch root");
-    let healthy = fake_codexbar(scratch.path(), RECORDED, 0);
-    // `codexbar_binary` is one global setting, so the failing runtime cannot
-    // simply get a different fake binary. It fails on the adapter mapping
-    // instead -- Codexbar has no Qwen provider -- which is still an
-    // operational failure raised before any sample exists, exactly the case
-    // Python drives with a raising adapter.
+    let healthy = selective_codexbar(scratch.path());
     let (_temp, home) = round_home(
         &[
             Fixture::new("codex", "codex", "codexbar"),
-            Fixture::new("failing", "qwen", "codexbar"),
+            Fixture::new("failing", "glm", "codexbar"),
             Fixture::new("unsupported", "claude", "none"),
             Fixture::disabled("disabled_rt"),
         ],
@@ -175,7 +187,6 @@ async fn partial_failure_never_blocks_healthy_runtimes() {
     assert_eq!(result_for(&report, "failing")["status"], "failed");
     assert_eq!(result_for(&report, "failing")["sample_count"], 0);
     assert_eq!(result_for(&report, "unsupported")["status"], "unsupported");
-    // A degraded round never reports overall success.
     assert_eq!(report["ok"], false);
 
     // One runtime's failure never removes another runtime's evidence.

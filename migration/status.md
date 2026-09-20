@@ -17,12 +17,43 @@ The remaining autonomous repair work is closed in the working tree after
   precondition instead of racing Darwin's pending-connect queue;
 - a repeated rollback is rejected as `deployment is already rolled back`
   instead of reporting a successful no-op.
+- Qwen is removed from both implementations, active fixtures, and public
+  runtime documentation; legacy adapter identifiers fail with deprecation
+  guidance instead of attempting dynamic loading.
 
 The full workspace suite passed with zero failures and one ignored Keychain
 smoke. Formatting, clippy with warnings denied, release qualification, source
 archive verification, and the 30-entry evidence index all pass. Formal release
 acceptance still requires the external live portions and signed checklist
 listed under *Blocking acceptance gates*; this update does not claim them.
+
+### Qwen removal checkpoint
+
+Qwen is intentionally deprecated, not awaiting a replacement implementation.
+The Rust adapter variant and execution branches, Python adapter package,
+Qwen-only tests and generated-home fixtures, Keychain fallback, public runtime
+documentation, and live T57 requirement are removed. Legacy Rust and Python
+adapter identifiers remain only as fail-fast deprecation guards. The explicit
+OmniRoute capacity source remains runtime-neutral and is not a Qwen adapter.
+
+Verification completed on this candidate: the Rust workspace builds every test
+target with `cargo test --offline --workspace --all-features --no-run`; the
+Python 3.14 native-settings selector passes 26 tests and 44 subtests, including
+the deprecated-config rejection. A first full Python run reached 1117 passed / 1
+failed / 1 skipped: the only failure was the operator-guide test still expecting
+the removed `opencode/` Qwen alias. The guide and assertion now describe only
+Codex/Claude/GLM, and the exact regression passes. Affected Python selectors
+pass 93 tests / 113 subtests; Rust clippy and affected Rust selectors pass. The
+coverage map is reconciled at 1078 ported / 68 declared divergences / 1 planned.
+The first full Rust run likewise had only three stale operator-guide assertions
+expecting `opencode/`; both affected Rust targets now pass (22 + 9 tests).
+The clean full Python rerun passes 1118 tests / 408 subtests with one skipped
+Keychain smoke. The clean full Rust rerun passes 1076 tests with zero failures
+and one ignored Keychain smoke. Qualification accepts the explicit T57
+divergence and reports 84/84 scenarios with three remaining live resource
+classes. Independent code review found no defects; evidence review findings are
+resolved. Remaining before final acceptance: commit, archive, and
+evidence-index refresh/verification.
 
 ## What this artifact is
 
@@ -48,8 +79,8 @@ Measured by `migration/tools/coverage_report.py`; the per-behavior ledger is
 
 | Status | Behaviors |
 | --- | ---: |
-| ported | 1107 |
-| declared divergence | 39 |
+| ported | 1078 |
+| declared divergence | 68 |
 | remaining | 1 |
 | **total** | **1147** |
 
@@ -69,7 +100,8 @@ behavior is carried as unported rather than quietly reclassified.
 Declared divergences are recorded per behavior in
 `migration/baseline/divergences.csv`, each naming the ADR that decided it: A09
 (Desktop relay, legacy queue sender), A10 (payload pipe, closed adapter set),
-A19 (release and deploy), A20 (supervisor architecture), A21 (runtime platform).
+A19 (release and deploy), A20 (supervisor architecture), A21 (runtime platform),
+and A22 (Qwen removal).
 
 ## Qualification scope
 
@@ -78,18 +110,19 @@ scenarios onto the Rust tests that assert them.
 
 | | Scenarios |
 | --- | ---: |
-| covered, no live portion | 80 |
-| covered, live portion remains | 1 |
-| partial, live portion open | 3 |
+| covered, no live portion | 79 |
+| covered, live portion remains | 2 |
+| partial, live portion open | 2 |
+| divergent, no live portion | 1 |
 | **not covered** | **0** |
 
 Every cited test name was checked against `cargo test --list`, so a citation
 cannot refer to a test that does not exist.
 
-The live portions that no fixture can supply are exactly three, and none is a
+The live resource classes that no fixture can supply are exactly three, and none is a
 coding task:
 
-1. one installed `qwen` binary, to prove the flags are accepted (T57);
+1. one installed supported engine, to prove continuation behavior (T58–T59);
 2. the running ChatGPT Desktop host (T71);
 3. one non-macOS machine (T82).
 

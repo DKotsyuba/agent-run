@@ -6,7 +6,7 @@ Source baseline: v0.11.15 / `c9904f9843ba4a0772bdfa8bac5259f18fad9dc3`. The map 
 
 ## Original application
 
-`agent-run` is a local supervisor for coding-agent command-line engines, not an LLM inference library. It owns durable job admission, process lifecycle, state and evidence; it delegates model execution to installed Codex, Claude Code, GLM-via-Claude, and Qwen executables.
+`agent-run` is a local supervisor for coding-agent command-line engines, not an LLM inference library. It owns durable job admission, process lifecycle, state and evidence; it delegates model execution to installed Codex, Claude Code, and GLM-via-Claude executables. Qwen was part of the Python baseline but is removed under A22.
 
 ```text
 CLI                 MCP stdio                   Unix socket JSON-RPC
@@ -43,7 +43,7 @@ One-shot starts are broker-backed. A separate supervisor durably records its pro
 | `verify.py` | `verify.rs` | Exact-byte proof v2, legacy terminal frame, size/hash/UTF-8 validation |
 | `adapters/base.py`, process transports | `adapters/mod.rs`, `adapters/io.rs` | Adapter selection, environment, bounded native protocol I/O |
 | `adapters/codex/*` | `adapters/codex.rs`, materializer/plugins | Model roster, grant translation and echo validation, thread/turn lifecycle |
-| `adapters/claude/*`, `glm/*`, `qwen/*` | `adapters/stream.rs`, materializer | Native stream-JSON commands, result classification, continuation |
+| `adapters/claude/*`, `glm/*` | `adapters/stream.rs`, materializer | Native stream-JSON commands, result classification, continuation |
 | `adapters/snapshot*`, plugin modules | `adapters/materialize.rs`, `adapters/plugins.rs` | Asset copies, hook trust, Rust runtime snapshot proof |
 | `service.py`, `resume.py`, `wait.py` | `service.rs` | Application facade, immutable identity, queries, answers and continuations |
 | `dispatch.py` | `dispatch.rs`, `resources/tools.json` | One schema/tool table and argument dispatch |

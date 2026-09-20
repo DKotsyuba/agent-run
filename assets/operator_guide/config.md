@@ -56,7 +56,7 @@ credential state. Legacy `default_account`, environment, and Rust declarations
 are readable but do not provision tools or redirect unlabelled starts.
 
 `runtimes.<name>.native_settings` retunes a runtime's own generated preference
-file (Codex `config.toml`, Claude/GLM `settings.json`, Qwen `.qwen/settings.json`)
+file (Codex `config.toml` or Claude/GLM `settings.json`)
 from this common config, with no Python edits and no package reinstall. The
 table attaches to a runtime you have already declared with its mandatory
 fields; for example, under an existing claude block:
@@ -74,7 +74,7 @@ roots are rejected with a validation error instead of being applied: model and
 reasoning-effort selection, provider and auth routing, credentials and
 environment (including `shell_environment_policy`, `notify`, `apiKeyHelper`,
 and the AWS/GCP credential helpers), sandbox, permissions, approvals, hooks and
-hook-disablement, MCP and plugin enablement, and Qwen's `tools.sandbox`. Those
+hook-disablement, and MCP and plugin enablement. Those
 stay owned by agent-run or the runtime's security model. An
 unknown-but-unreserved key (Codex `model_verbosity`, for instance) is accepted
 as a plain tuning value; that is a convenience, not a safety claim about every

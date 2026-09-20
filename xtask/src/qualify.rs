@@ -12,9 +12,9 @@ const SCENARIO_COUNT: usize = 84;
 /// The live portions that a fixture cannot prove, named by the scope rows that require them.
 const LIVE_PORTIONS: [(&[&str], &str, &str); 3] = [
     (
-        &["T57", "T58", "T59"],
+        &["T58", "T59"],
         "real engine",
-        "an installed qwen binary",
+        "an installed supported engine binary",
     ),
     (
         &["T71"],
@@ -108,7 +108,7 @@ impl Platform {
 
 /// Summarizes the scope rows needed by the report.
 struct Scope {
-    /// Number of rows whose status supplies deterministic scenario evidence.
+    /// Number of rows covered by evidence or an explicit scope divergence.
     covered: usize,
     /// IDs whose `live` column says a native boundary remains.
     live: BTreeSet<String>,
@@ -132,7 +132,7 @@ fn read_scope(root: &Path) -> Result<Scope, String> {
             return Err(format!("duplicate qualification scope row: {id}"));
         }
         match fields[4] {
-            "covered" | "partial" => covered += 1,
+            "covered" | "partial" | "divergent" => covered += 1,
             "not-covered" => {}
             status => return Err(format!("invalid qualification status {status:?} for {id}")),
         }

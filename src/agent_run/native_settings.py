@@ -2,8 +2,8 @@
 
 ``runtimes.<name>.native_settings`` in the common agent-run config declares
 tuning values that adapters merge into each native runtime's own generated
-preference file (Codex ``config.toml``, Claude/GLM ``settings.json``, Qwen
-``.qwen/settings.json``) so an operator can retune a runtime without editing
+preference file (Codex ``config.toml`` or Claude/GLM ``settings.json``) so an
+operator can retune a runtime without editing
 adapter Python or reinstalling the package. This module owns the shared
 contract: strict value types, key hygiene, immutable storage, deterministic
 JSON conversion, and the reserved control namespaces that stay owned by
@@ -23,7 +23,6 @@ from .errors import ValidationError
 __all__ = [
     "CODEX_RESERVED_ROOTS",
     "CLAUDE_RESERVED_ROOTS",
-    "QWEN_RESERVED_ROOTS",
     "ADAPTER_RESERVED_ROOTS",
     "validate_native_settings",
     "enforce_native_settings",
@@ -123,32 +122,6 @@ CLAUDE_RESERVED_ROOTS = frozenset(
     }
 )
 
-#: Qwen ``.qwen/settings.json`` roots that stay owned: ``tools`` carries the
-#: non-negotiable ``sandbox = true`` isolation control, ``context`` points at
-#: the generated context file, and ``security``/``permissions``/``hooks``/
-#: ``mcpServers``/``skills`` define granted capabilities and auth routing.
-QWEN_RESERVED_ROOTS = frozenset(
-    {
-        "model",
-        "modelProviders",
-        "providers",
-        "extensions",
-        "env",
-        "environment",
-        "credentials",
-        "auth",
-        "tools",
-        "context",
-        "security",
-        "permissions",
-        "hooks",
-        "mcpServers",
-        "mcp",
-        "skills",
-        "sandbox",
-    }
-)
-
 #: Adapter import refs (both ``module:ADAPTER`` spellings) whose native
 #: settings pass through a packaged adapter with a reserved-root contract.
 #: Other adapters fail closed: they have no merge implementation, so a
@@ -161,8 +134,6 @@ ADAPTER_RESERVED_ROOTS: Mapping[str, frozenset[str]] = MappingProxyType(
         "agent_run.adapters.claude.adapter:ADAPTER": CLAUDE_RESERVED_ROOTS,
         "agent_run.adapters.glm:ADAPTER": CLAUDE_RESERVED_ROOTS,
         "agent_run.adapters.glm.adapter:ADAPTER": CLAUDE_RESERVED_ROOTS,
-        "agent_run.adapters.qwen:ADAPTER": QWEN_RESERVED_ROOTS,
-        "agent_run.adapters.qwen.adapter:ADAPTER": QWEN_RESERVED_ROOTS,
     }
 )
 
@@ -170,7 +141,6 @@ ADAPTER_RESERVED_ROOTS: Mapping[str, frozenset[str]] = MappingProxyType(
 _RESERVED_LABELS = {
     id(CODEX_RESERVED_ROOTS): "codex",
     id(CLAUDE_RESERVED_ROOTS): "claude/glm",
-    id(QWEN_RESERVED_ROOTS): "qwen",
 }
 
 

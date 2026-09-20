@@ -11,7 +11,7 @@ topic for this index.
 | skills | `skills = [...]` per runtime, plugin ownership, symlinks, rematerialize |
 | mcp-servers | `[mcp.<name>]` declarations and per-runtime attachment |
 | plugins | `runtimes.<rt>.plugins`, per-runtime load mechanics, fail-closed refusal |
-| models | static rosters and Qwen OmniRoute route aliases |
+| models | static model rosters and live availability |
 | releases | sealed release build/switch/retention under standalone/releases |
 | migrations | PRAGMA user_version, numbered SQL deltas, pre-backup, refusal cases |
 | troubleshoot | doctor first, failure_kind vocabulary, limits honesty, orphan check |

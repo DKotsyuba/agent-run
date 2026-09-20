@@ -22,11 +22,11 @@ The manifest is a dependency selection, **not a resolved or audited lock**. Semv
 
 ## External executables
 
-Installed `codex`, `claude` and/or `qwen` engine CLIs remain required for their adapters. GLM uses a configured Claude-compatible CLI with the declared Z.ai authentication route. Native logins are delegated to those executables; the Rust application does not implement provider OAuth flows itself.
+Installed `codex` and/or `claude` engine CLIs remain required for their adapters. GLM uses a configured Claude-compatible CLI with the declared Z.ai authentication route. Native logins are delegated to those executables; the Rust application does not implement provider OAuth flows itself.
 
 Codexbar is optional. A signed Node executable and a host tools pipe are used only when Codex Desktop supplies both capabilities for completion delivery. The Node helper has a fixed tool surface and is locally contract-tested, but the actual Desktop authorization/transport has not been tested.
 
-macOS-specific execution may use `/bin/ps`, Xcode's `xcrun` Git discovery and generated launchd definitions. This port does not install or silently download those prerequisites.
+macOS-specific execution may use `/bin/ps` and generated launchd definitions. This port does not install or silently download those prerequisites.
 
 ## Deliberately not selected
 

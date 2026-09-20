@@ -8,12 +8,16 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+/// Materialized plugin roots and trust evidence for one runtime home.
 pub struct Installed {
+    /// Runtime-visible plugin roots in declaration order.
     pub paths: Vec<PathBuf>,
+    /// Plugin manifest name to runtime-visible root.
     pub roots: BTreeMap<String, PathBuf>,
+    /// Codex marketplace plugin names in declaration order.
     pub codex_names: Vec<String>,
+    /// Codex hook identity to trusted content digest.
     pub trust: BTreeMap<String, String>,
-    pub qwen_hooks: Value,
 }
 
 /// Returns the one declared plugin skill directory, or `None` when no plugin
@@ -168,13 +172,18 @@ fn manifest(path: &Path) -> Result<(String, String)> {
     }
     Err(invalid("plugin needs a safe name/version manifest"))
 }
+/// Installs declared plugins for `kind` and returns their runtime-visible roots.
+///
+/// Codex receives copied, digest-bound plugin assets. Claude-family runtimes
+/// retain declared roots unless a bounded snapshot asset list requires a copy.
+/// Invalid manifests, duplicate names, unsafe hooks, and missing assets fail
+/// before the returned installation can be used.
 pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<Installed> {
     let mut installed = Installed {
         paths: vec![],
         roots: BTreeMap::new(),
         codex_names: vec![],
         trust: BTreeMap::new(),
-        qwen_hooks: json!({}),
     };
     let mut listed = Vec::new();
     for source in &runtime.plugins {
@@ -189,10 +198,9 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
         let selected = runtime.plugin_snapshot_assets.get(base);
         let relative = match kind {
             Adapter::Codex => format!("plugins/cache/personal/{name}/{version}"),
-            Adapter::Qwen => format!(".qwen/agent-run-plugins/{name}"),
             _ => format!("declared-plugins/{base}"),
         };
-        let copy = matches!(kind, Adapter::Codex | Adapter::Qwen) || selected.is_some();
+        let copy = kind == Adapter::Codex || selected.is_some();
         let root = if copy {
             p.tree(source, &relative, selected.map(Vec::as_slice))?;
             p.root.join(&relative)
@@ -205,7 +213,7 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
             installed.codex_names.push(name.clone());
             listed.push(json!({"name":name,"source":{"source":"local","path":format!("./{relative}")},"policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"}}));
         }
-        if matches!(kind, Adapter::Codex | Adapter::Qwen) {
+        if kind == Adapter::Codex {
             if let Some(data) =
                 fs::Dir::open(source)?.optional(Path::new("hooks/hooks.json"), 1024 * 1024)?
             {
@@ -215,11 +223,7 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
                     .and_then(Value::as_object)
                     .ok_or_else(|| invalid("plugin hooks table is missing"))?;
                 for (event, groups) in events {
-                    let label = if kind == Adapter::Codex {
-                        event_label(event)?
-                    } else {
-                        ""
-                    };
+                    let label = event_label(event)?;
                     let groups = groups
                         .as_array()
                         .ok_or_else(|| invalid("plugin hook groups must be an array"))?;
@@ -236,39 +240,10 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
                             .and_then(Value::as_array)
                             .ok_or_else(|| invalid("plugin handlers must be an array"))?;
                         for (hi, handler) in handlers.iter().enumerate() {
-                            if kind == Adapter::Codex {
-                                installed.trust.insert(
-                                    format!("{name}@personal:hooks/hooks.json:{label}:{gi}:{hi}"),
-                                    digest(label, matcher, handler)?,
-                                );
-                            }
-                        }
-                        if kind == Adapter::Qwen {
-                            let mut group = group.clone();
-                            if let Some(handlers) =
-                                group.get_mut("hooks").and_then(Value::as_array_mut)
-                            {
-                                for h in handlers {
-                                    if let Some(cmd) = h.get("command").and_then(Value::as_str) {
-                                        h["command"] = json!(cmd
-                                            .replace(
-                                                "${CLAUDE_PLUGIN_ROOT}",
-                                                &root.to_string_lossy()
-                                            )
-                                            .replace(
-                                                "${QWEN_PLUGIN_ROOT}",
-                                                &root.to_string_lossy()
-                                            ));
-                                    }
-                                }
-                            }
-                            let target = installed
-                                .qwen_hooks
-                                .as_object_mut()
-                                .expect("object")
-                                .entry(event.clone())
-                                .or_insert(json!([]));
-                            target.as_array_mut().expect("array").push(group);
+                            installed.trust.insert(
+                                format!("{name}@personal:hooks/hooks.json:{label}:{gi}:{hi}"),
+                                digest(label, matcher, handler)?,
+                            );
                         }
                     }
                 }

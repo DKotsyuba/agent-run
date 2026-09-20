@@ -179,7 +179,6 @@ fn native_security_roots_cannot_be_overridden() {
         (Adapter::Codex, "sandbox_mode"),
         (Adapter::Claude, "permissions"),
         (Adapter::Glm, "apiKeyHelper"),
-        (Adapter::Qwen, "tools"),
     ] {
         let m = BTreeMap::from([(key.to_owned(), toml::Value::String("override".into()))]);
         assert!(config::native_settings(adapter, &m).is_err());
@@ -192,6 +191,21 @@ fn native_security_roots_cannot_be_overridden() {
         )])
     )
     .is_ok());
+}
+
+/// Removed Qwen identifiers fail with actionable migration guidance.
+#[test]
+fn qwen_adapter_identifiers_are_deprecated() {
+    for adapter in [
+        "qwen",
+        "agent_run.adapters.qwen:ADAPTER",
+        "agent_run.adapters.qwen.adapter:ADAPTER",
+    ] {
+        assert_eq!(
+            Adapter::parse(adapter).unwrap_err().to_string(),
+            "qwen runtime is deprecated and unsupported; remove it from config.toml"
+        );
+    }
 }
 #[test]
 fn native_values_reject_dotted_keys_dates_and_nan() {

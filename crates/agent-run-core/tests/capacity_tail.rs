@@ -1077,7 +1077,9 @@ fn tp_fresh_sample(key: Key, at: f64) -> Sample {
 fn collect_home(runtimes: &[(&str, &str, &str)]) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();
-    let mut text = String::from("schema_version=1\n");
+    let mut text = String::from(
+        "schema_version=1\n[capacity]\ncodexbar_binary=\"/definitely/missing/codexbar\"\n",
+    );
     for (name, adapter, source) in runtimes {
         text.push_str(&format!(
             "[runtimes.{name}]\nenabled=true\nadapter=\"{adapter}\"\nbinary={}\nhome={}\nmodels=[\"fixture\"]\nlimits_source=\"{source}\"\n",
@@ -1105,7 +1107,7 @@ fn result_for<'a>(report: &'a serde_json::Value, runtime: &str) -> &'a serde_jso
 async fn failed_empty_and_unsupported_outcomes_are_reported() {
     let home = collect_home(&[
         // A provider the port does not implement fails with a fixed reason.
-        ("failed", "qwen", "codexbar"),
+        ("failed", "codex", "codexbar"),
         // The local Claude stream fallback finds no evidence at all.
         ("empty", "claude", "native"),
         ("unsupported", "claude", "none"),
@@ -1136,15 +1138,12 @@ async fn collect_report_marks_only_degraded_rounds() {
     assert_eq!(result_for(&report, "unsupported")["status"], "unsupported");
     assert_eq!(report["ok"], true);
 
-    let degraded = collect_home(&[("failed", "qwen", "codexbar")]);
+    let degraded = collect_home(&[("failed", "codex", "codexbar")]);
     let report = sources::collect(degraded.path()).await.unwrap();
     assert_eq!(result_for(&report, "failed")["status"], "failed");
     assert_eq!(report["ok"], false);
     // Fixed reason codes only: no provider output ever reaches the report.
-    assert_eq!(
-        result_for(&report, "failed")["issues"][0],
-        "source_not_ported"
-    );
+    assert_eq!(result_for(&report, "failed")["issues"][0], "source_failed");
 }
 
 /// Mirrors `tests/test_capacity_topology.py::CollectSliceTests::test_collect_slice_passes_none_through_for_unsupported_sources`.

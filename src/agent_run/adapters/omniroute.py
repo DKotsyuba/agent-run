@@ -1,7 +1,7 @@
 """The OmniRoute account pool's quota, read from OmniRoute's own store.
 
-Every OmniRoute-served Qwen model shares the ``opencode-go`` account pool, so
-the pool's quota is Qwen's quota.
+The explicit ``limits_source = "omniroute"`` integration exposes the shared
+``opencode-go`` pool without coupling it to a runtime adapter.
 
 That store is the only real source there is. Probed live against the local
 server (2026-08-27):

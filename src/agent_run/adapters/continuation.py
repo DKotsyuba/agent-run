@@ -1,4 +1,4 @@
-"""Native CLI continuation arguments shared by the Claude and Qwen adapters."""
+"""Native CLI continuation arguments for Claude-family adapters."""
 
 from dataclasses import replace
 
@@ -10,7 +10,7 @@ def cli_resume_plan(plan: LaunchPlan, *, session_option: str | None = None) -> L
     """Return a plan targeting its saved native session, retaining all other settings.
 
     Fresh plans are unchanged. For Claude, ``session_option`` names the fresh-ID
-    option to remove; Qwen has none. Missing or malformed identity/argv raises
+    option to remove. Missing or malformed identity/argv raises
     ValidationError before spawning. No latest-session selection or fork is used.
     """
     identity = plan.resume_session_id

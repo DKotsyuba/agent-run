@@ -776,22 +776,7 @@ async fn command_page_deadline_bounds_blocked_engine_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_commands_are_answered_by_the_runtime_capability() {
     let (_tmp, home) = home();
-    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    std::fs::write(
-        home.join("config.toml"),
-        format!(
-            "{config}\n[runtimes.qwen]\nenabled=true\nadapter='qwen'\nbinary='{}'\nhome='{}'\nmodels=['fixture']\nlimits_source='none'\n",
-            env!("CARGO_BIN_EXE_agent-run-fixture"),
-            home.join("qwen-runtime").display()
-        ),
-    )
-    .unwrap();
-    // The Qwen adapter validates its configured environment credential before
-    // it reaches the fixture process; this value is never persisted.
-    // SAFETY: this test-only credential is scoped to the fixture process
-    // configuration and is not read by another test in this process.
-    unsafe { std::env::set_var("OPENAI_API_KEY", "fixture-key") };
-    let id = admit_runtime(&home, "qwen", "fixture:command-flood");
+    let id = admit(&home, "fixture:command-flood");
     let mut store = Store::open(&home).unwrap();
     store
         .enqueue(&id, "steer", &json!({"text":"focus"}))
@@ -800,32 +785,23 @@ async fn steer_commands_are_answered_by_the_runtime_capability() {
     let mut child = spawn_supervisor(&home, &id);
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let state: Option<String> = Store::open(&home)
+    let result = loop {
+        let result = Store::open(&home)
             .unwrap()
             .conn
             .query_row(
                 "SELECT result_json FROM commands WHERE agent_id=?",
                 [id.as_str()],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .ok();
-        if state.is_some() {
-            break;
+            .unwrap();
+        if let Some(result) = result {
+            break result;
         }
         assert!(Instant::now() < deadline, "steer was not answered");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let result: String = Store::open(&home)
-        .unwrap()
-        .conn
-        .query_row(
-            "SELECT result_json FROM commands WHERE agent_id=?",
-            [id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(result.contains("capability"));
+    };
+    assert!(result.contains("\"accepted\":true"));
     Service::new(home.clone()).cancel(&id).unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await

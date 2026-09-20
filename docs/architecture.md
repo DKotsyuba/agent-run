@@ -24,7 +24,7 @@ domain facade                     service.py (AgentService)
 durable state              state/  (versioned SQLite schema, migrations)
                                         │
 engine drivers          adapters/  ──  supervisor  ──  detached children
-                     codex · claude · glm · qwen
+                     codex · claude · glm
 ```
 
 MCP is a thin stdio proxy forwarding `tools/call` to the resident Unix-socket
@@ -111,7 +111,6 @@ child. What the adapters drive:
 | `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots are sent as `runtimeWorkspaceRoots` on read-only runs |
 | `claude` | `claude` CLI headless | `--setting-sources ""`, per-run plugin dirs |
 | `glm` | `claude` CLI pointed at Z.ai's Anthropic-compatible endpoint | subclass of the claude adapter; auth via env/keychain, base URL pinned in the adapter |
-| `qwen` | `qwen -p … --output-format stream-json --sandbox` | headless one-shot; approval mode maps to write/read-only; macOS uses Xcode's real Git binary instead of the sandbox-hostile `/usr/bin` shim |
 
 Auth is declared per runtime as env-var **names** or file links — secret
 values never appear in config. On macOS, adapters fall back to Keychain

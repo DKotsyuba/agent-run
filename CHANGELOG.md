@@ -2,6 +2,11 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [Unreleased]
+
+- feat!: remove the deprecated Qwen runtime; legacy Qwen configuration now
+  fails with explicit removal guidance
+
 ## [0.11.15] - 2026-09-15
 
 - docs(codex): clarify snapshot helper contracts

@@ -4,7 +4,7 @@ The Z.ai GLM Coding Plan exposes an Anthropic Messages endpoint, so the glm
 runtime launches the claude CLI against ``ANTHROPIC_BASE_URL`` with
 ``ANTHROPIC_AUTH_TOKEN`` as the key. A child launched without the token
 exported falls back to the managed login-keychain item the owner provisions
-out of band (mirrors :mod:`agent_run.adapters.qwen.auth`), so the secret
+out of band, so the secret
 never has to be exported into every shell that starts a glm child.
 
 Precedence is the keychain's, not the environment's: an inherited

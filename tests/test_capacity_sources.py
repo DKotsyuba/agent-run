@@ -158,7 +158,7 @@ class DispatchTests(unittest.TestCase):
 
         with mock.patch.object(omniroute, "pool_samples", return_value=(sample,)):
             result = sources.collect_samples(
-                "qwen", _runtime_config(limits_source="omniroute"), CapacityConfig(), load
+                "fixture", _runtime_config(limits_source="omniroute"), CapacityConfig(), load
             )
         self.assertEqual(result, (sample,))
 

@@ -830,10 +830,6 @@ fn auth_with(
 /// without accessing an operator's Keychain.
 fn keychain_present_with(name: &str, lookup: impl FnOnce(Option<&str>, &str) -> bool) -> bool {
     let fallback = match name {
-        "qwen" => Some((
-            Some("OMNIROUTE_API_KEY"),
-            "com.pluto.agent-run.opencode.omniroute",
-        )),
         "glm" => Some((Some("GLM_CODING_KEY"), "com.pluto.agent-run.glm")),
         "claude" => Some((None, "Claude Code-credentials")),
         _ => None,
@@ -1262,20 +1258,6 @@ mod tests {
         assert_eq!(seen, Some((None, "Claude Code-credentials".into())));
     }
 
-    /// Mirrors `test_doctor.py::KeychainFallbackAuthTests::test_an_absent_keychain_item_keeps_the_warning`.
-    #[test]
-    fn python_doctor_absent_keychain_item_keeps_the_warning() {
-        let findings = auth_findings("qwen", |_, _| false);
-        assert_eq!(
-            findings
-                .iter()
-                .map(|finding| finding.code.as_str())
-                .collect::<Vec<_>>(),
-            ["auth_environment_missing"]
-        );
-        assert_eq!(findings[0].severity, "warning");
-    }
-
     /// Mirrors `test_doctor.py::KeychainFallbackAuthTests::test_a_runtime_without_a_fallback_is_never_probed`.
     #[test]
     fn python_doctor_runtime_without_a_fallback_is_never_probed() {
@@ -1329,7 +1311,7 @@ mod tests {
     /// Builds one capacity snapshot row shaped like Python's `_row`.
     fn capacity_row(lane: &str, observed_at: f64, valid_until: Option<f64>) -> Value {
         json!({
-            "runtime": "qwen",
+            "runtime": "fixture",
             "lane": lane,
             "window": "5h",
             "target": null,

@@ -3,8 +3,8 @@
 Covers the full pipeline the feature promises: strict TOML parsing into
 immutable ``RuntimeConfig.native_settings``, fail-closed reserved control
 roots per adapter family, deep-merge over packaged defaults into each
-generated native config (Codex TOML round-trip, Claude/GLM settings.json,
-Qwen .qwen/settings.json), scoped ``dataclasses.replace`` copies, and
+generated native config (Codex TOML round-trip and Claude/GLM settings.json),
+scoped ``dataclasses.replace`` copies, and
 config-snapshot identity that changes with the declared options.
 """
 
@@ -25,12 +25,11 @@ from agent_run.adapters.claude.materialize import render_settings
 from agent_run.adapters.codex.adapter import ADAPTER as CODEX_ADAPTER
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE_ADAPTER
 from agent_run.adapters.glm.adapter import ADAPTER as GLM_ADAPTER
-from agent_run.adapters.qwen.adapter import ADAPTER as QWEN_ADAPTER
 from agent_run.adapters.snapshot_config import (
     _runtime_document,
     build_config_snapshot,
 )
-from agent_run.config import RuntimeAuthConfig, RuntimeConfig, load_config
+from agent_run.config import RuntimeConfig, load_config
 from agent_run.domain import StartRequest
 from agent_run.errors import ValidationError
 from agent_run.native_settings import native_settings_json, validate_native_settings
@@ -40,7 +39,6 @@ from role_helpers import resolved_role
 CODEX_REF = "agent_run.adapters.codex.adapter:ADAPTER"
 CLAUDE_REF = "agent_run.adapters.claude.adapter:ADAPTER"
 GLM_REF = "agent_run.adapters.glm.adapter:ADAPTER"
-QWEN_REF = "agent_run.adapters.qwen.adapter:ADAPTER"
 
 
 class NativeSettingsTestCase(unittest.TestCase):
@@ -195,10 +193,6 @@ class NativeSettingsParsing(NativeSettingsTestCase):
             ("claude", CLAUDE_REF, "awsAuthRefresh"),
             ("claude", CLAUDE_REF, "enabledPlugins"),
             ("glm", GLM_REF, "disableAllHooks"),
-            ("qwen", QWEN_REF, "tools"),
-            ("qwen", QWEN_REF, "mcpServers"),
-            ("qwen", QWEN_REF, "mcp"),
-            ("qwen", QWEN_REF, "security"),
         ]
         for name, ref, key in cases:
             with self.subTest(runtime=name, key=key):
@@ -212,17 +206,15 @@ class NativeSettingsParsing(NativeSettingsTestCase):
                 with self.assertRaises(ValidationError):
                     load_config(path)
 
-    def test_qwen_tools_sandbox_is_not_tunable(self) -> None:
-        """The Qwen sandbox control fails closed even as a nested table."""
-
+    def test_qwen_runtime_is_deprecated(self) -> None:
+        """A legacy Qwen declaration fails with removal guidance."""
         path = self.write_config(
             "schema_version = 1\n"
             "[runtimes.qwen]\n"
-            f"enabled = true\nadapter = \"{QWEN_REF}\"\n"
+            "enabled = true\nadapter = \"agent_run.adapters.qwen.adapter:ADAPTER\"\n"
             "binary = \"/bin/echo\"\nhome = \"/tmp/ar-q\"\nmodels = [\"m\"]\n"
-            "[runtimes.qwen.native_settings.tools]\nsandbox = false\n"
         )
-        with self.assertRaises(ValidationError):
+        with self.assertRaisesRegex(ValidationError, "deprecated unsupported Qwen"):
             load_config(path)
 
     def test_model_verbosity_is_ordinary_tuning(self) -> None:
@@ -401,49 +393,6 @@ class ClaudeNativeSettings(NativeSettingsTestCase):
         document = json.loads((home / "settings.json").read_text(encoding="utf-8"))
         self.assertIn("hooks", document)
         self.assertNotIn("native_settings", document)
-
-
-class QwenNativeSettings(NativeSettingsTestCase):
-    """Qwen settings JSON merge keeps tools.sandbox ownership protected."""
-
-    def qwen_runtime(self, **overrides: object) -> RuntimeConfig:
-        """Return a minimal materialize-capable Qwen runtime configuration."""
-
-        values: dict[str, object] = {
-            "enabled": True,
-            "adapter": QWEN_REF,
-            "binary": Path("/bin/echo"),
-            "home": self.workdir("home"),
-            "models": ("qwen-test",),
-            "skills": (),
-            "mcp": (),
-            "auth": RuntimeAuthConfig(
-                "environment", names=("OPENAI_API_KEY", "OPENAI_BASE_URL")
-            ),
-            "hooks": (),
-        }
-        values.update(overrides)
-        return RuntimeConfig(**values)
-
-    def test_declared_settings_land_and_sandbox_stays_owned(self) -> None:
-        """Qwen receives tuning while retaining its required sandbox grant."""
-        config = self.qwen_runtime(native_settings={"advance": {"thinking": True}})
-        QWEN_ADAPTER.materialize(
-            config, config.home, mcp_servers={}, skills_root=self.root / "skills"
-        )
-        document = json.loads(
-            (config.home / ".qwen" / "settings.json").read_text(encoding="utf-8")
-        )
-        self.assertIs(document["tools"]["sandbox"], True)
-        self.assertIs(document["advance"]["thinking"], True)
-
-    def test_security_and_capability_roots_rejected(self) -> None:
-        """Qwen cannot reroute providers or enable capabilities via tuning."""
-        for key in ("tools", "security", "context", "permissions", "skills", "model", "modelProviders", "providers", "extensions"):
-            with self.subTest(key=key):
-                config = self.qwen_runtime(native_settings={key: {"x": 1}})
-                with self.assertRaises(ValidationError):
-                    QWEN_ADAPTER.validate(config)
 
 
 class SnapshotAndScopedCopies(NativeSettingsTestCase):

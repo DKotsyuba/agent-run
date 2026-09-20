@@ -345,14 +345,6 @@ class KeychainFallbackAuthTests(unittest.TestCase):
             all("super-secret-value" not in (item.detail or "") for item in findings)
         )
 
-    def test_an_absent_keychain_item_keeps_the_warning(self) -> None:
-        absent = subprocess.CompletedProcess([], 44, stdout="", stderr="could not be found")
-        with mock.patch.object(doctor.subprocess, "run", return_value=absent):
-            findings = self._auth_findings("qwen", self._runtime())
-
-        self.assertEqual([item.code for item in findings], ["auth_environment_missing"])
-        self.assertEqual(findings[0].severity, "warning")
-
     def test_a_runtime_without_a_fallback_is_never_probed(self) -> None:
         with mock.patch.object(doctor.subprocess, "run") as probe:
             findings = self._auth_findings("codex", self._runtime())
@@ -590,7 +582,7 @@ class CapacityStalenessTests(unittest.TestCase):
     @staticmethod
     def _row(lane: str, observed_at: float, valid_until: float | None) -> dict:
         return {
-            "runtime": "qwen",
+            "runtime": "fixture",
             "lane": lane,
             "window": "5h",
             "target": None,

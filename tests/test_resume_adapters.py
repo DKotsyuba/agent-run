@@ -12,7 +12,6 @@ from agent_run.adapters.continuation import cli_resume_plan
 from agent_run.adapters.claude.adapter import ClaudeSession
 from agent_run.adapters.claude.adapter import ADAPTER as CLAUDE
 from agent_run.adapters.glm.adapter import ADAPTER as GLM
-from agent_run.adapters.qwen.adapter import ADAPTER as QWEN
 from agent_run.dispatch import call_tool
 from agent_run.domain import AgentStatus
 from agent_run.errors import ValidationError
@@ -28,8 +27,10 @@ class ArgumentsTests(unittest.TestCase):
         self.assertIs(cli_resume_plan(plan), plan)
         resumed = cli_resume_plan(replace(plan, resume_session_id="saved"), session_option="--session-id")
         self.assertEqual(resumed.argv, ("engine", "--model", "m", "--resume", "saved"))
-        qwen = cli_resume_plan(replace(plan, argv=("qwen", "-p", "task"), resume_session_id="saved"))
-        self.assertEqual(qwen.argv, ("qwen", "-p", "task", "--resume", "saved"))
+        alternate = cli_resume_plan(
+            replace(plan, argv=("engine", "-p", "task"), resume_session_id="saved")
+        )
+        self.assertEqual(alternate.argv, ("engine", "-p", "task", "--resume", "saved"))
         with self.assertRaises(ValidationError):
             cli_resume_plan(replace(plan, resume_session_id="--latest"))
 
@@ -48,7 +49,6 @@ class ArgumentsTests(unittest.TestCase):
         for adapter, session_type, argv in (
             (CLAUDE, "ClaudeSession", ("claude", "--session-id", "fresh")),
             (GLM, "ClaudeSession", ("claude", "--session-id", "fresh")),
-            (QWEN, "QwenSession", ("qwen", "-p", "task")),
         ):
             with self.subTest(adapter=adapter.describe().name):
                 plan = LaunchPlan(argv, Path("/tmp"), {}, "task", Path("/tmp/log"), {}, resume_session_id="saved")

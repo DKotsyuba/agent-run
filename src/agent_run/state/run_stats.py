@@ -1,7 +1,7 @@
 """Normalized per-run statistics: one queryable row per agent.
 
 Token and timing data arrives inside runtime-specific event payloads -- one
-``runtime_result`` event for the claude/glm/qwen family, a stream of
+``runtime_result`` event for the claude/glm family, a stream of
 ``thread/tokenUsage/updated`` events for codex whose last entry is cumulative.
 For a resumed Codex thread, a durable ``resume_usage_baseline`` is required
 before that cumulative total can be attributed to the new run.

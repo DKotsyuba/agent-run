@@ -135,18 +135,6 @@ def render_claude_denials(
     return _bash_denials(_native_command_patterns(commands, command_paths))
 
 
-def render_qwen_denials(
-    commands: Sequence[str], *, command_paths: Sequence[Path | str] = ()
-) -> tuple[str, ...]:
-    """Render Qwen ``permissions.deny`` Bash entries for exact commands.
-
-    Qwen's documented precedence makes these native deny entries stronger than
-    ask or allow entries; callers insert the returned strings in that array.
-    """
-
-    return _bash_denials(_native_command_patterns(commands, command_paths))
-
-
 def _prepare_directory(directory: Path) -> None:
     """Create a private managed directory or verify its ownership marker."""
 

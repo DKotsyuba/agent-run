@@ -68,7 +68,7 @@ fn empty() -> Stats {
     }
 }
 
-/// Normalizes the Claude/GLM/Qwen `runtime_result` payload shape.
+/// Normalizes the Claude/GLM `runtime_result` payload shape.
 fn runtime_result(payload: &Value) -> Stats {
     Stats {
         usage_source: "runtime_result",

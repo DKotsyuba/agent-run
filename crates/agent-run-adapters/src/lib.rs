@@ -9,7 +9,7 @@ pub mod materialize;
 pub mod plugins;
 pub mod redact;
 use agent_run_config::{
-    config::{Adapter, Auth, Config, Runtime},
+    config::{Adapter, Config, Runtime},
     profiles::Profile,
 };
 use agent_run_domain::{
@@ -34,21 +34,6 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
     let kind = runtime.kind()?;
     claude::validate_runtime(runtime, kind)?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
-    if kind == Adapter::Qwen {
-        match &runtime.auth {
-            Some(Auth::Environment { names })
-                if names
-                    .iter()
-                    .all(|name| matches!(name.as_str(), "OPENAI_API_KEY" | "OPENAI_BASE_URL")) => {}
-            Some(Auth::Environment { .. }) => {
-                return Err(invalid("qwen runtime auth.names has unsupported entries"));
-            }
-            Some(Auth::FileLink { .. }) => {
-                return Err(invalid("qwen runtime auth.kind must be 'environment'"));
-            }
-            None => {}
-        }
-    }
     if !runtime.models.contains(&request.model) {
         return Err(invalid("model is not configured for this runtime"));
     }
@@ -57,16 +42,6 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
     }
     if request.output_schema.is_some() && !matches!(kind, Adapter::Claude | Adapter::Glm) {
         return Err(invalid("adapter does not advertise output_schema"));
-    }
-    if kind == Adapter::Qwen && (profile.network || request.effort.is_some()) {
-        return Err(invalid("qwen does not support network profiles or effort"));
-    }
-    if kind == Adapter::Qwen
-        && (request.write != profile.write || request.read_roots != profile.read_roots)
-    {
-        return Err(invalid(
-            "qwen request grants do not match the resolved role",
-        ));
     }
     if kind == Adapter::Codex && profile.network && !profile.write {
         return Err(invalid(
@@ -98,6 +73,7 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
     }
     Ok(())
 }
+/// Returns the stable capability roster for a packaged adapter family.
 pub fn capabilities(kind: Adapter) -> Vec<&'static str> {
     let mut c = vec![
         "read_roots",
@@ -109,11 +85,7 @@ pub fn capabilities(kind: Adapter) -> Vec<&'static str> {
         "hooks",
         "resume",
     ];
-    if kind != Adapter::Qwen {
-        c.extend(["steer", "effort"]);
-    } else {
-        c.push("live_limits");
-    }
+    c.extend(["steer", "effort"]);
     if matches!(kind, Adapter::Claude | Adapter::Glm) {
         c.push("output_schema");
     }

@@ -1,6 +1,6 @@
 # agent-run
 
-Local supervisor for coding agents. Start Codex, Claude Code, GLM, Qwen
+Local supervisor for coding agents. Start Codex, Claude Code, and GLM
 Code children as **durable asynchronous jobs** on your own
 machine — with one state store, honest outcome verification, quota
 tracking, and three equal access layers: a CLI, an
@@ -19,7 +19,7 @@ you / your agent / your app
         │          transcripts, deliveries, run stats)
    adapters + supervisor
         │
-   codex · claude · glm · qwen                          ← engine CLIs you
+   codex · claude · glm                                 ← engine CLIs you
                                                           already have
 ```
 
@@ -48,7 +48,7 @@ you / your agent / your app
 ## Install
 
 Requirements: Python ≥ 3.14, macOS or Linux, plus the engine CLIs you intend
-to drive (`codex`, `claude`, `qwen` — any subset).
+to drive (`codex`, `claude` — either or both).
 
 | Feature | macOS | Linux |
 |---|---:|---:|
@@ -107,8 +107,8 @@ models  = ["sonnet", "opus"]
 spinnerTipsEnabled = false                    # optional native tuning
 ```
 
-Add more `[runtimes.<name>]` blocks for other engines (`codex`, `qwen`,
-`glm`) the same way. Per-runtime options cover auth (env-var
+Add more `[runtimes.<name>]` blocks for other engines (`codex`, `glm`) the
+same way. Per-runtime options cover auth (env-var
 names or file links — never secret values in config), allowed skills,
 declared MCP servers, lifecycle hooks, plugins, and the limits source
 (`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
@@ -270,9 +270,9 @@ a copy-paste Python client: [docs/api.md](docs/api.md).
 | State | `~/.agent-run/state.db` | SQLite, versioned schema + migrations |
 
 Engine adapters included: **codex** (app-server JSON-RPC),
-**claude** (Claude Code CLI), **glm** (Claude Code CLI pointed at Z.ai's
-Anthropic-compatible endpoint), **qwen** (Qwen Code headless with sandbox-safe
-macOS Git bootstrap).
+**claude** (Claude Code CLI), and **glm** (Claude Code CLI pointed at Z.ai's
+Anthropic-compatible endpoint). Qwen support is removed; legacy Qwen runtime
+declarations fail with migration guidance.
 
 ## Documentation
 

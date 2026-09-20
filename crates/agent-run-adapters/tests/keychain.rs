@@ -1,8 +1,6 @@
 //! Credential fallback regressions using injected Keychain lookups only.
 
-use agent_run_adapters::auth::{
-    glm_environment_with, qwen_auth_value_with, GLM_BASE_URL, QWEN_BASE_URL,
-};
+use agent_run_adapters::auth::{glm_environment_with, GLM_BASE_URL};
 use std::collections::BTreeMap;
 
 /// GLM prefers its managed Keychain credential over an inherited Anthropic token.
@@ -17,20 +15,6 @@ fn glm_keychain_precedes_ambient_token() {
     assert_eq!(
         environment.get("ANTHROPIC_BASE_URL"),
         Some(&GLM_BASE_URL.into())
-    );
-}
-
-/// Qwen retains an explicit process credential ahead of its Keychain fallback.
-#[test]
-fn qwen_host_credential_precedes_keychain() {
-    let host = BTreeMap::from([("OPENAI_API_KEY".into(), "ambient".into())]);
-    assert_eq!(
-        qwen_auth_value_with("OPENAI_API_KEY", &host, || Some("keychain".into())),
-        Some("ambient".into())
-    );
-    assert_eq!(
-        qwen_auth_value_with("OPENAI_BASE_URL", &host, || None),
-        Some(QWEN_BASE_URL.into())
     );
 }
 

@@ -745,6 +745,13 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         adapter = _string(table.get("adapter"), f"{path}.adapter")
         if not _IMPORT_REF.fullmatch(adapter):
             raise ValidationError(f"{path}.adapter must be 'module:attribute'")
+        if adapter in {
+            "agent_run.adapters.qwen:ADAPTER",
+            "agent_run.adapters.qwen.adapter:ADAPTER",
+        }:
+            raise ValidationError(
+                f"{path}.adapter selects deprecated unsupported Qwen; remove this runtime"
+            )
         models = _strings(table.get("models"), f"{path}.models")
         if not models:
             raise ValidationError(f"{path}.models must not be empty")
@@ -830,7 +837,7 @@ def _parse_runtimes(value: object, environments: Mapping[str, EnvironmentConfig]
         if "native_settings" in table and reserved_native is None:
             raise ValidationError(
                 f"{path}.native_settings is supported only by the codex, "
-                "claude, glm, and qwen adapters"
+                "claude, and glm adapters"
             )
         native_settings = validate_native_settings(
             table.get("native_settings", {}), f"{path}.native_settings"

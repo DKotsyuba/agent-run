@@ -1,7 +1,7 @@
 //! Application facade: transport code has no direct access to adapters or SQL.
 use crate::{
     adapters,
-    config::{Adapter, Config},
+    config::Config,
     domain::{now, AgentId, OrchestratorRef, Outcome, StartRequest, Status},
     error::invalid,
     lifecycle::reconcile,
@@ -368,20 +368,17 @@ impl Service {
     pub fn cancel(&self, id: &AgentId) -> Result<Value> {
         Store::open(&self.home)?.enqueue(id, "cancel", &json!({}))
     }
+    /// Enqueues one nonblank bounded steering message for an active agent.
+    ///
+    /// `text` may contain arbitrary UTF-8 up to 256 KiB. The command is
+    /// persisted before this method returns; unknown agents, invalid text, and
+    /// storage failures are returned without contacting the runtime directly.
     pub fn steer(&self, id: &AgentId, text: &str) -> Result<Value> {
         crate::domain::nonblank("steer text", text)?;
         if text.len() > 256 * 1024 {
             return Err(invalid("steer text exceeds 256 KiB"));
         }
-        let mut store = Store::open(&self.home)?;
-        let row = store.get(id)?;
-        let identity = LaunchIdentity::read(&row)?;
-        if identity.config.runtime(&row.request.runtime)?.kind()? == Adapter::Qwen {
-            return Err(Error::Unsupported(
-                "Qwen does not support live steering".into(),
-            ));
-        }
-        store.enqueue(id, "steer", &json!({"text":text}))
+        Store::open(&self.home)?.enqueue(id, "steer", &json!({"text":text}))
     }
     pub fn answer(&self, id: &AgentId) -> Result<Value> {
         let row = Store::open(&self.home)?.get(id)?;

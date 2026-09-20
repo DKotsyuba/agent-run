@@ -222,7 +222,7 @@ class AdapterTests(unittest.TestCase):
         """
 
         root = Path(__file__).parents[1] / "src" / "agent_run" / "adapters"
-        for family in ("claude", "codex", "glm", "qwen"):
+        for family in ("claude", "codex", "glm"):
             paths = sorted((root / family).glob("*.py"))
             self.assertTrue(paths, f"no adapter sources found for {family}")
             for path in paths:

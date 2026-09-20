@@ -1,4 +1,4 @@
-//! Normalized Python-home captures for the Claude, GLM, and Qwen adapters.
+//! Normalized Python-home captures for the Claude and GLM adapters.
 
 use agent_run_adapters::materialize;
 use agent_run_config::{
@@ -42,13 +42,6 @@ fn fixture(
             "fixture task",
             Some("medium"),
             Value::Null,
-        ),
-        Adapter::Qwen => (
-            "qwen",
-            "opencode/MiniMaxM3",
-            "Inspect the fixture repository and report only the requested result.",
-            None,
-            json!({"kind":"environment","names":["OPENAI_API_KEY","OPENAI_BASE_URL"]}),
         ),
         Adapter::Codex => unreachable!("the Codex golden is covered by its adapter test"),
     };
@@ -146,9 +139,6 @@ fn resolved_environment(adapter: Adapter, home: &Path) -> BTreeMap<String, Strin
                 "ANTHROPIC_BASE_URL".into(),
                 "https://api.z.ai/api/anthropic".into(),
             );
-        }
-        Adapter::Qwen => {
-            environment.insert("OPENAI_API_KEY".into(), "fixture-secret".into());
         }
         Adapter::Codex => unreachable!("the Codex golden is covered by its adapter test"),
     }
@@ -283,7 +273,6 @@ fn compare_launch(
     adapter: Adapter,
     plan: agent_run_adapters::LaunchPlan,
     record: &Record,
-    profile: &Profile,
     home: &Path,
 ) {
     let mut actual_argv = vec![plan.binary.display().to_string()];
@@ -354,14 +343,6 @@ fn compare_launch(
             },
             "session_id": "${SESSION_ID}",
         }),
-        Adapter::Qwen => json!({
-            "approval_mode": plan.args[plan.args.iter().position(|arg| arg == "--approval-mode").expect("approval mode") + 1],
-            "model": record.request.model,
-            "sandbox": plan.args.iter().any(|arg| arg == "--sandbox"),
-            "secret_env_names": vec!["OPENAI_API_KEY", "OPENAI_BASE_URL"],
-            "workdir": "${TEMP_ROOT}/workdir",
-            "write": profile.write,
-        }),
         Adapter::Codex => unreachable!("the Codex golden is covered by its adapter test"),
     };
     let mut expected_state: Value = serde_json::from_str(
@@ -379,7 +360,7 @@ fn compare_launch(
     );
 }
 
-/// Mirrors `test_claude_adapter.py`, `test_glm_adapter.py`, and `test_qwen_adapter.py` home preparation.
+/// Mirrors `test_claude_adapter.py` and `test_glm_adapter.py` home preparation.
 ///
 /// The comparison normalizes generated home/work directories, the fresh
 /// session UUID, JSON whitespace/key presentation, and the language-specific
@@ -390,8 +371,8 @@ fn compare_launch(
 /// names vary by Cargo, shell, and macOS version; every owned name and value,
 /// including secret *names* but never secret values, remains an exact check.
 #[test]
-fn python_golden_homes_match_claude_glm_and_qwen_read_only_and_write() {
-    for adapter in [Adapter::Claude, Adapter::Glm, Adapter::Qwen] {
+fn python_golden_homes_match_claude_and_glm_read_only_and_write() {
+    for adapter in [Adapter::Claude, Adapter::Glm] {
         for shape in ["read-only", "write"] {
             let temporary = tempfile::tempdir().expect("temporary fixture root");
             let (config, runtime, request, profile, home) =
@@ -427,27 +408,6 @@ fn python_golden_homes_match_claude_glm_and_qwen_read_only_and_write() {
                 resolved_environment(adapter, &home),
             )
             .expect("build golden launch");
-            #[cfg(target_os = "macos")]
-            if adapter == Adapter::Qwen {
-                let xcode_git = std::process::Command::new("/usr/bin/xcrun")
-                    .args(["--find", "git"])
-                    .output()
-                    .expect("locate Xcode Git");
-                assert!(
-                    xcode_git.status.success(),
-                    "Xcode Git toolchain is installed"
-                );
-                let git_dir = Path::new(String::from_utf8_lossy(&xcode_git.stdout).trim())
-                    .parent()
-                    .expect("Xcode Git has a parent directory")
-                    .display()
-                    .to_string();
-                assert_eq!(
-                    plan.environment["PATH"],
-                    format!("{git_dir}:/usr/bin:/bin"),
-                    "Xcode Git must precede the inherited PATH"
-                );
-            }
             let expected_launch: Value = serde_json::from_slice(
                 &std::fs::read(
                     capture_root()
@@ -458,7 +418,7 @@ fn python_golden_homes_match_claude_glm_and_qwen_read_only_and_write() {
                 .expect("golden launch"),
             )
             .expect("golden launch JSON");
-            compare_launch(&expected_launch, adapter, plan, &record, &profile, &home);
+            compare_launch(&expected_launch, adapter, plan, &record, &home);
         }
     }
 }

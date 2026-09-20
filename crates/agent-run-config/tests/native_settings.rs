@@ -360,10 +360,6 @@ fn reserved_roots_fail_closed_per_adapter() {
         (Adapter::Claude, "awsAuthRefresh"),
         (Adapter::Claude, "enabledPlugins"),
         (Adapter::Glm, "disableAllHooks"),
-        (Adapter::Qwen, "tools"),
-        (Adapter::Qwen, "mcpServers"),
-        (Adapter::Qwen, "mcp"),
-        (Adapter::Qwen, "security"),
     ];
     for (adapter, key) in cases {
         let settings =
@@ -373,18 +369,4 @@ fn reserved_roots_fail_closed_per_adapter() {
             "{adapter:?}.{key} must be reserved"
         );
     }
-}
-
-/// Mirrors `test_qwen_tools_sandbox_is_not_tunable`: the whole `tools` root
-/// stays reserved even when the declared value is a nested table.
-#[test]
-fn qwen_tools_root_stays_reserved_even_nested() {
-    let settings = std::collections::BTreeMap::from([(
-        "tools".to_string(),
-        toml::Value::Table(toml::map::Map::from_iter([(
-            "sandbox".to_string(),
-            toml::Value::Boolean(false),
-        )])),
-    )]);
-    assert!(config::native_settings(Adapter::Qwen, &settings).is_err());
 }

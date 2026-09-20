@@ -981,13 +981,11 @@ async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result
 }
 
 /// Maps an adapter identity to the provider name understood by Codexbar.
-/// Qwen has no documented Codexbar provider and is rejected as unsupported.
 fn codexbar_provider(adapter: Adapter) -> Result<&'static str> {
     match adapter {
         Adapter::Codex => Ok("codex"),
         Adapter::Claude => Ok("claude"),
         Adapter::Glm => Ok("zai"),
-        Adapter::Qwen => Err(Error::Unsupported("codexbar has no Qwen provider".into())),
     }
 }
 /// Reads the local OmniRoute current-cache into one capacity slice.
@@ -1086,7 +1084,6 @@ pub async fn collect(home: &Path) -> Result<Value> {
             let result = match (source, rt.kind()?) {
                 ("codexbar", _) => codexbar(home, &config, name, rt).await,
                 ("omniroute", _) => omniroute(name).await,
-                ("native", Adapter::Qwen) => omniroute(name).await,
                 ("native", Adapter::Claude) => match claude_native(name, rt).await {
                     Ok(slice) => Ok(slice),
                     Err(Error::Validation(reason)) if reason == "claude_token_missing" => {
@@ -1185,7 +1182,7 @@ pub async fn models(home: &Path) -> Result<Value> {
                 .is_ok()
             {
                 for id in &rt.models {
-                    roster.insert(id.clone(),json!({"id":id,"description":"configured native CLI model; authentication checked on launch","efforts":if kind==Adapter::Qwen{vec![]}else{vec!["low","medium","high","xhigh","max"]}}));
+                    roster.insert(id.clone(),json!({"id":id,"description":"configured native CLI model; authentication checked on launch","efforts":["low","medium","high","xhigh","max"]}));
                 }
             } else {
                 reason = Some("configured binary probe failed");

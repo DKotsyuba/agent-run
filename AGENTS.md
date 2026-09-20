@@ -23,7 +23,7 @@ presence alone does not grant authority over a different owner's data.
 - **No monolithic modules.** Keep files focused; a module drifting past
   a few hundred lines is a design smell here, not a habit to copy.
 - **Engines are driven only through adapters + the supervisor.** Never
-  spawn `codex`/`claude`/`qwen` binaries directly from feature code; the
+  spawn `codex`/`claude` binaries directly from feature code; the
   adapter renders the child's home/config, the supervisor owns the
   process tree, timeouts, and outcome classification.
 - **Every change lands with tests.** The suite is `unittest`-style,
@@ -84,7 +84,7 @@ presence alone does not grant authority over a different owner's data.
 | `src/agent_run/mcp.py` | stdio MCP transport (thin proxy over the socket daemon) |
 | `src/agent_run/api_socket.py` | Unix-socket JSON-RPC transport (`docs/api.md`) |
 | `src/agent_run/service.py` | AgentService — the domain facade every transport calls |
-| `src/agent_run/adapters/` | one package per engine (codex, claude, glm, qwen, …) |
+| `src/agent_run/adapters/` | one package per engine (codex, claude, glm) |
 | `src/agent_run/supervisor*.py` | detached child supervision: timeouts, stall watchdog, outcomes |
 | `src/agent_run/state/` | SQLite store, schema, migrations, reconciliation |
 | `src/agent_run/wait.py` | blocking watchdog logic shared by CLI and socket API |

@@ -48,7 +48,7 @@ fn doc_works_outside_the_checkout() {
     assert_eq!(value["topic"], "models");
     assert!(value["text"]
         .as_str()
-        .is_some_and(|text| text.contains("opencode/")));
+        .is_some_and(|text| text.contains("claude, codex, and glm")));
 }
 
 /// Mirrors `test_doc.py::test_doc_with_topic_returns_that_topic`.
@@ -72,7 +72,7 @@ fn release_candidate_runs_without_python_or_cjs_runtime_lookup() {
     assert_eq!(value["topic"], "models");
     assert!(value["text"]
         .as_str()
-        .is_some_and(|text| text.contains("opencode/")));
+        .is_some_and(|text| text.contains("claude, codex, and glm")));
 }
 
 /// Mirrors `test_doc.py::test_topic_text_completion_is_contract_template`.

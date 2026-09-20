@@ -318,7 +318,7 @@ fn resume_arguments_preserve_other_settings() {
 /// exactly once, and none of them can accidentally ask for a new session.
 #[test]
 fn adapters_pass_exact_native_resume_selector_to_process() {
-    for adapter in ["claude", "glm", "qwen"] {
+    for adapter in ["claude", "glm"] {
         let temporary = tempfile::tempdir().expect("temporary fixture root");
         let plan = resume_plan(temporary.path(), adapter, Some("saved"));
         assert_eq!(

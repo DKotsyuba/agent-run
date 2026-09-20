@@ -16,7 +16,7 @@ The division applies plan §19.3 and the dependency rules in plan §4.2. A lane 
 | store | `agent-run-store`, `sql/schema.sql`, `sql/migrations/` | M17 owns schema assets and M18 owns migration bodies. Capacity, delivery, and hooks use store APIs from M20d/M21/M22b. |
 | core lifecycle | `agent-run-core` service, preparation, launch, supervisor, lifecycle, resume | `service.rs` has one owner through M30d. Adapters return evidence; they never choose terminal status or access SQL. |
 | codex adapter | `agent-run-adapters/src/codex/` and Codex fixtures | Generated-home files use M23/M25 APIs. Shared adapter traits change only by a short core/config contract handoff. |
-| claude/glm/qwen adapters | `agent-run-adapters/src/{claude,glm,qwen}`, shared adapter I/O/redaction | M14b/M14c own environment/auth boundaries; M35d owns shared validation; capacity's OmniRoute reader is not owned here. |
+| claude/glm adapters | `agent-run-adapters/src/{claude,glm}`, shared adapter I/O/redaction | M14b/M14c own environment/auth boundaries; M35d owns shared validation; capacity's OmniRoute reader is not owned here. |
 | transports/CLI | `crates/agent-run/src/{cli,transport}`, socket/MCP tests | M12's registry is the sole tool list. Transport errors map M11 codes and never create a second execution host. |
 | capacity | `agent-run-core/src/capacity/` and capacity tests | M43b is the sole OmniRoute quota reader; it must not read launch credentials. Store persistence is M20d. |
 | delivery/hooks | `agent-run-core/src/delivery/`, `crates/agent-run/src/hooks/` | Store lease/evidence transitions are M21; late binding is M22b. M09 decides the native relay boundary before M48. |
@@ -35,7 +35,7 @@ Wave 1 is immediately startable against the M05 workspace worktree. Its only unf
 | M09 | Spike native Rust Desktop host capability | delivery/hooks | M05 | M |
 | M10 | Spike MCP negotiation errors cancellation and EOF | transports/CLI | M05 | M |
 | M11 | Define domain newtypes FSM errors and view DTOs | config/roles | M05 | M |
-| M14b | Match host-environment deny-list inheritance | claude/glm/qwen adapters | M05 | S |
+| M14b | Match host-environment deny-list inheritance | claude/glm adapters | M05 | S |
 | M23a | Provide anchored no-follow file and agent-path primitives | platform/artifacts | M05 | M |
 | M27 | Build a fault-controlled Rust fake engine | core lifecycle | M05 | M |
 
@@ -45,7 +45,7 @@ Wave 2 establishes the contract, DB, filesystem, and process seams needed by the
 |---|---|---|---|---|
 | M12 | Create the single 11-tool registry and golden schemas | config/roles | M03; M11 | M |
 | M13a | Port strict TOML and built-in adapter aliases | config/roles | M03; M11 | L |
-| M14c | Add GLM and Qwen Keychain credential fallback | claude/glm/qwen adapters | M05 | M |
+| M14c | Add GLM Keychain credential fallback | claude/glm adapters | M05 | M |
 | M17 | Create schema v16 and thread-owned store connections | store | M04; M11 | L |
 | M23b | Provide durable publication and fault-injection seams | platform/artifacts | M23a | M |
 | M26 | Observe process identity and verify group cleanup evidence | platform/artifacts | M06; M07 | L |
@@ -120,9 +120,9 @@ notification host, or a second operating system.
 
 No row can honestly become `verified` yet, and the reason is not oversight:
 
-- Three qualification scenarios retain a live portion that a fixture cannot
-  supply — an installed `qwen` binary, the running ChatGPT Desktop host, and one
-  non-macOS machine. They are named in `migration/evidence/qualification-scope.md`.
+- Four qualification scenarios retain three live resource classes that a fixture
+  cannot supply — an installed supported engine, the running ChatGPT Desktop host,
+  and one non-macOS machine. They are named in `migration/evidence/qualification-scope.md`.
 - M55 is the row that would establish that evidence, and it is `planned` because
   live qualification needs the owner's authorization, not more implementation.
 - Risk K01 in plan §22 is blocking and states the consequence directly: without

@@ -984,7 +984,7 @@
     "toml": "schema_version = 1\n[runtimes.codex]\nenabled = true\nadapter = \""
   },
   {
-    "error_message": "runtimes.stub.native_settings is supported only by the codex, claude, glm, and qwen adapters",
+    "error_message": "runtimes.stub.native_settings is supported only by the codex, claude, and glm adapters",
     "error_type": "ValidationError",
     "id": "tests/test_native_settings.py:174",
     "normalized_result_summary": null,

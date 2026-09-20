@@ -7,15 +7,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Packaged runtime families implemented by the Rust service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Adapter {
+    /// OpenAI Codex app-server runtime.
     Codex,
+    /// Anthropic Claude stream runtime.
     Claude,
+    /// GLM's Anthropic-compatible stream runtime.
     Glm,
-    Qwen,
 }
 impl Adapter {
+    /// Resolves a supported current or legacy adapter identifier.
+    ///
+    /// Removed Qwen identifiers return an actionable deprecation error; all
+    /// other unknown identifiers return the closed packaged-adapter error.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "codex"
@@ -29,18 +36,20 @@ impl Adapter {
             }
             "qwen"
             | "agent_run.adapters.qwen:ADAPTER"
-            | "agent_run.adapters.qwen.adapter:ADAPTER" => Ok(Self::Qwen),
+            | "agent_run.adapters.qwen.adapter:ADAPTER" => Err(invalid(
+                "qwen runtime is deprecated and unsupported; remove it from config.toml",
+            )),
             _ => Err(invalid(
-                "unknown adapter; Rust builds accept packaged codex/claude/glm/qwen adapters only",
+                "unknown adapter; Rust builds accept packaged codex/claude/glm adapters only",
             )),
         }
     }
+    /// Returns the stable lowercase runtime-family name used in owned paths.
     pub fn name(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Glm => "glm",
-            Self::Qwen => "qwen",
         }
     }
 }
@@ -593,7 +602,7 @@ impl Config {
                 // merge implementation for cannot accept tuning at all.
                 None if !r.native_settings.is_empty() => {
                     return Err(invalid(
-                        "native_settings is supported only by the codex, claude, glm, and qwen adapters",
+                        "native_settings is supported only by the codex, claude, and glm adapters",
                     ));
                 }
                 None => {}
@@ -605,7 +614,6 @@ impl Config {
 /// Top-level Codex settings owned by the agent-run launch/security contract.
 const CODEX_RESERVED:&str="model model_provider model_providers model_reasoning_effort cli_auth_credentials_store mcp_oauth_credentials_store forced_login_method forced_chatgpt_workspace_id openai_base_url chatgpt_base_url openai_api_key approvals_reviewer approval_policy sandbox_mode sandbox_workspace_write shell_environment_policy notify features otel profile profiles projects default_permissions permissions plugins hooks mcp_servers skills tools agents apps web_search trust auth credentials env environment provider providers web";
 const CLAUDE_RESERVED:&str="model env environment permissions sandbox credentials auth hooks mcpServers apiKeyHelper agent autoMemoryDirectory forceLoginMethod forceLoginOrgUUID disableAllHooks statusLine enableAllProjectMcpServers enabledMcpjsonServers disabledMcpjsonServers awsAuthRefresh awsCredentialExport gcpAuthRefresh enabledPlugins extraKnownMarketplaces fileSuggestion providers";
-const QWEN_RESERVED:&str="model modelProviders providers extensions env environment credentials auth tools context security permissions hooks mcpServers mcp skills sandbox";
 /// Validates unowned native tuning settings for one packaged adapter.
 ///
 /// Only identifier keys and TOML values that round-trip through the generated
@@ -616,7 +624,6 @@ pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) 
     let reserved = match kind {
         Adapter::Codex => CODEX_RESERVED,
         Adapter::Claude | Adapter::Glm => CLAUDE_RESERVED,
-        Adapter::Qwen => QWEN_RESERVED,
     };
     /// Returns whether a TOML key cannot splice another generated namespace.
     fn key(k: &str) -> bool {

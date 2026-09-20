@@ -15,9 +15,10 @@ fn fixture() -> tempfile::TempDir {
         "| id | scenario | layer | status | evidence | live |\n|---|---|---|---|---|---|\n",
     );
     for number in 1..=84 {
-        let live = matches!(number, 57 | 58 | 71 | 82);
+        let live = matches!(number, 58 | 59 | 71 | 82);
+        let status = if number == 57 { "divergent" } else { "covered" };
         scope.push_str(&format!(
-            "| T{number:02} | scenario | pure/unit | covered | fixture | {} |\n",
+            "| T{number:02} | scenario | pure/unit | {status} | fixture | {} |\n",
             if live { "yes" } else { "no" }
         ));
     }

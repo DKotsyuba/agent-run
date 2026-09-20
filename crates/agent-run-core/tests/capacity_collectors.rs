@@ -251,33 +251,12 @@ fn dispatcher_config(root: &Path, adapter: &str, source: &str, binary: &Path) {
 /// Exercises source dispatch's unsupported/empty distinctions without loading an adapter.
 // Mirrors `tests/test_capacity_sources.py::DispatchTests::test_none_source_is_unsupported`.
 // Mirrors `tests/test_capacity_sources.py::DispatchTests::test_native_source_gates_on_live_limits_capability`.
-// Mirrors `tests/test_capacity_sources.py::DispatchTests::test_codexbar_source_rejects_undocumented_providers`.
 #[tokio::test]
 async fn capacity_dispatch_keeps_unsupported_sources_distinct() {
     let temporary = tempfile::tempdir().unwrap();
     dispatcher_config(temporary.path(), "claude", "none", Path::new("/bin/true"));
     let unsupported = sources::collect(temporary.path()).await.unwrap();
     assert_eq!(unsupported["results"][0]["status"], "unsupported");
-
-    dispatcher_config(temporary.path(), "qwen", "codexbar", Path::new("/bin/true"));
-    let unavailable = sources::collect(temporary.path()).await.unwrap();
-    assert_eq!(unavailable["results"][0]["status"], "failed");
-    assert_eq!(unavailable["results"][0]["issues"][0], "source_not_ported");
-}
-
-/// Exercises the configured Qwen binary's bounded local version probe.
-// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_probe_observes_the_configured_binary_version`.
-#[tokio::test]
-async fn qwen_model_probe_uses_the_configured_binary() {
-    let temporary = tempfile::tempdir().unwrap();
-    let binary = temporary.path().join("qwen");
-    std::fs::write(&binary, "#!/bin/sh\nprintf 'runtime 1.2.3\\n'\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-    dispatcher_config(temporary.path(), "qwen", "none", &binary);
-    let roster = sources::models(temporary.path()).await.unwrap();
-    assert_eq!(roster["fixture"]["available"], true);
-    assert_eq!(roster["fixture"]["models"][0]["id"], "fixture");
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::test_current_cache_pool_average`.
@@ -297,13 +276,10 @@ fn omniroute_current_cache_averages_members_and_uses_earliest_reset() {
     assert_eq!(samples[0].key.target.as_deref(), Some("opencode-go:pool"));
 }
 
-/// Exercises Qwen's shared OmniRoute pool as a real empty, healthy, or failed source.
-// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_live_limits_capability_and_pool_samples_are_shared`.
-// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_a_successfully_read_empty_pool_has_no_samples`.
-// Mirrors `tests/test_qwen_adapter.py::QwenAdapterTests::test_a_failing_row_source_raises_a_safe_source_error`.
+/// Exercises OmniRoute as a real empty, healthy, or failed explicit source.
 // Mirrors `tests/test_capacity_sources.py::DispatchTests::test_omniroute_source_uses_the_pool_without_any_adapter`.
 #[tokio::test]
-async fn qwen_uses_the_shared_omniroute_pool_without_adapter_calls() {
+async fn omniroute_pool_needs_no_adapter_calls() {
     let rows = json!([{"window_key":"session","remaining_percentage":90.0,"next_reset_at":"2026-08-28T17:26:35.920Z","fetched_at":"2026-08-28T14:06:01.922Z"}]);
     let observed = chrono::DateTime::parse_from_rfc3339("2026-08-28T14:06:01.922Z")
         .unwrap()
@@ -643,7 +619,7 @@ impl ValueRows {
 #[test]
 fn collector_key_identity_is_runtime_lane_window_target_and_source() {
     let a = Key {
-        runtime: "qwen".into(),
+        runtime: "fixture".into(),
         lane: "pool".into(),
         window: "weekly".into(),
         target: Some("opencode-go:pool".into()),

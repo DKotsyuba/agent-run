@@ -50,7 +50,6 @@ to a new conversation. The new caller's binding must be confirmed just as for
 - Claude and GLM persist new CLI sessions and use `--resume <id>`. Runs created
   with the former `--no-session-persistence` setting may have no recoverable
   native history.
-- Qwen uses its explicit `--resume <id>` selector, never its latest-session option.
 
 Native compaction still applies: continuity preserves the history the runtime
 retains, not an unlimited verbatim memory. Old runs without a sufficient

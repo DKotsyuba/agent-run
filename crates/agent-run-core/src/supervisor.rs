@@ -269,16 +269,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
                 )
                 .await
             }
-            _ => {
-                crate::stream::run(
-                    &mut process,
-                    store,
-                    &row,
-                    runtime.kind()?,
-                    plan.initial_input.as_deref(),
-                )
-                .await
-            }
+            _ => crate::stream::run(&mut process, store, &row, plan.initial_input.as_deref()).await,
         }
     }
     .await;

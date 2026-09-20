@@ -34,7 +34,6 @@ _SECRET = re.compile(
 #: alone. Without this probe, doctor checks only ``os.environ`` and reports a
 #: keychain-backed runtime as unauthenticated.
 KEYCHAIN_FALLBACKS = {
-    "qwen": ("com.pluto.agent-run.opencode.omniroute", "OMNIROUTE_API_KEY"),
     "glm": ("com.pluto.agent-run.glm", "GLM_CODING_KEY"),
     "claude": ("Claude Code-credentials", None),
 }
@@ -367,7 +366,7 @@ def _hooks(runtime: RuntimeConfig, component: str, trusted, findings) -> None:
 def _auth(name: str, runtime: RuntimeConfig, component: str, findings) -> None:
     """Check one runtime's auth wiring and record what is missing.
 
-    ``name`` is the config runtime key (e.g. ``"qwen"``), used to look up a
+    ``name`` is the config runtime key (e.g. ``"glm"``), used to look up a
     keychain fallback. Environment auth is satisfied by any of ``auth.names``
     being set, or by the runtime's fallback keychain item resolving; bridge
     auth is checked as a source file plus a symlink into the runtime home.

@@ -248,7 +248,7 @@ async fn doc_dispatch_returns_the_index_and_requested_topic() {
     assert_eq!(models["topic"], "models");
     assert!(models["text"]
         .as_str()
-        .is_some_and(|text| text.contains("opencode/")));
+        .is_some_and(|text| text.contains("claude, codex, and glm")));
 }
 
 /// Mirrors `test_doc.py::test_doc_tool_call_rejects_unknown_topic`.

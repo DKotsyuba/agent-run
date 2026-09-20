@@ -163,7 +163,7 @@ class DocMcpTests(unittest.TestCase):
         third = responses[2]["result"]["structuredContent"]
         self.assertEqual(first["topic"], "index")
         self.assertEqual(second["topic"], "models")
-        self.assertIn("opencode/", second["text"])
+        self.assertIn("claude, codex, and glm", second["text"])
         self.assertEqual(third["topic"], "completion")
         self.assertIn("agent-run/completion", third["text"])
 

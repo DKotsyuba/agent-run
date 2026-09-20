@@ -41,11 +41,11 @@ pub fn plan(
     plan_with_environment(config, runtime, record, role, home, snapshot, environment)
 }
 
-/// Builds a Claude-family or Qwen launch after the caller has resolved its child environment.
+/// Builds a Claude-family launch after the caller has resolved its child environment.
 ///
 /// `environment` must already contain the adapter's managed HOME, PATH, and
 /// credential values; this function mutates only its local copy to add
-/// launch-specific exports such as `ANTHROPIC_MODEL` or `OPENAI_MODEL`.
+/// launch-specific exports such as `ANTHROPIC_MODEL`.
 /// Keeping this deterministic half separate lets fixture tests compare argv
 /// and environment ownership without probing a real Keychain or engine.
 pub fn plan_with_environment(
@@ -59,45 +59,7 @@ pub fn plan_with_environment(
 ) -> Result<LaunchPlan> {
     let kind = runtime.kind()?;
     let req = &record.request;
-    let (mut args, input) = if kind == Adapter::Qwen {
-        env.insert("OPENAI_MODEL".into(), req.model.clone());
-        #[cfg(target_os = "macos")]
-        {
-            // Put Xcode's Git ahead of the shim so Qwen cannot execute an untrusted Git.
-            let xcode = std::process::Command::new("/usr/bin/xcrun")
-                .args(["--find", "git"])
-                .output()?;
-            if !xcode.status.success() {
-                return Err(invalid("Qwen requires an installed Xcode Git toolchain"));
-            }
-            let git = String::from_utf8_lossy(&xcode.stdout).trim().to_owned();
-            let parent = Path::new(&git)
-                .parent()
-                .ok_or_else(|| invalid("invalid Xcode Git path"))?;
-            env.insert(
-                "PATH".into(),
-                format!(
-                    "{}:{}",
-                    parent.display(),
-                    env.get("PATH").cloned().unwrap_or_default()
-                ),
-            );
-        }
-        (
-            vec![
-                "-p".into(),
-                req.task.clone(),
-                "--output-format".into(),
-                "stream-json".into(),
-                "--approval-mode".into(),
-                if role.write { "yolo" } else { "plan" }.into(),
-                "--sandbox".into(),
-                "--model".into(),
-                req.model.clone(),
-            ],
-            None,
-        )
-    } else {
+    let (mut args, input) = {
         let mut tools = vec!["Read".to_owned(), "Grep".into(), "Glob".into()];
         if !role.skills.is_empty() {
             tools.push("Skill".into());
@@ -233,24 +195,6 @@ fn result_text(v: &Value) -> Option<String> {
     }
 }
 
-/// Returns Qwen's bounded provider-error line when a clean result is error-only.
-///
-/// Qwen may exit successfully after emitting a final text result beginning
-/// with `[API Error:`.  That text is not an answer: this helper retains only
-/// its first 500-character line for bounded failure evidence.  Ordinary
-/// answers, including answers that mention the marker later, return `None`.
-fn qwen_provider_error(text: Option<&str>) -> Option<String> {
-    let text = text?.trim();
-    text.starts_with("[API Error:").then(|| {
-        text.lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(500)
-            .collect()
-    })
-}
-
 /// Classifies a Claude-family terminal result without trusting its subtype alone.
 ///
 /// The native CLI occasionally labels an authentication error as `success`.
@@ -290,7 +234,6 @@ pub async fn run(
     process: &mut Process,
     store: &mut Store,
     record: &Record,
-    kind: Adapter,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
     if let Some(input) = initial_input {
@@ -338,35 +281,16 @@ pub async fn run(
                 }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        if kind == Adapter::Qwen {
-                            store.complete_command(
-                                &record.id,
-                                cid,
-                                &json!({"accepted":false,"reason":"capability_unavailable"}),
-                            )?;
-                        } else {
-                            let accepted = process
-                                .send_before(
-                                    &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
-                                    deadline,
-                                )
-                                .await
-                                .is_ok();
-                            store.complete_command(
-                                &record.id,
-                                cid,
-                                &json!({"accepted":accepted}),
-                            )?;
-                            if accepted {
-                                journal(
-                                    store,
-                                    &record.id,
-                                    "user",
-                                    &process.redact(text),
-                                    None,
-                                    None,
-                                )?;
-                            }
+                        let accepted = process
+                            .send_before(
+                                &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+                                deadline,
+                            )
+                            .await
+                            .is_ok();
+                        store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
+                        if accepted {
+                            journal(store, &record.id, "user", &process.redact(text), None, None)?;
                         }
                     } else {
                         store.complete_command(
@@ -584,14 +508,6 @@ pub async fn run(
                 if outcome.status == Status::Failed {
                     outcome.failure_text = text.clone();
                 }
-                if kind == Adapter::Qwen {
-                    if let Some(failure_text) = qwen_provider_error(text.as_deref()) {
-                        outcome = Outcome::failure("provider_error");
-                        outcome.runtime_session_id = session.clone();
-                        outcome.failure_text = Some(failure_text);
-                        text = None;
-                    }
-                }
                 if let Some(k) = text.as_deref().and_then(verify::error_only) {
                     outcome.status = Status::Failed;
                     outcome.failure_kind = Some(k.into());
@@ -631,7 +547,7 @@ fn runtime_result_usage(result: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{qwen_provider_error, result_failure_kind, result_text, runtime_result_usage};
+    use super::{result_failure_kind, result_text, runtime_result_usage};
     use serde_json::json;
 
     /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_result_with_error_subtype_is_terminal_and_marked_as_error`.
@@ -706,28 +622,6 @@ mod tests {
         assert_eq!(
             result_failure_kind("error_during_execution", Some("boom")),
             "runtime_failed"
-        );
-    }
-
-    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_error_only_400_result_fails_with_provider_error`.
-    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_error_only_500_result_fails_with_provider_error`.
-    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_error_mention_inside_real_content_stays_succeeded`.
-    // Mirrors `test_qwen_adapter.py::QwenErrorOnlyResultTests::test_claude_session_semantics_are_unchanged`.
-    /// Qwen's clean provider-error result is failure evidence, while embedded
-    /// error text and shared Claude classification remain ordinary content.
-    #[test]
-    fn qwen_error_only_results_become_bounded_provider_failures() {
-        let error_400 = "[API Error: 400 opencode-go/deepseek-v4-pro-high: model]";
-        let error_500 = "[API Error: 500 opencode-go/mimo-v2.5-max: provider]";
-        assert_eq!(qwen_provider_error(Some(error_400)), Some(error_400.into()));
-        assert_eq!(qwen_provider_error(Some(error_500)), Some(error_500.into()));
-        assert_eq!(
-            qwen_provider_error(Some("answer mentions [API Error:")),
-            None
-        );
-        assert_eq!(
-            result_failure_kind("success", Some(error_400)),
-            "engine_error"
         );
     }
 }

@@ -733,7 +733,7 @@ fn native_login_command(
                 }
             }
         }
-        Adapter::Glm | Adapter::Qwen => {
+        Adapter::Glm => {
             return Err(invalid("auth login is not supported for this runtime yet"));
         }
     }
