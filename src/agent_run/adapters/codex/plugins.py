@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Mapping
 
 from ...errors import ValidationError
@@ -66,8 +66,14 @@ def _token(value: object, label: str) -> str:
     return value
 
 
-def _manifest(directory: Path) -> tuple[str, str]:
-    """Read ``(name, version)`` from the plugin's codex or claude manifest."""
+def _manifest(directory: Path) -> tuple[str, str, str]:
+    """Read the plugin name, version, and normalized hook-manifest path.
+
+    Codex manifests may select a hook file with the ``hooks`` field. Plugins
+    without that field retain the historical ``hooks/hooks.json`` default.
+    Absolute paths, traversal, and non-string declarations are rejected before
+    agent-run reads from the plugin tree.
+    """
 
     for relative in (".codex-plugin/plugin.json", ".claude-plugin/plugin.json"):
         try:
@@ -75,9 +81,18 @@ def _manifest(directory: Path) -> tuple[str, str]:
         except (OSError, ValueError):
             continue
         if isinstance(payload, dict) and payload.get("name") and payload.get("version"):
+            raw_hooks = payload.get("hooks", _HOOKS_REL)
+            if not isinstance(raw_hooks, str):
+                raise ValidationError(
+                    f"codex plugin hooks path must be a string: {directory}"
+                )
+            hooks = PurePosixPath(raw_hooks.removeprefix("./"))
+            if hooks.is_absolute() or not hooks.parts or ".." in hooks.parts:
+                raise ValidationError(f"codex plugin hooks path is unsafe: {raw_hooks!r}")
             return (
                 _token(payload["name"], "name"),
                 _token(payload["version"], "version"),
+                hooks.as_posix(),
             )
     raise ValidationError(f"codex plugin has no usable manifest: {directory}")
 
@@ -126,19 +141,25 @@ def _digest(event: str, matcher: str | None, handler: dict[str, object]) -> str:
     return f"sha256:{content_hash(canonical)}"
 
 
-def _trust_entries(name: str, directory: Path) -> list[tuple[str, str]]:
-    """Return ``(state_key, trusted_hash)`` for every hook the plugin declares."""
+def _trust_entries(
+    name: str, directory: Path, hooks_relative: str
+) -> list[tuple[str, str]]:
+    """Return trust entries for hooks in the manifest-selected relative file."""
 
-    source = directory / _HOOKS_REL
+    source = directory / hooks_relative
     if not source.is_file():
         return []
     try:
         document = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
-        raise ValidationError(f"codex plugin {name} has an unreadable {_HOOKS_REL}: {error}") from error
+        raise ValidationError(
+            f"codex plugin {name} has an unreadable {hooks_relative}: {error}"
+        ) from error
     events = document.get("hooks") if isinstance(document, dict) else None
     if not isinstance(events, dict):
-        raise ValidationError(f"codex plugin {name} declares no hooks table in {_HOOKS_REL}")
+        raise ValidationError(
+            f"codex plugin {name} declares no hooks table in {hooks_relative}"
+        )
     entries: list[tuple[str, str]] = []
     for event_name in sorted(events):
         event = _EVENT_LABELS.get(event_name)
@@ -164,7 +185,7 @@ def _trust_entries(name: str, directory: Path) -> list[tuple[str, str]]:
             for handler_index, raw in enumerate(handlers):
                 handler = _handler(raw, f"{where}.hooks[{handler_index}]")
                 key = (
-                    f"{name}@{MARKETPLACE}:{_HOOKS_REL}:{event}:{group_index}:{handler_index}"
+                    f"{name}@{MARKETPLACE}:{hooks_relative}:{event}:{group_index}:{handler_index}"
                 )
                 entries.append((key, _digest(event, matcher, handler)))
     return entries
@@ -255,7 +276,7 @@ def install(
     fingerprint: list[str] = []
     listed: list[dict[str, object]] = []
     for directory in plugins:
-        name, version = _manifest(directory)
+        name, version, hooks_relative = _manifest(directory)
         relative = f"plugins/cache/{MARKETPLACE}/{name}/{version}"
         tree_digest = _copy_tree(home, relative, directory)
         roots[name] = Path(home) / relative
@@ -270,7 +291,7 @@ def install(
         lines.append("enabled = true")
         lines.append("")
         fingerprint.append(f"{name}@{MARKETPLACE}:{version}:{tree_digest}")
-        for key, trusted_hash in _trust_entries(name, directory):
+        for key, trusted_hash in _trust_entries(name, directory, hooks_relative):
             lines.append(f'[hooks.state."{key}"]')
             lines.append(f'trusted_hash = "{trusted_hash}"')
             lines.append("")

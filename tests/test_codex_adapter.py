@@ -488,6 +488,25 @@ env_from = ["PATH"]
         )
         self.assertNotEqual(digest, ADAPTER.materialize(self.runtime_config(), self.home, mcp_servers={}))
 
+    def test_materialize_trusts_manifest_declared_plugin_hook_path(self) -> None:
+        """Trust the official plugin hook file selected by its Codex manifest."""
+
+        plugin = self.make_plugin(hooks="./hooks/claude-codex-hooks.json")
+        (plugin / "hooks" / "hooks.json").rename(
+            plugin / "hooks" / "claude-codex-hooks.json"
+        )
+
+        ADAPTER.materialize(
+            self.runtime_config(plugins=(plugin,)), self.home, mcp_servers={}
+        )
+
+        generated = (self.home / "config.toml").read_text(encoding="utf-8")
+        self.assertIn(
+            "agent-pipline-compressor@personal:hooks/claude-codex-hooks.json:"
+            "pre_tool_use:0:0",
+            generated,
+        )
+
     def test_materialize_trusts_post_tool_use_failure_plugin_hook(self) -> None:
         """Translate the LSP failure hook to Codex's trusted native label."""
 
@@ -546,6 +565,10 @@ env_from = ["PATH"]
         hooks.write_text(json.dumps({"hooks": {"Bogus": []}}), encoding="utf-8")
         with self.assertRaisesRegex(ValidationError, "unsupported hook event"):
             ADAPTER.materialize(self.runtime_config(plugins=(plugin,)), self.home, mcp_servers={})
+
+        unsafe = self.make_plugin(hooks="../outside.json")
+        with self.assertRaisesRegex(ValidationError, "hooks path is unsafe"):
+            ADAPTER.materialize(self.runtime_config(plugins=(unsafe,)), self.home, mcp_servers={})
 
     def test_materialize_is_deterministic_for_identical_input(self) -> None:
         config = self.runtime_config()
