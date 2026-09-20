@@ -20,8 +20,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, label: supported-macos-arm64 }
-          - { os: ubuntu-latest, label: validation-only-linux }
+          - os: macos-latest
+            label: supported-macos-arm64
+            target: aarch64-apple-darwin
+            architecture: arm64
+          - os: ubuntu-latest
+            label: configured-release-target-linux-x86_64-pending-hosted-evidence
+            target: x86_64-unknown-linux-gnu
+            architecture: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -30,9 +36,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
-      - name: Verify supported runner architecture
-        if: runner.os == 'macOS'
-        run: test "$(uname -m)" = arm64
+      - name: Verify native runner architecture
+        run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - name: Reject legacy implementation files
         shell: bash
         run: |
@@ -44,8 +49,15 @@ jobs:
         run: cargo xtask check
       - name: Verify desktop transport fixture
         run: node --test scripts/check-desktop-transport.cjs
-      - name: Build locked release binary
-        run: cargo build --locked --release --package agent-run --bin agent-run
+      - name: Build and verify sealed native release
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          cargo xtask release build-native \
+            --target "${{ matrix.target }}" \
+            --output "$RUNNER_TEMP/native" \
+            --version "$version"
+          cargo xtask release verify --release "$RUNNER_TEMP/native/releases/$version"
 
   release-contract:
     name: Rust release contract
