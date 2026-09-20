@@ -8,7 +8,7 @@ fn repository_file(path: &str) -> String {
         .unwrap_or_else(|error| panic!("cannot read {path}: {error}"))
 }
 
-/// Ensures primary CI rejects legacy sources and runs every Rust release gate.
+/// Ensures primary CI runs locked gates and sealed builds on both native release targets.
 #[test]
 fn ci_is_rust_only_and_checks_the_desktop_transport() {
     let workflow = repository_file(".github/workflows/ci.yml");
@@ -20,9 +20,11 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
         "cargo xtask archive --verify",
         "cargo xtask release build-native",
         "cargo xtask release verify",
-        "cargo build --locked --release --package agent-run --bin agent-run",
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "test \"$(uname -m)\" = \"${{ matrix.architecture }}\"",
         "node --test scripts/check-desktop-transport.cjs",
-        "validation-only-linux",
+        "configured-release-target-linux-x86_64-pending-hosted-evidence",
     ] {
         assert!(workflow.contains(required), "CI is missing {required:?}");
     }
@@ -34,7 +36,7 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
     }
 }
 
-/// Ensures tagged releases publish only verified native and source archives.
+/// Ensures tagged releases aggregate two verified native archives and one source archive.
 #[test]
 fn release_publishes_checksummed_native_assets() {
     let workflow = repository_file(".github/workflows/release.yml");
@@ -47,9 +49,16 @@ fn release_publishes_checksummed_native_assets() {
         "cargo xtask release build-native",
         "cargo xtask release verify",
         "cargo xtask archive --revision HEAD",
-        "aarch64-apple-darwin.tar.gz",
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "agent-run-$version-${{ matrix.target }}.tar.gz",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "merge-multiple: true",
+        "needs: [gate, native]",
         "SHA256SUMS",
         "subject-checksums: dist/SHA256SUMS",
+        "GH_REPO: ${{ github.repository }}",
         "gh release create",
     ] {
         assert!(
@@ -68,6 +77,34 @@ fn release_publishes_checksummed_native_assets() {
         assert!(
             !workflow.contains(forbidden),
             "release still contains legacy artifact {forbidden:?}"
+        );
+    }
+    assert_eq!(
+        workflow
+            .matches("cargo xtask archive --revision HEAD")
+            .count(),
+        1,
+        "the verified source archive must be built once"
+    );
+    assert_eq!(
+        workflow.matches("gh release create").count(),
+        1,
+        "all archives must be published by one GitHub Release operation"
+    );
+}
+
+/// Ensures dependency automation covers both workflow actions and locked Rust crates weekly.
+#[test]
+fn dependabot_checks_actions_and_cargo_weekly() {
+    let configuration = repository_file(".github/dependabot.yml");
+    for required in [
+        "package-ecosystem: github-actions",
+        "package-ecosystem: cargo",
+        "interval: weekly",
+    ] {
+        assert!(
+            configuration.contains(required),
+            "Dependabot is missing {required:?}"
         );
     }
 }
