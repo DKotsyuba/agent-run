@@ -60,7 +60,7 @@ None of these is closed by work. Each blocks something specific.
 
 | # | Decision | What it blocks | Where the evidence is |
 |---|---|---|---|
-| 2.1 | **Process-group kill strategy.** Python kills the recorded group unconditionally; this port signals only a leader it has verified alive. | The single unported behavior, and part of risk K02 | `migration/adr/A10-spawn-backend.md`, section "Measured cost of decision 5" |
+| 2.1 | **Process-group kill strategy.** Rust signals only a group whose leader identity it has verified alive; unconditional signalling is an explicit A10 divergence. | Closed for the Rust-primary release | `migration/adr/A10-spawn-backend.md`, section "Measured cost of decision 5" |
 | 2.2 | **Supported platforms.** Every run to date was macOS/arm64. Linux code exists and has never executed. | Risk K02's "Mac/Linux" closure condition; what the release may claim | `migration/adr/A15-platforms.md` (Proposed) |
 | 2.3 | **Desktop relay boundary.** Direct Rust admission is refused by the host; option B runs a minimal shim through the Desktop-supplied Node. | **Blocking risk K01**, board row M09 | `migration/adr/A09-desktop-relay.md` (Proposed) |
 | 2.4 | **Live qualification authorization.** Supported-engine continuation, the running ChatGPT Desktop host, and one non-macOS machine need real resources. | Board row M55; the `live` portions of T58–T59, T71, T82 | `migration/evidence/qualification-scope.md` |

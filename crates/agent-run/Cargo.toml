@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Durable local coding-agent supervisor — Rust migration"
+description = "Durable local coding-agent supervisor"
 repository = "https://github.com/DKotsyuba/agent-run"
 publish = false
 

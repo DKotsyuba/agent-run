@@ -1,291 +1,131 @@
 # agent-run
 
-Local supervisor for coding agents. Start Codex, Claude Code, and GLM
-Code children as **durable asynchronous jobs** on your own
-machine — with one state store, honest outcome verification, quota
-tracking, and three equal access layers: a CLI, an
-MCP server, and a Unix-socket JSON-RPC API.
+`agent-run` is a self-contained Rust supervisor for Codex, Claude Code, and
+GLM coding agents. It runs children as durable asynchronous jobs, records
+verified outcomes in SQLite, tracks provider capacity, and exposes the same
+tool surface through its CLI, MCP stdio server, and Unix-socket JSON-RPC API.
 
-Built for orchestration: one agent (or script, or human) hands out work to
-many engine children, keeps working, and collects verified answers later —
-across process restarts.
+The broker and its release artifact do not require Python. Engine CLIs remain
+external dependencies and must be installed and authenticated separately.
 
-```
-you / your agent / your app
-        │
-   CLI ─┼─ MCP (stdio) ─── JSON-RPC (unix socket)      ← three transports,
-        │                                                 one tool surface
-   AgentService ── SQLite state (durable agents, events,
-        │          transcripts, deliveries, run stats)
-   adapters + supervisor
-        │
-   codex · claude · glm                                 ← engine CLIs you
-                                                          already have
-```
+## Supported release target
 
-## Why
-
-- **Durable, not fire-and-forget.** Every agent gets an id and a row in
-  SQLite before it runs. Kill your terminal; the child keeps running under
-  its supervisor, and `answer <id>` works tomorrow.
-- **Verified outcomes.** "Succeeded" is derived from recorded evidence
-  (completion sentinels, answer hashes, classified failure kinds) — not
-  from an engine's exit code. Error-only replies are classified, not
-  celebrated; legacy stall and timeout outcomes remain readable.
-- **One tool table, three transports.** The same tool surface is exposed via
-  CLI, MCP, and the socket API, generated from a single dispatcher; a
-  parity test keeps them from drifting.
-- **Isolated children.** Each run gets a generated home: no ambient
-  skills, MCP servers, or hooks leak in unless declared in config. What an
-  agent may read or write is explicit (`--write`, `--read-root`).
-- **Quota-aware.** A capacity collector samples remaining limits per
-  provider (native engine data, [codexbar](https://github.com/steipete/codexbar),
-  or a local router) and ranks compatible routes from current fresh readings.
-- **Locked dependencies.** Runtime packages are declared in `pyproject.toml`,
-  resolved in the committed `uv.lock`, and release installs verify a hashed
-  dependency closure before the application wheel.
+The first Rust-primary release supports macOS on Apple silicon
+(`aarch64-apple-darwin`). Linux is compiled and tested in CI as validation-only;
+it is not yet a supported release target. macOS-specific Keychain and launchd
+integration are unavailable elsewhere.
 
 ## Install
 
-Requirements: Python ≥ 3.14, macOS or Linux, plus the engine CLIs you intend
-to drive (`codex`, `claude` — either or both).
-
-| Feature | macOS | Linux |
-|---|---:|---:|
-| Core CLI, MCP, socket API | yes | yes |
-| Environment/file-based runtime auth | yes | yes |
-| Keychain auth fallback and launchd helpers | yes | no |
-| Optional codexbar / local OmniRoute capacity sources | when installed | when installed |
+Download `agent-run-0.12.0-aarch64-apple-darwin.tar.gz` and `SHA256SUMS` from
+the matching GitHub Release, verify the checksum, then place the binary on
+`PATH`:
 
 ```bash
-pipx install \
-  https://github.com/DKotsyuba/agent-run/releases/download/v0.3.1/agent_run-0.3.1-py3-none-any.whl
-# or use the same wheel URL with `python -m pip install` / `uv tool install`
-```
-
-Versioned wheel and source archives are attached to each
-[GitHub Release](https://github.com/DKotsyuba/agent-run/releases). After
-installing, confirm the selected version:
-
-```bash
-python -c 'from importlib.metadata import version; print(version("agent-run"))'
-```
-
-To install a tagged source tree instead of a release artifact:
-
-```bash
-python -m pip install \
-  git+https://github.com/DKotsyuba/agent-run.git@v0.3.1
-```
-
-Then bootstrap the home directory (default `~/.agent-run`, override with
-`AGENT_RUN_HOME` or `--home`):
-
-```bash
+shasum -a 256 -c SHA256SUMS
+tar -xzf agent-run-0.12.0-aarch64-apple-darwin.tar.gz
+install -m 0755 bin/agent-run ~/.local/bin/agent-run
 agent-run init
 ```
 
-### Configure
+Build from source with the pinned Rust toolchain:
 
-Everything lives in one file, `~/.agent-run/config.toml`. Unknown agent-run
-keys and reserved native control fields are rejected. Keys inside
-`native_settings` use the native engine's preference names; agent-run checks
-their value shapes, not every upstream preference name.
-Minimal single-runtime example:
+```bash
+cargo build --locked --release --package agent-run --bin agent-run
+install -m 0755 target/release/agent-run ~/.local/bin/agent-run
+```
+
+The home defaults to `~/.agent-run`; override it with `AGENT_RUN_HOME` or
+`--home`.
+
+## Configure
+
+Configuration lives in `<home>/config.toml`. Unknown agent-run keys and
+reserved native control fields fail closed. Runtime aliases are `codex`,
+`claude`, and `glm`.
 
 ```toml
 schema_version = 1
 
-[runtimes.claude]
+[runtimes.codex]
 enabled = true
-adapter = "agent_run.adapters.claude.adapter:ADAPTER"
-binary  = "/opt/homebrew/bin/claude"          # your engine CLI
-home    = "/Users/you/.agent-run/runtimes/claude"
-models  = ["sonnet", "opus"]
-
-[runtimes.claude.native_settings]
-spinnerTipsEnabled = false                    # optional native tuning
+adapter = "codex"
+binary = "/opt/homebrew/bin/codex"
+home = "/Users/you/.agent-run/runtimes/codex"
+models = ["gpt-5.6-sol"]
+limits_source = "codex_appserver"
 ```
 
-Add more `[runtimes.<name>]` blocks for other engines (`codex`, `glm`) the
-same way. Per-runtime options cover auth (env-var
-names or file links — never secret values in config), allowed skills,
-declared MCP servers, lifecycle hooks, plugins, and the limits source
-(`native` / `codex_appserver` / `codexbar` / `omniroute` / `none`).
-`priority_multiplier = 1.0` is the optional positive finite weight used by
-capacity ordering; it scales only viable routes and never revives an exhausted
-window. A `native_settings` table retunes the engine's own generated config
-file — e.g. Codex `model_context_window`/compaction limits, Claude/GLM
-`settings.json` preferences — without editing Python or reinstalling; keys
-that own model/auth/sandbox/hook/MCP control are rejected, and edits apply to
-new launches after a broker restart or reload.
+Per-runtime configuration supports declared auth sources, skills, MCP servers,
+hooks, plugins, native engine settings, and capacity sources. Credential values
+do not belong in this file. The resident broker hashes the file every minute
+and reloads valid changes; new requests also check immediately. Invalid changes
+leave the last valid configuration active.
 
-Optional `priority_account_multipliers` and `priority_lane_multipliers` tables
-override that weight for an account or quota lane: account wins over lane,
-which wins over the runtime default. Values are absolute weights, not products;
-all must be positive and finite. Shared-pool aliases remain one capacity choice,
-using the highest applicable weight rather than adding their weights.
-
-For Codex, `codex_appserver` reads each configured account through a
-short-lived local app-server process. Standard and model-specific buckets
-(including Spark when the plan exposes it) remain separate routes, and one
-account failure does not erase fresh evidence from the others.
-
-**Multiple accounts** (codex): declare labels on the runtime —
-`accounts = ["personal1", "personal2"]` —
-then log each one in via the engine's own OAuth flow:
+Initialize and inspect the installation:
 
 ```bash
-agent-run auth personal2 codex     # opens the browser login once
-agent-run start --runtime codex --account personal2 ...
-```
-
-Omitting `--account` uses the native global Codex account. Labelled credentials
-live in `<home>/accounts/codex/<label>/`; each account gets
-its own child-home lineage, and `--account` works identically over MCP
-and the socket API. With no accounts declared, nothing changes in account
-selection. A configured model is launchable only when the selected account's
-app-server roster reports it. `gpt-6-astra` permits only read-only
-`role-architect` and `role-review` launches. Delegation reserves this expensive,
-high-demand model for the hardest architecture and review decisions; coding
-and routine work use other models.
-
-Claude uses its native global CLI credential state when no label is supplied:
-
-```bash
-agent-run login claude
-```
-
-When Claude declares `accounts`, select one explicitly with
-`agent-run login claude --account personal`. Labelled runs use private
-`CLAUDE_CONFIG_DIR` state; unlabelled runs use the native global directory.
-
-Check the installation:
-
-```bash
+agent-run init
 agent-run doctor
 ```
 
-## Quick start (CLI)
+## Run the broker
 
-The one-shot `start` command submits to the resident Unix-socket daemon so an
-accepted asynchronous launch survives the CLI process. Start `agent-run api
-serve` first, or install the launchd job below; if the daemon is unavailable,
-`start` returns an actionable `BrokerUnavailable` error.
+`start` is broker-owned: it submits through the resident Unix socket and never
+falls back to a worker owned by the short-lived CLI process.
 
 ```bash
-# start one read-only agent; returns immediately with a durable id
-# --timeout remains accepted for compatibility and does not stop execution
-agent-run start --runtime claude --model sonnet --profile review \
-  --task "Summarize what this repo does in three lines." \
-  --workdir ~/projects/myrepo --timeout 600
-
-# add --wait to start when the same command should emit the terminal answer
-agent-run start --runtime claude --model sonnet --profile review \
-  --task "Summarize what this repo does in three lines." \
-  --workdir ~/projects/myrepo --wait
-
-# fetch the verified answer (works any time later, too)
-agent-run answer ag-20260831-...
+agent-run api serve
 ```
 
-Useful verbs beyond that: `transcript --follow`, `steer`, `cancel`, `agents`
-(list), `models`, and `limits`. All output is line-delimited JSON — pipe it
-into `jq`.
-
-For Codex queue delivery, `agent-run delivery status <agent-id>` exposes the latest
-bounded diagnostic summary: classifier, duration, exact exit status or spawn
-errno, output byte counts/truncation, and redacted stdout/stderr tails. It never
-contains the delivered message, session id, argv values, environment values,
-or credentials; non-queue deliveries report `null`.
-
-## Use as an MCP server
-
-`agent-run mcp` is an official MCP SDK stdio server over the resident Unix-socket
-daemon. The SDK owns protocol negotiation, request parsing, cancellation, and
-EOF lifecycle; each tool callback opens its own broker client, so an MCP client
-disconnect never cancels an already admitted durable agent run.
-Start the daemon in the foreground with `agent-run api serve`; MCP requires it
-to be running and reports `BrokerUnavailable` when it is down. The one-shot
-CLI `start` command uses the same resident path for lifecycle safety.
-
-For a long-lived macOS setup, generate and install a launchd job:
+For a long-lived macOS installation:
 
 ```bash
-agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgents/com.agent-run.api.plist
+agent-run api launchd --binary "$(command -v agent-run)" \
+  > ~/Library/LaunchAgents/com.agent-run.api.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 ```
 
-The proxy exposes the same eleven tools as the resident daemon: `start`,
-`resume`, `cancel`, `steer`, `list_agents`, `answer`, `transcript`, and
-`capacity_order`, plus `doc`, `models`, and `limits`.
-
-**Claude Code:**
+## Use the CLI
 
 ```bash
-claude mcp add agent-run -- agent-run --home ~/.agent-run mcp
+agent-run start --runtime codex --model gpt-5.6-sol --profile review \
+  --task "Review this repository." --workdir "$PWD"
+
+agent-run agents
+agent-run answer ag-...
+agent-run transcript ag-...
+agent-run resume ag-... --task "Continue with the highest-priority finding."
 ```
 
-**Codex** (`~/.codex/config.toml`):
+Output is line-delimited JSON. Other commands include `steer`, `cancel`,
+`models`, `limits`, `capacity order`, `delivery status`, and `doc`.
 
-```toml
-[mcp_servers.agent-run]
-command = "agent-run"
-args = ["--home", "/Users/you/.agent-run", "mcp"]
-```
+## Use the MCP server
 
-**Any MCP client** — generic stdio server config:
+The MCP process is a thin stdio proxy over the resident broker:
 
 ```json
-{"command": "agent-run", "args": ["--home", "/Users/you/.agent-run", "mcp"]}
+{"command":"agent-run","args":["--home","/Users/you/.agent-run","mcp"]}
 ```
 
-Use an absolute path to `agent-run` if the client's PATH is minimal. The
-orchestrating session gets bound to the agents it starts, and terminal
-notifications are delivered back to it.
+It exposes `start`, `resume`, `cancel`, `steer`, `list_agents`, `answer`,
+`transcript`, `capacity_order`, `doc`, `models`, and `limits`.
 
-## Use over the JSON-RPC socket API
+## Use the socket API
 
-For programs that are not MCP clients (services, UIs, other tools):
+The broker binds `<home>/api.sock` with mode `0600`. It accepts newline-framed
+JSON-RPC 2.0 and provides the tool methods plus `ping`, `tools`, and `wait`.
+See [docs/api.md](docs/api.md).
 
-```bash
-agent-run api serve          # binds ~/.agent-run/api.sock, chmod 0600
-```
+## Reliability contract
 
-Plain JSON-RPC 2.0, method = tool name, plus `tools` (schema discovery),
-`ping`, and blocking `wait`. Full integration guide with
-a copy-paste Python client: [docs/api.md](docs/api.md).
+- SQLite admission precedes execution, so accepted jobs remain durable.
+- Success requires answer proof, completion evidence, and verified cleanup.
+- Generated runtime homes include only declared auth bridges, tools, skills,
+  hooks, plugins, and policy.
+- The broker checks configuration hashes every 60 seconds and on requests.
+- Release directories are immutable, checksummed, and gated by `COMPLETE`.
 
-## What's in the box
-
-| Surface | Command | Notes |
-|---|---|---|
-| CLI | `agent-run <verb>` | line-JSON output, honest exit codes |
-| MCP server | `agent-run mcp` | stdio, shared tool surface |
-| JSON-RPC API | `agent-run api serve` | Unix socket, file permissions as auth |
-| Operator guide | `agent-run doc` | packaged orchestration rules and maintenance topics |
-| Self-diagnosis | `agent-run doctor` | config, binaries, auth, hooks, capacity freshness |
-| Capacity collector | `agent-run capacity collect` | + launchd plist generator |
-| Capacity priority | `agent-run capacity order` | read-only, role-independent route order |
-| State | `~/.agent-run/state.db` | SQLite, versioned schema + migrations |
-
-Engine adapters included: **codex** (app-server JSON-RPC),
-**claude** (Claude Code CLI), and **glm** (Claude Code CLI pointed at Z.ai's
-Anthropic-compatible endpoint). Qwen support is removed; legacy Qwen runtime
-declarations fail with migration guidance.
-
-## Documentation
-
-- `agent-run doc` — packaged orchestration and operating rules
-- [docs/architecture.md](docs/architecture.md) — how the pieces fit
-- [docs/api.md](docs/api.md) — socket API integration guide
-- [docs/delegation-authorization.md](docs/delegation-authorization.md) — owner-adopted delegation and context-transfer authorization
-- [docs/releasing.md](docs/releasing.md) — version, CI, and GitHub Release procedure
-- [CHANGELOG.md](CHANGELOG.md) — user-visible changes by version
-- [CONTRIBUTING.md](CONTRIBUTING.md) — development and pull-request checks
-- [SECURITY.md](SECURITY.md) — supported versions and private reporting
-- [AGENTS.md](AGENTS.md) — rules for working on this codebase
-
-## License
-
-[MIT](LICENSE)
+Development and release procedures are in [CONTRIBUTING.md](CONTRIBUTING.md)
+and [docs/releasing.md](docs/releasing.md).

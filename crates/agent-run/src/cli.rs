@@ -137,17 +137,14 @@ impl CliDependencies {
         }
     }
 }
-/// The Python-compatible operator command line.
+/// The operator command line shared with the resident broker transports.
 ///
 /// This parser is intentionally the single source of command names and flag
 /// spelling for the binary. Service calls keep their request schemas in the
 /// shared domain tool registry; this layer only adapts shell values to those
 /// schemas and never launches a one-shot start locally.
 #[derive(Parser, Debug)]
-#[command(
-    name = "agent-run",
-    about = "Durable local coding-agent supervisor (Rust migration)"
-)]
+#[command(name = "agent-run", about = "Durable local coding-agent supervisor")]
 pub struct Cli {
     #[arg(long, global = true, env = "AGENT_RUN_HOME")]
     pub home: Option<PathBuf>,

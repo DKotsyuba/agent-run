@@ -150,7 +150,7 @@ fn ordinary_model_verbosity_is_accepted() {
 /// Mirrors `tests/test_native_settings.py::NativeSettingsParsing::test_documented_full_config_example_loads`.
 #[test]
 fn documented_full_config_example_loads() {
-    let guide = include_str!("../../../src/agent_run/operator_guide/config.md");
+    let guide = include_str!("../../../assets/operator_guide/config.md");
     let block = guide
         .split_once("```toml\n")
         .and_then(|(_, rest)| rest.split_once("```").map(|(text, _)| text))

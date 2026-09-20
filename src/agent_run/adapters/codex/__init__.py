@@ -1,1 +1,0 @@
-"""Codex runtime adapter package."""

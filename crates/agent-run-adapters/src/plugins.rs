@@ -6,8 +6,10 @@ use agent_run_platform::fs;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
+/// Default hook manifest used when a plugin does not declare one.
+const DEFAULT_HOOKS_MANIFEST: &str = "hooks/hooks.json";
 /// Materialized plugin roots and trust evidence for one runtime home.
 pub struct Installed {
     /// Runtime-visible plugin roots in declaration order.
@@ -150,7 +152,38 @@ fn digest(event: &str, matcher: Option<&str>, raw: &Value) -> Result<String> {
         fs::sha256(&serde_json::to_vec(&identity)?)
     ))
 }
-fn manifest(path: &Path) -> Result<(String, String)> {
+/// Validates a plugin-declared hook manifest as a nonempty owned relative path.
+///
+/// Missing declarations retain the historical `hooks/hooks.json` default.
+/// Absolute paths, traversal, and non-string declarations fail before any
+/// plugin hook file is read.
+fn hook_manifest_path(value: Option<&Value>) -> Result<PathBuf> {
+    let raw = match value {
+        None => DEFAULT_HOOKS_MANIFEST,
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| invalid("plugin hooks path must be a string"))?,
+    };
+    if raw.trim().is_empty() {
+        return Err(invalid("plugin hooks path must be nonblank"));
+    }
+    let normalized = raw.strip_prefix("./").unwrap_or(raw);
+    let path = PathBuf::from(normalized);
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid(
+            "plugin hooks path must be relative without traversal",
+        ));
+    }
+    Ok(path)
+}
+
+/// Reads one usable plugin manifest and returns its safe identity and hook path.
+fn manifest(path: &Path) -> Result<(String, String, PathBuf)> {
     let dir = fs::Dir::open(path)?;
     for file in [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"] {
         if let Some(data) = dir.optional(Path::new(file), 64 * 1024)? {
@@ -165,7 +198,11 @@ fn manifest(path: &Path) -> Result<(String, String)> {
                             .all(|c| c.is_ascii_alphanumeric() || b"_.+-".contains(&c))
                 };
                 if safe(name) && safe(version) {
-                    return Ok((name.into(), version.into()));
+                    return Ok((
+                        name.into(),
+                        version.into(),
+                        hook_manifest_path(v.get("hooks"))?,
+                    ));
                 }
             }
         }
@@ -187,7 +224,7 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
     };
     let mut listed = Vec::new();
     for source in &runtime.plugins {
-        let (name, version) = manifest(source)?;
+        let (name, version, hooks_relative) = manifest(source)?;
         if installed.roots.contains_key(&name) {
             return Err(invalid("duplicate plugin name"));
         }
@@ -214,9 +251,7 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
             listed.push(json!({"name":name,"source":{"source":"local","path":format!("./{relative}")},"policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"}}));
         }
         if kind == Adapter::Codex {
-            if let Some(data) =
-                fs::Dir::open(source)?.optional(Path::new("hooks/hooks.json"), 1024 * 1024)?
-            {
+            if let Some(data) = fs::Dir::open(source)?.optional(&hooks_relative, 1024 * 1024)? {
                 let doc: Value = serde_json::from_slice(&data)?;
                 let events = doc
                     .get("hooks")
@@ -241,7 +276,10 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
                             .ok_or_else(|| invalid("plugin handlers must be an array"))?;
                         for (hi, handler) in handlers.iter().enumerate() {
                             installed.trust.insert(
-                                format!("{name}@personal:hooks/hooks.json:{label}:{gi}:{hi}"),
+                                format!(
+                                    "{name}@personal:{}:{label}:{gi}:{hi}",
+                                    hooks_relative.to_string_lossy()
+                                ),
                                 digest(label, matcher, handler)?,
                             );
                         }

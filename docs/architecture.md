@@ -101,7 +101,7 @@ are used; a surviving or reused process identity fails closed.
 
 ## Adapters
 
-One package per engine under `src/agent_run/adapters/`. An adapter renders
+One module per engine under `crates/agent-run-adapters/src/`. An adapter renders
 a **fully generated child home** — settings, auth wiring, declared skills,
 declared MCP servers, hooks, plugins — so nothing ambient leaks into the
 child. What the adapters drive:
@@ -152,7 +152,7 @@ or credential. Status exposes only the latest validated safe summary.
 Codex Desktop delivery uses a volatile local relay. With both
 `CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` supplied by the host, the
 MCP CLI replaces itself with the host's signed Node executable. That wrapper
-owns a private Unix socket and a thin Python MCP child; the child receives
+owns a private Unix socket and a thin Rust MCP child; the child receives
 neither host capability, preventing recursive wrappers. The wrapper calls only
 `send_message_to_thread` and renders the same structured completion notice from
 validated lifecycle fields, immutable runtime/model/effort selectors, and an
@@ -168,7 +168,7 @@ or message text enters delivery evidence.
 Agent completion notices use the `agent-run/completion` header and a short list:
 ID, terminal status, optional Failure/Advice lines, `runtime/model:effort`, and
 notification identity. Failure/Advice appear only for failed, lost, and timed-out
-agents. Python and the Node relay render one packaged template. Handling instructions live in
+agents. Rust and the Node relay render one packaged template. Handling instructions live in
 the same contract, exposed by the MCP `start` description and `agent-run doc
 completion`; they are not repeated in each notice. The contract explains
 asynchronous launch, bound delivery, result retrieval, and why a completion

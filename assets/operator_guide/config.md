@@ -21,7 +21,7 @@ approval_mode = "auto"
 
 [runtimes.codex]
 enabled = true
-adapter = "agent_run.adapters.codex.adapter:ADAPTER"
+adapter = "codex"
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
 workspace_root = "/Users/you/projects"
@@ -39,9 +39,8 @@ Revisioned Markdown profiles own write/network grants, external read-root policy
 skills, MCP selection, and required constraints. ``gpt-6-astra`` accepts only the
 public read-only profiles ``review`` and ``architect``; provider-facing agent-type
 names such as ``role-review`` are not profile identifiers. Legacy profiles and
-runtime
-`skills`/`mcp` lists remain readable until migration, but canonical and legacy
-asset declarations cannot be mixed.
+runtime `skills`/`mcp` lists remain readable for compatibility, but canonical
+and legacy asset declarations cannot be mixed.
 
 `workspace_root` affects write-capable Codex profiles only. Their workdir must
 be inside the configured tree; read-only profiles do not inherit write access.
@@ -57,7 +56,7 @@ are readable but do not provision tools or redirect unlabelled starts.
 
 `runtimes.<name>.native_settings` retunes a runtime's own generated preference
 file (Codex `config.toml` or Claude/GLM `settings.json`)
-from this common config, with no Python edits and no package reinstall. The
+from this common config, without rebuilding the broker. The
 table attaches to a runtime you have already declared with its mandatory
 fields; for example, under an existing claude block:
 

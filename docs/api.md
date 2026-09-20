@@ -3,7 +3,7 @@
 Programmatic access to agent-run for external processes on the same machine.
 This is the third transport next to the CLI and the stdio MCP server; all
 three expose the same tool surface through one shared dispatcher
-(`src/agent_run/dispatch.py`), so a tool that exists in MCP exists here
+(`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
 Audience: an integrating agent or developer who has never seen this repo.
@@ -162,42 +162,17 @@ connection and keep issuing calls on another.
 
 ## Typical integration loop
 
-```python
-import json, socket
+Open a Unix stream socket in the client language, write one compact JSON-RPC
+object plus `\n`, and read one reply line. A shell smoke can use BSD netcat:
 
-class AgentRun:
-    def __init__(self, path="~/.agent-run/api.sock"):
-        import os
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(os.path.expanduser(path))
-        self.file = self.sock.makefile("rwb")
-        self.next_id = 0
-
-    def call(self, method, **params):
-        self.next_id += 1
-        request = {"jsonrpc": "2.0", "id": self.next_id, "method": method}
-        if params:
-            request["params"] = params
-        self.file.write((json.dumps(request) + "\n").encode())
-        self.file.flush()
-        reply = json.loads(self.file.readline())
-        if "error" in reply:
-            raise RuntimeError(f"{method}: {reply['error']}")
-        return reply["result"]
-
-api = AgentRun()
-started = api.call(
-    "start",
-    runtime="glm", model="glm-5.3", profile="review",
-    task="Summarize the diff in one line.",
-    workdir="/path/to/repo", timeout_seconds=600,
-)
-final = api.call("wait", agent_id=started["agent_id"], timeout_seconds=600)
-if final.get("timed_out"):
-    ...  # still running; call list_agents or wait again
-else:
-    print(final["content"])  # the agent's answer text
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping"}' \
+  | nc -U ~/.agent-run/api.sock
 ```
+
+For asynchronous work, call `start`, retain the returned `agent_id`, then call
+`wait` on a separate connection. If `wait` returns `"timed_out": true`, the
+agent is still running and the same id can be waited on again.
 
 Notes for the loop:
 
@@ -243,9 +218,7 @@ id); `-32603` as a bug to report.
 - The tool surface is pinned to the MCP surface by a parity test; new
   tools appear in both transports simultaneously. Re-read `tools` after
   an agent-run upgrade instead of caching schemas across versions.
-- Restart `api serve` after upgrading the installed package. Operators using
-  the optional sealed-release layout restart it after switching
-  `~/.agent-run/standalone/current`; ordinary pip/pipx installs use the
-  `agent-run` executable on `PATH`.
+- Restart `api serve` after switching the verified sealed release at
+  `~/.agent-run/standalone/current`.
 - Schema version 9 adds immutable per-attempt delivery evidence. Older resident
   processes refuse the migrated database and must be restarted after upgrade.

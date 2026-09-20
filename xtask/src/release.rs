@@ -138,7 +138,7 @@ mod tests {
         let temporary = tempdir().expect("temporary directory");
         let binary = temporary.path().join("agent-run");
         fs::write(&binary, "native binary").expect("fixture binary");
-        let release = build(temporary.path(), "0.11.15", &binary).expect("sealed release");
+        let release = build(temporary.path(), "0.12.0", &binary).expect("sealed release");
         verify(&release).expect("valid manifest");
         fs::write(release.join("bin/agent-run"), "changed").expect("tamper fixture");
         assert!(verify(&release).is_err());

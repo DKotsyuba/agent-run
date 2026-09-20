@@ -1,64 +1,33 @@
 # Contributing
 
-agent-run is a Python 3.14+ standard-library runtime. Runtime dependencies are
-not accepted; `pytest` and packaging tools are development-only.
+agent-run is a Rust workspace built with the toolchain pinned in
+`rust-toolchain.toml`. Keep changes focused, preserve typed errors and durable
+evidence, and add the smallest regression test that proves changed behavior.
+
+Run the primary gate:
 
 ```bash
-python3.14 -m venv .venv-py314
-.venv-py314/bin/python -m pip install -e ".[test,release]"
-PYTHONPATH=src .venv-py314/bin/python -m pytest -q --rootdir . tests
+cargo xtask check
 ```
 
-When reusing an environment across worktrees, verify where the package imports
-from before trusting test results. An editable installation can still point to
-the checkout where the environment was created; changing cwd or pytest's
-`--rootdir` does not change that installation.
+That command formats, lints with all targets and features, and runs the full
+workspace test suite offline. Before a release-affecting change also run:
 
 ```bash
-PYTHONPATH=src .venv-py314/bin/python -c 'from pathlib import Path; import agent_run; origin = Path(agent_run.__file__).resolve(); print(origin); assert origin.is_relative_to(Path.cwd() / "src")'
+cargo xtask qualify --release
+cargo xtask evidence verify
+cargo xtask archive --verify
+cargo build --locked --release --package agent-run --bin agent-run
+node --test scripts/check-desktop-transport.cjs
 ```
 
-Keep the same explicit source path for the test command. If the import assertion
-fails, repair the environment/source selection before interpreting failures or
-accepting a green run.
+Transport changes need a live API/MCP smoke. Adapter or supervisor changes need
+recorded fixture or real-engine evidence. Use temporary homes and endpoints;
+never point tests at a production database, socket, inbox, or credential store.
 
-If a timing-sensitive test in `tests/test_launch.py` fails under load, rerun
-that module in isolation before treating it as a product failure. Never weaken
-its assertions to make CI pass.
+The supported release target is macOS Apple silicon. Linux CI is
+validation-only until its qualification evidence is accepted.
 
-Some transport tests bind temporary local Unix sockets. If a sandbox denies
-`bind`, check the fixture permission with the same interpreter and sandbox:
-
-```bash
-.venv-py314/bin/python - <<'PY'
-import socket
-import tempfile
-from pathlib import Path
-
-with tempfile.TemporaryDirectory(prefix="ar-check-") as directory:
-    with socket.socket(socket.AF_UNIX) as server:
-        server.bind(str(Path(directory) / "test.sock"))
-print("AF_UNIX fixture bind: OK")
-PY
-```
-
-A `PermissionError` here identifies an environment restriction, not a failed
-delivery assertion. Use the host's normal approval path for the exact local
-fixture command if needed, then rerun the affected tests under that permission:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:tests .venv-py314/bin/python -m unittest \
-  test_bind_hook test_state_outbox test_codex_queue test_claude_uds
-```
-
-These fixtures must use temporary endpoints, never real agent inboxes. A local
-socket permission does not authorize external delivery or a model launch.
-Report the restricted and permitted results separately; do not convert socket
-errors to skips, suppress assertions, or classify every socket error as a
-sandbox denial. Run the full suite for code changes once its required fixture
-permissions are available.
-
-Keep changes focused, add tests for changed behaviour, preserve typed errors,
-and follow the invariants in [AGENTS.md](AGENTS.md). A pull request should state
-the problem, the verification command and result, and any platform-specific
-validation that was not run.
+A pull request must state the problem, exact verification commands and results,
+and any platform or live-resource check that was not run. Follow the invariants
+in [AGENTS.md](AGENTS.md).

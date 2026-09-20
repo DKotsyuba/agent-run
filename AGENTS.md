@@ -1,109 +1,66 @@
 # Working on agent-run
 
-Instructions for coding agents (and humans in a hurry). The product is a
-local supervisor for running other coding agents — so the bar for
-reliability of *this* code is set by everything that will run on top of it.
-
-## Delegation authorization
-
-The canonical owner-adopted declaration is
-[docs/delegation-authorization.md](docs/delegation-authorization.md). Its marked
-block is installed in the owner's global agent instructions for cross-project
-use. Keep that projection synchronized with the canonical text; repository
-presence alone does not grant authority over a different owner's data.
+agent-run is a Rust supervisor for other coding agents. Reliability, durable
+evidence, process ownership, and secret safety are product requirements.
 
 ## Ground rules
 
-- **Python 3.14+, small deliberate dependency set.** Runtime dependencies are
-  declared in `pyproject.toml` and resolved in committed `uv.lock`; release
-  artifacts install a hash-verified closure into the sealed venv. Add one only
-  when it replaces concrete fragile code and passes supported-platform checks.
-  Prefer existing code and the standard library when they satisfy the contract.
-  `pytest` and `Hypothesis` provide example-based and stateful regression checks.
-- **No monolithic modules.** Keep files focused; a module drifting past
-  a few hundred lines is a design smell here, not a habit to copy.
-- **Engines are driven only through adapters + the supervisor.** Never
-  spawn `codex`/`claude` binaries directly from feature code; the
-  adapter renders the child's home/config, the supervisor owns the
-  process tree, timeouts, and outcome classification.
-- **Every change lands with tests.** The suite is `unittest`-style,
-  collected by pytest:
+- Use the pinned Rust toolchain and the committed `Cargo.lock`. Prefer the
+  standard library and existing workspace dependencies.
+- Keep modules focused. Add tests for every behavior change.
+- Engine processes are created only through adapters and the supervisor.
+- Preserve unrelated work and never weaken lifecycle assertions to hide flakes.
+- The supported release target is macOS Apple silicon. Linux CI is
+  validation-only until qualified.
 
-  ```bash
-  .venv-py314/bin/python -m pytest -q --rootdir . tests
-  ```
+## Invariants
 
-  It must end `N passed, 1 skipped, 0 failed`. A handful of
-  timing-sensitive tests in `tests/test_launch.py` can flake under heavy
-  parallel machine load — rerun the module in isolation before suspecting
-  your change, and never weaken their assertions to make them pass.
-
-## Invariants that tests enforce (do not fight them)
-
-- **One tool table, many transports.** `src/agent_run/dispatch.py` owns
-  `TOOLS`/`call_tool`; the stdio MCP server (`mcp.py`) and the Unix-socket
-  JSON-RPC server (`api_socket.py`) both import it. Parity tests fail if a
-  transport grows its own list. Add a tool once, in the dispatch table.
-- **SQLite connections are thread-affine.** A `StateStore` connection may
-  only be used on the thread that created it (`StateStore.path()` exists
-  so another thread can open its own). The socket API routes all dispatch
-  through one owning thread — copy that pattern, don't share stores across
-  threads.
-- **Detached launch is `posix_spawn`-first.** The resident API daemon is
-  multithreaded, so never reintroduce Python work between `fork` and `exec`.
-  The legacy fork path is allowed only when session-creating `posix_spawn` is
-  explicitly unavailable; PID/PGID, readiness, cleanup, and reap evidence must
-  stay exact.
-- **One-shot CLI start is broker-owned.** `agent-run start` must submit through
-  the resident Unix-socket daemon. Never create an asynchronous start worker
-  owned by the short-lived CLI process, and never silently fall back locally
-  when the broker is unavailable.
-- **Schema changes go through migrations.** `state/schema.sql` is the
-  current shape; every change also needs a numbered file in
-  `state/migrations/` and a schema-version bump. Old MCP servers
-  version-check and refuse politely — that is intended behavior.
-- **Errors are typed.** Raise `ValidationError` for bad input and
-  `AgentRunError` subclasses for domain failures; transports map them to
-  protocol errors uniformly. Don't return error-shaped dicts.
-- **Answers are evidence, not trust.** Agent outcomes carry
-  sha256/size/path and completion sentinels; anything that reports
-  "succeeded" must be derivable from recorded state, not from an
-  adapter's optimism.
-- **Delivery diagnostics are bounded and secret-safe.** Persist one immutable
-  evidence row per owned Codex queue attempt in the same transaction as its
-  delivery verdict. Never store the message, session id, argv/environment
-  values, or credentials; tails stay redacted and at most 4096 UTF-8 bytes.
+- The domain dispatcher owns one public tool table shared by CLI, MCP, and the
+  Unix-socket JSON-RPC server.
+- `agent-run start` submits through the resident broker; it never silently runs
+  asynchronous work under the one-shot CLI process.
+- SQLite schema changes require a numbered migration, current-schema update,
+  version bump, and historical migration tests.
+- Bad inputs and domain failures remain typed across all transports.
+- A successful outcome must be derivable from durable answer, completion,
+  process-identity, and cleanup evidence.
+- Process groups are signalled only while the recorded leader identity is
+  verified alive. Do not trade PID-reuse safety for unconditional cleanup.
+- Delivery diagnostics are immutable, bounded to 4096 UTF-8 bytes, and never
+  persist messages, session ids, arguments, environment values, or credentials.
+- Configuration reloads compare the file SHA-256 every 60 seconds and at request
+  boundaries. Invalid revisions never replace the last valid configuration.
+- Release directories remain immutable and must pass manifest plus `COMPLETE`
+  verification before pointer switching.
 
 ## Layout
 
-| Path | What lives there |
+| Path | Responsibility |
 |---|---|
-| `src/agent_run/cli.py` | argument parsing + command wiring (entry point `agent-run`) |
-| `src/agent_run/dispatch.py` | transport-neutral tool table and dispatcher |
-| `src/agent_run/broker_client.py` | client for the resident Unix-socket daemon |
-| `src/agent_run/mcp.py` | stdio MCP transport (thin proxy over the socket daemon) |
-| `src/agent_run/api_socket.py` | Unix-socket JSON-RPC transport (`docs/api.md`) |
-| `src/agent_run/service.py` | AgentService — the domain facade every transport calls |
-| `src/agent_run/adapters/` | one package per engine (codex, claude, glm) |
-| `src/agent_run/supervisor*.py` | detached child supervision: timeouts, stall watchdog, outcomes |
-| `src/agent_run/state/` | SQLite store, schema, migrations, reconciliation |
-| `src/agent_run/wait.py` | blocking watchdog logic shared by CLI and socket API |
-| `src/agent_run/capacity/` | limits collection (per-runtime sources) and risk advisory |
-| `src/agent_run/doctor.py` | self-diagnosis; keep it free of false alarms |
-| `src/agent_run/operator_guide/` | the pages `agent-run doc` serves |
-| `docs/` | architecture and integration docs for humans |
-| `skills/` | skills shipped to child agents |
+| `crates/agent-run` | CLI, API daemon, MCP transport, launchd helpers |
+| `crates/agent-run-domain` | public contracts, tools, errors, state machine |
+| `crates/agent-run-config` | configuration, profiles, snapshots, role plans |
+| `crates/agent-run-store` | SQLite store, migrations, reconciliation |
+| `crates/agent-run-adapters` | Codex, Claude, and GLM adapters |
+| `crates/agent-run-core` | service, supervisor, capacity, delivery, doctor |
+| `crates/agent-run-platform` | process, filesystem, and artifact primitives |
+| `xtask` | checks, qualification, evidence, archives, releases, deployment |
+| `assets/operator_guide` | embedded `agent-run doc` pages |
+| `docs` | public architecture and operations documentation |
+| `migration` | historical migration decisions and evidence |
 
-## Verifying your work
+## Verification
 
-1. Full suite (command above) — green, honestly gated (check the exit
-   code, not the tail line).
-2. If you touched a transport: the parity tests plus a live smoke of that
-   transport (`agent-run mcp` speaks stdio JSON-RPC; `agent-run api serve`
-   binds `<home>/api.sock`).
-3. If you touched adapters/supervisor: state your evidence — which live
-   run or recorded fixture proves the behavior. Fixtures for engine output
-   live next to the adapter tests; prefer captured real transcripts over
-   invented ones.
-4. `agent-run doctor` should stay clean; a new warning class needs a very
-   good reason to exist.
+```bash
+cargo xtask check
+cargo xtask qualify --release
+cargo xtask evidence verify
+cargo xtask archive --verify
+cargo build --locked --release --package agent-run --bin agent-run
+node --test scripts/check-desktop-transport.cjs
+```
+
+If a transport changed, add a live API/MCP smoke. If an adapter or supervisor
+changed, identify the fixture or real-engine run proving it. `agent-run doctor`
+must remain clean. Release and deployment procedures are in
+`docs/releasing.md`.

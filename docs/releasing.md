@@ -1,149 +1,92 @@
 # Releasing agent-run
 
-The canonical package version is `[project].version` in `pyproject.toml`.
-Releases use annotated Semantic Versioning tags (`vX.Y.Z`); the release workflow
-refuses a tag that does not match the package version.
+The canonical version is `workspace.package.version` in `Cargo.toml`. Releases
+use annotated `vX.Y.Z` tags. The tag workflow refuses a tag that does not match
+the workspace version.
 
-## Runbook
+Version 0.12.x publishes one supported native target: macOS Apple silicon
+(`aarch64-apple-darwin`). Linux CI is validation-only and produces no supported
+release artifact.
 
-Start from a clean maintainer checkout at the current `origin/main`. The command
-validates that precondition before changing anything.
+## Prepare
 
-Before publishing streaming-adapter changes, run a candidate smoke through the
-adapter and supervisor in an isolated home with a supported real engine. Verify
-both the answer proof and the exact transcript of whitespace-bearing output.
-Keep regressions for fragmented tokens, idle polls, cancellation requests and
-canonical completion; contiguous fake output alone does not establish wire
-compatibility. Never modify an installed sealed release to perform this check.
-
-| Operation | Command |
-|---|---|
-| Publish and update the local runtime | `python3 scripts/release.py X.Y.Z` |
-| Resume an interrupted release | Run the same command with the same version |
-| Publish without a local update | `python3 scripts/release.py X.Y.Z --publish-only` |
-
-For example:
+From a clean checkout of the accepted commit:
 
 ```bash
-python3 scripts/release.py 0.6.3
+cargo xtask check
+cargo xtask qualify --release
+cargo xtask evidence verify
+cargo xtask archive --verify
+cargo build --locked --release --package agent-run --bin agent-run
+node --test scripts/check-desktop-transport.cjs
 ```
 
-Wait for the command to finish. Success is reported as:
+For adapter or supervisor changes, also run a candidate through a supported
+real engine in an isolated home. Verify the answer proof, transcript, process
+cleanup, and continuation. Never modify an installed sealed release for this
+smoke.
 
-```text
-Done: v0.6.3 published and local runtime updated. Reconnect existing MCP clients.
+## Build and verify locally
+
+```bash
+release_root="$(mktemp -d)"
+cargo xtask release build-native --output "$release_root" --version 0.12.0
+cargo xtask release verify --release "$release_root/releases/0.12.0"
+cargo xtask archive --revision HEAD \
+  --output "$release_root/agent-run-0.12.0-source.tar" --verify
 ```
 
-If the command fails, preserve its output, `<home>/standalone/deploy.json`, and
-the reported backup directory. Correct the reported cause and run the same
-command again. Do not move an existing tag, delete a backup or deployment
-journal, or point an older runtime at a newer database schema. A failed CI or
-Release workflow remains failed evidence; inspect it before retrying or issuing
-a corrected patch version.
+The sealed release contains the native binary, metadata, `SHA256SUMS`, and the
+`COMPLETE` marker. It contains no interpreter, virtual environment, or package
+installation.
 
-## What the command does
+## Publish
 
-The command waits until the GitHub Release is public, verifies the downloaded
-wheel and sdist against `SHA256SUMS` and GitHub attestations (repository,
-workflow, tag, commit, and subject hash), then updates the local sealed runtime.
-It requires authenticated `gh`, `git`, Python 3.14, and the existing macOS
-standalone installation and API/capacity/delivery launchd plists.
-
-For a new version, start from a clean committed checkout equal to `origin/main`.
-The script prepares only `pyproject.toml` and `CHANGELOG.md` on the deterministic
-`release/vX.Y.Z` branch in a dedicated worktree. It reuses an existing changelog
-entry, or generates concise notes from public commit subjects. It opens/reuses
-the pull request, waits for all CI jobs and nonempty required checks at the
-exact head, merges without bypassing branch protection, waits for main CI at the
-merge commit, and pushes an annotated tag. The existing Release workflow alone
-publishes artifacts; the script never creates or overwrites a GitHub Release.
-
-Run the same command after interruption. An already public version validates its
-annotated tag and package version and goes directly to asset verification and
-installation, even from a dirty checkout. Existing PRs, commits and tags are
-reused; mismatched immutable state, failed/cancelled checks, missing evidence at
-the deadline, and corrupt sealed releases fail explicitly. Correct the reported
-cause (for example, rerun a failed workflow) and repeat the command.
-
-Options: `--publish-only` skips local deployment; `--home` defaults to
-`~/.agent-run`; `--python` defaults to `python3.14`; `--launchd-prefix` defaults
-to `com.<login>.agent-run`; `--timeout` and `--poll` are positive seconds,
-defaulting to 3600 and 10. Publication itself can run on other operating systems.
-Timeouts stop waiting; they do not cancel a remote CI run or active agent.
-
-Local deployment verifies the wheel and `requirements.lock`, installs the
-hash-pinned dependency closure, installs the wheel without re-resolving it, and
-runs `pip check` before it seals the release. A release missing the lock is
-refused. It then verifies or reuses the sealed release and runs isolated
-init/doctor/API/MCP checks. It waits for every active
-agent and any birth-verified writer from an archived workflow runtime, reserves
-the SQLite writer while stopping API admission and
-loaded periodic jobs, then rechecks quiescence. Before migration it backs up
-SQLite with its backup API, saves configuration and the previous pointer under
-`<home>/standalone/backups/`, and records a private deployment journal. Migration
-uses the new installed `StateStore.initialize`; the current symlink changes
-atomically only after the target passes the COMPLETE/manifest gate. It restores
-the previously loaded services and checks version, schema, database integrity,
-API liveness/tool discovery and doctor. It keeps all old releases and backups.
-After service bootstrap, it waits for API readiness before inspecting SQLite.
-Transient SQLite open/lock failures are retried within the command deadline;
-missing files, corruption and version/schema mismatches still fail immediately.
-
-On failure, recovery chooses a binary compatible with the database's actual
-schema. Once the database advances, recovery completes migration and starts the
-new binary; it never silently points an old binary at a newer schema. The
-journal at `<home>/standalone/deploy.json` remains for retry. If recovery itself
-needs to wait for SQLite, it has an independent 120-second allowance. An already
-migrated target is reused without running migration again. If recovery itself
-fails, the error identifies the journal and backup and explicitly warns that
-services may remain stopped. Preserve those files and resume the same version.
-
-Release builds generate `dist/requirements.lock` from the committed graph with
-`uv export --frozen --no-dev --no-editable --no-emit-project --format requirements-txt --output-file dist/requirements.lock`.
-The lock is checksummed, attested, and uploaded with the wheel and source archive.
-Incomplete candidate directories are preserved under an `.incomplete-<time>`
-suffix before rebuilding; a corrupt or incomplete current release is refused.
-Reconnect existing MCP clients after the update; application hosts are not killed.
-
-## Manual publication
-
-1. Update `pyproject.toml` and `CHANGELOG.md` in the same pull request.
-2. Run the full test suite and build checks locally.
-3. Merge only after the `CI` workflow passes.
-4. Create and push an annotated tag from the accepted `main` commit:
+1. Update `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` together.
+2. Merge only after the `CI` workflow passes.
+3. Create and push an annotated tag from that accepted commit:
 
    ```bash
-   git tag -a v0.1.0 -m "agent-run 0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.12.0 -m "agent-run 0.12.0"
+   git push origin v0.12.0
    ```
 
-The tag-triggered `Release` workflow repeats the tests, builds wheel and sdist,
-runs package/install smokes, writes `SHA256SUMS`, creates GitHub provenance
-attestations, creates a draft GitHub Release, and publishes it only after every
-gate succeeds. A failed run leaves no public partial release.
+The `Release` workflow repeats the Rust gates, builds and verifies the sealed
+native release and source archive, generates `SHA256SUMS`, attests the listed
+artifacts, and publishes a GitHub Release only after every gate succeeds. A
+failed run leaves no public partial release. Tags are immutable; corrections
+ship as a new patch version.
 
-Verify downloaded artifacts with:
+## Install or update a sealed runtime
 
-```bash
-# Linux
-sha256sum -c SHA256SUMS
-# macOS
-shasum -a 256 -c SHA256SUMS
-gh attestation verify agent_run-0.1.0-py3-none-any.whl \
-  --repo DKotsyuba/agent-run
-```
+Use `cargo xtask release install`, `update`, `roll-forward`, or `rollback` with
+the explicit release, prefix, and home described by `cargo xtask release` usage.
+The deployer verifies the manifest before switching `current`, checks schema
+compatibility, reserves the SQLite writer, backs up state, and records a private
+deployment journal.
+
+launchd control and post-switch API/MCP validation remain explicit operator
+steps:
+
+1. Stop admission and verify no active agents or birth-verified writers remain.
+2. Run the xtask install/update command against the verified release.
+3. Restart the API, capacity, and delivery launchd jobs from the new binary.
+4. Verify release metadata, database integrity, `agent-run doctor`, API
+   `ping`/`tools`, and MCP `initialize`/`tools/list`.
+5. Run one provider-free broker fixture before admitting real work.
+
+On failure, preserve `<home>/standalone/deploy.json`, the reported backup, and
+the command output. Recover with the journal-aware xtask command; never point an
+older binary at a database already migrated by a newer schema.
 
 ## Distribution boundary
 
-GitHub Releases is the only public distribution channel. Each release carries
-the Python wheel, source archive, hash-pinned `requirements.lock`, checksums,
-and GitHub provenance attestation. The version PR regenerates `uv.lock` and
-checks it before staging the package version, changelog, and lock together.
-The project does not publish to PyPI, GitHub Packages, Docker, or GHCR.
+GitHub Releases is the only public distribution channel. Each release carries:
 
-## Repository settings
+- `agent-run-X.Y.Z-aarch64-apple-darwin.tar.gz`;
+- `agent-run-X.Y.Z-source.tar`;
+- `SHA256SUMS`;
+- GitHub provenance for the checksummed subjects.
 
-Require the `CI` checks on `main`, require pull requests, enable private
-vulnerability reporting, retain read-only default workflow-token permissions,
-and require immutable action references. These settings live on GitHub and are
-reviewed separately from repository code.
+The project does not publish package-manager artifacts, containers, or runtime
+dependency bundles.

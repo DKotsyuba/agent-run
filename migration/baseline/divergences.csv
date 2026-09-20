@@ -1,4 +1,5 @@
 test_id,adr,reason
+tests/test_adapter_versions.py::test_grandchild_holding_stdout_cannot_outlive_the_deadline,A10,leader-verified-group-signal
 tests/test_release_script.py::PublicationTests::test_missing_or_wrong_head_workflow_never_passes,A19,github-publication
 tests/test_release_script.py::PublicationTests::test_failed_and_empty_job_workflows_fail_closed,A19,github-publication
 tests/test_release_script.py::PublicationTests::test_required_pending_and_missing_checks_wait,A19,github-publication

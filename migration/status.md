@@ -44,7 +44,7 @@ failed / 1 skipped: the only failure was the operator-guide test still expecting
 the removed `opencode/` Qwen alias. The guide and assertion now describe only
 Codex/Claude/GLM, and the exact regression passes. Affected Python selectors
 pass 93 tests / 113 subtests; Rust clippy and affected Rust selectors pass. The
-coverage map is reconciled at 1078 ported / 68 declared divergences / 1 planned.
+coverage map is reconciled at 1078 ported / 69 declared divergences / 0 planned.
 The first full Rust run likewise had only three stale operator-guide assertions
 expecting `opencode/`; both affected Rust targets now pass (22 + 9 tests).
 The clean full Python rerun passes 1118 tests / 408 subtests with one skipped
@@ -88,17 +88,15 @@ Measured by `migration/tools/coverage_report.py`; the per-behavior ledger is
 | Status | Behaviors |
 | --- | ---: |
 | ported | 1078 |
-| declared divergence | 68 |
-| remaining | 1 |
+| declared divergence | 69 |
+| remaining | 0 |
 | **total** | **1147** |
 
-The single remaining behavior is
-`tests/test_adapter_versions.py::test_grandchild_holding_stdout_cannot_outlive_the_deadline`.
-It is **composite**, and only half of it is open. The deadline half — the call
-returns promptly even while a descendant holds stdout — is satisfied. The other
-half, that the descendant is dead once cleanup returns, is not: Python kills the
-recorded process group unconditionally, while this port signals only a leader it
-has verified alive (ADR A10, decision 5).
+The last previously planned behavior,
+`tests/test_adapter_versions.py::test_grandchild_holding_stdout_cannot_outlive_the_deadline`,
+is an explicit A10 divergence. Rust returns promptly at the deadline but never
+unconditionally signals a process group after its leader identity can no longer
+be verified.
 
 That divergence was measured, not assumed; the measurement and the false-pass
 trap that hides it are recorded in `migration/adr/A10-spawn-backend.md` under

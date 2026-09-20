@@ -158,7 +158,7 @@ the literal `6` without copying the ratio is what produced the false pass. Any
 future test of this behavior must keep the descendant's lifetime far outside the
 sum of the deadline and the poll window.
 
-### The choice this leaves open
+### Rust-primary resolution
 
 The two implementations make different promises, and neither is strictly safer:
 
@@ -168,8 +168,7 @@ The two implementations make different promises, and neither is strictly safer:
   leader is gone, the group id may already belong to something else, so it
   refuses to signal and reports the descendant set as unknown rather than clean.
 
-Adopting Python's guarantee means accepting that a reused group id can be
-signalled. Keeping decision 5 means accepting that an escaped descendant can
-outlive a probe. **This is an owner decision, not an implementation gap**, and it
-is the reason the behavior above is carried as unported rather than silently
-reclassified.
+The Rust-primary release keeps decision 5: avoiding a signal to a possibly
+reused process group takes precedence over unconditional descendant cleanup.
+The Python baseline test is therefore recorded as the explicit A10 divergence
+`leader-verified-group-signal`, not as unfinished migration work.

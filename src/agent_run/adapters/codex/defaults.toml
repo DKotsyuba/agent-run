@@ -1,7 +1,0 @@
-# Packaged Codex native defaults merged into every generated config.toml.
-# Declared runtimes.<name>.native_settings override these keys; reserved
-# control roots (model, approval, sandbox, hooks, providers, ...) are
-# rejected before this merge and can never be tuned here.
-model_context_window = 1000000
-model_auto_compact_token_limit = 780000
-model_auto_compact_token_limit_scope = "total"

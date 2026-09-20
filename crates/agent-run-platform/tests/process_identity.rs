@@ -2,7 +2,7 @@
 //! including a differential check against psutil itself.
 use agent_run_platform::process::{self, ProcessState};
 use std::{
-    process::{Command, Stdio},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -110,66 +110,16 @@ fn compare_with_psutil(pid: i32, expected: f64) {
     assert_eq!(identity.birth.to_bits(), expected.to_bits(), "pid {pid}");
 }
 
-/// Differential evidence against Python psutil, which wrote every stored
-/// `supervisor_birth_time` this port must keep reading.
+/// Compares an externally recorded legacy psutil birth value when supplied.
 ///
-/// `AGENT_RUN_DIFF_PID` plus `AGENT_RUN_DIFF_BIRTH` compare one PID whose
-/// create_time the caller already read with psutil; `AGENT_RUN_PSUTIL_PYTHON`
-/// runs the probe here instead, where the sandbox allows that interpreter.
+/// The optional PID and birth variables are inert recorded inputs; this Rust
+/// suite never launches a Python interpreter.
 #[test]
-fn birth_matches_python_psutil_bit_for_bit() {
+fn birth_matches_recorded_psutil_value_bit_for_bit() {
     if let (Ok(pid), Ok(birth)) = (
         std::env::var("AGENT_RUN_DIFF_PID"),
         std::env::var("AGENT_RUN_DIFF_BIRTH"),
     ) {
         compare_with_psutil(pid.trim().parse().unwrap(), birth.trim().parse().unwrap());
     }
-    let Some(python) = std::env::var_os("AGENT_RUN_PSUTIL_PYTHON") else {
-        eprintln!("skipped: AGENT_RUN_PSUTIL_PYTHON is not set");
-        return;
-    };
-    const PROBE: &str = "import psutil, sys\ntry:\n    print(repr(psutil.Process(int(sys.argv[1])).create_time()))\nexcept psutil.Error as error:\n    print(type(error).__name__)";
-    let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-    let mut pids = vec![child.id() as i32, std::process::id() as i32];
-    // One root-owned process exercises foreign-user readability, when listable.
-    if let Ok(listing) = Command::new("/bin/ps").args(["-axo", "pid=,uid="]).output() {
-        pids.extend(
-            String::from_utf8_lossy(&listing.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    let pid: i32 = fields.next()?.parse().ok()?;
-                    (fields.next()? == "0" && pid > 1).then_some(pid)
-                })
-                .take(1),
-        );
-    }
-    let mut probed = 0;
-    for pid in pids {
-        let probe = match Command::new(&python)
-            .args(["-c", PROBE, &pid.to_string()])
-            .stderr(Stdio::inherit())
-            .output()
-        {
-            Ok(probe) => probe,
-            Err(error) => {
-                eprintln!("skipped: the psutil probe cannot run here: {error}");
-                break;
-            }
-        };
-        let psutil = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
-        match psutil.parse::<f64>() {
-            Ok(expected) => {
-                compare_with_psutil(pid, expected);
-                probed += 1;
-            }
-            Err(_) => eprintln!("pid={pid} psutil={psutil} rust={:?}", process::inspect(pid)),
-        }
-    }
-    child.kill().unwrap();
-    child.wait().unwrap();
-    assert!(
-        probed == 0 || probed >= 2,
-        "psutil must read this process and its child"
-    );
 }

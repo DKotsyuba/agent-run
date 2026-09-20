@@ -4,8 +4,19 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-20
+
+- feat!: make the self-contained Rust broker the sole primary implementation
+- build!: replace interpreter packages with a sealed macOS Apple-silicon binary
+- ci!: run Rust-only checks, release verification, and source-archive gates
+- fix(codex): honor safe plugin-declared relative hook manifest paths
 - feat!: remove the deprecated Qwen runtime; legacy Qwen configuration now
   fails with explicit removal guidance
+
+BREAKING CHANGE: Python packages, interpreter-based installation, and the
+Python implementation are no longer shipped from the primary branch. Install
+the native release artifact and use the built-in `codex`, `claude`, or `glm`
+runtime aliases.
 
 ## [0.11.15] - 2026-09-15
 

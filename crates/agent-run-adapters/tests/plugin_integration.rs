@@ -293,6 +293,73 @@ fn codex_hook_groups_include_config_path_trust_entries() {
         .any(|key| key.contains("demo-plugin@personal:hooks/hooks.json:pre_tool_use:0:0")));
 }
 
+/// Accepts a safe manifest-selected hook file and keys trust to that exact path.
+#[test]
+fn codex_plugin_manifest_selects_relative_hook_file() {
+    let root = tempfile::tempdir().unwrap();
+    let plugin_path = plugin(root.path(), "custom-hooks", &[], false);
+    std::fs::write(
+        plugin_path.join(".claude-plugin/plugin.json"),
+        json!({"name":"custom-hooks","version":"1.0.0","hooks":"config/custom.json"}).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(plugin_path.join("config")).unwrap();
+    std::fs::write(
+        plugin_path.join("config/custom.json"),
+        json!({"hooks":{"PreToolUse":[{"hooks":[{
+            "type":"command","command":"true"
+        }]}]}})
+        .to_string(),
+    )
+    .unwrap();
+    let home = root.path().join("home");
+    let runtime = runtime("codex", &home, vec![plugin_path], vec![], vec![], vec![]);
+    let config = config(&runtime, BTreeMap::new());
+    let (request, profile) = request_profile("codex", root.path(), vec![], vec![]);
+
+    materialize::materialize(&config, &runtime, &request, &profile, &home, root.path()).unwrap();
+
+    let document: toml::Value =
+        toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+    assert!(document["hooks"]["state"]
+        .as_table()
+        .unwrap()
+        .keys()
+        .any(|key| key.contains("custom-hooks@personal:config/custom.json:pre_tool_use:0:0")));
+}
+
+/// Rejects non-string, blank, absolute, and traversing manifest hook paths.
+#[test]
+fn codex_plugin_manifest_rejects_unsafe_hook_paths() {
+    for (index, hooks) in [
+        json!(false),
+        json!(""),
+        json!("/tmp/hooks.json"),
+        json!("../hooks.json"),
+        json!("hooks/../hooks.json"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_path = plugin(root.path(), &format!("unsafe-{index}"), &[], false);
+        std::fs::write(
+            plugin_path.join(".claude-plugin/plugin.json"),
+            json!({"name":format!("unsafe-{index}"),"version":"1.0.0","hooks":hooks}).to_string(),
+        )
+        .unwrap();
+        let home = root.path().join("home");
+        let runtime = runtime("codex", &home, vec![plugin_path], vec![], vec![], vec![]);
+        let config = config(&runtime, BTreeMap::new());
+        let (request, profile) = request_profile("codex", root.path(), vec![], vec![]);
+        assert!(
+            materialize::materialize(&config, &runtime, &request, &profile, &home, root.path())
+                .is_err(),
+            "unsafe hooks value {hooks} was accepted"
+        );
+    }
+}
+
 /// Mirrors `tests/test_plugin_integration.py::CodexGuardHookTests::test_guard_command_resolves_to_the_copy_inside_the_home`.
 #[test]
 fn codex_plugin_hook_command_uses_the_installed_copy() {

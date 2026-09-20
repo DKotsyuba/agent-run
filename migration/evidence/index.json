@@ -14,8 +14,8 @@
     {
       "path": "migration/adr/A10-spawn-backend.md",
       "kind": "decision",
-      "bytes": 10746,
-      "sha256": "9fea24b41e9cd262cdd5151f65d88e56d8e6d3782e4eeb373535224dac4ae1c5"
+      "bytes": 10714,
+      "sha256": "7297618ee2c1ac56973a92a7679ae9528ff2cb6eef403ff60aab1c58d366b68a"
     },
     {
       "path": "migration/adr/A11-required-constraints.md",
@@ -86,14 +86,14 @@
     {
       "path": "migration/baseline/divergences.csv",
       "kind": "ledger",
-      "bytes": 8499,
-      "sha256": "c40383141d9f319a9dc38e5b54a7fb6a7554ff696db433f63eabb121eb21fc6c"
+      "bytes": 8623,
+      "sha256": "8f0cd452920876f2e30d7e1ffdb91de947c5cb270a06c18c61c4b7d0846d1af0"
     },
     {
       "path": "migration/baseline/test-map.csv",
       "kind": "ledger",
-      "bytes": 384541,
-      "sha256": "ec1fd99f90f661e14033b08fc757cd4f126e5ae885867678df6d3afff98c9b3b"
+      "bytes": 384543,
+      "sha256": "ac658615798e475d9ff05071f5953b4b1517d8c524dcff697fc89a4aa7750b97"
     },
     {
       "path": "migration/defects-found.md",
@@ -110,8 +110,8 @@
     {
       "path": "migration/evidence/coverage-2026-09-20.md",
       "kind": "evidence",
-      "bytes": 27470,
-      "sha256": "3798382dc81c33f470bfcdd67d683fa810d8c1711f10de229dfb435a0d61b25f"
+      "bytes": 27058,
+      "sha256": "c30f981bddc128ba6747f6e749b56f12a2b4b9eb31d11912094ff703112eee1e"
     },
     {
       "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
@@ -194,8 +194,8 @@
     {
       "path": "migration/review-checklist.md",
       "kind": "review",
-      "bytes": 7927,
-      "sha256": "a52c82967fcb374ea7bb9cbd35842dd89b655d5d396cf210088668d2bf3f7a0f"
+      "bytes": 7935,
+      "sha256": "92b5808890836deedae2f7257b0f8b5473b762a70d9245d5121ab648fd311498"
     },
     {
       "path": "migration/tasks.csv",
