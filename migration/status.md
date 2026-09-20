@@ -14,7 +14,7 @@ Python. Qwen is removed by [ADR A22](adr/A22-qwen-removal.md).
 - A sealed 0.12.0 candidate passed CLI, API, MCP, broker, answer-proof, doctor,
   and cleanup smoke; see the [release smoke](evidence/release-smoke-2026-09-20.md).
 - Real Codex, Claude, and GLM start and resume canaries succeeded through an
-  isolated Rust broker; see the [live canary checkpoint](live-canary-checkpoint-2026-09-20.md).
+  isolated Rust broker; see the [indexed live-canary evidence](evidence/live-canary-2026-09-20.md).
 - Configuration reload compares the exact `config.toml` SHA-256 every 60
   seconds and at request boundaries. Invalid revisions leave the last valid
   configuration active.

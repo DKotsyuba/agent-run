@@ -42,8 +42,3 @@ This smoke proves the sealed artifact's local packaging, CLI, API, MCP,
 supervisor, fixture-backed execution, answer proof, doctor, and cleanup paths.
 It does not replace the pending Desktop-host, supported-engine continuation,
 non-macOS, or production-cutover acceptance gates.
-
-Successor evidence: later the same day, real Codex, Claude, and GLM start and
-resume canaries closed the supported-engine continuation gate; see the
-[live canary checkpoint](../live-canary-checkpoint-2026-09-20.md). Desktop-host,
-hosted Linux, and production-cutover evidence remain separate.
