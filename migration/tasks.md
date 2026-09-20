@@ -1,5 +1,10 @@
 # Rust migration execution board
 
+> **Historical execution board.** Row states and counts record how the port was
+> decomposed; they are not the 0.12.0 release status. The authoritative current
+> summary is [status.md](status.md). The two still-unclaimed live gates are
+> Desktop T71 and hosted Linux T82.
+
 This board is the executable decomposition of the authoritative plan at Python baseline `0d28b79`. Task targets use the post-M05 workspace from plan §4.1; dependency direction follows plan §4.2, gates follow plan §18, and task completion follows plan §19.1/§19.4. Detailed scope, tests, status, and acceptance commands are in `migration/tasks.csv`.
 
 Current shared HEAD includes all six parity inventories, including `migration/inventory/engines.md` at `522697240498a9829faf6b88e36738834c993500`; no row is `inventory-pending`. M01-M08 and M18 are already `in_progress`. M18 may port migration bodies now, but its final integration acceptance waits for M17's store/schema API.

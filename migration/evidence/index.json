@@ -1,15 +1,15 @@
 {
   "index_version": 1,
-  "generated_for_commit": "766542cf2c1c2764b6fcaa278ac837792ed05ebc",
-  "generated_at": "2026-09-20T19:10:37+02:00",
+  "generated_for_commit": "7f17768508aaec8ddcc607657330a4b2ee26d408",
+  "generated_at": "2026-09-20T21:10:00+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
   "entry_count": 33,
   "entries": [
     {
       "path": "migration/adr/A09-desktop-relay.md",
       "kind": "decision",
-      "bytes": 20886,
-      "sha256": "1b45a2e68446afd8601278cc589d03c07ee64e676b670f73a21292c9b72d4ead"
+      "bytes": 1902,
+      "sha256": "7ce4a5fa94359e7c37342b73a7fbb9d842d58e7219dec1fd557ce74f6a2ac6ad"
     },
     {
       "path": "migration/adr/A10-spawn-backend.md",
@@ -26,62 +26,62 @@
     {
       "path": "migration/adr/A12-canonical-json.md",
       "kind": "decision",
-      "bytes": 12065,
-      "sha256": "6ff936b01f66c10da9a100a672a4e26f693c0e0dc7815b96ebc98f223c4dda1c"
+      "bytes": 1521,
+      "sha256": "680d5c9984eff9fa27568dd509cb0794639379f39e37e8bd05137f36580727bd"
     },
     {
       "path": "migration/adr/A14-mcp-sdk.md",
       "kind": "decision",
-      "bytes": 1885,
-      "sha256": "beabc61ce4337a6d604087220bc34b47939fceab2765be7ea922e06fc3a27abd"
+      "bytes": 2088,
+      "sha256": "1b8070544a7bd8f7ee200c35f8f50a39fa0c061082d1ffd11750406099b1e6ee"
     },
     {
       "path": "migration/adr/A15-platforms.md",
       "kind": "decision",
-      "bytes": 3932,
-      "sha256": "4f5ea7bf0ff3688a6abd3b1e6c0f1f1779c93cb52d0bcd64e4f5c69e00f080f5"
+      "bytes": 1314,
+      "sha256": "18d33af1635c0c162a5d89f6243af053ed8a248b3cbef1cc4d632f9cb0c7b5f9"
     },
     {
       "path": "migration/adr/A17-notice-contract.md",
       "kind": "decision",
-      "bytes": 12729,
-      "sha256": "82b669737dc498f82e83cbcbcddfead2f6462a4ab21880fcccecf2b1e4a51a4a"
+      "bytes": 13034,
+      "sha256": "b706bd476be1d90bd21930391195e313e05ebd816eed8f9102e12f16763784f4"
     },
     {
       "path": "migration/adr/A18-python-run-continuation.md",
       "kind": "decision",
-      "bytes": 2643,
-      "sha256": "4c4d092aaac2c0e00d3ff807620d24ae447b1f94564e9420d57c96da703ef2ba"
+      "bytes": 1143,
+      "sha256": "79b261b358426fd8070df8f69c294120c1c21f7d9d863c5556921f5e19b0b53d"
     },
     {
       "path": "migration/adr/A19-release-and-deploy-divergence.md",
       "kind": "decision",
-      "bytes": 5955,
-      "sha256": "442e2c8d6060608e5e5bd7e595cea7051abb79b499ebab5ff654a9ddecbd4cf0"
+      "bytes": 1624,
+      "sha256": "81818132c7c51156a76db80a09b0e42daeceff82ae0943c3b6235f574303dea2"
     },
     {
       "path": "migration/adr/A20-supervisor-architecture-divergence.md",
       "kind": "decision",
-      "bytes": 3874,
-      "sha256": "5893acdace56b9db04d74e8beb5e4cad48780a0d2140c3a227ca6b3960509054"
+      "bytes": 4078,
+      "sha256": "08034caa69833faf7a8ac6c7663b3075a3953f9875e9b50e45c939be27fd7ee8"
     },
     {
       "path": "migration/adr/A21-runtime-platform-divergence.md",
       "kind": "decision",
-      "bytes": 1133,
-      "sha256": "f5bba39c765cccd393559e69d0248ca7c1534d328eff523c3552d04f69e95312"
+      "bytes": 1342,
+      "sha256": "d9b8bd41b65bf1ec68e1d8fce66de8b337089fa67ade5fb334da8a1e5ea6537c"
     },
     {
       "path": "migration/adr/A22-qwen-removal.md",
       "kind": "decision",
-      "bytes": 1168,
-      "sha256": "cd5eeef351e2b0e6c1cf43c9c3bcba06d68c28910a10391dca06492b05ccb4b0"
+      "bytes": 1242,
+      "sha256": "f885f49a1bc3ed5f08cd504a8c6d4baf01112695862df2ecbe134ba31730a7a6"
     },
     {
       "path": "migration/adr/cli-extensions.md",
       "kind": "decision",
-      "bytes": 1195,
-      "sha256": "2fde5ded01f0bdc2c22c978a496f8dfa0676b3889da8713319958895232b49ee"
+      "bytes": 843,
+      "sha256": "8e600ce447f8b2baa65fe8dec769dd5078981a9e55d292dd5193706791a25893"
     },
     {
       "path": "migration/baseline/divergences.csv",
@@ -98,8 +98,8 @@
     {
       "path": "migration/defects-found.md",
       "kind": "evidence",
-      "bytes": 8261,
-      "sha256": "046bfbd360cd554db8f1bac001d8754330c4c99e414dd65aeea06e48e4fe6eef"
+      "bytes": 8462,
+      "sha256": "fe689e3bb9fc2d48b5ba7c2f2fbd40b939ffa21e3eba621801e6df5a96dcdcd5"
     },
     {
       "path": "migration/evidence/coverage-2026-09-16.md",
@@ -122,8 +122,8 @@
     {
       "path": "migration/evidence/port-snapshot/REPORT.md",
       "kind": "evidence",
-      "bytes": 3986,
-      "sha256": "d18a3bf24b093bc53faf4c1e8490d89b1adb66e9141c3d45d515266a89080811"
+      "bytes": 4253,
+      "sha256": "96d90004e5210786e3e423b28dad165137886cac8b98fb459e9beea2cb071b1d"
     },
     {
       "path": "migration/evidence/port-snapshot/SOURCE_BASELINE.json",
@@ -158,14 +158,14 @@
     {
       "path": "migration/evidence/qualification-scope.md",
       "kind": "evidence",
-      "bytes": 42809,
-      "sha256": "3c1bdf842b49d6cd673b27e6a51b7cbca4f9a5c9687c55ad13a0a4edef1488de"
+      "bytes": 42792,
+      "sha256": "73ed6a0a0bffdc4ecfb1e3d413bc2d91e6b1a12dd5accf0debc86c1196bc4de2"
     },
     {
       "path": "migration/evidence/release-smoke-2026-09-20.md",
       "kind": "evidence",
-      "bytes": 2042,
-      "sha256": "39a1769a91a92156f7d140948e9d8df2a6361929084ae68431a545be87984444"
+      "bytes": 2336,
+      "sha256": "c9cea5000b30e57d9b948d8ba538ca29da335c3c6b46b12bd6c4848c42433a02"
     },
     {
       "path": "migration/evidence/verification-2026-09-16.md",
@@ -188,14 +188,14 @@
     {
       "path": "migration/post-cutover-report.md",
       "kind": "review",
-      "bytes": 5452,
-      "sha256": "df80ffd98ae43e7bacc17e049c36ffc97f61d1eff053272e891dbc4732227ccc"
+      "bytes": 1268,
+      "sha256": "ec82bebdf5e835a0c6bb7bdcc557b7fe611a3d2bf5e645f945c2fe6d052a2923"
     },
     {
       "path": "migration/review-checklist.md",
       "kind": "review",
-      "bytes": 7966,
-      "sha256": "5198480598495313dd2b5f4c4c565ea3f0e1b30573664effcf07493753c594e4"
+      "bytes": 2043,
+      "sha256": "63c71461b16b76110efc531d16653074ed0ffe414277ab40e3acc057ec613379"
     },
     {
       "path": "migration/tasks.csv",

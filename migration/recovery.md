@@ -1,15 +1,20 @@
-# Native release recovery
+# Rust release recovery
 
-`cargo xtask release update` first refuses durable active agents and archived
-`workflow_runs` owners whose PID cannot be proven gone (an unobservable or
-access-denied writer counts as live, exactly like the Python release script),
-writes
-`<prefix>/deploy.json`, retains a state/config backup under `<prefix>/backups`,
-then atomically switches `current`. `--force` skips only the active-agent
-query: it does not stop a daemon, cancel work, or make an unsafe deployment
-safe. Establish quiescence first.
+Use the sealed-release deployment commands documented in
+[docs/releasing.md](../docs/releasing.md). Inspect the retained deployment
+journal before acting; do not infer a missing pointer or backup.
 
-Run `cargo xtask release rollback --prefix PREFIX --home HOME` only on a
-quiescent disposable or operator-approved home. It restores the journal's
-previous pointer and retained state/config files. The command never registers
-launchd jobs and never targets the owner home implicitly.
+1. Stop or wait for active agents and other workflow writers.
+2. Verify the named release and database backup.
+3. Run the appropriate `cargo xtask release recover`, `roll-forward`, or
+   `rollback` command with explicit `--prefix`, `--home`, and release paths.
+4. Never start an older release against a newer unsupported schema. Restore the
+   matching verified database backup with the matching release instead.
+5. Restart the service, then verify API ping, MCP discovery, doctor, one broker
+   run, answer proof, cleanup, and socket lifecycle.
+6. Preserve the deployment journal and record the result in a dated copy of
+   [post-cutover-report.md](post-cutover-report.md).
+
+The frozen Python branch is source-history fallback, not an automatic runtime
+rollback path. Production rollback uses the retained installed release and its
+matching database evidence.

@@ -1,5 +1,10 @@
 # A17 — Completion notice, delivery evidence, and failure-kind contract
 
+> **Historical compatibility investigation.** Python paths and the local venv
+> command below describe the frozen baseline used to correct the port. They are
+> evidence provenance, not current operating instructions. Read each
+> `src/agent_run/...` citation as `archive/python-legacy:src/agent_run/...`.
+
 Status: accepted. Resolves three pre-existing `crates/agent-run/tests/protocol.rs`
 failures and two `crates/agent-run/tests/fake_engine.rs` failures (the latter
 surfaced by same-night merges landing the answer-proof work), all introduced by

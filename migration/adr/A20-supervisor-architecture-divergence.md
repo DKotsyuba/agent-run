@@ -2,6 +2,10 @@
 
 Status: accepted for the migration.
 
+Python source paths below cite `archive/python-legacy`; they are historical
+comparison evidence, not files expected on `main`. The accepted Rust design is
+the current design, not unfinished parity work.
+
 ## Context
 
 Five behaviors in `tests/test_supervisor.py` describe supervisor mechanics that

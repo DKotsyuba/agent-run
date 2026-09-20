@@ -1,6 +1,6 @@
 # Qualification scope map
 
-This is a static traceability map, not a qualification result. `covered` means
+This is a living traceability map, not by itself a release verdict. `covered` means
 that the named Rust test asserts the scenario's complete statement. `partial`
 means that the evidence covers only the named portion; the missing portion is
 called out in the evidence cell. The layer is the dominant layer of the plan's
@@ -65,9 +65,9 @@ row while the remaining native boundary still needs a live check.
 | T54 | Runtime/model/account roster gate, fast/effort/output_schema и ограничение специальных моделей сохраняются | differential | covered | `crates/agent-run-adapters/tests/codex_runtime.rs::python_test_codex_roster_cache_preserves_supported_efforts_and_fails_closed`; `crates/agent-run-core/tests/codex_adapter_prepare.rs::python_codex_prepare_fast_request_adds_only_fast_overrides`; `crates/agent-run-core/tests/codex_adapter_prepare.rs::python_codex_prepare_requires_discovered_effort`; `crates/agent-run-adapters/tests/codex_runtime.rs::python_test_codex_adapter_admission_keeps_capabilities_and_roles_closed` | no |
 | T55 | Claude unlabelled и labelled credential environments различаются по контракту; ambient MCP/settings не расширяют роль | differential | covered | `crates/agent-run-core/tests/service.rs::python_test_service_account_resolution_uses_scoped_home`; `crates/agent-run-core/tests/claude_contract.rs::claude_launch_is_explicitly_scoped_without_secret_argv`; `crates/agent-run-adapters/tests/native_settings.rs::claude_settings_and_hooks_coexist` | no |
 | T56 | GLM endpoint/auth wiring не смешивается с обычным Claude; ответы и failures правильно классифицируются | differential | covered | `crates/agent-run-adapters/tests/glm.rs::prepare_falls_back_to_default_base_url`; `crates/agent-run-adapters/tests/glm.rs::validate_rejects_foreign_auth_names_and_kinds`; `crates/agent-run-core/src/stream.rs::tests::glm_uses_claude_response_and_failure_classification` | no |
-| T57 | Qwen sandbox/approval/read-root flags и macOS Git path проходят native smoke, не только argv snapshot | differential | divergent | Qwen removed from the supported runtime set; legacy identifiers are rejected by `crates/agent-run-config/tests/domain_config.rs::qwen_adapter_identifiers_are_deprecated` and `tests/test_native_settings.py::NativeSettingsTestCase::test_qwen_runtime_is_deprecated` | no |
-| T58 | Native resume использует точный session ID, унаследованные grants/home/effort; отсутствующая history даёт отказ | differential | covered | `crates/agent-run-core/tests/codex_app_server.rs::python_test_codex_app_server_resume_keeps_exact_thread_id`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_canonical_role_payload_round_trips`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_without_native_session_is_refused`; `crates/agent-run-core/tests/codex_app_server.rs::python_test_codex_app_server_resume_grant_omits_effort` | yes |
-| T59 | Неоднозначно отправленный prompt не переотправляется автоматически; новый разговор не заменяет отсутствующую history | differential | covered | `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_lost_parent_requires_quiescence`; `crates/agent-run-core/tests/resume_stream.rs::resume_refuses_missing_or_wrong_stream_identity`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_without_native_session_is_refused`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_failed_child_lends_source_session`; `crates/agent-run-core/tests/service.rs::python_test_service_launch_failure_is_durable_and_replayable` | yes |
+| T57 | Qwen sandbox/approval/read-root flags и macOS Git path проходят native smoke, не только argv snapshot | differential | divergent | Qwen was removed by [ADR A22](../adr/A22-qwen-removal.md); legacy identifiers are rejected by `crates/agent-run-config/tests/domain_config.rs::qwen_adapter_identifiers_are_deprecated`. | no |
+| T58 | Native resume использует точный session ID, унаследованные grants/home/effort; отсутствующая history даёт отказ | differential | covered | Deterministic tests: `crates/agent-run-core/tests/codex_app_server.rs::python_test_codex_app_server_resume_keeps_exact_thread_id`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_canonical_role_payload_round_trips`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_without_native_session_is_refused`. Live Codex, Claude, and GLM continuations succeeded in the [20 September canary](../live-canary-checkpoint-2026-09-20.md). | no |
+| T59 | Неоднозначно отправленный prompt не переотправляется автоматически; новый разговор не заменяет отсутствующую history | differential | covered | Deterministic tests: `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_lost_parent_requires_quiescence`; `crates/agent-run-core/tests/resume_stream.rs::resume_refuses_missing_or_wrong_stream_identity`; `crates/agent-run-core/tests/codex_resume.rs::python_test_resume_without_native_session_is_refused`. Supported-engine start/resume identity and terminal proof were confirmed in the [20 September canary](../live-canary-checkpoint-2026-09-20.md). | no |
 | T60 | Cumulative usage учитывается только с доказанным baseline, иначе null; прошлые run_stats не переписываются | differential | covered | `crates/agent-run-store/tests/run_stats.rs::python_test_run_stats_resumed_codex_requires_and_subtracts_baseline`; `crates/agent-run-store/tests/run_stats.rs::python_test_run_stats_absent_usage_stays_null`; `crates/agent-run-store/tests/run_stats.rs::python_test_run_stats_golden_v16_rows_are_read_without_shape_drift` | no |
 | T61 | Partial/oversized/invalid NDJSON, bad id и batch array дают ожидаемые коды и не раздувают память | process/filesystem | covered | `crates/agent-run/tests/protocol.rs::framing_rejects_partial_and_oversized_lines`; `crates/agent-run/tests/mcp_parity.rs::mcp_rejects_oversized_stdio_frame`; `crates/agent-run/tests/socket_api_planned.rs::python_ndjson_bad_id_and_batch_errors_are_typed_on_the_wire`; `crates/agent-run/tests/protocol.rs::framing_does_not_consume_beyond_the_memory_bound` | no |
 | T62 | Notification без id не получает response; на одном соединении сохраняется порядок ответов | process/filesystem | covered | `crates/agent-run/tests/protocol.rs::notifications_have_no_response_and_unknown_arguments_fail`; `crates/agent-run/tests/mcp_parity.rs::mcp_matches_python_handshake_tools_calls_notifications_and_eof` | no |
@@ -103,11 +103,12 @@ Layer counts: **pure/unit 19**, **process/filesystem 52**, **differential 12**,
 the current test suite has executed that layer or that a `python_test_*` name is
 itself a differential run.
 
-Authorizing live qualification would require **2 scenarios with a supported real engine
-(T58–T59)**, **1 with the real Desktop host (T71)**, and **1 on a second OS
-(T82)**. It would also need the missing deterministic assertions above, a real
-qualification run/report, and the release/cutover evidence in T84. No live
-qualification was run for this map.
+The supported-engine live requirement for T58–T59 is satisfied by the isolated
+Codex, Claude, and GLM start/resume canary. The remaining live gaps are **1 with
+the real Desktop host (T71)** and **1 hosted Linux run (T82)**. The sealed
+artifact successor evidence is the
+[20 September release smoke](release-smoke-2026-09-20.md); it does not close
+either remaining platform boundary or prove a production cutover.
 
 The CSV is useful as an inventory but not as scenario evidence: its repeated
 range assignments attach unrelated tests to many T-ids. Among its 1,107

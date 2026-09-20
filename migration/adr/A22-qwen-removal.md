@@ -5,8 +5,9 @@ Status: Accepted
 ## Decision
 
 Agent-run no longer implements or advertises Qwen. The Rust adapter variant,
-Python adapter package, generated-home logic, credentials, probes, fixtures,
-and live qualification requirement are removed. Legacy adapter identifiers are
+generated-home logic, credentials, probes, fixtures, and live qualification
+requirement are removed from `main`. The former Python adapter exists only in
+the frozen `archive/python-legacy` branch. Legacy adapter identifiers are
 recognized only long enough to return an actionable deprecation error telling
 the operator to remove the runtime from `config.toml`.
 
@@ -20,7 +21,7 @@ unchanged because they describe earlier releases and the original baseline.
   capacity routing.
 - Existing configurations must remove their Qwen runtime before this release is
   installed; invalid configuration continues to fail closed.
-- Qwen-specific Python baseline behaviors are declared divergences under this
+- Qwen-specific archived baseline behaviors are declared divergences under this
   ADR rather than reported as missing Rust work.
 - Restoring Qwen would require a new product decision and a fresh adapter,
   security, and live-qualification contract.

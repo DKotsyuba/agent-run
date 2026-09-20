@@ -1,5 +1,10 @@
 # Migration plan and acceptance gates
 
+> **Historical execution plan.** Rust became the primary implementation in
+> 0.12.0. Statements such as “still required,” old paths, and interim counts
+> describe the port while it was being authored. Use [status.md](status.md) and
+> [qualification-scope.md](evidence/qualification-scope.md) for current claims.
+
 Baseline: v0.11.15, immutable commit `c9904f9843ba4a0772bdfa8bac5259f18fad9dc3`.
 
 The delivery goal is complete replacement of the Python application, not a Python launcher with a Rust executable name. External engine CLIs and the signed Desktop host remain external integrations. This document distinguishes the work already represented by source code from work still blocking that goal.

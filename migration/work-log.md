@@ -1,5 +1,9 @@
 # Work log
 
+> **Historical log.** Entries are point-in-time observations. Later successful
+> Rust builds and qualification do not make the early blocked observations
+> incorrect; current status is in [status.md](status.md).
+
 2026-09-15: Started a real Rust source tree in /mnt/data/agent-run-rust.
 Target upstream: c9904f9843ba4a0772bdfa8bac5259f18fad9dc3 (0.11.15).
 The prior attempt left no code. The upstream files visible through the GitHub
