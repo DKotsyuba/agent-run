@@ -49,3 +49,17 @@ size and matching digest. Provider transcripts contain the submitted task and
 provider-produced answer; Codex additionally recorded a streamed provider
 message reference. All child process groups and descendants were confirmed
 gone after completion. Production remained unchanged.
+
+All three provider sessions were then continued through the Rust `resume`
+path. Each continuation preserved its parent/runtime/model identity and reached
+terminal success:
+
+| Runtime | Child agent | Exact answer | SHA-256 |
+|---|---|---|---|
+| Codex | `ag-20260920-190102-a73f7b820f` | `CODEX_RESUME_OK` | `94dc2b37cc65dda5430cccf3eab7e131ddabc413d1d79a8ea88d69281fa9f8b1` |
+| Claude | `ag-20260920-190108-88dd8a933b` | `CLAUDE_RESUME_OK` | `c63cc25d7cf7c1b4e52dd8704a768c0c5ba75930ac00e75e5712b2297ea32c14` |
+| GLM | `ag-20260920-190109-3870a6eb50` | `GLM_RESUME_OK` | `f8b61a1fa45f32f06bbd1e4db787b8f64fca5daa6114edf8996d2bd649c88036` |
+
+The three continuation answers were independently read back through the CLI
+with proof version 2 and matching digests. Cleanup was confirmed for every
+continuation. This closes the live resume risk for the supported providers.
