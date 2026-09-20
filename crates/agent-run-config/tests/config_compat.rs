@@ -9,12 +9,11 @@
 //! with one fresh temporary directory per case, used both as `HOME` (for `~`
 //! expansion) and as the config's home directory (config.toml lives directly
 //! at `$TMP_HOME/config.toml`, matching the Python fixture layout literally
-//! named in several expected error messages). Known scope reduction: the
-//! Python default `~/.agent-run/{profiles,skills}` hardcodes a nested
-//! `.agent-run` segment that this crate's `Config::load(home)` does not
-//! reproduce (its `home` parameter already denotes that directory), so
-//! `profiles.directory` / `skills_directory` are checked for presence only,
-//! not for an exact string match, when the field is left at its default.
+//! named in several expected error messages). Expected values derive the Rust
+//! loader's `home/{profiles,skills}` defaults from that fixture root and
+//! canonicalize the fixture path fields that production canonicalizes. This
+//! keeps every other value strict while tolerating host aliases such as
+//! Linux's `/bin/echo` -> `/usr/bin/echo`.
 mod common;
 
 use agent_run_config::{config::Config, profiles};
@@ -41,29 +40,12 @@ fn cases() -> Vec<Case> {
     serde_json::from_str(&text).expect("golden config fixture must parse")
 }
 
-/// Keys whose Python default derives from a hardcoded `~/.agent-run/...`
-/// literal that this crate's explicit `home` parameter cannot reproduce
-/// byte-for-byte, or from a path that both loaders canonicalize only when it
-/// actually exists on the host (so a machine with `codexbar`/Homebrew
-/// installed resolves its default to a real symlink target that the
-/// capturing machine's state may not have shared); checked for
-/// presence/type only (see module docs).
-fn presence_only(key: &str) -> bool {
-    matches!(key, "directory" | "skills_directory" | "codexbar_binary")
-}
-
 /// Structural comparison: every key Python reports must be reproduced with
-/// an equivalent (not necessarily byte-identical, see `presence_only`) value.
-/// Extra keys on the Rust side, and a Rust key entirely absent when Python's
-/// value is `null`, are both accepted (Rust omits absent-variant enum fields
-/// that Python's dataclass always carries as `None`).
-fn compatible(actual: &Value, expected: &Value, key: &str) -> bool {
-    if presence_only(key) {
-        return matches!(
-            (actual, expected),
-            (Value::String(_), Value::String(_)) | (Value::Null, Value::Null)
-        );
-    }
+/// an equivalent value after fixture-specific path normalization. Extra keys
+/// on the Rust side, and a Rust key entirely absent when Python's value is
+/// `null`, are both accepted (Rust omits absent-variant enum fields that
+/// Python's dataclass always carries as `None`).
+fn compatible(actual: &Value, expected: &Value) -> bool {
     match (actual, expected) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -73,10 +55,10 @@ fn compatible(actual: &Value, expected: &Value, key: &str) -> bool {
         }
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Array(a), Value::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| compatible(x, y, key))
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| compatible(x, y))
         }
         (Value::Object(a), Value::Object(b)) => b.iter().all(|(k, ev)| match a.get(k) {
-            Some(av) => compatible(av, ev, k),
+            Some(av) => compatible(av, ev),
             None => ev.is_null(),
         }),
         _ => false,
@@ -198,21 +180,98 @@ fn environment_value(e: &agent_run_config::config::Environment) -> Value {
     })
 }
 
-/// Substitutes `${TMP_HOME}` in the raw JSON text before parsing, so nested
-/// placeholders at any depth resolve against this case's real temp directory.
-fn expected_value(raw: &Value, tmp_home: &std::path::Path) -> Value {
-    let text = serde_json::to_string(raw).unwrap();
-    let text = text.replace("${TMP_HOME}", &tmp_home.to_string_lossy());
-    serde_json::from_str(&text).unwrap()
+/// Canonicalizes one expected string path when its target exists on this host.
+///
+/// Missing paths retain their lexical fixture value, matching production's
+/// `expand` behavior. Non-string values, including optional `null` paths, are
+/// left unchanged.
+fn canonicalize_existing_path(value: &mut Value) {
+    let Some(path) = value.as_str().map(PathBuf::from) else {
+        return;
+    };
+    if let Ok(canonical) = path.canonicalize() {
+        *value = Value::String(canonical.to_string_lossy().into_owned());
+    }
 }
 
-fn run_config_case(case: &Case) -> Result<Value, Error> {
+/// Applies production-equivalent host path normalization to one config oracle.
+///
+/// Only canonical path fields exercised by this fixture corpus are normalized;
+/// all other strings remain strict. Python's OS-home defaults for profiles and
+/// skills are first rewritten to the explicit Rust config-home defaults used
+/// by this harness.
+fn normalize_expected_config_paths(expected: &mut Value, home: &std::path::Path) {
+    let python_default_profiles = home.join(".agent-run/profiles");
+    let rust_default_profiles = home.join("profiles");
+    let python_default_skills = home.join(".agent-run/skills");
+    let rust_default_skills = home.join("skills");
+
+    if expected
+        .pointer("/profiles/directory")
+        .and_then(Value::as_str)
+        == Some(python_default_profiles.to_string_lossy().as_ref())
+    {
+        expected["profiles"]["directory"] =
+            Value::String(rust_default_profiles.to_string_lossy().into_owned());
+    }
+    if expected
+        .pointer("/skills_directory")
+        .and_then(Value::as_str)
+        == Some(python_default_skills.to_string_lossy().as_ref())
+    {
+        expected["skills_directory"] =
+            Value::String(rust_default_skills.to_string_lossy().into_owned());
+    }
+
+    for pointer in [
+        "/capacity/codexbar_binary",
+        "/delivery/codex_queue_bin",
+        "/profiles/directory",
+        "/skills_directory",
+    ] {
+        if let Some(value) = expected.pointer_mut(pointer) {
+            canonicalize_existing_path(value);
+        }
+    }
+    if let Some(mcp) = expected.get_mut("mcp").and_then(Value::as_object_mut) {
+        for declaration in mcp.values_mut() {
+            if let Some(command) = declaration.get_mut("command") {
+                canonicalize_existing_path(command);
+            }
+        }
+    }
+}
+
+/// Substitutes `${TMP_HOME}` and derives host-portable expected config paths.
+///
+/// Placeholders at any depth resolve against this case's real fixture root.
+/// The returned value is then normalized only for paths whose production
+/// loader semantics vary with the host filesystem.
+fn expected_config_value(raw: &Value, tmp_home: &std::path::Path) -> Value {
+    let text = serde_json::to_string(raw).unwrap();
+    let text = text.replace("${TMP_HOME}", &tmp_home.to_string_lossy());
+    let mut expected = serde_json::from_str(&text).unwrap();
+    normalize_expected_config_paths(&mut expected, tmp_home);
+    expected
+}
+
+/// Executes one config case and derives its expected value inside the fixture.
+///
+/// `HOME` is set for tilde expansion, `config.toml` is written below the same
+/// root, and expected host paths are canonicalized before that temporary
+/// filesystem is removed. An error case without an oracle returns `None`.
+fn run_config_case(case: &Case) -> (Result<Value, Error>, Option<Value>) {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = temp.path().canonicalize().unwrap();
     std::env::set_var("HOME", &home);
     let text = case.toml.replace("${TMP_HOME}", &home.to_string_lossy());
     std::fs::write(home.join("config.toml"), text).unwrap();
-    Config::load(&home).map(|cfg| config_to_value(&cfg))
+    let result = Config::load(&home).map(|cfg| config_to_value(&cfg));
+    let expected = case
+        .normalized_result_summary
+        .as_ref()
+        .map(|raw| expected_config_value(raw, &home));
+    (result, expected)
 }
 
 fn run_profile_case(case: &Case) -> Result<Value, Error> {
@@ -241,6 +300,46 @@ fn run_profile_case(case: &Case) -> Result<Value, Error> {
             "required_constraints": p.required_constraints,
         })
     })
+}
+
+/// Proves expected normalization is explicit, host-aware, and field-scoped.
+///
+/// A lexically aliased MCP command must resolve like production, while the same
+/// string in a runtime binary must remain lexical. Python's nested default
+/// catalogs must derive from the explicit Rust fixture home rather than being
+/// ignored.
+#[test]
+fn expected_config_paths_are_portable_without_relaxing_other_strings() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let target = home.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let alias = target.join("..").join("target");
+    let mut expected = json!({
+        "profiles": {"directory": home.join(".agent-run/profiles")},
+        "skills_directory": home.join(".agent-run/skills"),
+        "mcp": {"tool": {"command": alias}},
+        "runtimes": {"tool": {"binary": alias}},
+    });
+
+    normalize_expected_config_paths(&mut expected, home);
+
+    assert_eq!(
+        expected.pointer("/profiles/directory").unwrap(),
+        &json!(home.join("profiles"))
+    );
+    assert_eq!(
+        expected.pointer("/skills_directory").unwrap(),
+        &json!(home.join("skills"))
+    );
+    assert_eq!(
+        expected.pointer("/mcp/tool/command").unwrap(),
+        &json!(target.canonicalize().unwrap())
+    );
+    assert_eq!(
+        expected.pointer("/runtimes/tool/binary").unwrap(),
+        &json!(alias)
+    );
 }
 
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_accounts_parse_and_validate`,
@@ -273,21 +372,18 @@ fn golden_config_cases_match_python() {
     let mut checked = 0usize;
     for case in cases() {
         checked += 1;
-        let tmp_home_for_expected: PathBuf; // resolved lazily only for "ok" comparisons
-        let result = if case.source_test == "tests/test_profiles.py" {
-            run_profile_case(&case)
+        let (result, expected) = if case.source_test == "tests/test_profiles.py" {
+            (
+                run_profile_case(&case),
+                case.normalized_result_summary.clone(),
+            )
         } else {
             run_config_case(&case)
         };
         match (&result, case.outcome.as_str()) {
             (Ok(actual), "ok") => {
-                if let Some(expected_raw) = &case.normalized_result_summary {
-                    // The config-case branch already substituted ${TMP_HOME}
-                    // with the real HOME used for that load; reuse it here.
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    tmp_home_for_expected = PathBuf::from(&home);
-                    let expected = expected_value(expected_raw, &tmp_home_for_expected);
-                    if !compatible(actual, &expected, "") {
+                if let Some(expected) = expected {
+                    if !compatible(actual, &expected) {
                         failures.push(format!(
                             "{}: accepted but structure differs\n  actual:   {actual}\n  expected: {expected}",
                             case.id
