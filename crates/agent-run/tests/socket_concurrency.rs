@@ -183,20 +183,27 @@ async fn python_control_lane_survives_regular_connection_pressure() {
     let _ = task.await;
 }
 
-/// Sends one long-poll request and decodes its ordered broker response.
+/// Sends one JSON-RPC request and decodes its response within five seconds.
+///
+/// The bound accommodates the one-second long polls in this suite while making
+/// an unresponsive broker fail the test promptly.
 async fn request(path: &Path, value: serde_json::Value) -> serde_json::Value {
-    let mut stream = UnixStream::connect(path).await.unwrap();
-    frame::write(&mut stream, &value, socket::MAX_FRAME)
-        .await
-        .unwrap();
-    let mut input = BufReader::new(stream);
-    serde_json::from_slice(
-        &frame::read(&mut input, socket::MAX_FRAME)
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        frame::write(&mut stream, &value, socket::MAX_FRAME)
             .await
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap()
+            .unwrap();
+        let mut input = BufReader::new(stream);
+        serde_json::from_slice(
+            &frame::read(&mut input, socket::MAX_FRAME)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    })
+    .await
+    .expect("broker request exceeded five-second test deadline")
 }
 
 // Rust-internal assertion: SIGTERM must let admitted requests finish before
