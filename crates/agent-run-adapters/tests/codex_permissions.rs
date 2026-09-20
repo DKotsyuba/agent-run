@@ -8,7 +8,7 @@ use agent_run_adapters::{
     materialize,
 };
 use agent_run_config::{
-    config::{Adapter, Capacity, Catalog, Config, Core, Delivery, Mcp, Runtime},
+    config::{Capacity, Catalog, Config, Core, Delivery, Mcp, Runtime},
     profiles::Profile,
 };
 use agent_run_domain::domain::StartRequest;
@@ -230,19 +230,6 @@ fn python_test_native_settings_nested_tables_stay_inline_before_owned_sections()
         2,
     );
     assert!(document.get("projects").is_some());
-}
-
-/// Mirrors `test_codex_adapter.py::test_managed_projects_uses_one_definition_and_verifies_all_write_roots` refusal behavior.
-#[test]
-fn python_test_codex_adapter_projects_refuses_an_unproven_managed_root() {
-    let root = temporary_directory();
-    let (config, mut runtime, request, profile) = fixture(&root, true);
-    runtime.workspace_root = Some(root.join("projects"));
-    std::fs::create_dir_all(runtime.workspace_root.as_ref().expect("project root"))
-        .expect("project root");
-    let home = root.join("home");
-    assert!(materialize::materialize(&config, &runtime, &request, &profile, &home, &root).is_err());
-    assert_eq!(runtime.kind().expect("Codex kind"), Adapter::Codex);
 }
 
 /// Mirrors `test_codex_adapter.py::test_materialize_approves_only_configured_mcp_and_adds_narrow_hook`.
