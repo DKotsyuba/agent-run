@@ -20,8 +20,8 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
         "cargo xtask archive --verify",
         "cargo xtask release build-native",
         "cargo xtask release verify",
-        "aarch64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
+        "- os: macos-15\n            label: supported-macos-arm64\n            target: aarch64-apple-darwin\n            architecture: arm64",
+        "- os: ubuntu-latest\n            label: configured-release-target-linux-x86_64-pending-hosted-evidence\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
         "test \"$(uname -m)\" = \"${{ matrix.architecture }}\"",
         "node --test scripts/check-desktop-transport.cjs",
         "configured-release-target-linux-x86_64-pending-hosted-evidence",
@@ -32,6 +32,28 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
         assert!(
             !workflow.contains(forbidden),
             "CI still contains legacy command {forbidden:?}"
+        );
+    }
+    assert!(
+        !workflow.contains("macos-latest"),
+        "CI must pin the arm64 runner"
+    );
+    let (matrix_job, release_contract) = workflow
+        .split_once("\n  release-contract:")
+        .expect("CI must retain its release-contract job");
+    for (name, job) in [
+        ("matrix", matrix_job),
+        ("release-contract", release_contract),
+    ] {
+        let fetch = job
+            .find("cargo fetch --locked")
+            .unwrap_or_else(|| panic!("{name} job must fetch the locked graph"));
+        let gate = job
+            .find("cargo xtask")
+            .unwrap_or_else(|| panic!("{name} job must run an xtask gate"));
+        assert!(
+            fetch < gate,
+            "{name} job must fetch before offline xtask use"
         );
     }
 }
@@ -49,8 +71,8 @@ fn release_publishes_checksummed_native_assets() {
         "cargo xtask release build-native",
         "cargo xtask release verify",
         "cargo xtask archive --revision HEAD",
-        "aarch64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
+        "- os: macos-15\n            target: aarch64-apple-darwin\n            architecture: arm64",
+        "- os: ubuntu-latest\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
         "agent-run-$version-${{ matrix.target }}.tar.gz",
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
@@ -90,6 +112,60 @@ fn release_publishes_checksummed_native_assets() {
         workflow.matches("gh release create").count(),
         1,
         "all archives must be published by one GitHub Release operation"
+    );
+    assert!(
+        !workflow.contains("macos-latest"),
+        "release builds must pin the arm64 runner"
+    );
+    let (header, jobs) = workflow
+        .split_once("\njobs:")
+        .expect("release workflow must declare jobs");
+    let (gate, jobs) = jobs
+        .split_once("\n  native:")
+        .expect("release workflow must declare a native job");
+    let (native, publish) = jobs
+        .split_once("\n  publish:")
+        .expect("release workflow must declare a publish job");
+    assert!(
+        header.contains("permissions:\n  contents: read"),
+        "workflow-level permissions must be read-only"
+    );
+    assert!(
+        !header.contains("write")
+            && !gate.contains("contents: write")
+            && !native.contains("contents: write"),
+        "write permissions must not be available before publish"
+    );
+    for permission in [
+        "contents: write",
+        "id-token: write",
+        "attestations: write",
+        "artifact-metadata: write",
+    ] {
+        assert!(
+            publish.contains(permission),
+            "publish job is missing {permission:?}"
+        );
+    }
+    assert!(
+        publish.contains("needs: [gate, native]"),
+        "publish must wait for both verified artifact jobs"
+    );
+    for (name, job) in [("gate", gate), ("native", native)] {
+        let fetch = job
+            .find("cargo fetch --locked")
+            .unwrap_or_else(|| panic!("{name} job must fetch the locked graph"));
+        let gate = job
+            .find("cargo xtask")
+            .unwrap_or_else(|| panic!("{name} job must run an xtask gate"));
+        assert!(
+            fetch < gate,
+            "{name} job must fetch before offline xtask use"
+        );
+    }
+    assert!(
+        native.contains("run: cargo xtask check"),
+        "both native matrix entries must run the full locked workspace gates"
     );
 }
 

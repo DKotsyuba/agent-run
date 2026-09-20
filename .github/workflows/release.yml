@@ -5,10 +5,7 @@ on:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -17,13 +14,17 @@ concurrency:
 jobs:
   gate:
     name: Verify tag and build source archive
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Verify annotated tag and workspace version
         shell: bash
         run: |
@@ -57,7 +58,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             architecture: arm64
           - os: ubuntu-latest
@@ -71,8 +72,12 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Verify native runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
+      - name: Run locked workspace gates
+        run: cargo xtask check
       - name: Build and verify sealed native archive
         shell: bash
         run: |
@@ -97,6 +102,11 @@ jobs:
     name: Publish verified release
     needs: [gate, native]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Download release archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

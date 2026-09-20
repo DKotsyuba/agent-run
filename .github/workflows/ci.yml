@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             label: supported-macos-arm64
             target: aarch64-apple-darwin
             architecture: arm64
@@ -36,6 +36,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Verify native runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - name: Reject legacy implementation files
@@ -61,13 +63,17 @@ jobs:
 
   release-contract:
     name: Rust release contract
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Verify release evidence and source archive
         run: |
           cargo xtask qualify --release
