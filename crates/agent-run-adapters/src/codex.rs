@@ -313,3 +313,37 @@ fn resolve_command(command: &str, path: &str) -> Option<PathBuf> {
         .then_some(candidate)
     })
 }
+
+/// Exercises managed Projects policy validation without depending on host policy files.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors `test_codex_adapter.py::test_managed_projects_uses_one_definition_and_verifies_all_write_roots` refusal behavior.
+    #[test]
+    fn python_test_codex_adapter_projects_refuses_an_unproven_managed_root() {
+        let runtime: Runtime = serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-codex-test",
+            "models": ["fixture"],
+            "workspace_root": "/workspace/unproven",
+        }))
+        .expect("fixture runtime");
+        let policy: toml::Value = toml::from_str(
+            r#"
+extends = ":workspace"
+workspace_roots = { "/workspace/granted" = true }
+network = { enabled = false }
+"#,
+        )
+        .expect("fixture policy");
+
+        let error = managed_roots(&runtime, policy.as_table().expect("Projects policy table"))
+            .expect_err("unproven workspace root must be refused");
+        assert!(error
+            .to_string()
+            .contains("workspace_root is not granted by managed Projects"));
+    }
+}
