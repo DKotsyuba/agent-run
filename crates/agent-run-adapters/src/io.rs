@@ -210,8 +210,15 @@ impl Process {
         let deadline = tokio::time::Instant::now() + timeout;
         let id = self.next_id;
         self.next_id += 1;
-        self.send_until(&json!({"id":id,"method":method,"params":params}), deadline)
-            .await?;
+        if let Err(error) = self
+            .send_until(&json!({"id":id,"method":method,"params":params}), deadline)
+            .await
+        {
+            return match error {
+                Error::Io(_) => Err(self.closed_error(method, deadline).await),
+                other => Err(other),
+            };
+        }
         loop {
             let event = tokio::time::timeout_at(deadline, self.events.recv())
                 .await
@@ -246,20 +253,41 @@ impl Process {
                     }
                     self.backlog.push_back(Event::Json(v));
                 }
-                Event::Eof => return Err(self.closed_error(method).await),
+                Event::Eof => return Err(self.closed_error(method, deadline).await),
                 Event::Failure(kind) => return Err(Error::Runtime(kind.into())),
             }
         }
     }
     /// Describes an early child exit using only bounded, redacted diagnostics.
-    async fn closed_error(&mut self, method: &str) -> Error {
-        let _ = self.child.try_wait();
-        tokio::task::yield_now().await;
-        let code = self
-            .child
-            .try_wait()
-            .ok()
-            .flatten()
+    ///
+    /// Stderr draining receives at most one second of the caller's remaining
+    /// deadline, followed by at most 100 milliseconds for the child status.
+    /// Neither wait may extend the RPC deadline.
+    async fn closed_error(&mut self, method: &str, deadline: tokio::time::Instant) -> Error {
+        let stderr_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+        let stderr_drained = if let Some(stderr_reader) = self.tasks.last_mut() {
+            tokio::time::timeout_at(stderr_deadline, stderr_reader)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if stderr_drained {
+            self.tasks.pop();
+        }
+        let mut status = self.child.try_wait().ok().flatten();
+        if status.is_none() {
+            let exit_deadline =
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(100));
+            if exit_deadline > tokio::time::Instant::now() {
+                if let Ok(Ok(exited)) =
+                    tokio::time::timeout_at(exit_deadline, self.child.wait()).await
+                {
+                    status = Some(exited);
+                }
+            }
+        }
+        let code = status
             .and_then(|status| status.code())
             .map(|code| format!("exit code {code}"))
             .unwrap_or_else(|| "unknown exit status".into());
