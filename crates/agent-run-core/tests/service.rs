@@ -12,6 +12,29 @@ use agent_run_platform::{fs, verify};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path};
 
+/// Proves content-based configuration refresh skips identical bytes, accepts a
+/// valid changed revision, and rejects an invalid changed revision.
+#[test]
+fn configuration_refresh_uses_content_digest() {
+    let home = common::Home::new();
+    let service = Service::new(home.path.clone());
+    assert!(service.refresh_config().unwrap());
+    assert!(!service.refresh_config().unwrap());
+
+    let path = home.path.join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{original}\n[delivery]\nretry_base_seconds = 3.0\n"),
+    )
+    .unwrap();
+    assert!(service.refresh_config().unwrap());
+    assert!(!service.refresh_config().unwrap());
+
+    std::fs::write(&path, "not valid TOML = [").unwrap();
+    assert!(service.refresh_config().is_err());
+}
+
 /// Admits one request through the same atomic store boundary used by the service.
 fn admit(
     home: &common::Home,

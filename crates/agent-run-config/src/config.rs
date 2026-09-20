@@ -303,9 +303,31 @@ impl Runtime {
     }
 }
 impl Config {
+    /// Reads, parses, and validates the home configuration.
+    ///
+    /// The file is opened through the symlink-safe platform directory API and
+    /// is limited to one MiB. Missing, malformed, or invalid configuration is
+    /// returned as a domain error.
     pub fn load(home: &Path) -> Result<Self> {
-        let text = fs::Dir::open(home)?.read(Path::new("config.toml"), 1024 * 1024)?;
-        let text = std::str::from_utf8(&text).map_err(|_| invalid("config must be UTF-8"))?;
+        Self::load_if_changed(home, None)?
+            .map(|(config, _)| config)
+            .ok_or_else(|| invalid("configuration unexpectedly matched an absent revision"))
+    }
+
+    /// Loads the configuration only when its SHA-256 differs from `revision`.
+    ///
+    /// The digest covers the exact `config.toml` bytes. `Ok(None)` means the
+    /// file is unchanged and avoids TOML parsing; a changed file is parsed and
+    /// validated before its configuration and new lowercase digest are
+    /// returned. Invalid changes are never presented as a usable revision.
+    pub fn load_if_changed(home: &Path, revision: Option<&str>) -> Result<Option<(Self, String)>> {
+        let bytes = fs::Dir::open(home)?.read(Path::new("config.toml"), 1024 * 1024)?;
+        let digest = fs::sha256(&bytes);
+        if revision == Some(digest.as_str()) {
+            return Ok(None);
+        }
+        let text = bytes.as_slice();
+        let text = std::str::from_utf8(text).map_err(|_| invalid("config must be UTF-8"))?;
         // Remove only the explicitly retired runtime table before strict parsing.
         let mut raw: toml::Value =
             toml::from_str(text).map_err(|_| invalid("invalid config TOML"))?;
@@ -325,7 +347,7 @@ impl Config {
         let mut cfg: Self = toml::from_str(&rewritten)
             .map_err(|_| invalid("invalid config shape, type, or unknown field"))?;
         cfg.validate(home)?;
-        Ok(cfg)
+        Ok(Some((cfg, digest)))
     }
     pub fn profiles_dir(&self) -> &Path {
         self.profiles

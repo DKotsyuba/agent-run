@@ -185,6 +185,11 @@ fn python_rollback_restores_release_pointer_state_and_config() {
     )
     .expect("journal is valid JSON");
     assert_eq!(journal["phase"], "rolled_back");
+    assert_eq!(
+        deploy::rollback(&prefix, &home, false).unwrap_err(),
+        "deployment is already rolled back",
+        "a repeated rollback must identify the completed phase"
+    );
 }
 
 /// Mirrors `tests/test_release_script.py::LocalTests::test_live_birth_verified_legacy_writer_blocks_release`

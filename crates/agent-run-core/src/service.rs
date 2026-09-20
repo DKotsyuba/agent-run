@@ -18,7 +18,11 @@ use agent_run_config::role_plan;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,9 +57,21 @@ impl LaunchIdentity {
         Ok(result)
     }
 }
+/// Transport-neutral application facade with one shared configuration cache.
 #[derive(Clone)]
 pub struct Service {
+    /// Private agent-run home containing configuration and durable state.
     pub home: PathBuf,
+    /// Last valid configuration keyed by its exact on-disk SHA-256 revision.
+    config: Arc<RwLock<Option<CachedConfig>>>,
+}
+/// One immutable configuration revision retained between service calls.
+#[derive(Clone)]
+struct CachedConfig {
+    /// Lowercase SHA-256 of the exact `config.toml` bytes.
+    revision: String,
+    /// Parsed and validated configuration for `revision`.
+    value: Config,
 }
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -101,8 +117,45 @@ impl Query {
     }
 }
 impl Service {
+    /// Creates a service whose configuration is loaded lazily on first use.
+    ///
+    /// Clones share one configuration cache. File access and validation errors
+    /// are returned by [`Self::refresh_config`] or the operation using config.
     pub fn new(home: PathBuf) -> Self {
-        Self { home }
+        Self {
+            home,
+            config: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Reloads `config.toml` only when its content digest changed.
+    ///
+    /// Returns `true` after installing a new valid revision and `false` when
+    /// the exact bytes are unchanged. A malformed change returns an error and
+    /// leaves the last valid revision intact for diagnostics; operations that
+    /// need current configuration still reject that malformed change.
+    pub fn refresh_config(&self) -> Result<bool> {
+        let mut cache = self
+            .config
+            .write()
+            .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?;
+        let revision = cache.as_ref().map(|cached| cached.revision.as_str());
+        let Some((value, revision)) = Config::load_if_changed(&self.home, revision)? else {
+            return Ok(false);
+        };
+        *cache = Some(CachedConfig { revision, value });
+        Ok(true)
+    }
+
+    /// Returns the current valid configuration after checking its file digest.
+    fn current_config(&self) -> Result<Config> {
+        self.refresh_config()?;
+        self.config
+            .read()
+            .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
+            .as_ref()
+            .map(|cached| cached.value.clone())
+            .ok_or_else(|| Error::Runtime("configuration cache is empty".into()))
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;
@@ -132,7 +185,7 @@ impl Service {
                 }
             }
         }
-        let config = Config::load(&self.home)?;
+        let config = self.current_config()?;
         let runtime = config.runtime(&request.runtime)?;
         request.account = runtime.selected_account(request.account.as_deref())?;
         request.timeout_seconds = Some(
@@ -259,7 +312,7 @@ impl Service {
             .as_deref()
             .ok_or_else(|| invalid("parent has no runtime snapshot proof"))?;
         adapters::materialize::verify(runtime_home, digest)?;
-        let current = Config::load(&self.home)?;
+        let current = self.current_config()?;
         let active = current.runtime(&parent.request.runtime)?;
         if !active.models.contains(&parent.request.model) {
             return Err(invalid("parent model is no longer enabled"));

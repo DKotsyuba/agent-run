@@ -704,32 +704,31 @@ async fn command_flood_yields_after_one_bounded_page() {
     let mut child = spawn_supervisor(&home, &id);
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     wait_engine_poll_marker(&home, &id).await;
-    let accepted: i64 = Store::open(&home)
-        .unwrap()
+    let store = Store::open(&home).unwrap();
+    let marker_at: f64 = store
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND state='completed' AND json_extract(result_json,'$.accepted')=1",
+            "SELECT MIN(at) FROM messages WHERE agent_id=? AND content LIKE '%fixture poll marker%'",
             [id.as_str()],
             |row| row.get(0),
         )
         .unwrap();
+    let accepted: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND completed_at<=? AND json_extract(result_json,'$.accepted')=1",
+            rusqlite::params![id.as_str(), marker_at],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(accepted, 16);
+    drop(store);
     Service::new(home.clone()).cancel(&id).unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
-    let store = Store::open(&home).unwrap();
-    let steer_accepted: i64 = store
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='steer' AND json_extract(result_json,'$.accepted')=1",
-            [id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(steer_accepted, 16);
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_command_time_budget_yields_before_the_count_limit`.

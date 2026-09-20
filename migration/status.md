@@ -2,6 +2,28 @@
 
 Baseline: `DKotsyuba/agent-run` v0.11.15, commit `c9904f9843ba4a0772bdfa8bac5259f18fad9dc3`.
 
+## Update — 20 September 2026
+
+The remaining autonomous repair work is closed in the working tree after
+`5fcf870`:
+
+- the broker compares the exact `config.toml` SHA-256 every 60 seconds and
+  loads changed valid configuration without restart; starts and continuations
+  also check immediately;
+- the command-flood failure was a real event-loop fairness defect, not a flaky
+  assertion: both stream runners now poll ready engine output before opening a
+  later command page;
+- the stale-socket test now waits for the kernel's required `ECONNREFUSED`
+  precondition instead of racing Darwin's pending-connect queue;
+- a repeated rollback is rejected as `deployment is already rolled back`
+  instead of reporting a successful no-op.
+
+The full workspace suite passed with zero failures and one ignored Keychain
+smoke. Formatting, clippy with warnings denied, release qualification, source
+archive verification, and the 30-entry evidence index all pass. Formal release
+acceptance still requires the external live portions and signed checklist
+listed under *Blocking acceptance gates*; this update does not claim them.
+
 ## What this artifact is
 
 A native Rust implementation of agent-run: workspace source, SQL, assets, an
@@ -95,25 +117,10 @@ Measured personally on macOS (Darwin 27.0.0, arm64) at the commits noted:
 | first | **1084 passed, 0 failed, 1 ignored** across 109 targets |
 | `--locked` | **1084 passed, 0 failed, 1 ignored** — the committed lockfile resolves |
 | second | 1083 passed, **1 failed**, 1 ignored |
+| 20 September working tree | **all targets passed, 0 failed, 1 ignored** |
 
-The ignored test is a Keychain probe that needs a real keychain.
-
-**Two tests failed intermittently and are under investigation. Neither is
-dismissed as flaky.**
-
-- `command_flood_yields_after_one_bounded_page` failed once under load with 40
-  accepted commands where the page limit is 16. The paged loop is literally
-  `for _ in 0..COMMAND_PAGE_LIMIT`, so one page cannot accept 17; 40 suggests
-  three pages elapsed before the test counted. It passed 15 consecutive isolated
-  runs here. That reading is a hypothesis under active falsification, not a
-  conclusion.
-- `python_stale_socket_reclaim_requires_econnrefused` failed once in ten, on its
-  **precondition** rather than its subject: a connect issued immediately after
-  the stale listener was dropped succeeded instead of being refused, so the
-  reclaim assertion was never reached.
-
-Until both are resolved, this revision should be read as "1084 passing with two
-known intermittent test failures", not as a clean suite.
+The ignored test is a Keychain probe that needs a real keychain. The two former
+intermittent failures are resolved in the 20 September update above.
 
 A shell that forbids binding Unix domain sockets reports ~56 failures across 7
 targets. Every one is a bind denial — verified by a direct bind probe and by
@@ -153,14 +160,9 @@ services/jobs, verify API readiness and capability discovery, then run the
 isolated release smoke."* That is ADR A19's divergence stated in the artifact an
 operator reads at the moment of cutover.
 
-**One weakness found, not yet fixed.** Running `rollback` a second time returns
-exit 0 and reports success although there was nothing left to roll back: the
-phase stays `rolled_back` and the pointer does not move. It performs no work,
-which is correct, but it does not say that no work was done — unlike the
-no-predecessor case, which refuses explicitly. Plan §21.6 requires a repeated
-command to recognise its phase and not declare success over unfinished work. An
-operator who repeats a rollback after a dropped connection cannot tell which
-invocation acted.
+The repeated-rollback weakness found by this rehearsal is fixed in the 20
+September working tree: a second rollback recognizes `rolled_back`, returns an
+explicit error, and leaves the pointer and journal unchanged.
 
 This rehearsal is **not** a substitute for the §21.6 drill set or for a
 production cutover. It shows the switch, rollback and roll-forward mechanics

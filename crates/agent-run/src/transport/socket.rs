@@ -271,6 +271,8 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_PENDING_REQUESTS: usize = 64;
 const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
+/// Interval between content-digest checks for a running broker's configuration.
+const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_METHODS: &[&str] = &["start", "resume", "cancel", "steer"];
 
 /// Bounds one socket server's connections, request queue, and frame deadlines.
@@ -638,11 +640,24 @@ pub async fn serve_at_with_options(
     let worker = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut config_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + CONFIG_RELOAD_INTERVAL,
+            CONFIG_RELOAD_INTERVAL,
+        );
+        config_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
-            let _ = maintenance.reconcile();
-            if let Err(e) = crate::delivery::dispatch_once(&maintenance.home).await {
-                eprintln!("delivery maintenance: {}", e.public().kind);
+            tokio::select! {
+                _ = tick.tick() => {
+                    let _ = maintenance.reconcile();
+                    if let Err(e) = crate::delivery::dispatch_once(&maintenance.home).await {
+                        eprintln!("delivery maintenance: {}", e.public().kind);
+                    }
+                }
+                _ = config_tick.tick() => match maintenance.refresh_config() {
+                    Ok(true) => eprintln!("configuration reloaded"),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("configuration reload: {}", error.public().kind),
+                },
             }
         }
     });

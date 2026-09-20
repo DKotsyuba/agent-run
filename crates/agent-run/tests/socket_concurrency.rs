@@ -48,8 +48,7 @@ async fn python_stale_socket_reclaim_requires_econnrefused() {
     let stale = UnixListener::bind(&path).expect("bind stale socket");
     let stale_inode = std::fs::symlink_metadata(&path).unwrap().ino();
     drop(stale);
-    let error = UnixStream::connect(&path).await.unwrap_err();
-    assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+    wait_for_connection_refused(&path).await;
 
     let task = tokio::spawn({
         let home = temp.path().to_owned();
@@ -64,6 +63,27 @@ async fn python_stale_socket_reclaim_requires_econnrefused() {
     );
     task.abort();
     let _ = task.await;
+}
+
+/// Waits until a dropped listener is observably stale to the kernel.
+///
+/// Darwin can briefly complete a queued connect after the listener handle is
+/// dropped. Retrying only establishes the production precondition this test
+/// needs; the broker still performs and verifies its own reclaim probe.
+async fn wait_for_connection_refused(path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match UnixStream::connect(path).await {
+            Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => return,
+            Ok(stream) => drop(stream),
+            Err(error) => panic!("unexpected stale socket probe error: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stale socket never reached ECONNREFUSED"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A slow or malformed owner probe remains protected because connect success

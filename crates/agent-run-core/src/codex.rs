@@ -524,7 +524,11 @@ pub async fn run(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let event = tokio::select! {event=process.next()=>Some(event),_=tick.tick()=>None};
+        let event = tokio::select! {
+            biased;
+            event = process.next() => Some(event),
+            _ = tick.tick() => None,
+        };
         let Some(event) = event else {
             process.owner.refresh();
             let started = tokio::time::Instant::now();
@@ -586,6 +590,7 @@ pub async fn run(
                     )?;
                 }
             }
+            tick.reset();
             continue;
         };
         let v = match event {

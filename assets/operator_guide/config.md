@@ -80,12 +80,14 @@ unknown-but-unreserved key (Codex `model_verbosity`, for instance) is accepted
 as a plain tuning value; that is a convenience, not a safety claim about every
 upstream key. Never place secret values in `native_settings`: auth and
 credential sources are never resolved through it, but the table is persisted
-verbatim in the config snapshot. Edit the TOML, parse it, run
-`agent-run doctor`, then restart or reload the broker: new launches pick up the
-settings. There is no live hot reload, and existing sessions keep the config
-they were prepared with. The config snapshot records the declared settings, so
-a change alters snapshot identity and forces regeneration on the next launch.
+verbatim in the config snapshot. Edit the TOML, parse it, and run
+`agent-run doctor`: the broker compares the file's SHA-256 every 60 seconds and
+loads a changed valid revision without restarting. New starts and continuations
+also check immediately; malformed changes are rejected instead of replacing the
+last valid cached revision. Existing sessions keep the immutable config they
+were prepared with. The config snapshot records the declared settings, so a
+change alters snapshot identity and forces regeneration on the next launch.
 
-Before restarting a service after manual edits, parse the TOML and run
-`agent-run doctor`. Doctor checks binaries and role assets; runtime start does
-not run language-toolchain readiness probes.
+After manual edits, parse the TOML and run `agent-run doctor`. Doctor checks
+binaries and role assets; runtime start does not run language-toolchain
+readiness probes.

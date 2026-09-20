@@ -491,9 +491,15 @@ pub fn roll_forward(prefix: &Path, home: &Path, force: bool) -> Result<(), Strin
 }
 
 /// Restores the prior pointer and retained state/config backup from the journal.
+///
+/// A journal already in `rolled_back` phase is rejected explicitly so an
+/// operator never mistakes a no-op retry for a second completed restore.
 pub fn rollback(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
     quiescent(home, force)?;
     let journal = read_journal(prefix)?;
+    if journal["phase"] == "rolled_back" {
+        return Err("deployment is already rolled back".into());
+    }
     let old = PathBuf::from(
         journal["old_release"]
             .as_str()
@@ -649,9 +655,9 @@ mod tests {
         }
     }
 
-    // Rust-only: retry, roll-forward, and explicit restore all have repeatable end states.
+    // Rust-only: retry and roll-forward are repeatable; repeated restore is explicit.
     #[test]
-    fn t84_retry_roll_forward_and_explicit_restore_are_idempotent() {
+    fn t84_retry_and_roll_forward_are_idempotent_and_repeat_rollback_is_explicit() {
         let (_temporary, prefix, home, old, new) = cutover_fixture();
         assert!(deploy_with_failure(&prefix, &home, &new, CutoverStage::Before).is_err());
         deploy(&prefix, &home, &new, false).expect("retry deployment");
@@ -662,7 +668,10 @@ mod tests {
             new
         );
         rollback(&prefix, &home, false).expect("explicit restore");
-        rollback(&prefix, &home, false).expect("repeat explicit restore");
+        assert_eq!(
+            rollback(&prefix, &home, false).unwrap_err(),
+            "deployment is already rolled back"
+        );
         assert_eq!(
             fs::read_link(prefix.join("current")).expect("current pointer"),
             old
