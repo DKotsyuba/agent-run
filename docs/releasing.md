@@ -62,19 +62,33 @@ one host's binary.
    git push origin v0.12.0
    ```
 
-The `Release` workflow repeats the Rust gates on macOS and Linux, builds and
-verifies each sealed native release plus the source archive, generates one
-`SHA256SUMS`, attests the listed artifacts, and publishes a GitHub Release only
-after every required job succeeds. A failed run leaves no public partial
-release. Tags are immutable; corrections ship as a new patch version.
+After CI accepts the commit, the tagged `Release` workflow runs `cargo xtask
+check` and the release gates in both native macOS and Linux jobs, then builds
+and verifies both sealed artifacts. It also verifies the source archive,
+generates one `SHA256SUMS`, attests the listed artifacts, and publishes a GitHub
+Release only after every required job succeeds. A failed run leaves no public
+partial release. Tags are immutable; corrections ship as a new patch version.
 
 ## Install or update a sealed runtime
 
-Use `cargo xtask release install`, `update`, `roll-forward`, or `rollback` with
-the explicit release, prefix, and home described by `cargo xtask release` usage.
-The deployer verifies the manifest before switching `current`, checks schema
-compatibility, reserves the SQLite writer, backs up state, and records a private
-deployment journal.
+Use explicit paths for every deployment operation:
+
+```bash
+release=/absolute/path/to/sealed-release
+prefix="$HOME/.agent-run/standalone"
+home="$HOME/.agent-run"
+
+cargo xtask release install --release "$release" --prefix "$prefix" --home "$home"
+cargo xtask release update --release "$release" --prefix "$prefix" --home "$home"
+cargo xtask release roll-forward --prefix "$prefix" --home "$home"
+cargo xtask release rollback --prefix "$prefix" --home "$home"
+```
+
+`--release` is required for install and update; roll-forward and rollback use
+the retained deployment journal and therefore accept only `--prefix` and
+`--home`. The deployer verifies the manifest before switching `current`, checks
+schema compatibility, reserves the SQLite writer, backs up state, and records a
+private deployment journal.
 
 Service control and post-switch API/MCP validation remain explicit operator
 steps:

@@ -4,15 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-- build: add macOS Apple-silicon and Linux x86-64 release artifacts; Linux
-  remains pending qualification until its first hosted full-suite and sealed
-  release succeeds
-
 ## [0.12.0] - 2026-09-20
 
 - feat!: make the self-contained Rust broker the sole primary implementation
-- build!: replace interpreter packages with a sealed macOS Apple-silicon binary
-- ci!: run Rust-only checks, release verification, and source-archive gates
+- build!: replace interpreter packages with sealed macOS Apple-silicon and
+  Linux x86-64 binaries; Linux remains pending its first hosted qualification
+- ci!: run Rust-only checks and sealed release verification on both native
+  targets, plus source-archive gates
 - fix(codex): honor safe plugin-declared relative hook manifest paths
 - feat!: remove the deprecated Qwen runtime; legacy Qwen configuration now
   fails with explicit removal guidance
