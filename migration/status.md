@@ -69,10 +69,10 @@ A native Rust implementation of agent-run: workspace source, SQL, assets, an
 optional signed-Node bridge for one external host, tests, and migration
 documentation. It is not a Python wrapper.
 
-The Python implementation is present in this repository and was used as the
-behavioral reference throughout: every ported Rust test cites the Python test it
-mirrors, and the citations are machine-checked by
-`migration/tools/coverage_report.py` against `cargo test --list`.
+The frozen Python implementation on `archive/python-legacy` was the behavioral
+reference throughout. Rust tests retain their baseline citations, and the final
+coverage ledger generated before archival remains in
+`migration/baseline/test-map.csv`.
 
 **What "ported" means here.** A behavior is counted only when a Rust test
 carrying a machine-parsed `Mirrors` citation is discovered by `cargo test
@@ -82,7 +82,7 @@ platform other than the one it was tested on. See *Blocking acceptance gates*.
 
 ## Corpus coverage
 
-Measured by `migration/tools/coverage_report.py`; the per-behavior ledger is
+The final pre-archive measurement is retained in
 `migration/baseline/test-map.csv`.
 
 | Status | Behaviors |
@@ -98,10 +98,10 @@ is an explicit A10 divergence. Rust returns promptly at the deadline but never
 unconditionally signals a process group after its leader identity can no longer
 be verified.
 
-That divergence was measured, not assumed; the measurement and the false-pass
-trap that hides it are recorded in `migration/adr/A10-spawn-backend.md` under
-"Measured cost of decision 5". It is an owner decision, which is why the
-behavior is carried as unported rather than quietly reclassified.
+That divergence was measured, not assumed; the measurement and false-pass trap
+are recorded in `migration/adr/A10-spawn-backend.md` under "Measured cost of
+decision 5". The Rust-primary decision explicitly records it as a divergence,
+not unfinished work.
 
 Declared divergences are recorded per behavior in
 `migration/baseline/divergences.csv`, each naming the ADR that decided it: A09
