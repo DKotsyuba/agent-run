@@ -8,22 +8,29 @@ tool surface through its CLI, MCP stdio server, and Unix-socket JSON-RPC API.
 The broker and its release artifact do not require Python. Engine CLIs remain
 external dependencies and must be installed and authenticated separately.
 
-## Supported release target
+## Release targets
 
-The first Rust-primary release supports macOS on Apple silicon
-(`aarch64-apple-darwin`). Linux is compiled and tested in CI as validation-only;
-it is not yet a supported release target. macOS-specific Keychain and launchd
-integration are unavailable elsewhere.
+Releases are built for macOS Apple silicon (`aarch64-apple-darwin`) and Linux
+x86-64 (`x86_64-unknown-linux-gnu`). macOS has committed qualification
+evidence. Linux remains pending qualification until the first hosted Linux
+full-suite and sealed-release run succeeds; its artifact is an early target,
+not yet equivalent evidence. Keychain and launchd integration remain macOS-only.
 
 ## Install
 
-Download `agent-run-0.12.0-aarch64-apple-darwin.tar.gz` and `SHA256SUMS` from
-the matching GitHub Release, verify the checksum, then place the binary on
-`PATH`:
+Download `SHA256SUMS` and the archive for your platform from the matching
+GitHub Release:
+
+- `agent-run-0.12.0-aarch64-apple-darwin.tar.gz`
+- `agent-run-0.12.0-x86_64-unknown-linux-gnu.tar.gz`
+
+Verify the checksum, then place the binary on `PATH`:
 
 ```bash
-shasum -a 256 -c SHA256SUMS
-tar -xzf agent-run-0.12.0-aarch64-apple-darwin.tar.gz
+target=x86_64-unknown-linux-gnu  # macOS: aarch64-apple-darwin
+grep "agent-run-0.12.0-${target}.tar.gz" SHA256SUMS | sha256sum -c -
+# macOS: replace `sha256sum -c -` with `shasum -a 256 -c -`
+tar -xzf "agent-run-0.12.0-${target}.tar.gz"
 install -m 0755 bin/agent-run ~/.local/bin/agent-run
 agent-run init
 ```
@@ -50,8 +57,8 @@ schema_version = 1
 [runtimes.codex]
 enabled = true
 adapter = "codex"
-binary = "/opt/homebrew/bin/codex"
-home = "/Users/you/.agent-run/runtimes/codex"
+binary = "/absolute/path/to/codex"
+home = "/absolute/path/to/agent-run-home/runtimes/codex"
 models = ["gpt-5.6-sol"]
 limits_source = "codex_appserver"
 ```
@@ -86,6 +93,10 @@ agent-run api launchd --binary "$(command -v agent-run)" \
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
 ```
 
+On Linux, run the same `agent-run api serve` command under an external service
+manager such as systemd, using an absolute binary path, `AGENT_RUN_HOME`, and a
+normal user account. agent-run does not generate systemd units.
+
 ## Use the CLI
 
 ```bash
@@ -106,7 +117,7 @@ Output is line-delimited JSON. Other commands include `steer`, `cancel`,
 The MCP process is a thin stdio proxy over the resident broker:
 
 ```json
-{"command":"agent-run","args":["--home","/Users/you/.agent-run","mcp"]}
+{"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
 It exposes `start`, `resume`, `cancel`, `steer`, `list_agents`, `answer`,

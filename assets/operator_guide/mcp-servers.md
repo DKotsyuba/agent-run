@@ -58,8 +58,6 @@ not replace Codex sandboxing or residual auto-review.
 
 ## Current state
 
-Children (agents started via claude and codex) see `agent_lsp` and
-`codegraph` today, when those runtimes' config lists them.
-
-This is an upstream engine limitation rather than an agent-run config error;
-use another runtime when a child requires MCP tools.
+Codex and Claude children receive only the MCP servers named by their runtime
+or revisioned profile. GLM does not expose the same native child-MCP surface;
+use Codex or Claude when a task requires MCP tools.

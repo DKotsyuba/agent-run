@@ -24,7 +24,7 @@ enabled = true
 adapter = "codex"
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
-workspace_root = "/Users/you/projects"
+workspace_root = "/absolute/path/to/projects"
 workspace_network = true
 models = ["gpt-6-astra"]
 accounts = ["personal2"]
@@ -51,8 +51,9 @@ MCP `approval_mode = "approve"` is appropriate only for a locally trusted server
 whose own runtime enforces downstream permissions.
 
 Omitting an account uses native global auth. An explicit label selects separate
-credential state. Legacy `default_account`, environment, and Rust declarations
-are readable but do not provision tools or redirect unlabelled starts.
+credential state. Compatibility-only `default_account`, environment, and Rust
+declarations remain readable but do not provision tools or redirect unlabelled
+starts; remove them from new configurations.
 
 `runtimes.<name>.native_settings` retunes a runtime's own generated preference
 file (Codex `config.toml` or Claude/GLM `settings.json`)

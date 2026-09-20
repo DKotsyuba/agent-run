@@ -30,6 +30,26 @@ The generated service runs `BINARY --home HOME api serve` with `RunAtLoad` and
 broker, supervisors, and runtime children inherit that limit instead of
 launchd's default 256. A foreground process can still be run under another
 supervisor when launchd is unavailable.
+
+On Linux, run the foreground command under an external service manager.
+agent-run does not generate systemd units. A user unit can use:
+
+```ini
+[Unit]
+Description=agent-run broker
+
+[Service]
+ExecStart=/home/you/.local/bin/agent-run --home /home/you/.agent-run api serve
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
+```
+
+Install it as `~/.config/systemd/user/agent-run.service`, adjust both absolute
+paths, then run `systemctl --user enable --now agent-run.service`.
+
 - Socket path defaults to `<home>/api.sock` (with `--home ~/.agent-run`
   that is `~/.agent-run/api.sock`). Override with `--socket PATH`.
   macOS caps `AF_UNIX` paths at ~104 bytes — keep the path short.
@@ -220,5 +240,5 @@ id); `-32603` as a bug to report.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- Schema version 9 adds immutable per-attempt delivery evidence. Older resident
-  processes refuse the migrated database and must be restarted after upgrade.
+- The current database schema is version 16. Older resident processes refuse a
+  newer database and must be restarted after an upgrade migrates it.

@@ -35,7 +35,8 @@ Continuations preserve it without probing again; it does not claim that the
 configured binary itself is pinned or unchanged at resume time. Adapters without
 trustworthy current version evidence record `null`.
 
-Executable contract scenarios live in `tests/test_snapshots.py`:
+Executable contract scenarios live in
+`crates/agent-run-adapters/tests/snapshots.rs`:
 
 1. Copy a skill containing a manifest, script, and empty directory; changing
    only script bytes changes the snapshot revision.

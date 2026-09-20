@@ -28,8 +28,7 @@ Two checks matter most for a supervisor that cannot even start:
   the same way.
 - **MCP process inventory** (`component: mcp:*`): lists every running
   `agent-run mcp` process it can see, with pid, start time, and the release
-  path from its own `ps` argv (macOS has no way to read a running process's
-  resolved executable back from the OS). `mcp_process_older_release` fires
+  path from its `ps` argv. `mcp_process_older_release` fires
   when a process started before the `standalone/current` symlink's last
   switch — it may still be running old code; reconnect MCP in that session
   before pruning releases.
@@ -41,8 +40,6 @@ Known kinds include `auth_failed`, `permission_rejected`,
 `supervision_failed`, and the `runner-*` family for runner-level failures.
 Match on `failure_kind` first, then read `failure_text` for the specific
 detail — don't parse `failure_text` to decide behavior.
-
-permissions bug elsewhere.
 
 ## limits: honest-unknown, not always-fresh
 
@@ -75,7 +72,7 @@ and credentials are intentionally unavailable.
 
 ## Orphan check
 
-To find agents whose supervisor process died without cleanup: `ps` for
-`supervisor_main` processes, and cross-reference with `agents --active`
-per home. A home with active agents in the store but no matching
-supervisor process is an orphan and safe to reconcile.
+Run `agent-run doctor` and cross-reference its supervisor findings with
+`agent-run agents --active` for the same home. Reconcile only records whose
+stored PID plus birth identity is observed as dead or reused; unknown or denied
+identity is never proof of an orphan.

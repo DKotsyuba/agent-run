@@ -16,7 +16,8 @@ plugins = ["/abs/path/to/tokenpipe-compressor", "/abs/path/to/agent-lsp-plugin"]
 - **codex** copies the plugin into the generated home, and hook trust
   digests are auto-seeded for it (config-level `hooks` entries are seeded
   the same way).
-  hook/tool mechanism of its own today.
+- **glm** accepts declared skill assets but has no native plugin hook/tool
+  mechanism.
 
 ## Operator checklist for a new plugin
 
@@ -25,5 +26,5 @@ plugins = ["/abs/path/to/tokenpipe-compressor", "/abs/path/to/agent-lsp-plugin"]
 2. If the plugin ships skills, add each skill name to that runtime's
    `skills = [...]` too — omitting this step is the most common cause of
    "the plugin is configured but its skill is refused."
-3. Rematerialize and restart per `service` / `skills` as appropriate for
-   the runtime.
+3. Start a new run. Existing sessions retain their immutable generated home;
+   resume only when its stored snapshot still verifies.

@@ -2,7 +2,8 @@
 
 state.db's schema version is tracked in SQLite's own `PRAGMA user_version`.
 Each schema change beyond the initial schema is a numbered SQL delta file
-under `state/migrations/` (`NNN_slug.sql`), applied in order.
+under `sql/migrations/` (`NNN_slug.sql`), applied in order. The current schema
+is version 16.
 
 ## Write paths migrate automatically
 
