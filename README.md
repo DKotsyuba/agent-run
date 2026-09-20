@@ -88,9 +88,10 @@ agent-run api serve
 For a long-lived macOS installation:
 
 ```bash
+plist="$HOME/Library/LaunchAgents/com.agent-run.api.plist"
 agent-run api launchd --binary "$(command -v agent-run)" \
-  > ~/Library/LaunchAgents/com.agent-run.api.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
+  | plutil -extract plist raw -o "$plist" -
+launchctl bootstrap "gui/$(id -u)" "$plist"
 ```
 
 On Linux, run the same `agent-run api serve` command under an external service
@@ -100,7 +101,7 @@ normal user account. agent-run does not generate systemd units.
 ## Use the CLI
 
 ```bash
-agent-run start --runtime codex --model gpt-5.6-sol --profile review \
+agent-run start --runtime codex --model gpt-5.6-sol --profile role-review \
   --task "Review this repository." --workdir "$PWD"
 
 agent-run agents

@@ -19,12 +19,13 @@ the value as `default_tools_approval_mode`. For every attached server set to
 can approve only that server's MCP namespace. It never approves Bash or file
 operations. Other adapters ignore the Codex-specific approval hint.
 
-## Attaching to runtimes
+## Selecting servers
 
-A declared `[mcp.<name>]` server does nothing on its own. Attach it to a
-runtime by adding its name to that runtime's `mcp = [...]` list. A server
-declared but attached to no runtime is inert; a name listed in `mcp =
-[...]` but not declared under `[mcp.<name>]` fails closed at config load.
+A declared `[mcp.<name>]` server does nothing on its own. Canonical revisioned
+profiles select servers with `mcp = ["name"]` in their front matter. Runtime
+`mcp = [...]` lists remain readable only for compatibility profiles; canonical
+and compatibility selection cannot be mixed. A server selected nowhere is
+inert, and an unknown selected name fails closed at config load.
 
 ## Codex workspace and destructive guard
 
@@ -58,6 +59,5 @@ not replace Codex sandboxing or residual auto-review.
 
 ## Current state
 
-Codex and Claude children receive only the MCP servers named by their runtime
-or revisioned profile. GLM does not expose the same native child-MCP surface;
-use Codex or Claude when a task requires MCP tools.
+Codex, Claude, and GLM children receive only the MCP servers selected by the
+effective revisioned profile or compatibility runtime list.

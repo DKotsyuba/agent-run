@@ -21,9 +21,14 @@ For the recommended long-lived macOS setup, generate a keep-alive launchd
 plist, then bootstrap it for the current user:
 
 ```bash
-agent-run --home ~/.agent-run api launchd --binary "$(command -v agent-run)" > ~/Library/LaunchAgents/com.agent-run.api.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-run.api.plist
+plist="$HOME/Library/LaunchAgents/com.agent-run.api.plist"
+agent-run --home "$HOME/.agent-run" api launchd --binary "$(command -v agent-run)" \
+  | plutil -extract plist raw -o "$plist" -
+launchctl bootstrap "gui/$(id -u)" "$plist"
 ```
+
+The launchd command emits a JSON result. Extract its `plist` field as shown;
+redirecting the full JSON object does not create a valid launchd plist.
 
 The generated service runs `BINARY --home HOME api serve` with `RunAtLoad` and
 `KeepAlive` enabled. It sets the job's soft open-file limit to 65,536; the API
