@@ -9,7 +9,6 @@ use agent_run::{
 };
 use serde_json::json;
 use std::{
-    os::unix::fs::MetadataExt,
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -46,7 +45,6 @@ async fn python_stale_socket_reclaim_requires_econnrefused() {
     cli::init(temp.path()).expect("initialize temporary home");
     let path = temp.path().join("broker.sock");
     let stale = UnixListener::bind(&path).expect("bind stale socket");
-    let stale_inode = std::fs::symlink_metadata(&path).unwrap().ino();
     drop(stale);
     wait_for_connection_refused(&path).await;
 
@@ -56,11 +54,12 @@ async fn python_stale_socket_reclaim_requires_econnrefused() {
         async move { socket::serve_at(&home, &path).await }
     });
     wait_for_socket(&path).await;
-    assert_ne!(
-        std::fs::symlink_metadata(&path).unwrap().ino(),
-        stale_inode,
-        "reclaim must replace the refused socket inode"
-    );
+    let ping = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}}),
+    )
+    .await;
+    assert_eq!(ping["result"]["ok"], true, "response={ping}");
     task.abort();
     let _ = task.await;
 }
@@ -184,20 +183,27 @@ async fn python_control_lane_survives_regular_connection_pressure() {
     let _ = task.await;
 }
 
-/// Sends one long-poll request and decodes its ordered broker response.
+/// Sends one JSON-RPC request and decodes its response within five seconds.
+///
+/// The bound accommodates the one-second long polls in this suite while making
+/// an unresponsive broker fail the test promptly.
 async fn request(path: &Path, value: serde_json::Value) -> serde_json::Value {
-    let mut stream = UnixStream::connect(path).await.unwrap();
-    frame::write(&mut stream, &value, socket::MAX_FRAME)
-        .await
-        .unwrap();
-    let mut input = BufReader::new(stream);
-    serde_json::from_slice(
-        &frame::read(&mut input, socket::MAX_FRAME)
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        frame::write(&mut stream, &value, socket::MAX_FRAME)
             .await
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap()
+            .unwrap();
+        let mut input = BufReader::new(stream);
+        serde_json::from_slice(
+            &frame::read(&mut input, socket::MAX_FRAME)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    })
+    .await
+    .expect("broker request exceeded five-second test deadline")
 }
 
 // Rust-internal assertion: SIGTERM must let admitted requests finish before
