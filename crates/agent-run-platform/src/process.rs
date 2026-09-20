@@ -272,15 +272,21 @@ fn proc_ids() -> std::io::Result<Vec<i32>> {
     let mut ids = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
-        if let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse().ok())
-        {
+        if let Some(pid) = safe_process_id(&entry.file_name()) {
             ids.push(pid);
         }
     }
     Ok(ids)
+}
+
+/// Parse one process-directory name only when it is safe to inspect or signal.
+///
+/// PID 0 and PID 1 are excluded before [`processes`] calls [`inspect`], so the
+/// platform-wide snapshot cannot fail merely because procfs exposes its init
+/// process alongside owned runtime processes.
+#[cfg(any(target_os = "linux", test))]
+fn safe_process_id(name: &std::ffi::OsStr) -> Option<i32> {
+    name.to_str()?.parse().ok().filter(|pid| *pid > 1)
 }
 
 /// Prefix of Darwin's `struct extern_proc` ending at its stable PID field.
@@ -673,6 +679,16 @@ impl OwnedProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Procfs init and wildcard-like names never enter a process snapshot.
+    #[test]
+    fn process_directory_names_require_a_pid_above_one() {
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("0")), None);
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("1")), None);
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("self")), None);
+        assert_eq!(safe_process_id(std::ffi::OsStr::new("2")), Some(2));
+    }
+
     #[test]
     fn unreadable_evidence_is_never_death() {
         let failed = |code| Err(std::io::Error::from_raw_os_error(code));
