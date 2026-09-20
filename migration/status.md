@@ -57,6 +57,12 @@ resolved. The implementation is committed as
 the refreshed evidence index verifies 32 entries. Remaining acceptance work is
 limited to the live resource classes and signed P12 checklist described below.
 
+The sealed candidate at `e8d5b7d6011680f4ff79913d0c25c8d6f92a81c4`
+also passed an isolated release smoke: manifest verification, CLI, API ping and
+tool discovery, MCP initialization/listing, broker-backed fixture execution,
+verified answer proof, clean doctor, and socket cleanup. Evidence is recorded
+in `migration/evidence/release-smoke-2026-09-20.md`.
+
 ## What this artifact is
 
 A native Rust implementation of agent-run: workspace source, SQL, assets, an
