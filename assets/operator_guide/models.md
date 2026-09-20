@@ -3,8 +3,9 @@
 ## claude, codex, and glm
 
 Static rosters: whatever model ids are listed in each runtime's `models =
-[...]` in config.toml. There is nothing to sync — editing the list and
-rematerializing is the whole operation.
+[...]` in config.toml. There is nothing else to sync: the broker loads a valid
+changed config automatically, and new starts materialize the updated roster.
+Existing sessions retain their admitted model identity.
 
 ### Verifying
 

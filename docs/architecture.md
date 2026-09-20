@@ -1,292 +1,137 @@
 # agent-run architecture
 
-How the pieces fit, as shipped today. For integration details see
+agent-run is one Rust workspace and one native `agent-run` executable. It owns
+durable admission, detached supervision, runtime materialization, evidence, and
+completion delivery for Codex, Claude, and GLM. For the local wire contract, see
 [api.md](api.md).
 
-## Managed Codex context
+## Component map
 
-Every agent start regenerates its managed Codex `config.toml`. The generator
-writes root-level `model_context_window = 1000000`,
-`model_auto_compact_token_limit = 780000`, and
-`model_auto_compact_token_limit_scope = "total"`. These defaults survive
-regeneration and also apply to account-specific runtime homes. They are explicit
-client settings; they do not increase a model's server-side context limit.
-
-## The shape
-
-```
-transports          CLI (cli.py)   MCP stdio (mcp.py)   JSON-RPC socket (api_socket.py)
-                          \               |                see docs/api.md
-one tool surface           `──────  dispatch.py  ──────'
-                                        │  TOOLS table + call_tool
-domain facade                     service.py (AgentService)
-                                        │
-durable state              state/  (versioned SQLite schema, migrations)
-                                        │
-engine drivers          adapters/  ──  supervisor  ──  detached children
-                     codex · claude · glm
+```text
+CLI ───────────────┐
+MCP stdio proxy ───┼─> shared dispatcher ─> service ─> store / adapters
+Unix socket API ───┘                              └─> detached supervisor
 ```
 
-MCP is a thin stdio proxy forwarding `tools/call` to the resident Unix-socket
-daemon. The daemon is the single launch host, closing the nested-sandbox
-failure mode; a proxy without store access survives release switches.
+| Crate | Responsibility |
+|---|---|
+| `agent-run` | CLI, MCP proxy, Unix-socket daemon, launchd helper |
+| `agent-run-domain` | public requests, responses, tools, errors, states |
+| `agent-run-config` | strict config, profiles, role plans, snapshots |
+| `agent-run-store` | SQLite schema 16, migrations, events, projections |
+| `agent-run-adapters` | Codex, Claude, and GLM preparation and protocols |
+| `agent-run-core` | service, supervisor, lifecycle, delivery, capacity, doctor |
+| `agent-run-platform` | native launch, process identity, safe files, snapshots |
 
-Three transports expose one dispatcher. A tool added to
-`dispatch.TOOLS` appears in all of them; parity tests fail otherwise.
-`AgentService` is the only door to state and adapters — transports never
-touch the store or an engine directly.
+The dispatcher is the only public tool table. CLI, MCP, and socket JSON-RPC
+route through it, and parity tests prevent transport-specific tool surfaces.
+MCP is a thin proxy to the resident broker, so the broker remains the only
+launch host.
 
-## Durable agents
+## Configuration and generated homes
 
-`start` validates and durably admits the request as `starting`, then launches a
-**detached supervisor process**. The supervisor records its PID and birth proof
-and signals READY before authentication, materialization, or adapter preparation;
-`start` returns after that ownership handoff. The supervisor opens its own
-thread-affine store, performs those slow steps, and then owns the child engine.
-Payload delivery and the READY handshake are bounded and honor cancellation even
-when the child stops reading the pipe. After READY, preparation and runtime
-execution have no service-owned age or deadline transition. Reconciliation marks
-an owned run `lost` only when observing its stored PID and birth proof yields the
-OS verdict `dead` or `reused`; `unknown` and `denied` remain unchanged.
-On supported POSIX systems the launcher uses `posix_spawn(..., setsid=True)`;
-the legacy fork path is only a compatibility fallback when session-creating
-spawn is explicitly unavailable.
-From that point the orchestrating process is optional: state transitions
-(`starting → running → succeeded/failed/timed_out/cancelled/lost`) are
-recorded as events; transcripts are journaled as messages with large
-payloads kept as file references.
+`<home>/config.toml` is strict and credential-free. The service caches the last
+valid revision, compares the file SHA-256 every 60 seconds, and checks again at
+request boundaries. A malformed changed file is rejected without replacing the
+cached configuration.
 
-The supervisor enforces:
+Each fresh run gets a generated lineage home. The adapter materializes only the
+declared runtime settings, account bridge, skills, MCP servers, hooks, plugins,
+and role policy. Managed trees and the sanitized config snapshot are hashed and
+indexed. A continuation reuses the lineage only after the stored snapshot
+verifies; it does not silently rebuild from changed live assets. See
+[artifact-snapshots.md](artifact-snapshots.md) and
+[runtime-contract.md](runtime-contract.md).
 
-- **cancellation** — kills the process tree, not just the first child;
-- **outcome classification** — the terminal status is derived from
-  recorded evidence (result payloads, completion sentinels, error-only
-  answer detection), never from exit code alone.
+## Admission and supervision
 
-Runtime execution has no automatic deadline, warning, silence watchdog, or
-periodic heartbeat. Legacy timeout and watchdog fields remain accepted and
-stored so older requests and state snapshots stay readable, but the supervisor
-does not act on them. Runs stop when the engine finishes or cancellation is
-requested.
+`start` validates the request and commits a `starting` row before process
+creation. The broker starts the hidden `_supervisor` command as a detached
+session leader, then requires three bounded bootstrap steps:
 
-Current answers store the engine's exact UTF-8 payload without a completion
-sentinel. A directory format marker makes the adjacent versioned proof
-mandatory; the marker, payload, and proof are individually synchronized in that
-order, and the proof binds the payload name, size, and sha256. Historical
-sentinel-framed answers remain readable only with the exact terminal frame.
-`answer <id>` opens owned files without following links, verifies at most 16 MiB
-of original stored bytes, and streams validation when content exceeds the
-separate inline display limit.
+1. the child reports its exact PID;
+2. ownership and native birth identity are committed;
+3. the child reports READY.
 
-Codex raw assistant deltas are journaled as they arrive. Normalized transcript
-chunks retain a final nonblank segment and adjacent whitespace until more text
-or a completion boundary arrives. Idle polls and interrupt requests do not end
-the stream. Canonical completed items contribute only text not already saved;
-whitespace and repeated deltas are preserved. These partial
-messages do not create an answer proof or imply success; an interrupted or
-timed-out run can therefore have a useful transcript without a complete answer.
-Unexpected app-server EOF is a transport failure, not an indefinitely silent
-session. Terminal Codex errors retain explicit `error.kind`/`error.code`
-precedence, then use a bounded safe `codexErrorInfo` category. The
-`serverOverloaded` code becomes `provider_overloaded`; its provider message
-remains durable detail while completion notices use only package-owned guidance.
-Initialization and native interruption follow the
-[Codex app-server contract](https://learn.chatgpt.com/docs/app-server).
+Only then does `start` return ownership to the caller. The supervisor opens its
+own store connection, materializes the runtime, starts the engine, journals its
+stream, seals an answer, records terminal evidence, and performs cleanup.
 
-An owned engine may exit before process-group discovery. This is not an
-automatic failure or success: completion still requires the real engine outcome,
-answer proof, and absence of both the leader PID and live members of its expected
-group. Without verified ownership, neither native cancellation nor group signals
-are used; a surviving or reused process identity fails closed.
+The runtime execution itself has no automatic deadline or silence watchdog.
+Compatibility timeout fields remain in request identity, but a run ends only
+when the engine finishes or cancellation is requested. Success requires a
+verified answer plus completion and cleanup evidence; exit code alone is never
+enough.
 
-## Adapters
+Native process identity and signalling are described in
+[process-identity.md](process-identity.md).
 
-One module per engine under `crates/agent-run-adapters/src/`. An adapter renders
-a **fully generated child home** — settings, auth wiring, declared skills,
-declared MCP servers, hooks, plugins — so nothing ambient leaks into the
-child. What the adapters drive:
+## Runtime adapters
 
-| Runtime | Engine process | Notes |
-|---|---|---|
-| `codex` | `codex app-server` (stdio JSON-RPC, one-shot) | sandboxed; external read roots are sent as `runtimeWorkspaceRoots` on read-only runs |
-| `claude` | `claude` CLI headless | `--setting-sources ""`, per-run plugin dirs |
-| `glm` | `claude` CLI pointed at Z.ai's Anthropic-compatible endpoint | subclass of the claude adapter; auth via env/keychain, base URL pinned in the adapter |
+- **Codex** speaks the app-server protocol, preserves normalized stream deltas,
+  and stores the native thread identity for continuation.
+- **Claude** and **GLM** use their supported native CLI protocols and retain the
+  corresponding session identity when continuation is available.
+- Engine binaries and authentication remain external. agent-run never embeds
+  provider credentials or invokes an engine outside its adapter and supervisor.
 
-Auth is declared per runtime as env-var **names** or file links — secret
-values never appear in config. On macOS, adapters fall back to Keychain
-lookups where configured.
+`resume` admits a new durable row linked to the latest terminal run and reuses
+the native conversation only after its immutable authority and generated-home
+snapshot verify. See [continuations.md](continuations.md).
 
-## State
+## Durable state
 
-Single SQLite database at `<home>/state.db`, `PRAGMA user_version = 10`.
-Main tables: `agents`, `attempts`, `events`, `messages` (transcripts),
-`commands` (steer/cancel outbox to supervisors), `orchestrator_sessions`,
-`deliveries`, immutable `delivery_attempt_evidence`, `capacity_samples`,
-`capacity_route_snapshots`, `run_stats`, and `context_receipts`. Legacy
-`workflow_runs`, `workflow_steps`, and `workflow_deliveries` tables remain so
-upgrades preserve historical rows; no current product path reads or writes them.
+SQLite is the source of truth for agents, events, messages, answers, native
+session lineage, deliveries, cleanup evidence, capacity, and statistics. The
+current schema is version 16. Numbered migrations live in `sql/migrations/`;
+write opens migrate transactionally after making a pre-version backup, while
+read-only opens report that migration is required. A binary refuses a database
+newer than its supported schema.
 
-Schema changes ship as numbered migrations (`state/migrations/`) with a
-pre-migration backup; components version-check and refuse to run against a
-newer schema rather than corrupt it.
+Large payloads live under the run directory and are referenced by path, size,
+and SHA-256. A terminal success must be reproducible from stored state and
+sealed files.
 
-SQLite connections are **thread-affine** and the code treats that as law:
-a store is used only on the thread that created it (the socket API runs a
-dedicated dispatch thread for exactly this reason).
+## Completion delivery
 
-## Orchestrator binding and delivery
+Bound runs create durable delivery rows. Codex Desktop delivery crosses the
+host boundary through the signed Node relay supplied by the host; the Rust MCP
+child receives no host capability. Claude uses its configured local UDS
+transport. Unbound callers retrieve completion through `wait`, `answer`, or
+`list_agents`.
 
-An agent started by an MCP session (or with explicit `--session-*` flags)
-is **bound** to that orchestrator session. On terminal state, a delivery
-row is created and a dispatcher pushes the completion notice back to the
-orchestrator's chat (the relay-backed `codex_queue` compatibility identifier
-and Claude UDS transports exist).
-Unbound runs create no delivery row — `wait` on them is the delivery.
-Deliveries retry with backoff and expire instead of retrying forever.
-Each Codex delivery attempt records an immutable bounded evidence row in the same
-transaction that completes, retries, or fails its owned delivery claim. The
-record distinguishes exit status (including 127), spawn errno, timeout, session
-loss, and success while storing no message, session id, argv/environment value,
-or credential. Status exposes only the latest validated safe summary.
+Delivery attempts are leased, bounded, and retried with backoff. Persisted
+diagnostics contain safe classifications and redacted tails, never task or
+answer text, session IDs, argument or environment values, or credentials.
 
-Codex Desktop delivery uses a volatile local relay. With both
-`CODEX_APP_TOOLS_PIPE_PATH` and `CODEX_MCP_NODE_PATH` supplied by the host, the
-MCP CLI replaces itself with the host's signed Node executable. That wrapper
-owns a private Unix socket and a thin Rust MCP child; the child receives
-neither host capability, preventing recursive wrappers. The wrapper calls only
-`send_message_to_thread` and renders the same structured completion notice from
-validated lifecycle fields, immutable runtime/model/effort selectors, and an
-optional bounded failure category. Task, answer, and runtime error prose never
-enter the notice; metadata is escaped for safe single-line display. Failure
-reasons and recovery advice come from a package-owned allowlist keyed by that
-category. Effort is the explicit value persisted in the launch request, not an
-inferred runtime default; missing effort is `unspecified`.
-Host tool inventories have an 8 MiB frame limit;
-local delivery requests remain bounded to 8 KiB. No socket path, host response,
-or message text enters delivery evidence.
+## Capacity and diagnostics
 
-Agent completion notices use the `agent-run/completion` header and a short list:
-ID, terminal status, optional Failure/Advice lines, `runtime/model:effort`, and
-notification identity. Failure/Advice appear only for failed, lost, and timed-out
-agents. Rust and the Node relay render one packaged template. Handling instructions live in
-the same contract, exposed by the MCP `start` description and `agent-run doc
-completion`; they are not repeated in each notice. The contract explains
-asynchronous launch, bound delivery, result retrieval, and why a completion
-notice is neither a new task nor user approval. Host-added trust warnings remain
-under the host's control.
-The local relay protocol accepts strict legacy v1 requests, selector-bearing v2,
-and failure-aware v3. A current host advertises `ar-cdx-v3-*.sock`; clients
-prefer v3, then v2, and use legacy requests for older hosts. Old clients send
-their v1 shape to a v3 host and remain compatible. Existing
-outbox rows require no migration. Already-running old MCP hosts keep delivering
-their old format until the `agent-run` MCP connection is restarted.
+Capacity collectors store timestamped provider observations and explicit
+physical quota topology. `limits` reports freshness and projections without
+calling providers; `capacity order` returns an advisory compatible-route order
+and never launches work. Missing or stale evidence becomes unknown rather than
+an invented zero.
 
-Codex completion delivery uses only the signed Desktop relay. The persisted
-`codex_queue` name is a compatibility identifier; it never invokes the Codex
-UI queue or requires a queue executable. Missing or rejected relays are
-retryable; unknown acceptance after transmission remains ambiguous and
-retryable. Relay discovery has a ten-second total budget and the host call
-has an eight-second budget, within the existing thirty-second lease.
-The Node wrapper preserves MCP stdio and removes its socket on child exit.
-
-## Capacity and limits
-
-A collector (`agent-run capacity collect`, launchd-schedulable) samples
-remaining quota per runtime through a pluggable per-runtime source:
-`native` engine data, a short-lived Codex app-server, the `codexbar` CLI,
-a local OmniRoute router, or `none`. A collection stores samples and its
-explicit physical-pool/route topology atomically. Per-account scopes refresh
-independently, so a failed account keeps its previous topology only until that
-snapshot expires instead of deleting healthy sibling scopes. Samples carry
-validity windows; `limits` serves projections with burn-rate–based exhaustion
-risk per lane, worst first, hiding nothing.
-The launchd job copies the invoking user's `HOME` and `PATH` so headless Codex
-app-server and CLI probes resolve the same host runtimes as an interactive
-shell; it persists no credentials or other environment variables.
-
-Collection outcomes distinguish `collected`, `partial`, `failed`, `no_data`,
-and `unsupported`. A source failure is not a successful collection of zero
-samples. Successful account slices remain independently committed when a
-sibling probe or write fails; reported sample counts reflect those commits.
-`capacity collect --once` still prints its JSON report, but exits with status
-2 for partial, failed, or empty supported-source collection. Logs carry safe
-reason codes and counts, never provider response bodies or raw child stderr.
-Sources retain their bounded call deadlines; a round exceeding the configured
-collection interval is explicitly warned about.
-
-Freshness uses source observations, not the time an old payload was fetched
-again. Future observations and windows whose reset has arrived are unknown.
-Diagnostic snapshots select the newest row per quota identity before applying
-their result cap, so a busy account cannot hide a stale sibling through repeated
-samples. Stored sample history retains its separate, global retention bound.
-Reset-cycle grouping tolerates up to one second of reporting jitter only when
-both reported resets were still in the future at the latest observation.
-Stored timestamps and the reported latest reset remain unchanged; a reset
-that already passed is not merged into the next cycle.
-
-OmniRoute quotas come from its current `key_value` cache under the
-`providerLimitsCache` namespace, using `fetchedAt` as the observation clock.
-Its `quota_snapshots` table records changes, not every successful poll, and
-therefore cannot establish freshness for unchanged quota values. Active,
-quota-visible members with missing or malformed current evidence fail the
-collection rather than silently disappearing from the pool average. Only
-quota percentages and timestamps cross the Docker reader boundary; cache
-messages, plans, credentials and connection identifiers are not emitted.
-OmniRoute pool freshness is limited by its oldest included member; future
-observations and expired resets invalidate the whole window, never just remove
-the inconvenient member from the mean. Its quota query detects overflow of the
-64-row bound rather than silently returning a truncated, apparently healthy
-pool. Upstream snapshot timestamps and the source's shelf life remain intact.
-
-Claude credentials are account-scoped when a Claude `account` is configured: login
-and launches share one `CLAUDE_CONFIG_DIR` child path under that account home.
-When `account` is omitted, Claude uses native host credential state and keychain
-auth, and `CLAUDE_CONFIG_DIR` is left unset in the child process environment.
-Native usage collection uses only a declared, explicitly exported OAuth token;
-otherwise its capacity is reported unavailable rather than inspecting scoped
-credential state. API keys are not OAuth tokens.
-
-Account labels are opaque: a labelled account cannot collide with the absent
-account even when its label is `base`, `default`, or `shared`. Provider-scoped
-identifiers encode that distinction without changing the original sample keys.
-For Codex, a malformed present quota window disables that bucket's route;
-valid sibling samples remain advisory evidence, never proof that the unknown
-governing limit does not exist.
-
-Capacity route ranking is a pure read of those snapshots. Every governing
-window must be fresh and known; a zero window is omitted before scoring.
-Evidence spanning at least one hour projects remaining capacity to reset,
-while warmup/thin/no-reset evidence uses a remaining-percent fallback centered
-at 50%. The worst window defines a nonnegative route score, then a positive
-runtime multiplier scales its priority. Optional account and quota-lane weight
-maps override that default, with account taking precedence over lane. Weights
-are absolute replacements, not products. Concrete account/model aliases sharing
-the same runtime and physical pool set remain one capacity choice, with the
-highest applicable alias weight and preferred selector first.
-`agent-run capacity order` exposes that same read-only, role-independent order:
-its first route is highest priority, while the orchestrator still chooses a
-compatible role/model alias and decides whether to launch. The output retains
-deferred evidence, exhausted omissions, unavailable runtimes, and the
-`insufficient_diversity` signal alongside the working routes.
-
-Run-level usage (tokens, ttft, cost estimate) lands in `run_stats` at terminal.
+`agent-run doctor` checks configuration, binaries, role assets, state,
+supervisor identity, MCP processes, delivery, and capacity freshness. Its
+provider-free canary exercises the production detach, identity, and READY path.
 
 ## Releases
 
-The runtime deploys as a **sealed release**: a venv built from a git SHA
-under `~/.agent-run/standalone/releases/<sha>` with a `COMPLETE` marker,
-selected by the `standalone/current` symlink. Rollback is repointing the
-symlink; retention keeps releases that live sessions still execute from.
-Details: [releasing.md](releasing.md).
+A sealed native release contains `bin/agent-run`, metadata, checksums, and a
+`COMPLETE` marker. Release directories are immutable and the deployment helper
+switches `standalone/current` only after manifest verification, writer
+quiescence, backup, and schema checks.
+
+Release automation builds macOS Apple silicon and Linux x86-64 artifacts.
+macOS is qualified; Linux remains pending its first successful hosted Linux
+full-suite and sealed-release run. launchd integration is built in on macOS;
+Linux uses an external service manager. See [releasing.md](releasing.md).
 
 ## Design invariants
 
-1. Fail-closed configuration: unknown keys are rejected; a typo cannot
-   silently widen permissions.
-2. Isolation by construction: children see only what config declares.
-3. Evidence over optimism: terminal states are derived from recorded
-   facts; fabricated success must be structurally impossible.
-4. One dispatcher, many transports; parity is tested, not promised.
-5. Use maintained dependencies for commodity protocols and utilities when
-   they replace concrete handwritten code. Lock and verify their dependency
-   graph; keep durable ownership and outcome guarantees explicit and tested.
+1. Configuration fails closed and credentials stay outside snapshots.
+2. Admission is durable before execution starts.
+3. PID reuse or unreadable identity never authorizes a signal.
+4. Success is derived from evidence, not adapter optimism.
+5. One dispatcher defines every transport's public tool surface.

@@ -12,5 +12,6 @@ translate that same list into Codex or Claude/GLM native configuration.
 Missing skill directories or `SKILL.md` files fail before admission; content
 revisions are stored in the resolved role snapshot.
 
-Legacy per-runtime skill lists remain readable during migration. Do not combine
-them with revisioned roles.
+Compatibility per-runtime skill lists remain readable for existing
+configurations. New configurations should use revisioned roles; the two forms
+cannot be combined.

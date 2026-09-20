@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- build: add macOS Apple-silicon and Linux x86-64 release artifacts; Linux
+  remains pending qualification until its first hosted full-suite and sealed
+  release succeeds
+
 ## [0.12.0] - 2026-09-20
 
 - feat!: make the self-contained Rust broker the sole primary implementation
@@ -334,6 +338,38 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
+[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.12.0
+[0.11.15]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.15
+[0.11.14]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.14
+[0.11.13]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.13
+[0.11.12]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.12
+[0.11.11]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.11
+[0.11.10]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.10
+[0.11.9]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.9
+[0.11.8]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.8
+[0.11.7]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.7
+[0.11.6]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.6
+[0.11.5]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.5
+[0.11.4]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.4
+[0.11.3]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.3
+[0.11.2]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.2
+[0.11.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.1
+[0.11.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.0
+[0.10.2]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.10.2
+[0.10.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.10.1
+[0.10.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.10.0
+[0.9.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.9.0
+[0.8.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.8.0
+[0.7.3]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.7.3
+[0.7.2]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.7.2
+[0.7.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.7.1
+[0.7.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.7.0
+[0.6.4]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.6.4
+[0.6.3]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.6.3
+[0.6.2]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.6.2
+[0.6.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.6.1
+[0.6.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.6.0
 [0.5.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.5.0
 [0.4.1]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.1
 [0.4.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.4.0

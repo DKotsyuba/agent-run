@@ -1,22 +1,40 @@
 # Process identity
 
-An owned process is identified by its PID and `psutil.Process(pid).create_time()`.
-`alive`, `dead`, `reused`, `unknown`, and `denied` are distinct verdicts. Missing
-legacy birth evidence is `unknown`, never `dead`; an unknown or reused PID is
-never signalled. Command text remains diagnostic only. Tests inject `psutil.Process`
-at this helper seam. The API coordinator persists its own PID and birth time
-for the pre-READY startup claim, and the supervisor replaces that claim with its
-own PID and birth proof before signalling READY. Reconciliation records `lost`
-only for the OS verdict `dead` or `reused`. Legacy rows without birth evidence
-can still prove a missing PID dead, but a present PID remains `unknown`; elapsed
-age never upgrades an uncertain observation into process loss.
+agent-run never treats a PID alone as ownership. Every Rust-started supervisor
+records the PID, process group, kernel birth time, and a platform token:
 
-Runtime cleanup signals only the process group whose leader/group equality and
-stable psutil creation time were verified. Before signalling, it snapshots any
-readable descendants by PID and creation time. Group disappearance and the
-observed descendant set are reported separately in one `process_cleanup` event:
-`scope`, `group_gone`, nullable `descendants_gone`, and `confirmed`. An escaped
-descendant is never signalled individually, and group disappearance alone never
-claims that the wider tree was contained. Runtime answer/status classification
-remains separate from this broader cleanup scope; a surviving original group
-still fails closed.
+- Linux: boot ID plus `/proc/<pid>/stat` start ticks;
+- macOS: kernel process start seconds and microseconds.
+
+The native platform layer classifies an observation as `alive`, `dead`,
+`reused`, `unknown`, `denied`, or `not_started`. Exact token or birth-time
+equality is required for `alive`. A missing process or zombie is `dead`; a
+different birth identity is `reused`. Missing, unreadable, or denied evidence
+never becomes death because time elapsed.
+
+During admission, the broker stores its own startup-owner identity. The detached
+supervisor reports its exact PID over the bootstrap pipe, commits its native
+identity, and only then signals READY. Reconciliation marks an active run lost
+only when the stored startup owner or supervisor is observed as dead or reused.
+
+## Signalling and cleanup
+
+Signals are allowed only while the recorded supervisor identity is `alive` and
+the supervisor is still the leader of its recorded process group. Reused,
+unknown, denied, and missing identity never authorize a signal.
+
+Before group termination, agent-run captures every readable member by PID and
+birth identity. Cleanup evidence records the signals attempted, scope,
+`group_gone`, nullable `descendants_gone`, and `confirmed`. Confirmation
+requires both the original group and every readable captured descendant to be
+gone. Escaped descendants are not signalled individually, and group
+disappearance alone does not claim wider tree cleanup.
+
+macOS uses native process APIs and a start-time-only sysctl fallback when
+same-user relationship fields are unavailable. Linux reads `/proc`; its boot ID
+prevents start-tick reuse across reboots. Both platforms fail closed when group
+or relationship evidence cannot be established.
+
+Historical rows that contain only a birth-time float remain readable. They can
+prove a missing PID dead or a birth mismatch reused, but a present PID without
+matching evidence remains unknown.

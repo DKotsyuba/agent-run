@@ -10,8 +10,9 @@ evidence, process ownership, and secret safety are product requirements.
 - Keep modules focused. Add tests for every behavior change.
 - Engine processes are created only through adapters and the supervisor.
 - Preserve unrelated work and never weaken lifecycle assertions to hide flakes.
-- The supported release target is macOS Apple silicon. Linux CI is
-  validation-only until qualified.
+- Release workflows build macOS Apple silicon and Linux x86-64 artifacts.
+  macOS is qualified; Linux remains pending the first successful hosted Linux
+  full-suite and sealed-release run.
 
 ## Invariants
 

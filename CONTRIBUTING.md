@@ -25,8 +25,10 @@ Transport changes need a live API/MCP smoke. Adapter or supervisor changes need
 recorded fixture or real-engine evidence. Use temporary homes and endpoints;
 never point tests at a production database, socket, inbox, or credential store.
 
-The supported release target is macOS Apple silicon. Linux CI is
-validation-only until its qualification evidence is accepted.
+Release workflows build macOS Apple silicon and Linux x86-64 artifacts. macOS
+has accepted qualification evidence. Linux remains pending until a hosted
+Linux run passes the full suite and sealed-release verification; do not report
+it as qualified before that evidence exists.
 
 A pull request must state the problem, exact verification commands and results,
 and any platform or live-resource check that was not run. Follow the invariants

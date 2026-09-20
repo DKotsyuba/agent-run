@@ -7,7 +7,7 @@ topic for this index.
 | Topic | Covers |
 |---|---|
 | completion | MCP start response, automatic bound-chat delivery, compact notice format, result retrieval |
-| config | ~/.agent-run/config.toml: source of truth, fail-closed, priority multiplier/order, safe-edit discipline |
+| config | `<home>/config.toml`: source of truth, fail-closed validation, hot reload, safe-edit discipline |
 | skills | `skills = [...]` per runtime, plugin ownership, symlinks, rematerialize |
 | mcp-servers | `[mcp.<name>]` declarations and per-runtime attachment |
 | plugins | `runtimes.<rt>.plugins`, per-runtime load mechanics, fail-closed refusal |
@@ -16,5 +16,6 @@ topic for this index.
 | migrations | PRAGMA user_version, numbered SQL deltas, pre-backup, refusal cases |
 | troubleshoot | doctor first, failure_kind vocabulary, limits honesty, orphan check |
 
-Read `config` and `service` first: almost every maintenance task reduces to
-"edit config.toml safely, then get the affected service to pick it up."
+Read `config` first. Valid changes are loaded at request boundaries and by the
+broker's 60-second hash check; invalid revisions leave the previous config
+active.
