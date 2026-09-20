@@ -1,5 +1,6 @@
 //! macOS Keychain access without exposing credential values in diagnostics.
 
+#[cfg(target_os = "macos")]
 use std::{
     io::{self, Read},
     os::fd::AsRawFd,
@@ -59,6 +60,7 @@ fn lookup(service: &str, account: Option<&str>) -> Option<String> {
 }
 
 /// Runs one Keychain command with a deadline covering process exit and stdout EOF.
+#[cfg(target_os = "macos")]
 fn lookup_command(mut command: Command, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     let mut child = command
@@ -93,6 +95,7 @@ fn lookup_command(mut command: Command, timeout: Duration) -> Option<String> {
 }
 
 /// Drains a child stdout pipe until EOF or the shared command deadline.
+#[cfg(target_os = "macos")]
 fn read_until(output: &mut (impl Read + AsRawFd), deadline: Instant) -> Option<Vec<u8>> {
     let fd = output.as_raw_fd();
     let mut bytes = Vec::new();
