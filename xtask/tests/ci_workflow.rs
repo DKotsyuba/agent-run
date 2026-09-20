@@ -72,13 +72,26 @@ fn release_publishes_checksummed_native_assets() {
     }
 }
 
-/// Pins local check and native-release commands to warning-denied locked builds.
+/// Pins the xtask alias, local checks, and native release to the reviewed lockfile.
 #[test]
-fn xtask_denies_warnings_and_locks_native_release_resolution() {
+fn xtask_entrypoints_and_builds_use_locked_resolution() {
+    let alias = repository_file(".cargo/config.toml");
+    assert!(
+        alias.contains("xtask = \"run --locked --package xtask --\""),
+        "the xtask alias must use the committed lockfile"
+    );
     let source = repository_file("xtask/src/main.rs");
     assert!(
-        source.contains("\"--all-features\",\n            \"--\",\n            \"-D\",\n            \"warnings\","),
+        source.contains("\"clippy\",\n            \"--offline\",\n            \"--locked\","),
+        "cargo xtask check must lock clippy resolution"
+    );
+    assert!(
+        source.contains("\"--\",\n            \"-D\",\n            \"warnings\","),
         "cargo xtask check must deny clippy warnings"
+    );
+    assert!(
+        source.contains("\"test\",\n            \"--offline\",\n            \"--locked\","),
+        "cargo xtask check must lock test resolution"
     );
     assert!(
         source.contains(

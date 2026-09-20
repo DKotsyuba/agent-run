@@ -2,7 +2,7 @@
 use std::{env, path::PathBuf, process::Command};
 use xtask::{archive, deploy, evidence, qualify, release};
 
-/// Runs the Rust workspace's formatter, warning-denied linter, and test gates.
+/// Runs the Rust workspace's formatter plus locked linter and test gates.
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments.first().map(String::as_str) == Some("release") {
@@ -32,6 +32,7 @@ fn main() {
         vec![
             "clippy",
             "--offline",
+            "--locked",
             "--workspace",
             "--all-targets",
             "--all-features",
@@ -39,7 +40,13 @@ fn main() {
             "-D",
             "warnings",
         ],
-        vec!["test", "--offline", "--workspace", "--all-features"],
+        vec![
+            "test",
+            "--offline",
+            "--locked",
+            "--workspace",
+            "--all-features",
+        ],
     ] {
         let status = Command::new("cargo")
             .args(arguments)
