@@ -52,8 +52,10 @@ Keychain smoke. The clean full Rust rerun passes 1076 tests with zero failures
 and one ignored Keychain smoke. Qualification accepts the explicit T57
 divergence and reports 84/84 scenarios with three remaining live resource
 classes. Independent code review found no defects; evidence review findings are
-resolved. Remaining before final acceptance: commit, archive, and
-evidence-index refresh/verification.
+resolved. The implementation is committed as
+`93c7a8c1e106bbb9f1eeab09ec1f51b069254125`; its source archive verifies, and
+the refreshed evidence index verifies 32 entries. Remaining acceptance work is
+limited to the live resource classes and signed P12 checklist described below.
 
 ## What this artifact is
 

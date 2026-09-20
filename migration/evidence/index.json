@@ -1,9 +1,9 @@
 {
   "index_version": 1,
-  "generated_for_commit": "fe72daaee497ff7f74a3c930d4e9862792af2bb3",
-  "generated_at": "2026-09-16T09:24:55+02:00",
+  "generated_for_commit": "93c7a8c1e106bbb9f1eeab09ec1f51b069254125",
+  "generated_at": "2026-09-20T18:10:55+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
-  "entry_count": 30,
+  "entry_count": 32,
   "entries": [
     {
       "path": "migration/adr/A09-desktop-relay.md",
@@ -72,6 +72,12 @@
       "sha256": "f5bba39c765cccd393559e69d0248ca7c1534d328eff523c3552d04f69e95312"
     },
     {
+      "path": "migration/adr/A22-qwen-removal.md",
+      "kind": "decision",
+      "bytes": 1168,
+      "sha256": "cd5eeef351e2b0e6c1cf43c9c3bcba06d68c28910a10391dca06492b05ccb4b0"
+    },
+    {
       "path": "migration/adr/cli-extensions.md",
       "kind": "decision",
       "bytes": 1195,
@@ -80,14 +86,14 @@
     {
       "path": "migration/baseline/divergences.csv",
       "kind": "ledger",
-      "bytes": 4900,
-      "sha256": "5dfd375853cff0c4f3e7299a997cac3423a13df21ad2de884532cd07397d3598"
+      "bytes": 8499,
+      "sha256": "c40383141d9f319a9dc38e5b54a7fb6a7554ff696db433f63eabb121eb21fc6c"
     },
     {
       "path": "migration/baseline/test-map.csv",
       "kind": "ledger",
-      "bytes": 388397,
-      "sha256": "1c3cb0d712cc7d2a3432c48502815d5de4fe90ab3945e2d36854f56c70b43375"
+      "bytes": 384541,
+      "sha256": "ec1fd99f90f661e14033b08fc757cd4f126e5ae885867678df6d3afff98c9b3b"
     },
     {
       "path": "migration/defects-found.md",
@@ -100,6 +106,12 @@
       "kind": "evidence",
       "bytes": 18269,
       "sha256": "8fc76e66f37fc8c994df1476d5b9eea56b5b33cc4141b1a143cf0e6aa1e41e7a"
+    },
+    {
+      "path": "migration/evidence/coverage-2026-09-20.md",
+      "kind": "evidence",
+      "bytes": 27470,
+      "sha256": "3798382dc81c33f470bfcdd67d683fa810d8c1711f10de229dfb435a0d61b25f"
     },
     {
       "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
@@ -146,8 +158,8 @@
     {
       "path": "migration/evidence/qualification-scope.md",
       "kind": "evidence",
-      "bytes": 43067,
-      "sha256": "899aaeff31aff35a9f60b6c5e9c8885b7d8b180bee043f2b490419c5d3b18a38"
+      "bytes": 42809,
+      "sha256": "3c1bdf842b49d6cd673b27e6a51b7cbca4f9a5c9687c55ad13a0a4edef1488de"
     },
     {
       "path": "migration/evidence/verification-2026-09-16.md",
@@ -176,14 +188,14 @@
     {
       "path": "migration/review-checklist.md",
       "kind": "review",
-      "bytes": 7937,
-      "sha256": "5f4db552058f853225607ec153c09a7f25ad3d7fce7c07a47506d1e8ce285d18"
+      "bytes": 7927,
+      "sha256": "a52c82967fcb374ea7bb9cbd35842dd89b655d5d396cf210088668d2bf3f7a0f"
     },
     {
       "path": "migration/tasks.csv",
       "kind": "ledger",
-      "bytes": 25662,
-      "sha256": "53a417bddd78d7e5e65ad36f15da15c7ede0fb03122b6b7807e515f9b19411df"
+      "bytes": 25453,
+      "sha256": "923c82ce3a07253d3cd5dc9a66405a167095aee883840429cb44df1d2e12fbac"
     }
   ]
 }
