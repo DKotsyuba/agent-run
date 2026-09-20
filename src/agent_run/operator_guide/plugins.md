@@ -14,8 +14,9 @@ plugins = ["/abs/path/to/tokenpipe-compressor", "/abs/path/to/agent-lsp-plugin"]
   `skills = [...]` is REFUSED — fail-closed, not silently dropped. See
   `skills` for the ownership rule this implies.
 - **codex** copies the plugin into the generated home, and hook trust
-  digests are auto-seeded for it (config-level `hooks` entries are seeded
-  the same way).
+  digests are auto-seeded from the hook file selected by
+  `.codex-plugin/plugin.json` (config-level `hooks` entries are seeded the
+  same way).
   hook/tool mechanism of its own today.
 
 ## Operator checklist for a new plugin
