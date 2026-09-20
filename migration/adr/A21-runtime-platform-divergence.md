@@ -2,6 +2,10 @@
 
 Status: accepted for the migration.
 
+The Python version gate cited below belongs to the frozen
+`archive/python-legacy` implementation. The Rust product has no Python runtime
+gate; supported target claims are governed by [A15](A15-platforms.md).
+
 ## Context
 
 The Python distribution gates the interpreter it runs on. `_require_supported_python`

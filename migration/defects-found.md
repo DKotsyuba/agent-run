@@ -1,5 +1,9 @@
 # Defects the port found in itself
 
+> **Historical defect ledger.** These fixed defects explain regressions found
+> during migration; this is not an open-issues list. Current qualification gaps
+> are recorded in [status.md](status.md).
+
 These are correctness defects discovered in the Rust implementation while
 closing the qualification gaps, not defects in the Python baseline. Each was
 found by a test or a run, never by reading a report. Each is fixed and merged,

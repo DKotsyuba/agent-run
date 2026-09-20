@@ -8,6 +8,10 @@
 > old measurement to code it never described. For what is covered today, see
 > `migration/status.md`, `migration/baseline/test-map.csv` and
 > `migration/evidence/qualification-scope.md`.
+>
+> **A22 consequence:** Qwen is no longer a supported engine or pending port.
+> All Qwen sections below are historical inventory only. The current adapter
+> set is Codex, Claude, and GLM; see [ADR A22](../adr/A22-qwen-removal.md).
 
 Area owner: EN. Scope: `src/agent_run/adapters/{base,registry,environment,version,plugin_skills,continuation,omniroute}.py`,
 `adapters/claude/*` (not `limits.py`), `adapters/glm/*`, `adapters/qwen/*`.

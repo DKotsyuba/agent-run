@@ -1,5 +1,10 @@
 # Validation report
 
+> **Immutable historical snapshot.** This report describes the early authoring
+> environment and is intentionally not updated with later successful builds.
+> See [the 20 September release smoke](../release-smoke-2026-09-20.md) for the
+> successor artifact evidence.
+
 ## Scope
 
 The source port is **not compiled or release-validated**. This report deliberately separates checks that ran from test code that merely exists.
