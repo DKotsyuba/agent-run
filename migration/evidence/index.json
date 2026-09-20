@@ -3,7 +3,7 @@
   "generated_for_commit": "7f17768508aaec8ddcc607657330a4b2ee26d408",
   "generated_at": "2026-09-20T21:10:00+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
-  "entry_count": 33,
+  "entry_count": 34,
   "entries": [
     {
       "path": "migration/adr/A09-desktop-relay.md",
@@ -114,6 +114,12 @@
       "sha256": "c30f981bddc128ba6747f6e749b56f12a2b4b9eb31d11912094ff703112eee1e"
     },
     {
+      "path": "migration/evidence/live-canary-2026-09-20.md",
+      "kind": "evidence",
+      "bytes": 2655,
+      "sha256": "a0d34459758709904c837cd92a09c547ffae1442324995015fc659cbd0d0b55e"
+    },
+    {
       "path": "migration/evidence/port-snapshot/MANIFEST.sha256",
       "kind": "evidence",
       "bytes": 5339,
@@ -122,8 +128,8 @@
     {
       "path": "migration/evidence/port-snapshot/REPORT.md",
       "kind": "evidence",
-      "bytes": 4253,
-      "sha256": "96d90004e5210786e3e423b28dad165137886cac8b98fb459e9beea2cb071b1d"
+      "bytes": 3986,
+      "sha256": "d18a3bf24b093bc53faf4c1e8490d89b1adb66e9141c3d45d515266a89080811"
     },
     {
       "path": "migration/evidence/port-snapshot/SOURCE_BASELINE.json",
@@ -158,14 +164,14 @@
     {
       "path": "migration/evidence/qualification-scope.md",
       "kind": "evidence",
-      "bytes": 42792,
-      "sha256": "73ed6a0a0bffdc4ecfb1e3d413bc2d91e6b1a12dd5accf0debc86c1196bc4de2"
+      "bytes": 42780,
+      "sha256": "897abaf56fbdf45dd8e5314eee19b95ce5f06d4c2f7c5bc703d2820997289865"
     },
     {
       "path": "migration/evidence/release-smoke-2026-09-20.md",
       "kind": "evidence",
-      "bytes": 2336,
-      "sha256": "c9cea5000b30e57d9b948d8ba538ca29da335c3c6b46b12bd6c4848c42433a02"
+      "bytes": 2042,
+      "sha256": "39a1769a91a92156f7d140948e9d8df2a6361929084ae68431a545be87984444"
     },
     {
       "path": "migration/evidence/verification-2026-09-16.md",
