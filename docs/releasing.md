@@ -62,12 +62,13 @@ one host's binary.
    git push origin v0.12.0
    ```
 
-After CI accepts the commit, the tagged `Release` workflow runs `cargo xtask
-check` and the release gates in both native macOS and Linux jobs, then builds
-and verifies both sealed artifacts. It also verifies the source archive,
-generates one `SHA256SUMS`, attests the listed artifacts, and publishes a GitHub
-Release only after every required job succeeds. A failed run leaves no public
-partial release. Tags are immutable; corrections ship as a new patch version.
+After CI accepts the commit, both native jobs in the tagged `Release` workflow
+run the workspace checks and build and verify their sealed artifact. The macOS
+gate job additionally runs qualification, evidence, Desktop transport, and
+source-archive gates once. The workflow then generates one `SHA256SUMS`, attests
+the listed artifacts, and publishes a GitHub Release only after every required
+job succeeds. A failed run leaves no public partial release. Tags are immutable;
+corrections ship as a new patch version.
 
 ## Install or update a sealed runtime
 
