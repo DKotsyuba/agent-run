@@ -2,8 +2,9 @@
 
 > **Historical execution board.** Row states and counts record how the port was
 > decomposed; they are not the 0.12.0 release status. The authoritative current
-> summary is [status.md](status.md). The two still-unclaimed live gates are
-> Desktop T71 and hosted Linux T82.
+> summary is [status.md](status.md). Desktop T71 remains unclaimed; hosted Linux
+> T82 is retained as a future evidence requirement after the owner deferred the
+> Linux release.
 
 This board is the executable decomposition of the authoritative plan at Python baseline `0d28b79`. Task targets use the post-M05 workspace from plan §4.1; dependency direction follows plan §4.2, gates follow plan §18, and task completion follows plan §19.1/§19.4. Detailed scope, tests, status, and acceptance commands are in `migration/tasks.csv`.
 

@@ -10,9 +10,9 @@ evidence, process ownership, and secret safety are product requirements.
 - Keep modules focused. Add tests for every behavior change.
 - Engine processes are created only through adapters and the supervisor.
 - Preserve unrelated work and never weaken lifecycle assertions to hide flakes.
-- Release workflows build macOS Apple silicon and Linux x86-64 artifacts.
-  macOS is qualified; Linux remains pending the first successful hosted Linux
-  full-suite and sealed-release run.
+- Release workflows publish only the qualified macOS Apple-silicon artifact.
+  Linux x86-64 remains visible as non-blocking validation; its release and
+  qualification are deferred.
 
 ## Invariants
 

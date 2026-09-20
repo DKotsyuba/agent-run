@@ -19,8 +19,8 @@ evidence to describe a new candidate.
 ## Platform claim
 
 - [ ] macOS arm64 artifact is built and smoked on macOS arm64
-- [ ] Linux x86_64 is labelled unqualified unless the hosted Linux full suite
-      and sealed-release smoke are attached
+- [ ] the release contains no Linux archive; Linux validation is non-blocking
+      and explicitly unqualified
 - [ ] no unsupported architecture is published under a supported target name
 
 ## Runtime evidence

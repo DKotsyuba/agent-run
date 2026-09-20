@@ -18,6 +18,9 @@ evidence in place.
 | Deployment journal | |
 | Database backup | |
 
+For a 0.12.0 production cutover, the target triple must be
+`aarch64-apple-darwin`; no Linux artifact is published.
+
 ## Pre-switch
 
 - [ ] manifest and `COMPLETE` verified

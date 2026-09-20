@@ -3,11 +3,10 @@
 Public versions come from annotated `vX.Y.Z` tags. The tag must match the
 workspace version in `Cargo.toml`.
 
-Release automation produces sealed macOS Apple-silicon and Linux x86-64
-artifacts. macOS has committed qualification evidence. Linux remains pending
-qualification until the first hosted full-suite and sealed-release run passes.
-Each release also includes a verified source archive, `SHA256SUMS`, and
-provenance.
+Release automation produces one sealed macOS Apple-silicon artifact. Linux
+x86-64 remains an unqualified, non-blocking validation target; its release is
+deferred. Each release also includes a verified source archive, `SHA256SUMS`,
+and provenance.
 
 ## Local release check
 
@@ -35,8 +34,8 @@ SQLite and configuration, records `standalone/deploy.json`, migrates state, and
 switches `current` atomically. It does not control the platform service manager
 or perform the final API/MCP smoke.
 
-After an update, restart the launchd jobs on macOS or the externally managed
-service on Linux. Verify version, database integrity, doctor, API
+After an update, restart the launchd jobs on macOS. Verify version, database
+integrity, doctor, API
 `ping`/`tools`, MCP `initialize`/`tools/list`, and one provider-free broker run.
 Preserve the deployment journal and backup after any failure. Use the
 journal-aware recovery command; never manually point an older binary at a newer

@@ -123,10 +123,11 @@ A sealed native release contains `bin/agent-run`, metadata, checksums, and a
 switches `standalone/current` only after manifest verification, writer
 quiescence, backup, and schema checks.
 
-Release automation builds macOS Apple silicon and Linux x86-64 artifacts.
-macOS is qualified; Linux remains pending its first successful hosted Linux
-full-suite and sealed-release run. launchd integration is built in on macOS;
-Linux uses an external service manager. See [releasing.md](releasing.md).
+Release automation publishes a macOS Apple-silicon artifact. macOS is the only
+qualified 0.12.0 release platform. Linux x86-64 remains a visible non-blocking
+validation lane; its release and qualification are deferred. launchd
+integration is built in on macOS. Future Linux deployments use an external
+service manager. See [releasing.md](releasing.md).
 
 ## Design invariants
 

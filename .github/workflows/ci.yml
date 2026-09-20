@@ -16,6 +16,7 @@ concurrency:
 jobs:
   rust:
     name: Rust checks (${{ matrix.label }})
+    continue-on-error: ${{ matrix.continue_on_error }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,10 +25,12 @@ jobs:
             label: supported-macos-arm64
             target: aarch64-apple-darwin
             architecture: arm64
+            continue_on_error: false
           - os: ubuntu-latest
-            label: configured-release-target-linux-x86_64-pending-hosted-evidence
+            label: validation-only-linux-x86_64-unqualified
             target: x86_64-unknown-linux-gnu
             architecture: x86_64
+            continue_on_error: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
