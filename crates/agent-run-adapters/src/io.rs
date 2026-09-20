@@ -34,6 +34,11 @@ pub enum Event {
     Failure(&'static str),
 }
 
+/// Returns whether an adapter write failed because the child closed its pipe.
+fn is_broken_pipe(error: &Error) -> bool {
+    matches!(error, Error::Io(source) if source.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
 /// Owns an app-server child, its bounded streams, and request correlation state.
 pub struct Process {
     pub child: Child,
@@ -215,7 +220,7 @@ impl Process {
             .await
         {
             return match error {
-                Error::Io(_) => Err(self.closed_error(method, deadline).await),
+                closed if is_broken_pipe(&closed) => Err(self.closed_error(method, deadline).await),
                 other => Err(other),
             };
         }
@@ -334,5 +339,26 @@ impl Drop for Process {
         for t in &self.tasks {
             t.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Deterministic classifications for write-side process transport failures.
+
+    use super::is_broken_pipe;
+    use agent_run_domain::{Error, MachineCode};
+    use std::io::ErrorKind;
+
+    /// Keeps unrelated write failures in the generic I/O error category.
+    #[test]
+    fn non_broken_pipe_write_errors_retain_io_classification() {
+        let error = Error::Io(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "fixture write denied",
+        ));
+
+        assert!(!is_broken_pipe(&error));
+        assert_eq!(error.machine_code(), MachineCode::IOError);
     }
 }
