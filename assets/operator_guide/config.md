@@ -38,10 +38,11 @@ model_auto_compact_token_limit = 400000
 Revisioned Markdown profiles own write/network grants, external read-root
 policy, skills, MCP selection, and required constraints. `agent-run init`
 creates the valid profile identifiers `role-review`, `role-architect`, and
-`role-code`. Model policy is separate from profile naming: `gpt-6-astra` is
-restricted to read-only review or architecture work. Compatibility profiles
-and runtime `skills`/`mcp` lists remain readable, but canonical and compatibility
-asset declarations cannot be mixed.
+`role-code`. Model policy is separate from general profile validity:
+`gpt-6-astra` accepts only the exact read-only profile IDs `review` and
+`architect`. A generally valid ID such as `role-review` is rejected for that
+model. Compatibility profiles and runtime `skills`/`mcp` lists remain readable,
+but canonical and compatibility asset declarations cannot be mixed.
 
 `workspace_root` affects write-capable Codex profiles only. Their workdir must
 be inside the configured tree; read-only profiles do not inherit write access.
