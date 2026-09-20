@@ -1,9 +1,9 @@
 {
   "index_version": 1,
-  "generated_for_commit": "93c7a8c1e106bbb9f1eeab09ec1f51b069254125",
-  "generated_at": "2026-09-20T18:10:55+02:00",
+  "generated_for_commit": "766542cf2c1c2764b6fcaa278ac837792ed05ebc",
+  "generated_at": "2026-09-20T19:10:37+02:00",
   "note": "Inventory of migration evidence and decisions with content hashes. Verified by `cargo xtask evidence verify`, which recomputes every hash and exits non-zero on drift.",
-  "entry_count": 32,
+  "entry_count": 33,
   "entries": [
     {
       "path": "migration/adr/A09-desktop-relay.md",
@@ -160,6 +160,12 @@
       "kind": "evidence",
       "bytes": 42809,
       "sha256": "3c1bdf842b49d6cd673b27e6a51b7cbca4f9a5c9687c55ad13a0a4edef1488de"
+    },
+    {
+      "path": "migration/evidence/release-smoke-2026-09-20.md",
+      "kind": "evidence",
+      "bytes": 2042,
+      "sha256": "39a1769a91a92156f7d140948e9d8df2a6361929084ae68431a545be87984444"
     },
     {
       "path": "migration/evidence/verification-2026-09-16.md",
