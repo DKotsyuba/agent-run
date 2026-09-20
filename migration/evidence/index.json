@@ -38,8 +38,8 @@
     {
       "path": "migration/adr/A15-platforms.md",
       "kind": "decision",
-      "bytes": 1314,
-      "sha256": "18d33af1635c0c162a5d89f6243af053ed8a248b3cbef1cc4d632f9cb0c7b5f9"
+      "bytes": 1551,
+      "sha256": "0d345555c1113d5e2aa912cb27f58ed9749fc3b61fe5a89177c1ba3b07f96ada"
     },
     {
       "path": "migration/adr/A17-notice-contract.md",
@@ -194,14 +194,14 @@
     {
       "path": "migration/post-cutover-report.md",
       "kind": "review",
-      "bytes": 1268,
-      "sha256": "ec82bebdf5e835a0c6bb7bdcc557b7fe611a3d2bf5e645f945c2fe6d052a2923"
+      "bytes": 1384,
+      "sha256": "52714299169bee0e82102ef57e747b37e90c5fd91ee561515c694cf928ce3f40"
     },
     {
       "path": "migration/review-checklist.md",
       "kind": "review",
-      "bytes": 2043,
-      "sha256": "63c71461b16b76110efc531d16653074ed0ffe414277ab40e3acc057ec613379"
+      "bytes": 2032,
+      "sha256": "c4a51fb149c7c6efaa5d687a638a5b76580cb4ca4e84e779b013d3b34972520c"
     },
     {
       "path": "migration/tasks.csv",

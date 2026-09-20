@@ -4,14 +4,9 @@ The canonical version is `workspace.package.version` in `Cargo.toml`. Releases
 use annotated `vX.Y.Z` tags. The tag workflow refuses a tag that does not match
 the workspace version.
 
-Release automation builds two native targets:
-
-- macOS Apple silicon (`aarch64-apple-darwin`), with committed qualification
-  evidence;
-- Linux x86-64 GNU (`x86_64-unknown-linux-gnu`), pending qualification until
-  the first hosted Linux full-suite and sealed-release run succeeds.
-
-Do not describe Linux as qualified until that hosted evidence is recorded.
+Release automation publishes one native target: qualified macOS Apple silicon
+(`aarch64-apple-darwin`). Linux x86-64 remains a visible non-blocking CI
+validation lane; its release and qualification are deferred.
 
 ## Prepare
 
@@ -26,9 +21,9 @@ cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs
 ```
 
-Run the Rust gates on both hosted target platforms. The Desktop relay check is
-macOS-specific; Linux still runs the workspace suite, clippy, source archive,
-and sealed native release verification.
+Run the release gates on macOS arm64. The non-blocking Linux validation lane
+runs the workspace and sealed-build checks independently, but its result does
+not gate or add an artifact to the 0.12.0 release.
 
 For adapter or supervisor changes, also run a candidate through a supported
 real engine in an isolated home. Verify the answer proof, transcript, process
@@ -62,13 +57,13 @@ one host's binary.
    git push origin v0.12.0
    ```
 
-After CI accepts the commit, both native jobs in the tagged `Release` workflow
-run the workspace checks and build and verify their sealed artifact. The macOS
+After CI accepts the commit, the tagged `Release` workflow runs the macOS
+workspace checks and builds and verifies the sealed macOS artifact. The macOS
 gate job additionally runs qualification, evidence, Desktop transport, and
 source-archive gates once. The workflow then generates one `SHA256SUMS`, attests
-the listed artifacts, and publishes a GitHub Release only after every required
-job succeeds. A failed run leaves no public partial release. Tags are immutable;
-corrections ship as a new patch version.
+the listed macOS and source artifacts, and publishes a GitHub Release only after
+every required job succeeds. A failed run leaves no public partial release.
+Tags are immutable; corrections ship as a new patch version.
 
 ## Install or update a sealed runtime
 
@@ -96,9 +91,7 @@ steps:
 
 1. Stop admission and verify no active agents or birth-verified writers remain.
 2. Run the xtask install/update command against the verified release.
-3. Restart the API, capacity, and delivery launchd jobs on macOS, or restart
-   the external service-manager units on Linux. agent-run does not generate
-   systemd units.
+3. Restart the API, capacity, and delivery launchd jobs on macOS.
 4. Verify release metadata, database integrity, `agent-run doctor`, API
    `ping`/`tools`, and MCP `initialize`/`tools/list`.
 5. Run one provider-free broker fixture before admitting real work.
@@ -112,7 +105,6 @@ older binary at a database already migrated by a newer schema.
 GitHub Releases is the only public distribution channel. Each release carries:
 
 - `agent-run-X.Y.Z-aarch64-apple-darwin.tar.gz`;
-- `agent-run-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`;
 - `agent-run-X.Y.Z-source.tar`;
 - `SHA256SUMS`;
 - GitHub provenance for the checksummed subjects.

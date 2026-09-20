@@ -8,7 +8,7 @@ implementation is frozen on branch `archive/python-legacy` at commit
 
 - [Status](status.md) — current completion and remaining qualification gaps.
 - [Qualification scope](evidence/qualification-scope.md) — scenario coverage
-  and the remaining live Desktop and Linux checks.
+  and historical live-evidence boundaries; Linux release is owner-deferred.
 - [Review checklist](review-checklist.md) — gates for a release candidate.
 - [Recovery](recovery.md) and [post-cutover report](post-cutover-report.md) —
   operator records for production deployment.

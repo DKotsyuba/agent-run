@@ -24,12 +24,13 @@ Python. Qwen is removed by [ADR A22](adr/A22-qwen-removal.md).
 | Scope | State | Acceptance evidence still required |
 |---|---|---|
 | macOS arm64 | supported | release gates and sealed-release smoke are recorded |
-| Linux x86_64 | build target, not yet qualified | first hosted Linux full suite and sealed-release smoke (T82) |
+| Linux x86_64 | non-blocking validation only; release and qualification owner-deferred | a future release decision plus hosted Linux full suite and sealed-release smoke (T82) |
 | Desktop delivery | not yet live-qualified | smoke against the real Desktop host (T71) |
 | Production cutover | operator action, not implied by build success | completed [review checklist](review-checklist.md), deployment journal, service smoke, and rollback evidence |
 
-No document may promote Linux or Desktop delivery to supported/qualified until
-that evidence is committed. Current scenario status is in the
+Version 0.12.0 publishes no Linux artifact. No document may promote Linux or
+Desktop delivery to supported/qualified until that evidence is committed.
+Current scenario status is in the
 [qualification scope map](evidence/qualification-scope.md).
 
 ## Historical material

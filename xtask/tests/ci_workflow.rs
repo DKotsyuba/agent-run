@@ -8,7 +8,7 @@ fn repository_file(path: &str) -> String {
         .unwrap_or_else(|error| panic!("cannot read {path}: {error}"))
 }
 
-/// Ensures primary CI runs locked gates and sealed builds on both native release targets.
+/// Ensures primary CI gates macOS releases while retaining visible Linux validation.
 #[test]
 fn ci_is_rust_only_and_checks_the_desktop_transport() {
     let workflow = repository_file(".github/workflows/ci.yml");
@@ -21,10 +21,13 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
         "cargo xtask release build-native",
         "cargo xtask release verify",
         "- os: macos-15\n            label: supported-macos-arm64\n            target: aarch64-apple-darwin\n            architecture: arm64",
-        "- os: ubuntu-latest\n            label: configured-release-target-linux-x86_64-pending-hosted-evidence\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
+        "- os: ubuntu-latest\n            label: validation-only-linux-x86_64-unqualified\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
+        "continue-on-error: ${{ matrix.continue_on_error }}",
+        "continue_on_error: false",
+        "continue_on_error: true",
         "test \"$(uname -m)\" = \"${{ matrix.architecture }}\"",
         "node --test scripts/check-desktop-transport.cjs",
-        "configured-release-target-linux-x86_64-pending-hosted-evidence",
+        "validation-only-linux-x86_64-unqualified",
     ] {
         assert!(workflow.contains(required), "CI is missing {required:?}");
     }
@@ -58,7 +61,7 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
     }
 }
 
-/// Ensures tagged releases aggregate two verified native archives and one source archive.
+/// Ensures tagged releases aggregate one verified macOS archive and one source archive.
 #[test]
 fn release_publishes_checksummed_native_assets() {
     let workflow = repository_file(".github/workflows/release.yml");
@@ -71,9 +74,9 @@ fn release_publishes_checksummed_native_assets() {
         "cargo xtask release build-native",
         "cargo xtask release verify",
         "cargo xtask archive --revision HEAD",
-        "- os: macos-15\n            target: aarch64-apple-darwin\n            architecture: arm64",
-        "- os: ubuntu-latest\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
-        "agent-run-$version-${{ matrix.target }}.tar.gz",
+        "runs-on: macos-15",
+        "--target aarch64-apple-darwin",
+        "agent-run-$version-aarch64-apple-darwin.tar.gz",
         "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
         "merge-multiple: true",
@@ -95,6 +98,8 @@ fn release_publishes_checksummed_native_assets() {
         "uv sync",
         ".whl",
         "sdist",
+        "x86_64-unknown-linux-gnu",
+        "matrix.target",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -165,7 +170,7 @@ fn release_publishes_checksummed_native_assets() {
     }
     assert!(
         native.contains("run: cargo xtask check"),
-        "both native matrix entries must run the full locked workspace gates"
+        "the macOS native job must run the full locked workspace gates"
     );
 }
 

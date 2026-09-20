@@ -12,5 +12,5 @@
 
 Python-реализация заморожена в `archive/python-legacy` на `c58d5a0`. Qwen
 удалён решением [A22](adr/A22-qwen-removal.md). Подтверждены реальные start и
-resume для Codex, Claude и GLM; Desktop-host и Linux-квалификация остаются
-открытыми.
+resume для Codex, Claude и GLM. Desktop-host остаётся непроверенным, а выпуск и
+квалификация Linux отложены владельцем.

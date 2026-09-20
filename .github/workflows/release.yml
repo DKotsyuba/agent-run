@@ -52,19 +52,9 @@ jobs:
           retention-days: 7
 
   native:
-    name: Build ${{ matrix.target }} archive
+    name: Build aarch64-apple-darwin archive
     needs: gate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            target: aarch64-apple-darwin
-            architecture: arm64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            architecture: x86_64
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-15
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,7 +65,7 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Verify native runner architecture
-        run: test "$(uname -m)" = "${{ matrix.architecture }}"
+        run: test "$(uname -m)" = arm64
       - name: Run locked workspace gates
         run: cargo xtask check
       - name: Build and verify sealed native archive
@@ -84,17 +74,17 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cargo xtask release build-native \
-            --target "${{ matrix.target }}" \
+            --target aarch64-apple-darwin \
             --output "$RUNNER_TEMP/native" \
             --version "$version"
           cargo xtask release verify --release "$RUNNER_TEMP/native/releases/$version"
           tar -C "$RUNNER_TEMP/native/releases/$version" \
-            -czf "dist/agent-run-$version-${{ matrix.target }}.tar.gz" .
+            -czf "dist/agent-run-$version-aarch64-apple-darwin.tar.gz" .
       - name: Upload native archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: native-${{ matrix.target }}
-          path: dist/agent-run-*-${{ matrix.target }}.tar.gz
+          name: native-aarch64-apple-darwin
+          path: dist/agent-run-*-aarch64-apple-darwin.tar.gz
           if-no-files-found: error
           retention-days: 7
 
