@@ -38,6 +38,13 @@ async fn read<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Value> {
     Ok(v)
 }
 
+/// Sends `notice` for the target Desktop session `thread` to the first eligible relay endpoint.
+///
+/// Candidates under `home` are restricted to same-user Unix sockets, ordered by
+/// protocol preference and name, and attempted until the shared ten-second
+/// deadline expires. Accepted and rejected replies are classified directly;
+/// malformed or interrupted exchanges are ambiguous because delivery may have
+/// reached the relay. No reachable endpoint returns `relay_unavailable`.
 pub async fn send(home: &Path, thread: &str, notice: &Notice) -> Evidence {
     let mut paths: Vec<_> = std::fs::read_dir(home)
         .into_iter()
@@ -57,7 +64,6 @@ pub async fn send(home: &Path, thread: &str, notice: &Notice) -> Evidence {
             n.to_string(),
         )
     });
-    paths.truncate(16);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut rejected = false;
     for path in paths {
