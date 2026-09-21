@@ -142,7 +142,8 @@ impl CliDependencies {
 /// This parser is intentionally the single source of command names and flag
 /// spelling for the binary. Service calls keep their request schemas in the
 /// shared domain tool registry; this layer only adapts shell values to those
-/// schemas and never launches a one-shot start locally.
+/// schemas and never launches a one-shot start locally. Clap renders the
+/// package version through `--version` and `-V` before command dispatch.
 #[derive(Parser, Debug)]
 #[command(
     name = "agent-run",

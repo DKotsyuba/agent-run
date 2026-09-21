@@ -147,13 +147,19 @@ pub fn start(runtime: &str, model: &str, agent_id: &str, created: bool) {
 /// revision, or `None` when no valid revision has been cached yet, which is
 /// enough to distinguish successful adoption from a rejected change.
 /// Configuration contents, paths, environment values, and credentials are
-/// never included.
+/// never included. Accepted revisions are normal `Info`; rejected revisions
+/// are recoverable `Warning` events so operators cannot suppress invalid
+/// configuration diagnostics with the conventional warning threshold.
 pub fn config_reload(accepted: bool, revision: Option<&str>) {
     if let Some(logger) = configured() {
         let outcome = if accepted { "accepted" } else { "rejected" };
         let revision = revision.unwrap_or("none");
         logger.log(
-            Level::Info,
+            if accepted {
+                Level::Info
+            } else {
+                Level::Warning
+            },
             &format!("config reload {outcome} revision={revision}"),
         );
     }

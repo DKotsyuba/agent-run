@@ -138,3 +138,29 @@ fn config_reload_diagnostics_name_the_active_revision() {
     );
     reset_logging();
 }
+
+/// Proves invalid configuration remains visible at the warning log threshold.
+#[test]
+fn config_reload_rejection_survives_warning_threshold() {
+    let _guard = logger_guard();
+    reset_logging();
+    // SAFETY: logger_guard excludes every other test that reads this setting.
+    unsafe { std::env::set_var("AGENT_RUN_LOG_LEVEL", "WARNING") };
+    let home = common::Home::new();
+    let config_path = home.path.join("config.toml");
+    let original = std::fs::read(&config_path).unwrap();
+    logging::configure(&home.path, "cli");
+    let service = Service::new(home.path.clone());
+    assert!(service.refresh_config().unwrap());
+
+    let invalid = "not valid TOML = [";
+    std::fs::write(&config_path, invalid).unwrap();
+    assert!(service.refresh_config().is_err());
+    let text = std::fs::read_to_string(home.path.join("logs/cli.log")).unwrap();
+    assert!(text.contains(&format!(
+        "Warning cli config reload rejected revision={}",
+        fs::sha256(&original)
+    )));
+    assert!(!text.contains(invalid));
+    reset_logging();
+}

@@ -21,6 +21,11 @@ pub enum ProcessState {
     Denied,
     NotStarted,
 }
+/// Reads one Linux process identity from procfs without trusting command-name encoding.
+///
+/// `pid` must be greater than one. The function returns the underlying procfs,
+/// boot-clock, or numeric-field error when identity evidence is unavailable or
+/// malformed; callers decide whether that evidence permits lifecycle action.
 #[cfg(target_os = "linux")]
 pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     if pid <= 1 {

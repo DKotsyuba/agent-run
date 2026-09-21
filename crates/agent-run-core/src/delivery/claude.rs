@@ -2,6 +2,7 @@
 
 use super::{Evidence, Notice};
 use serde_json::{json, Value};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -37,15 +38,14 @@ pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
     let mut stream =
         match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(&socket)).await {
             Ok(Ok(stream)) => stream,
-            // A refused connection to a socket-file endpoint means the peer
-            // died; Linux also refuses when the path is not a socket at all
-            // (for example a directory), which is an unavailable endpoint
-            // rather than a lost session, so the path type decides.
+            // A refused connection to a socket endpoint, or a path removed
+            // after descriptor resolution, means the peer died. Linux also
+            // refuses non-socket files, which are unavailable rather than lost.
             Ok(Err(error))
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) && !socket.is_dir() =>
+                ) && socket_is_gone_or_socket(&socket) =>
             {
                 return Evidence::new("uds_session_gone", false, false);
             }
@@ -70,6 +70,19 @@ pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
             Evidence::new("uds_ambiguous", false, true)
         }
         Ok(Err(_)) | Err(_) => Evidence::new("uds_unavailable", false, false),
+    }
+}
+
+/// Returns whether a failed endpoint is absent or is an actual Unix socket.
+///
+/// Missing paths and socket inodes represent a peer that disappeared or stopped
+/// listening. Existing regular files, directories, FIFOs, and symlinks return
+/// `false` so callers classify them as unavailable configuration rather than a
+/// lost session. Metadata errors other than not-found are likewise unavailable.
+fn socket_is_gone_or_socket(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_socket(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
