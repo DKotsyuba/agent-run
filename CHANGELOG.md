@@ -4,6 +4,37 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-21
+
+- fix(cli,mcp): `cancel` returns the current agent view with top-level status
+  after enqueuing the durable cancellation, restoring the archived response
+  shape shared by CLI, socket, and MCP transports
+- fix(core): lost-process reconciliation drains late pending steer/cancel
+  commands through the shared completion path, and finalizes pending commands
+  inside the transaction that commits the lost status so a crash cannot strand
+  them behind a terminal row
+- fix(cli): the CLI parser carries the package version so `--version` prints it
+- fix(config): reload adoption and rejection are recorded in bounded process
+  logs naming the active SHA-256 revision; adoption is logged only after the
+  snapshot is installed, and no config contents, paths, environment values, or
+  credentials are persisted
+- fix(mcp): the `start` tool description names both direct host-visible engine
+  aliases and is pinned to the archived Python baseline plus exactly that
+  guidance
+- fix(platform): parse `/proc/<pid>/stat` as bytes so a non-UTF-8 command name
+  can no longer discard leader identity and fail Linux cleanup observation
+- fix(core): classify a non-socket Claude UDS endpoint as unavailable instead
+  of session-gone; Linux reports `ECONNREFUSED` for both
+- test(core,store): derive Codex app-server fixture paths from the host temp
+  directory and run the `chflags uchg` reopen fixture only on macOS so Linux
+  validation passes
+- chore: remove the completed Rust migration archive and its migration-only
+  `xtask evidence verify` and `xtask qualify` commands; release safety stays
+  with the workspace checks, source archive verification, the sealed native
+  release, and the Desktop transport fixture
+- 0.12.1 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.12.0] - 2026-09-20
 
 - feat!: make the self-contained Rust broker the sole primary implementation
@@ -336,7 +367,8 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/DKotsyuba/agent-run/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.12.0
 [0.11.15]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.15
 [0.11.14]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.14

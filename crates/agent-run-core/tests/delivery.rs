@@ -582,7 +582,7 @@ async fn claude_uds_classifies_registry_and_auth_failures_without_host_contact()
 }
 
 /// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_unreachable_socket_and_foreign_target_are_delivery_errors`.
-/// Unix socket test: a non-socket endpoint exercises the unavailable delivery class.
+/// Unix socket test: every existing non-socket endpoint stays unavailable.
 #[tokio::test]
 async fn claude_uds_classifies_unreachable_endpoint_as_unavailable() {
     let temporary = tempfile::tempdir().unwrap();
@@ -593,6 +593,26 @@ async fn claude_uds_classifies_unreachable_endpoint_as_unavailable() {
     claude_descriptor(&registry, "unavailable", &endpoint);
     assert_eq!(
         claude::send(&registry, "unavailable", &notice())
+            .await
+            .classifier,
+        "uds_unavailable"
+    );
+
+    let regular = temporary.path().join("endpoint-file");
+    std::fs::write(&regular, "not a socket").unwrap();
+    claude_descriptor(&registry, "regular-file", &regular);
+    assert_eq!(
+        claude::send(&registry, "regular-file", &notice())
+            .await
+            .classifier,
+        "uds_unavailable"
+    );
+
+    let symlink = temporary.path().join("endpoint-symlink");
+    std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+    claude_descriptor(&registry, "symlink", &symlink);
+    assert_eq!(
+        claude::send(&registry, "symlink", &notice())
             .await
             .classifier,
         "uds_unavailable"

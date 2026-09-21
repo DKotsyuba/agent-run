@@ -336,6 +336,9 @@ fn read_candidate(row: &rusqlite::Row<'_>) -> Result<Candidate> {
 }
 
 /// Atomically recheck captured ownership evidence and write the terminal loss.
+///
+/// The lost status, events, delivery and terminal results for pending commands
+/// commit in one transaction; claimed commands are left for their owner.
 fn guarded_lost(
     store: &mut Store,
     expected: &Candidate,
@@ -414,6 +417,10 @@ fn guarded_lost(
             params![format!("ntf_{}", uuid::Uuid::new_v4().simple()), expected.id.as_str(), session, terminal_event_seq, finished_at],
         )?;
     }
+    // Pending commands are finalized in this same transaction: future sweeps skip
+    // terminal rows, so a crash between the lost commit and a separate drain
+    // would leave them pending forever. Claimed commands stay untouched.
+    crate::commands::complete_pending_in(&tx, &expected.id, finished_at)?;
     tx.commit()?;
     Ok(true)
 }

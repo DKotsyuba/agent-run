@@ -111,6 +111,99 @@ fn reused_pid_is_lost_with_identity_mismatch() {
     );
 }
 
+/// Proves a lost reconciliation drains late pending commands through the same
+/// shared terminal path as a normal completion, so no command stays pending.
+#[test]
+fn lost_reconciliation_finalizes_pending_commands() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    active(&store, &id, 4245, "linux:fixture:4", 4.0);
+    store
+        .enqueue(&id, "steer", &json!({"text":"continue"}))
+        .unwrap();
+    store.enqueue(&id, "cancel", &json!({})).unwrap();
+
+    let changed = reconcile_with(&mut store, 10, |_, _, _| ProcessState::Dead).unwrap();
+
+    assert_eq!(changed, vec![id.clone()]);
+    assert_eq!(store.get(&id).unwrap().status, Status::Lost);
+    let (pending, completed): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT SUM(state='pending'),SUM(state='completed') FROM commands WHERE agent_id=?",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, 0, "no pending command survives the terminal loss");
+    assert_eq!(completed, 2, "both commands receive one terminal result");
+    let cancelled: String = store
+        .conn
+        .query_row(
+            "SELECT result_json FROM commands WHERE agent_id=? AND kind='cancel'",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&cancelled).unwrap(),
+        json!({"accepted": true, "reason": "already_stopping"})
+    );
+}
+
+/// Proves the lost transition and pending-command finalization are one atomic
+/// commit: a failure while finalizing commands rolls the whole loss back, so a
+/// retry can still reconcile the row, and a claimed command is never replayed.
+#[test]
+fn lost_reconciliation_is_atomic_with_command_finalization() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    active(&store, &id, 4246, "linux:fixture:5", 5.0);
+    store
+        .enqueue(&id, "steer", &json!({"text":"claimed"}))
+        .unwrap();
+    store.claim_command(&id).unwrap().unwrap();
+    store
+        .enqueue(&id, "steer", &json!({"text":"pending"}))
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_finalize BEFORE UPDATE OF state ON commands
+             WHEN NEW.state='completed' BEGIN SELECT RAISE(ABORT,'injected'); END",
+        )
+        .unwrap();
+
+    reconcile_with(&mut store, 10, |_, _, _| ProcessState::Dead).unwrap_err();
+
+    assert_eq!(store.get(&id).unwrap().status, Status::Running);
+    let states = |store: &Store| -> Vec<String> {
+        let mut statement = store
+            .conn
+            .prepare("SELECT state FROM commands WHERE agent_id=? ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([id.as_str()], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(states(&store), ["claimed", "pending"]);
+    store
+        .conn
+        .execute_batch("DROP TRIGGER fail_finalize")
+        .unwrap();
+
+    let changed = reconcile_with(&mut store, 10, |_, _, _| ProcessState::Dead).unwrap();
+
+    assert_eq!(changed, vec![id.clone()]);
+    assert_eq!(store.get(&id).unwrap().status, Status::Lost);
+    assert_eq!(states(&store), ["claimed", "completed"]);
+}
+
 /// Mirrors `test_unavailable_startup_birth_proof_is_not_death_before_deadline`.
 /// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_supervisor_identity_needs_no_process_probe`.
 #[test]

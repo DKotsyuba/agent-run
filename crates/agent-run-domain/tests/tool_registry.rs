@@ -1,6 +1,6 @@
 //! Golden and metadata contracts for the one public tool registry.
 
-use agent_run_domain::{registry, tools_json, ArgumentDefault};
+use agent_run_domain::{registry, tool, tools_json, ArgumentDefault};
 use serde_json::Value;
 
 /// Parses the captured Python discovery payload shared by all registry assertions.
@@ -19,7 +19,10 @@ fn registry_matches_python_golden_field_by_field() {
 
     for (definition, (actual, expected)) in registry().iter().zip(actual.iter().zip(expected)) {
         assert_eq!(actual["name"], expected["name"]);
-        assert_eq!(actual["description"], expected["description"]);
+        if definition.name != "start" {
+            assert_eq!(actual["description"], expected["description"]);
+        }
+        // The start description is pinned by `start_description_extends_the_python_baseline_exactly`.
         assert_eq!(actual["inputSchema"], expected["inputSchema"]);
         assert_eq!(actual["outputSchema"], expected["outputSchema"]);
         assert_eq!(actual["resultShape"], expected["resultShape"]);
@@ -46,12 +49,27 @@ fn registry_matches_python_golden_field_by_field() {
     }
 }
 
-/// Keep the checked-in asset byte-identical to the captured Python golden.
+/// The only text the start description adds to the frozen Python baseline: the
+/// binding guidance, inserted directly after the baseline's opening sentence. It names both direct host-visible aliases and forbids indirect calls.
+const START_BINDING_GUIDANCE: &str = "Automatic PostToolUse hook binding requires a direct, host-visible mcp__agent_run__start or mcp__agent-run__start call; do not wrap or nest start inside functions.exec, a shell call, another tool, or any other indirect invocation when automatic binding is expected. If a direct call is unavailable, pass the current session identity in orchestrator; otherwise delivery remains bound:false and no completion notice will arrive automatically. ";
+
+/// Pins the start description to the Python baseline plus exactly the binding
+/// guidance: removing that one insertion must reproduce the baseline byte for byte,
+/// so no historical guidance can disappear or drift unnoticed.
 #[test]
-fn checked_in_asset_is_the_verified_python_golden() {
+fn start_description_extends_the_python_baseline_exactly() {
+    let baseline = golden()
+        .into_iter()
+        .find(|tool| tool["name"] == "start")
+        .expect("golden start tool")["description"]
+        .as_str()
+        .expect("golden description is a string")
+        .to_owned();
+    let description = &tool("start").expect("start tool").description;
+    assert_eq!(description.matches(START_BINDING_GUIDANCE).count(), 1);
     assert_eq!(
-        include_str!("../../../assets/tools.json"),
-        include_str!("../../../tests/fixtures/baseline/tools.json")
+        description.replacen(START_BINDING_GUIDANCE, "", 1),
+        baseline
     );
 }
 

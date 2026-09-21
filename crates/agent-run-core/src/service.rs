@@ -133,18 +133,30 @@ impl Service {
     /// Returns `true` after installing a new valid revision and `false` when
     /// the exact bytes are unchanged. A malformed change returns an error and
     /// leaves the last valid revision intact for diagnostics; operations that
-    /// need current configuration still reject that malformed change.
+    /// need current configuration still reject that malformed change. Adoption
+    /// and rejection diagnostics are offered to the configured logger at
+    /// `Info` and `Warning` respectively, naming the SHA-256 revision that
+    /// remains active; the logger's effective threshold controls persistence.
+    /// An adoption is emitted only after the snapshot is installed, using the
+    /// revision read back from the cache, so it never names an inactive revision.
     pub fn refresh_config(&self) -> Result<bool> {
         let mut cache = self
             .config
             .write()
             .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?;
         let revision = cache.as_ref().map(|cached| cached.revision.as_str());
-        let Some((value, revision)) = Config::load_if_changed(&self.home, revision)? else {
-            return Ok(false);
-        };
-        *cache = Some(CachedConfig { revision, value });
-        Ok(true)
+        match Config::load_if_changed(&self.home, revision) {
+            Ok(None) => Ok(false),
+            Ok(Some((value, revision))) => {
+                *cache = Some(CachedConfig { revision, value });
+                logging::config_reload(true, cache.as_ref().map(|c| c.revision.as_str()));
+                Ok(true)
+            }
+            Err(error) => {
+                logging::config_reload(false, revision);
+                Err(error)
+            }
+        }
     }
 
     /// Returns the current valid configuration after checking its file digest.
@@ -365,8 +377,18 @@ impl Service {
             Err(error) => Err(error),
         }
     }
+    /// Enqueues one durable cancellation and returns the agent's public view.
+    ///
+    /// The pending command is persisted exactly as [`Store::enqueue`] records
+    /// it, so command durability is unchanged; the returned envelope is the
+    /// current agent view including its top-level `status`, matching the
+    /// archived Python `self.get(agent_id)` response.  An unknown or already
+    /// terminal agent fails before any command is queued.
     pub fn cancel(&self, id: &AgentId) -> Result<Value> {
-        Store::open(&self.home)?.enqueue(id, "cancel", &json!({}))
+        let mut store = Store::open(&self.home)?;
+        store.enqueue(id, "cancel", &json!({}))?;
+        let row = store.get(id)?;
+        self.view(&store, &row)
     }
     /// Enqueues one nonblank bounded steering message for an active agent.
     ///

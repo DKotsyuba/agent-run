@@ -10,6 +10,19 @@ use agent_run_platform::fs;
 use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// Returns the canonical host temp directory as text.
+///
+/// `/private/tmp` exists only on macOS, so the spawned fake plans and the
+/// admitted requests derive one canonical existing path that is identical on
+/// every validation platform.
+fn scratch() -> String {
+    std::env::temp_dir()
+        .canonicalize()
+        .expect("temp dir")
+        .display()
+        .to_string()
+}
+
 /// Returns the legacy read-only grant used by startup echo regressions.
 fn startup_grant() -> Grant {
     Grant {
@@ -58,8 +71,8 @@ fn runtime(home: PathBuf) -> Runtime {
 fn fake_plan() -> LaunchPlan {
     LaunchPlan {
         binary: PathBuf::from("/bin/sh"),
-        args: vec!["-c".into(), r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in 1) printf '%s\n' '{"id":1,"result":{}}' ;; 3) printf '%s\n' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;; 4) case "$line" in *'"permissions"'*) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;; 5) printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;; esac; done"#.into()],
-        cwd: PathBuf::from("/private/tmp"),
+        args: vec!["-c".into(), r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in 1) printf '%s\n' '{"id":1,"result":{}}' ;; 3) printf '%s\n' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;; 4) case "$line" in *'"permissions"'*) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;; 5) printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;; esac; done"#.replace("/private/tmp", &scratch())],
+        cwd: PathBuf::from(scratch()),
         environment: BTreeMap::new(),
         initial_input: None,
     }
@@ -69,8 +82,8 @@ fn fake_plan() -> LaunchPlan {
 fn streaming_plan() -> LaunchPlan {
     LaunchPlan {
         binary: PathBuf::from("/bin/sh"),
-        args: vec!["-c".into(), r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in 1) printf '%s\n' '{"id":1,"result":{}}' ;; 3) printf '%s\n' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;; 4) case "$line" in *'"permissions"'*) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;; 5) printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn"}}}'; sleep 1; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":" \\n"}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"agentMessage","id":"item","text":"samesame \\n"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;; esac; done"#.into()],
-        cwd: PathBuf::from("/private/tmp"),
+        args: vec!["-c".into(), r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in 1) printf '%s\n' '{"id":1,"result":{}}' ;; 3) printf '%s\n' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;; 4) case "$line" in *'"permissions"'*) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s\n' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;; 5) printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn"}}}'; sleep 1; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":" \\n"}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"agentMessage","id":"item","text":"samesame \\n"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;; esac; done"#.replace("/private/tmp", &scratch())],
+        cwd: PathBuf::from(scratch()),
         environment: BTreeMap::new(),
         initial_input: None,
     }
@@ -82,7 +95,7 @@ fn streaming_plan() -> LaunchPlan {
 async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
     let fixture = common::Home::new();
     let mut request = fixture.request();
-    request.workdir = PathBuf::from("/private/tmp");
+    request.workdir = PathBuf::from(scratch());
     request.request_id = Some("codex-protocol-correlation".into());
     request.validate().expect("fixture request");
     let (id, _) = fixture
@@ -129,7 +142,7 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
 async fn python_test_codex_app_server_repeated_chunks_are_journaled_after_idle_poll() {
     let fixture = common::Home::new();
     let mut request = fixture.request();
-    request.workdir = PathBuf::from("/private/tmp");
+    request.workdir = PathBuf::from(scratch());
     request.validate().expect("fixture request");
     let (id, _) = fixture
         .store()
