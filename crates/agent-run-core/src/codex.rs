@@ -284,6 +284,11 @@ impl Grant {
         }
         v
     }
+    /// Verifies the app-server thread echo against the admitted grant.
+    ///
+    /// Readable and writable root collections compare as multisets: the echo
+    /// order is not contractual, so a pure permutation passes while extra,
+    /// missing, duplicate, and malformed entries still fail closed.
     pub fn verify(&self, v: &Value) -> Result<()> {
         let sandbox = match v.get("sandbox") {
             Some(Value::String(s)) => s.as_str(),
@@ -331,7 +336,17 @@ impl Grant {
             }
             roots
         };
-        if roots != self.roots || writable != self.writable_roots {
+        // Echo order is not contractual: compare readable and writable roots
+        // as sorted multisets, so extra, missing, and duplicate entries still
+        // fail closed.
+        let same_roots = |echo: &[String], granted: &[String]| {
+            let mut echo: Vec<_> = echo.to_vec();
+            let mut granted: Vec<_> = granted.to_vec();
+            echo.sort();
+            granted.sort();
+            echo == granted
+        };
+        if !same_roots(&roots, &self.roots) || !same_roots(&writable, &self.writable_roots) {
             return Err(invalid(
                 "Codex effective readable/writable roots differ from admitted grant",
             ));

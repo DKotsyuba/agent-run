@@ -263,6 +263,130 @@ fn python_test_codex_app_server_beta_writable_roots_unexpected_entry_is_reported
     assert!(grant.verify(&actual).is_err());
 }
 
+/// Returns a workspace-write grant holding several readable and writable roots.
+fn multi_root_grant() -> Grant {
+    Grant {
+        model: "gpt-5.6-sol".into(),
+        cwd: "/work".into(),
+        roots: vec!["/a".into(), "/b".into(), "/c".into()],
+        writable_roots: vec!["/c".into(), "/b".into(), "/a".into()],
+        sandbox: "workspace-write".into(),
+        approval_policy: "never".into(),
+        reviewer: None,
+        network_access: false,
+        permission_profile: None,
+    }
+}
+
+/// A pure permutation of the echoed readable and writable roots passes.
+#[test]
+fn roots_echo_order_is_not_contractual() {
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/c", "/a", "/b"]),
+            json!(["/b", "/c", "/a"]),
+        ))
+        .is_ok());
+}
+
+/// An extra echoed root fails closed even when every granted root is present.
+#[test]
+fn extra_echoed_root_is_refused() {
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/b", "/c", "/d"]),
+            json!(["/a", "/b", "/c"]),
+        ))
+        .is_err());
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/b", "/c"]),
+            json!(["/a", "/b", "/c", "/d"]),
+        ))
+        .is_err());
+}
+
+/// A missing echoed root fails closed.
+#[test]
+fn missing_echoed_root_is_refused() {
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/c"]),
+            json!(["/a", "/b", "/c"]),
+        ))
+        .is_err());
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/b", "/c"]),
+            json!(["/a", "/c"]),
+        ))
+        .is_err());
+}
+
+/// A non-string element in the echoed readable roots fails closed.
+#[test]
+fn malformed_readable_roots_element_is_refused() {
+    assert!(read_only_grant()
+        .verify(&echo(json!("read-only"), json!(["/work", 7]), json!([])))
+        .is_err());
+}
+
+/// A non-array readable roots shape fails closed.
+#[test]
+fn malformed_readable_roots_shape_is_refused() {
+    assert!(read_only_grant()
+        .verify(&echo(json!("read-only"), json!("/work"), json!([])))
+        .is_err());
+}
+
+/// A non-string element in the echoed writableRoots fails closed.
+#[test]
+fn malformed_writable_roots_element_is_refused() {
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/b", "/c"]),
+            json!(["/a", "/b", true]),
+        ))
+        .is_err());
+}
+
+/// A non-array writableRoots shape fails closed.
+#[test]
+fn malformed_writable_roots_shape_is_refused() {
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/b", "/c"]),
+            json!("/a"),
+        ))
+        .is_err());
+}
+
+/// A duplicated echoed root fails closed because comparison stays a multiset.
+#[test]
+fn duplicate_echoed_root_is_refused() {
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/a", "/b", "/c"]),
+            json!(["/a", "/b", "/c"]),
+        ))
+        .is_err());
+    assert!(multi_root_grant()
+        .verify(&echo(
+            json!("workspace-write"),
+            json!(["/a", "/b", "/c"]),
+            json!(["/a", "/b", "/c", "/c"]),
+        ))
+        .is_err());
+}
+
 /// Builds the read-only role for request-grant construction tests.
 fn read_only_profile(read_roots: Vec<PathBuf>) -> Profile {
     Profile {
