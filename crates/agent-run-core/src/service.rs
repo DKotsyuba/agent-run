@@ -135,7 +135,9 @@ impl Service {
     /// leaves the last valid revision intact for diagnostics; operations that
     /// need current configuration still reject that malformed change. Every
     /// adoption and rejection is recorded in the bounded process log, naming
-    /// the SHA-256 revision that remains active after the attempt.
+    /// the SHA-256 revision that remains active after the attempt. An adoption
+    /// is logged only after the snapshot is installed, using the revision read
+    /// back from the cache, so the log never names an inactive revision.
     pub fn refresh_config(&self) -> Result<bool> {
         let mut cache = self
             .config
@@ -145,8 +147,8 @@ impl Service {
         match Config::load_if_changed(&self.home, revision) {
             Ok(None) => Ok(false),
             Ok(Some((value, revision))) => {
-                logging::config_reload(true, Some(&revision));
                 *cache = Some(CachedConfig { revision, value });
+                logging::config_reload(true, cache.as_ref().map(|c| c.revision.as_str()));
                 Ok(true)
             }
             Err(error) => {

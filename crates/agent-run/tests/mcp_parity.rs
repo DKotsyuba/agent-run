@@ -136,15 +136,44 @@ fn socket_ready(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_socket())
 }
 
-/// Read the captured Python exchange for one supported handshake protocol version.
+/// The only text the Rust start description adds to the frozen Python baseline,
+/// inserted directly after its opening sentence (see the domain registry contract).
+const START_BINDING_GUIDANCE: &str = "Automatic PostToolUse hook binding requires a direct, host-visible mcp__agent_run__start or mcp__agent-run__start call; do not wrap or nest start inside functions.exec, a shell call, another tool, or any other indirect invocation when automatic binding is expected. If a direct call is unavailable, pass the current session identity in orchestrator; otherwise delivery remains bound:false and no completion notice will arrive automatically. ";
+
+/// The baseline start description's opening sentence, which the guidance follows.
+const START_OPENING: &str = "Start one asynchronous durable agent. ";
+
+/// Inserts the intentional binding guidance into every captured `start` tool
+/// description found anywhere in `value`, leaving all other bytes untouched.
+fn extend_start_description(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if object.get("name").and_then(Value::as_str) == Some("start") {
+                if let Some(Value::String(description)) = object.get_mut("description") {
+                    *description = description.replacen(
+                        START_OPENING,
+                        &format!("{START_OPENING}{START_BINDING_GUIDANCE}"),
+                        1,
+                    );
+                }
+            }
+            object.values_mut().for_each(extend_start_description);
+        }
+        Value::Array(items) => items.iter_mut().for_each(extend_start_description),
+        _ => {}
+    }
+}
+
+/// Read the captured Python exchange for one supported handshake protocol version,
+/// extended by the intentional start binding guidance.
 fn baseline(version: &str) -> Vec<Value> {
-    serde_json::from_str::<Value>(include_str!(
+    let mut exchange = serde_json::from_str::<Value>(include_str!(
         "../../../tests/fixtures/baseline/mcp/handshake.json"
     ))
     .unwrap()[version]
-        .as_array()
-        .unwrap()
-        .clone()
+        .clone();
+    extend_start_description(&mut exchange);
+    exchange.as_array().unwrap().clone()
 }
 
 /// Build a deterministic initialize request shared with the captured Python session.
@@ -204,6 +233,7 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
         .unwrap();
     let mut expected: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/baseline/tools.json")).unwrap();
+    extend_start_description(&mut expected);
     for tool in expected.as_array_mut().unwrap() {
         tool.as_object_mut().unwrap().retain(|key, value| {
             !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()

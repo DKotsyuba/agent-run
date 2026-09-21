@@ -83,19 +83,34 @@ fn config_reload_diagnostics_name_the_active_revision() {
     logging::configure(&home.path, "cli");
     let service = Service::new(home.path.clone());
     let digest = |bytes: &[u8]| fs::sha256(bytes);
+    let log = || std::fs::read_to_string(home.path.join("logs/cli.log")).unwrap();
+    // The newest line after an adoption names the revision that is now active.
+    let newest_is = |line: String| assert!(log().lines().last().unwrap().ends_with(&line));
 
     let original = std::fs::read(&config_path).unwrap();
     assert!(service.refresh_config().unwrap());
+    newest_is(format!(
+        "config reload accepted revision={}",
+        digest(&original)
+    ));
     let changed = format!(
         "{}\n[delivery]\nretry_base_seconds = 3.0\n",
         String::from_utf8_lossy(&original)
     );
     std::fs::write(&config_path, &changed).unwrap();
     assert!(service.refresh_config().unwrap());
+    newest_is(format!(
+        "config reload accepted revision={}",
+        digest(changed.as_bytes())
+    ));
 
     let invalid = "not valid TOML = [";
     std::fs::write(&config_path, invalid).unwrap();
     assert!(service.refresh_config().is_err());
+    newest_is(format!(
+        "config reload rejected revision={}",
+        digest(changed.as_bytes())
+    ));
     // Restoring the last valid bytes is a digest hit only when the invalid
     // revision never replaced the cached snapshot.
     std::fs::write(&config_path, &changed).unwrap();
@@ -103,7 +118,7 @@ fn config_reload_diagnostics_name_the_active_revision() {
     std::fs::write(&config_path, &original).unwrap();
     assert!(service.refresh_config().unwrap());
 
-    let text = std::fs::read_to_string(home.path.join("logs/cli.log")).unwrap();
+    let text = log();
     assert!(text.contains(&format!(
         "config reload accepted revision={}",
         digest(&original)
