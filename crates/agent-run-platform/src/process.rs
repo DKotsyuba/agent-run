@@ -83,7 +83,7 @@ fn stat_fields(stat: &[u8]) -> std::io::Result<Vec<&[u8]>> {
         .collect())
 }
 /// Report one unparsable `/proc/<pid>/stat` tail field.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn proc_field_error() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, "proc field")
 }

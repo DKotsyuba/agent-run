@@ -37,7 +37,7 @@ launchd's default 256. A foreground process can still be run under another
 supervisor when launchd is unavailable.
 
 Future, unqualified Linux builds can run the foreground command under an
-external service manager. Linux is not a published 0.12.0 target, and agent-run
+external service manager. Linux is not a published 0.12.1 target, and agent-run
 does not generate systemd units. A user unit can use:
 
 ```ini
