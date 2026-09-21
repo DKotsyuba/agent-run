@@ -1,7 +1,7 @@
 //! Data-driven oracle over `tests/fixtures/baseline/config/cases.json`,
 //! captured from the real Python `agent_run.config.load_config`,
 //! `agent_run.native_settings`, and `agent_run.profiles.parse_profile`
-//! (`migration/tools/capture_baseline.py`). Every case id names the exact
+//! (a frozen capture; its tooling is not in this repository). Every case id names the exact
 //! Python test it mirrors (`tests/test_config.py`, `tests/test_native_settings.py`,
 //! `tests/test_profiles.py`).
 //!

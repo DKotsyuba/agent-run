@@ -127,7 +127,8 @@ Release automation publishes a macOS Apple-silicon artifact. macOS is the only
 qualified 0.12.0 release platform. Linux x86-64 remains a visible non-blocking
 validation lane; its release and qualification are deferred. launchd
 integration is built in on macOS. Future Linux deployments use an external
-service manager. See [releasing.md](releasing.md).
+service manager. A platform-only integration such as launchd fails explicitly
+where it is unavailable. See [releasing.md](releasing.md).
 
 ## Design invariants
 

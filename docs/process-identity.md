@@ -35,6 +35,14 @@ same-user relationship fields are unavailable. Linux reads `/proc`; its boot ID
 prevents start-tick reuse across reboots. Both platforms fail closed when group
 or relationship evidence cannot be established.
 
+Supervisors start with session-creating `posix_spawn`, so no parent code runs in
+the child between fork and exec. The fork fallback exists only when the C
+library explicitly rejects `POSIX_SPAWN_SETSID`; any other spawn error
+propagates and an ambiguous creation is never retried through a second backend.
+The chosen backend is recorded as launch evidence. On macOS the recorded birth
+time is the kernel start timeval as `seconds + microseconds / 1e6`, with no
+rounding beyond that division.
+
 Historical rows that contain only a birth-time float remain readable. They can
 prove a missing PID dead or a birth mismatch reused, but a present PID without
 matching evidence remains unknown.

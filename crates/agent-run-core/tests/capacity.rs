@@ -883,10 +883,9 @@ fn manual_reset_credits_are_bounded_and_never_revive_exhaustion() {
 
 #[test]
 fn overflowing_priority_defers_rather_than_producing_infinity() {
-    // ADR A16: large weights/overflow must be rejected/deferred with a typed
-    // reason before ranking; `Infinity` must never enter the sort or the JSON
-    // projection. No direct Python test covers this -- the Python baseline
-    // leaves it as an open decision (rust-migration-plan.md 23.2, A16).
+    // Large weights/overflow must be deferred with a typed reason before
+    // ranking; `Infinity` must never enter the sort or the JSON projection.
+    // No Python baseline test covers this.
     let route = rk_route(
         "codex",
         "huge",
@@ -964,7 +963,7 @@ fn values_close(actual: &serde_json::Value, expected: &serde_json::Value) -> boo
 fn golden_capacity_ranking_cases_match_python() {
     // Data-driven oracle: tests/fixtures/baseline/capacity/cases.json holds
     // exact inputs and outputs captured from the real Python
-    // `rank_capacity_routes` (migration/tools/capture_baseline.py). Every
+    // `rank_capacity_routes` (a frozen capture). Every
     // case name mirrors a test in tests/test_capacity_ranking.py (the
     // `reset-credit-bonus` case duplicates
     // `manual_reset_credits_are_bounded_and_never_revive_exhaustion` above and

@@ -1,7 +1,6 @@
 //! Ports `tests/test_profiles.py` and `tests/test_effective_policy.py`
 //! (profile parsing/write decisions and effective-policy admission), plus
-//! the ADR A11 `required_constraints` regression
-//! (see `migration/adr/A11-required-constraints.md`).
+//! the `required_constraints` union regression (see `docs/api.md`).
 mod common;
 
 use agent_run_config::{
@@ -377,9 +376,8 @@ fn advisory_and_tool_filter_evidence_cannot_satisfy_isolation_requirements() {
     }
 }
 
-/// ADR A11 regression: `Profile.required_constraints` is `role ∪ request`
-/// (tightening), not Python's canonical-vs-legacy override. See
-/// `migration/adr/A11-required-constraints.md`.
+/// Regression: `Profile.required_constraints` is `role ∪ request`
+/// (tightening), not Python's canonical-vs-legacy override. See `docs/api.md`.
 #[test]
 fn required_constraints_union_role_and_request_matches_python_when_only_one_side_is_set() {
     let home = common::Home::new();

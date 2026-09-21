@@ -225,7 +225,8 @@ pub fn admission_decision(policy: &EffectivePolicy) -> AdmissionDecision {
 /// the same way the pre-port implementation did, then delegates to
 /// [`effective_policy`]. `runtime.required_constraints` is not read here;
 /// callers pass the already-tightened `profile.required_constraints`
-/// (see `migration/adr/A11-required-constraints.md`).
+/// (the effective requirement is the union of role and request; see
+/// `docs/api.md`).
 pub fn evaluate(runtime_name: &str, runtime: &Runtime, profile: &Profile) -> EffectivePolicy {
     let platform = current_platform();
     let mut capabilities = BTreeMap::new();

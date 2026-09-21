@@ -219,7 +219,7 @@ fn temporary_directory(label: &str) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-/// Runs git archive with the source-tree exclusions required by M56.
+/// Runs git archive with the source-tree exclusions required for handoff.
 fn git_archive(
     root: &Path,
     commit: &str,

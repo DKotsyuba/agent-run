@@ -1,8 +1,8 @@
 //! Byte-exact parity tests against Python-generated canonical JSON vectors.
 //!
 //! Fixtures live in `tests/fixtures/canonical/vectors.json`, produced by the
-//! *actual* Python functions (see `migration/tools/gen_canonical_vectors.py`
-//! and `migration/adr/A12-canonical-json.md`). This test never reformats
+//! *actual* Python functions and are frozen; the generator is not part of this
+//! repository (see `docs/artifact-snapshots.md`). This test never reformats
 //! Python's output — it feeds each vector's `payload` into
 //! `agent_run::canonical::dumps` and asserts the raw bytes and SHA-256 match
 //! what CPython actually produced.
@@ -16,7 +16,7 @@ fn vectors() -> Value {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/canonical/vectors.json"
     ))
-    .expect("vectors.json fixture is present (run migration/tools/gen_canonical_vectors.py)");
+    .expect("vectors.json fixture is present (frozen; do not regenerate)");
     serde_json::from_str(&raw).expect("vectors.json is valid JSON")
 }
 

@@ -66,7 +66,14 @@ adapter-known flat config files, declared credential-link paths and targets,
 and the materialization revision; resume requires its stored SHA-256, revision,
 and every referenced artifact to match. `inspect_config_snapshot()` likewise reads the attempt's
 configuration metadata as a no-follow regular file, checks its recorded hash,
-and requires canonical version-one JSON before reuse.
+and requires canonical version-one JSON before reuse. Persisted revisions,
+snapshot manifests, and replay fingerprints hash one shared serialization
+(`agent-run-domain::canonical`): sorted keys, `,`/`:` separators, and
+CPython-compatible string escaping and float rendering, with `ensure_ascii`
+chosen explicitly per document. Any change to those bytes makes existing runs
+unresumable or falsely rejects a replay, so JSON used only as a wire frame or a
+Rust-local manifest may use its own serializer but must not replace this one at a
+persisted boundary.
 
 For Codex, preparation writes the native per-workdir `trust_level = "trusted"`
 receipt before this index is finalized. The receipt is one exact project table

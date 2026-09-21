@@ -77,10 +77,8 @@ jobs:
         run: rustup show active-toolchain
       - name: Fetch locked dependencies
         run: cargo fetch --locked
-      - name: Verify release evidence and source archive
+      - name: Verify source archive
         run: |
-          cargo xtask qualify --release
-          cargo xtask evidence verify
           cargo xtask archive --verify
       - name: Build and verify sealed native release
         shell: bash

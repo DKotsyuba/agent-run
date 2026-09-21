@@ -150,8 +150,9 @@ async fn version_command_receives_no_ambient_value() {
 // `os.killpg(checked_pgid(group), SIGKILL)` unconditionally, so a grandchild
 // that holds stdout open after its leader exited is still killed. Rust's
 // `OwnedProcess::signal` (agent-run-platform/src/process.rs:501-513) sends
-// `kill(-pid)` only while the leader is observed `Alive`, which ADR A10
-// decision 5 established on purpose to avoid signalling a reused PID's group.
+// `kill(-pid)` only while the leader is observed `Alive`, which was chosen
+// on purpose (see `docs/process-identity.md`) to avoid signalling a reused PID's
+// group.
 // A written-out port of this behavior fails against the current Rust code, and
 // reconciling it changes that documented safety rule inside the supervisor
 // lifecycle. It is recorded for an owner decision rather than resolved here.

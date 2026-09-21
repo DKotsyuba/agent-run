@@ -5,7 +5,7 @@
 //! C library explicitly rejects `POSIX_SPAWN_SETSID`. Under one deadline the
 //! parent then waits for the child's PID proof and READY token, verifies that
 //! the leader heads its own group, and on failure signals only that verified
-//! group before reaping it. Decision record: `migration/adr/A10-spawn-backend.md`.
+//! group before reaping it. See `docs/process-identity.md`.
 use crate::process::{self, Identity, ProcessState};
 use serde::Serialize;
 use serde_json::Value;

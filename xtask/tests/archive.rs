@@ -1,4 +1,4 @@
-//! Source archive round-trip coverage for the M56 handoff tool.
+//! Source archive round-trip coverage for the handoff tool.
 
 use std::{fs, path::Path};
 use tempfile::tempdir;

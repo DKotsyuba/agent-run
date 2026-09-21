@@ -1,13 +1,12 @@
 //! Byte-exact equivalent of CPython's
 //! `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=...)`.
 //!
-//! Migration plan backlog M08 / ADR A12: the Rust binary must be able to
-//! reproduce, byte for byte, the canonical JSON the Python release already
-//! hashed and persisted (role-plan `config_revision`, config-snapshot and
-//! runtime-snapshot-index documents, answer proofs, `request_json`/
-//! `identity_json` rows). Any divergence makes an existing run unresumable
-//! or a replay falsely rejected. See `migration/adr/A12-canonical-json.md`
-//! for the inventory this was built against.
+//! The Rust binary must reproduce, byte for byte, the canonical JSON the Python
+//! release already hashed and persisted (role-plan `config_revision`,
+//! config-snapshot and runtime-snapshot-index documents, answer proofs,
+//! `request_json`/`identity_json` rows). Any divergence makes an existing run
+//! unresumable or a replay falsely rejected, so this is the one serializer for
+//! persisted cross-version boundaries (see `docs/artifact-snapshots.md`).
 //!
 //! Two Python call sites are covered, selected by `ensure_ascii`:
 //! - `ensure_ascii=True` (Python's default; used by role_plan/snapshot

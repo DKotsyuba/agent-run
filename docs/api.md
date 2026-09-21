@@ -129,7 +129,10 @@ authority, idempotency and history availability.
 names from tool discovery. Omission means no additional requirement. A named
 constraint must have enforcement strong enough for that boundary before any
 agent row is admitted; advisory evidence and unrelated tool filtering do not
-satisfy isolation requirements. Unknown or duplicate names are invalid.
+satisfy isolation requirements. Unknown or duplicate names are invalid. The
+effective requirement is the union of the role's `required_constraints` and the
+request's, for every profile kind; a caller can add a boundary but no role or
+request can drop one the other declared.
 
 `request_id` replay is scoped to the caller namespace in the original request.
 A later PostToolUse notification binding does not change that identity. Clients
@@ -210,7 +213,9 @@ Notes for the loop:
 - Bound Codex/Claude chats receive completion notices automatically when
   delivery is configured. The MCP `start` description includes the shared
   notice format and handling contract; `agent-run doc completion` (or MCP
-  `doc` with `{"topic": "completion"}`) serves the same contract. The `wait`
+  `doc` with `{"topic": "completion"}`) serves the same contract. A notification ID is any nonblank
+  string of at most 512 characters, and delivery attempt evidence accepts only
+  its declared fields. The `wait`
   example above is for an unbound API caller, not a bound-chat polling loop.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down

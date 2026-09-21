@@ -45,17 +45,14 @@ evidence, process ownership, and secret safety are product requirements.
 | `crates/agent-run-adapters` | Codex, Claude, and GLM adapters |
 | `crates/agent-run-core` | service, supervisor, capacity, delivery, doctor |
 | `crates/agent-run-platform` | process, filesystem, and artifact primitives |
-| `xtask` | checks, qualification, evidence, archives, releases, deployment |
+| `xtask` | checks, archives, releases, deployment |
 | `assets/operator_guide` | embedded `agent-run doc` pages |
 | `docs` | public architecture and operations documentation |
-| `migration` | historical migration decisions and evidence |
 
 ## Verification
 
 ```bash
 cargo xtask check
-cargo xtask qualify --release
-cargo xtask evidence verify
 cargo xtask archive --verify
 cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs

@@ -1,7 +1,6 @@
 # Python baseline corpus
 
-This is the sanitized Python reference corpus for Rust migration plan P0
-(backlog M01–M03). It was captured from Python baseline commit
+This is the sanitized Python reference corpus for the Rust port. It was captured from Python baseline commit
 `c9904f9843ba4a0772bdfa8bac5259f18fad9dc3`, which is an ancestor of BASE
 `31f723ba881fe0e35146a7262103c89737dd52ef`; `src/` and `tests/` were unchanged
 relative to that commit.
@@ -23,5 +22,5 @@ becomes `${WORKTREE}`. No real agent-run home, credentials, task text, answer
 content, network state, session IDs, or secrets were read or persisted.
 
 The corpus contains 33 CLI command nodes, 11 tools, 14 socket methods, 47
-config/profile cases, 11 notice cases, and 8 capacity cases. Pytest evidence is
-kept separately in `migration/evidence/python-baseline-pytest.log`.
+config/profile cases, 11 notice cases, and 8 capacity cases. The original Pytest log
+is preserved only in Git history.

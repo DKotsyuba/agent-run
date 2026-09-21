@@ -43,6 +43,8 @@ creates the valid profile identifiers `role-review`, `role-architect`, and
 `architect`. A generally valid ID such as `role-review` is rejected for that
 model. Compatibility profiles and runtime `skills`/`mcp` lists remain readable,
 but canonical and compatibility asset declarations cannot be mixed.
+Qwen is no longer a runtime: a Qwen adapter identifier is rejected with a
+deprecation error, and the runtime must be removed from `config.toml`.
 
 `workspace_root` affects write-capable Codex profiles only. Their workdir must
 be inside the configured tree; read-only profiles do not inherit write access.

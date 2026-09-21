@@ -1,6 +1,6 @@
 //! Repository-local verification and sealed native release entry point.
 use std::{env, path::PathBuf, process::Command};
-use xtask::{archive, deploy, evidence, qualify, release};
+use xtask::{archive, deploy, release};
 
 /// Runs the Rust workspace's formatter plus locked linter and test gates.
 fn main() {
@@ -13,17 +13,9 @@ fn main() {
         archive_command(&arguments[1..]);
         return;
     }
-    if arguments.first().map(String::as_str) == Some("evidence") {
-        evidence_command(&arguments[1..]);
-        return;
-    }
-    if arguments.first().map(String::as_str) == Some("qualify") {
-        qualify_command(&arguments[1..]);
-        return;
-    }
     if arguments.first().map(String::as_str) != Some("check") {
         eprintln!(
-            "usage: cargo xtask check | qualify [--release] | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify | evidence verify"
+            "usage: cargo xtask check | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify"
         );
         std::process::exit(2);
     }
@@ -54,26 +46,6 @@ fn main() {
             .expect("cargo must be executable");
         if !status.success() {
             std::process::exit(status.code().unwrap_or(1));
-        }
-    }
-}
-
-/// Checks the current host against immutable recorded qualification evidence.
-fn qualify_command(arguments: &[String]) {
-    let release = match arguments {
-        [] => false,
-        [argument] if argument == "--release" => true,
-        _ => {
-            eprintln!("qualify stopped: usage: cargo xtask qualify [--release]");
-            std::process::exit(2);
-        }
-    };
-    let root = env::current_dir().expect("current directory must be readable");
-    match qualify::qualify(&root, &qualify::host_platform(), release) {
-        Ok(report) => print!("{report}"),
-        Err(error) => {
-            eprintln!("qualify stopped: {error}");
-            std::process::exit(2);
         }
     }
 }
@@ -110,22 +82,6 @@ fn archive_command(arguments: &[String]) {
         });
     if let Err(error) = result {
         eprintln!("archive stopped: {error}");
-        std::process::exit(2);
-    }
-}
-
-/// Verifies the repository's hand-assembled migration evidence index.
-fn evidence_command(arguments: &[String]) {
-    let result = match arguments.first().map(String::as_str) {
-        Some("verify") if arguments.len() == 1 => {
-            let root = env::current_dir().expect("current directory must be readable");
-            evidence::verify(&root)
-                .map(|count| println!("evidence verify: passed ({count} entries)"))
-        }
-        _ => Err("usage: cargo xtask evidence verify".into()),
-    };
-    if let Err(error) = result {
-        eprintln!("evidence stopped: {error}");
         std::process::exit(2);
     }
 }

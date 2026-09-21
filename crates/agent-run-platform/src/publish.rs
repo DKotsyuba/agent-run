@@ -3,7 +3,7 @@
 //! entry is its own ordered, durable temp-then-rename replacement, exactly
 //! as `adapters/home.py`'s `write_managed_file` documents for `seal_answer`'s
 //! marker/payload/proof sequence and `snapshot_tree.py`'s manifest-last
-//! publish (see `rust-migration-plan.md` 9.2/9.4).
+//! publish (see `docs/artifact-snapshots.md`).
 use crate::fs::Dir;
 pub use crate::fs::FaultPoint;
 use agent_run_domain::Result;

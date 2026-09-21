@@ -231,7 +231,7 @@ fn positive_finite(name: &str, value: f64) -> Result<f64> {
 /// known reset credit count adds only `1 + n/(n+1)` after eligibility;
 /// aliases use the maximum count once.
 ///
-/// A non-finite priority (large-weight overflow, see ADR A16) defers that
+/// A non-finite priority (large-weight overflow) defers that
 /// route with reason `priority_overflow` rather than letting `Infinity`
 /// enter the sort or the JSON projection.
 pub fn rank_capacity_routes(
@@ -387,7 +387,7 @@ pub fn rank_capacity_routes(
                 scope_id: None,
                 route_id: Some(aliases[0].route_id.clone()),
                 reason: "priority_overflow".into(),
-                detail: "capacity priority overflowed a finite number (see ADR A16)".into(),
+                detail: "capacity priority overflowed a finite number".into(),
             });
             continue;
         }

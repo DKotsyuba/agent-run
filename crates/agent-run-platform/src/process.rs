@@ -71,7 +71,7 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
 ///
 /// `birth` is the kernel `p_start` timeval computed exactly like psutil's
 /// `tv_sec + tv_usec / 1000000.0`, so it equals Python's stored create_time
-/// bit for bit (migration/adr/A10-spawn-backend.md).
+/// bit for bit (see `docs/process-identity.md`).
 #[cfg(target_os = "macos")]
 pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     if pid <= 1 {

@@ -8,14 +8,17 @@ Release automation publishes one native target: qualified macOS Apple silicon
 (`aarch64-apple-darwin`). Linux x86-64 remains a visible non-blocking CI
 validation lane; its release and qualification are deferred.
 
+Publication and installation are separate boundaries. A green publication
+workflow does not prove a production cutover, and a local `release install` or
+`update` never publishes to GitHub. Linux stays labelled unqualified until a
+hosted full-suite run and sealed-release smoke exist for it.
+
 ## Prepare
 
 From a clean checkout of the accepted commit:
 
 ```bash
 cargo xtask check
-cargo xtask qualify --release
-cargo xtask evidence verify
 cargo xtask archive --verify
 cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs
@@ -59,8 +62,7 @@ one host's binary.
 
 After CI accepts the commit, the tagged `Release` workflow runs the macOS
 workspace checks and builds and verifies the sealed macOS artifact. The macOS
-gate job additionally runs qualification, evidence, Desktop transport, and
-source-archive gates once. The workflow then generates one `SHA256SUMS`, attests
+gate job additionally runs Desktop transport and source-archive gates once. The workflow then generates one `SHA256SUMS`, attests
 the listed macOS and source artifacts, and publishes a GitHub Release only after
 every required job succeeds. A failed run leaves no public partial release.
 Tags are immutable; corrections ship as a new patch version.

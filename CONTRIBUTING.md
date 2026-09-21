@@ -14,8 +14,6 @@ That command formats, lints with all targets and features, and runs the full
 workspace test suite offline. Before a release-affecting change also run:
 
 ```bash
-cargo xtask qualify --release
-cargo xtask evidence verify
 cargo xtask archive --verify
 cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs

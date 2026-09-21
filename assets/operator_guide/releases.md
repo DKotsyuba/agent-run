@@ -12,8 +12,6 @@ and provenance.
 
 ```bash
 cargo xtask check
-cargo xtask qualify --release
-cargo xtask evidence verify
 cargo xtask archive --verify
 cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs

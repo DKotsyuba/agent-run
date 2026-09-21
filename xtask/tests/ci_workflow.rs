@@ -15,8 +15,6 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
     for required in [
         "test -z \"$(git ls-files '*.py')\"",
         "cargo xtask check",
-        "cargo xtask qualify --release",
-        "cargo xtask evidence verify",
         "cargo xtask archive --verify",
         "cargo xtask release build-native",
         "cargo xtask release verify",
@@ -69,8 +67,6 @@ fn release_publishes_checksummed_native_assets() {
         "git cat-file -t",
         "Cargo.toml",
         "cargo xtask check",
-        "cargo xtask qualify --release",
-        "cargo xtask evidence verify",
         "cargo xtask release build-native",
         "cargo xtask release verify",
         "cargo xtask archive --revision HEAD",
