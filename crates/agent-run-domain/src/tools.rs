@@ -7,9 +7,11 @@ use std::sync::OnceLock;
 
 /// A public tool as represented by the Python-compatible discovery payload.
 ///
-/// The serialized fields intentionally match `tests/fixtures/baseline/tools.json`.
-/// Transport-only metadata, such as possible public error classes and argument
-/// defaults, is derived from this schema and is never added to the wire payload.
+/// The serialized schema fields intentionally match
+/// `tests/fixtures/baseline/tools.json`. Human-facing descriptions may extend
+/// the Python baseline with current transport requirements, while transport-only
+/// metadata such as public error classes and argument defaults is derived from
+/// this schema and is never added to the wire payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolDefinition {
@@ -156,11 +158,12 @@ impl ToolDefinition {
     }
 }
 
-/// Returns the sole registry, parsed once from the checked-in Python-compatible asset.
+/// Returns the sole registry, parsed once from the checked-in public asset.
 ///
-/// `assets/tools.json` is deliberately a data-only golden artifact. The domain
-/// crate owns parsing, lookup, argument metadata, and error declarations, so
-/// no transport can acquire an independent schema or name list.
+/// `assets/tools.json` preserves the Python-compatible schemas and carries
+/// current operator guidance in each description. The domain crate owns parsing,
+/// lookup, argument metadata, and error declarations, so no transport can acquire
+/// an independent schema or name list.
 pub fn registry() -> &'static [ToolDefinition] {
     static REGISTRY: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
     REGISTRY
@@ -181,7 +184,7 @@ pub fn is_tool(name: &str) -> bool {
     tool(name).is_some()
 }
 
-/// Renders the registry exactly as the Python discovery table expects it.
+/// Renders the current registry for every public discovery transport.
 pub fn tools_json() -> Vec<Value> {
     registry()
         .iter()
