@@ -26,6 +26,10 @@ pub enum ProcessState {
 /// `pid` must be greater than one. The function returns the underlying procfs,
 /// boot-clock, or numeric-field error when identity evidence is unavailable or
 /// malformed; callers decide whether that evidence permits lifecycle action.
+/// On success, `ppid` and `group` come from the stat fields, `birth` is Unix
+/// seconds derived from boot time plus start ticks, `token` is the stable
+/// `linux:<boot-id>:<start-ticks>` PID-reuse fence, and `zombie` covers both the
+/// kernel `Z` and dead-process `X` states.
 #[cfg(target_os = "linux")]
 pub fn inspect(pid: i32) -> std::io::Result<Identity> {
     if pid <= 1 {

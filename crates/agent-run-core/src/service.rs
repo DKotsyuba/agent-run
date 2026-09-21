@@ -133,11 +133,12 @@ impl Service {
     /// Returns `true` after installing a new valid revision and `false` when
     /// the exact bytes are unchanged. A malformed change returns an error and
     /// leaves the last valid revision intact for diagnostics; operations that
-    /// need current configuration still reject that malformed change. Every
-    /// adoption and rejection is recorded in the bounded process log, naming
-    /// the SHA-256 revision that remains active after the attempt. An adoption
-    /// is logged only after the snapshot is installed, using the revision read
-    /// back from the cache, so the log never names an inactive revision.
+    /// need current configuration still reject that malformed change. Adoption
+    /// and rejection diagnostics are offered to the configured logger at
+    /// `Info` and `Warning` respectively, naming the SHA-256 revision that
+    /// remains active; the logger's effective threshold controls persistence.
+    /// An adoption is emitted only after the snapshot is installed, using the
+    /// revision read back from the cache, so it never names an inactive revision.
     pub fn refresh_config(&self) -> Result<bool> {
         let mut cache = self
             .config
