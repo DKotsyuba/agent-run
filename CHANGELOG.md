@@ -4,6 +4,20 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-09-21
+
+- feat(codex): accept multiple operator-authorized write roots through
+  `workspace_roots = ["...", "..."]`, while preserving the legacy singular
+  `workspace_root` declaration and rejecting configurations that declare both
+- fix(codex): admit write workdirs below any configured root, require every root
+  in a managed Projects policy, and generate the complete root set for unmanaged
+  Projects without widening access to the rest of the home directory
+- docs(config): expose the plural snapshot and operator contract, including that
+  a write role admitted under one root receives write access to every configured
+  Projects root
+- 0.12.2 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.12.1] - 2026-09-21
 
 - fix(cli,mcp): `cancel` returns the current agent view with top-level status
@@ -367,7 +381,8 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/DKotsyuba/agent-run/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/DKotsyuba/agent-run/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.12.0
 [0.11.15]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.11.15
