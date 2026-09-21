@@ -139,6 +139,26 @@ pub fn start(runtime: &str, model: &str, agent_id: &str, created: bool) {
     }
 }
 
+/// Emits one bounded configuration reload outcome when logging is configured.
+///
+/// `accepted` marks a newly adopted revision; `!accepted` marks invalid bytes
+/// whose rejection leaves the named revision active.  `revision` is the
+/// lowercase SHA-256 of the exact `config.toml` bytes for the active cached
+/// revision, or `None` when no valid revision has been cached yet, which is
+/// enough to distinguish successful adoption from a rejected change.
+/// Configuration contents, paths, environment values, and credentials are
+/// never included.
+pub fn config_reload(accepted: bool, revision: Option<&str>) {
+    if let Some(logger) = configured() {
+        let outcome = if accepted { "accepted" } else { "rejected" };
+        let revision = revision.unwrap_or("none");
+        logger.log(
+            Level::Info,
+            &format!("config reload {outcome} revision={revision}"),
+        );
+    }
+}
+
 /// Clears the process logger for isolated Rust tests.
 #[doc(hidden)]
 pub fn reset_for_tests() {

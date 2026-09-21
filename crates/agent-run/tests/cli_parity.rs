@@ -148,6 +148,10 @@ fn python_cli_spec_command_surface_is_present() {
                 .into_iter()
                 .flatten()
             })
+            // The Rust parser additionally carries the package version, which
+            // the archived Python capture predates; the dedicated --version
+            // test below pins that surface instead.
+            .filter(|option| option != "--version" && option != "-V")
             .collect::<BTreeSet<_>>();
         assert_eq!(actual_options, expected_options, "options for {path}");
         for action in row["actions"].as_array().expect("actions") {
@@ -252,6 +256,27 @@ fn python_cli_validation_error_uses_the_expected_json_field_names() {
     let value: Value = serde_json::from_slice(&output.stderr).expect("JSON error on stderr");
     assert_eq!(value["error"]["type"], "ValidationError");
     assert!(value["error"]["message"].is_string());
+}
+
+/// Mirrors `test_cli.py::test_version_reports_the_workspace_package_version`.
+///
+/// The parser carries the package version metadata, so clap's DisplayVersion
+/// handling in `main` prints it and exits successfully.
+#[test]
+fn python_cli_version_reports_the_package_version() {
+    let error =
+        Cli::try_parse_from(["agent-run", "--version"]).expect_err("--version is not a subcommand");
+    assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--version")
+        .output()
+        .expect("agent-run binary executes");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")),
+        "printed version must include the package version"
+    );
 }
 
 /// Mirrors `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`.

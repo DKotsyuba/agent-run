@@ -144,7 +144,11 @@ impl CliDependencies {
 /// shared domain tool registry; this layer only adapts shell values to those
 /// schemas and never launches a one-shot start locally.
 #[derive(Parser, Debug)]
-#[command(name = "agent-run", about = "Durable local coding-agent supervisor")]
+#[command(
+    name = "agent-run",
+    version,
+    about = "Durable local coding-agent supervisor"
+)]
 pub struct Cli {
     #[arg(long, global = true, env = "AGENT_RUN_HOME")]
     pub home: Option<PathBuf>,

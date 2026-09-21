@@ -415,6 +415,10 @@ fn guarded_lost(
         )?;
     }
     tx.commit()?;
+    // The terminal loss must drain late pending commands exactly as a normal
+    // terminal completion does, or a steer/cancel acknowledged just before the
+    // lost transition would remain pending forever.
+    crate::commands::complete_terminal(store, &expected.id)?;
     Ok(true)
 }
 

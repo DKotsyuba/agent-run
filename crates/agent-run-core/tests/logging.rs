@@ -1,6 +1,10 @@
 //! Logging setup parity checks for the process-wide Rust logger.
 
+mod common;
+
 use agent_run_core::logging::{self, Level};
+use agent_run_core::service::Service;
+use agent_run_platform::fs;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Serializes process-global logger tests so each case owns its reset boundary.
@@ -64,5 +68,58 @@ fn service_start_logging_is_reconstructable_without_private_payloads() {
     assert!(text.contains("start runtime=fake model=model agent_id=ag-test created=true"));
     assert!(!text.contains("sk-super-secret-token-value"));
     assert!(!text.contains("do the work do the work"));
+    reset_logging();
+}
+
+/// Proves bounded reload diagnostics name the active revision for both
+/// adoption and rejection, an invalid revision never replaces the last valid
+/// cached snapshot, and a restored valid revision is accepted again.
+#[test]
+fn config_reload_diagnostics_name_the_active_revision() {
+    let _guard = logger_guard();
+    reset_logging();
+    let home = common::Home::new();
+    let config_path = home.path.join("config.toml");
+    logging::configure(&home.path, "cli");
+    let service = Service::new(home.path.clone());
+    let digest = |bytes: &[u8]| fs::sha256(bytes);
+
+    let original = std::fs::read(&config_path).unwrap();
+    assert!(service.refresh_config().unwrap());
+    let changed = format!(
+        "{}\n[delivery]\nretry_base_seconds = 3.0\n",
+        String::from_utf8_lossy(&original)
+    );
+    std::fs::write(&config_path, &changed).unwrap();
+    assert!(service.refresh_config().unwrap());
+
+    let invalid = "not valid TOML = [";
+    std::fs::write(&config_path, invalid).unwrap();
+    assert!(service.refresh_config().is_err());
+    // Restoring the last valid bytes is a digest hit only when the invalid
+    // revision never replaced the cached snapshot.
+    std::fs::write(&config_path, &changed).unwrap();
+    assert!(!service.refresh_config().unwrap());
+    std::fs::write(&config_path, &original).unwrap();
+    assert!(service.refresh_config().unwrap());
+
+    let text = std::fs::read_to_string(home.path.join("logs/cli.log")).unwrap();
+    assert!(text.contains(&format!(
+        "config reload accepted revision={}",
+        digest(&original)
+    )));
+    assert!(text.contains(&format!(
+        "config reload accepted revision={}",
+        digest(changed.as_bytes())
+    )));
+    assert!(text.contains(&format!(
+        "config reload rejected revision={}",
+        digest(changed.as_bytes())
+    )));
+    assert!(!text.contains(invalid), "config contents are never logged");
+    assert!(
+        !text.contains("config.toml"),
+        "configuration paths are never logged"
+    );
     reset_logging();
 }
