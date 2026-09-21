@@ -735,6 +735,23 @@ async fn desktop_relay_missing_endpoint_is_retryable() {
     assert_eq!(evidence.classifier, "relay_unavailable");
 }
 
+/// Ensures discovery reaches a live endpoint after more than sixteen stale sockets.
+#[tokio::test]
+async fn desktop_relay_discovers_live_endpoint_after_stale_inventory() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..16 {
+        let path = root.path().join(format!("ar-cdx-v3-stale-{index:02}.sock"));
+        drop(tokio::net::UnixListener::bind(path).unwrap());
+    }
+    let path = root.path().join("ar-cdx-v3-zz-live.sock");
+    let peer = fake_relay(&path, "accepted").await;
+
+    let evidence = relay::send(root.path(), "thread-test", &notice()).await;
+
+    assert_eq!(evidence.classifier, "relay_accepted");
+    peer.await.unwrap();
+}
+
 /// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_partial_send_is_ambiguous_and_stops_discovery`.
 #[tokio::test]
 async fn desktop_relay_partial_send_is_ambiguous_without_fallback() {
