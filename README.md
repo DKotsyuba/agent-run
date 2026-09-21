@@ -10,7 +10,7 @@ external dependencies and must be installed and authenticated separately.
 
 ## Release targets
 
-Version 0.12.2 publishes a native artifact only for macOS Apple silicon
+Version 0.12.3 publishes a native artifact only for macOS Apple silicon
 (`aarch64-apple-darwin`), the qualified release platform. Linux x86-64 remains
 an unqualified, non-blocking validation target; its release and qualification
 are deferred. Keychain and launchd integration remain macOS-only.
@@ -18,13 +18,13 @@ are deferred. Keychain and launchd integration remain macOS-only.
 ## Install
 
 Download `SHA256SUMS` and
-`agent-run-0.12.2-aarch64-apple-darwin.tar.gz` from the GitHub Release.
+`agent-run-0.12.3-aarch64-apple-darwin.tar.gz` from the GitHub Release.
 
 Verify the checksum, then place the binary on `PATH`:
 
 ```bash
-grep "agent-run-0.12.2-aarch64-apple-darwin.tar.gz" SHA256SUMS | shasum -a 256 -c -
-tar -xzf agent-run-0.12.2-aarch64-apple-darwin.tar.gz
+grep "agent-run-0.12.3-aarch64-apple-darwin.tar.gz" SHA256SUMS | shasum -a 256 -c -
+tar -xzf agent-run-0.12.3-aarch64-apple-darwin.tar.gz
 install -m 0755 bin/agent-run ~/.local/bin/agent-run
 agent-run init
 ```
@@ -90,7 +90,7 @@ launchctl bootstrap "gui/$(id -u)" "$plist"
 
 Future Linux builds can run the same `agent-run api serve` command under an
 external service manager such as systemd. Linux is not a qualified or published
-0.12.2 platform, and agent-run does not generate systemd units.
+0.12.3 platform, and agent-run does not generate systemd units.
 
 ## Use the CLI
 

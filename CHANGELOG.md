@@ -4,6 +4,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-09-21
+
+- fix(core): compare Codex readable and writable root echoes as exact multisets
+  so app-server ordering differences no longer reject an otherwise identical
+  managed Projects grant
+- test(core): keep extra, missing, duplicate, malformed, and reordered readable
+  and writable root cases fail-closed under focused regression coverage
+- 0.12.3 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.12.2] - 2026-09-21
 
 - feat(codex): accept multiple operator-authorized write roots through
@@ -381,7 +391,8 @@ First public release.
 - Resumable multi-step workflows with parallel and pipeline execution.
 - Isolated runtime homes, explicit read/write permissions, diagnostics, and operator guide.
 
-[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/DKotsyuba/agent-run/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/DKotsyuba/agent-run/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/DKotsyuba/agent-run/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/DKotsyuba/agent-run/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/DKotsyuba/agent-run/releases/tag/v0.12.0
