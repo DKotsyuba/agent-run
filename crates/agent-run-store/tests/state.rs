@@ -578,6 +578,9 @@ fn open_refuses_v1_tables_with_corrupt_column_shapes() {
 /// Re-tightening modes is best effort for a store this process did not create,
 /// so a sandboxed reader still gets a connection; a creating caller keeps the
 /// strict behavior because a store left readable at creation is a defect.
+/// The fixture makes `chmod` fail through the `uchg` immutable flag, a BSD
+/// file flag with no Linux equivalent, so the scenario runs only on macOS.
+#[cfg(target_os = "macos")]
 #[test]
 fn reopen_tolerates_chmod_denied_but_creation_does_not() {
     let home = common::Home::new();

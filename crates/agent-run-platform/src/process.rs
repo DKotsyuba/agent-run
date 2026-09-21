@@ -29,21 +29,16 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
             "unsafe process id",
         ));
     }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let end = stat
-        .rfind(')')
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "proc stat"))?;
-    let parts: Vec<_> = stat[end + 1..].split_whitespace().collect();
-    if parts.len() < 20 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "proc stat",
-        ));
-    }
+    // Read raw bytes: the parenthesized command name inherits the executable's
+    // filename bytes and is not guaranteed UTF-8 (psutil reads bytes for the
+    // same reason), so the line must never be validated as a String.
+    let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+    let parts = stat_fields(&stat)?;
     let num = |i: usize| {
-        parts[i]
+        std::str::from_utf8(parts.get(i).ok_or_else(proc_field_error)?)
+            .map_err(|_| proc_field_error())?
             .parse::<u64>()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "proc field"))
+            .map_err(|_| proc_field_error())
     };
     let ticks = num(19)?;
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
@@ -64,8 +59,33 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
         group: num(2)? as i32,
         birth: epoch + ticks as f64 / hz as f64,
         token: format!("linux:{}:{ticks}", boot.trim()),
-        zombie: matches!(parts[0], "Z" | "X"),
+        zombie: parts
+            .first()
+            .is_some_and(|state| *state == b"Z" || *state == b"X"),
     })
+}
+/// Split one `/proc/<pid>/stat` line into the fields after the command name.
+///
+/// The line is arbitrary bytes: the kernel copies the executable's filename
+/// into the parenthesized command name verbatim, so it may contain invalid
+/// UTF-8 or unbalanced parentheses. Fields are therefore taken after the final
+/// `)`, which cannot appear in the numeric tail. Returns the whitespace-split
+/// tail fields, or `InvalidData` when the line has no command name at all.
+#[cfg(any(target_os = "linux", test))]
+fn stat_fields(stat: &[u8]) -> std::io::Result<Vec<&[u8]>> {
+    let end = stat
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "proc stat"))?;
+    Ok(stat[end + 1..]
+        .split(|&byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect())
+}
+/// Report one unparsable `/proc/<pid>/stat` tail field.
+#[cfg(any(target_os = "linux", test))]
+fn proc_field_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "proc field")
 }
 /// Read one PID's kernel start time, group and zombie state.
 ///
@@ -687,6 +707,21 @@ mod tests {
         assert_eq!(safe_process_id(std::ffi::OsStr::new("1")), None);
         assert_eq!(safe_process_id(std::ffi::OsStr::new("self")), None);
         assert_eq!(safe_process_id(std::ffi::OsStr::new("2")), Some(2));
+    }
+
+    /// A stat line whose command name carries non-UTF-8 filename bytes still
+    /// yields the numeric identity fields; reading it as a String would reject
+    /// the whole observation as unreadable and lose the leader identity.
+    #[test]
+    fn stat_fields_tolerate_non_utf8_command_names() {
+        let line =
+            b"1234 (sh\xee) R 1200 1234 1234 0 -1 4194304 200 0 0 0 1 2 3 4 20 0 6 0 98765 0";
+        let fields = stat_fields(line).expect("non-UTF-8 command name");
+        assert_eq!(fields.first(), Some(&b"R".as_slice()));
+        assert_eq!(fields.get(1), Some(&b"1200".as_slice()));
+        assert_eq!(fields.get(2), Some(&b"1234".as_slice()));
+        assert_eq!(fields.get(19), Some(&b"98765".as_slice()));
+        assert!(stat_fields(b"no command name").is_err());
     }
 
     #[test]

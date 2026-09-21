@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(platform): parse `/proc/<pid>/stat` as bytes so a non-UTF-8 command name
+  can no longer discard leader identity and fail Linux cleanup observation
+- fix(core): classify a non-socket Claude UDS endpoint as unavailable instead
+  of session-gone; Linux reports `ECONNREFUSED` for both
+- test(core): derive Codex app-server fixture paths from the host temp
+  directory so `/private/tmp`-only paths do not fail on Linux
+- test(store): run the `chflags uchg` reopen fixture only on macOS, its
+  unsupported-on-Linux mechanism
+
 ## [0.12.0] - 2026-09-20
 
 - feat!: make the self-contained Rust broker the sole primary implementation

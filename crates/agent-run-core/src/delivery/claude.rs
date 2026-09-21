@@ -14,8 +14,11 @@ const MESSAGE_LIMIT: usize = 4096;
 /// Delivers one rendered completion notice through a specified Claude registry.
 ///
 /// The registry and socket path are supplied by the caller so tests and embedded
-/// hosts can use private temporary directories. A missing descriptor or dead
-/// socket is classified as a definite session loss; an interrupted write is
+/// hosts can use private temporary directories. A missing descriptor, dead
+/// socket, or deleted endpoint is classified as a definite session loss, while
+/// an endpoint that is not a socket (such as a directory) is classified as an
+/// unavailable endpoint because Linux reports both as `ECONNREFUSED`; an
+/// interrupted write is
 /// classified as ambiguous because the inbox has no acknowledgement protocol.
 pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
     if !bounded(session, SESSION_LIMIT) || notice.render().is_err() {
@@ -32,13 +35,17 @@ pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
         return Evidence::new("uds_rejected", false, false);
     };
     let mut stream =
-        match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(socket)).await {
+        match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(&socket)).await {
             Ok(Ok(stream)) => stream,
+            // A refused connection to a socket-file endpoint means the peer
+            // died; Linux also refuses when the path is not a socket at all
+            // (for example a directory), which is an unavailable endpoint
+            // rather than a lost session, so the path type decides.
             Ok(Err(error))
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
+                ) && !socket.is_dir() =>
             {
                 return Evidence::new("uds_session_gone", false, false);
             }
