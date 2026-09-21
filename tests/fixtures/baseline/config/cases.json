@@ -685,7 +685,9 @@
           "rust": null,
           "skills": [],
           "workspace_network": true,
-          "workspace_root": "/Users/pluto/projects"
+          "workspace_roots": [
+            "/Users/pluto/projects"
+          ]
         }
       },
       "schema_version": 1,

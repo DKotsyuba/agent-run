@@ -135,7 +135,7 @@ fn config_to_value(cfg: &Config) -> Value {
                     "environment": environment,
                     "plugin_snapshot_assets": r.plugin_snapshot_assets,
                     "credential_state_home": Value::Null,
-                    "workspace_root": r.workspace_root,
+                    "workspace_roots": r.workspace_roots,
                     "workspace_network": r.workspace_network,
                     "native_settings": r.native_settings,
                 }),

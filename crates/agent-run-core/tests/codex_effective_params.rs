@@ -293,15 +293,16 @@ fn grant_request(workdir: &str, write: bool) -> StartRequest {
     .expect("valid request fixture")
 }
 
-/// Builds a runtime with no ambient permissions or credentials.
-fn grant_runtime(workspace_root: Option<&str>) -> Runtime {
+/// Builds a runtime with no ambient permissions or credentials and the given
+/// configured workspace roots in admission-check order.
+fn grant_runtime(workspace_roots: &[&str]) -> Runtime {
     serde_json::from_value(json!({
         "enabled": true,
         "adapter": "codex",
         "binary": "/bin/true",
         "home": "/private/tmp/codex-runtime",
         "models": ["fixture"],
-        "workspace_root": workspace_root,
+        "workspace_roots": workspace_roots,
     }))
     .expect("valid runtime fixture")
 }
@@ -312,7 +313,7 @@ fn grant_runtime(workspace_root: Option<&str>) -> Runtime {
 fn python_test_codex_adapter_grant_keeps_read_and_write_authority_separate() {
     let request = grant_request("/private/tmp/work", false);
     let grant = Grant::new(
-        &grant_runtime(None),
+        &grant_runtime(&[]),
         &request,
         &read_only_profile(vec![PathBuf::from("/private/tmp/read")]),
         PathBuf::from("/private/tmp/home").as_path(),
@@ -329,7 +330,7 @@ fn python_test_codex_adapter_grant_keeps_read_and_write_authority_separate() {
         ..read_only_profile(vec![])
     };
     let grant = Grant::new(
-        &grant_runtime(None),
+        &grant_runtime(&[]),
         &write_request,
         &write,
         PathBuf::from("/private/tmp/home").as_path(),
@@ -351,14 +352,14 @@ fn python_test_codex_adapter_grant_refuses_authority_outside_the_workspace() {
         ..read_only_profile(vec![PathBuf::from("/private/tmp/read")])
     };
     assert!(Grant::new(
-        &grant_runtime(Some("/private/tmp/project")),
+        &grant_runtime(&["/private/tmp/project"]),
         &request,
         &write_with_read,
         PathBuf::from("/private/tmp/home").as_path(),
     )
     .is_err());
     assert!(Grant::new(
-        &grant_runtime(Some("/private/tmp/project")),
+        &grant_runtime(&["/private/tmp/project"]),
         &grant_request("/private/tmp/elsewhere", true),
         &Profile {
             name: "implement".into(),
@@ -368,4 +369,59 @@ fn python_test_codex_adapter_grant_refuses_authority_outside_the_workspace() {
         PathBuf::from("/private/tmp/home").as_path(),
     )
     .is_err());
+}
+
+/// A write-capable request is admitted under any one configured workspace
+/// root and refused outside all of them.
+///
+/// On hosts without a managed Projects policy the admitted grant composes
+/// every configured root into its writable set; on managed hosts the fixture
+/// roots fail the later managed-policy check, so an error here must be the
+/// managed-policy error, proving admission itself passed. The pure admission
+/// and generated-profile logic is additionally verified hermetically in
+/// `src/codex.rs`.
+#[test]
+fn write_requests_admit_any_configured_workspace_root() {
+    let write = Profile {
+        name: "implement".into(),
+        write: true,
+        ..read_only_profile(vec![])
+    };
+    let runtime = grant_runtime(&["/private/tmp/other", "/private/tmp/project"]);
+    let home = PathBuf::from("/private/tmp/home");
+
+    let under_second_root = Grant::new(
+        &runtime,
+        &grant_request("/private/tmp/project/repo", true),
+        &write,
+        home.as_path(),
+    );
+    match under_second_root {
+        Ok(grant) => {
+            for configured in ["/private/tmp/other", "/private/tmp/project"] {
+                assert!(
+                    grant.writable_roots.iter().any(|root| root == configured),
+                    "writable set must contain every configured root: {:?}",
+                    grant.writable_roots
+                );
+            }
+        }
+        Err(error) => assert!(
+            !error
+                .to_string()
+                .contains("outside configured workspace_roots"),
+            "an in-root workdir must pass admission before any policy error: {error}"
+        ),
+    }
+
+    let error = Grant::new(
+        &runtime,
+        &grant_request("/private/tmp/elsewhere", true),
+        &write,
+        home.as_path(),
+    )
+    .expect_err("a workdir outside every root must be refused");
+    assert!(error
+        .to_string()
+        .contains("outside configured workspace_roots"));
 }

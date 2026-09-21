@@ -24,7 +24,7 @@ enabled = true
 adapter = "codex"
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
-workspace_root = "/absolute/path/to/projects"
+workspace_roots = ["/absolute/path/to/projects", "/absolute/path/to/worktrees"]
 workspace_network = true
 models = ["gpt-6-astra"]
 accounts = ["personal2"]
@@ -46,11 +46,14 @@ but canonical and compatibility asset declarations cannot be mixed.
 Qwen is no longer a runtime: a Qwen adapter identifier is rejected with a
 deprecation error, and the runtime must be removed from `config.toml`.
 
-`workspace_root` affects write-capable Codex profiles only. Their workdir must
-be inside the configured tree; read-only profiles do not inherit write access.
+`workspace_roots` affects write-capable Codex profiles only. Their workdir must
+be inside at least one configured tree; read-only profiles do not inherit write
+access. A write role admitted under one root receives write access to every
+configured root. The legacy singular `workspace_root = "..."` declaration is still
+accepted and normalizes to one root; declaring both forms is rejected.
 `workspace_network = true` explicitly enables shell network in that Projects
 profile and keeps `curl` behind Codex's normal approval reviewer; it defaults
-to false and requires `workspace_root`.
+to false and requires at least one configured workspace root.
 MCP `approval_mode = "approve"` is appropriate only for a locally trusted server
 whose own runtime enforces downstream permissions.
 

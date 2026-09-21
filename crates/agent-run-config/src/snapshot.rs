@@ -86,8 +86,8 @@ fn runtime_document(config: &Config, runtime: &Runtime) -> Result<Value> {
     if !runtime.native_settings.is_empty() {
         document["native_settings"] = serde_json::to_value(&runtime.native_settings)?;
     }
-    if let Some(workspace_root) = &runtime.workspace_root {
-        document["workspace_root"] = json!(workspace_root);
+    if !runtime.workspace_roots.is_empty() {
+        document["workspace_roots"] = json!(runtime.workspace_roots);
     }
     if runtime.workspace_network {
         document["workspace_network"] = Value::Bool(true);
@@ -230,4 +230,54 @@ pub fn inspect_config_snapshot(directory: &Path, expected_sha256: &str) -> Resul
         materialize_revision,
         runtime_version,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds one codex runtime fixture declaring the given workspace roots.
+    fn workspace_runtime(roots: Value) -> Runtime {
+        serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-snapshot-test",
+            "models": ["fixture"],
+            "workspace_roots": roots,
+        }))
+        .expect("fixture runtime")
+    }
+
+    /// Legacy singular and plural workspace declarations both serialize the
+    /// effective runtime configuration with the plural `workspace_roots` key
+    /// only, and the plural form retains every configured root.
+    #[test]
+    fn runtime_config_exposes_plural_workspace_roots_only() {
+        let config: Config = toml::from_str("schema_version = 1").expect("minimal config");
+
+        let singular_runtime: Runtime = serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-snapshot-test",
+            "models": ["fixture"],
+            "workspace_root": "/workspace/a",
+        }))
+        .expect("singular fixture runtime");
+        let singular = runtime_document(&config, &singular_runtime).expect("singular document");
+        assert!(singular.get("workspace_root").is_none());
+        assert_eq!(singular["workspace_roots"], json!(["/workspace/a"]));
+
+        let plural = runtime_document(
+            &config,
+            &workspace_runtime(json!(["/workspace/a", "/workspace/b"])),
+        )
+        .expect("plural document");
+        assert!(plural.get("workspace_root").is_none());
+        assert_eq!(
+            plural["workspace_roots"],
+            json!(["/workspace/a", "/workspace/b"])
+        );
+    }
 }

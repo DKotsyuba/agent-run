@@ -36,7 +36,7 @@ fn runtime() -> Runtime {
         rust: None,
         environment: None,
         plugin_snapshot_assets: BTreeMap::new(),
-        workspace_root: None,
+        workspace_roots: Vec::new(),
         workspace_network: false,
         native_settings: BTreeMap::new(),
     }

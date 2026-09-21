@@ -82,22 +82,30 @@ fn caches(home: &Path) -> Vec<PathBuf> {
 }
 
 /// Validates an installed Projects policy and returns its permitted roots.
+///
+/// Every configured `workspace_roots` entry must be explicitly granted by the
+/// system table's `workspace_roots` map, `extends` must select `:workspace`,
+/// and the network switch must agree exactly with `workspace_network`. Any
+/// ungranted root, malformed table, or network disagreement fails closed.
 fn managed_roots(runtime: &Runtime, system: &toml::Table) -> Result<Vec<String>> {
-    let root = runtime
-        .workspace_root
-        .as_ref()
-        .ok_or_else(|| invalid("managed Projects requires workspace_root"))?;
+    let roots = &runtime.workspace_roots;
+    if roots.is_empty() {
+        return Err(invalid("managed Projects requires workspace_roots"));
+    }
     let table = system
         .get("workspace_roots")
         .and_then(toml::Value::as_table)
         .ok_or_else(|| invalid("invalid managed workspace roots"))?;
-    if table
-        .get(root.to_string_lossy().as_ref())
-        .and_then(toml::Value::as_bool)
-        != Some(true)
-        || system.get("extends").and_then(toml::Value::as_str) != Some(":workspace")
+    if !roots.iter().all(|root| {
+        table
+            .get(root.to_string_lossy().as_ref())
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    }) || system.get("extends").and_then(toml::Value::as_str) != Some(":workspace")
     {
-        return Err(invalid("workspace_root is not granted by managed Projects"));
+        return Err(invalid(
+            "workspace_roots are not granted by managed Projects",
+        ));
     }
     let network = system
         .get("network")
@@ -126,16 +134,24 @@ fn managed_roots(runtime: &Runtime, system: &toml::Table) -> Result<Vec<String>>
     Ok(roots)
 }
 
-/// Renders the immutable Codex Projects policy for a configured workspace.
+/// Renders the immutable Codex Projects policy for the configured workspace
+/// roots.
+///
+/// Without configured roots the document is left untouched. With a managed
+/// system Projects policy every configured root must be granted and only the
+/// native `default_permissions` selector is emitted. Otherwise the generated
+/// `Projects` profile grants every configured root plus the runtime caches,
+/// denies shell access to the auth bridge target when given, and records
+/// `workspace_network`.
 pub fn render_permissions(
     document: &mut toml::Table,
     runtime: &Runtime,
     home: &Path,
     auth_target: Option<&str>,
 ) -> Result<()> {
-    let Some(root) = &runtime.workspace_root else {
+    if runtime.workspace_roots.is_empty() {
         return Ok(());
-    };
+    }
     if let Some(system) = system_projects()? {
         managed_roots(runtime, &system)?;
         document.insert(
@@ -155,7 +171,7 @@ pub fn render_permissions(
         );
     }
     writes.insert(":workspace_roots".into(), json!({".":"write","**/.env":"deny","**/.env.*":"deny","**/*.pem":"deny","**/*.key":"deny"}));
-    let projects = json!({PROJECTS_PROFILE:{"extends":":workspace","workspace_roots":{(root.to_string_lossy().to_string()):true},"filesystem":writes,"network":{"enabled":runtime.workspace_network}}});
+    let projects = projects_profile(runtime, writes);
     document.insert(
         "default_permissions".into(),
         toml::Value::String(PROJECTS_PROFILE.into()),
@@ -166,6 +182,17 @@ pub fn render_permissions(
             .map_err(|_| invalid("cannot encode Projects permissions"))?,
     );
     Ok(())
+}
+
+/// Builds the generated `Projects` profile payload granting every configured
+/// workspace root, `writes` filesystem rules, and the declared network state.
+fn projects_profile(runtime: &Runtime, writes: serde_json::Map<String, Value>) -> Value {
+    let granted: serde_json::Map<String, Value> = runtime
+        .workspace_roots
+        .iter()
+        .map(|root| (root.to_string_lossy().into_owned(), json!(true)))
+        .collect();
+    json!({PROJECTS_PROFILE:{"extends":":workspace","workspace_roots":granted,"filesystem":writes,"network":{"enabled":runtime.workspace_network}}})
 }
 
 /// Returns whether a PermissionRequest targets exactly one trusted MCP namespace.
@@ -320,6 +347,9 @@ mod tests {
     use super::*;
 
     /// Mirrors `test_codex_adapter.py::test_managed_projects_uses_one_definition_and_verifies_all_write_roots` refusal behavior.
+    ///
+    /// The singular fixture key also proves the legacy `workspace_root`
+    /// declaration still parses into the normalized plural contract.
     #[test]
     fn python_test_codex_adapter_projects_refuses_an_unproven_managed_root() {
         let runtime: Runtime = serde_json::from_value(json!({
@@ -344,6 +374,76 @@ network = { enabled = false }
             .expect_err("unproven workspace root must be refused");
         assert!(error
             .to_string()
-            .contains("workspace_root is not granted by managed Projects"));
+            .contains("workspace_roots are not granted by managed Projects"));
+    }
+
+    /// Managed Projects validation requires every configured root to be
+    /// granted, and returns the granted roots sorted and deduplicated.
+    #[test]
+    fn managed_projects_verifies_every_configured_workspace_root() {
+        let runtime: Runtime = serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-codex-test",
+            "models": ["fixture"],
+            "workspace_roots": ["/workspace/a", "/workspace/unproven"],
+        }))
+        .expect("fixture runtime");
+        let policy: toml::Value = toml::from_str(
+            r#"
+extends = ":workspace"
+workspace_roots = { "/workspace/a" = true, "/workspace/b" = true }
+network = { enabled = false }
+"#,
+        )
+        .expect("fixture policy");
+        let table = policy.as_table().expect("Projects policy table");
+
+        let error = managed_roots(&runtime, table)
+            .expect_err("one ungranted root must refuse the whole policy");
+        assert!(error
+            .to_string()
+            .contains("workspace_roots are not granted by managed Projects"));
+
+        let runtime: Runtime = serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-codex-test",
+            "models": ["fixture"],
+            "workspace_roots": ["/workspace/b", "/workspace/a"],
+        }))
+        .expect("fixture runtime");
+        assert_eq!(
+            managed_roots(&runtime, table).expect("all roots granted"),
+            vec!["/workspace/a", "/workspace/b"]
+        );
+    }
+
+    /// The generated unmanaged Projects profile grants every configured root.
+    #[test]
+    fn generated_projects_permissions_include_every_workspace_root() {
+        let runtime: Runtime = serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-codex-test",
+            "models": ["fixture"],
+            "workspace_roots": ["/workspace/a", "/workspace/b"],
+        }))
+        .expect("fixture runtime");
+
+        let projects = projects_profile(&runtime, serde_json::Map::new());
+        let roots = projects[PROJECTS_PROFILE]["workspace_roots"]
+            .as_object()
+            .expect("roots map");
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots["/workspace/a"].as_bool(), Some(true));
+        assert_eq!(roots["/workspace/b"].as_bool(), Some(true));
+        assert_eq!(
+            projects[PROJECTS_PROFILE]["extends"].as_str(),
+            Some(":workspace")
+        );
     }
 }

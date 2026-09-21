@@ -84,22 +84,32 @@ fn caches(home: &Path) -> Vec<PathBuf> {
     .map(|p| home.join(p))
     .collect()
 }
+/// Validates the installed managed Projects policy against every configured
+/// workspace root and returns its permitted roots.
+///
+/// Every configured `workspace_roots` entry must be explicitly granted by the
+/// system table's `workspace_roots` map, `extends` must select `:workspace`,
+/// and the network switch must agree with `workspace_network`. Any ungranted
+/// root, malformed table, or network disagreement fails the launch closed.
 fn managed_roots(runtime: &Runtime, system: &toml::Table) -> Result<Vec<String>> {
-    let root = runtime
-        .workspace_root
-        .as_ref()
-        .ok_or_else(|| invalid("managed Projects requires workspace_root"))?;
+    let roots = &runtime.workspace_roots;
+    if roots.is_empty() {
+        return Err(invalid("managed Projects requires workspace_roots"));
+    }
     let table = system
         .get("workspace_roots")
         .and_then(toml::Value::as_table)
         .ok_or_else(|| invalid("invalid managed workspace roots"))?;
-    if table
-        .get(root.to_string_lossy().as_ref())
-        .and_then(toml::Value::as_bool)
-        != Some(true)
-        || system.get("extends").and_then(toml::Value::as_str) != Some(":workspace")
+    if !roots.iter().all(|root| {
+        table
+            .get(root.to_string_lossy().as_ref())
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    }) || system.get("extends").and_then(toml::Value::as_str) != Some(":workspace")
     {
-        return Err(invalid("workspace_root is not granted by managed Projects"));
+        return Err(invalid(
+            "workspace_roots are not granted by managed Projects",
+        ));
     }
     let network = system
         .get("network")
@@ -134,24 +144,52 @@ fn managed_roots(runtime: &Runtime, system: &toml::Table) -> Result<Vec<String>>
     roots.dedup();
     Ok(roots)
 }
+/// Resolves the configured workspace root admitting one workdir.
+///
+/// Write-capable requests resolve to the first configured root containing
+/// `workdir`, to `workdir` itself when no root is configured, or to the
+/// admission error when the workdir falls outside every configured root.
+/// Read-only roles always resolve to `workdir` because they never write.
+fn admitted_root<'a>(roots: &'a [PathBuf], workdir: &'a Path, write: bool) -> Result<&'a Path> {
+    if !write {
+        return Ok(workdir);
+    }
+    match roots {
+        [] => Ok(workdir),
+        configured => configured
+            .iter()
+            .find(|root| workdir.starts_with(root))
+            .map(|root| root.as_path())
+            .ok_or_else(|| invalid("workdir is outside configured workspace_roots")),
+    }
+}
+/// Builds the generated `Projects` profile payload granting every configured
+/// workspace root, `writes` filesystem rules, and the declared network state.
+fn projects_profile(runtime: &Runtime, writes: serde_json::Map<String, Value>) -> Value {
+    let granted: serde_json::Map<String, Value> = runtime
+        .workspace_roots
+        .iter()
+        .map(|root| (root.to_string_lossy().into_owned(), json!(true)))
+        .collect();
+    json!({"Projects":{"extends":":workspace","workspace_roots":granted,"filesystem":writes,"network":{"enabled":runtime.workspace_network}}})
+}
 impl Grant {
+    /// Builds the admitted Codex grant for one resolved role and request.
+    ///
+    /// A write-capable request is admitted only when `request.workdir`
+    /// resolves below at least one configured `workspace_roots` entry; with
+    /// no configured root the workdir itself is the sole grant, and
+    /// read-only roles never write. Generated `Projects` grants validate the
+    /// managed system policy or compose every configured root with the
+    /// runtime cache locations, and network roles require an explicit
+    /// `workspace_network` opt-in.
     pub fn new(
         runtime: &Runtime,
         request: &StartRequest,
         role: &Profile,
         home: &Path,
     ) -> Result<Self> {
-        let root = if role.write {
-            runtime
-                .workspace_root
-                .as_deref()
-                .unwrap_or(&request.workdir)
-        } else {
-            &request.workdir
-        };
-        if role.write && !request.workdir.starts_with(root) {
-            return Err(invalid("workdir is outside configured workspace_root"));
-        }
+        let root = admitted_root(&runtime.workspace_roots, &request.workdir, role.write)?;
         if request.write != role.write {
             return Err(invalid("request write grant does not match resolved role"));
         }
@@ -176,14 +214,18 @@ impl Grant {
         let profile;
         if !role.write {
             profile = managed.then(|| ":read-only".into());
-        } else if runtime.workspace_root.is_some() && (managed || !role.network) {
+        } else if !runtime.workspace_roots.is_empty() && (managed || !role.network) {
             if role.network && !runtime.workspace_network {
                 return Err(invalid("network role requires workspace_network"));
             }
             writable = if let Some(system) = &system {
                 managed_roots(runtime, system)?
             } else {
-                let mut a = vec![root.to_string_lossy().into_owned()];
+                let mut a: Vec<String> = runtime
+                    .workspace_roots
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
                 a.extend(
                     caches(home)
                         .iter()
@@ -196,7 +238,7 @@ impl Grant {
             profile = Some("Projects".into());
         } else {
             if managed && role.network {
-                return Err(invalid("network role requires managed workspace_root"));
+                return Err(invalid("network role requires managed workspace_roots"));
             }
             profile = managed.then(|| ":workspace".into());
         }
@@ -319,10 +361,17 @@ impl Grant {
         Ok(())
     }
 }
+/// Renders the Codex permissions document for the configured workspace roots.
+///
+/// Without configured roots the document is left untouched. With a managed
+/// system Projects policy, every configured root must be granted and only the
+/// native `default_permissions` selector is emitted. Otherwise the generated
+/// `Projects` profile grants every configured root plus the runtime caches,
+/// denies shell access to the auth bridge, and records `workspace_network`.
 pub fn render_permissions(doc: &mut toml::Table, runtime: &Runtime, home: &Path) -> Result<()> {
-    let Some(root) = &runtime.workspace_root else {
+    if runtime.workspace_roots.is_empty() {
         return Ok(());
-    };
+    }
     if let Some(system) = system_projects()? {
         managed_roots(runtime, &system)?;
         doc.insert(
@@ -340,7 +389,7 @@ pub fn render_permissions(doc: &mut toml::Table, runtime: &Runtime, home: &Path)
         json!("deny"),
     );
     writes.insert(":workspace_roots".into(),json!({".":"write","**/.env":"deny","**/.env.*":"deny","**/*.pem":"deny","**/*.key":"deny"}));
-    let projects = json!({"Projects":{"extends":":workspace","workspace_roots":{(root.to_string_lossy().to_string()):true},"filesystem":writes,"network":{"enabled":runtime.workspace_network}}});
+    let projects = projects_profile(runtime, writes);
     doc.insert(
         "default_permissions".into(),
         toml::Value::String("Projects".into()),
@@ -806,8 +855,95 @@ pub async fn query(process: &mut Process, method: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::token_usage_event;
+    use super::{admitted_root, managed_roots, projects_profile, token_usage_event};
+    use crate::config::Runtime;
     use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    /// Builds a codex runtime fixture carrying the given configured roots.
+    fn root_runtime(roots: &[&str]) -> Runtime {
+        serde_json::from_value(json!({
+            "enabled": true,
+            "adapter": "codex",
+            "binary": "/bin/true",
+            "home": "/tmp/agent-run-codex-core-test",
+            "models": ["fixture"],
+            "workspace_roots": roots,
+        }))
+        .expect("fixture runtime")
+    }
+
+    /// Managed Projects validation rejects one ungranted configured root and
+    /// succeeds only when every configured root is granted, returning the
+    /// granted set sorted and deduplicated. Pure table input keeps this free
+    /// of host `/etc` policy.
+    #[test]
+    fn managed_roots_verifies_every_configured_workspace_root() {
+        let policy: toml::Value = toml::from_str(
+            r#"
+extends = ":workspace"
+workspace_roots = { "/workspace/a" = true, "/workspace/b" = true }
+network = { enabled = false }
+"#,
+        )
+        .expect("fixture policy");
+        let table = policy.as_table().expect("Projects policy table");
+
+        let error = managed_roots(
+            &root_runtime(&["/workspace/b", "/workspace/unproven"]),
+            table,
+        )
+        .expect_err("one ungranted root rejects the policy");
+        assert!(error
+            .to_string()
+            .contains("workspace_roots are not granted by managed Projects"));
+
+        assert_eq!(
+            managed_roots(&root_runtime(&["/workspace/b", "/workspace/a"]), table)
+                .expect("all roots granted"),
+            vec!["/workspace/a", "/workspace/b"]
+        );
+    }
+
+    /// The generated unmanaged Projects profile grants every configured root.
+    #[test]
+    fn generated_projects_profile_grants_every_workspace_root() {
+        let runtime = root_runtime(&["/workspace/a", "/workspace/b"]);
+
+        let projects = projects_profile(&runtime, serde_json::Map::new());
+
+        let roots = projects["Projects"]["workspace_roots"]
+            .as_object()
+            .expect("roots map");
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots["/workspace/a"].as_bool(), Some(true));
+        assert_eq!(roots["/workspace/b"].as_bool(), Some(true));
+        assert_eq!(projects["Projects"]["extends"].as_str(), Some(":workspace"));
+    }
+
+    /// A write-capable workdir resolves below any one configured root and is
+    /// refused outside all of them; read-only roles always keep the workdir.
+    #[test]
+    fn write_admission_accepts_any_configured_root_and_refuses_outside() {
+        let roots = [PathBuf::from("/workspace/a"), PathBuf::from("/workspace/b")];
+
+        assert_eq!(
+            admitted_root(&roots, Path::new("/workspace/b/repo"), true)
+                .expect("second configured root admits"),
+            Path::new("/workspace/b")
+        );
+        let error = admitted_root(&roots, Path::new("/workspace/elsewhere"), true)
+            .expect_err("a workdir outside every root is refused");
+        assert!(error
+            .to_string()
+            .contains("outside configured workspace_roots"));
+        assert!(admitted_root(&roots, Path::new("/workspace/a2/repo"), true).is_err());
+        assert_eq!(
+            admitted_root(&roots, Path::new("/workspace/elsewhere"), false)
+                .expect("read-only roles never write"),
+            Path::new("/workspace/elsewhere")
+        );
+    }
 
     /// Mirrors `test_codex_app_server.py::test_token_usage_updated_is_cumulative`.
     #[test]

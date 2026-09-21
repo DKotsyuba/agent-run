@@ -421,7 +421,7 @@ fn python_codex_prepare_uses_project_root_only_for_write() {
     let workdir = projects.join("repo");
     std::fs::create_dir_all(&workdir).unwrap();
     let mut rt = runtime(temporary.path());
-    rt.workspace_root = Some(projects);
+    rt.workspace_roots = vec![projects];
     let read = Grant::new(
         &rt,
         &request(&workdir, false),

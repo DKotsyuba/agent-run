@@ -18,9 +18,13 @@ skills and MCP servers selected by their role. The generated directory is
 configuration separation, not an OS security boundary.
 
 Codex write roles normally receive only their assigned workdir. An explicit
-`runtimes.codex.workspace_root` replaces that root with one operator-authorized
-project tree after agent-run proves the workdir is contained by it; read-only
-roles ignore the setting. Ordinary write roles use the generated native
+`runtimes.codex.workspace_roots` array replaces that scope with operator-authorized
+project trees after agent-run proves the workdir is contained by at least one of
+them; read-only roles ignore the setting. A write role admitted under one
+configured root receives the full configured Projects root set, not only the
+tree containing its workdir. The legacy singular
+`workspace_root` declaration remains accepted and normalizes to one root, but
+declaring both forms is rejected. Ordinary write roles use the generated native
 `Projects` profile and must echo that exact active profile before their first
 turn; read-only and network roles retain the stricter legacy sandbox path. MCP
 declarations preserve native approval modes, and
@@ -32,8 +36,8 @@ requesting a boundary escalation, while the generated auth bridge is denied to
 shell tools. A declared DCG `PreToolUse` hook is an additional deny-only layer.
 
 When the host's `/etc/codex/requirements.toml` defines `Projects`, ordinary write
-roles select it instead of generating a conflicting duplicate. The existing
-`workspace_root` must be explicitly granted by that managed profile and
+roles select it instead of generating a conflicting duplicate. Every configured
+`workspace_roots` entry must be explicitly granted by that managed profile and
 `workspace_network` must agree with it. Agent-run verifies its effective
 write roots and uses its granted uv, npm, pip, and Go cache locations; existing
 host `CARGO_HOME` forwarding remains unchanged. A mismatched policy fails the

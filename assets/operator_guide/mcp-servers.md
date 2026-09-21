@@ -29,15 +29,17 @@ inert, and an unknown selected name fails closed at config load.
 
 ## Codex workspace and destructive guard
 
-`runtimes.codex.workspace_root` optionally gives write-capable Codex roles one
-operator-approved project tree instead of only their assigned workdir. The
-workdir must resolve below that root, external read roots still fail closed, and
+`runtimes.codex.workspace_roots` optionally gives write-capable Codex roles
+operator-approved project trees instead of only their assigned workdir. The
+workdir must resolve below at least one of those roots, a write role admitted
+under one root receives the full configured Projects root set, external read roots
+still fail closed, and
 read-only roles remain read-only with their exact roots. Write roles without a
 network grant use the generated native `Projects` permission profile as their
 app-server default; agent-run omits the conflicting legacy `sandbox` request and
 verifies `activePermissionProfile.id` before starting a model turn. The
 `runtimeWorkspaceRoots` echo stays scoped to the assigned workdir, while the
-effective `sandbox.writableRoots` must contain the configured project tree.
+effective `sandbox.writableRoots` must contain every configured root.
 When `workspace_network = true`, the Projects profile permits shell network and
 the generated command policy routes `curl` through the normal approval reviewer.
 Read-only and network roles keep their explicit legacy sandbox until Codex

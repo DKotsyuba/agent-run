@@ -216,8 +216,20 @@ pub struct Runtime {
     pub environment: Option<String>,
     #[serde(default)]
     pub plugin_snapshot_assets: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub workspace_root: Option<PathBuf>,
+    /// Operator-authorized Codex write roots, in declaration order.
+    ///
+    /// Configurations may declare the plural `workspace_roots` array or the
+    /// legacy singular `workspace_root` path; both normalize to this one
+    /// vector, and declaring both keys is a duplicate-field error. Every entry
+    /// must be an absolute path after `~` expansion, is admitted only for the
+    /// codex adapter, and admits a write-capable request when it contains the
+    /// request workdir. An empty vector restores the workdir-only default.
+    #[serde(
+        default,
+        alias = "workspace_root",
+        deserialize_with = "workspace_roots"
+    )]
+    pub workspace_roots: Vec<PathBuf>,
     #[serde(default)]
     pub workspace_network: bool,
     #[serde(default)]
@@ -225,6 +237,27 @@ pub struct Runtime {
 }
 fn one() -> f64 {
     1.0
+}
+/// Deserializes Codex workspace roots from the plural array or the legacy
+/// singular path declaration, normalizing either shape to one vector.
+///
+/// Declaring both `workspace_roots` and its `workspace_root` alias is rejected
+/// by serde as a duplicate field before this function runs, so ambiguous
+/// configurations never reach validation.
+fn workspace_roots<'de, D>(deserializer: D) -> std::result::Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Declared {
+        One(PathBuf),
+        Many(Vec<PathBuf>),
+    }
+    match Declared::deserialize(deserializer)? {
+        Declared::One(path) => Ok(vec![path]),
+        Declared::Many(roots) => Ok(roots),
+    }
 }
 pub fn name(s: &str) -> bool {
     !s.is_empty()
@@ -543,14 +576,17 @@ impl Config {
                     return Err(invalid("unknown environment"));
                 }
             }
-            if let Some(p) = &mut r.workspace_root {
+            if !r.workspace_roots.is_empty() {
                 if kind != Some(Adapter::Codex) {
-                    return Err(invalid("workspace_root requires codex"));
+                    return Err(invalid("workspace_roots requires codex"));
                 }
-                expand(p)?;
+                for p in &mut r.workspace_roots {
+                    expand(p)?;
+                }
             }
-            if r.workspace_network && (kind != Some(Adapter::Codex) || r.workspace_root.is_none()) {
-                return Err(invalid("workspace_network requires codex workspace_root"));
+            if r.workspace_network && (kind != Some(Adapter::Codex) || r.workspace_roots.is_empty())
+            {
+                return Err(invalid("workspace_network requires codex workspace_roots"));
             }
             if let Some(roots) = &mut r.rust {
                 expand(&mut roots.rustup_home)?;
