@@ -8,30 +8,58 @@ const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
 const {spawn}=require('node:child_process');
+/** Embedded frontend source exercised through Node's `-e` path. @type {string} */
 const frontend=fs.readFileSync(path.join(__dirname,'../assets/desktop-transport.cjs'),'utf8');
+/** Canonical notice contract supplied as the production argument. @type {string} */
 const contract=fs.readFileSync(path.join(__dirname,'../assets/completion_notice.json'),'utf8');
+/** Valid v3 request reused by behavior scenarios. @type {Record<string, unknown>} */
 const valid={version:3,op:'completion',thread_id:'thread-fixture',notification_id:'ntf_fixture',agent_id:'ag-20260825-120000-0123456789',status:'succeeded',runtime:null,model:null,effort:null,failure_kind:null};
 
-/** Encode one bounded fixture value using the production uint32-LE format. */
+/**
+ * Encode one fixture value using the production uint32-LE format.
+ * @param {unknown} value JSON-serializable fixture value.
+ * @returns {Buffer} Header and encoded body.
+ */
 function frame(value){const data=Buffer.from(JSON.stringify(value));const n=Buffer.alloc(4);n.writeUInt32LE(data.length);return Buffer.concat([n,data]);}
 
-/** Read one framed JSON reply from a fixture socket. */
-function receive(socket){return new Promise((resolve,reject)=>{let data=Buffer.alloc(0);socket.on('data',chunk=>{data=Buffer.concat([data,chunk]);if(data.length>=4&&data.length>=4+data.readUInt32LE(0))resolve(JSON.parse(data.subarray(4,4+data.readUInt32LE(0))));});socket.once('error',reject);socket.once('close',()=>data.length<4&&reject(Error('closed')));});}
+/**
+ * Read one framed JSON reply from a fixture socket.
+ * @param {net.Socket} socket Connected local relay socket.
+ * @returns {Promise<unknown>} Decoded reply value; rejects on transport failure or early close.
+ */
+function receive(socket){return new Promise((resolve,reject)=>{/** @type {Buffer} */let data=Buffer.alloc(0);socket.on('data',chunk=>{data=Buffer.concat([data,chunk]);if(data.length>=4&&data.length>=4+data.readUInt32LE(0))resolve(JSON.parse(data.subarray(4,4+data.readUInt32LE(0))));});socket.once('error',reject);socket.once('close',()=>data.length<4&&reject(Error('closed')));});}
 
-/** Wait for the frontend's randomly suffixed private relay path. */
+/**
+ * Wait for the frontend's randomly suffixed private relay path.
+ * @param {string} directory Private temporary home to scan.
+ * @returns {Promise<string>} Absolute relay path after it appears.
+ * @throws {Error} When no endpoint appears within the bounded polling window.
+ */
 async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v3-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
 
-/** Connect after the listening callback, tolerating the socket-file visibility race. */
+/**
+ * Connect after the listening callback, tolerating the socket-file visibility race.
+ * @param {string} endpoint Absolute relay socket path.
+ * @returns {Promise<net.Socket>} Connected local relay socket.
+ * @throws {Error} On non-race connection failures or exhausted retries.
+ */
 async function connectRelay(endpoint){for(let i=0;i<200;i++){try{return await new Promise((resolve,reject)=>{const socket=net.createConnection(endpoint);socket.once('connect',()=>resolve(socket));socket.once('error',reject);});}catch(error){if(error.code!=='ECONNREFUSED')throw error;await new Promise(resolve=>setTimeout(resolve,10));}}throw Error('relay did not accept');}
 
-/** Run one typed local request through the frontend and a fake native host. */
+/**
+ * Run one typed local request through the frontend and a fake native host.
+ * @param {string} mode Fixture host response or connection-cap scenario.
+ * @param {Record<string, unknown>} [request=valid] Typed relay request.
+ * @returns {Promise<{result?: unknown, calls: Record<string, unknown>[], hostPid?: number, child?: Record<string, unknown>, overflowClosed?: boolean}>} Scenario observations after complete process and socket cleanup.
+ * @throws {Error} On fixture startup, protocol, timeout, or cleanup failure.
+ */
 async function scenario(mode,request=valid){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'ar-node-'));
   const socketPath=path.join(directory,'host.sock');const calls=[];const peers=new Set();
-  const server=net.createServer(socket=>{peers.add(socket);socket.on('close',()=>peers.delete(socket));socket.on('error',()=>{});let input=Buffer.alloc(0);socket.on('data',chunk=>{input=Buffer.concat([input,chunk]);while(input.length>=4&&input.length>=4+input.readUInt32LE(0)){const length=input.readUInt32LE(0);const value=JSON.parse(input.subarray(4,4+length));input=input.subarray(4+length);calls.push(value);if(value.method==='tools/list'){if(mode==='disconnect_inventory')return socket.destroy();if(mode==='oversized_inventory'){const head=Buffer.alloc(4);head.writeUInt32LE(8*1024*1024+1);return socket.write(head);}socket.write(frame({jsonrpc:'2.0',id:value.id,result:{tools:mode==='missing_tool'?[]:[{name:'other',namespace:'wrong'},{name:'send_message_to_thread',namespace:'fixture-host'}]}}));}else{assert.equal(value.method,'tools/call');assert.equal(value.params.tool,'send_message_to_thread');assert.equal(value.params.namespace,'fixture-host');if(mode==='disconnect_after_send')return socket.destroy();if(mode==='wrong_id')return socket.write(frame({jsonrpc:'2.0',id:999,result:{success:true}}));socket.write(frame({jsonrpc:'2.0',id:value.id,result:mode==='missing_success'?{}:{success:mode==='accepted'}}));}}});});
+  const server=net.createServer(socket=>{peers.add(socket);socket.on('close',()=>peers.delete(socket));socket.on('error',()=>{});/** @type {Buffer} */let input=Buffer.alloc(0);socket.on('data',chunk=>{input=Buffer.concat([input,chunk]);while(input.length>=4&&input.length>=4+input.readUInt32LE(0)){const length=input.readUInt32LE(0);const value=JSON.parse(input.subarray(4,4+length));input=input.subarray(4+length);calls.push(value);if(value.method==='tools/list'){if(mode==='disconnect_inventory')return socket.destroy();if(mode==='oversized_inventory'){const head=Buffer.alloc(4);head.writeUInt32LE(8*1024*1024+1);return socket.write(head);}socket.write(frame({jsonrpc:'2.0',id:value.id,result:{tools:mode==='missing_tool'?[]:[{name:'other',namespace:'wrong'},{name:'send_message_to_thread',namespace:'fixture-host'}]}}));}else{assert.equal(value.method,'tools/call');assert.equal(value.params.tool,'send_message_to_thread');assert.equal(value.params.namespace,'fixture-host');if(mode==='disconnect_after_send')return socket.destroy();if(mode==='wrong_id')return socket.write(frame({jsonrpc:'2.0',id:999,result:{success:true}}));socket.write(frame({jsonrpc:'2.0',id:value.id,result:mode==='missing_success'?{}:{success:mode==='accepted'}}));}}});});
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(socketPath,resolve);});
   const childCode="process.stdout.write(JSON.stringify({pid:process.pid,ppid:process.ppid,pipe:process.env.CODEX_APP_TOOLS_PIPE_PATH||null,node:process.env.CODEX_MCP_NODE_PATH||null})+'\\n');setInterval(()=>{},1000)";
   const host=spawn(process.execPath,['-e',frontend,'--',process.execPath,directory,contract,'-e',childCode],{env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:socketPath,CODEX_MCP_NODE_PATH:process.execPath},stdio:['ignore','pipe','pipe']});
+  /** Child protocol stdout captured without frontend output. @type {string} */
   let output='';host.stdout.on('data',data=>output+=data);host.stderr.on('data',()=>{});
   try{
     const endpoint=await relayPath(directory);
