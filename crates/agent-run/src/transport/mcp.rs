@@ -10,8 +10,12 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use std::{
+    ffi::CString,
+    os::unix::{ffi::OsStrExt, process::CommandExt},
+    path::Path,
     path::PathBuf,
     pin::Pin,
+    process::Command,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -23,6 +27,61 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Preserve Python's stable, operator-actionable broker-unavailable wording.
 const BROKER_UNAVAILABLE: &str =
     "agent-run broker is not running; start it with `agent-run api serve` or its launchd job";
+
+/// Fixed diagnostic for an optional Desktop frontend that cannot replace this process.
+const DESKTOP_FRONTEND_UNAVAILABLE: &str =
+    "agent-run: Desktop MCP frontend unavailable; continuing without relay delivery";
+
+/// Return whether `path` names a regular file executable by the current process identity.
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+        && CString::new(path.as_os_str().as_bytes())
+            // SAFETY: the CString is NUL-terminated and remains alive for the read-only query.
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+}
+
+/// Replace a production Desktop MCP process with the host-supplied signed Node frontend.
+///
+/// The replacement occurs only when both absolute capability paths are present. The frontend
+/// receives the current executable, resolved home, trusted notice contract, and exact original
+/// argument vector without shell interpretation. It removes both capability variables before
+/// starting the Rust MCP child, which makes recursion impossible and keeps native host access in
+/// the signed process. Successful replacement never returns. Missing, malformed, non-executable,
+/// or failed optional frontends emit one fixed
+/// diagnostic and leave the caller to run the direct Rust MCP without native-host access.
+pub fn exec_desktop_frontend(home: &Path) -> Result<()> {
+    let (Some(pipe), Some(node)) = (
+        std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH"),
+        std::env::var_os("CODEX_MCP_NODE_PATH"),
+    ) else {
+        return Ok(());
+    };
+    let pipe = PathBuf::from(pipe);
+    let node = PathBuf::from(node);
+    if !pipe.is_absolute() || !node.is_absolute() || !is_executable_file(&node) {
+        eprintln!("{DESKTOP_FRONTEND_UNAVAILABLE}");
+        // Direct MCP only proxies stdio to the resident broker. It opens no native-host client
+        // and spawns no engine, so these capabilities remain inert without unsafe environment
+        // mutation after Tokio worker threads have started.
+        return Ok(());
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        eprintln!("{DESKTOP_FRONTEND_UNAVAILABLE}");
+        return Ok(());
+    };
+    let _error = Command::new(node)
+        .arg("-e")
+        .arg(include_str!("../../../../assets/desktop-transport.cjs"))
+        .arg("--")
+        .arg(executable)
+        .arg(home)
+        .arg(include_str!("../../../../assets/completion_notice.json"))
+        .args(std::env::args_os().skip(1))
+        .exec();
+    eprintln!("{DESKTOP_FRONTEND_UNAVAILABLE}");
+    // The failed exec leaves this same direct, capability-inert MCP process in place.
+    Ok(())
+}
 
 /// Bound stdin one LF-delimited MCP frame at a time for the SDK transport.
 struct BoundedReader<R> {
@@ -314,7 +373,6 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let _relay = crate::delivery::relay::host(&home)?;
     let service = Proxy {
         broker,
         home,

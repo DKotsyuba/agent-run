@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.5] - 2026-09-22
+
+- fix(mcp): replace Desktop-launched MCP with the supplied signed Node frontend,
+  which owns the native-tools pipe and long-lived typed completion relay while
+  its Rust MCP child runs without host capabilities
+- fix(mcp): preserve direct MCP `initialize` and `tools/list` service with a
+  fixed bounded warning when the optional frontend path is malformed, missing,
+  non-executable, or fails during `exec`; fallback never opens a native-host
+  client
+- 0.12.5 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.12.4] - 2026-09-22
 
 - fix(core): continue Codex relay discovery past stale endpoints so a live
