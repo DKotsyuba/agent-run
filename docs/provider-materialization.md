@@ -25,6 +25,8 @@ provider/model/connection/grants, and the newly selected account scope.
 Changed live settings cannot replace frozen permissions. The resulting
 `ProviderLaunchPlan` contains a child-only `LaunchPlan`, frozen
 `native_model`, and validated role; do not serialize or log its environment.
+The existing effective-policy evaluator runs at materialization and retry,
+so a required model constraint must have actual harness/profile enforcement.
 
 Native Codex uses the existing login and app-server invocation. Its selected
 `auth.json` link is bound per attempt outside the immutable asset manifest,

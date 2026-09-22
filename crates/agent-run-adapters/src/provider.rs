@@ -10,6 +10,7 @@ use crate::{
 };
 use agent_run_config::{
     config::{self, Config, Runtime},
+    policy,
     profiles::Profile,
     provider_config::ProviderConfig,
     role_plan::{role_from_authority, ResolvedRolePlan},
@@ -185,6 +186,7 @@ pub fn materialize_selected(
         return Err(invalid("provider workdir must exist"));
     }
     let runtime = runtime(config, definition.harness, model)?;
+    policy::evaluate(provider.as_str(), &runtime, &profile(&role)).admit()?;
     let selected_label = match &reference {
         CredentialRef::Named { label, .. } => Some(label.as_str()),
         _ => None,
@@ -323,6 +325,7 @@ pub fn plan_selected(
     }
     let reference = CredentialRef::from_str(lease.secret().reference())?;
     let runtime = runtime(config, sealed.harness, &authority.model)?;
+    policy::evaluate(authority.provider.as_str(), &runtime, &profile(&role)).admit()?;
     let selected_label = match &reference {
         CredentialRef::Named { label, .. } => Some(label.as_str()),
         _ => None,

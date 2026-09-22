@@ -130,12 +130,12 @@ fn catalog(config: &ProviderConfig) -> ProviderCatalog {
 }
 
 /// Freezes a read-only canonical role carrying the configured model restriction.
-fn role(root: &Path) -> ResolvedRolePlan {
+fn role(root: &Path, network: bool) -> ResolvedRolePlan {
     let profile = Profile {
         name: "review".into(),
         body: "Review safely.".into(),
         write: false,
-        network: false,
+        network,
         revision: "1".into(),
         canonical: true,
         allow_external_read_roots: false,
@@ -192,7 +192,7 @@ fn native_provider_keeps_login_and_model_alias() {
     let root = home.path();
     let config = config(root, &fake_engine(root));
     let catalog = catalog(&config);
-    let role = role(root);
+    let role = role(root, false);
     let auth = root.join("accounts/codex/work/auth.json");
     fs::create_dir_all(auth.parent().unwrap()).unwrap();
     fs::write(&auth, "{}").unwrap();
@@ -318,7 +318,20 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
         );
     assert!(forbidden.validate(root).is_err());
     let catalog = catalog(&config);
-    let role = role(root);
+    let unsafe_role = role(root, true);
+    let role = role(root, false);
+    assert!(materialize_selected(
+        &config,
+        &catalog,
+        &"glm-any".parse().unwrap(),
+        "glm",
+        &"acct-glm".parse().unwrap(),
+        &unsafe_role,
+        root,
+        &root.join("unsafe-run"),
+        root,
+    )
+    .is_err());
     let host = BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]);
 
     let provider: ProviderId = "glm-any".parse().unwrap();
