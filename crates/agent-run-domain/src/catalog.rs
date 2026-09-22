@@ -227,9 +227,16 @@ impl<'de> Deserialize<'de> for AuthFamily {
 }
 
 /// A reference naming where a credential lives; never the credential itself.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SecretRef(String);
+
+impl fmt::Debug for SecretRef {
+    /// Hides even malformed storage text from diagnostic formatting.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretRef(<redacted>)")
+    }
+}
 
 impl SecretRef {
     /// Returns the opaque storage reference, e.g. a keychain label.
@@ -423,7 +430,9 @@ pub struct ProviderBinding {
     pub multiplier: PositiveFinite,
 }
 
-pub use crate::provider_connection::{LimitsSource, ProviderConnection, ProviderProtocol};
+pub use crate::provider_connection::{
+    CredentialHeader, LimitsSource, ProviderConnection, ProviderProtocol,
+};
 
 /// A provider: one harness and connection, explicit models and bindings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -747,9 +756,16 @@ impl ResolvedLaunchAuthority {
 /// The handle carries no secret bytes and implements no serde trait, so it
 /// cannot cross a wire, enter configuration, or be logged by serialization.
 /// The resolver mints handles only through a selected, in-scope catalog record.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecretHandle {
     reference: Arc<str>,
+}
+
+impl fmt::Debug for SecretHandle {
+    /// Hides the selected storage reference from diagnostic formatting.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretHandle(<redacted>)")
+    }
 }
 
 impl SecretHandle {

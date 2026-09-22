@@ -70,9 +70,12 @@ account = "acct-glm"
 `native` preserves the harness's existing login and endpoint. It has no
 custom URL or implicit API-key conversion. `custom` requires an explicit
 HTTPS endpoint and protocol: Codex accepts `responses`, Claude Code accepts
-`messages`. Loopback HTTP requires `allow_loopback_http = true` inside the
+`messages`. Custom connections use bearer authorization by default and may
+set `auth_header = "x_api_key"` for compatible gateways. Loopback HTTP
+requires `allow_loopback_http = true` inside the
 custom connection. Credentials are selected from registered account
-references, never embedded in this file. Codex's Responses provider settings
+references, never embedded in this file; see the [account registry](account-registry.md).
+Codex's Responses provider settings
 and Claude's Messages gateway environment are materialized by their later
 adapter consumer; this config parser does not launch either CLI. See the
 [Codex custom-provider configuration](https://learn.chatgpt.com/docs/config-file/config-advanced)

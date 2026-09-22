@@ -128,6 +128,10 @@ fn v2_rejects_invalid_provider_contracts() {
         valid.replace("models = [\"gpt\"]", "models = [\"missing\"]"),
         valid.replace("priority_multiplier = 5.0", "priority_multiplier = -1.0"),
         valid.replace("protocol = \"messages\"", "protocol = \"responses\""),
+        valid.replace(
+            "connection = { kind = \"native\" }",
+            "connection = { kind = \"custom\", endpoint = \"https://api.example.com\", protocol = \"responses\", auth_header = \"x_api_key\" }",
+        ),
         valid.replace("https://api.example.com/messages", ""),
         valid.replace(
             "allowed_params = { effort = [\"medium\", \"high\"] }",

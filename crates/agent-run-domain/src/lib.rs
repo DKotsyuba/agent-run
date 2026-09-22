@@ -1,6 +1,7 @@
 //! Validated product types and transport-safe errors.
 pub mod canonical;
 pub mod catalog;
+pub mod credential_ref;
 pub mod domain;
 pub mod error;
 pub mod fsm;
@@ -12,13 +13,14 @@ pub mod types;
 pub mod views;
 
 pub use catalog::{
-    AccountId, AccountRecord, AccountStatus, AttemptCredentials, AuthFamily, HarnessId,
-    LimitsSource, NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
-    ProviderConnection, ProviderDefinition, ProviderId, ProviderModel, ProviderProtocol,
-    QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, QuotaModelObservation,
-    QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretHandle, SecretRef,
-    SelectionIntent,
+    AccountId, AccountRecord, AccountStatus, AttemptCredentials, AuthFamily, CredentialHeader,
+    HarnessId, LimitsSource, NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding,
+    ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderId, ProviderModel,
+    ProviderProtocol, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet,
+    QuotaModelObservation, QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority,
+    SecretHandle, SecretRef, SelectionIntent,
 };
+pub use credential_ref::CredentialRef;
 pub use error::{Error, MachineCode, ProtocolMapping, PublicError, Result};
 pub use fsm::{validate_transition, ACTIVE, TERMINAL};
 pub use tools::{

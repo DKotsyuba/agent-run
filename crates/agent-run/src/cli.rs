@@ -10,6 +10,10 @@ use crate::{
     state::Store,
     transport, Result,
 };
+use agent_run_domain::{
+    catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
+    CredentialRef,
+};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
@@ -214,6 +218,11 @@ pub enum Command {
         label: String,
         runtime: String,
     },
+    /// Manage global account references without invoking native login.
+    Accounts {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
     Context(Context),
     Hook {
         #[command(subcommand)]
@@ -249,6 +258,31 @@ pub enum Command {
         /// Repeated configured MCP namespaces eligible for the narrow allow decision.
         #[arg(long = "allow-mcp", required = true)]
         allow_mcp: Vec<String>,
+    },
+}
+
+/// Administrative account registry operations; references name existing
+/// protected stores and never accept credential bytes as an argument.
+#[derive(Subcommand, Debug)]
+pub enum AccountCommand {
+    /// Register one global account and existing credential reference.
+    Register {
+        /// Opaque global account identity shared by provider aliases.
+        #[arg(long)]
+        id: AccountId,
+        /// Protocol credential family matching provider bindings.
+        #[arg(long)]
+        auth_family: AuthFamily,
+        /// Nonsecret native/named/env/file/Keychain storage reference.
+        #[arg(long)]
+        reference: SecretRef,
+    },
+    /// List registered account metadata without full storage references.
+    List,
+    /// Disable future account selection while preserving history.
+    Disable {
+        /// Existing global account identity.
+        id: AccountId,
     },
 }
 /// Optional orchestrator identity shared by public tool commands.
@@ -1117,6 +1151,46 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             }
             return Ok(code);
         }
+        Command::Accounts { command } => match command {
+            AccountCommand::Register {
+                id,
+                auth_family,
+                reference,
+            } => {
+                let source = CredentialRef::from_secret(&reference)?;
+                let record = AccountRecord {
+                    account_id: id.clone(),
+                    auth_family: auth_family.clone(),
+                    secret_ref: reference,
+                    status: AccountStatus::Enabled,
+                };
+                Store::open(&home)?.register_account(&record)?;
+                (dependencies.output)(&json!({
+                    "account_id": id, "auth_family": auth_family.as_str(),
+                    "status": "enabled", "source": source.kind()
+                }))?;
+            }
+            AccountCommand::List => {
+                let records = Store::open(&home)?.list_accounts()?;
+                let views: Vec<_> = records
+                    .iter()
+                    .map(|record| {
+                        json!({
+                            "account_id": record.account_id,
+                            "auth_family": record.auth_family.as_str(),
+                            "status": record.status.as_str(),
+                            "source": CredentialRef::from_secret(&record.secret_ref)
+                                .map(|reference| reference.kind()).unwrap_or("unknown"),
+                        })
+                    })
+                    .collect();
+                (dependencies.output)(&json!({"accounts":views}))?;
+            }
+            AccountCommand::Disable { id } => {
+                Store::open(&home)?.disable_account(&id)?;
+                (dependencies.output)(&json!({"account_id":id,"status":"disabled"}))?;
+            }
+        },
         // The supervisor is spawned by posix_spawn with three fixed bootstrap
         // descriptors; keep that signature from the launch work.
         Command::Supervisor {

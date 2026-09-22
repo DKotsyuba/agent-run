@@ -184,6 +184,42 @@ fn python_view_dtos_keep_field_order_and_nulls() {
 
 // --- provider orchestration catalog contracts (schema v17 preparation) ---
 
+/// Credential references identify existing protected stores without accepting
+/// inline tokens, relative files, or escaping named-account labels.
+#[test]
+fn credential_references_are_typed_storage_locations() {
+    for reference in [
+        "native:codex",
+        "named:claude-code:work",
+        "env:FAKE_TOKEN",
+        "file:/tmp/fake-auth",
+        "keychain:fake.service:FAKE_KEY",
+    ] {
+        assert!(
+            reference.parse::<agent_run_domain::CredentialRef>().is_ok(),
+            "{reference}"
+        );
+    }
+    for reference in [
+        "fake-raw-token",
+        "named:codex:../escape",
+        "file:relative",
+        "env:bad",
+        "keychain:missing",
+    ] {
+        assert!(
+            reference
+                .parse::<agent_run_domain::CredentialRef>()
+                .is_err(),
+            "{reference}"
+        );
+    }
+    assert_eq!(
+        format!("{:?}", "fake-raw-token".parse::<SecretRef>().unwrap()),
+        "SecretRef(<redacted>)"
+    );
+}
+
 use agent_run_domain::catalog::{
     decode_legacy_request, legacy_runtime, AccountId, AccountRecord, AccountStatus,
     AttemptCredentials, AuthFamily, HarnessId, LegacyRuntime, LimitsSource,
@@ -210,6 +246,7 @@ fn aliased_catalog() -> ProviderCatalog {
         connection: ProviderConnection::Custom {
             endpoint: "https://api.example.com".into(),
             protocol: ProviderProtocol::Responses,
+            auth_header: Default::default(),
             allow_loopback_http: false,
         },
         auth_family: AuthFamily::from_str("openai").unwrap(),
@@ -330,6 +367,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         provider.connection = ProviderConnection::Custom {
             endpoint: endpoint.into(),
             protocol: ProviderProtocol::Responses,
+            auth_header: Default::default(),
             allow_loopback_http: false,
         };
         assert!(provider.validate().is_err(), "{endpoint}");
@@ -337,24 +375,28 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
     provider.connection = ProviderConnection::Custom {
         endpoint: "http://localhost:8080".into(),
         protocol: ProviderProtocol::Responses,
+        auth_header: Default::default(),
         allow_loopback_http: false,
     };
     assert!(provider.validate().is_err());
     provider.connection = ProviderConnection::Custom {
         endpoint: "http://localhost:8080".into(),
         protocol: ProviderProtocol::Responses,
+        auth_header: Default::default(),
         allow_loopback_http: true,
     };
     provider.validate().unwrap();
     provider.connection = ProviderConnection::Custom {
         endpoint: "http://[::1]:8080".into(),
         protocol: ProviderProtocol::Responses,
+        auth_header: Default::default(),
         allow_loopback_http: true,
     };
     provider.validate().unwrap();
     provider.connection = ProviderConnection::Custom {
         endpoint: "http://example.com".into(),
         protocol: ProviderProtocol::Responses,
+        auth_header: Default::default(),
         allow_loopback_http: true,
     };
     assert!(provider.validate().is_err());
@@ -631,6 +673,7 @@ fn launch_authority_is_serializable_but_credential_leases_are_not() {
     )
     .unwrap();
     assert_eq!(lease.secret().reference(), "keychain:codex");
+    assert_eq!(format!("{:?}", lease.secret()), "SecretHandle(<redacted>)");
     // SecretHandle is not Serialize/Deserialize by construction; this test
     // compiles only because the assertions below never serialize the lease.
     assert_eq!(lease.account().as_str(), "acct-codex-native");

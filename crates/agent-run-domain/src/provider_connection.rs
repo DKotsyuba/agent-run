@@ -16,10 +16,24 @@ pub enum ProviderConnection {
         endpoint: String,
         /// Protocol supported by the selected harness.
         protocol: ProviderProtocol,
+        /// Explicit HTTP authorization header style; bearer by default.
+        #[serde(default)]
+        auth_header: CredentialHeader,
         /// Enables HTTP only for exact localhost or loopback IP hosts.
         #[serde(default)]
         allow_loopback_http: bool,
     },
+}
+
+/// Credential header used only for an explicitly configured custom gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialHeader {
+    /// Authorization: Bearer, including GLM's inference gateway.
+    #[default]
+    Bearer,
+    /// Anthropic-compatible x-api-key header.
+    XApiKey,
 }
 
 impl ProviderConnection {
@@ -30,6 +44,7 @@ impl ProviderConnection {
         let Self::Custom {
             endpoint,
             protocol,
+            auth_header,
             allow_loopback_http,
         } = self
         else {
@@ -50,6 +65,7 @@ impl ProviderConnection {
                 (HarnessId::Codex, ProviderProtocol::Responses)
                     | (HarnessId::ClaudeCode, ProviderProtocol::Messages)
             )
+            || (harness == HarnessId::Codex && *auth_header != CredentialHeader::Bearer)
         {
             return Err(invalid("unsupported provider protocol endpoint"));
         }

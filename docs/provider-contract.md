@@ -32,8 +32,9 @@ them from `agent_run_domain::catalog` rather than redefining business types.
 * Wire deserialization runs the same whole-catalog checks as construction,
   including duplicate ids, model subsets, registration, and auth families.
 * No secret bytes exist in any catalog type. Credentials are named by
-  `SecretRef` (a storage reference such as a keychain label); the real
-  resolver is a separate deliverable.
+  `SecretRef`; registration checks its typed native/named/environment/file/
+  Keychain location. The Rust-only [account registry](account-registry.md)
+  resolves custom request headers at use time.
 
 Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
 (`codex-plus`, `codex-pro` over one `gpt-5.1` model and one global account).

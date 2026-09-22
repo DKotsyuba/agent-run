@@ -1,4 +1,5 @@
 //! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
+pub mod accounts;
 /// Atomic durable admission, replay, and active-capacity reservation.
 pub mod admission;
 /// Durable delivery outbox rows, binding, expiry, and evidence verdicts.

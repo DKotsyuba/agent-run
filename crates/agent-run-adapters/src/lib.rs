@@ -1,5 +1,6 @@
 //! Native engines remain external tools. No Python runtime or Python fallback is used.
 pub mod auth;
+pub mod authorized_request;
 pub mod claude;
 pub mod codex;
 pub mod command_policy;
