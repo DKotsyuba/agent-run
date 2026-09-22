@@ -859,9 +859,17 @@ pub struct QuotaCandidate {
     #[serde(default)]
     pub rank: u32,
     /// Exact physical quota pools this model/attempt must reserve together.
+    /// Legal empty only for unknown capacity: a never-collected or stale
+    /// account keeps no fabricated pools, and its ownership still comes from
+    /// `selected_account_id` account-level attempt counts.
     pub physical_keys: Vec<PhysicalQuotaKey>,
     /// The candidate's effective positive finite multiplier.
     pub multiplier: PositiveFinite,
+    /// Whether fresh account quota evidence backs this candidate. `false`
+    /// means unknown capacity (never collected, stale, or failed evidence),
+    /// never a known zero; a computed score must never enter `multiplier`.
+    #[serde(default)]
+    pub quota_known: bool,
 }
 
 /// The immutable, ordered candidate set quota hands to transactional admission.
@@ -885,8 +893,9 @@ pub struct QuotaCandidateSet {
 }
 
 impl QuotaCandidateSet {
-    /// Validates nonblank model, distinct accounts and host-bound physical
-    /// key sets, and the pinned account's membership.
+    /// Validates nonblank model, distinct accounts, host-bound physical key
+    /// sets that are nonempty exactly for known-capacity candidates, and the
+    /// pinned account's membership.
     pub fn validate(&self) -> Result<()> {
         nonblank("model", &self.model)?;
         let mut seen = std::collections::BTreeSet::new();
@@ -900,7 +909,7 @@ impl QuotaCandidateSet {
                 return Err(invalid("quota candidates must not repeat an account"));
             }
             let mut keys = std::collections::BTreeSet::new();
-            if candidate.physical_keys.is_empty()
+            if (candidate.quota_known && candidate.physical_keys.is_empty())
                 || candidate.physical_keys.len() > 32
                 || candidate
                     .physical_keys
@@ -908,7 +917,8 @@ impl QuotaCandidateSet {
                     .any(|key| !key.belongs_to(&candidate.account) || !keys.insert(key))
             {
                 return Err(invalid(
-                    "candidate physical keys must be distinct and account-bound",
+                    "candidate physical keys must be distinct, account-bound, and nonempty \
+                     for known capacity",
                 ));
             }
         }

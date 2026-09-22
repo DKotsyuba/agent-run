@@ -156,6 +156,7 @@ fn candidates(revision: i64) -> QuotaCandidateSet {
                 agent_run_domain::PhysicalQuotaKey::new(&account, "tokens").unwrap()
             ],
             multiplier: PositiveFinite::try_from(1.0).unwrap(),
+            quota_known: true,
         }],
         capacity_revision: revision,
     }
