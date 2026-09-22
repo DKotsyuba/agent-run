@@ -115,9 +115,10 @@ arrives — there is no line buffering — with one newline per message or tool
 row; untrusted roles, names, and content are stripped of terminal escape
 sequences. The Codex runtime journals deltas and completion tails of one
 message under a shared item identity, so they render as one continuous row;
-the Claude runtime currently journals assistant deltas without an item
-identity or a message-boundary row, so its consecutive assistant rows render
-as one continuous row as well. Other commands
+the Claude runtime journals assistant fragments and the completion tail of one
+message under its native message id (or one producer-owned fallback per
+message boundary when the engine omits ids), so each message renders as one
+continuous row and distinct messages stay distinct. Other commands
 include `steer`, `cancel`, `models`, `limits`, `capacity order`,
 `delivery status`, and `doc`.
 
