@@ -960,11 +960,11 @@ async fn test_transcript_text_follow_drains_without_duplicates() {
                 vec![
                     (
                         0,
-                        json!({"messages":[{"seq":1,"role":"assistant","content":"one"}],"complete":false}),
+                        json!({"messages":[{"seq":1,"role":"assistant","content":"one","raw_ref":"item-1"}],"complete":false}),
                     ),
                     (
                         1,
-                        json!({"messages":[{"seq":2,"role":"assistant","content":"two"}],"complete":true}),
+                        json!({"messages":[{"seq":2,"role":"assistant","content":"two","raw_ref":"item-2"}],"complete":true}),
                     ),
                 ],
                 true,
@@ -1013,4 +1013,79 @@ async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
             .expect("agent view")["status"],
         "running"
     );
+}
+
+/// Proves same-identity journal fragments stream continuously across polls.
+///
+/// Mirrors the real Codex producer: `item/agentMessage/delta` journals
+/// word-sized fragments of one agentMessage under one `itemId`, so the
+/// viewer must render `Hello`, ` `, `world` from three pages as one line.
+#[tokio::test]
+async fn test_transcript_text_streams_fragments_across_pages() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let rows = |seq: i64, content: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":"same-message"});
+    agent_run::cli::run_with(
+        parse(&[
+            "transcript",
+            AGENT_ID,
+            "--limit",
+            "1",
+            "--follow",
+            "--format",
+            "text",
+        ]),
+        text_dependencies(
+            Arc::new(FakeService::new(
+                vec![
+                    (0, json!({"messages":[rows(1,"Hello")],"complete":false})),
+                    (1, json!({"messages":[rows(2," ")],"complete":false})),
+                    (2, json!({"messages":[rows(3,"world")],"complete":true})),
+                ],
+                true,
+            )),
+            lines.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*lines.lock().unwrap(), vec!["Hello world"]);
+}
+
+/// Proves escape sequences split across polling pages never leak payload.
+#[tokio::test]
+async fn test_transcript_text_consumes_escape_splits_across_pages() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let row = |seq: i64, content: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":"m"});
+    agent_run::cli::run_with(
+        parse(&[
+            "transcript",
+            AGENT_ID,
+            "--limit",
+            "1",
+            "--follow",
+            "--format",
+            "text",
+        ]),
+        text_dependencies(
+            Arc::new(FakeService::new(
+                vec![
+                    (
+                        0,
+                        json!({"messages":[row(1,"bad \u{1b}[3")],"complete":false}),
+                    ),
+                    (
+                        1,
+                        json!({"messages":[row(2,"1mred\u{1b}[0m ok")],"complete":true}),
+                    ),
+                ],
+                true,
+            )),
+            lines.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*lines.lock().unwrap(), vec!["bad red ok"]);
 }

@@ -1055,26 +1055,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             // An explicit --format always wins; otherwise text is interactive
             // and JSON keeps piped consumers on the historical machine shape.
             let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
-            // Renders one page's messages in the selected format.
-            let emit_page = |page: &Value,
-                             text: bool,
-                             output: &CliOutput,
-                             text_output: &CliTextOutput|
-             -> Result<()> {
-                if text {
-                    for line in crate::transcript::render(
-                        page["messages"]
-                            .as_array()
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
-                    ) {
-                        text_output(&line)?;
-                    }
-                    Ok(())
-                } else {
-                    output(page)
-                }
-            };
+            // Streaming state persists across pages and polls so journal
+            // fragments of one model message render continuously.
+            let mut renderer = crate::transcript::Renderer::default();
             if full {
                 let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
                 let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
@@ -1096,12 +1079,8 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     pages += 1;
                 }
                 if text {
-                    emit_page(
-                        &json!({"messages":messages}),
-                        true,
-                        &dependencies.output,
-                        &dependencies.text_output,
-                    )?;
+                    renderer.page(&messages, &mut |line| (dependencies.text_output)(line))?;
+                    renderer.finish(&mut |line| (dependencies.text_output)(line))?;
                 } else {
                     (dependencies.output)(
                         &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
@@ -1110,7 +1089,17 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             } else {
                 loop {
                     let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
-                    emit_page(&page, text, &dependencies.output, &dependencies.text_output)?;
+                    if text {
+                        renderer.page(
+                            page["messages"]
+                                .as_array()
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            &mut |line| (dependencies.text_output)(line),
+                        )?;
+                    } else {
+                        (dependencies.output)(&page)?;
+                    }
                     if let Some(seq) = page["messages"]
                         .as_array()
                         .and_then(|a| a.last())
@@ -1137,6 +1126,8 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     // agent; the resident supervisor keeps running it.
                     tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
                 }
+                // Flush the tail of the streamed item on any viewer exit.
+                renderer.finish(&mut |line| (dependencies.text_output)(line))?;
             }
         }
         Command::Models => (dependencies.output)(&dependencies.service.models().await?)?,
