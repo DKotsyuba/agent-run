@@ -5,6 +5,7 @@ pub mod domain;
 pub mod error;
 pub mod fsm;
 mod legacy_provider;
+mod provider_connection;
 pub mod quota_snapshot;
 pub mod tools;
 pub mod types;
@@ -12,10 +13,11 @@ pub mod views;
 
 pub use catalog::{
     AccountId, AccountRecord, AccountStatus, AttemptCredentials, AuthFamily, HarnessId,
-    NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
-    ProviderDefinition, ProviderId, ProviderModel, QuotaAdmissionError, QuotaCandidate,
-    QuotaCandidateSet, QuotaModelObservation, QuotaPoolObservation, QuotaWindow,
-    ResolvedLaunchAuthority, SecretHandle, SecretRef, SelectionIntent,
+    LimitsSource, NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
+    ProviderConnection, ProviderDefinition, ProviderId, ProviderModel, ProviderProtocol,
+    QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, QuotaModelObservation,
+    QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretHandle, SecretRef,
+    SelectionIntent,
 };
 pub use error::{Error, MachineCode, ProtocolMapping, PublicError, Result};
 pub use fsm::{validate_transition, ACTIVE, TERMINAL};

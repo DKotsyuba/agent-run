@@ -186,9 +186,10 @@ fn python_view_dtos_keep_field_order_and_nulls() {
 
 use agent_run_domain::catalog::{
     decode_legacy_request, legacy_runtime, AccountId, AccountRecord, AccountStatus,
-    AttemptCredentials, AuthFamily, HarnessId, LegacyRuntime, NormalizedQuotaSnapshot,
-    PhysicalQuotaKey, ProviderBinding, ProviderCatalog, ProviderDefinition, ProviderId,
-    ProviderModel, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, QuotaModelObservation,
+    AttemptCredentials, AuthFamily, HarnessId, LegacyRuntime, LimitsSource,
+    NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
+    ProviderConnection, ProviderDefinition, ProviderId, ProviderModel, ProviderProtocol,
+    QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, QuotaModelObservation,
     QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretRef, SelectionIntent,
 };
 
@@ -199,15 +200,22 @@ fn aliased_catalog() -> ProviderCatalog {
         id: "gpt-5.1".into(),
         native_model: None,
         params: [("effort".to_string(), "medium|high".to_string())].into(),
+        allowed_params: Default::default(),
         recommendations: vec!["general coding".into()],
         restrictions: vec![],
     };
     let make = |id: &str| ProviderDefinition {
         id: ProviderId::from_str(id).unwrap(),
         harness: HarnessId::Codex,
-        protocol_endpoint: "https://api.example.com".into(),
-        allow_loopback_http: false,
+        connection: ProviderConnection::Custom {
+            endpoint: "https://api.example.com".into(),
+            protocol: ProviderProtocol::Responses,
+            allow_loopback_http: false,
+        },
         auth_family: AuthFamily::from_str("openai").unwrap(),
+        recommendations: vec![],
+        priority_multiplier: PositiveFinite::try_from(1.0).unwrap(),
+        limits_source: LimitsSource::Native,
         models: vec![model.clone()],
         bindings: vec![ProviderBinding {
             label: "plus".parse().unwrap(),
@@ -319,18 +327,38 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         "file:///tmp/x",
         "https://user:pass@example.com",
     ] {
-        provider.protocol_endpoint = endpoint.into();
+        provider.connection = ProviderConnection::Custom {
+            endpoint: endpoint.into(),
+            protocol: ProviderProtocol::Responses,
+            allow_loopback_http: false,
+        };
         assert!(provider.validate().is_err(), "{endpoint}");
     }
-    provider.protocol_endpoint = "http://localhost:8080".into();
+    provider.connection = ProviderConnection::Custom {
+        endpoint: "http://localhost:8080".into(),
+        protocol: ProviderProtocol::Responses,
+        allow_loopback_http: false,
+    };
     assert!(provider.validate().is_err());
-    provider.allow_loopback_http = true;
+    provider.connection = ProviderConnection::Custom {
+        endpoint: "http://localhost:8080".into(),
+        protocol: ProviderProtocol::Responses,
+        allow_loopback_http: true,
+    };
     provider.validate().unwrap();
-    provider.protocol_endpoint = "http://[::1]:8080".into();
+    provider.connection = ProviderConnection::Custom {
+        endpoint: "http://[::1]:8080".into(),
+        protocol: ProviderProtocol::Responses,
+        allow_loopback_http: true,
+    };
     provider.validate().unwrap();
-    provider.protocol_endpoint = "http://example.com".into();
+    provider.connection = ProviderConnection::Custom {
+        endpoint: "http://example.com".into(),
+        protocol: ProviderProtocol::Responses,
+        allow_loopback_http: true,
+    };
     assert!(provider.validate().is_err());
-    provider.protocol_endpoint = "https://example.com".into();
+    provider.connection = ProviderConnection::Native;
     provider.auth_family = "anthropic".parse().unwrap();
     assert!(provider.validate().is_err());
 
@@ -578,7 +606,7 @@ fn launch_authority_is_serializable_but_credential_leases_are_not() {
     let mut authority = ResolvedLaunchAuthority {
         provider: ProviderId::from_str("codex-plus").unwrap(),
         harness: HarnessId::Codex,
-        protocol_endpoint: "https://api.example.com".into(),
+        connection: ProviderConnection::Native,
         model: "gpt-5.1".into(),
         effort: Some("high".into()),
         profile: "engineer".into(),

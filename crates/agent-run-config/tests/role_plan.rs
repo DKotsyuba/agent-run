@@ -84,7 +84,7 @@ Review the assigned change.\n";
     let mut authority = ResolvedLaunchAuthority {
         provider: "codex".parse().unwrap(),
         harness: agent_run_domain::HarnessId::Codex,
-        protocol_endpoint: "https://api.example.com".into(),
+        connection: agent_run_domain::ProviderConnection::Native,
         model: "gpt-5.1".into(),
         effort: None,
         profile: plan.role_name.clone(),

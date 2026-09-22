@@ -18,14 +18,13 @@
 
 use crate::{
     canonical,
-    domain::nonblank,
+    domain::{nonblank, Constraint},
     error::invalid,
     types::{AccountLabel, PositiveFinite, Sha256Digest},
     Error, Result,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr, sync::Arc};
-use url::Url;
 
 /// Validates an identifier fragment: nonempty, starts alphanumeric, continues
 /// with the established `alnum . _ -` grammar, and stays within `max` bytes.
@@ -45,7 +44,7 @@ fn identifier(label: &str, value: &str, max: usize) -> Result<()> {
 }
 
 /// The execution harness a provider binds to; exactly the two supported ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HarnessId {
     /// The Codex app-server harness.
     #[serde(rename = "codex")]
@@ -320,6 +319,7 @@ pub struct AccountRecord {
 /// Every field is explicit configuration text: ids, textual parameters, and
 /// prose recommendations. Nothing is inferred, scored, or classified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderModel {
     /// The model id callers must pass to start; never inferred.
     pub id: String,
@@ -329,12 +329,15 @@ pub struct ProviderModel {
     /// Textual request parameters such as effort choices and defaults.
     #[serde(default)]
     pub params: BTreeMap<String, String>,
+    /// Explicit accepted values for each orchestrator-selected parameter.
+    #[serde(default)]
+    pub allowed_params: BTreeMap<String, Vec<String>>,
     /// Plain-text advisory recommendations; advisory only, never scoring.
     #[serde(default)]
     pub recommendations: Vec<String>,
     /// Explicit preserved hard restrictions; enforced, not inferred.
     #[serde(default)]
-    pub restrictions: Vec<String>,
+    pub restrictions: Vec<Constraint>,
 }
 
 impl ProviderModel {
@@ -345,8 +348,38 @@ impl ProviderModel {
         if let Some(native) = &self.native_model {
             external_model_id(native)?;
         }
-        for key in self.params.keys() {
+        for (key, value) in &self.params {
             nonblank("model param key", key)?;
+            nonblank("model param value", value)?;
+        }
+        for (key, allowed) in &self.allowed_params {
+            nonblank("allowed model param", key)?;
+            if key.len() > 64
+                || allowed.is_empty()
+                || allowed.len() > 32
+                || allowed.iter().any(|value| value.trim().is_empty())
+                || allowed.iter().any(|value| value.len() > 128)
+                || allowed
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != allowed.len()
+                || self
+                    .params
+                    .get(key)
+                    .is_some_and(|value| !allowed.contains(value))
+            {
+                return Err(invalid("invalid allowed model parameters or fixed default"));
+            }
+        }
+        if self
+            .restrictions
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != self.restrictions.len()
+        {
+            return Err(invalid("model restrictions must not repeat"));
         }
         Ok(())
     }
@@ -372,6 +405,7 @@ fn multiplier_one() -> PositiveFinite {
 /// subset that must be contained in it. `multiplier` scales this binding's
 /// quota score and defaults to one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderBinding {
     /// Provider-local alias label; unique within its provider.
     pub label: AccountLabel,
@@ -381,24 +415,36 @@ pub struct ProviderBinding {
     #[serde(default)]
     pub models: Option<Vec<String>>,
     /// Positive finite quota score multiplier, defaulting to one.
-    #[serde(default = "multiplier_one")]
+    #[serde(
+        default = "multiplier_one",
+        rename = "priority_multiplier",
+        alias = "multiplier"
+    )]
     pub multiplier: PositiveFinite,
 }
 
-/// A provider: one harness, one endpoint, explicit models, account bindings.
+pub use crate::provider_connection::{LimitsSource, ProviderConnection, ProviderProtocol};
+
+/// A provider: one harness and connection, explicit models and bindings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderDefinition {
     /// Provider identity used by the start API.
     pub id: ProviderId,
     /// The single harness this provider executes through.
     pub harness: HarnessId,
-    /// Protocol endpoint the harness connects to.
-    pub protocol_endpoint: String,
-    /// Allows HTTP only for a loopback endpoint used by local fixtures.
-    #[serde(default)]
-    pub allow_loopback_http: bool,
+    /// Native login or explicit custom gateway; never an empty sentinel URL.
+    pub connection: ProviderConnection,
     /// Required account auth family; bindings must match it exactly.
     pub auth_family: AuthFamily,
+    /// Plain-text provider advice, never model scoring.
+    #[serde(default)]
+    pub recommendations: Vec<String>,
+    /// Positive finite provider ranking multiplier, default one.
+    #[serde(default = "multiplier_one")]
+    pub priority_multiplier: PositiveFinite,
+    /// Explicit collector family for quota observations.
+    pub limits_source: LimitsSource,
     /// Explicit model offerings; duplicates are rejected.
     pub models: Vec<ProviderModel>,
     /// Account alias bindings; duplicate labels are rejected.
@@ -409,22 +455,13 @@ impl ProviderDefinition {
     /// Validates self-containment: unique model ids, unique binding labels,
     /// and every declared binding model subset contained in the model set.
     pub fn validate(&self) -> Result<()> {
-        let endpoint = Url::parse(&self.protocol_endpoint)
-            .map_err(|_| invalid("invalid provider protocol endpoint"))?;
-        if endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.fragment().is_some()
-            || !(endpoint.scheme() == "https"
-                || (self.allow_loopback_http
-                    && endpoint.scheme() == "http"
-                    && matches!(
-                        endpoint.host_str(),
-                        Some("localhost" | "127.0.0.1" | "[::1]")
-                    )))
-        {
-            return Err(invalid("unsupported provider protocol endpoint"));
+        if self.models.is_empty() {
+            return Err(invalid("provider must offer at least one model"));
         }
+        for advice in &self.recommendations {
+            nonblank("provider recommendation", advice)?;
+        }
+        self.connection.validate(self.harness)?;
         if !matches!(
             (self.harness, self.auth_family.as_str()),
             (HarnessId::Codex, "openai") | (HarnessId::ClaudeCode, "anthropic")
@@ -563,6 +600,7 @@ impl<'de> Deserialize<'de> for ProviderCatalog {
     ) -> std::result::Result<Self, D::Error> {
         /// Raw wire shape; checked construction follows deserialization.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Wire {
             accounts: Vec<AccountRecord>,
             providers: Vec<ProviderDefinition>,
@@ -632,7 +670,7 @@ pub use crate::quota_snapshot::{
 /// The immutable launch authority frozen at admission, before any attempt.
 ///
 /// Everything a launch must not change across retries lives here: provider,
-/// harness, endpoint, explicit model and effort, role profile, workdir,
+/// harness, connection, explicit model and effort, role profile, workdir,
 /// a sealed operative role document, the tool-assets digest, and the frozen eligible
 /// account scope. Raw harness-native settings can never override these owned
 /// fields. Per-attempt choices deliberately do not appear here; they belong to
@@ -643,8 +681,8 @@ pub struct ResolvedLaunchAuthority {
     pub provider: ProviderId,
     /// Harness the provider binds to.
     pub harness: HarnessId,
-    /// Protocol endpoint captured from the provider definition.
-    pub protocol_endpoint: String,
+    /// Native or custom connection captured from the provider definition.
+    pub connection: ProviderConnection,
     /// The explicit model id requested and validated against the catalog.
     pub model: String,
     /// Optional textual effort, validated against model parameters.

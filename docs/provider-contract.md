@@ -8,14 +8,15 @@ them from `agent_run_domain::catalog` rather than redefining business types.
 ## C1 Catalog
 
 * Harnesses are exactly `codex` and `claude-code` (`HarnessId`).
-* A provider (`ProviderDefinition`) binds one harness, one protocol endpoint,
-  one auth family, an explicit model list, and account bindings. Provider ids
-  are arbitrary within the identifier grammar. Endpoints require HTTPS; an
-  explicit provider flag allows HTTP only for loopback fixtures. URL userinfo,
+* A provider (`ProviderDefinition`) binds one harness, one native or custom
+  connection, one auth family, an explicit model list, and account bindings.
+  Provider ids are arbitrary within the identifier grammar. Custom endpoints
+  require HTTPS; an explicit custom-connection flag allows HTTP only for
+  loopback fixtures. URL userinfo,
   fragments, unsupported schemes, and harness/auth-family mismatches fail
   validation.
-* Provider models are explicit: model id, optional native model, textual
-  parameters (e.g. effort choices), plain-text recommendations, and explicit
+* Provider models are explicit: model id, optional native model, fixed textual
+  settings, allowed parameter values, plain-text recommendations, and typed
   preserved restrictions. There is no model intelligence, classification, or
   scoring in the catalog.
 * A registered account (`AccountRecord`) has an immutable global opaque
@@ -40,7 +41,7 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
 ## C2 Authority versus attempt lease
 
 * `ResolvedLaunchAuthority` is the immutable authority frozen at admission:
-  provider, harness, protocol endpoint, explicit model and effort, profile,
+  provider, harness, native/custom connection, explicit model and effort, profile,
   workdir, canonical resolved role payload, required tool-assets digest, and
   frozen eligible account scope. The payload carries the operative prompt,
   write/network/read grants, skill and MCP permissions, and required
