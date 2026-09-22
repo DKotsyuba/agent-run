@@ -1051,6 +1051,54 @@ async fn test_transcript_text_streams_fragments_across_pages() {
     assert_eq!(*text.lock().unwrap(), "Hello world\n");
 }
 
+/// Proves the Claude producer's journal identity renders two streamed messages
+/// as distinct rows: fragments plus completion tail join per message, distinct
+/// messages never merge, and the full text is never doubled.
+///
+/// The pages mirror the durable rows the core producer test
+/// `partial_fragments_and_tails_share_identity_per_message` journals for two
+/// native messages.
+#[tokio::test]
+async fn test_transcript_text_renders_two_claude_messages_distinctly() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let text = Arc::new(Mutex::new(String::new()));
+    let row = |seq: i64, content: &str, raw_ref: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":raw_ref});
+    agent_run::cli::run_with(
+        parse(&[
+            "transcript",
+            AGENT_ID,
+            "--limit",
+            "3",
+            "--follow",
+            "--format",
+            "text",
+        ]),
+        text_dependencies(
+            Arc::new(FakeService::new(
+                vec![
+                    (
+                        0,
+                        json!({"messages":[
+                            row(1,"first ","msg_one"),
+                            row(2,"message","msg_one"),
+                            row(3,"second","msg_two")
+                        ],"complete":false}),
+                    ),
+                    (
+                        3,
+                        json!({"messages":[row(4," message","msg_two")],"complete":true}),
+                    ),
+                ],
+                true,
+            )),
+            text.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*text.lock().unwrap(), "first message\nsecond message\n");
+}
+
 /// Proves escape sequences split across polling pages never leak payload.
 #[tokio::test]
 async fn test_transcript_text_consumes_escape_splits_across_pages() {

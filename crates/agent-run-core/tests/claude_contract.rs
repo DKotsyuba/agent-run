@@ -210,6 +210,15 @@ fn claude_launch_is_explicitly_scoped_without_secret_argv() {
     assert!(flag(&plan, "--tools").contains("Read"));
     assert!(!flag(&plan, "--tools").contains("Bash"));
     assert!(!plan.args.iter().any(|arg| arg.contains("fixture-secret")));
+    // Partial streaming events carry the per-message transcript identity.
+    assert_eq!(
+        plan.args
+            .iter()
+            .filter(|arg| *arg == "--include-partial-messages")
+            .count(),
+        1,
+        "the legacy CLI plan must request partial messages exactly once"
+    );
     assert!(plan
         .initial_input
         .expect("Claude input")
@@ -337,6 +346,10 @@ fn adapters_pass_exact_native_resume_selector_to_process() {
                 .count(),
             1,
             "{adapter} must select the session exactly once"
+        );
+        assert!(
+            plan.args.contains(&"--include-partial-messages".to_owned()),
+            "{adapter} shares the Claude-family partial-message streaming flag"
         );
     }
 }
