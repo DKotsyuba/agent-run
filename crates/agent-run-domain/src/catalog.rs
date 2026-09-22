@@ -434,20 +434,40 @@ pub use crate::provider_connection::{
     CredentialHeader, LimitsSource, ProviderConnection, ProviderProtocol,
 };
 
-/// Explicit binding of a Lua limits source to one first-party collector.
+/// Explicit binding of a Lua limits source to one collector.
 ///
 /// `script` names a first-party collector identity the capacity side resolves
-/// through its own registry; it is never inferred from a provider name.
-/// `origins` are the exact credential-bearing origins the collector may
-/// request: HTTPS in production, plain HTTP only for explicit loopback
-/// fixtures, and never userinfo, fragments, queries, or paths.
+/// through its own registry, or a caller-chosen identity for a configured
+/// custom script; it is never inferred from a provider name. `origins` are
+/// the exact credential-bearing origins the collector may request: HTTPS in
+/// production, plain HTTP only for explicit loopback fixtures, and never
+/// userinfo, fragments, queries, or paths. A custom `script_file` supplies
+/// the Lua bytes for a non-first-party identity; `auth` selects the
+/// credential placement for such a custom script (first-party collectors
+/// fix their own placement and reject overrides).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorBinding {
-    /// First-party collector script identity, e.g. `glm_quota`.
+    /// Collector script identity, e.g. `glm_quota` or a custom name.
     pub script: String,
     /// Exact requestable origins; never empty and never a credential.
     pub origins: Vec<String>,
+    /// Absolute path of a custom Lua collector script; never a credential.
+    #[serde(default)]
+    pub script_file: Option<std::path::PathBuf>,
+    /// Credential placement for a custom script; raw by default.
+    #[serde(default)]
+    pub auth: Option<CredentialPlacement>,
+}
+
+/// Where a custom collector's credential is placed on allowed requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialPlacement {
+    /// `Authorization: <token>` exactly as stored.
+    RawAuthorization,
+    /// `Authorization: Bearer <token>`.
+    BearerAuthorization,
 }
 
 impl CollectorBinding {
@@ -465,6 +485,17 @@ impl CollectorBinding {
         }
         if self.origins.is_empty() || self.origins.len() > 8 {
             return Err(invalid("collector needs one to eight origins"));
+        }
+        if let Some(file) = &self.script_file {
+            if !file.is_absolute()
+                || file.components().count() > 32
+                || file.as_os_str().len().saturating_add(self.script.len()) > 512
+                || self.auth.is_none()
+            {
+                return Err(invalid(
+                    "custom collector scripts need an absolute bounded path and an explicit auth placement",
+                ));
+            }
         }
         for origin in &self.origins {
             let url = url::Url::parse(origin).map_err(|_| invalid("invalid collector origin"))?;

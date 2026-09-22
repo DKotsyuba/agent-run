@@ -94,6 +94,8 @@ fn mappings() -> BTreeMap<String, RuntimeMapping> {
                 collector: Some(CollectorBinding {
                     script: "glm_quota".into(),
                     origins: vec!["https://gateway.example".into()],
+                    script_file: None,
+                    auth: None,
                 }),
                 native_models: BTreeMap::from([("glm-5.3".into(), "glm-5.3[1m]".into())]),
                 model_restrictions: BTreeMap::new(),

@@ -255,6 +255,9 @@ pub enum QuotaHttpError {
     /// Script tried to set an auth or routing-control header; placement is
     /// Rust-owned configuration.
     HeaderForbidden,
+    /// Endpoint signalled throttling (429/503); carries the parsed bounded
+    /// `retry-after` horizon in seconds when the endpoint supplied one.
+    RateLimited,
 }
 
 impl fmt::Display for QuotaHttpError {
@@ -267,6 +270,7 @@ impl fmt::Display for QuotaHttpError {
             Self::BodyTooLarge => "body_too_large",
             Self::Transport => "transport",
             Self::HeaderForbidden => "header_forbidden",
+            Self::RateLimited => "rate_limited",
         };
         f.write_str(name)
     }
@@ -519,6 +523,9 @@ pub enum CollectorError {
     ScriptTampered,
     /// HTTP failure with its static category.
     Http(QuotaHttpError),
+    /// Endpoint throttled the round (429/503); carries the parsed bounded
+    /// `retry-after` horizon in seconds when the endpoint supplied one.
+    RateLimited(Option<u64>),
     /// Output was not a `{windows=...}` table.
     MalformedOutput,
     /// Output failed validation; carries the stable domain rejection code.
@@ -538,6 +545,7 @@ impl fmt::Display for CollectorError {
             Self::ScriptFailed => f.write_str("quota_collector_script_failed"),
             Self::ScriptTampered => f.write_str("quota_collector_script_tampered"),
             Self::Http(error) => write!(f, "quota_collector_http_{error}"),
+            Self::RateLimited(_) => f.write_str("quota_collector_rate_limited"),
             Self::MalformedOutput => f.write_str("quota_collector_output_malformed"),
             Self::InvalidOutput(code) => write!(f, "quota_collector_output_invalid_{code}"),
             Self::Internal(code) => write!(f, "quota_collector_internal_{code}"),
@@ -718,6 +726,35 @@ impl HttpState {
             }
         }
         out
+    }
+
+    /// Returns the bounded numeric `retry-after` seconds a throttled
+    /// response declared, or `None` when absent, unparseable, or over the
+    /// hard ceiling. Header names are already lowercased.
+    fn retry_after_seconds(response: &QuotaHttpResponse) -> Option<u64> {
+        let raw = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "retry-after")
+            .map(|(_, value)| value.trim())?;
+        let seconds: u64 = raw.parse().ok()?;
+        (seconds > 0 && seconds <= 900).then_some(seconds)
+    }
+
+    /// Classifies one completed response: throttled statuses become the
+    /// typed rate-limit category — with the parsed horizon carried in the
+    /// static sentinel text, never raw headers — instead of a
+    /// script-visible response table.
+    fn throttle(response: &QuotaHttpResponse) -> Option<mlua::Error> {
+        matches!(response.status, 429 | 503).then(|| {
+            let horizon = Self::retry_after_seconds(response);
+            mlua::Error::RuntimeError(format!(
+                "{HTTP_SENTINEL}rate_limited:{}",
+                horizon
+                    .map(|seconds| seconds.to_string())
+                    .unwrap_or_default()
+            ))
+        })
     }
 }
 
@@ -936,6 +973,11 @@ async fn invoke(
                     .map_err(|error| {
                         mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}{error}"))
                     })?;
+                    // Throttled responses never reach Lua: the typed category
+                    // with its parsed horizon is the only observable fact.
+                    if let Some(error) = HttpState::throttle(&response) {
+                        return Err(error);
+                    }
                     let location = if (301..=308).contains(&response.status) {
                         response
                             .headers
@@ -1178,6 +1220,18 @@ fn map_lua_error(error: mlua::Error) -> CollectorError {
         CollectorError::InstructionLimit
     } else if text.contains(WALL_SENTINEL) {
         CollectorError::Timeout
+    } else if let Some(horizon) = text
+        .split(HTTP_SENTINEL)
+        .nth(1)
+        .and_then(|rest| rest.strip_prefix("rate_limited:"))
+        .and_then(|digits| {
+            digits
+                .split(|c: char| c.is_whitespace() || c == ':' || c == '"')
+                .next()
+        })
+        .and_then(|digits| digits.parse::<u64>().ok())
+    {
+        CollectorError::RateLimited((1..=900).contains(&horizon).then_some(horizon))
     } else if let Some(category) = text
         .split(HTTP_SENTINEL)
         .nth(1)
@@ -1205,6 +1259,7 @@ fn parse_http_category(name: &str) -> Option<QuotaHttpError> {
         "body_too_large" => Some(QuotaHttpError::BodyTooLarge),
         "transport" => Some(QuotaHttpError::Transport),
         "header_forbidden" => Some(QuotaHttpError::HeaderForbidden),
+        "rate_limited" => Some(QuotaHttpError::RateLimited),
         _ => None,
     }
 }

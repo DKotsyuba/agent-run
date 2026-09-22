@@ -112,34 +112,62 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
 * A provider with `limits_source = "lua"` must bind an explicit
   `CollectorBinding` — a first-party script identity (`glm_quota`,
   `anthropic_usage`) plus one to eight exact origins (HTTPS, or plain HTTP
-  only for loopback fixtures; never userinfo, fragments, queries, or paths).
-  Validation is part of the provider contract: a Lua source without a
-  binding, a binding without the Lua source, and unknown origin spellings
-  are all rejected. A script or credential identity is never inferred from
-  a provider's name, and an unknown script identity surfaces as the typed
-  `collector_unknown` round failure.
-* One round collects once per `(global account, collector)` regardless of
-  how many provider labels bind the account: aliases denote one physical
+  only for loopback fixtures; never userinfo, fragments, queries, or
+  paths), and optionally an absolute `script_file` plus an explicit `auth`
+  placement for a provider-specific custom Lua script. Validation is part
+  of the provider contract: a Lua source without a binding, a binding
+  without the Lua source, unknown origin spellings, and a custom script
+  without an explicit placement are all rejected. A script or credential
+  identity is never inferred from a provider's name; an unknown script
+  identity surfaces as the typed `collector_unknown` round failure, and a
+  first-party identity cannot be overridden by a script file. Custom
+  scripts install through the retained-script registry: a replacement is
+  installed only when it verifies and compiles, so a bad file edit never
+  displaces the last valid revision, and script files carry no
+  credentials.
+* Every alias of one `(global account, script)` must declare the exact
+  same binding; a contradiction is rejected during planning, before any
+  credential access or network request, in either declaration order. One
+  round collects once per `(global account, collector)` regardless of how
+  many provider labels bind the account: aliases denote one physical
   account, so they never duplicate remote requests or fork pools. The
-  model set is the union of each bound provider's
-  `native_model.unwrap_or(id)` spellings and is the exhaustive membership
-  a script may report.
+  model set is the union of each enabled eligible binding's effective
+  model subset (its own subset, else the provider's full set), keyed by
+  each model's `native_model.unwrap_or(id)` spelling, and is the
+  exhaustive membership a script may report.
 * Credentials come only from the account registry's protected reference
-  through the native `CredentialReader`: environment, private file, and
-  Keychain stores resolve at request time; native and named harness logins
-  are refused (`native login remains owned by the harness`) and never
-  become exportable quota tokens. Resolved bytes go straight into the
-  redacted `AuthCapability` — never configuration, reports, or the store.
-  GLM quota uses `RawAuthorization` (the quota endpoint is not the
-  inference gateway's Bearer form); Anthropic OAuth uses
-  `BearerAuthorization` plus the script-supplied `anthropic-beta` header.
-* Failures apply a bounded exponential backoff keyed by
-  `(account, collector source)` — 60 s doubling to a 900 s ceiling, shared
-  across every alias — and a success clears it. Suppressed rounds issue no
-  remote request and leave previous samples and the durable exhaustion
-  latch untouched. All network and credential work happens outside every
-  database transaction; persistence runs through
-  `record_quota_snapshot` only after a round fully succeeds.
+  through the quota-side `QuotaCredentialReader`: environment, private
+  file, and Keychain stores resolve at request time exactly as the shared
+  system reader does; native and named **Claude** logins resolve through
+  the Claude harness's own OAuth store (its credentials file, else the
+  service-keyed Keychain item) and only inside Rust; native Codex logins
+  are refused because Codex quota travels through app-server metadata.
+  The generic custom-gateway reader keeps its own native refusal
+  unchanged. Resolved bytes go straight into the redacted
+  `AuthCapability` — never configuration, reports, or the store. GLM quota
+  uses `RawAuthorization` (the quota endpoint is not the inference
+  gateway's Bearer form); Anthropic OAuth uses `BearerAuthorization` plus
+  the script-supplied `anthropic-beta` header.
+* Failures apply a bounded backoff keyed by `(account, collector source)`
+  — 60 s doubling to a 900 s ceiling, an endpoint-declared `retry-after`
+  horizon overriding the exponential default within the same cap — shared
+  across every alias. Throttled statuses (429/503) never reach Lua: the
+  engine classifies them typed with the parsed bounded horizon carried on
+  the error, never raw headers. The ledger is durable in
+  `capacity/backoff.json` under the agent-run home, so suppression
+  survives the process boundary between launchd polling rounds.
+  Suppressed rounds issue no remote request and leave previous samples
+  and the durable exhaustion latch untouched. All network and credential
+  work happens outside every database transaction; persistence runs
+  through `record_quota_snapshot` only after a round fully succeeds.
+* The polling path dispatches on schema: `capacity collect` runs the
+  account-scoped provider sources (Lua units plus Codex app-server units)
+  for a schema-v2 home, and the legacy per-runtime path otherwise.
+  CodexAppserver providers produce the same explicit account/pool
+  observations through `account/rateLimits/read` per bound label — reusing
+  the verified isolated probe and cleanup contract — normalized by the
+  same closed version-1 validation and keyed by the registered
+  `AccountId`, which is what provider ranking consumes.
 
 ## First-party collectors
 
@@ -153,12 +181,19 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   contract establishes no weekly or reset fields and none are invented.
 * `anthropic_usage` (source identity `anthropic-usage`) calls
   `GET {origin}/api/oauth/usage` with the Bearer capability and the
-  `anthropic-beta: oauth-2025-04-20` header. It ports the **recorded**
-  envelope (`limits[]` of `kind`/`percent`, optional RFC 3339 `resets_at`;
-  `session` → `primary`/`five_hour`, weekly kinds →
-  `secondary`/`seven_day`). That envelope has not been re-verified against
-  a live endpoint; a contract drift surfaces as the engine's typed failure
-  categories, never as invented windows.
+  `anthropic-beta: oauth-2025-04-20` header. Only kinds with a recorded
+  contract are reported: `session` → `primary`/`five_hour` and
+  `weekly_all` → `secondary`/`seven_day`. Model-scoped weekly kinds and
+  every unknown kind are ignored — an all-model pool for them would
+  invent governing quota — and a payload with no known kind fails typed.
+  The live envelope has not been re-verified against a live endpoint; a
+  contract drift surfaces as the engine's typed failure categories, never
+  as invented windows.
 * Live-contract evidence is tracked separately from these fixture-verified
   paths: the GLM field names come from the official plugin source; the
-  Anthropic live schema remains an open verification gate.
+  Anthropic live schema remains an open verification gate. The
+  credential-safe canary `cargo run -p agent-run-core --bin quota_canary --
+  <glm|anthropic> [origin|claude_home]` performs one real read-only
+  request against an approved account and prints only normalized facts
+  (status, typed failure, bounded retry-after, top-level keys, limits
+  field names and kinds) — never tokens, bodies, or headers.

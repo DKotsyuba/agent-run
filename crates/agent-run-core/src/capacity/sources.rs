@@ -76,7 +76,8 @@ fn timestamp(v: Option<&Value>) -> Option<f64> {
         .map(|d| d.timestamp_millis() as f64 / 1000.0)
         .filter(|v| *v >= 0.0)
 }
-fn window_name(minutes: f64) -> String {
+/// Maps one app-server window duration to its stable window name.
+pub fn window_name(minutes: f64) -> String {
     if minutes == 300.0 {
         "five_hour".into()
     } else if minutes == 10080.0 {
@@ -1022,6 +1023,14 @@ async fn omniroute(name: &str) -> Result<Slice> {
     Ok(slice_from_samples(name, name, samples, topology, 0.0))
 }
 pub async fn collect(home: &Path) -> Result<Value> {
+    // A schema-v2 home runs the account-scoped provider sources exclusively:
+    // the launchd polling path lands here every round, and its durable
+    // backoff ledger under `capacity/backoff.json` survives the process
+    // boundary between rounds.
+    if let Ok((provider_config, _)) = agent_run_config::provider_config::ProviderConfig::load(home)
+    {
+        return super::collectors::collect_providers(home, &provider_config).await;
+    }
     let config = Config::load(home)?;
     let started = now();
     let mut results = Vec::new();

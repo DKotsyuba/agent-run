@@ -125,6 +125,8 @@ fn lua_provider(
         collector: Some(CollectorBinding {
             script: script.to_owned(),
             origins: vec![format!("{origin}/")],
+            script_file: None,
+            auth: None,
         }),
         models: vec![ProviderModel {
             id: model.0.to_owned(),
@@ -163,6 +165,11 @@ fn limits() -> CollectorLimits {
         http_request_timeout: Duration::from_secs(2),
         ..CollectorLimits::default()
     }
+}
+
+/// The host clock, for horizon assertions.
+fn now_epoch() -> f64 {
+    agent_run_core::domain::now()
 }
 
 /// Official-shape GLM quota payload: data root, limits, TOKENS_LIMIT/TIME_LIMIT.
@@ -619,7 +626,10 @@ async fn unknown_collector_script_is_a_typed_failure() {
     .await
     .unwrap();
     assert!(!report["ok"].as_bool().unwrap());
-    assert_eq!(report["results"][0]["issues"][0], "collector_unknown");
+    assert_eq!(
+        report["results"][0]["issues"][0],
+        "quota_collector_output_invalid_collector_unknown"
+    );
     assert!(first_party("anthropic_usage").is_some());
 }
 
@@ -658,4 +668,343 @@ async fn malformed_payloads_fail_typed_without_persisting() {
         "quota_collector_script_failed"
     );
     assert!(stored(home.path(), "acct-glm").is_empty());
+}
+
+/// Contradictory alias bindings are rejected before credential or network
+/// use, regardless of declaration order.
+#[tokio::test]
+async fn contradictory_alias_bindings_are_rejected_in_either_order() {
+    let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
+    let bound = account("acct-glm");
+    for providers in [
+        vec![
+            lua_provider(
+                "glm-a",
+                "glm_quota",
+                "https://a.example",
+                ("m", None),
+                &bound,
+            ),
+            lua_provider(
+                "glm-b",
+                "glm_quota",
+                "https://b.example",
+                ("m", None),
+                &bound,
+            ),
+        ],
+        vec![
+            lua_provider(
+                "glm-b",
+                "glm_quota",
+                "https://b.example",
+                ("m", None),
+                &bound,
+            ),
+            lua_provider(
+                "glm-a",
+                "glm_quota",
+                "https://a.example",
+                ("m", None),
+                &bound,
+            ),
+        ],
+    ] {
+        let catalog = catalog(providers, &accounts);
+        let client = FakeHttp::new(vec![]);
+        let mut backoff = AccountBackoff::default();
+        let error = collect_provider_quota(
+            tempdir().unwrap().path(),
+            &catalog,
+            64,
+            &limits(),
+            client.clone(),
+            &FakeReader,
+            &mut backoff,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("contradictory collector bindings"));
+        assert_eq!(client.issued(), 0, "rejected before any request");
+    }
+}
+
+/// Eligible binding model subsets union across aliases; a disabled account's
+/// bindings contribute nothing.
+#[tokio::test]
+async fn binding_subsets_union_across_aliases() {
+    let home = tempdir().unwrap();
+    let accounts = [
+        ("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN"),
+        ("acct-off", "anthropic", "env:GLM_OFF_TOKEN"),
+    ];
+    registered(home.path(), &accounts);
+    let bound = account("acct-glm");
+    let mut subset_provider = lua_provider(
+        "glm-a",
+        "glm_quota",
+        "https://open.bigmodel.cn",
+        ("alias-only", None),
+        &bound,
+    );
+    subset_provider.models.push(ProviderModel {
+        id: "unused".into(),
+        native_model: None,
+        params: Default::default(),
+        allowed_params: Default::default(),
+        recommendations: vec![],
+        restrictions: vec![],
+    });
+    subset_provider.bindings[0].models = Some(vec!["alias-only".into()]);
+    let catalog = catalog(
+        vec![
+            subset_provider,
+            lua_provider(
+                "glm-b",
+                "glm_quota",
+                "https://open.bigmodel.cn",
+                ("inherit", None),
+                &bound,
+            ),
+        ],
+        &accounts,
+    );
+    let client = FakeHttp::new(vec![response(200, &glm_payload(10.0))]);
+    let mut backoff = AccountBackoff::default();
+    let report = collect_provider_quota(
+        home.path(),
+        &catalog,
+        64,
+        &limits(),
+        client.clone(),
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap();
+    assert!(report["ok"].as_bool().unwrap());
+    let conn = Connection::open(home.path().join("state.db")).unwrap();
+    let membership: String = conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE account_id='acct-glm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(membership.contains("alias-only") && membership.contains("inherit"));
+    assert!(
+        !membership.contains("unused"),
+        "a non-subset provider model never enters the union"
+    );
+}
+
+/// An endpoint Retry-After horizon is respected across aliases and rounds.
+#[tokio::test]
+async fn retry_after_horizon_suppresses_later_rounds() {
+    let home = tempdir().unwrap();
+    let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
+    registered(home.path(), &accounts);
+    let bound = account("acct-glm");
+    let catalog = catalog(
+        vec![
+            lua_provider(
+                "glm-a",
+                "glm_quota",
+                "https://open.bigmodel.cn",
+                ("m", None),
+                &bound,
+            ),
+            lua_provider(
+                "glm-b",
+                "glm_quota",
+                "https://open.bigmodel.cn",
+                ("m", None),
+                &bound,
+            ),
+        ],
+        &accounts,
+    );
+    let throttled = QuotaHttpResponse {
+        status: 429,
+        headers: vec![("retry-after".into(), "120".into())],
+        body: Vec::new(),
+    };
+    let client = FakeHttp::new(vec![throttled]);
+    let mut backoff = AccountBackoff::default();
+    let first = collect_provider_quota(
+        home.path(),
+        &catalog,
+        64,
+        &limits(),
+        client.clone(),
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first["results"][0]["issues"][0],
+        "quota_collector_rate_limited"
+    );
+    assert!(backoff.suppressed(&bound, "glm-quota", now_epoch() + 60.0));
+    let second = collect_provider_quota(
+        home.path(),
+        &catalog,
+        64,
+        &limits(),
+        client.clone(),
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second["results"][0]["issues"][0], "backoff");
+    assert_eq!(client.issued(), 1, "aliases shared the suppression");
+}
+
+/// A credential reader echoing secret text cannot reach the round report.
+#[tokio::test]
+async fn reader_errors_never_carry_secret_text() {
+    struct LeakyReader;
+    impl CredentialReader for LeakyReader {
+        fn read(&self, _reference: &CredentialRef) -> agent_run_domain::Result<String> {
+            Err(agent_run_domain::Error::Validation(format!(
+                "boom: {GLM_SECRET}"
+            )))
+        }
+    }
+    let home = tempdir().unwrap();
+    let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
+    registered(home.path(), &accounts);
+    let catalog = catalog(
+        vec![lua_provider(
+            "glm-main",
+            "glm_quota",
+            "https://open.bigmodel.cn",
+            ("glm-5.3", None),
+            &account("acct-glm"),
+        )],
+        &accounts,
+    );
+    let client = FakeHttp::new(vec![]);
+    let mut backoff = AccountBackoff::default();
+    let report = collect_provider_quota(
+        home.path(),
+        &catalog,
+        64,
+        &limits(),
+        client,
+        &LeakyReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap();
+    let text = report.to_string();
+    assert!(
+        !text.contains(GLM_SECRET),
+        "report leaked reader text: {text}"
+    );
+    assert!(text.contains("credential_unavailable"));
+}
+
+/// The durable ledger survives the process boundary between polling rounds.
+#[tokio::test]
+async fn backoff_ledger_survives_restart_and_suppresses_real_rounds() {
+    let home = tempdir().unwrap();
+    let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
+    registered(home.path(), &accounts);
+    let catalog = catalog(
+        vec![lua_provider(
+            "glm-main",
+            "glm_quota",
+            "https://open.bigmodel.cn",
+            ("glm-5.3", None),
+            &account("acct-glm"),
+        )],
+        &accounts,
+    );
+    // Round one fails in a "previous process" and persists its ledger.
+    let client = FakeHttp::new(vec![]);
+    let mut backoff = AccountBackoff::default();
+    collect_provider_quota(
+        home.path(),
+        &catalog,
+        64,
+        &limits(),
+        client.clone(),
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap();
+    backoff.save(home.path(), 0.0).unwrap();
+    // A fresh process loads the ledger and skips the remote request.
+    let mut restored = AccountBackoff::load(home.path());
+    let client2 = FakeHttp::new(vec![]);
+    let report = collect_provider_quota(
+        home.path(),
+        &catalog,
+        64,
+        &limits(),
+        client2.clone(),
+        &FakeReader,
+        &mut restored,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report["results"][0]["issues"][0], "backoff");
+    assert_eq!(client2.issued(), 0);
+}
+
+/// The polling entry dispatches a schema-v2 home to the provider sources.
+#[tokio::test]
+async fn polling_round_dispatches_v2_homes_to_provider_sources() {
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            r#"
+schema_version = 2
+[harnesses.codex]
+binary = "/bin/true"
+home = "{home}/codex"
+[harnesses.claude-code]
+binary = "/bin/true"
+home = "{home}/claude"
+[providers.glm]
+harness = "claude-code"
+connection = {{ kind = "custom", endpoint = "https://open.bigmodel.cn/api", protocol = "messages" }}
+auth_family = "anthropic"
+limits_source = "lua"
+collector = {{ script = "glm_quota", origins = ["https://open.bigmodel.cn"] }}
+[[providers.glm.models]]
+id = "glm-5.3"
+[[providers.glm.bindings]]
+label = "main"
+account = "acct-glm"
+"#,
+            home = home.path().display()
+        ),
+    )
+    .unwrap();
+    let mut store = agent_run_store::Store::initialize(home.path()).unwrap();
+    store
+        .register_account(&AccountRecord {
+            account_id: account("acct-glm"),
+            auth_family: AuthFamily::from_str("anthropic").unwrap(),
+            secret_ref: "env:GLM_QUOTA_TOKEN".parse().unwrap(),
+            status: AccountStatus::Enabled,
+        })
+        .unwrap();
+    let report = agent_run_core::capacity::sources::collect(home.path())
+        .await
+        .unwrap();
+    let row = &report["results"][0];
+    assert_eq!(row["account"], "acct-glm");
+    assert_eq!(row["source"], "glm-quota");
+    // Whether the live endpoint answers depends on the host; the dispatch
+    // itself is the contract under test.
+    assert!(row["status"].is_string());
 }
