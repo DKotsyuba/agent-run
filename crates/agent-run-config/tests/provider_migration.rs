@@ -6,7 +6,7 @@ use agent_run_config::{
     provider_migration::{plan_v1, RuntimeMapping},
 };
 use agent_run_domain::catalog::{
-    decode_legacy_request, AccountRecord, AccountStatus, HarnessId, LimitsSource,
+    decode_legacy_request, AccountRecord, AccountStatus, CollectorBinding, HarnessId, LimitsSource,
     ProviderConnection, ProviderProtocol,
 };
 use serde_json::json;
@@ -71,6 +71,7 @@ fn mappings() -> BTreeMap<String, RuntimeMapping> {
                 connection: ProviderConnection::Native,
                 auth_family: "openai".parse().unwrap(),
                 limits_source: LimitsSource::CodexAppserver,
+                collector: None,
                 native_models: BTreeMap::from([("gpt".into(), "gpt-native".into())]),
                 model_restrictions: BTreeMap::new(),
                 global_account: "acct-main".parse().unwrap(),
@@ -90,6 +91,10 @@ fn mappings() -> BTreeMap<String, RuntimeMapping> {
                 },
                 auth_family: "anthropic".parse().unwrap(),
                 limits_source: LimitsSource::Lua,
+                collector: Some(CollectorBinding {
+                    script: "glm_quota".into(),
+                    origins: vec!["https://gateway.example".into()],
+                }),
                 native_models: BTreeMap::from([("glm-5.3".into(), "glm-5.3[1m]".into())]),
                 model_restrictions: BTreeMap::new(),
                 global_account: "acct-glm".parse().unwrap(),

@@ -725,7 +725,10 @@ impl HttpState {
 ///
 /// `scope` supplies the persistence runtime, the collector source identity
 /// (never script-chosen), and the configured models; `models` carries each
-/// model's nonsecret configuration value into `ctx.models`. The script must
+/// model's nonsecret configuration value into `ctx.models`; `origin` is the
+/// single Rust-chosen request origin exposed as `ctx.origin`, which must name
+/// exactly one of `auth`'s validated origins so a script never discovers or
+/// widens the credential allowlist. The script must
 /// define `collect(ctx)` and return `{windows = {...}}` in version-1 shape;
 /// the result is normalized and validated against `scope` before returning.
 /// Fresh failures are typed [`CollectorError`] categories with static text.
@@ -740,6 +743,7 @@ pub async fn run_collector(
     limits: &CollectorLimits,
     client: Arc<dyn QuotaHttpClient>,
     auth: &AuthCapability,
+    origin: &str,
 ) -> std::result::Result<NormalizedQuotaSnapshot, CollectorError> {
     if script.source.as_bytes().starts_with(b"\x1bLua") {
         return Err(CollectorError::BytecodeRejected);
@@ -765,9 +769,15 @@ pub async fn run_collector(
         AllowedOrigin::new(&origin.scheme, &origin.host, origin.port)
             .map_err(|_| CollectorError::Internal("origins"))?;
     }
+    if !auth.origins().iter().any(|allowed| allowed.allows(origin)) {
+        return Err(CollectorError::Internal("origin"));
+    }
+    // Scripts concatenate paths onto `ctx.origin`; Lua has no string library,
+    // so Rust normalizes the trailing slash they would otherwise duplicate.
+    let origin = origin.trim_end_matches('/');
     let deadline = Instant::now() + limits.invocation_timeout;
     let work = invoke(
-        script, scope, account, models, host_now, limits, client, auth, deadline,
+        script, scope, account, models, host_now, limits, client, auth, origin, deadline,
     );
     match tokio::time::timeout_at(deadline.into(), work).await {
         Ok(result) => result,
@@ -786,6 +796,7 @@ async fn invoke(
     limits: &CollectorLimits,
     client: Arc<dyn QuotaHttpClient>,
     auth: &AuthCapability,
+    origin: &str,
     deadline: Instant,
 ) -> std::result::Result<NormalizedQuotaSnapshot, CollectorError> {
     let lua = Lua::new_with(StdLib::NONE, LuaOptions::new())
@@ -1040,6 +1051,10 @@ async fn invoke(
     ctx.set("models", models_table)
         .map_err(|_| CollectorError::Internal("context"))?;
     ctx.set("now", host_now)
+        .map_err(|_| CollectorError::Internal("context"))?;
+    // The one Rust-chosen request origin; the engine re-checks every script
+    // request against the capability's full validated allowlist anyway.
+    ctx.set("origin", origin)
         .map_err(|_| CollectorError::Internal("context"))?;
     // Opaque capability marker: no method, no secret, nothing to extract.
     let auth_marker = lua

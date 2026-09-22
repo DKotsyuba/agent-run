@@ -1,7 +1,7 @@
 # Quota collectors
 
 Public semantics of the physical quota observation layer and the embedded
-Lua collector engine (`agent_run_core::capacity::{quota,lua}`,
+Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
 `agent_run_store::quota`).
 
 ## Observation layer (`capacity::quota`, `agent_run_store::quota`)
@@ -101,3 +101,64 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua}`,
   both verify and compile in text mode inside a bounded throwaway VM before
   it can displace it. The presence and contract of `collect` are enforced
   per invocation.
+* `ctx.origin` is the single Rust-chosen request origin, validated against
+  the capability's origin allowlist before the VM starts and normalized of
+  its trailing slash (Lua has no string library to do that itself). Scripts
+  concatenate endpoint paths onto it; every request still re-authorizes
+  against the full allowlist and budget.
+
+## Account-scoped driver (`capacity::collectors`)
+
+* A provider with `limits_source = "lua"` must bind an explicit
+  `CollectorBinding` — a first-party script identity (`glm_quota`,
+  `anthropic_usage`) plus one to eight exact origins (HTTPS, or plain HTTP
+  only for loopback fixtures; never userinfo, fragments, queries, or paths).
+  Validation is part of the provider contract: a Lua source without a
+  binding, a binding without the Lua source, and unknown origin spellings
+  are all rejected. A script or credential identity is never inferred from
+  a provider's name, and an unknown script identity surfaces as the typed
+  `collector_unknown` round failure.
+* One round collects once per `(global account, collector)` regardless of
+  how many provider labels bind the account: aliases denote one physical
+  account, so they never duplicate remote requests or fork pools. The
+  model set is the union of each bound provider's
+  `native_model.unwrap_or(id)` spellings and is the exhaustive membership
+  a script may report.
+* Credentials come only from the account registry's protected reference
+  through the native `CredentialReader`: environment, private file, and
+  Keychain stores resolve at request time; native and named harness logins
+  are refused (`native login remains owned by the harness`) and never
+  become exportable quota tokens. Resolved bytes go straight into the
+  redacted `AuthCapability` — never configuration, reports, or the store.
+  GLM quota uses `RawAuthorization` (the quota endpoint is not the
+  inference gateway's Bearer form); Anthropic OAuth uses
+  `BearerAuthorization` plus the script-supplied `anthropic-beta` header.
+* Failures apply a bounded exponential backoff keyed by
+  `(account, collector source)` — 60 s doubling to a 900 s ceiling, shared
+  across every alias — and a success clears it. Suppressed rounds issue no
+  remote request and leave previous samples and the durable exhaustion
+  latch untouched. All network and credential work happens outside every
+  database transaction; persistence runs through
+  `record_quota_snapshot` only after a round fully succeeds.
+
+## First-party collectors
+
+* `glm_quota` (source identity `glm-quota`) follows the official
+  `glm-plan-usage` contract: `GET {origin}/api/monitor/usage/quota/limit`,
+  payload root `data` when present else the top-level object, `limits[]`
+  entries with `type` and `percentage`. `TOKENS_LIMIT.percentage` is the
+  five-hour token usage and is reported as the remaining share of one
+  `primary` pool's `five_hour` window. `TIME_LIMIT` is monthly MCP usage
+  and does not govern inference quota, so it is not reported; the official
+  contract establishes no weekly or reset fields and none are invented.
+* `anthropic_usage` (source identity `anthropic-usage`) calls
+  `GET {origin}/api/oauth/usage` with the Bearer capability and the
+  `anthropic-beta: oauth-2025-04-20` header. It ports the **recorded**
+  envelope (`limits[]` of `kind`/`percent`, optional RFC 3339 `resets_at`;
+  `session` → `primary`/`five_hour`, weekly kinds →
+  `secondary`/`seven_day`). That envelope has not been re-verified against
+  a live endpoint; a contract drift surfaces as the engine's typed failure
+  categories, never as invented windows.
+* Live-contract evidence is tracked separately from these fixture-verified
+  paths: the GLM field names come from the official plugin source; the
+  Anthropic live schema remains an open verification gate.

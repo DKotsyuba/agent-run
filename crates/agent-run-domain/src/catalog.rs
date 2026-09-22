@@ -434,6 +434,57 @@ pub use crate::provider_connection::{
     CredentialHeader, LimitsSource, ProviderConnection, ProviderProtocol,
 };
 
+/// Explicit binding of a Lua limits source to one first-party collector.
+///
+/// `script` names a first-party collector identity the capacity side resolves
+/// through its own registry; it is never inferred from a provider name.
+/// `origins` are the exact credential-bearing origins the collector may
+/// request: HTTPS in production, plain HTTP only for explicit loopback
+/// fixtures, and never userinfo, fragments, queries, or paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorBinding {
+    /// First-party collector script identity, e.g. `glm_quota`.
+    pub script: String,
+    /// Exact requestable origins; never empty and never a credential.
+    pub origins: Vec<String>,
+}
+
+impl CollectorBinding {
+    /// Validates the script identifier grammar and every origin spelling
+    /// against the same URL reading custom endpoints use.
+    pub fn validate(&self) -> Result<()> {
+        nonblank("collector script", &self.script)?;
+        if self.script.len() > 64
+            || !self
+                .script
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(invalid("invalid collector script identity"));
+        }
+        if self.origins.is_empty() || self.origins.len() > 8 {
+            return Err(invalid("collector needs one to eight origins"));
+        }
+        for origin in &self.origins {
+            let url = url::Url::parse(origin).map_err(|_| invalid("invalid collector origin"))?;
+            if url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+                || url.query().is_some()
+                || !(url.path() == "/" || url.path().is_empty())
+                || !(url.scheme() == "https"
+                    || (url.scheme() == "http"
+                        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
+            {
+                return Err(invalid("invalid collector origin"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A provider: one harness and connection, explicit models and bindings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -454,6 +505,11 @@ pub struct ProviderDefinition {
     pub priority_multiplier: PositiveFinite,
     /// Explicit collector family for quota observations.
     pub limits_source: LimitsSource,
+    /// Explicit first-party collector binding; required exactly for the Lua
+    /// source so a script or credential identity is configuration, never an
+    /// inference from the provider name.
+    #[serde(default)]
+    pub collector: Option<CollectorBinding>,
     /// Explicit model offerings; duplicates are rejected.
     pub models: Vec<ProviderModel>,
     /// Account alias bindings; duplicate labels are rejected.
@@ -466,6 +522,16 @@ impl ProviderDefinition {
     pub fn validate(&self) -> Result<()> {
         if self.models.is_empty() {
             return Err(invalid("provider must offer at least one model"));
+        }
+        match (&self.limits_source, &self.collector) {
+            (LimitsSource::Lua, Some(binding)) => binding.validate()?,
+            (LimitsSource::Lua, None) => {
+                return Err(invalid("lua limits source requires a collector binding"));
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(invalid("collector binding requires the lua limits source"));
+            }
         }
         for advice in &self.recommendations {
             nonblank("provider recommendation", advice)?;

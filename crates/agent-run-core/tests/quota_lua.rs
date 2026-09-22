@@ -122,6 +122,7 @@ async fn run_with(
         &limits,
         client,
         &auth,
+        "https://api.test/quota",
     )
     .await
 }
@@ -589,6 +590,7 @@ async fn bytecode_and_tampered_scripts_are_rejected() {
         &fast(),
         FakeHttp::new(vec![]),
         &auth(),
+        "https://api.test/quota",
     )
     .await
     .unwrap_err();
@@ -872,6 +874,7 @@ end
         &fast(),
         FakeHttp::new(vec![]),
         &auth(),
+        "https://api.test/quota",
     )
     .await
     .unwrap();

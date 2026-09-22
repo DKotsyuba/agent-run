@@ -253,6 +253,7 @@ fn aliased_catalog() -> ProviderCatalog {
         recommendations: vec![],
         priority_multiplier: PositiveFinite::try_from(1.0).unwrap(),
         limits_source: LimitsSource::CodexAppserver,
+        collector: None,
         models: vec![model.clone()],
         bindings: vec![ProviderBinding {
             label: "plus".parse().unwrap(),

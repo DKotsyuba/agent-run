@@ -9,8 +9,8 @@ use crate::{
 };
 use agent_run_domain::{
     catalog::{
-        AccountId, AccountRecord, AuthFamily, HarnessId, LegacyRuntime, LimitsSource,
-        ProviderBinding, ProviderConnection, ProviderId, ProviderModel,
+        AccountId, AccountRecord, AuthFamily, CollectorBinding, HarnessId, LegacyRuntime,
+        LimitsSource, ProviderBinding, ProviderConnection, ProviderId, ProviderModel,
     },
     domain::Constraint,
     error::invalid,
@@ -39,6 +39,10 @@ pub struct RuntimeMapping {
     pub auth_family: AuthFamily,
     /// New v2 source: codex_appserver, lua, or none.
     pub limits_source: LimitsSource,
+    /// Explicit first-party collector binding for a Lua source; supplied by
+    /// the mapping caller because a script identity is never inferred from a
+    /// runtime name.
+    pub collector: Option<CollectorBinding>,
     /// One native model id per historical public model id.
     pub native_models: BTreeMap<String, String>,
     /// Model-specific hard constraints to carry into v2.
@@ -180,6 +184,7 @@ pub fn plan_v1(
             recommendations: vec![],
             priority_multiplier: provider_weight,
             limits_source: mapped.limits_source,
+            collector: mapped.collector.clone(),
         };
         if providers
             .insert(mapped.provider.clone(), settings)

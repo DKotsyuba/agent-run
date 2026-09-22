@@ -9,8 +9,8 @@ use crate::config::{
 use agent_run_domain::{
     canonical,
     catalog::{
-        AccountRecord, AuthFamily, HarnessId, LimitsSource, ProviderBinding, ProviderCatalog,
-        ProviderConnection, ProviderDefinition, ProviderId, ProviderModel,
+        AccountRecord, AuthFamily, CollectorBinding, HarnessId, LimitsSource, ProviderBinding,
+        ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderId, ProviderModel,
     },
     error::invalid,
     types::PositiveFinite,
@@ -84,6 +84,9 @@ pub struct ProviderSettings {
     pub priority_multiplier: PositiveFinite,
     /// Explicit collector selection for capacity observations.
     pub limits_source: LimitsSource,
+    /// Explicit first-party collector binding; required for the Lua source.
+    #[serde(default)]
+    pub collector: Option<CollectorBinding>,
 }
 
 /// Returns the validated default ranking multiplier.
@@ -328,6 +331,7 @@ impl ProviderConfig {
             recommendations: provider.recommendations.clone(),
             priority_multiplier: provider.priority_multiplier,
             limits_source: provider.limits_source,
+            collector: provider.collector.clone(),
             models: provider.models.clone(),
             bindings: provider.bindings.clone(),
         }
