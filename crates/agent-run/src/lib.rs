@@ -12,4 +12,5 @@ pub use agent_run_store as state;
 pub mod cli;
 pub mod init;
 pub mod launchd;
+pub mod transcript;
 pub mod transport;

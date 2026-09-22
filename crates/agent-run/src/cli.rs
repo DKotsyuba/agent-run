@@ -14,7 +14,7 @@ use agent_run_domain::{
     catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
     CredentialRef,
 };
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
@@ -32,6 +32,35 @@ pub type CliFuture<'a> = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>
 
 /// Output callback used by [`CliDependencies`].
 pub type CliOutput = Arc<dyn Fn(&Value) -> Result<()> + Send + Sync>;
+
+/// Human-readable text sink used by the transcript viewer's text format.
+pub type CliTextOutput = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+/// Output format of the `transcript` viewer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum TranscriptFormat {
+    /// Human-readable activity stream.
+    Text,
+    /// Line-delimited transcript pages (the historical machine format).
+    Json,
+}
+
+impl TranscriptFormat {
+    /// Resolves an explicit `--format` or the automatic default.
+    ///
+    /// An explicit choice always wins; otherwise text is used when standard
+    /// output is a terminal and JSON for any piped or captured consumer.
+    pub fn effective(format: Option<Self>) -> Self {
+        format.unwrap_or({
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                Self::Text
+            } else {
+                Self::Json
+            }
+        })
+    }
+}
 
 /// Structured doctor callback used by [`CliDependencies`].
 pub type DoctorRunner = Arc<dyn Fn(&Path) -> Result<crate::doctor::Report> + Send + Sync>;
@@ -126,6 +155,8 @@ pub struct CliDependencies {
     pub broker: Arc<dyn CliBroker>,
     /// JSON sink; production writes one newline-delimited value to stdout.
     pub output: CliOutput,
+    /// Text sink used by the transcript viewer's human-readable format.
+    pub text_output: CliTextOutput,
     /// Structured doctor report provider.
     pub doctor: DoctorRunner,
 }
@@ -137,6 +168,7 @@ impl CliDependencies {
             service: Arc::new(Service::new(home.clone())),
             broker: Arc::new(SocketBroker { home }),
             output: Arc::new(emit),
+            text_output: Arc::new(write_line),
             doctor: Arc::new(crate::doctor::run),
         }
     }
@@ -190,6 +222,9 @@ pub enum Command {
         follow: bool,
         #[arg(long, conflicts_with = "follow")]
         full: bool,
+        /// Output format; defaults to text on a terminal, JSON otherwise.
+        #[arg(long, value_enum)]
+        format: Option<TranscriptFormat>,
     },
     Models,
     Limits,
@@ -522,6 +557,14 @@ fn task_text(value: &str, max: usize) -> Result<String> {
         return Err(invalid("task must be nonblank"));
     }
     Ok(text)
+}
+/// Writes one sanitized viewer text line followed by a newline to stdout.
+pub fn write_line(line: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
 }
 pub fn emit(value: &Value) -> Result<()> {
     let encoded = serde_json::to_vec(value)?;
@@ -1007,9 +1050,33 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             limit,
             follow,
             full,
-        } => loop {
-            let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
+            format,
+        } => {
+            // An explicit --format always wins; otherwise text is interactive
+            // and JSON keeps piped consumers on the historical machine shape.
+            let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
+            // Renders one page's messages in the selected format.
+            let emit_page = |page: &Value,
+                             text: bool,
+                             output: &CliOutput,
+                             text_output: &CliTextOutput|
+             -> Result<()> {
+                if text {
+                    for line in crate::transcript::render(
+                        page["messages"]
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                    ) {
+                        text_output(&line)?;
+                    }
+                    Ok(())
+                } else {
+                    output(page)
+                }
+            };
             if full {
+                let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
                 let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
                 let mut page_cursor = cursor;
                 let mut pages = 1usize;
@@ -1028,36 +1095,50 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
                     pages += 1;
                 }
-                (dependencies.output)(
-                    &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
-                )?;
-                break;
+                if text {
+                    emit_page(
+                        &json!({"messages":messages}),
+                        true,
+                        &dependencies.output,
+                        &dependencies.text_output,
+                    )?;
+                } else {
+                    (dependencies.output)(
+                        &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
+                    )?;
+                }
+            } else {
+                loop {
+                    let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
+                    emit_page(&page, text, &dependencies.output, &dependencies.text_output)?;
+                    if let Some(seq) = page["messages"]
+                        .as_array()
+                        .and_then(|a| a.last())
+                        .and_then(|v| v["seq"].as_i64())
+                    {
+                        cursor = seq;
+                    }
+                    if !follow {
+                        break;
+                    }
+                    if page["complete"] == true
+                        && dependencies.service.agent(&agent_id)?["status"]
+                            .as_str()
+                            .is_some_and(|status| {
+                                matches!(
+                                    status,
+                                    "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
+                                )
+                            })
+                    {
+                        break;
+                    }
+                    // Interrupting the viewer never cancels the supervised
+                    // agent; the resident supervisor keeps running it.
+                    tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+                }
             }
-            (dependencies.output)(&page)?;
-            if let Some(seq) = page["messages"]
-                .as_array()
-                .and_then(|a| a.last())
-                .and_then(|v| v["seq"].as_i64())
-            {
-                cursor = seq;
-            }
-            if !follow {
-                break;
-            }
-            if page["complete"] == true
-                && dependencies.service.agent(&agent_id)?["status"]
-                    .as_str()
-                    .is_some_and(|status| {
-                        matches!(
-                            status,
-                            "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
-                        )
-                    })
-            {
-                break;
-            }
-            tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
-        },
+        }
         Command::Models => (dependencies.output)(&dependencies.service.models().await?)?,
         Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
         Command::Doc { topic } => {

@@ -121,6 +121,7 @@ fn fake_dependencies(
             sink.lock().expect("output lock").push(value.clone());
             Ok(())
         }),
+        text_output: Arc::new(|_| Ok(())),
         doctor: Arc::new(|home| {
             Ok(agent_run::doctor::Report {
                 home: home.to_owned(),

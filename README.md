@@ -101,11 +101,17 @@ agent-run start --runtime codex --model gpt-5.6-sol --profile role-review \
 agent-run agents
 agent-run answer ag-...
 agent-run transcript ag-...
+agent-run transcript ag-... --follow --format text
 agent-run resume ag-... --task "Continue with the highest-priority finding."
 ```
 
-Output is line-delimited JSON. Other commands include `steer`, `cancel`,
-`models`, `limits`, `capacity order`, `delivery status`, and `doc`.
+Output is line-delimited JSON. `transcript --follow` streams a live view:
+model text, tool activity, and results as they arrive, exiting when the agent
+reaches a terminal state and its journal is drained; Ctrl-C exits only the
+viewer and never cancels the agent. `--format text|json` picks the rendering,
+defaulting to text on a terminal and JSON when output is piped. Other commands
+include `steer`, `cancel`, `models`, `limits`, `capacity order`,
+`delivery status`, and `doc`.
 
 ## Use the MCP server
 

@@ -19,6 +19,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const AGENT_ID: &str = "ag-20260826-120000-0123456789";
 
+/// Serializes follow-mode tests: the SIGINT test signals the whole process, so
+/// no other test may hold a Ctrl-C handler while it runs.
+static FOLLOW_TESTS: Mutex<()> = Mutex::new(());
+
 /// Records broker method and payload pairs while returning fixed responses.
 struct FakeBroker {
     calls: Mutex<Vec<(String, Value)>>,
@@ -115,6 +119,7 @@ fn dependencies(
             sink.lock().unwrap().push(value.clone());
             Ok(())
         }),
+        text_output: Arc::new(|_| Ok(())),
         doctor: Arc::new(|home| {
             Ok(agent_run::doctor::Report {
                 home: home.to_owned(),
@@ -493,6 +498,7 @@ async fn test_transcript_is_bounded_unless_full_is_explicit() {
 /// Mirrors `tests/test_cli.py::test_transcript_follow_polls_without_duplicates_until_terminal_and_drained`.
 #[tokio::test]
 async fn test_transcript_follow_polls_without_duplicates_until_terminal_and_drained() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
     let service = Arc::new(FakeService::new(
         vec![
             (0, json!({"messages":[{"seq":1}],"complete":false})),
@@ -549,6 +555,7 @@ async fn test_doctor_delegates_to_the_structured_read_only_seam() {
         service: Arc::new(FakeService::new(Vec::new(), false)),
         broker: Arc::new(FakeBroker::new(Vec::new())),
         output: Arc::new(|_| Ok(())),
+        text_output: Arc::new(|_| Ok(())),
         doctor: Arc::new(move |home| {
             *seen.lock().unwrap() = Some(home.to_owned());
             Ok(agent_run::doctor::Report {
@@ -827,4 +834,183 @@ fn test_mcp_unusable_frontends_fall_back_to_direct_protocol() {
     .unwrap();
     fs::set_permissions(&invalid_executable, fs::Permissions::from_mode(0o755)).unwrap();
     assert_direct_mcp_fallback(&invalid_executable, temp.path());
+}
+
+/// Creates dependencies whose human-readable transcript lines are collected in memory.
+fn text_dependencies(service: Arc<FakeService>, lines: Arc<Mutex<Vec<String>>>) -> CliDependencies {
+    let sink = Arc::clone(&lines);
+    CliDependencies {
+        service,
+        broker: Arc::new(FakeBroker::new(Vec::new())),
+        output: Arc::new(|_| Ok(())),
+        text_output: Arc::new(move |line| {
+            sink.lock().unwrap().push(line.to_owned());
+            Ok(())
+        }),
+        doctor: Arc::new(|home| {
+            Ok(agent_run::doctor::Report {
+                home: home.to_owned(),
+                checked_at: 0.0,
+                findings: Vec::new(),
+            })
+        }),
+    }
+}
+
+/// One transcript page fixture mixing model text, tool activity, and controls.
+fn activity_page(complete: bool) -> Value {
+    json!({"messages":[
+        {"seq":1,"role":"user","content":"review \x1b[1mthis\x1b[0m"},
+        {"seq":2,"role":"assistant","content":"looking now"},
+        {"seq":3,"role":"tool_call","name":"shell","content":"{\"cmd\":\"ls\"}"},
+        {"seq":4,"role":"tool_result","content":"file.txt\x1b]0;pwned\x07"},
+        {"seq":5,"role":"runtime_session","content":"{\"id\":\"s1\"}"}
+    ],"complete":complete})
+}
+
+/// Proves `--format text` renders model text, tool activity, and sanitized results.
+#[tokio::test]
+async fn test_transcript_explicit_text_format_renders_sanitized_activity() {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    agent_run::cli::run_with(
+        parse(&["transcript", AGENT_ID, "--format", "text"]),
+        text_dependencies(
+            Arc::new(FakeService::new(vec![(0, activity_page(true))], true)),
+            lines.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *lines.lock().unwrap(),
+        vec![
+            "review this",
+            "looking now",
+            "-> shell {\"cmd\":\"ls\"}",
+            "<- file.txt",
+            "runtime_session: {\"id\":\"s1\"}",
+        ]
+    );
+}
+
+/// Proves explicit JSON and the piped default keep the historical page shape.
+#[tokio::test]
+async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
+    for args in [
+        vec!["transcript", AGENT_ID],
+        vec!["transcript", AGENT_ID, "--format", "json"],
+    ] {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let json_sink = Arc::clone(&output);
+        let text_sink = Arc::clone(&lines);
+        let mut argv = vec!["agent-run"];
+        argv.extend(args.iter().copied());
+        agent_run::cli::run_with(
+            Cli::try_parse_from(argv).unwrap(),
+            CliDependencies {
+                service: Arc::new(FakeService::new(vec![(0, activity_page(true))], true)),
+                broker: Arc::new(FakeBroker::new(Vec::new())),
+                output: Arc::new(move |value| {
+                    json_sink.lock().unwrap().push(value.clone());
+                    Ok(())
+                }),
+                text_output: Arc::new(move |line| {
+                    text_sink.lock().unwrap().push(line.to_owned());
+                    Ok(())
+                }),
+                doctor: Arc::new(|home| {
+                    Ok(agent_run::doctor::Report {
+                        home: home.to_owned(),
+                        checked_at: 0.0,
+                        findings: Vec::new(),
+                    })
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let pages = output.lock().unwrap();
+        assert_eq!(pages.len(), 1, "one JSON page for {args:?}");
+        assert_eq!(pages[0]["messages"][2]["role"], "tool_call", "for {args:?}");
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "no text lines for {args:?}"
+        );
+    }
+}
+
+/// Proves text follow drains terminal journals in durable order without repeats.
+#[tokio::test]
+async fn test_transcript_text_follow_drains_without_duplicates() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    agent_run::cli::run_with(
+        parse(&[
+            "transcript",
+            AGENT_ID,
+            "--limit",
+            "1",
+            "--follow",
+            "--format",
+            "text",
+        ]),
+        text_dependencies(
+            Arc::new(FakeService::new(
+                vec![
+                    (
+                        0,
+                        json!({"messages":[{"seq":1,"role":"assistant","content":"one"}],"complete":false}),
+                    ),
+                    (
+                        1,
+                        json!({"messages":[{"seq":2,"role":"assistant","content":"two"}],"complete":true}),
+                    ),
+                ],
+                true,
+            )),
+            lines.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*lines.lock().unwrap(), vec!["one", "two"]);
+}
+
+/// Proves interrupting the viewer exits cleanly while the agent keeps running.
+#[tokio::test]
+async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let service = Arc::new(FakeService::new(
+        vec![(
+            0,
+            json!({"messages":[{"seq":1,"role":"assistant","content":"hello"}],"complete":true}),
+        )],
+        false,
+    ));
+    let runner = agent_run::cli::run_with(
+        parse(&["transcript", AGENT_ID, "--follow", "--format", "text"]),
+        text_dependencies(service.clone(), lines.clone()),
+    );
+    let task = tokio::spawn(runner);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // SAFETY: delivering SIGINT to this test process; tokio's installed
+    // handler turns it into the viewer's Ctrl-C branch instead of an abort.
+    unsafe {
+        libc::kill(std::process::id() as libc::pid_t, libc::SIGINT);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("viewer exits on Ctrl-C")
+        .unwrap()
+        .unwrap();
+    assert_eq!(*lines.lock().unwrap(), vec!["hello"]);
+    // The viewer has no cancellation path: the agent status stays untouched.
+    assert_eq!(
+        service
+            .agent(&AGENT_ID.parse().expect("fixture agent id"))
+            .expect("agent view")["status"],
+        "running"
+    );
 }
