@@ -1,7 +1,7 @@
 //! Account-bound quota observation normalization, persistence, and latch.
 
 use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
-use agent_run_domain::catalog::AccountId;
+use agent_run_domain::catalog::{AccountId, AccountRecord, AccountStatus};
 use agent_run_store::quota::record_quota_snapshot;
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, str::FromStr};
@@ -10,6 +10,19 @@ use tempfile::tempdir;
 /// The global account every fixture binds to; labels never appear here.
 fn account() -> AccountId {
     AccountId::from_str("acct-main").unwrap()
+}
+
+/// Registers the fixture account so persisted facts satisfy the registry FK.
+fn registered(home: &std::path::Path) {
+    let mut store = agent_run_store::Store::open(home).unwrap();
+    store
+        .register_account(&AccountRecord {
+            account_id: account(),
+            auth_family: "openai".parse().unwrap(),
+            secret_ref: "native:codex".parse().unwrap(),
+            status: AccountStatus::Enabled,
+        })
+        .unwrap();
 }
 
 /// One configured GLM-like scope with two explicit models and a stable
@@ -154,6 +167,7 @@ fn latest(home: &Path) -> (Option<f64>, Option<f64>, f64) {
 fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -162,6 +176,11 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     .unwrap();
     let r1 = record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1500.0).unwrap();
     assert_eq!(r1, 1);
+    assert_eq!(
+        latch_rows(home.path()),
+        1,
+        "fresh exhaustion latches durably"
+    );
 
     // A round that only produced unknown data must not displace the exhausted fact.
     let unknown = normalize(&json!({
@@ -175,6 +194,7 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     assert_eq!(remaining, Some(0.0));
     assert_eq!(reset, Some(2000.0));
     assert!(valid_until >= 2000.0, "latch extends survival to the reset");
+    assert_eq!(latch_rows(home.path()), 1, "unknown round keeps the latch");
 
     // A stale positive observation never releases the latch.
     let stale = normalize(&json!({
@@ -185,6 +205,11 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     .unwrap();
     record_quota_snapshot(home.path(), "glm", &stale, 100, 1600.0).unwrap();
     assert_eq!(latest(home.path()).0, Some(0.0));
+    assert_eq!(
+        latch_rows(home.path()),
+        1,
+        "stale positive never clears the latch"
+    );
 
     // Positive fresh evidence releases the latch immediately.
     let fresh = normalize(&json!({
@@ -195,18 +220,54 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     .unwrap();
     record_quota_snapshot(home.path(), "glm", &fresh, 100, 1700.0).unwrap();
     assert_eq!(latest(home.path()).0, Some(60.0));
+    assert_eq!(
+        latch_rows(home.path()),
+        0,
+        "fresh positive clears the latch"
+    );
 
     // Re-latch, then let the known reset pass: unknown data supersedes again
     // without synthesizing unobserved capacity.
     record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1800.0).unwrap();
     record_quota_snapshot(home.path(), "glm", &unknown, 100, 2500.0).unwrap();
     assert_eq!(latest(home.path()).0, None);
+    assert_eq!(latch_rows(home.path()), 0, "expired reset clears the latch");
+}
+
+/// Counts durable latch rows for the fixture account.
+fn latch_rows(home: &std::path::Path) -> i64 {
+    let store = agent_run_store::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM quota_exhaustion WHERE account_id='acct-main'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn persistence_requires_a_registered_account() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let snapshot = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                     "remaining_percent":50.0,"observed_at":1000.0}]
+    }))
+    .unwrap();
+    let err = record_quota_snapshot(home.path(), "glm", &snapshot, 100, 1000.0).unwrap_err();
+    assert!(err.to_string().contains("not registered"));
+    registered(home.path());
+    assert!(record_quota_snapshot(home.path(), "glm", &snapshot, 100, 1000.0).is_ok());
 }
 
 #[test]
 fn exhaustion_latch_survives_a_collector_source_change() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -236,6 +297,7 @@ fn exhaustion_latch_survives_a_collector_source_change() {
 fn shared_pool_windows_persist_once_with_full_membership() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
     let shared = normalize(&json!({
         "version": 1,
         "windows": [
@@ -265,12 +327,23 @@ fn shared_pool_windows_persist_once_with_full_membership() {
         )
         .unwrap();
     assert!(five_hour.contains("glm-4.7") && five_hour.contains("glm-4.6"));
+    let (account_id, quota_key): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT account_id,quota_key FROM capacity_samples WHERE window='five_hour'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(account_id, "acct-main");
+    assert_eq!(quota_key, "acct-main::primary");
 }
 
 #[test]
 fn malformed_rounds_and_noop_rounds_leave_history_and_revision_untouched() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
     let good = normalize(&json!({
         "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],

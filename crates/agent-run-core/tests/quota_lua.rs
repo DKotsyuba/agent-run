@@ -798,6 +798,15 @@ async fn collector_output_persists_through_the_quota_store_path() {
     // latch and one revision advance in the same transaction.
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::Store::open(home.path()).unwrap();
+    store
+        .register_account(&agent_run_domain::catalog::AccountRecord {
+            account_id: account(),
+            auth_family: "openai".parse().unwrap(),
+            secret_ref: "native:codex".parse().unwrap(),
+            status: agent_run_domain::catalog::AccountStatus::Enabled,
+        })
+        .unwrap();
     let script = CollectorScript::new(
         r#"
 collect = function(ctx)

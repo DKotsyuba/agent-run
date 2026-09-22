@@ -25,15 +25,21 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua}`,
   a pool. A shared pool's window facts must be identical for every model
   that declares it.
 * `agent_run_store::quota::record_quota_snapshot` persists **one row per
-  physical window** — never one per model — with the lane in `lane`, the
-  global account in `target`, and full model membership in `payload_json`,
-  in one immediate transaction that advances the single
-  `quota_capacity_revision` exactly once when it mutates rows and not at all
-  for a no-op round. The store only persists raw facts; scoring, ranking,
-  and reservation stay in core.
-* **Exhaustion latch**: a persisted zero-remaining window survives a round
-  that only produced unknown data (timeout/malformed rounds persist
-  nothing) until its known reset passes or — with no reset — actually fresh
+  physical window** — never one per model — with explicit
+  `capacity_samples.account_id`/`quota_key` identity (the legacy `target`
+  column is kept only as a view mirror), the lane in `lane`, and full model
+  membership in `payload_json`, in one immediate transaction that advances
+  the single `quota_capacity_revision` exactly once when it mutates rows and
+  not at all for a no-op round. The account must be registered
+  (`provider_accounts`), enforced by foreign key and an explicit
+  pre-transaction check. The store only persists raw facts; scoring,
+  ranking, and reservation stay in core.
+* **Exhaustion latch** is durable in `quota_exhaustion`, keyed by account,
+  physical key, stable collector source, and window — independent of rolling
+  sample retention and of script revisions: a latched zero-remaining window
+  survives a round that only produced unknown data (timeout/malformed
+  rounds persist nothing) until its known reset passes or — with no reset —
+  actually fresh
   positive evidence arrives (`remaining > 0`, observed not later than now,
   validity unexpired, reset not passed). A stale positive never revives
   capacity. Matching is by lane and window across collector source
