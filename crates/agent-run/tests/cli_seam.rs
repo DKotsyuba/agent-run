@@ -972,16 +972,20 @@ async fn test_transcript_text_follow_drains_without_duplicates() {
     assert_eq!(*text.lock().unwrap(), "one\ntwo\n");
 }
 
-/// Proves interrupting the viewer exits cleanly while the agent keeps running.
+/// Proves interrupting the viewer exits cleanly while the agent keeps running,
+/// including an extra empty poll before the process-wide signal is delivered.
 #[tokio::test]
 async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
     let _guard = FOLLOW_TESTS.lock().unwrap();
     let text = Arc::new(Mutex::new(String::new()));
     let service = Arc::new(FakeService::new(
-        vec![(
-            0,
-            json!({"messages":[{"seq":1,"role":"assistant","content":"hello"}],"complete":true}),
-        )],
+        vec![
+            (
+                0,
+                json!({"messages":[{"seq":1,"role":"assistant","content":"hello"}],"complete":true}),
+            ),
+            (1, json!({"messages":[],"complete":true})),
+        ],
         false,
     ));
     let runner = agent_run::cli::run_with(
@@ -989,7 +993,7 @@ async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
         text_dependencies(service.clone(), text.clone()),
     );
     let task = tokio::spawn(runner);
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     // SAFETY: delivering SIGINT to this test process; tokio's installed
     // handler turns it into the viewer's Ctrl-C branch instead of an abort.
     unsafe {
