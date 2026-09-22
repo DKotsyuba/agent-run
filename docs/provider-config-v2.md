@@ -98,3 +98,5 @@ for a secret-free digest and stable ids. A failed reload returns an error;
 the caller retains its last valid cached value. The current v1 `Config`
 continues serving existing launch consumers during staged integration. V1 is
 historical/migration input, not a promise of permanent public v1 launches.
+The [provider materialization contract](provider-materialization.md) names
+the sealed adapter APIs that consume this configuration.

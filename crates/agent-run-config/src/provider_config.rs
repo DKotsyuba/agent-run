@@ -4,7 +4,7 @@
 //! `load_if_changed` rejects a new file revision.
 
 use crate::config::{
-    self, Auth, Capacity, Catalog, Config, Core, Delivery, Environment, Hook, Mcp, RustRoots,
+    self, Capacity, Catalog, Config, Core, Delivery, Environment, Hook, Mcp, RustRoots,
 };
 use agent_run_domain::{
     canonical,
@@ -57,9 +57,6 @@ pub struct HarnessConfig {
     /// Existing environment name, not an inline credential.
     #[serde(default)]
     pub environment: Option<String>,
-    /// Existing native auth linkage; provider secrets remain account records.
-    #[serde(default)]
-    pub auth: Option<Auth>,
     /// Existing Rust toolchain paths for materialization.
     #[serde(default)]
     pub rust: Option<RustRoots>,
@@ -268,20 +265,6 @@ impl ProviderConfig {
             if let Some(roots) = &mut harness.rust {
                 roots.rustup_home = fs::expand(&roots.rustup_home)?;
                 roots.cargo_bin = fs::expand(&roots.cargo_bin)?;
-            }
-            if let Some(auth) = &mut harness.auth {
-                match auth {
-                    Auth::Environment { names }
-                        if names.is_empty() || names.iter().any(|name| !config::env_name(name)) =>
-                    {
-                        return Err(invalid("invalid harness auth environment"))
-                    }
-                    Auth::FileLink { source, target } => {
-                        *source = fs::expand(source)?;
-                        fs::relative(Path::new(target))?;
-                    }
-                    _ => {}
-                }
             }
         }
         for (id, provider) in &self.providers {

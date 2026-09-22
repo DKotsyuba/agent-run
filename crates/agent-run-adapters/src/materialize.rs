@@ -414,6 +414,44 @@ pub fn materialize(
     home: &Path,
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
+    materialize_with_provider(config, runtime, request, profile, home, app_home, None)
+}
+
+/// Seals provider-specific native settings and nonsecret launch metadata into
+/// the same verified runtime index as skills, MCP, hooks, and permissions.
+pub fn materialize_provider(
+    config: &Config,
+    runtime: &Runtime,
+    request: &StartRequest,
+    profile: &Profile,
+    home: &Path,
+    app_home: &Path,
+    provider: &agent_run_domain::ProviderDefinition,
+    native_model: &str,
+    config_sha256: &str,
+) -> Result<(Snapshot, String)> {
+    materialize_with_provider(
+        config,
+        runtime,
+        request,
+        profile,
+        home,
+        app_home,
+        Some((provider, native_model, config_sha256)),
+    )
+}
+
+/// Shared v1/v2 writer; only the optional provider branch adds new files or
+/// custom gateway settings, so historical materialization stays byte-stable.
+fn materialize_with_provider(
+    config: &Config,
+    runtime: &Runtime,
+    request: &StartRequest,
+    profile: &Profile,
+    home: &Path,
+    app_home: &Path,
+    provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
+) -> Result<(Snapshot, String)> {
     let kind = runtime.kind()?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     super::claude::validate_runtime(runtime, kind)?;
@@ -568,7 +606,17 @@ pub fn materialize(
             );
             doc.insert("projects".into(), toml::Value::Table(projects));
             super::plugins::codex_config(&mut doc, &hooks, home, &plugins)?;
-            let auth_target = if request.account.is_some() {
+            let custom = provider.is_some_and(|(provider, _, _)| {
+                matches!(
+                    provider.connection,
+                    agent_run_domain::ProviderConnection::Custom { .. }
+                )
+            });
+            let auth_target = if custom {
+                None
+            } else if provider.is_some() {
+                Some("auth.json")
+            } else if request.account.is_some() {
                 Some("auth.json")
             } else if let Some(Auth::FileLink { target, .. }) = &runtime.auth {
                 Some(target.as_str())
@@ -576,28 +624,65 @@ pub fn materialize(
                 None
             };
             super::codex::render_permissions(&mut doc, runtime, home, auth_target)?;
+            if let Some((provider, _, _)) = provider {
+                if let agent_run_domain::ProviderConnection::Custom { endpoint, .. } =
+                    &provider.connection
+                {
+                    let mut gateway = toml::Table::new();
+                    gateway.insert(
+                        "name".into(),
+                        toml::Value::String("agent-run gateway".into()),
+                    );
+                    gateway.insert("base_url".into(), toml::Value::String(endpoint.clone()));
+                    gateway.insert(
+                        "env_key".into(),
+                        toml::Value::String("AGENT_RUN_PROVIDER_TOKEN".into()),
+                    );
+                    gateway.insert("wire_api".into(), toml::Value::String("responses".into()));
+                    doc.insert(
+                        "model_provider".into(),
+                        toml::Value::String("agent_run_gateway".into()),
+                    );
+                    let mut providers = toml::Table::new();
+                    providers.insert("agent_run_gateway".into(), toml::Value::Table(gateway));
+                    doc.insert("model_providers".into(), toml::Value::Table(providers));
+                    let mut shell = toml::Table::new();
+                    shell.insert("inherit".into(), toml::Value::String("core".into()));
+                    shell.insert(
+                        "exclude".into(),
+                        toml::Value::Array(vec![toml::Value::String(
+                            "AGENT_RUN_PROVIDER_TOKEN".into(),
+                        )]),
+                    );
+                    doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
+                }
+            }
             let text = toml::to_string_pretty(&doc)
                 .map_err(|_| invalid("native config could not be serialized"))?;
             let mut config_text = native_lines.join("\n");
             config_text.push_str("\n\n");
             config_text.push_str(&text);
             p.file("config.toml", config_text.as_bytes(), 0o600)?;
-            let (source, target) = if let Some(a) = request.account.as_deref() {
-                (
+            let source_target = if provider.is_some() {
+                None
+            } else if let Some(a) = request.account.as_deref() {
+                Some((
                     account_home(app_home, kind, a).join("auth.json"),
                     "auth.json".into(),
-                )
+                ))
             } else if let Some(Auth::FileLink { source, target }) = &runtime.auth {
-                (source.clone(), target.clone())
+                Some((source.clone(), target.clone()))
             } else {
                 let global = std::env::var_os("CODEX_HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
                         PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
                     });
-                (global.join("auth.json"), "auth.json".into())
+                Some((global.join("auth.json"), "auth.json".into()))
             };
-            p.link(&target, &source)?;
+            if let Some((source, target)) = source_target {
+                p.link(&target, &source)?;
+            }
         }
         Adapter::Claude | Adapter::Glm => {
             let mut settings = native;
@@ -658,6 +743,26 @@ pub fn materialize(
             "command-refusals/.agent-run-command-policy.json",
             marker.as_bytes(),
             0o600,
+        )?;
+    }
+    if let Some((provider, native_model, config_sha256)) = provider {
+        p.json(
+            "provider-launch.json",
+            &json!({
+                "provider": provider.id,
+                "config_sha256": config_sha256,
+                "harness": provider.harness,
+                "model": request.model,
+                "native_model": native_model,
+                "connection": provider.connection,
+                "binary": runtime.binary,
+                "plugin_paths": p.snapshot.plugin_paths,
+                "workdir": request.workdir,
+                "profile": profile.name,
+                "restrictions": provider.models.iter()
+                    .find(|model| model.id == request.model)
+                    .map(|model| &model.restrictions),
+            }),
         )?;
     }
     p.finish()
