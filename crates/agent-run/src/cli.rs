@@ -800,6 +800,9 @@ async fn login(
 /// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home.clone())?;
+    if matches!(&cli.command, Command::Mcp) {
+        transport::mcp::exec_desktop_frontend(&home)?;
+    }
     agent_run_core::logging::configure(
         &home,
         if matches!(&cli.command, Command::Mcp) {

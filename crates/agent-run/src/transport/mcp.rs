@@ -10,8 +10,11 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use std::{
+    os::unix::process::CommandExt,
+    path::Path,
     path::PathBuf,
     pin::Pin,
+    process::Command,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -23,6 +26,43 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Preserve Python's stable, operator-actionable broker-unavailable wording.
 const BROKER_UNAVAILABLE: &str =
     "agent-run broker is not running; start it with `agent-run api serve` or its launchd job";
+
+/// Replace a production Desktop MCP process with the host-supplied signed Node frontend.
+///
+/// The replacement occurs only when both absolute capability paths are present. The frontend
+/// receives the current executable, resolved home, trusted notice contract, and exact original
+/// argument vector without shell interpretation. It removes both capability variables before
+/// starting the Rust MCP child, which makes recursion impossible and keeps native host access in
+/// the signed process. A failed `exec` is returned to the caller; successful replacement never
+/// returns.
+pub fn exec_desktop_frontend(home: &Path) -> Result<()> {
+    let (Some(pipe), Some(node)) = (
+        std::env::var_os("CODEX_APP_TOOLS_PIPE_PATH"),
+        std::env::var_os("CODEX_MCP_NODE_PATH"),
+    ) else {
+        return Ok(());
+    };
+    let pipe = PathBuf::from(pipe);
+    let node = PathBuf::from(node);
+    if !pipe.is_absolute() || !node.is_absolute() {
+        return Err(crate::error::invalid(
+            "Desktop capability paths must be absolute",
+        ));
+    }
+    let executable = std::env::current_exe()?;
+    let error = Command::new(node)
+        .arg("-e")
+        .arg(include_str!("../../../../assets/desktop-transport.cjs"))
+        .arg("--")
+        .arg(executable)
+        .arg(home)
+        .arg(include_str!("../../../../assets/completion_notice.json"))
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(Error::Runtime(format!(
+        "failed to exec Desktop MCP frontend: {error}"
+    )))
+}
 
 /// Bound stdin one LF-delimited MCP frame at a time for the SDK transport.
 struct BoundedReader<R> {
@@ -314,7 +354,6 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let _relay = crate::delivery::relay::host(&home)?;
     let service = Proxy {
         broker,
         home,

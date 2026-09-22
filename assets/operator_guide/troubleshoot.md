@@ -70,6 +70,13 @@ delivery never invokes the Codex UI queue. `null` means no attempt evidence
 has been recorded. Raw messages, session ids, argument/environment values,
 and credentials are intentionally unavailable.
 
+Desktop relay discovery requires the MCP process to have started with absolute
+`CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the
+MCP PID belongs to the supplied signed Node frontend, while its distinct Rust
+child has neither variable. A missing `ar-cdx-v3-*.sock` beside the agent-run
+home indicates that the frontend could not bind its private relay; MCP continues
+without relay delivery and reports the failure on stderr.
+
 ## Orphan check
 
 Run `agent-run doctor` and cross-reference its supervisor findings with

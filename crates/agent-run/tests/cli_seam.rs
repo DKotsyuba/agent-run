@@ -10,6 +10,8 @@ use clap::Parser;
 use serde_json::{json, Value};
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
+    process::Command,
     sync::{Arc, Mutex},
 };
 use tempfile::tempdir;
@@ -724,4 +726,37 @@ async fn test_mcp_uses_injected_stdio_for_initialize_and_tools_list() {
     );
     drop(input_writer);
     let _ = server.await;
+}
+
+/// Proves production MCP startup replaces its process image with the configured frontend.
+#[test]
+fn test_mcp_exec_preserves_pid_and_passes_exact_arguments() {
+    let temp = tempdir().unwrap();
+    let frontend = temp.path().join("frontend");
+    let pid_file = temp.path().join("pid");
+    let args_file = temp.path().join("args");
+    let pipe = temp.path().join("native.sock");
+    fs::write(
+        &frontend,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$PID_FILE\"\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&frontend, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut process = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["--home", temp.path().to_str().unwrap(), "mcp"])
+        .env("CODEX_MCP_NODE_PATH", &frontend)
+        .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe)
+        .env("PID_FILE", &pid_file)
+        .env("ARGS_FILE", &args_file)
+        .spawn()
+        .unwrap();
+    let launched_pid = process.id();
+    assert!(process.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(pid_file).unwrap().trim(),
+        launched_pid.to_string()
+    );
+    let arguments = fs::read_to_string(args_file).unwrap();
+    assert!(arguments.starts_with("-e\n"));
+    assert!(arguments.ends_with(&format!("--home\n{}\nmcp\n", temp.path().display())));
 }

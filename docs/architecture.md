@@ -94,11 +94,15 @@ sealed files.
 
 ## Completion delivery
 
-Bound runs create durable delivery rows. Codex Desktop delivery crosses the
-host boundary through the signed Node relay supplied by the host; the Rust MCP
-child receives no host capability. Claude uses its configured local UDS
-transport. Unbound callers retrieve completion through `wait`, `answer`, or
-`list_agents`.
+Bound runs create durable delivery rows. When Desktop supplies both capability
+paths, `agent-run mcp` replaces its process image with that exact signed Node
+executable. The frontend owns the private typed v1/v2/v3 relay and native-tools
+pipe, then starts the same Rust MCP command with both capability variables
+removed. It renders only the embedded completion-notice contract and can call
+only the namespaced `send_message_to_thread` tool; the Rust child owns MCP stdio
+but cannot contact native host tools. Without both capabilities, the Rust MCP
+runs directly. Claude uses its configured local UDS transport. Unbound callers
+retrieve completion through `wait`, `answer`, or `list_agents`.
 
 Delivery attempts are leased, bounded, and retried with backoff. Persisted
 diagnostics contain safe classifications and redacted tails, never task or

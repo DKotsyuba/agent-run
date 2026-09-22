@@ -1,5 +1,5 @@
-/* Local contract tests for the small signed-Node transport. No Desktop app or
- * provider connection is made. This does not test the Rust relay listener. */
+/* Local contract tests for the long-lived signed-Node frontend. No Desktop app,
+ * live relay, provider connection, or production notification is used. */
 'use strict';
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
@@ -8,53 +8,51 @@ const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
 const {spawn}=require('node:child_process');
-const helper=path.join(__dirname,'../assets/desktop-transport.cjs');
-function frame(v){const data=Buffer.from(JSON.stringify(v));const n=Buffer.alloc(4);n.writeUInt32LE(data.length);return Buffer.concat([n,data]);}
-async function scenario(mode,request={threadId:'fixture-thread',notificationId:'ntf_fixture',prompt:'agent-run/completion\n- ID: fixture'}){
+const frontend=fs.readFileSync(path.join(__dirname,'../assets/desktop-transport.cjs'),'utf8');
+const contract=fs.readFileSync(path.join(__dirname,'../assets/completion_notice.json'),'utf8');
+const valid={version:3,op:'completion',thread_id:'thread-fixture',notification_id:'ntf_fixture',agent_id:'ag-20260825-120000-0123456789',status:'succeeded',runtime:null,model:null,effort:null,failure_kind:null};
+
+/** Encode one bounded fixture value using the production uint32-LE format. */
+function frame(value){const data=Buffer.from(JSON.stringify(value));const n=Buffer.alloc(4);n.writeUInt32LE(data.length);return Buffer.concat([n,data]);}
+
+/** Read one framed JSON reply from a fixture socket. */
+function receive(socket){return new Promise((resolve,reject)=>{let data=Buffer.alloc(0);socket.on('data',chunk=>{data=Buffer.concat([data,chunk]);if(data.length>=4&&data.length>=4+data.readUInt32LE(0))resolve(JSON.parse(data.subarray(4,4+data.readUInt32LE(0))));});socket.once('error',reject);socket.once('close',()=>data.length<4&&reject(Error('closed')));});}
+
+/** Wait for the frontend's randomly suffixed private relay path. */
+async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v3-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
+
+/** Connect after the listening callback, tolerating the socket-file visibility race. */
+async function connectRelay(endpoint){for(let i=0;i<200;i++){try{return await new Promise((resolve,reject)=>{const socket=net.createConnection(endpoint);socket.once('connect',()=>resolve(socket));socket.once('error',reject);});}catch(error){if(error.code!=='ECONNREFUSED')throw error;await new Promise(resolve=>setTimeout(resolve,10));}}throw Error('relay did not accept');}
+
+/** Run one typed local request through the frontend and a fake native host. */
+async function scenario(mode,request=valid){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'ar-node-'));
-  const socketPath=path.join(directory,'host.sock');let calls=[];const peers=new Set();
-  const server=net.createServer(socket=>{
-    peers.add(socket);socket.on('close',()=>peers.delete(socket));socket.on('error',()=>{});let input=Buffer.alloc(0);
-    socket.on('data',chunk=>{
-      input=Buffer.concat([input,chunk]);
-      while(input.length>=4&&input.length>=4+input.readUInt32LE(0)){
-        const length=input.readUInt32LE(0);const v=JSON.parse(input.subarray(4,4+length));input=input.subarray(4+length);calls.push(v);
-        if(v.method==='tools/list'){
-          if(mode==='disconnect_inventory'){socket.destroy();return;}
-          if(mode==='oversized_inventory'){const header=Buffer.alloc(4);header.writeUInt32LE(8*1024*1024+1);socket.write(header);return;}
-          socket.write(frame({jsonrpc:'2.0',id:v.id,result:{tools:mode==='missing_tool'?[]:[{name:'send_message_to_thread',namespace:'fixture-host'}]}}));
-        }else{
-          assert.equal(v.method,'tools/call');assert.equal(v.params.tool,'send_message_to_thread');assert.equal(v.params.namespace,'fixture-host');
-          if(mode==='disconnect_after_send'){socket.destroy();return;}
-          if(mode==='wrong_id'){socket.write(frame({jsonrpc:'2.0',id:999,result:{success:true}}));return;}
-          socket.write(frame({jsonrpc:'2.0',id:v.id,result:mode==='missing_success'?{}:{success:mode==='accepted'}}));
-        }
-      }
-    });
-  });
+  const socketPath=path.join(directory,'host.sock');const calls=[];const peers=new Set();
+  const server=net.createServer(socket=>{peers.add(socket);socket.on('close',()=>peers.delete(socket));socket.on('error',()=>{});let input=Buffer.alloc(0);socket.on('data',chunk=>{input=Buffer.concat([input,chunk]);while(input.length>=4&&input.length>=4+input.readUInt32LE(0)){const length=input.readUInt32LE(0);const value=JSON.parse(input.subarray(4,4+length));input=input.subarray(4+length);calls.push(value);if(value.method==='tools/list'){if(mode==='disconnect_inventory')return socket.destroy();if(mode==='oversized_inventory'){const head=Buffer.alloc(4);head.writeUInt32LE(8*1024*1024+1);return socket.write(head);}socket.write(frame({jsonrpc:'2.0',id:value.id,result:{tools:mode==='missing_tool'?[]:[{name:'other',namespace:'wrong'},{name:'send_message_to_thread',namespace:'fixture-host'}]}}));}else{assert.equal(value.method,'tools/call');assert.equal(value.params.tool,'send_message_to_thread');assert.equal(value.params.namespace,'fixture-host');if(mode==='disconnect_after_send')return socket.destroy();if(mode==='wrong_id')return socket.write(frame({jsonrpc:'2.0',id:999,result:{success:true}}));socket.write(frame({jsonrpc:'2.0',id:value.id,result:mode==='missing_success'?{}:{success:mode==='accepted'}}));}}});});
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(socketPath,resolve);});
-  let child;
+  const childCode="process.stdout.write(JSON.stringify({pid:process.pid,ppid:process.ppid,pipe:process.env.CODEX_APP_TOOLS_PIPE_PATH||null,node:process.env.CODEX_MCP_NODE_PATH||null})+'\\n');setInterval(()=>{},1000)";
+  const host=spawn(process.execPath,['-e',frontend,'--',process.execPath,directory,contract,'-e',childCode],{env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:socketPath,CODEX_MCP_NODE_PATH:process.execPath},stdio:['ignore','pipe','pipe']});
+  let output='';host.stdout.on('data',data=>output+=data);host.stderr.on('data',()=>{});
   try{
-    const result=await new Promise((resolve,reject)=>{
-      child=spawn(process.execPath,[helper],{env:{CODEX_APP_TOOLS_PIPE_PATH:socketPath},stdio:['pipe','pipe','pipe']});
-      let output=Buffer.alloc(0),errors='';let timer=setTimeout(()=>{child.kill();reject(Error('test child timeout'));},9000);
-      child.on('error',e=>{clearTimeout(timer);reject(e);});child.stdin.on('error',()=>{});
-      child.stdout.on('data',data=>output=Buffer.concat([output,data]));child.stderr.on('data',data=>errors+=data);
-      child.on('close',code=>{clearTimeout(timer);try{assert.equal(code,0,errors);assert.ok(output.length>=4);assert.equal(output.readUInt32LE(0),output.length-4);resolve(JSON.parse(output.subarray(4)));}catch(e){reject(e);}});
-      child.stdin.end(frame(request));
-    });
-    return {result,calls};
+    const endpoint=await relayPath(directory);
+    if(mode==='connection_cap'){const holders=await Promise.all(Array.from({length:8},()=>connectRelay(endpoint)));await new Promise(resolve=>setTimeout(resolve,20));const overflow=await connectRelay(endpoint);await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('overflow connection stayed open')),1000);overflow.once('close',()=>{clearTimeout(timer);resolve();});});for(const socket of holders)socket.destroy();return {overflowClosed:true,calls};}
+    const client=await connectRelay(endpoint);const reply=receive(client);client.write(frame(request));const result=await reply;client.destroy();for(let i=0;i<100&&!output.includes('\n');i++)await new Promise(resolve=>setTimeout(resolve,10));const child=JSON.parse(output.trim());return {result,calls,hostPid:host.pid,child};
   }finally{
-    if(child&&!child.killed)child.kill();for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));fs.rmSync(directory,{recursive:true,force:true});
+    host.kill('SIGTERM');await new Promise(resolve=>host.once('close',resolve));for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));assert.equal(fs.readdirSync(directory).some(v=>v.startsWith('ar-cdx-v3-')),false);fs.rmSync(directory,{recursive:true,force:true});
   }
 }
-test('accepted host response and fixed tool surface',async()=>{const{result,calls}=await scenario('accepted');assert.deepEqual(result,{outcome:'accepted'});assert.equal(calls.length,2);assert.deepEqual(calls[1].params.arguments,{threadId:'fixture-thread',prompt:'agent-run/completion\n- ID: fixture'});});
+
+test('accepted response uses only the fixed native tool and child protocol stdout',async()=>{const{result,calls,hostPid,child}=await scenario('accepted');assert.deepEqual(result,{outcome:'accepted'});assert.equal(calls.length,2);assert.equal(calls[1].params.tool,'send_message_to_thread');assert.equal(calls[1].params.arguments.threadId,valid.thread_id);assert.equal(child.ppid,hostPid);assert.notEqual(child.pid,hostPid);assert.equal(child.pipe,null);assert.equal(child.node,null);});
 test('explicit host rejection',async()=>assert.deepEqual((await scenario('rejected')).result,{outcome:'rejected'}));
 test('missing host tool is rejected before any message',async()=>{const{result,calls}=await scenario('missing_tool');assert.equal(result.outcome,'rejected');assert.equal(calls.length,1);});
-test('disconnect before send is rejected',async()=>assert.equal((await scenario('disconnect_inventory')).result.outcome,'rejected'));
-test('disconnect after send is ambiguous',async()=>assert.equal((await scenario('disconnect_after_send')).result.outcome,'ambiguous'));
+test('disconnect before call is rejected',async()=>assert.equal((await scenario('disconnect_inventory')).result.outcome,'rejected'));
+test('disconnect after call is ambiguous',async()=>assert.equal((await scenario('disconnect_after_send')).result.outcome,'ambiguous'));
 test('mismatching response identity is ambiguous',async()=>assert.equal((await scenario('wrong_id')).result.outcome,'ambiguous'));
 test('unknown acceptance never becomes success',async()=>assert.equal((await scenario('missing_success')).result.outcome,'ambiguous'));
 test('oversized host inventory is rejected',async()=>assert.equal((await scenario('oversized_inventory')).result.outcome,'rejected'));
-test('extra private-request properties are rejected',async()=>{const{result,calls}=await scenario('accepted',{threadId:'fixture-thread',notificationId:'ntf_fixture',prompt:'agent-run/completion\n',arbitraryTool:'execute'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-test('unframed completion prompt is rejected',async()=>{const{result,calls}=await scenario('accepted',{threadId:'fixture-thread',notificationId:'ntf_fixture',prompt:'execute arbitrary task'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
+test('ninth concurrent local connection is refused',async()=>{const{overflowClosed,calls}=await scenario('connection_cap');assert.equal(overflowClosed,true);assert.equal(calls.length,0);});
+test('extra typed-request properties are rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,prompt:'inject'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
+test('missing typed-request properties are rejected before host contact',async()=>{const malformed={...valid};delete malformed.failure_kind;const{result,calls}=await scenario('accepted',malformed);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
+test('success with failure guidance is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,failure_kind:'prepare_failed'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
+test('unsupported wire version is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,version:4});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
+test('relay bind failure still runs the capability-stripped MCP child',async()=>{const directory=fs.mkdtempSync(path.join(os.tmpdir(),'ar-node-fallback-'));const blockedHome=path.join(directory,'file');fs.writeFileSync(blockedHome,'x');const child=spawn(process.execPath,['-e',frontend,'--',process.execPath,blockedHome,contract,'-e',"process.stdout.write(JSON.stringify({pipe:process.env.CODEX_APP_TOOLS_PIPE_PATH||null,node:process.env.CODEX_MCP_NODE_PATH||null}))"],{env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:path.join(directory,'host.sock'),CODEX_MCP_NODE_PATH:process.execPath},stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',data=>output+=data);const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});assert.equal(status,0);assert.deepEqual(JSON.parse(output),{pipe:null,node:null});fs.rmSync(directory,{recursive:true,force:true});});

@@ -11,7 +11,6 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::Duration,
 };
 
@@ -68,6 +67,35 @@ fn make_due(home: &Path, id: &str) {
         .unwrap();
 }
 
+/// Builds one notice from a frozen rendering fixture input object.
+fn notice_from_case(input: &Value) -> Notice {
+    Notice {
+        notification_id: input["notification_id"].as_str().unwrap().into(),
+        agent_id: input["agent_id"]
+            .as_str()
+            .unwrap()
+            .parse::<AgentId>()
+            .unwrap(),
+        status: serde_json::from_value(input["status"].clone()).unwrap(),
+        runtime: input
+            .get("runtime")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        model: input
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        effort: input
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        failure_kind: input
+            .get("failure_kind")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
 /// Mirrors `tests/test_delivery_base.py::test_every_terminal_status_renders_its_own_line`.
 /// Mirrors `tests/test_delivery_base.py::test_failed_notice_explains_known_and_unknown_failure_categories`.
 /// Mirrors `tests/test_delivery_base.py::test_configured_identifier_punctuation_renders_verbatim`.
@@ -82,31 +110,7 @@ fn notice_rendering_matches_python_golden_cases() {
     .unwrap();
     for case in cases {
         let input = case.get("input").unwrap();
-        let notice = Notice {
-            notification_id: input["notification_id"].as_str().unwrap().into(),
-            agent_id: input["agent_id"]
-                .as_str()
-                .unwrap()
-                .parse::<AgentId>()
-                .unwrap(),
-            status: serde_json::from_value(input["status"].clone()).unwrap(),
-            runtime: input
-                .get("runtime")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            model: input
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            effort: input
-                .get("effort")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            failure_kind: input
-                .get("failure_kind")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        };
+        let notice = notice_from_case(input);
         assert_eq!(notice.render().unwrap(), case["rendered"], "{}", case["id"]);
     }
 }
@@ -363,16 +367,9 @@ async fn write_frame(stream: &mut tokio::net::UnixStream, value: &Value) {
     stream.write_all(&frame(value)).await.unwrap();
 }
 
-/// Serializes tests that temporarily configure the process-wide relay paths.
-fn relay_env_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-/// Runs one Rust relay host exchange against a private fake Desktop MCP pipe.
+/// Runs the embedded signed-Node frontend against a private fake Desktop MCP pipe.
 async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     use tokio::io::AsyncWriteExt;
-    let _guard = relay_env_lock().lock().await;
     let root = tempfile::tempdir().unwrap();
     let pipe_path = root.path().join("desktop.sock");
     let pipe_listener = tokio::net::UnixListener::bind(&pipe_path).unwrap();
@@ -386,6 +383,10 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
         let (mut stream, _) = pipe_listener.accept().await.unwrap();
         let listed = read_frame(&mut stream).await;
         assert_eq!(listed["id"], 1);
+        if peer_mode == "deadline" {
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            return None;
+        }
         if peer_mode == "precall" {
             write_frame(&mut stream, &json!({"jsonrpc":"2.0","id":999,"result":{}})).await;
             return None;
@@ -421,56 +422,70 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
         write_frame(&mut stream, &response).await;
         Some(called)
     });
-    let node = if mode == "deadline" {
-        let path = root.path().join("blocking-node");
-        std::fs::write(&path, "#!/bin/sh\nexec /usr/bin/tail -f /dev/null\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    } else {
-        [
-            "/usr/local/bin/node",
-            "/opt/homebrew/bin/node",
-            "/usr/bin/node",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .expect("Node is required for relay host tests")
-    };
-    // SAFETY: host tests serialize process-environment mutation with relay_env_lock.
-    unsafe {
-        std::env::set_var("CODEX_APP_TOOLS_PIPE_PATH", &pipe_path);
-        std::env::set_var("CODEX_MCP_NODE_PATH", &node);
-    }
-    let host = relay::host(root.path()).unwrap().expect("relay host");
-    let endpoint = std::fs::read_dir(root.path())
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
+    let node = [
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/bin/node",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .expect("Node is required for relay host tests");
+    let mut host = tokio::process::Command::new(&node)
+        .args([
+            "-e",
+            include_str!("../../../assets/desktop-transport.cjs"),
+            "--",
+        ])
+        .arg(&node)
+        .arg(root.path())
+        .arg(include_str!("../../../assets/completion_notice.json"))
+        .args(["-e", "setInterval(() => {}, 1000)"])
+        .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe_path)
+        .env("CODEX_MCP_NODE_PATH", &node)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let endpoint = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(path) = std::fs::read_dir(root.path())
                 .unwrap()
-                .to_string_lossy()
-                .starts_with("ar-cdx-v3-")
-        })
-        .expect("relay endpoint");
-    let mut client = tokio::net::UnixStream::connect(endpoint).await.unwrap();
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("ar-cdx-v3-")
+                })
+            {
+                break path;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("relay endpoint");
+    let mut client = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match tokio::net::UnixStream::connect(&endpoint).await {
+                Ok(client) => break client,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("relay connect failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("relay accepts connections");
     client.write_all(&frame(&request)).await.unwrap();
     let response = read_frame(&mut client).await;
-    let called = if mode == "deadline" {
-        host_peer.abort();
-        let _ = host_peer.await;
-        None
-    } else {
-        host_peer.await.unwrap()
-    };
-    drop(host);
-    // SAFETY: host tests serialize process-environment mutation with relay_env_lock.
-    unsafe {
-        std::env::remove_var("CODEX_APP_TOOLS_PIPE_PATH");
-        std::env::remove_var("CODEX_MCP_NODE_PATH");
-    }
+    let called = host_peer.await.unwrap();
+    let _ = host.kill().await;
     (response, called)
 }
 
@@ -860,6 +875,42 @@ async fn desktop_relay_host_renders_rich_notice_exactly() {
     );
 }
 
+/// Proves every frozen status, guidance, default, null, and escaping case matches Rust bytewise.
+#[tokio::test]
+async fn desktop_relay_host_matches_every_notice_golden_case() {
+    let cases: Vec<Value> = serde_json::from_slice(
+        &std::fs::read(fixture("tests/fixtures/baseline/notices/cases.json")).unwrap(),
+    )
+    .unwrap();
+    for case in cases {
+        let notice = notice_from_case(&case["input"]);
+        let (response, called) = host_exchange(v3_request(&notice), "true").await;
+        assert_eq!(response, json!({"outcome":"accepted"}), "{}", case["id"]);
+        assert_eq!(
+            called.unwrap()["params"]["arguments"]["prompt"],
+            notice.render().unwrap(),
+            "{}",
+            case["id"]
+        );
+    }
+}
+
+/// Ensures JavaScript prototype names use the same default guidance as Rust.
+#[tokio::test]
+async fn desktop_relay_host_uses_default_guidance_for_prototype_names() {
+    for failure_kind in ["__proto__", "constructor"] {
+        let mut notice = rich_notice();
+        notice.status = Status::Failed;
+        notice.failure_kind = Some(failure_kind.into());
+        let (response, called) = host_exchange(v3_request(&notice), "true").await;
+        assert_eq!(response, json!({"outcome":"accepted"}));
+        assert_eq!(
+            called.unwrap()["params"]["arguments"]["prompt"],
+            notice.render().unwrap()
+        );
+    }
+}
+
 /// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_escaped_metadata_renders_identically_on_the_real_host`.
 #[tokio::test]
 async fn desktop_relay_host_escapes_metadata_without_changing_text() {
@@ -929,7 +980,7 @@ async fn desktop_relay_host_allows_slow_discovery() {
     );
 }
 
-/// Checks that a child which never produces host output is cut off by host_send.
+/// Checks that a pre-call host deadline remains safely retryable.
 #[tokio::test]
 async fn desktop_relay_host_deadline_expires_without_child_output() {
     let response = tokio::time::timeout(
@@ -939,7 +990,7 @@ async fn desktop_relay_host_deadline_expires_without_child_output() {
     .await
     .expect("host deadline must expire before the test guard")
     .0;
-    assert_eq!(response, json!({"outcome":"ambiguous"}));
+    assert_eq!(response, json!({"outcome":"rejected"}));
 }
 
 /// Mirrors `tests/test_codex_desktop_relay.py::NodeWrapperTests::test_explicit_rejection_and_precall_failure_are_retryable`.
@@ -961,50 +1012,6 @@ async fn desktop_relay_host_classifies_post_dispatch_uncertainty_as_ambiguous() 
             host_exchange(v3_request(&notice()), mode).await.0,
             json!({"outcome":"ambiguous"})
         );
-    }
-}
-
-/// Mirrors `tests/test_codex_desktop_relay.py::ExecWrapperTests::test_missing_capability_does_not_exec`.
-#[tokio::test]
-async fn desktop_relay_host_is_not_started_without_both_capabilities() {
-    let _guard = relay_env_lock().lock().await;
-    // SAFETY: this test owns and serializes the process-wide relay environment.
-    unsafe {
-        std::env::remove_var("CODEX_APP_TOOLS_PIPE_PATH");
-        std::env::remove_var("CODEX_MCP_NODE_PATH");
-    }
-    let root = tempfile::tempdir().unwrap();
-    assert!(relay::host(root.path()).unwrap().is_none());
-}
-
-/// Mirrors `tests/test_codex_desktop_relay.py::ExecWrapperTests::test_exec_uses_exact_node_and_python_child`.
-#[tokio::test]
-async fn desktop_relay_host_uses_the_absolute_configured_node_transport() {
-    let _guard = relay_env_lock().lock().await;
-    let root = tempfile::tempdir().unwrap();
-    let pipe = root.path().join("host.sock");
-    let node = [
-        "/usr/local/bin/node",
-        "/opt/homebrew/bin/node",
-        "/usr/bin/node",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|path| path.is_file())
-    .expect("Node is required for relay host tests");
-    // SAFETY: this test owns and serializes the process-wide relay environment.
-    unsafe {
-        std::env::set_var("CODEX_APP_TOOLS_PIPE_PATH", &pipe);
-        std::env::set_var("CODEX_MCP_NODE_PATH", &node);
-    }
-    let host = relay::host(root.path())
-        .unwrap()
-        .expect("configured relay host");
-    drop(host);
-    // SAFETY: this test owns and serializes the process-wide relay environment.
-    unsafe {
-        std::env::remove_var("CODEX_APP_TOOLS_PIPE_PATH");
-        std::env::remove_var("CODEX_MCP_NODE_PATH");
     }
 }
 
