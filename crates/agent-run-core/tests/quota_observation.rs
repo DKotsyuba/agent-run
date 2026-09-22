@@ -3,7 +3,7 @@
 use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
 use agent_run_domain::catalog::AccountId;
 use agent_run_store::quota::record_quota_snapshot;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::Path, str::FromStr};
 use tempfile::tempdir;
 
@@ -12,25 +12,35 @@ fn account() -> AccountId {
     AccountId::from_str("acct-main").unwrap()
 }
 
-/// One configured GLM-like scope with two explicit models.
+/// One configured GLM-like scope with two explicit models and a stable
+/// collector identity that does not move with script revisions.
 fn scope() -> CollectorScope {
     CollectorScope {
         runtime: "glm".into(),
-        source: "lua:abc123".into(),
+        source: "glm-native".into(),
         models: BTreeSet::from(["glm-4.7".to_owned(), "glm-4.6".to_owned()]),
     }
 }
 
-/// Normalizes one raw collector round for `account`.
-fn normalize(
-    raw: &serde_json::Value,
+/// Normalizes one raw collector round for `account` observed by host time `at`.
+fn normalize_at(
+    raw: &Value,
+    at: f64,
 ) -> agent_run_domain::Result<agent_run_domain::catalog::NormalizedQuotaSnapshot> {
-    normalize_collector_output(&account(), &scope(), raw, 256, 256)
+    normalize_collector_output(&account(), &scope(), raw, at, 256, 256)
+}
+
+/// Normalizes against a host clock after every fixture observation.
+fn normalize(
+    raw: &Value,
+) -> agent_run_domain::Result<agent_run_domain::catalog::NormalizedQuotaSnapshot> {
+    normalize_at(raw, 3000.0)
 }
 
 #[test]
 fn normalizes_valid_output_into_one_physical_pool_per_lane() {
     let snapshot = normalize(&json!({
+        "version": 1,
         "windows": [
             {"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.6"],
              "remaining_percent":42.5,"reset_at":2000.0,"observed_at":1000.0},
@@ -61,39 +71,69 @@ fn normalizes_valid_output_into_one_physical_pool_per_lane() {
 #[test]
 fn rejects_foreign_models_duplicates_bad_numbers_and_overflow() {
     let foreign = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["gpt-5.1"],
                      "remaining_percent":10.0,"observed_at":1000.0}]
     }));
     assert!(foreign.is_err());
     let duplicate = normalize(&json!({
+        "version": 1,
         "windows": [
             {"pool":"primary","window":"five_hour","models":["glm-4.7"],"remaining_percent":10.0,"observed_at":1000.0},
             {"pool":"primary","window":"five_hour","models":["glm-4.7"],"remaining_percent":20.0,"observed_at":1000.0}
         ]
     }));
     assert!(duplicate.is_err());
+    let repeated_model = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.7"],
+                     "remaining_percent":10.0,"observed_at":1000.0}]
+    }));
+    assert!(repeated_model.is_err());
     let out_of_range = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":101.0,"observed_at":1000.0}]
     }));
     assert!(out_of_range.is_err());
     let not_a_number = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":"42","observed_at":1000.0}]
     }));
     assert!(not_a_number.is_err());
     let inverted_time = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":10.0,"observed_at":1000.0,"valid_until":999.0}]
     }));
     assert!(inverted_time.is_err());
     let extra_field = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":10.0,"observed_at":1000.0,"weekly":true}]
     }));
     assert!(extra_field.is_err());
-    let overflow: serde_json::Value = json!({"windows": (0..257).map(|i| json!({"pool":"p","window":format!("w{i}"),"models":["glm-4.7"],"observed_at":1.0}).to_owned()).collect::<Vec<_>>()});
+    let overflow: Value = json!({"version": 1, "windows": (0..257).map(|i| json!({"pool":"p","window":format!("w{i}"),"models":["glm-4.7"],"observed_at":1.0}).to_owned()).collect::<Vec<_>>()});
     assert!(normalize(&overflow).is_err());
+}
+
+#[test]
+fn enforces_explicit_version_envelope_and_host_time_boundary() {
+    // Missing version, wrong version, and foreign top-level keys all fail.
+    assert!(normalize(&json!({"windows": []})).is_err());
+    assert!(normalize(&json!({"version": 2, "windows": []})).is_err());
+    assert!(normalize(&json!({"version": 1, "windows": [], "extra": true})).is_err());
+    // An observation later than the host clock is a future claim, not a fact.
+    let future = normalize_at(
+        &json!({
+            "version": 1,
+            "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                         "remaining_percent":10.0,"observed_at":999.0}]
+        }),
+        500.0,
+    );
+    assert!(future.is_err());
 }
 
 /// Reads the newest persisted row for one lane and account.
@@ -115,6 +155,7 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
     let exhausted = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":0.0,"reset_at":2000.0,"observed_at":1000.0}]
     }))
@@ -124,6 +165,7 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
 
     // A round that only produced unknown data must not displace the exhausted fact.
     let unknown = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],"observed_at":1500.0}]
     }))
     .unwrap();
@@ -134,8 +176,19 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     assert_eq!(reset, Some(2000.0));
     assert!(valid_until >= 2000.0, "latch extends survival to the reset");
 
+    // A stale positive observation never releases the latch.
+    let stale = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                     "remaining_percent":60.0,"observed_at":1000.0,"valid_until":1100.0}]
+    }))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &stale, 100, 1600.0).unwrap();
+    assert_eq!(latest(home.path()).0, Some(0.0));
+
     // Positive fresh evidence releases the latch immediately.
     let fresh = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":60.0,"reset_at":3000.0,"observed_at":1700.0}]
     }))
@@ -143,10 +196,75 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     record_quota_snapshot(home.path(), "glm", &fresh, 100, 1700.0).unwrap();
     assert_eq!(latest(home.path()).0, Some(60.0));
 
-    // Re-latch, then let the known reset pass: unknown data supersedes again.
+    // Re-latch, then let the known reset pass: unknown data supersedes again
+    // without synthesizing unobserved capacity.
     record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1800.0).unwrap();
     record_quota_snapshot(home.path(), "glm", &unknown, 100, 2500.0).unwrap();
     assert_eq!(latest(home.path()).0, None);
+}
+
+#[test]
+fn exhaustion_latch_survives_a_collector_source_change() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let exhausted = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                     "remaining_percent":0.0,"reset_at":2000.0,"observed_at":1000.0}]
+    }))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1500.0).unwrap();
+    // A script revision changes the collector source identity; the latched
+    // physical fact for the lane and window still governs.
+    let mut replaced = scope();
+    replaced.source = "glm-native-v2".into();
+    let unknown = normalize_collector_output(
+        &account(),
+        &replaced,
+        &json!({"version": 1, "windows": [{"pool":"primary","window":"five_hour",
+                 "models":["glm-4.7"],"observed_at":1600.0}]}),
+        3000.0,
+        256,
+        256,
+    )
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &unknown, 100, 1600.0).unwrap();
+    assert_eq!(latest(home.path()).0, Some(0.0));
+}
+
+#[test]
+fn shared_pool_windows_persist_once_with_full_membership() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let shared = normalize(&json!({
+        "version": 1,
+        "windows": [
+            {"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.6"],
+             "remaining_percent":42.5,"observed_at":1000.0},
+            {"pool":"primary","window":"monthly_mcp","models":["glm-4.7"],
+             "remaining_percent":90.0,"observed_at":1000.0}
+        ]
+    }))
+    .unwrap();
+    let revision = record_quota_snapshot(home.path(), "glm", &shared, 100, 1500.0).unwrap();
+    assert_eq!(revision, 1);
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let rows: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 2, "one row per physical window, not per model");
+    let five_hour: String = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE window='five_hour'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(five_hour.contains("glm-4.7") && five_hour.contains("glm-4.6"));
 }
 
 #[test]
@@ -154,16 +272,17 @@ fn malformed_rounds_and_noop_rounds_leave_history_and_revision_untouched() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
     let good = normalize(&json!({
+        "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
                      "remaining_percent":50.0,"observed_at":1000.0}]
     }))
     .unwrap();
     let r1 = record_quota_snapshot(home.path(), "glm", &good, 100, 1000.0).unwrap();
     // A timeout or malformed output never reaches persistence at all.
-    assert!(normalize(&json!({"windows": "garbage"})).is_err());
+    assert!(normalize(&json!({"version": 1, "windows": "garbage"})).is_err());
     assert!(normalize(&json!({})).is_err());
     // A structurally valid round with no windows mutates nothing.
-    let empty = normalize(&json!({"windows": []})).unwrap();
+    let empty = normalize(&json!({"version": 1, "windows": []})).unwrap();
     let r2 = record_quota_snapshot(home.path(), "glm", &empty, 100, 1100.0).unwrap();
     assert_eq!(r1, r2);
     let store = agent_run_store::Store::open(home.path()).unwrap();

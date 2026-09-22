@@ -1,8 +1,9 @@
 //! Embedded Lua collector engine boundary tests with fake HTTP fixtures.
 
 use agent_run_core::capacity::lua::{
-    run_collector, AllowedOrigin, AuthCapability, CollectorError, CollectorLimits, CollectorScript,
-    QuotaHttpClient, QuotaHttpError, QuotaHttpRequest, QuotaHttpResponse, ScriptRegistry,
+    run_collector, AllowedOrigin, AuthCapability, AuthPlacement, CollectorError, CollectorLimits,
+    CollectorScript, QuotaHttpClient, QuotaHttpError, QuotaHttpRequest, QuotaHttpResponse,
+    ScriptRegistry,
 };
 use agent_run_core::capacity::quota::CollectorScope;
 use agent_run_domain::catalog::{AccountId, NormalizedQuotaSnapshot};
@@ -12,6 +13,7 @@ use std::{
     path::Path,
     str::FromStr,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tempfile::tempdir;
 
@@ -68,11 +70,30 @@ fn response(status: u16, headers: &[(&str, &str)], body: &str) -> QuotaHttpRespo
 }
 
 fn origins() -> Vec<AllowedOrigin> {
-    vec![AllowedOrigin {
-        scheme: "https".into(),
-        host: "api.test".into(),
-        port: 443,
-    }]
+    vec![AllowedOrigin::new("https", "api.test", 443).unwrap()]
+}
+
+fn account() -> AccountId {
+    AccountId::from_str("acct-main").unwrap()
+}
+
+fn auth() -> AuthCapability {
+    AuthCapability::new(
+        account(),
+        AuthPlacement::RawAuthorization,
+        SECRET.into(),
+        origins(),
+    )
+    .unwrap()
+}
+
+fn scope(_script: &CollectorScript) -> CollectorScope {
+    CollectorScope {
+        runtime: "glm".into(),
+        // Stable collector identity: a script revision must not fork pools.
+        source: "glm-native".into(),
+        models: BTreeSet::from(["glm-4.7".to_owned()]),
+    }
 }
 
 async fn run(
@@ -80,22 +101,24 @@ async fn run(
     limits: CollectorLimits,
     client: Arc<dyn QuotaHttpClient>,
 ) -> Result<NormalizedQuotaSnapshot, CollectorError> {
+    run_with(source, limits, client, auth()).await
+}
+
+async fn run_with(
+    source: &str,
+    limits: CollectorLimits,
+    client: Arc<dyn QuotaHttpClient>,
+    auth: AuthCapability,
+) -> Result<NormalizedQuotaSnapshot, CollectorError> {
     let script = CollectorScript::new(source);
-    let scope = CollectorScope {
-        runtime: "glm".into(),
-        source: format!("lua:{}", &script.sha256[..8]),
-        models: BTreeSet::from(["glm-4.7".to_owned()]),
-    };
     let models = BTreeMap::from([("glm-4.7".to_owned(), json!({"tier": "pro"}))]);
-    let auth = AuthCapability::new(SECRET.into(), vec![SECRET.to_owned()]);
     run_collector(
         &script,
-        &scope,
-        &AccountId::from_str("acct-main").unwrap(),
+        &scope(&script),
+        &account(),
         &models,
         1000.0,
         &limits,
-        &origins(),
         client,
         &auth,
     )
@@ -104,8 +127,8 @@ async fn run(
 
 fn fast() -> CollectorLimits {
     CollectorLimits {
-        invocation_timeout: std::time::Duration::from_secs(5),
-        http_request_timeout: std::time::Duration::from_secs(2),
+        invocation_timeout: Duration::from_secs(5),
+        http_request_timeout: Duration::from_secs(2),
         ..CollectorLimits::default()
     }
 }
@@ -117,17 +140,11 @@ collect = function(ctx)
   assert(ctx.models["glm-4.7"].tier == "pro", "explicit model config")
   assert(ctx.now == 1000.0, "host time")
   local r = ctx.http.request({url = "https://api.test/quota"})
-  local data = require_nothing(r)
-  return { windows = data }
-end
-function require_nothing(r)
-  local decoded = json_decode(r.body)
-  return decoded
-end
-function json_decode(body)
-  local limits = body:match('"remaining_percent":([%d%.]+)')
-  return { { pool = "primary", window = "five_hour", models = {"glm-4.7"},
-            remaining_percent = tonumber(limits), observed_at = 1000.0 } }
+  local data = ctx.json.decode(r.body)
+  assert(ctx.time.rfc3339("1970-01-01T00:16:40Z") == 1000.0, "host time parser")
+  return { version = 1, windows = { { pool = "primary", window = "five_hour",
+    models = {"glm-4.7"}, remaining_percent = data.remaining_percent,
+    reset_at = data.reset_at, observed_at = 1000.0 } } }
 end
 "#;
 
@@ -136,11 +153,11 @@ async fn valid_collection_binds_account_and_injects_authorization_in_rust() {
     let client = FakeHttp::new(vec![response(
         200,
         &[],
-        r#"{"remaining_percent":42.5,"limits":{}}"#,
+        r#"{"remaining_percent":42.5,"reset_at":2000.0}"#,
     )]);
     let snapshot = run(GOOD_SCRIPT, fast(), client.clone()).await.unwrap();
     snapshot.validate().unwrap();
-    assert_eq!(snapshot.account, AccountId::from_str("acct-main").unwrap());
+    assert_eq!(snapshot.account, account());
     assert_eq!(
         snapshot.models[0].pools[0].key.as_str(),
         "acct-main::primary"
@@ -154,6 +171,23 @@ async fn valid_collection_binds_account_and_injects_authorization_in_rust() {
         .expect("authorization injected by Rust");
     assert_eq!(name, "authorization");
     assert_eq!(value, SECRET);
+}
+
+#[tokio::test]
+async fn secret_holders_never_leak_through_debug() {
+    // Root repro 1: derived Debug of the capability and of the injected
+    // request must never contain credential material.
+    let capability = auth();
+    assert!(!format!("{capability:?}").contains(SECRET));
+    let client = FakeHttp::new(vec![response(200, &[], "{}")]);
+    run(GOOD_SCRIPT, fast(), client.clone()).await.unwrap();
+    let requests = client.requests.lock().unwrap();
+    let debug = format!("{:?}", requests[0]);
+    assert!(
+        !debug.contains(SECRET),
+        "request Debug must be redacted: {debug}"
+    );
+    assert!(debug.contains("[redacted]"));
 }
 
 #[tokio::test]
@@ -174,7 +208,6 @@ async fn forbidden_origin_is_rejected_before_any_credential_access() {
         "https://user:pass@api.test/quota",
         "https://api.test/quota#frag",
         "https://api.test:8443/quota",
-        "http://api.test/quota",
     ] {
         let client = FakeHttp::new(vec![]);
         let script = format!("collect = function(ctx) ctx.http.request({{url = \"{url}\"}}) end");
@@ -182,6 +215,48 @@ async fn forbidden_origin_is_rejected_before_any_credential_access() {
         assert_eq!(err, CollectorError::Http(QuotaHttpError::OriginForbidden));
         assert_eq!(client.issued(), 0);
     }
+}
+
+#[tokio::test]
+async fn non_https_origins_are_rejected_at_construction_and_invocation() {
+    // Root repro 3: plain HTTP away from loopback can never become an origin.
+    assert!(AllowedOrigin::new("http", "api.example.com", 80).is_err());
+    let loopback = AllowedOrigin::new("http", "127.0.0.1", 8080).unwrap();
+    assert!(loopback.allows("http://127.0.0.1:8080/quota"));
+    assert!(!loopback.allows("http://127.0.0.1:8081/quota"));
+    // A capability built with an invalid origin cannot be constructed at all,
+    // so no invocation can be widened to it through the public API.
+    assert!(AuthCapability::new(
+        account(),
+        AuthPlacement::RawAuthorization,
+        SECRET.into(),
+        vec![AllowedOrigin {
+            scheme: "http".into(),
+            host: "api.example.com".into(),
+            port: 80,
+        }],
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn capability_is_bound_to_one_account() {
+    let other = AuthCapability::new(
+        AccountId::from_str("acct-other").unwrap(),
+        AuthPlacement::RawAuthorization,
+        SECRET.into(),
+        origins(),
+    )
+    .unwrap();
+    let err = run_with(
+        "collect = function(ctx) end",
+        fast(),
+        FakeHttp::new(vec![]),
+        other,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, CollectorError::Internal("auth_account"));
 }
 
 #[tokio::test]
@@ -199,7 +274,7 @@ async fn cross_origin_redirects_are_rejected_and_same_origin_followed() {
 
     let client = FakeHttp::new(vec![
         response(302, &[("location", "https://api.test/other")], ""),
-        response(200, &[], r#"{"remaining_percent":11.0}"#),
+        response(200, &[], r#"{"remaining_percent":11.0,"reset_at":2000.0}"#),
     ]);
     let snapshot = run(GOOD_SCRIPT, fast(), client.clone()).await.unwrap();
     assert_eq!(
@@ -207,6 +282,150 @@ async fn cross_origin_redirects_are_rejected_and_same_origin_followed() {
         Some(11.0)
     );
     assert_eq!(client.issued(), 2);
+}
+
+#[tokio::test]
+async fn redirect_hops_count_against_the_shared_budget() {
+    // Three same-origin hops under a budget of two: exactly two attempts run.
+    let client = FakeHttp::new(vec![
+        response(302, &[("location", "https://api.test/a")], ""),
+        response(302, &[("location", "https://api.test/b")], ""),
+        response(200, &[], r#"{"remaining_percent":1.0}"#),
+    ]);
+    let limits = CollectorLimits {
+        http_requests: 2,
+        ..fast()
+    };
+    let err = run(GOOD_SCRIPT, limits, client.clone()).await.unwrap_err();
+    assert_eq!(err, CollectorError::Http(QuotaHttpError::BudgetExhausted));
+    assert_eq!(client.issued(), 2, "every hop consumes the budget");
+}
+
+#[tokio::test]
+async fn exhausted_budget_stays_exhausted_through_pcall_retries() {
+    // Root finding E: pcall catching each failure must not buy more requests
+    // than the budget allows; successes are counted from granted requests.
+    let ok_responses: Vec<QuotaHttpResponse> = (0..20).map(|_| response(200, &[], "{}")).collect();
+    let client = FakeHttp::new(ok_responses);
+    let limits = CollectorLimits {
+        http_requests: 4,
+        ..fast()
+    };
+    let script = r#"
+collect = function(ctx)
+  local granted = 0
+  for i = 1, 20 do
+    local ok = pcall(function() ctx.http.request({url = "https://api.test/q"}) end)
+    if ok then granted = granted + 1 end
+  end
+  return { version = 1, windows = { { pool = "primary", window = "five_hour",
+    models = {"glm-4.7"}, remaining_percent = granted, observed_at = 1000.0 } } }
+end
+"#;
+    let snapshot = run(script, limits, client.clone()).await.unwrap();
+    assert_eq!(client.issued(), 4, "checked budget never underflows");
+    assert_eq!(
+        snapshot.models[0].pools[0].windows[0].remaining_percent,
+        Some(4.0)
+    );
+}
+
+#[tokio::test]
+async fn script_supplied_auth_and_routing_headers_are_blocked() {
+    for header in [
+        "authorization",
+        "Authorization",
+        "host",
+        "proxy-authorization",
+    ] {
+        let client = FakeHttp::new(vec![]);
+        let script = format!(
+            r#"collect = function(ctx)
+  local ok = pcall(function()
+    ctx.http.request({{url = "https://api.test/q", headers = {{["{header}"] = "x"}} }})
+  end)
+  if ok then error("override accepted") end
+  return {{ version = 1, windows = {{ {{ pool = "primary", window = "five_hour",
+    models = {{"glm-4.7"}}, remaining_percent = 5.0, observed_at = 1000.0 }} }} }}
+end
+"#
+        );
+        let snapshot = run(&script, fast(), client.clone()).await.unwrap();
+        assert_eq!(snapshot.models.len(), 1, "header {header} blocked");
+        assert_eq!(client.issued(), 0);
+    }
+    // Custom placement headers are equally protected from scripts.
+    let client = FakeHttp::new(vec![response(
+        200,
+        &[],
+        r#"{"remaining_percent":9.0,"reset_at":2000.0}"#,
+    )]);
+    let gateway = AuthCapability::new(
+        account(),
+        AuthPlacement::Header("x-api-key".into()),
+        SECRET.into(),
+        origins(),
+    )
+    .unwrap();
+    let script = r#"
+collect = function(ctx)
+  local ok = pcall(function()
+    ctx.http.request({url = "https://api.test/q", headers = {["x-api-key"] = "spoof"} })
+  end)
+  if ok then error("x-api-key override accepted") end
+  local r = ctx.http.request({url = "https://api.test/q"})
+  local v = r.body:match('"remaining_percent":([%d%.]+)')
+  return { version = 1, windows = { { pool = "primary", window = "five_hour",
+    models = {"glm-4.7"}, remaining_percent = tonumber(v), observed_at = 1000.0 } } }
+end
+"#;
+    let snapshot = run_with(script, fast(), client.clone(), gateway)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.models[0].pools[0].windows[0].remaining_percent,
+        Some(9.0)
+    );
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(
+        requests[0].headers[0],
+        ("x-api-key".to_owned(), SECRET.to_owned())
+    );
+}
+
+#[tokio::test]
+async fn echoed_credentials_are_scrubbed_before_lua_can_read_them() {
+    // Root finding B: a fixture echoing the injected secret in body and
+    // headers must not let the script observe it.
+    let echo = format!("{{\"echo\":\"{SECRET}\",\"remaining_percent\":42.0}}");
+    let client = FakeHttp::new(vec![response(
+        200,
+        &[
+            ("x-echo-auth", SECRET),
+            ("content-type", "application/json"),
+        ],
+        &echo,
+    )]);
+    let needle = &SECRET["synthetic-secret".len()..];
+    let script = format!(
+        r#"
+collect = function(ctx)
+  local r = ctx.http.request({{url = "https://api.test/quota"}})
+  local leaked = (r.body:find("{needle}", 1, true) ~= nil)
+    or (r.headers["x-echo-auth"] ~= nil and r.headers["x-echo-auth"]:find("{needle}", 1, true) ~= nil)
+  local v = r.body:match('"remaining_percent":([%d%.]+)')
+  if leaked then v = "55.0" end
+  return {{ version = 1, windows = {{ {{ pool = "primary", window = "five_hour",
+    models = {{"glm-4.7"}}, remaining_percent = tonumber(v), observed_at = 1000.0 }} }} }}
+end
+"#
+    );
+    let snapshot = run(&script, fast(), client).await.unwrap();
+    assert_eq!(
+        snapshot.models[0].pools[0].windows[0].remaining_percent,
+        Some(42.0),
+        "secret material must not be observable from Lua"
+    );
 }
 
 #[tokio::test]
@@ -226,7 +445,7 @@ async fn instruction_budget_and_wall_deadline_abort_cpu_loops() {
 
     let limits = CollectorLimits {
         instructions: 100_000_000,
-        invocation_timeout: std::time::Duration::from_millis(150),
+        invocation_timeout: Duration::from_millis(150),
         ..fast()
     };
     let err = run(
@@ -237,6 +456,46 @@ async fn instruction_budget_and_wall_deadline_abort_cpu_loops() {
     .await
     .unwrap_err();
     assert_eq!(err, CollectorError::Timeout);
+}
+
+#[tokio::test]
+async fn catchable_hook_errors_cannot_outrun_the_invocation_deadline() {
+    // Root finding G, executed repro: hook errors are ordinary catchable Lua
+    // errors and the outer async timeout cannot preempt a poll that never
+    // yields. The guarded pcall/xpcall escalation must terminate this exact
+    // script on its own, with a typed bound failure and no external kill.
+    let limits = CollectorLimits {
+        invocation_timeout: Duration::from_millis(100),
+        ..fast()
+    };
+    let exact = "while true do pcall(function() while true do end end) end";
+    for script in [
+        exact,
+        // The same escape through xpcall and a coroutine resumer.
+        "local co = coroutine.wrap(function() local x = 0 while true do x = x + 1 end end) \
+         while true do xpcall(co, function() end) pcall(function() local y = 0 while true do y = y + 1 end end) end",
+        // An instruction-budget catcher collapses the same way.
+        "while true do pcall(function() local x = 0 while true do x = x + 1 end end) end",
+    ] {
+        let limits = if script == exact {
+            limits
+        } else {
+            CollectorLimits {
+                instructions: 10_000,
+                ..limits
+            }
+        };
+        let started = Instant::now();
+        let err = run(script, limits, FakeHttp::new(vec![])).await.unwrap_err();
+        assert!(
+            matches!(err, CollectorError::Timeout | CollectorError::InstructionLimit),
+            "unexpected {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "terminated on its own without a watchdog"
+        );
+    }
 }
 
 #[tokio::test]
@@ -263,8 +522,8 @@ async fn unsafe_libraries_and_loaders_are_absent() {
 collect = function(ctx)
   assert(io == nil and os == nil and debug == nil and package == nil, "unsafe library present")
   assert(load == nil and loadstring == nil and dofile == nil and require == nil, "loader present")
-  return { windows = { { pool = "primary", window = "five_hour", models = {"glm-4.7"},
-                        remaining_percent = 5.0, observed_at = 1000.0 } } }
+  return { version = 1, windows = { { pool = "primary", window = "five_hour",
+    models = {"glm-4.7"}, remaining_percent = 5.0, observed_at = 1000.0 } } }
 end
 "#,
         fast(),
@@ -294,53 +553,41 @@ async fn bytecode_and_tampered_scripts_are_rejected() {
 
     let mut tampered = CollectorScript::new("collect = function(ctx) end");
     tampered.sha256 = "0".repeat(64);
-    let scope = CollectorScope {
-        runtime: "glm".into(),
-        source: "lua:t".into(),
-        models: BTreeSet::from(["glm-4.7".to_owned()]),
-    };
+    let models = BTreeMap::new();
     let err = run_collector(
         &tampered,
-        &scope,
-        &AccountId::from_str("acct-main").unwrap(),
-        &BTreeMap::new(),
+        &scope(&tampered),
+        &account(),
+        &models,
         1000.0,
         &fast(),
-        &origins(),
         FakeHttp::new(vec![]),
-        &AuthCapability::new(SECRET.into(), vec![SECRET.to_owned()]),
+        &auth(),
     )
     .await
     .unwrap_err();
     assert_eq!(err, CollectorError::ScriptTampered);
+}
 
-    // A retained registry revision survives a rejected replacement.
+#[tokio::test]
+async fn registry_rejects_non_compiling_replacement_and_keeps_valid_revision() {
+    // Root repro 2: a syntax-invalid script must never displace a retained
+    // valid revision, and installation compiles in text mode first.
     let mut registry = ScriptRegistry::default();
     let valid = CollectorScript::new("collect = function(ctx) end");
-    registry.install("glm", valid.clone()).unwrap();
-    let mut bad = CollectorScript::new("collect = function(ctx) end");
-    bad.sha256 = "1".repeat(64);
-    assert!(registry.install("glm", bad).is_err());
+    registry.install("glm", valid.clone(), &fast()).unwrap();
+    assert!(registry
+        .install(
+            "glm",
+            CollectorScript::new("this is not valid Lua !!!!!"),
+            &fast()
+        )
+        .is_err());
     assert_eq!(registry.get("glm"), Some(&valid));
 }
 
 #[tokio::test]
 async fn request_budget_response_bound_and_output_bound_are_enforced() {
-    // Shared request budget: 8 requests, script asks for 9.
-    let responses: Vec<_> = (0..9)
-        .map(|_| response(200, &[], r#"{"remaining_percent":1.0}"#))
-        .collect();
-    let client = FakeHttp::new(responses);
-    let err = run(
-        r#"collect = function(ctx) for i = 1, 9 do ctx.http.request({url = "https://api.test/q"}) end end"#,
-        fast(),
-        client.clone(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err, CollectorError::Http(QuotaHttpError::BudgetExhausted));
-    assert_eq!(client.issued(), 8);
-
     // Response body bound.
     let big = "x".repeat(3 * 1024 * 1024);
     let client = FakeHttp::new(vec![response(200, &[], &big)]);
@@ -348,7 +595,7 @@ async fn request_budget_response_bound_and_output_bound_are_enforced() {
     assert_eq!(err, CollectorError::Http(QuotaHttpError::BodyTooLarge));
 
     // Output window bound.
-    let script = "collect = function(ctx) return { windows = { \
+    let script = "collect = function(ctx) return { version = 1, windows = { \
         { pool = 'primary', window = 'w0', models = {'glm-4.7'}, observed_at = 1000.0 }, \
         { pool = 'primary', window = 'w1', models = {'glm-4.7'}, observed_at = 1000.0 }, \
         { pool = 'primary', window = 'w2', models = {'glm-4.7'}, observed_at = 1000.0 } } } end";
@@ -356,10 +603,23 @@ async fn request_budget_response_bound_and_output_bound_are_enforced() {
         output_windows: 2,
         ..fast()
     };
-    let err = run(&script, limits, FakeHttp::new(vec![]))
+    let err = run(script, limits, FakeHttp::new(vec![]))
         .await
         .unwrap_err();
     assert_eq!(err, CollectorError::InvalidOutput("quota_output_overflow"));
+
+    // Limits themselves are validated before anything runs.
+    let err = run(
+        "collect = function(ctx) end",
+        CollectorLimits {
+            instructions: 0,
+            ..fast()
+        },
+        FakeHttp::new(vec![]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, CollectorError::Internal("limits"));
 }
 
 #[tokio::test]
@@ -371,7 +631,20 @@ async fn malformed_and_foreign_outputs_fail_with_stable_categories() {
     )
     .await
     .unwrap_err();
-    assert_eq!(err, CollectorError::InvalidOutput("quota_output_malformed"));
+    assert_eq!(
+        err,
+        CollectorError::InvalidOutput("quota_output_version"),
+        "version envelope is mandatory"
+    );
+
+    let err = run(
+        r#"collect = function(ctx) return { windows = {} } end"#,
+        fast(),
+        FakeHttp::new(vec![]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, CollectorError::InvalidOutput("quota_output_version"));
 
     let err = run(
         r#"collect = function(ctx) return 42 end"#,
@@ -384,7 +657,7 @@ async fn malformed_and_foreign_outputs_fail_with_stable_categories() {
 
     let err = run(
         r#"collect = function(ctx)
-              return { windows = { { pool = "primary", window = "five_hour",
+              return { version = 1, windows = { { pool = "primary", window = "five_hour",
                                      models = {"gpt-5.1"}, remaining_percent = 1.0,
                                      observed_at = 1000.0 } } }
            end"#,
@@ -400,7 +673,7 @@ async fn malformed_and_foreign_outputs_fail_with_stable_categories() {
 
     let err = run(
         r#"collect = function(ctx)
-              return { windows = { { pool = "primary", window = "five_hour",
+              return { version = 1, windows = { { pool = "primary", window = "five_hour",
                                      models = {"glm-4.7"}, remaining_percent = 101.0,
                                      observed_at = 1000.0 } } }
            end"#,
@@ -414,18 +687,21 @@ async fn malformed_and_foreign_outputs_fail_with_stable_categories() {
         CollectorError::InvalidOutput("quota_output_invalid_number")
     );
 
-    // Limits themselves are validated before anything runs.
     let err = run(
-        "collect = function(ctx) end",
-        CollectorLimits {
-            instructions: 0,
-            ..fast()
-        },
+        r#"collect = function(ctx)
+              return { version = 1, windows = { { pool = "primary", window = "five_hour",
+                                     models = {"glm-4.7"}, remaining_percent = 1.0,
+                                     observed_at = 100000.0 } } }
+           end"#,
+        fast(),
         FakeHttp::new(vec![]),
     )
     .await
     .unwrap_err();
-    assert_eq!(err, CollectorError::Internal("limits"));
+    assert_eq!(
+        err,
+        CollectorError::InvalidOutput("quota_output_invalid_time")
+    );
 }
 
 #[tokio::test]
@@ -445,12 +721,75 @@ async fn secrets_never_surface_in_errors_or_diagnostics() {
     assert!(!format!("{err}").contains(SECRET));
     assert!(!format!("{err:?}").contains(SECRET));
 
-    // The redaction helper scrubs every known marker.
-    let auth = AuthCapability::new(SECRET.into(), vec![SECRET.to_owned()]);
+    // The redaction helper scrubs every known marker, value first.
+    let auth = auth();
     assert_eq!(
         auth.redact(&format!("head {SECRET} tail")),
         "head [redacted] tail"
     );
+}
+
+#[tokio::test]
+async fn host_json_and_time_primitives_are_bounded_and_static() {
+    // The JSON host primitive decodes real bodies and surfaces only static
+    // categories; encode is bounded by the same body bound.
+    let client = FakeHttp::new(vec![response(
+        200,
+        &[],
+        r#"{"remaining_percent":42.5,"reset_at":2000.0}"#,
+    )]);
+    let snapshot = run(GOOD_SCRIPT, fast(), client).await.unwrap();
+    let window = &snapshot.models[0].pools[0].windows[0];
+    assert_eq!(window.remaining_percent, Some(42.5));
+    assert_eq!(window.reset_at, Some(2000.0));
+
+    let script = r#"
+collect = function(ctx)
+  local ok1 = pcall(function() ctx.json.decode("{not json") end)
+  local ok2, text = pcall(function() return ctx.json.encode({a = 1}) end)
+  assert(ok2 and text == '{"a":1}', "encode roundtrip")
+  assert(ctx.time.rfc3339("garbage") == nil, "unparseable stays unknown")
+  if ok1 then error("malformed JSON accepted") end
+  return { version = 1, windows = { { pool = "primary", window = "five_hour",
+    models = {"glm-4.7"}, remaining_percent = 1.0, observed_at = 1000.0 } } }
+end
+"#;
+    let snapshot = run(script, fast(), FakeHttp::new(vec![])).await.unwrap();
+    assert_eq!(snapshot.models.len(), 1);
+
+    // Oversized decode input is rejected by the static bound.
+    let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(4096));
+    let script = format!(
+        r#"collect = function(ctx)
+  local ok = pcall(function() ctx.json.decode({}) end)
+  if ok then error("oversized JSON accepted") end
+  return {{ version = 1, windows = {{ {{ pool = "primary", window = "five_hour",
+    models = {{"glm-4.7"}}, remaining_percent = 1.0, observed_at = 1000.0 }} }} }}
+end
+"#,
+        string_literal(&big)
+    );
+    let limits = CollectorLimits {
+        http_response_body_bytes: 1024,
+        ..fast()
+    };
+    let snapshot = run(&script, limits, FakeHttp::new(vec![])).await.unwrap();
+    assert_eq!(snapshot.models.len(), 1);
+}
+
+/// Encodes `text` as a quoted Lua string literal with escapes.
+fn string_literal(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[tokio::test]
@@ -462,27 +801,20 @@ async fn collector_output_persists_through_the_quota_store_path() {
     let script = CollectorScript::new(
         r#"
 collect = function(ctx)
-  return { windows = { { pool = "primary", window = "five_hour", models = {"glm-4.7"},
+  return { version = 1, windows = { { pool = "primary", window = "five_hour", models = {"glm-4.7"},
                         remaining_percent = 0.0, reset_at = 2000.0, observed_at = ctx.now } } }
 end
 "#,
     );
-    let scope = CollectorScope {
-        runtime: "glm".into(),
-        source: format!("lua:{}", &script.sha256[..8]),
-        models: BTreeSet::from(["glm-4.7".to_owned()]),
-    };
-    let auth = AuthCapability::new(SECRET.into(), vec![SECRET.to_owned()]);
     let snapshot = run_collector(
         &script,
-        &scope,
-        &AccountId::from_str("acct-main").unwrap(),
+        &scope(&script),
+        &account(),
         &BTreeMap::from([("glm-4.7".to_owned(), json!({}))]),
         1000.0,
         &fast(),
-        &origins(),
         FakeHttp::new(vec![]),
-        &auth,
+        &auth(),
     )
     .await
     .unwrap();

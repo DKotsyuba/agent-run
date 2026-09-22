@@ -57,21 +57,39 @@ fn finite(value: Option<&Value>, code: &'static str) -> Result<Option<f64>> {
 /// `pool` (physical lane), `window`, a nonempty explicit `models` list, an
 /// optional `remaining_percent` (absent or null means unknown), optional
 /// `reset_at`, required `observed_at`, and optional `valid_until` defaulting
-/// to `observed_at + DEFAULT_WINDOW_TTL_SECONDS`. Unknown entry keys, foreign
-/// or unconfigured models, duplicate or conflicting pool windows, nonfinite or
-/// out-of-range numbers, inverted times, and outputs above
-/// [`MAX_OUTPUT_WINDOWS`]/[`MAX_OUTPUT_MODELS`] are rejected before any fact
-/// is bound to `account`; the account identity itself comes only from Rust.
-/// Returns a snapshot that already passed [`NormalizedQuotaSnapshot::validate`].
+/// to `observed_at + DEFAULT_WINDOW_TTL_SECONDS`. The envelope must declare
+/// `version` exactly `1` and carry no other top-level key; entry keys are
+/// closed the same way. `observed_at` may not lie in the future of `host_now`.
+/// Foreign or unconfigured models, repeated model names, duplicate or
+/// conflicting pool windows, nonfinite or out-of-range numbers, inverted
+/// times, and outputs above [`MAX_OUTPUT_WINDOWS`]/[`MAX_OUTPUT_MODELS`] are
+/// rejected before any fact is bound to `account`; the account identity
+/// itself comes only from Rust. Returns a snapshot that already passed
+/// [`NormalizedQuotaSnapshot::validate`].
 pub fn normalize_collector_output(
     account: &AccountId,
     scope: &CollectorScope,
     raw: &Value,
+    host_now: f64,
     max_windows: usize,
     max_models: usize,
 ) -> Result<NormalizedQuotaSnapshot> {
     if max_windows == 0 || max_models == 0 || max_windows > MAX_OUTPUT_WINDOWS {
         return Err(invalid("invalid collector output bound"));
+    }
+    if !host_now.is_finite() || host_now < 0.0 {
+        return Err(invalid("quota_output_invalid_time"));
+    }
+    let envelope = raw
+        .as_object()
+        .ok_or_else(|| invalid("quota_output_malformed"))?;
+    if envelope.contains_key("version") == false
+        || envelope.get("version").and_then(Value::as_i64) != Some(1)
+        || envelope
+            .keys()
+            .any(|key| key != "version" && key != "windows")
+    {
+        return Err(invalid("quota_output_version"));
     }
     let entries = raw
         .get("windows")
@@ -139,7 +157,7 @@ pub fn normalize_collector_output(
         let observed_at = object
             .get("observed_at")
             .and_then(Value::as_f64)
-            .filter(|n| n.is_finite() && *n >= 0.0)
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= host_now)
             .ok_or_else(|| invalid("quota_output_invalid_time"))?;
         let valid_until = finite(object.get("valid_until"), "quota_output_invalid_time")?
             .unwrap_or(observed_at + DEFAULT_WINDOW_TTL_SECONDS);
@@ -155,7 +173,11 @@ pub fn normalize_collector_output(
             if !scope.models.contains(model) {
                 return Err(invalid("quota_output_foreign_model"));
             }
-            window_models.insert(model.to_owned());
+            // A repeated model name inside one window is a malformed claim,
+            // not an implicit second membership.
+            if !window_models.insert(model.to_owned()) {
+                return Err(invalid("quota_output_malformed"));
+            }
         }
         models_seen.extend(window_models.iter().cloned());
         if models_seen.len() > max_models {

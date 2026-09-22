@@ -16,7 +16,9 @@ use crate::{
 };
 use agent_run_domain::catalog::{AccountId, NormalizedQuotaSnapshot};
 use mlua::chunk::{AsChunk, ChunkMode};
-use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, VmState};
+use mlua::{
+    HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, StdLib, Value as LuaValue, VmState,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -25,7 +27,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -119,55 +121,80 @@ impl CollectorLimits {
 
 /// One exactly configured network origin a collector may request.
 ///
-/// Matching is exact on scheme, ASCII-lowercased host, and port; userinfo,
-/// fragments, and any other origin never match.
+/// Matching uses the same canonical `reqwest::Url` interpretation as the
+/// transport, so a URL can never pass one parser and be reinterpreted by
+/// another. HTTPS is required; plain HTTP exists only for explicit loopback
+/// fixtures. Userinfo, fragments, non-HTTP(S) schemes, and any looser or
+/// wildcard spelling never match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowedOrigin {
-    /// Only `https` in production; `http` exists for explicit loopback fixtures.
+    /// `https`, or `http` only for an explicit loopback fixture.
     pub scheme: String,
     /// Exact host, no wildcards.
     pub host: String,
-    /// Explicit port.
+    /// Explicit port compared against the URL's effective port.
     pub port: u16,
 }
 
-/// Minimal strict URL parser producing an origin triple, or `None` for any
-/// URL with a non-HTTP(S) scheme, userinfo, fragment, or malformed authority.
-///
-/// Exists so the engine never depends on a URL crate's lenient parsing.
-fn parse_origin(url: &str) -> Option<(String, String, u16)> {
-    let (scheme, rest) = url.split_once("://")?;
-    if !matches!(scheme, "http" | "https") || rest.is_empty() {
-        return None;
-    }
-    if url.contains('#') {
-        return None;
-    }
-    let authority = rest.split(['/', '?']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse::<u16>().ok()?),
-        None => (authority, if scheme == "https" { 443 } else { 80 }),
-    };
-    if host.is_empty() || port == 0 {
-        return None;
-    }
-    Some((scheme.to_owned(), host.to_ascii_lowercase(), port))
-}
-
 impl AllowedOrigin {
-    /// Returns whether `url` names exactly this origin and nothing looser.
+    /// Validates one origin: HTTPS for production, plain HTTP only for
+    /// loopback fixtures (`localhost`, `127.0.0.1`, `::1`).
+    pub fn new(scheme: &str, host: &str, port: u16) -> Result<Self> {
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if host.is_empty() || host.len() > 253 || port == 0 {
+            return Err(invalid("invalid collector origin"));
+        }
+        match scheme {
+            "https" => {}
+            "http" if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") => {}
+            _ => return Err(invalid("collector origin must be https, or loopback http")),
+        }
+        Ok(Self {
+            scheme: scheme.into(),
+            host,
+            port,
+        })
+    }
+
+    /// Returns the canonical `(scheme, host, effective port)` of `url` using
+    /// `reqwest::Url`, or `None` when it carries userinfo, a fragment, a
+    /// non-HTTP(S) scheme, or no host.
+    pub fn canonical(url: &str) -> Option<(String, String, u16)> {
+        let url = reqwest::Url::parse(url).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let host = url
+            .host_str()?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let port = url.port_or_known_default()?;
+        (!host.is_empty()).then(|| (url.scheme().to_owned(), host, port))
+    }
+
+    /// Returns whether `url` names exactly this origin under the canonical
+    /// transport interpretation.
     pub fn allows(&self, url: &str) -> bool {
-        parse_origin(url).is_some_and(|(scheme, host, port)| {
-            scheme == self.scheme && host == self.host.to_ascii_lowercase() && port == self.port
+        Self::canonical(url).is_some_and(|(scheme, host, port)| {
+            scheme == self.scheme && host == self.host && port == self.port
         })
     }
 }
 
-/// One engine-validated HTTP request, never carrying authorization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One engine-validated HTTP request as handed to the transport.
+///
+/// The engine injects account authorization into `headers` after the origin
+/// check, so the derived [`fmt::Debug`] redacts every header value and body;
+/// no `{:?}` output of this type can carry credential bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct QuotaHttpRequest {
     /// `GET` or `POST`.
     pub method: String,
@@ -177,6 +204,26 @@ pub struct QuotaHttpRequest {
     pub headers: Vec<(String, String)>,
     /// Optional bounded body bytes.
     pub body: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for QuotaHttpRequest {
+    /// Redacts all header values and the body: this is the one type through
+    /// which injected credential material could otherwise reach a log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuotaHttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| (name, "[redacted]"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("body", &self.body.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 /// One completed HTTP response whose body the engine has already bounded.
@@ -205,6 +252,9 @@ pub enum QuotaHttpError {
     BodyTooLarge,
     /// Transport failure without any remote detail.
     Transport,
+    /// Script tried to set an auth or routing-control header; placement is
+    /// Rust-owned configuration.
+    HeaderForbidden,
 }
 
 impl fmt::Display for QuotaHttpError {
@@ -216,6 +266,7 @@ impl fmt::Display for QuotaHttpError {
             Self::RequestTimeout => "request_timeout",
             Self::BodyTooLarge => "body_too_large",
             Self::Transport => "transport",
+            Self::HeaderForbidden => "header_forbidden",
         };
         f.write_str(name)
     }
@@ -309,34 +360,141 @@ impl QuotaHttpClient for ReqwestQuotaHttp {
     }
 }
 
-/// The Rust-held authorization capability for one account.
+/// Where Rust places the account credential on an allowed request.
 ///
-/// The credential value never crosses into Lua; `markers` are the synthetic
-/// or real secret substrings scrubbed from any bounded diagnostic the engine
-/// could ever emit.
-#[derive(Debug, Clone)]
+/// Placement is explicit Rust configuration per provider contract: GLM quota
+/// uses a raw `Authorization` token (unlike its Bearer inference gateway),
+/// Claude-style OAuth uses `Bearer`, and gateway API keys use a named header.
+/// Lua never sees or overrides it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthPlacement {
+    /// `Authorization: <token>` exactly as stored.
+    RawAuthorization,
+    /// `Authorization: Bearer <token>`.
+    BearerAuthorization,
+    /// A named request header carrying the token (gateway API-key style).
+    Header(String),
+}
+
+impl AuthPlacement {
+    /// The exact header pair the engine injects after the origin check.
+    fn header(&self, value: &str) -> (String, String) {
+        match self {
+            Self::RawAuthorization => ("authorization".into(), value.to_owned()),
+            Self::BearerAuthorization => ("authorization".into(), format!("Bearer {value}")),
+            Self::Header(name) => (name.to_ascii_lowercase(), value.to_owned()),
+        }
+    }
+}
+
+/// The Rust-held authorization capability for exactly one account and its
+/// declared credential origins.
+///
+/// The capability is constructed bound to the selected global account and the
+/// validated origins it may authenticate against, so it cannot be paired with
+/// a different account or widen its origin set at invocation time. The
+/// credential value never crosses into Lua; the value itself is always a
+/// redaction marker, so scrubbing never depends solely on a caller-supplied
+/// marker list. The derived [`fmt::Debug`] is redacted.
 pub struct AuthCapability {
+    account: AccountId,
+    placement: AuthPlacement,
     value: Arc<str>,
     markers: Vec<String>,
+    origins: Vec<AllowedOrigin>,
+}
+
+impl fmt::Debug for AuthCapability {
+    /// Shows binding facts only; the credential value and marker contents
+    /// never appear in derived debug output.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthCapability")
+            .field("account", &self.account)
+            .field("placement", &self.placement)
+            .field("origins", &self.origins)
+            .field("markers", &self.markers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthCapability {
-    /// Builds the capability; `value` is the raw authorization token the
-    /// engine injects as `Authorization` on allowlisted origins.
-    pub fn new(value: Arc<str>, markers: Vec<String>) -> Self {
-        Self { value, markers }
+    /// Builds the capability for `account`, placing `value` per `placement`
+    /// on exactly `origins`; `origins` must be nonempty and each origin must
+    /// validate (HTTPS, or explicit loopback HTTP). The value itself is
+    /// registered as a redaction marker automatically.
+    pub fn new(
+        account: AccountId,
+        placement: AuthPlacement,
+        value: Arc<str>,
+        origins: Vec<AllowedOrigin>,
+    ) -> Result<Self> {
+        if origins.is_empty() || value.is_empty() {
+            return Err(invalid("capability needs a value and at least one origin"));
+        }
+        for origin in &origins {
+            AllowedOrigin::new(&origin.scheme, &origin.host, origin.port)?;
+        }
+        Ok(Self {
+            account,
+            placement,
+            markers: vec![value.to_string()],
+            value,
+            origins,
+        })
     }
 
-    /// Returns `text` with every known secret marker replaced.
+    /// The global account this capability is bound to.
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+
+    /// The exact origins this capability may authenticate against.
+    pub fn origins(&self) -> &[AllowedOrigin] {
+        &self.origins
+    }
+
+    /// The configured credential header pair the engine injects.
+    fn header_pair(&self) -> (String, String) {
+        self.placement.header(&self.value)
+    }
+
+    /// Returns `text` with the credential value and every extra marker
+    /// replaced.
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_owned();
-        for marker in self.markers.iter().filter(|m| !m.is_empty()) {
-            if out.contains(marker.as_str()) {
-                out = out.replace(marker.as_str(), "[redacted]");
+        for marker in self.secret_material() {
+            if !marker.is_empty() && out.contains(&marker) {
+                out = out.replace(&marker, "[redacted]");
             }
         }
         out
     }
+
+    /// The credential value first, then any additional markers.
+    fn secret_material(&self) -> Vec<String> {
+        let mut material = vec![self.value.to_string()];
+        material.extend(self.markers.iter().cloned());
+        material
+    }
+}
+
+/// Replaces every occurrence of `needle` in `haystack` with `replacement`.
+fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(replacement);
+            index += needle.len();
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 /// Stable typed failure categories for one collector invocation.
@@ -436,11 +594,39 @@ pub struct ScriptRegistry {
     scripts: BTreeMap<String, CollectorScript>,
 }
 
+/// Compiles `source` in text mode inside a bounded throwaway VM.
+///
+/// Compilation only: nothing executes, so a compile check has no top-level
+/// side effects, no network capability, and no `collect` call. Syntax-invalid
+/// sources are rejected here, before any invocation or registry replacement;
+/// the presence and contract of `collect(ctx)` is enforced per invocation.
+pub fn compile_check(source: &str, limits: &CollectorLimits) -> Result<()> {
+    let lua = Lua::new_with(
+        StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
+        LuaOptions::new(),
+    )
+    .map_err(|_| invalid("collector vm unavailable"))?;
+    lua.set_memory_limit(limits.vm_memory_bytes)
+        .map_err(|_| invalid("collector vm unavailable"))?;
+    lua.load(TextChunk(source.to_owned()))
+        .set_name("collector")
+        .into_function()
+        .map_err(|_| invalid("collector script does not compile"))?;
+    Ok(())
+}
+
 impl ScriptRegistry {
-    /// Installs `script` under `name` only when it verifies; the previous
-    /// revision is retained on any rejection.
-    pub fn install(&mut self, name: &str, script: CollectorScript) -> Result<()> {
+    /// Installs `script` under `name` only when it both verifies and
+    /// compiles in text mode; the previous revision is retained on any
+    /// rejection, so an invalid replacement never displaces a valid one.
+    pub fn install(
+        &mut self,
+        name: &str,
+        script: CollectorScript,
+        limits: &CollectorLimits,
+    ) -> Result<()> {
         script.verify()?;
+        compile_check(&script.source, limits)?;
         self.scripts.insert(name.to_owned(), script);
         Ok(())
     }
@@ -478,19 +664,58 @@ struct HttpState {
     origins: Vec<AllowedOrigin>,
     limits: CollectorLimits,
     auth_header: (String, String),
+    /// Credential material scrubbed from every response before Lua exposure.
+    secrets: Vec<String>,
 }
 
 impl HttpState {
-    /// Validates one script-supplied URL against the exact allowlist before
-    /// the credential is ever read, then decrements the shared budget.
+    /// Header names scripts may never set: the configured credential header
+    /// plus routing-control headers that could redirect or re-authenticate.
+    fn forbidden_header(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name == self.auth_header.0
+            || matches!(
+                name.as_str(),
+                "authorization" | "proxy-authorization" | "host" | "cookie" | "connection"
+            )
+    }
+
+    /// Validates one URL against the exact allowlist before the credential is
+    /// ever read, then atomically consumes one unit of the shared budget with
+    /// a checked compare-and-swap: an exhausted budget stays exhausted and
+    /// can never underflow or be retried past zero by a caught error.
     fn authorize(&self, url: &str) -> std::result::Result<String, QuotaHttpError> {
         if !self.origins.iter().any(|origin| origin.allows(url)) {
             return Err(QuotaHttpError::OriginForbidden);
         }
-        if self.budget.fetch_sub(1, Ordering::SeqCst) == 0 {
-            return Err(QuotaHttpError::BudgetExhausted);
+        let mut current = self.budget.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return Err(QuotaHttpError::BudgetExhausted);
+            }
+            match self.budget.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         Ok(url.to_owned())
+    }
+
+    /// Scrubs credential material from response bytes and header values
+    /// before anything is exposed to Lua.
+    fn scrub(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        for secret in &self.secrets {
+            if !secret.is_empty() {
+                out = replace_bytes(&out, secret.as_bytes(), b"[redacted]");
+            }
+        }
+        out
     }
 }
 
@@ -509,7 +734,6 @@ pub async fn run_collector(
     models: &BTreeMap<String, Value>,
     host_now: f64,
     limits: &CollectorLimits,
-    origins: &[AllowedOrigin],
     client: Arc<dyn QuotaHttpClient>,
     auth: &AuthCapability,
 ) -> std::result::Result<NormalizedQuotaSnapshot, CollectorError> {
@@ -525,9 +749,18 @@ pub async fn run_collector(
     if models.keys().any(|model| !scope.models.contains(model)) || !host_now.is_finite() {
         return Err(CollectorError::Internal("context"));
     }
+    // The capability is bound to exactly this account and its own validated
+    // origins; it cannot be paired with another account or widened here.
+    if auth.account() != account {
+        return Err(CollectorError::Internal("auth_account"));
+    }
+    for origin in auth.origins() {
+        AllowedOrigin::new(&origin.scheme, &origin.host, origin.port)
+            .map_err(|_| CollectorError::Internal("origins"))?;
+    }
     let deadline = Instant::now() + limits.invocation_timeout;
     let work = invoke(
-        script, scope, account, models, host_now, limits, origins, client, auth, deadline,
+        script, scope, account, models, host_now, limits, client, auth, deadline,
     );
     match tokio::time::timeout_at(deadline.into(), work).await {
         Ok(result) => result,
@@ -544,7 +777,6 @@ async fn invoke(
     models: &BTreeMap<String, Value>,
     host_now: f64,
     limits: &CollectorLimits,
-    origins: &[AllowedOrigin],
     client: Arc<dyn QuotaHttpClient>,
     auth: &AuthCapability,
     deadline: Instant,
@@ -558,14 +790,22 @@ async fn invoke(
         .map_err(|_| CollectorError::Internal("memory_limit"))?;
     let hook_instructions = Arc::new(AtomicU64::new(0));
     let instruction_budget = limits.instructions;
+    // Set once the wall deadline passes; every later hook tick errors and the
+    // guarded pcall/xpcall wrappers refuse, so a script that catches abort
+    // errors inside pcall or coroutines still collapses within bounded hook
+    // ticks and the invocation terminates on its own.
+    let deadline_exceeded = Arc::new(AtomicBool::new(false));
+    let hook_latch = deadline_exceeded.clone();
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(2_000),
         move |_, _| {
             let executed = hook_instructions.fetch_add(2_000, Ordering::Relaxed) + 2_000;
             if executed > u64::from(instruction_budget) {
+                hook_latch.store(true, Ordering::SeqCst);
                 return Err(mlua::Error::RuntimeError(INSTRUCTION_SENTINEL.into()));
             }
             if Instant::now() > deadline {
+                hook_latch.store(true, Ordering::SeqCst);
                 return Err(mlua::Error::RuntimeError(WALL_SENTINEL.into()));
             }
             Ok(VmState::Continue)
@@ -578,12 +818,35 @@ async fn invoke(
             .set(escape, mlua::Nil)
             .map_err(|_| CollectorError::Internal("sandbox"))?;
     }
+    // Guarded pcall/xpcall: identical to the originals, except that once the
+    // instruction or wall budget is exhausted they refuse to protect
+    // anything, so no catch loop can outlive the invocation. This is the only
+    // supported abort escalation for Lua 5.4, where hook errors are ordinary
+    // catchable errors and `set_interrupt` does not exist.
+    for name in ["pcall", "xpcall"] {
+        let real: mlua::Function = globals
+            .get(name)
+            .map_err(|_| CollectorError::Internal("sandbox"))?;
+        let latch = deadline_exceeded.clone();
+        let guarded = lua
+            .create_function(move |_lua, args: MultiValue| {
+                if latch.load(Ordering::SeqCst) {
+                    return Err(mlua::Error::RuntimeError(WALL_SENTINEL.into()));
+                }
+                real.call::<MultiValue>(args)
+            })
+            .map_err(|_| CollectorError::Internal("sandbox"))?;
+        globals
+            .set(name, guarded)
+            .map_err(|_| CollectorError::Internal("sandbox"))?;
+    }
 
     let request_state = Arc::new(HttpState {
         budget: AtomicU64::new(u64::from(limits.http_requests)),
-        origins: origins.to_vec(),
+        origins: auth.origins().to_vec(),
         limits: *limits,
-        auth_header: ("authorization".into(), auth.value.to_string()),
+        auth_header: auth.header_pair(),
+        secrets: auth.secret_material(),
     });
     let request = lua
         .create_async_function(move |lua, table: LuaValue| {
@@ -617,9 +880,9 @@ async fn invoke(
                         let (name, value) = pair.map_err(|_| {
                             mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}origin_forbidden"))
                         })?;
-                        if name.eq_ignore_ascii_case("authorization") {
+                        if state.forbidden_header(&name) {
                             return Err(mlua::Error::RuntimeError(format!(
-                                "{HTTP_SENTINEL}origin_forbidden"
+                                "{HTTP_SENTINEL}header_forbidden"
                             )));
                         }
                         headers.push((name, value));
@@ -637,7 +900,7 @@ async fn invoke(
                         body: body.clone(),
                     };
                     // Credential injection happens here, in Rust, only after
-                    // the origin check above has already passed.
+                    // the origin check and budget accounting have passed.
                     request.headers.push(state.auth_header.clone());
                     let response = tokio::time::timeout(
                         state.limits.http_request_timeout,
@@ -666,18 +929,28 @@ async fn invoke(
                             )));
                         }
                         remaining_redirects -= 1;
-                        let next = resolve_redirect(&current, &location).ok_or_else(|| {
-                            mlua::Error::RuntimeError(format!(
-                                "{HTTP_SENTINEL}cross_origin_redirect"
-                            ))
-                        })?;
-                        // No cross-origin credential redirects: the redirect
-                        // target must name the exact origin first requested.
-                        if parse_origin(&next) != parse_origin(&authorized) {
+                        // Resolve with the transport's own URL semantics.
+                        let next = reqwest::Url::parse(&current)
+                            .ok()
+                            .and_then(|base| base.join(&location).ok())
+                            .map(|url| url.to_string())
+                            .ok_or_else(|| {
+                                mlua::Error::RuntimeError(format!(
+                                    "{HTTP_SENTINEL}cross_origin_redirect"
+                                ))
+                            })?;
+                        // No cross-origin credential redirects: the target
+                        // must name the exact origin first requested, and
+                        // every hop re-authorizes against origin AND budget.
+                        if AllowedOrigin::canonical(&next) != AllowedOrigin::canonical(&authorized)
+                        {
                             return Err(mlua::Error::RuntimeError(format!(
                                 "{HTTP_SENTINEL}cross_origin_redirect"
                             )));
                         }
+                        state.authorize(&next).map_err(|error| {
+                            mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}{error}"))
+                        })?;
                         current = next;
                         continue;
                     }
@@ -686,6 +959,10 @@ async fn invoke(
                             "{HTTP_SENTINEL}body_too_large"
                         )));
                     }
+                    // Scrub credential material from body and headers before
+                    // anything is exposed to Lua, regardless of markers a
+                    // caller happened to supply.
+                    let scrubbed_body = state.scrub(&response.body);
                     let out = lua.create_table().map_err(|_| {
                         mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
                     })?;
@@ -694,7 +971,7 @@ async fn invoke(
                     })?;
                     out.set(
                         "body",
-                        lua.create_string(&response.body).map_err(|_| {
+                        lua.create_string(&scrubbed_body).map_err(|_| {
                             mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
                         })?,
                     )
@@ -702,10 +979,16 @@ async fn invoke(
                     let header_table = lua.create_table().map_err(|_| {
                         mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
                     })?;
-                    for (name, value) in response.headers {
-                        header_table.set(name, value).map_err(|_| {
-                            mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
-                        })?;
+                    for (name, value) in &response.headers {
+                        header_table
+                            .set(
+                                name.clone(),
+                                String::from_utf8_lossy(&state.scrub(value.as_bytes()))
+                                    .into_owned(),
+                            )
+                            .map_err(|_| {
+                                mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
+                            })?;
                     }
                     out.set("headers", header_table).map_err(|_| {
                         mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
@@ -756,6 +1039,68 @@ async fn invoke(
     ctx.set("http", http_table)
         .map_err(|_| CollectorError::Internal("context"))?;
 
+    // Bounded host JSON: `package`/`require` are absent, so safe decoding is
+    // a host primitive, not a script dependency. Both directions surface
+    // static error categories only and respect the response-body bound.
+    let json_table = lua
+        .create_table()
+        .map_err(|_| CollectorError::Internal("context"))?;
+    let json_bound = limits.http_response_body_bytes;
+    let decode = lua
+        .create_function(move |lua, (text,): (String,)| {
+            if text.len() > json_bound {
+                return Err(mlua::Error::RuntimeError("quota_json_overflow".into()));
+            }
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))?;
+            lua.to_value(&value)
+                .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))
+        })
+        .map_err(|_| CollectorError::Internal("context"))?;
+    let encode = lua
+        .create_function(move |lua, value: LuaValue| {
+            let value: Value = lua
+                .from_value(value)
+                .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))?;
+            let text = serde_json::to_string(&value)
+                .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))?;
+            if text.len() > json_bound {
+                return Err(mlua::Error::RuntimeError("quota_json_overflow".into()));
+            }
+            Ok(text)
+        })
+        .map_err(|_| CollectorError::Internal("context"))?;
+    json_table
+        .set("decode", decode)
+        .map_err(|_| CollectorError::Internal("context"))?;
+    json_table
+        .set("encode", encode)
+        .map_err(|_| CollectorError::Internal("context"))?;
+    ctx.set("json", json_table)
+        .map_err(|_| CollectorError::Internal("context"))?;
+
+    // Bounded host time helper: RFC 3339 reset fields become Unix seconds or
+    // nil for unparseable input, preserving unknowns instead of inventing.
+    let time_table = lua
+        .create_table()
+        .map_err(|_| CollectorError::Internal("context"))?;
+    let rfc3339 = lua
+        .create_function(|_, (text,): (String,)| {
+            if text.len() > 64 {
+                return Ok(LuaValue::Nil);
+            }
+            Ok(chrono::DateTime::parse_from_rfc3339(&text)
+                .ok()
+                .map(|value| value.timestamp_millis() as f64 / 1000.0)
+                .map_or(LuaValue::Nil, LuaValue::Number))
+        })
+        .map_err(|_| CollectorError::Internal("context"))?;
+    time_table
+        .set("rfc3339", rfc3339)
+        .map_err(|_| CollectorError::Internal("context"))?;
+    ctx.set("time", time_table)
+        .map_err(|_| CollectorError::Internal("context"))?;
+
     let function = lua
         .load(TextChunk(script.source.clone()))
         .set_name("collector")
@@ -776,6 +1121,7 @@ async fn invoke(
         account,
         scope,
         &json,
+        host_now,
         limits.output_windows,
         MAX_OUTPUT_MODELS,
     )
@@ -784,20 +1130,6 @@ async fn invoke(
         _ => CollectorError::MalformedOutput,
     })?;
     Ok(snapshot)
-}
-
-/// Resolves a `Location` value against the requested URL, rejecting anything
-/// but a same-origin absolute or path-absolute target.
-fn resolve_redirect(current: &str, location: &str) -> Option<String> {
-    let (scheme, host, port) = parse_origin(current)?;
-    if location.starts_with("http://") || location.starts_with("https://") {
-        let (ls, lh, lp) = parse_origin(location)?;
-        return (ls == scheme && lh == host && lp == port).then(|| location.to_owned());
-    }
-    if location.starts_with('/') && !location.contains("://") {
-        return Some(format!("{scheme}://{host}:{port}{location}"));
-    }
-    None
 }
 
 /// Maps an interpreter failure to its typed category, discarding all text
@@ -840,6 +1172,7 @@ fn parse_http_category(name: &str) -> Option<QuotaHttpError> {
         "request_timeout" => Some(QuotaHttpError::RequestTimeout),
         "body_too_large" => Some(QuotaHttpError::BodyTooLarge),
         "transport" => Some(QuotaHttpError::Transport),
+        "header_forbidden" => Some(QuotaHttpError::HeaderForbidden),
         _ => None,
     }
 }
@@ -849,6 +1182,7 @@ fn parse_http_category(name: &str) -> Option<QuotaHttpError> {
 fn leak_static(code: String) -> &'static str {
     match code.as_str() {
         "quota_output_malformed" => "quota_output_malformed",
+        "quota_output_version" => "quota_output_version",
         "quota_output_overflow" => "quota_output_overflow",
         "quota_output_foreign_model" => "quota_output_foreign_model",
         "quota_output_duplicate_window" => "quota_output_duplicate_window",
