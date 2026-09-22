@@ -247,6 +247,57 @@ fn latch_rows(home: &std::path::Path) -> i64 {
         .unwrap()
 }
 
+/// A no-data round cannot clear durable exhaustion or advance its revision.
+#[test]
+fn empty_observation_keeps_durable_exhaustion() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let exhausted = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                     "remaining_percent":0.0,"observed_at":1500.0,"valid_until":2500.0}]
+    }))
+    .unwrap();
+    let revision = record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1600.0).unwrap();
+    let empty = normalize(&json!({"version":1,"windows":[]})).unwrap();
+    let after = record_quota_snapshot(home.path(), "glm", &empty, 100, 1700.0).unwrap();
+    assert_eq!(
+        latch_rows(home.path()),
+        1,
+        "absence is not positive evidence"
+    );
+    assert_eq!(after, revision, "no-data round changes no quota facts");
+}
+
+/// An older positive sample cannot supersede a newer authoritative exhaustion,
+/// even while the older sample's own validity horizon has not expired.
+#[test]
+fn older_valid_observation_cannot_clear_newer_exhaustion() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let exhausted = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                     "remaining_percent":0.0,"observed_at":1500.0,"valid_until":2500.0}]
+    }))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1600.0).unwrap();
+    let older = normalize(&json!({
+        "version": 1,
+        "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
+                     "remaining_percent":60.0,"observed_at":1400.0,"valid_until":2500.0}]
+    }))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &older, 100, 1700.0).unwrap();
+    assert_eq!(
+        latch_rows(home.path()),
+        1,
+        "newer exhausted evidence must win"
+    );
+}
+
 #[test]
 fn persistence_requires_a_registered_account() {
     let home = tempdir().unwrap();
