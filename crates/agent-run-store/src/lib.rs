@@ -13,6 +13,8 @@ pub mod lineage;
 pub mod migrations;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
+/// Account-bound quota observation persistence and the exhaustion latch.
+pub mod quota;
 /// Python-compatible normalization and repair of cumulative run usage rows.
 pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
