@@ -118,6 +118,19 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
     process identity, and cleanup/session proof facts.
   * `provider_accounts` — the account registry (global id, auth family,
     secret reference, status).
+  * `capacity_samples.account_id` and `quota_key` — nullable together.
+    Historical samples retain both NULL and their original `runtime`/
+    `target` meanings. New provider samples reference a registered global
+    account and a physical key beginning with `<account_id>::` plus a
+    nonempty lane. Consumers read these explicit fields and never infer an
+    account from legacy target/runtime text.
+  * `quota_exhaustion` — durable physical-window facts independent of sample
+    retention. The primary key is `(account_id, quota_key, source, window_id)`;
+    rows also carry `observed_at`, optional `reset_at`, and optional
+    `collector_revision`. The account is registered, the key belongs to it,
+    and source/window ids are nonblank. `source` is a stable collector identity;
+    code revision is non-key metadata and cannot fork a latch. Deleting old
+    capacity samples cannot delete exhaustion rows.
   * `quota_capacity_revision` — one committed monotonic revision for the
     whole scored snapshot.
   * `attempt_quota_keys` — the exact physical key set consumed by each
@@ -126,6 +139,9 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
     Alias labels share the same keys, while distinct lanes remain distinct.
     A legacy NULL account may be bound once; a non-NULL selection and
     persisted quota keys cannot be changed to another identity.
+* The quota writer owns atomic exhaustion set/clear decisions and global
+  revision advancement. A positive clear requires fresh evidence no older
+  than the latched observation; this schema does not score or clear facts.
 * `attempts.ownership_active` (default 0) marks the attempt that owns the
   agent's execution slot. Ownership spans the entire orchestrated lifecycle —
   claim (prepared/starting), running, account switch, and cleanup-pending —

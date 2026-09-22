@@ -13,6 +13,38 @@ CREATE TABLE provider_accounts (
   UNIQUE (auth_family, secret_ref)
 );
 
+-- Historical capacity rows keep their original runtime/target identity and
+-- receive NULLs. New provider observations name the registered global account
+-- and its exact physical lane instead of overloading target.
+ALTER TABLE capacity_samples ADD COLUMN account_id TEXT
+  REFERENCES provider_accounts(account_id);
+ALTER TABLE capacity_samples ADD COLUMN quota_key TEXT
+  CHECK (
+    (account_id IS NULL AND quota_key IS NULL)
+    OR (account_id IS NOT NULL AND quota_key IS NOT NULL
+      AND substr(quota_key, 1, length(account_id) + 2) = account_id || '::'
+      AND length(quota_key) > length(account_id) + 2)
+  );
+CREATE INDEX idx_capacity_samples_account_key
+  ON capacity_samples(account_id, quota_key) WHERE account_id IS NOT NULL;
+
+-- Durable exhaustion survives bounded capacity_samples retention. Source is
+-- the stable collector identity; collector_revision is non-key metadata.
+CREATE TABLE quota_exhaustion (
+  account_id TEXT NOT NULL REFERENCES provider_accounts(account_id),
+  quota_key TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+  window_id TEXT NOT NULL CHECK (length(trim(window_id)) > 0),
+  observed_at REAL NOT NULL,
+  reset_at REAL,
+  collector_revision TEXT,
+  PRIMARY KEY (account_id, quota_key, source, window_id),
+  CHECK (
+    substr(quota_key, 1, length(account_id) + 2) = account_id || '::'
+    AND length(quota_key) > length(account_id) + 2
+  )
+);
+
 -- One committed revision for the entire scored snapshot. Each relevant quota
 -- mutation advances this singleton in the same transaction as its facts.
 CREATE TABLE quota_capacity_revision (
