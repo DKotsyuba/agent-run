@@ -174,6 +174,16 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(admitted["created"], true);
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let attempt = admitted["attempt_id"].as_str().unwrap().to_owned();
+    let stored_identity = Store::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap()
+        .identity
+        .unwrap()
+        .to_string();
+    assert!(!stored_identity.contains("synthetic-token"));
+    assert!(!stored_identity.contains("env:FAKE_TOKEN"));
+    fs::write(home.join("config.toml"), "schema_version=2\n").unwrap();
     let mut child = supervisor(&home, &id);
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
@@ -227,7 +237,6 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
         )
         .unwrap();
     assert_eq!(deliveries, 1);
-    fs::write(home.join("config.toml"), "schema_version=2\n").unwrap();
     let replay = service
         .admit_provider_trusted(request, candidates(0))
         .unwrap();
@@ -336,6 +345,45 @@ async fn provider_supervisor_refuses_tampered_role_authority() {
     assert_eq!(active, 0);
     assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
     assert_eq!(process, None);
+}
+
+/// A changed stored provider setting without the original snapshot digest
+/// cannot alter the model or executable after admission.
+#[tokio::test]
+async fn provider_supervisor_refuses_tampered_config_snapshot() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(0))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let store = Store::open(&home).unwrap();
+    let mut identity = store.get(&id).unwrap().identity.unwrap();
+    identity["provider_config"]["providers"]["glm-user"]["models"][0]["native_model"] =
+        serde_json::json!("different-native-model");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=? WHERE id=?",
+            rusqlite::params![identity.to_string(), id.as_str()],
+        )
+        .unwrap();
+    let mut child = supervisor(&home, &id);
+    let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Failed);
+    let (active, process): (i64, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,process_identity FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((active, process), (0, None));
 }
 
 /// An OS refusal to spawn the configured engine proves no child existed and

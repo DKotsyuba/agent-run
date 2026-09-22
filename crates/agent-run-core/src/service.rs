@@ -58,6 +58,8 @@ pub struct ProviderLaunchIdentity {
     pub provider_request: ProviderStartRequest,
     /// SHA-256 of exact config.toml bytes accepted at the request boundary.
     pub provider_config_sha256: String,
+    /// Complete validated, credential-free launch configuration at admission.
+    pub provider_config: ProviderConfig,
     /// Secret-free digest and ids of the operative normalized v2 config.
     pub provider_config_snapshot: Value,
     /// Frozen provider/model/role/scope; asset digest seals before spawning.
@@ -97,6 +99,8 @@ impl ProviderLaunchIdentity {
             || identity.authority.model != identity.provider_request.model
             || identity.authority.profile != identity.provider_request.profile
             || identity.authority.workdir != identity.provider_request.workdir
+            || identity.provider_config.schema_version != 2
+            || identity.provider_config.snapshot()? != identity.provider_config_snapshot
             || identity.replay_request_sha256
                 != agent_run_domain::canonical::sha256_hex(
                     &serde_json::to_value(&identity.provider_request)?,
@@ -395,6 +399,7 @@ impl Service {
             ),
             provider_request: request.clone(),
             provider_config_sha256: revision,
+            provider_config: config.clone(),
             provider_config_snapshot: config.snapshot()?,
             authority: authority.clone(),
             runtime_home: None,

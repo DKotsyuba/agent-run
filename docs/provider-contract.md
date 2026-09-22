@@ -123,8 +123,10 @@ hook must obtain candidates from the quota producer and retry
 
 `agents.identity_json.provider_identity_version=2` and its request hash prove
 new provider identity independently of the historical `runtime` read-model
-projection. The row freezes the original request, exact config digest and
-secret-free snapshot, resolved role grants, model and eligible account scope.
+projection. The row freezes the original request, exact config byte digest,
+validated credential-free config, its normalized snapshot digest, resolved
+role grants, model and eligible account scope. Later TOML edits do not change
+that admitted launch.
 The supervisor seals the generated asset digest before spawn and reads the
 selected account only from its owned attempt. It plans credentials through the
 provider adapter for that account, binds events/messages to the real attempt,

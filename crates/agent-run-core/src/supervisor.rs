@@ -10,7 +10,7 @@ use crate::{
     state::Store,
     verify, Error, Result,
 };
-use agent_run_config::{provider_config::ProviderConfig, role_plan::ResolvedRolePlan};
+use agent_run_config::role_plan::ResolvedRolePlan;
 use agent_run_domain::catalog::HarnessId;
 use rusqlite::{params, TransactionBehavior};
 use serde_json::json;
@@ -353,14 +353,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     }
     let mut row = store.get(id)?;
     let mut identity = ProviderLaunchIdentity::read(&row)?;
-    let (config, revision) = ProviderConfig::load(home)?;
-    if revision != identity.provider_config_sha256
-        || config.snapshot()? != identity.provider_config_snapshot
-    {
-        return Err(Error::Integrity(
-            "provider configuration changed after admission".into(),
-        ));
-    }
+    let config = identity.provider_config.clone();
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
     let (attempt_id, account) = store.provider_attempt(id)?;
     let harness = config
