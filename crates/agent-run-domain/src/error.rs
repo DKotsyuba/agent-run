@@ -1,3 +1,4 @@
+use crate::catalog::QuotaAdmissionError;
 use serde::Serialize;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -5,6 +6,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Stable public machine codes carried by CLI, JSON-RPC, and MCP error envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MachineCode {
+    /// Candidate ordering was computed against an older committed snapshot.
+    SelectionStale,
+    /// No currently eligible account remains for the explicit provider/model.
+    NoEligibleAccount,
     /// The caller supplied an invalid public value.
     ValidationError,
     /// A derived path escaped its declared owned root.
@@ -35,6 +40,8 @@ impl MachineCode {
     /// Returns the exact Python-compatible public error type name.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SelectionStale => "selection_stale",
+            Self::NoEligibleAccount => "no_eligible_account",
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
             Self::AgentNotFound => "AgentNotFound",
@@ -65,6 +72,9 @@ pub struct ProtocolMapping {
 /// Expected domain failures; source-bearing variants never expose source diagnostics publicly.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A typed provider admission refusal with no partial durable admission.
+    #[error("{0}")]
+    QuotaAdmission(#[from] QuotaAdmissionError),
     /// A public input contract was violated.
     #[error("{0}")]
     Validation(String),
@@ -154,6 +164,13 @@ impl Error {
     /// Returns the stable machine code without formatting untrusted source diagnostics.
     pub const fn machine_code(&self) -> MachineCode {
         match self {
+            Self::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }) => {
+                MachineCode::SelectionStale
+            }
+            Self::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. }) => {
+                MachineCode::NoEligibleAccount
+            }
+            Self::QuotaAdmission(_) => MachineCode::CapacityExhausted,
             Self::Validation(_) | Self::Json(_) => MachineCode::ValidationError,
             Self::PathEscape(_) => MachineCode::PathEscapeError,
             Self::NotFound(_) => MachineCode::AgentNotFound,
@@ -195,6 +212,7 @@ impl Error {
             | Self::AnswerIntegrity(s)
             | Self::Integrity(s)
             | Self::Runtime(s) => s.clone(),
+            Self::QuotaAdmission(value) => value.to_string(),
             Self::Broker { message, .. } => message.clone(),
             Self::Bootstrap { message, .. } => message.clone(),
             // Parser/OS/database diagnostics can contain configured secret values.

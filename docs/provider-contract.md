@@ -76,10 +76,12 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   must have identical window sets and facts, regardless of window order.
   Scoring stays outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
-  auto or pinned intent, deterministically ordered candidates, and the
+  auto or pinned intent, deterministically ordered rank groups, and the
   committed capacity revision the ordering was computed against. Each
   candidate carries the exact account-bound physical key set that admission
-  must reserve with the attempt. Producing and ordering the set (scoring)
+  must reserve with the attempt. Rank is a producer-assigned ordinal: lower
+  groups win, and only equal ranks use active-count then stable global account
+  id as admission tie-breaks. Producing and ordering the set (scoring)
   belongs to the quota side. Unknown capacity
   candidates follow known usable capacity; missing data is never invented.
 * Transactional admission (session side) re-validates the committed revision
@@ -104,6 +106,36 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   auto requests select among the ordered candidates. The intent persists with
   the request for replay: the original auto/pinned intent is stored separately
   from the resolved account.
+
+### Initial provider start handoff
+
+`ProviderStartRequest` is the strict new input: configured provider id,
+explicit model, canonical profile, task and workdir, optional provider-local
+account label, and the established start options. It rejects a `runtime` field
+or caller-supplied quota candidates. `Service::start_provider_trusted` accepts
+this request plus a **trusted Rust** `QuotaCandidateSet`, admits one logical
+agent and first attempt atomically, then launches the normal supervisor only
+for a newly created admission. `Service::admit_provider_trusted` exposes the
+same admission without spawning for offline supervisor fixtures. Neither is a
+public CLI/MCP/JSON-RPC quota-candidate endpoint; the final public dispatch
+hook must obtain candidates from the quota producer and retry
+`selection_stale` only after fresh production outside the transaction.
+
+`agents.identity_json.provider_identity_version=2` and its request hash prove
+new provider identity independently of the historical `runtime` read-model
+projection. The row freezes the original request, exact config byte digest,
+validated credential-free config, its normalized snapshot digest, resolved
+role grants, model and eligible account scope. Later TOML edits do not change
+that admitted launch.
+The supervisor seals the generated asset digest before spawn and reads the
+selected account only from its owned attempt. It plans credentials through the
+provider adapter for that account, binds events/messages to the real attempt,
+and releases physical keys only after verified cleanup or a certified
+never-spawned result. Replays return the first admission before consulting
+changed configuration or quota state. This first path does not switch accounts
+automatically; historical version-one rows retain their existing read path.
+Claude Messages launches request partial stream events so live assistant text
+can be journaled while the engine is running.
 
 ## C4 Attempts and ownership (schema v17)
 

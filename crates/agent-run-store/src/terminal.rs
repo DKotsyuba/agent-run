@@ -49,6 +49,25 @@ pub fn finish(
     if row.status.terminal() {
         return Ok(());
     }
+    let provider_attempt: Option<String> = if row
+        .identity
+        .as_ref()
+        .is_some_and(|value| value["provider_identity_version"] == 2)
+    {
+        let proof: (String, Option<String>) = tx.query_row(
+            "SELECT id,cleanup_proof_json FROM attempts WHERE agent_id=? AND ownership_active=1",
+            [id.as_str()],
+            |item| Ok((item.get(0)?, item.get(1)?)),
+        )?;
+        if proof.1.is_none() {
+            return Err(invalid(
+                "provider attempt cannot release without cleanup proof",
+            ));
+        }
+        Some(proof.0)
+    } else {
+        None
+    };
     let pending_cancel = if matches!(outcome.status, Status::Succeeded | Status::TimedOut) {
         tx.query_row(
             "SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending' ORDER BY id LIMIT 1",
@@ -99,10 +118,17 @@ pub fn finish(
             ],
         )?;
     }
-    tx.execute(
-        "UPDATE attempts SET state=?,finished_at=? WHERE agent_id=?",
-        params![to.as_str(), time, id.as_str()],
-    )?;
+    if let Some(attempt) = &provider_attempt {
+        tx.execute(
+            "UPDATE attempts SET state=?,finished_at=? WHERE id=? AND agent_id=? AND ownership_active=1",
+            params![to.as_str(), time, attempt, id.as_str()],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE attempts SET state=?,finished_at=? WHERE agent_id=?",
+            params![to.as_str(), time, id.as_str()],
+        )?;
+    }
     let event = tx_event(
         &tx,
         id,
@@ -124,6 +150,12 @@ pub fn finish(
     // lifecycle proof. A malformed or unavailable stats table must not turn a
     // committed engine outcome back into an active row.
     let _stats_error = run_stats::record_in_transaction(&tx, id, time).is_err();
+    if let Some(attempt) = provider_attempt {
+        tx.execute(
+            "UPDATE attempts SET ownership_active=0 WHERE id=? AND agent_id=?",
+            params![attempt, id.as_str()],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }

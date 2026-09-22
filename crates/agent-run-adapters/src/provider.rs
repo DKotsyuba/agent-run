@@ -70,6 +70,10 @@ pub struct ProviderLaunchPlan {
     pub native_model: String,
     /// Verified frozen role used for grant echo and tool checks.
     pub role: ResolvedRolePlan,
+    /// V1-shaped, digest-checked harness settings for existing Codex echo checks.
+    pub runtime: Runtime,
+    /// Frozen role grants for existing harness echo and stream checks.
+    pub profile: Profile,
 }
 
 /// Returns one v1-shaped runtime solely to reuse the established asset and
@@ -442,11 +446,13 @@ pub fn plan_selected(
             )),
         },
         native_model: sealed.native_model,
+        runtime,
+        profile: profile(&role),
         role,
     })
 }
 
-/// Builds Claude's existing stream mode with the sealed model, role grants,
+/// Builds Claude's partial-message stream with the sealed model, role grants,
 /// MCP/plugin assets, and exact resume id, without model-name special cases.
 fn claude_args(
     sealed: &SealedProvider,
@@ -485,6 +491,7 @@ fn claude_args(
         "--print".into(),
         "--output-format".into(),
         "stream-json".into(),
+        "--include-partial-messages".into(),
         "--input-format".into(),
         "stream-json".into(),
         "--verbose".into(),

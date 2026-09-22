@@ -7,6 +7,7 @@ pub mod error;
 pub mod fsm;
 mod legacy_provider;
 mod provider_connection;
+pub mod provider_start;
 pub mod quota_snapshot;
 pub mod tools;
 pub mod types;
@@ -23,6 +24,7 @@ pub use catalog::{
 pub use credential_ref::CredentialRef;
 pub use error::{Error, MachineCode, ProtocolMapping, PublicError, Result};
 pub use fsm::{validate_transition, ACTIVE, TERMINAL};
+pub use provider_start::ProviderStartRequest;
 pub use tools::{
     is_tool, registry, tool, tools_json, ArgumentDefault, ArgumentDefinition, ToolDefinition,
 };
