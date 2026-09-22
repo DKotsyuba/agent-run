@@ -11,6 +11,7 @@ use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
+    process::{Command, Stdio},
     str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -374,9 +375,9 @@ collect = function(ctx)
   end)
   if ok then error("x-api-key override accepted") end
   local r = ctx.http.request({url = "https://api.test/q"})
-  local v = r.body:match('"remaining_percent":([%d%.]+)')
+  local v = ctx.json.decode(r.body).remaining_percent
   return { version = 1, windows = { { pool = "primary", window = "five_hour",
-    models = {"glm-4.7"}, remaining_percent = tonumber(v), observed_at = 1000.0 } } }
+    models = {"glm-4.7"}, remaining_percent = v, observed_at = 1000.0 } } }
 end
 "#;
     let snapshot = run_with(script, fast(), client.clone(), gateway)
@@ -406,17 +407,16 @@ async fn echoed_credentials_are_scrubbed_before_lua_can_read_them() {
         ],
         &echo,
     )]);
-    let needle = &SECRET["synthetic-secret".len()..];
     let script = format!(
         r#"
 collect = function(ctx)
   local r = ctx.http.request({{url = "https://api.test/quota"}})
-  local leaked = (r.body:find("{needle}", 1, true) ~= nil)
-    or (r.headers["x-echo-auth"] ~= nil and r.headers["x-echo-auth"]:find("{needle}", 1, true) ~= nil)
-  local v = r.body:match('"remaining_percent":([%d%.]+)')
-  if leaked then v = "55.0" end
+  local body = ctx.json.decode(r.body)
+  local leaked = (body.echo == "{SECRET}") or (r.headers["x-echo-auth"] == "{SECRET}")
+  local v = body.remaining_percent
+  if leaked then v = 55.0 end
   return {{ version = 1, windows = {{ {{ pool = "primary", window = "five_hour",
-    models = {{"glm-4.7"}}, remaining_percent = tonumber(v), observed_at = 1000.0 }} }} }}
+    models = {{"glm-4.7"}}, remaining_percent = v, observed_at = 1000.0 }} }} }}
 end
 "#
     );
@@ -458,44 +458,68 @@ async fn instruction_budget_and_wall_deadline_abort_cpu_loops() {
     assert_eq!(err, CollectorError::Timeout);
 }
 
-#[tokio::test]
-async fn catchable_hook_errors_cannot_outrun_the_invocation_deadline() {
-    // Root finding G, executed repro: hook errors are ordinary catchable Lua
-    // errors and the outer async timeout cannot preempt a poll that never
-    // yields. The guarded pcall/xpcall escalation must terminate this exact
-    // script on its own, with a typed bound failure and no external kill.
+/// Runs each dangerous Lua case in an owned test process; a watchdog kill is
+/// always a failed assertion, never evidence of collector termination.
+#[test]
+fn lua_negative_cases_terminate_without_watchdog() {
+    for case in ["catch", "pattern", "method_pattern", "coroutine"] {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lua_negative_child", "--nocapture"])
+            .env("AGENT_RUN_LUA_NEGATIVE_CASE", case)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{case} child rejected its own assertion");
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{case} collector required external watchdog termination");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Exercises the actual collector in the process owned by the watchdog test.
+#[test]
+fn lua_negative_child() {
+    let Ok(case) = std::env::var("AGENT_RUN_LUA_NEGATIVE_CASE") else {
+        return;
+    };
+    let script = match case.as_str() {
+        "catch" => "while true do pcall(function() while true do end end) end",
+        "pattern" => "collect = function(ctx) return string.find(string.rep('a',32), '^'..string.rep('a?',32)..'b$') end",
+        "method_pattern" => "collect = function(ctx) return ('a'):find('a?b') end",
+        "coroutine" => "collect = function(ctx) return coroutine.wrap(function() while true do end end)() end",
+        _ => panic!("unknown negative case"),
+    };
     let limits = CollectorLimits {
         invocation_timeout: Duration::from_millis(100),
         ..fast()
     };
-    let exact = "while true do pcall(function() while true do end end) end";
-    for script in [
-        exact,
-        // The same escape through xpcall and a coroutine resumer.
-        "local co = coroutine.wrap(function() local x = 0 while true do x = x + 1 end end) \
-         while true do xpcall(co, function() end) pcall(function() local y = 0 while true do y = y + 1 end end) end",
-        // An instruction-budget catcher collapses the same way.
-        "while true do pcall(function() local x = 0 while true do x = x + 1 end end) end",
-    ] {
-        let limits = if script == exact {
-            limits
-        } else {
-            CollectorLimits {
-                instructions: 10_000,
-                ..limits
-            }
-        };
-        let started = Instant::now();
-        let err = run(script, limits, FakeHttp::new(vec![])).await.unwrap_err();
-        assert!(
-            matches!(err, CollectorError::Timeout | CollectorError::InstructionLimit),
-            "unexpected {err:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "terminated on its own without a watchdog"
-        );
-    }
+    let err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run(script, limits, FakeHttp::new(vec![])))
+        .unwrap_err();
+    assert!(
+        match case.as_str() {
+            "catch" => matches!(
+                err,
+                CollectorError::Timeout | CollectorError::InstructionLimit
+            ),
+            _ => err == CollectorError::ScriptFailed,
+        },
+        "unexpected {case} error: {err:?}"
+    );
+    eprintln!("{case}: {err:?}");
 }
 
 #[tokio::test]
@@ -505,7 +529,7 @@ async fn memory_budget_aborts_allocation_heavy_scripts() {
         ..fast()
     };
     let err = run(
-        r#"collect = function(ctx) local t = {} for i = 1, 100000 do t[i] = string.rep("x", 4096) end end"#,
+        r#"collect = function(ctx) local t = {} for i = 1, 100000 do t[i] = {i, i, i, i} end end"#,
         limits,
         FakeHttp::new(vec![]),
     )
@@ -521,7 +545,9 @@ async fn unsafe_libraries_and_loaders_are_absent() {
         r#"
 collect = function(ctx)
   assert(io == nil and os == nil and debug == nil and package == nil, "unsafe library present")
-  assert(load == nil and loadstring == nil and dofile == nil and require == nil, "loader present")
+  assert(load == nil and loadfile == nil and loadstring == nil and dofile == nil and require == nil, "loader present")
+  assert(string == nil and table == nil and math == nil and utf8 == nil and coroutine == nil, "optional library present")
+  assert(collectgarbage == nil, "unbounded garbage collection present")
   return { version = 1, windows = { { pool = "primary", window = "five_hour",
     models = {"glm-4.7"}, remaining_percent = 5.0, observed_at = 1000.0 } } }
 end
@@ -581,6 +607,28 @@ async fn registry_rejects_non_compiling_replacement_and_keeps_valid_revision() {
             "glm",
             CollectorScript::new("this is not valid Lua !!!!!"),
             &fast()
+        )
+        .is_err());
+    let invalid_limits = CollectorLimits {
+        vm_memory_bytes: 0,
+        ..fast()
+    };
+    assert!(registry
+        .install(
+            "glm",
+            CollectorScript::new("collect = function(ctx) end"),
+            &invalid_limits
+        )
+        .is_err());
+    let small_source_limit = CollectorLimits {
+        vm_memory_bytes: 4096,
+        ..fast()
+    };
+    assert!(registry
+        .install(
+            "glm",
+            CollectorScript::new(&" ".repeat(4097)),
+            &small_source_limit
         )
         .is_err());
     assert_eq!(registry.get("glm"), Some(&valid));

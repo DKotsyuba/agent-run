@@ -91,13 +91,25 @@ fn extend_survival(window: &QuotaWindow, at: f64) -> QuotaWindow {
     carried
 }
 
+/// Whether a positive `window` can release `fact` at host time `at`.
+fn authoritative_positive(window: &QuotaWindow, fact: &QuotaWindow, at: f64) -> bool {
+    window
+        .remaining_percent
+        .is_some_and(|remaining| remaining > 0.0)
+        && window.observed_at >= fact.observed_at
+        && window.observed_at <= at
+        && window.valid_until >= at
+        && window.reset_at.is_none_or(|reset| reset > at)
+}
+
 /// Applies the exhaustion latch to `snapshot` in place.
 ///
 /// A latched zero-remaining window survives a round that only produced
 /// unknown data for its pool (empty or `None` remaining) until its known
 /// reset time passes, or — when reset is absent — until actually fresh
-/// positive evidence arrives (`remaining > 0`, observed not later than `at`,
-/// validity unexpired, reset not passed). Fresh exhaustion, fresh
+/// positive evidence arrives (`remaining > 0`, observed at least as late as
+/// the exhaustion and not later than `at`, validity unexpired, reset not
+/// passed). Fresh exhaustion, fresh
 /// percentages, and expired resets are never overridden; carried facts keep
 /// their original observation times and collector source.
 pub fn retain_exhausted(
@@ -114,20 +126,20 @@ pub fn retain_exhausted(
             // and unknown or missing data displaces nothing. Matching is by
             // physical window name across collector sources, so a source
             // change neither forks the pool nor strands the fact.
-            let fresh_positive = |windows: &[QuotaWindow], name: &str| {
-                windows.iter().any(|w| {
-                    w.name == name
-                        && w.remaining_percent.is_some_and(|remaining| remaining > 0.0)
-                        && w.observed_at <= at
-                        && w.valid_until >= at
-                        && w.reset_at.is_none_or(|reset| reset > at)
-                })
-            };
             let mut carried: Vec<QuotaWindow> = Vec::new();
             for ((l, name), fact) in exhausted {
                 if l != &lane
                     || fact.reset_at.is_some_and(|reset| reset <= at)
-                    || fresh_positive(&pool.windows, name)
+                    || pool
+                        .windows
+                        .iter()
+                        .any(|w| w.name == *name && authoritative_positive(w, fact, at))
+                    || pool.windows.iter().any(|w| {
+                        w.name == *name
+                            && w.remaining_percent == Some(0.0)
+                            && w.observed_at > fact.observed_at
+                            && w.observed_at <= at
+                    })
                 {
                     continue;
                 }
@@ -179,6 +191,23 @@ pub fn record_quota_snapshot(
         return Err(invalid("quota account is not registered"));
     }
     let exhausted = latched_windows(&tx, &account)?;
+    let mut released = BTreeSet::new();
+    for ((lane, name), fact) in &exhausted {
+        if fact.reset_at.is_some_and(|reset| reset <= at)
+            || snapshot
+                .models
+                .iter()
+                .flat_map(|model| &model.pools)
+                .any(|pool| {
+                    lane_of(&pool.key, &account).ok() == Some(lane.as_str())
+                        && pool.windows.iter().any(|window| {
+                            window.name == *name && authoritative_positive(window, fact, at)
+                        })
+                })
+        {
+            released.insert((lane.as_str(), name.as_str()));
+        }
+    }
     let mut snapshot = snapshot.clone();
     retain_exhausted(&exhausted, &mut snapshot, &account, at)?;
 
@@ -231,14 +260,25 @@ pub fn record_quota_snapshot(
         mutations += 1;
     }
 
+    // Release old latches before inserting this round's exhausted facts: a
+    // new zero observed after a reset must remain latched.
+    for (lane, name) in &released {
+        let quota_key = format!("{}::{}", account.as_str(), lane);
+        mutations += tx.execute(
+            "DELETE FROM quota_exhaustion WHERE account_id=?1 AND quota_key=?2 AND window_id=?3",
+            params![account.as_str(), quota_key, name],
+        )?;
+    }
+
     // Durable latch maintenance: every currently exhausted physical window
-    // upserts its fact (so a fresh exhaustion latches even without history),
-    // and a released prior latch (fresh positive evidence, or an expired
-    // reset) is cleared. Both count as relevant mutations for the same
-    // revision; sample retention never erases the latch.
-    let mut latched_now: BTreeSet<(&str, &str)> = BTreeSet::new();
+    // upserts its fact, and sample retention never erases the latch.
     for ((lane, source, name), window) in &physical {
-        if window.remaining_percent != Some(0.0) {
+        if window.remaining_percent != Some(0.0)
+            || window.reset_at.is_some_and(|reset| reset <= at)
+            || exhausted
+                .get(&(lane.to_string(), name.to_string()))
+                .is_some_and(|fact| window.observed_at < fact.observed_at)
+        {
             continue;
         }
         let quota_key = format!("{}::{}", account.as_str(), lane);
@@ -256,19 +296,12 @@ pub fn record_quota_snapshot(
                 window.reset_at,
             ],
         )?;
-        latched_now.insert((*lane, *name));
         mutations += 1;
+        mutations += tx.execute(
+            "DELETE FROM quota_exhaustion WHERE account_id=?1 AND quota_key=?2 AND window_id=?3 AND source<>?4",
+            params![account.as_str(), quota_key, name, source],
+        )?;
     }
-    for (lane, name) in exhausted.keys() {
-        if !latched_now.contains(&(lane.as_str(), name.as_str())) {
-            let quota_key = format!("{}::{}", account.as_str(), lane);
-            mutations += tx.execute(
-                "DELETE FROM quota_exhaustion WHERE account_id=?1 AND quota_key=?2 AND window_id=?3",
-                params![account.as_str(), quota_key, name],
-            )?;
-        }
-    }
-
     let revision = if mutations > 0 {
         tx.execute(
             "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?)",

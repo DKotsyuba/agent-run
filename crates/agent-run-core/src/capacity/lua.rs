@@ -1,10 +1,9 @@
 //! Bounded embedded Lua 5.4 quota collector engine.
 //!
-//! Every invocation gets a fresh restricted VM: a safe standard-library
-//! subset, memory and instruction limits enforced from inside the interpreter
-//! (a wall deadline is checked on the same hook, so a tight Lua loop cannot
-//! out-wait a socket timeout), and an HTTP capability whose authorization is
-//! injected in Rust only for explicitly allowed origins. Scripts never see
+//! Every invocation gets a fresh base-only VM with memory and instruction
+//! limits enforced inside the interpreter and a wall deadline checked by its
+//! hook. An HTTP capability injects authorization in Rust only for allowed
+//! origins. Scripts never see
 //! credential bytes, reference paths, or auth headers. Errors that cross the
 //! boundary are static typed categories; Lua error text and HTTP bodies stay
 //! inside the VM and are redacted from every diagnostic.
@@ -71,7 +70,8 @@ pub struct CollectorLimits {
     pub vm_memory_bytes: usize,
     /// Instruction budget enforced by the interpreter hook.
     pub instructions: u32,
-    /// Whole-invocation wall budget; exceeding it aborts CPU and HTTP work.
+    /// Whole-invocation wall budget checked at Lua hooks and async boundaries;
+    /// bounded native host calls cannot be preempted mid-call.
     pub invocation_timeout: Duration,
     /// Maximum HTTP requests one invocation may issue, redirects included.
     pub http_requests: u32,
@@ -598,14 +598,16 @@ pub struct ScriptRegistry {
 ///
 /// Compilation only: nothing executes, so a compile check has no top-level
 /// side effects, no network capability, and no `collect` call. Syntax-invalid
-/// sources are rejected here, before any invocation or registry replacement;
+/// sources and invalid limits are rejected here, before any invocation or
+/// registry replacement; source bytes may not exceed the VM memory cap;
 /// the presence and contract of `collect(ctx)` is enforced per invocation.
 pub fn compile_check(source: &str, limits: &CollectorLimits) -> Result<()> {
-    let lua = Lua::new_with(
-        StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
-        LuaOptions::new(),
-    )
-    .map_err(|_| invalid("collector vm unavailable"))?;
+    limits.validate()?;
+    if source.len() > limits.vm_memory_bytes {
+        return Err(invalid("collector script exceeds vm memory limit"));
+    }
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::new())
+        .map_err(|_| invalid("collector vm unavailable"))?;
     lua.set_memory_limit(limits.vm_memory_bytes)
         .map_err(|_| invalid("collector vm unavailable"))?;
     lua.load(TextChunk(source.to_owned()))
@@ -616,9 +618,9 @@ pub fn compile_check(source: &str, limits: &CollectorLimits) -> Result<()> {
 }
 
 impl ScriptRegistry {
-    /// Installs `script` under `name` only when it both verifies and
-    /// compiles in text mode; the previous revision is retained on any
-    /// rejection, so an invalid replacement never displaces a valid one.
+    /// Installs `script` under `name` only when it verifies and compiles in
+    /// text mode within validated limits and the source-size cap; the previous
+    /// revision is retained on any rejection.
     pub fn install(
         &mut self,
         name: &str,
@@ -727,6 +729,8 @@ impl HttpState {
 /// define `collect(ctx)` and return `{windows = {...}}` in version-1 shape;
 /// the result is normalized and validated against `scope` before returning.
 /// Fresh failures are typed [`CollectorError`] categories with static text.
+/// The VM exposes base Lua only; hook deadlines cannot preempt native host
+/// calls mid-call, so the wall timeout is cooperative rather than real-time.
 pub async fn run_collector(
     script: &CollectorScript,
     scope: &CollectorScope,
@@ -740,12 +744,15 @@ pub async fn run_collector(
     if script.source.as_bytes().starts_with(b"\x1bLua") {
         return Err(CollectorError::BytecodeRejected);
     }
-    script
-        .verify()
-        .map_err(|_| CollectorError::ScriptTampered)?;
     limits
         .validate()
         .map_err(|_| CollectorError::Internal("limits"))?;
+    if script.source.len() > limits.vm_memory_bytes {
+        return Err(CollectorError::MemoryLimit);
+    }
+    script
+        .verify()
+        .map_err(|_| CollectorError::ScriptTampered)?;
     if models.keys().any(|model| !scope.models.contains(model)) || !host_now.is_finite() {
         return Err(CollectorError::Internal("context"));
     }
@@ -768,8 +775,8 @@ pub async fn run_collector(
     }
 }
 
-/// One invocation's VM lifecycle; boxed inner future so the outer timeout can
-/// cancel (drop) it, which joins all interpreter and HTTP work on this task.
+/// One invocation's base-only VM lifecycle; the outer timeout can cancel
+/// pending HTTP work, while synchronous Lua work checks its hook deadline.
 async fn invoke(
     script: &CollectorScript,
     scope: &CollectorScope,
@@ -781,18 +788,15 @@ async fn invoke(
     auth: &AuthCapability,
     deadline: Instant,
 ) -> std::result::Result<NormalizedQuotaSnapshot, CollectorError> {
-    let lua = Lua::new_with(
-        StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
-        LuaOptions::new(),
-    )
-    .map_err(|_| CollectorError::Internal("vm"))?;
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::new())
+        .map_err(|_| CollectorError::Internal("vm"))?;
     lua.set_memory_limit(limits.vm_memory_bytes)
         .map_err(|_| CollectorError::Internal("memory_limit"))?;
     let hook_instructions = Arc::new(AtomicU64::new(0));
     let instruction_budget = limits.instructions;
     // Set once the wall deadline passes; every later hook tick errors and the
     // guarded pcall/xpcall wrappers refuse, so a script that catches abort
-    // errors inside pcall or coroutines still collapses within bounded hook
+    // errors inside pcall still collapses within bounded hook
     // ticks and the invocation terminates on its own.
     let deadline_exceeded = Arc::new(AtomicBool::new(false));
     let hook_latch = deadline_exceeded.clone();
@@ -813,16 +817,24 @@ async fn invoke(
     )
     .map_err(|_| CollectorError::Internal("hook"))?;
     let globals = lua.globals();
-    for escape in ["load", "loadstring", "dofile", "require", "print"] {
+    for escape in [
+        "load",
+        "loadfile",
+        "loadstring",
+        "dofile",
+        "require",
+        "print",
+        "collectgarbage",
+    ] {
         globals
             .set(escape, mlua::Nil)
             .map_err(|_| CollectorError::Internal("sandbox"))?;
     }
     // Guarded pcall/xpcall: identical to the originals, except that once the
     // instruction or wall budget is exhausted they refuse to protect
-    // anything, so no catch loop can outlive the invocation. This is the only
-    // supported abort escalation for Lua 5.4, where hook errors are ordinary
-    // catchable errors and `set_interrupt` does not exist.
+    // anything, so no Lua catch loop can outlive the invocation. Hook errors
+    // are ordinary catchable Lua 5.4 errors; optional coroutine libraries are
+    // absent, so they cannot create another protected execution path.
     for name in ["pcall", "xpcall"] {
         let real: mlua::Function = globals
             .get(name)
@@ -998,6 +1010,11 @@ async fn invoke(
             }
         })
         .map_err(|_| CollectorError::Internal("http"))?;
+    // mlua loads the coroutine library while registering any async callback;
+    // remove its Lua-facing entry point after ctx.http.request is installed.
+    globals
+        .set("coroutine", mlua::Nil)
+        .map_err(|_| CollectorError::Internal("sandbox"))?;
     let ctx = lua
         .create_table()
         .map_err(|_| CollectorError::Internal("context"))?;

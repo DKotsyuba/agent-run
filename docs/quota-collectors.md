@@ -39,13 +39,14 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua}`,
   sample retention and of script revisions: a latched zero-remaining window
   survives a round that only produced unknown data (timeout/malformed
   rounds persist nothing) until its known reset passes or — with no reset —
-  actually fresh
-  positive evidence arrives (`remaining > 0`, observed not later than now,
-  validity unexpired, reset not passed). A stale positive never revives
-  capacity. Matching is by lane and window across collector source
-  identities, so a script revision neither forks the pool nor strands the
-  latch. Carried facts keep their original observation times; only the
-  survival horizon extends (to the reset, or one 900 s TTL past the round).
+  actually fresh positive evidence arrives (`remaining > 0`, observed at least
+  as late as the exhausted fact and not later than now, validity unexpired,
+  reset not passed). Missing pools and unrelated pools cannot release a latch;
+  an older exhausted report cannot roll it back. Matching is by lane and
+  window across collector source identities, so a script revision neither
+  forks the pool nor strands the latch. Carried facts keep their original
+  observation times; only the survival horizon extends (to the reset, or one
+  900 s TTL past the round).
 * Freshness, unknown data, and collection failure are distinct states; a
   failed collector never replaces good evidence, and read-only advice never
   fetches network or reserves.
@@ -53,20 +54,23 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua}`,
 ## Lua collector engine (`capacity::lua`)
 
 * Lua 5.4 embedded via mlua 0.12.1 (vendored). Each invocation runs a fresh
-  restricted VM: coroutine/table/string/math/utf8 libraries only; `io`, `os`,
-  `debug`, `package`, `load`, `loadstring`, `dofile`, `require`, and `print`
-  are absent; chunks load in text-only mode so bytecode is rejected.
+  base-only VM. The optional coroutine, table, string (including Lua pattern
+  matching), math, and utf8 libraries are absent, as are `io`, `os`, `debug`,
+  `package`, `load`, `loadfile`, `loadstring`, `dofile`, `require`, `print`, and
+  `collectgarbage`; chunks load in text-only mode so bytecode is rejected.
 * Default bounds (validated, overridable only positively and under hard
   ceilings): 16 MiB VM memory, 10,000,000 instructions, 30 s invocation,
   8 HTTP requests, 10 s and 2 MiB per request, 256 output windows.
-  Instruction and wall limits are enforced by the interpreter hook. Lua 5.4
-  hook errors are ordinary catchable errors, so `pcall`/`xpcall` are
+  Instruction and wall limits are checked by the interpreter hook. Lua 5.4
+  hook errors are ordinary catchable errors, so the base `pcall`/`xpcall` are
   **guarded**: once either budget is exhausted they refuse to protect
   anything, and every later hook tick errors, so a script catching aborts
-  inside `pcall` or coroutines still collapses within bounded ticks and the
-  invocation returns a typed `Timeout`/`InstructionLimit` on its own — no
-  detached worker, external kill, or panic escalation. The stdlib exposes no
-  long native call that bypasses the hook.
+  inside `pcall` still collapses within bounded ticks and the invocation
+  returns a typed `Timeout`/`InstructionLimit` on its own. Native host work
+  (such as bounded JSON conversion) cannot be preempted by a Lua hook; the
+  wall limit is cooperative, not a hard real-time deadline. No collector may
+  use Lua pattern matching or coroutines. Registry compilation validates the
+  same resource limits and rejects source larger than the VM memory bound.
 * `collect(ctx)` receives the nonsecret host-bound account identity, explicit
   model configurations, host time, an opaque auth marker, bounded host JSON
   (`ctx.json.decode/encode`, static `quota_json_*` errors, body-bounded), a

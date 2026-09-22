@@ -298,6 +298,72 @@ fn older_valid_observation_cannot_clear_newer_exhaustion() {
     );
 }
 
+/// An unrelated pool cannot release a latch for a missing physical pool.
+#[test]
+fn omitted_pool_keeps_exhaustion() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let exhausted = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"observed_at":1500.0,"valid_until":2500.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1600.0).unwrap();
+    let unrelated = normalize(&json!({"version":1,"windows":[
+        {"pool":"secondary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":90.0,"observed_at":1700.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &unrelated, 100, 1700.0).unwrap();
+    assert_eq!(latch_rows(home.path()), 1);
+}
+
+/// A delayed exhausted report cannot replace the newer latched observation.
+#[test]
+fn older_exhaustion_cannot_roll_back_latch() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let newer = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"observed_at":1500.0,"reset_at":2500.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &newer, 100, 1600.0).unwrap();
+    let older = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"observed_at":1400.0,"reset_at":2400.0}
+    ]}))
+    .unwrap();
+    let revision = record_quota_snapshot(home.path(), "glm", &older, 100, 1700.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let fact: (f64, Option<f64>) = store
+        .conn
+        .query_row(
+            "SELECT observed_at,reset_at FROM quota_exhaustion WHERE account_id='acct-main'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(fact, (1500.0, Some(2500.0)));
+    assert_eq!(latch_rows(home.path()), 1);
+    let empty = normalize(&json!({"version":1,"windows":[]})).unwrap();
+    let cleared = record_quota_snapshot(home.path(), "glm", &empty, 100, 2600.0).unwrap();
+    assert_eq!(cleared, revision + 1, "expired reset advances the revision");
+    assert_eq!(latch_rows(home.path()), 0);
+    assert_eq!(
+        record_quota_snapshot(home.path(), "glm", &empty, 100, 2700.0).unwrap(),
+        cleared
+    );
+    record_quota_snapshot(home.path(), "glm", &older, 100, 2800.0).unwrap();
+    assert_eq!(
+        latch_rows(home.path()),
+        0,
+        "expired old zero cannot relatch"
+    );
+}
+
 #[test]
 fn persistence_requires_a_registered_account() {
     let home = tempdir().unwrap();
