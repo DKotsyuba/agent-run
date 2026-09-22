@@ -19,7 +19,7 @@ const V1_AGENTS: [&str; 3] = ["agt_alpha", "agt_beta", "agt_gamma"];
 fn build_fixture(path: &Path, version: i64) -> Connection {
     if version >= 2 {
         let fixture_name = if version == VERSION {
-            "current-v16.sqlite".to_owned()
+            format!("current-v{VERSION}.sqlite")
         } else {
             format!("historical-v{version}.sqlite")
         };
@@ -661,4 +661,166 @@ fn read_only_snapshot_refuses_a_pending_migration_without_mutation() {
     let error = agent_run_store::diagnostics::diagnostic_snapshot(&db_path, 1.0, 256).unwrap_err();
     assert!(error.to_string().contains("state migration required"));
     assert_eq!(user_version(&open_ro(&db_path)), 1);
+}
+
+// --- (e) schema v17 provider orchestration: additive columns, one owned
+// attempt across the orchestrated lifecycle, and legacy rows stay readable ---
+
+/// Seeds a v16 store with one agent, a legacy open attempt without a selected
+/// account, and a historical message whose attempt binding is NULL.
+fn seed_v16_legacy(conn: &Connection) {
+    conn.execute(
+        "INSERT INTO agents (id, runtime, model, profile, task, task_summary, workdir, \
+         request_json, status, created_at, timeout_seconds, config_revision) \
+         VALUES ('ag-20260825-010203-0123456789','codex','gpt-5.1','profile','task','summary','/tmp', \
+         '{\"runtime\":\"codex\",\"model\":\"gpt-5.1\",\"profile\":\"profile\",\"task\":\"task\",\
+         \"workdir\":\"/tmp\"}','running',1.0,10.0,'cfg')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at) \
+         VALUES ('att_legacy', 'ag-20260825-010203-0123456789', 1, 'running', '{}', 1.0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO messages (agent_id, attempt_id, at, role, content) \
+         VALUES ('ag-20260825-010203-0123456789', NULL, 1.0, 'user', 'historical message')",
+        [],
+    )
+    .unwrap();
+}
+
+/// Verifies v16 -> v17 keeps historical rows readable, leaves new columns
+/// NULL, still accepts current `running` attempt inserts that claim no
+/// ownership, and enforces one owned attempt per agent across the whole
+/// orchestrated lifecycle regardless of attempt state.
+#[test]
+fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let build = build_fixture(&db_path, 16);
+    seed_v16_legacy(&build);
+    drop(build);
+
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(store.health().unwrap()["schema_version"], VERSION);
+    let conn = open_ro(&db_path);
+
+    // Historical message with NULL attempt remains readable through the store.
+    let transcript = store
+        .transcript(&"ag-20260825-010203-0123456789".parse().unwrap(), 0, 10)
+        .unwrap();
+    let messages = transcript["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"], "historical message");
+
+    // New columns arrive NULL on legacy rows; ownership stays unclaimed.
+    let (selected, phase, intent, owned): (Option<String>, Option<String>, Option<String>, i64) =
+        conn.query_row(
+            "SELECT a.selected_account_id, a.phase, g.selection_intent, a.ownership_active \
+             FROM attempts a JOIN agents g ON g.id=a.agent_id WHERE a.id='att_legacy'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(selected, None);
+    assert_eq!(phase, None);
+    assert_eq!(intent, None);
+    assert_eq!(owned, 0);
+
+    // Registry and quota revision tables start empty and admit typed facts.
+    let account: agent_run_domain::AccountId = "acct-codex-native".parse().unwrap();
+    let key = agent_run_domain::PhysicalQuotaKey::new(&account, "gpt-5.1").unwrap();
+    assert_eq!(store.quota_capacity_revision(&key).unwrap(), None);
+    assert_eq!(
+        store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        0
+    );
+
+    let writable = Connection::open(&db_path).unwrap();
+    writable
+        .execute(
+            "INSERT INTO provider_accounts VALUES ('acct-codex-native','openai',\
+             'keychain:codex','enabled',1.0,1.0)",
+            [],
+        )
+        .unwrap();
+    writable
+        .execute(
+            "INSERT INTO quota_capacity_revisions VALUES (?1, 7, 1.0)",
+            params![key.as_str()],
+        )
+        .unwrap();
+    assert_eq!(store.quota_capacity_revision(&key).unwrap(), Some(7));
+
+    // Legacy-style inserts (no ownership claim) still work beside the index,
+    // even while another attempt holds ownership.
+    writable
+        .execute(
+            "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at) \
+             VALUES ('att_legacy2', 'ag-20260825-010203-0123456789', 2, 'running', '{}', 2.0)",
+            [],
+        )
+        .unwrap();
+
+    // One owned attempt across distinct lifecycle states: a claim in the
+    // prepared state already fences every later owned attempt.
+    writable
+        .execute(
+            "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at, \
+             selected_account_id, ownership_active) VALUES ('att_orch','ag-20260825-010203-0123456789',3,'prepared',\
+             '{}',3.0,'acct-codex-native',1)",
+            [],
+        )
+        .unwrap();
+    for (id, number, state) in [
+        ("att_orch_run", 4, "running"),
+        ("att_orch_switch", 5, "account_switch"),
+        ("att_orch_cleanup", 6, "cleanup_pending"),
+    ] {
+        let conflict = writable
+            .execute(
+                "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, \
+                 created_at, selected_account_id, ownership_active) \
+                 VALUES (?1,'ag-20260825-010203-0123456789',?2,?3,'{}',4.0,'acct-codex-native',1)",
+                params![id, number, state],
+            )
+            .unwrap_err();
+        // Fresh attempt numbers mean this uniqueness failure can only come
+        // from the ownership partial index, not the (agent_id, number) key.
+        assert!(
+            conflict
+                .to_string()
+                .contains("UNIQUE constraint failed: attempts.agent_id"),
+            "{state}: {conflict}"
+        );
+    }
+
+    // Releasing ownership after verified cleanup frees the slot for the next
+    // attempt, and released rows stop counting as active.
+    writable
+        .execute(
+            "UPDATE attempts SET ownership_active=0, state='finished', finished_at=4.0 \
+             WHERE id='att_orch'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        0
+    );
+    writable
+        .execute(
+            "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at, \
+             selected_account_id, ownership_active) VALUES ('att_orch2','ag-20260825-010203-0123456789',7,\
+             'prepared','{}',5.0,'acct-codex-native',1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        1
+    );
 }

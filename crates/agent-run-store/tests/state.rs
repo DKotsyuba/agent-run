@@ -21,8 +21,8 @@ fn schema_initialization_and_reopen() {
     let h = common::Home::new();
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
-    assert_eq!(a["schema_version"], 16);
-    assert_eq!(a["tables"], 16);
+    assert_eq!(a["schema_version"], 17);
+    assert_eq!(a["tables"], 18);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     assert_eq!(
@@ -360,7 +360,7 @@ fn backup_is_openable_and_never_overwrites_an_existing_file() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         db.query_row(
@@ -391,34 +391,45 @@ fn backup_is_openable_and_never_overwrites_an_existing_file() {
 fn newer_database_version_is_refused_without_upgrade() {
     let h = common::Home::new();
     let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
-    db.pragma_update(None, "user_version", 17).unwrap();
+    db.pragma_update(None, "user_version", 18).unwrap();
     drop(db);
     assert!(Store::open(&h.path).is_err());
     let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
             .unwrap(),
-        17
+        18
     );
 }
 #[test]
 fn legacy_database_version_is_migrated_on_open() {
-    // Schema 15 is only one migration (016_reconciliation_cursors.sql) behind
-    // current: drop the table and index it adds and stamp the store back to
-    // v15, then confirm `Store::open` upgrades it transparently instead of
-    // refusing it (see rust/src/state/migrations.rs, ported from
-    // src/agent_run/state/migrations.py).
+    // Schema 15 is two migrations (016 reconciliation cursors, 017 provider
+    // orchestration) behind current: drop what both add and stamp the store
+    // back to v15, then confirm `Store::open` upgrades it transparently
+    // instead of refusing it (see crates/agent-run-store/src/migrations.rs,
+    // ported from src/agent_run/state/migrations.py).
     let h = common::Home::new();
     {
         let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
         db.execute_batch(
-            "DROP INDEX idx_agents_request_id; DROP TABLE reconciliation_cursors; \
+            "DROP INDEX idx_attempts_one_active; DROP INDEX idx_attempts_selected_account; \
+             ALTER TABLE attempts DROP COLUMN selected_account_id; \
+             ALTER TABLE attempts DROP COLUMN phase; \
+             ALTER TABLE attempts DROP COLUMN process_identity; \
+             ALTER TABLE attempts DROP COLUMN process_birth_time; \
+             ALTER TABLE attempts DROP COLUMN cleanup_proof_json; \
+             ALTER TABLE attempts DROP COLUMN session_facts_json; \
+             ALTER TABLE attempts DROP COLUMN ownership_active; \
+             ALTER TABLE agents DROP COLUMN selection_intent; \
+             ALTER TABLE agents DROP COLUMN requested_account_id; \
+             DROP TABLE provider_accounts; DROP TABLE quota_capacity_revisions; \
+             DROP INDEX idx_agents_request_id; DROP TABLE reconciliation_cursors; \
              PRAGMA user_version=15;",
         )
         .unwrap();
     }
     let store = Store::open(&h.path).unwrap();
-    assert_eq!(store.health().unwrap()["schema_version"], 16);
+    assert_eq!(store.health().unwrap()["schema_version"], 17);
 }
 #[tokio::test]
 async fn start_replay_is_independent_of_later_configuration_edits() {
@@ -649,6 +660,6 @@ fn concurrent_first_initializers_share_one_atomic_schema() {
         .into_iter()
         .map(|handle| handle.join().expect("initializer thread"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![16; callers]);
+    assert_eq!(versions, vec![17; callers]);
     Store::open(&home).expect("the shared schema is usable afterwards");
 }

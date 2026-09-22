@@ -17,6 +17,7 @@ pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
 use agent_run_domain::{
+    catalog::{AccountId, PhysicalQuotaKey},
     domain::{self, now, AgentId, Outcome, StartRequest, Status},
     error::invalid,
     Error, Result,
@@ -32,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-pub const VERSION: i64 = 16;
+pub const VERSION: i64 = 17;
 pub const ACTIVE_SQL: &str = "('created','starting','running','cancelling')";
 /// How long an ordinary store connection waits out a competing writer before
 /// giving up with `SQLITE_BUSY`.
@@ -792,6 +793,41 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+    /// Returns the committed capacity revision of one physical quota pool.
+    ///
+    /// `None` means no revision was ever committed for the pool, which
+    /// transactional admission treats as a mismatch against any candidate set
+    /// carrying a committed revision. Read-only: the session module owns the
+    /// `BEGIN IMMEDIATE` re-validation and never scores anything here.
+    pub fn quota_capacity_revision(&self, key: &PhysicalQuotaKey) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT capacity_revision FROM quota_capacity_revisions WHERE quota_key=?",
+                [key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    /// Counts owned orchestrated attempts per selected global account.
+    ///
+    /// Only attempts that carry a selected account and currently hold the
+    /// ownership flag are counted; released and legacy attempts stay
+    /// invisible, matching the schema's one-active-attempt partial index on
+    /// `ownership_active`. Accounts absent from `accounts` are not queried;
+    /// absent rows count as zero.
+    pub fn active_attempt_counts(&self, accounts: &[AccountId]) -> Result<BTreeMap<String, u64>> {
+        let mut counts = BTreeMap::new();
+        for account in accounts {
+            let open: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM attempts WHERE selected_account_id=? AND ownership_active=1",
+                [account.as_str()],
+                |row| row.get(0),
+            )?;
+            counts.insert(account.as_str().to_owned(), open as u64);
+        }
+        Ok(counts)
     }
     /// Records a native runtime session and its durable session event atomically.
     ///
