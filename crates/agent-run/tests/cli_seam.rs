@@ -836,15 +836,16 @@ fn test_mcp_unusable_frontends_fall_back_to_direct_protocol() {
     assert_direct_mcp_fallback(&invalid_executable, temp.path());
 }
 
-/// Creates dependencies whose human-readable transcript lines are collected in memory.
-fn text_dependencies(service: Arc<FakeService>, lines: Arc<Mutex<Vec<String>>>) -> CliDependencies {
-    let sink = Arc::clone(&lines);
+/// Creates dependencies whose human-readable transcript chunks are
+/// concatenated in memory exactly as the raw sink would write them.
+fn text_dependencies(service: Arc<FakeService>, text: Arc<Mutex<String>>) -> CliDependencies {
+    let sink = Arc::clone(&text);
     CliDependencies {
         service,
         broker: Arc::new(FakeBroker::new(Vec::new())),
         output: Arc::new(|_| Ok(())),
-        text_output: Arc::new(move |line| {
-            sink.lock().unwrap().push(line.to_owned());
+        text_output: Arc::new(move |chunk| {
+            sink.lock().unwrap().push_str(chunk);
             Ok(())
         }),
         doctor: Arc::new(|home| {
@@ -871,25 +872,19 @@ fn activity_page(complete: bool) -> Value {
 /// Proves `--format text` renders model text, tool activity, and sanitized results.
 #[tokio::test]
 async fn test_transcript_explicit_text_format_renders_sanitized_activity() {
-    let lines = Arc::new(Mutex::new(Vec::new()));
+    let text = Arc::new(Mutex::new(String::new()));
     agent_run::cli::run_with(
         parse(&["transcript", AGENT_ID, "--format", "text"]),
         text_dependencies(
             Arc::new(FakeService::new(vec![(0, activity_page(true))], true)),
-            lines.clone(),
+            text.clone(),
         ),
     )
     .await
     .unwrap();
     assert_eq!(
-        *lines.lock().unwrap(),
-        vec![
-            "review this",
-            "looking now",
-            "-> shell {\"cmd\":\"ls\"}",
-            "<- file.txt",
-            "runtime_session: {\"id\":\"s1\"}",
-        ]
+        *text.lock().unwrap(),
+        "review this\nlooking now\n-> shell {\"cmd\":\"ls\"}\n<- file.txt\nruntime_session: {\"id\":\"s1\"}\n"
     );
 }
 
@@ -901,9 +896,9 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
         vec!["transcript", AGENT_ID, "--format", "json"],
     ] {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let lines = Arc::new(Mutex::new(Vec::new()));
+        let text = Arc::new(Mutex::new(String::new()));
         let json_sink = Arc::clone(&output);
-        let text_sink = Arc::clone(&lines);
+        let text_sink = Arc::clone(&text);
         let mut argv = vec!["agent-run"];
         argv.extend(args.iter().copied());
         agent_run::cli::run_with(
@@ -915,8 +910,8 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
                     json_sink.lock().unwrap().push(value.clone());
                     Ok(())
                 }),
-                text_output: Arc::new(move |line| {
-                    text_sink.lock().unwrap().push(line.to_owned());
+                text_output: Arc::new(move |chunk| {
+                    text_sink.lock().unwrap().push_str(chunk);
                     Ok(())
                 }),
                 doctor: Arc::new(|home| {
@@ -934,8 +929,8 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
         assert_eq!(pages.len(), 1, "one JSON page for {args:?}");
         assert_eq!(pages[0]["messages"][2]["role"], "tool_call", "for {args:?}");
         assert!(
-            lines.lock().unwrap().is_empty(),
-            "no text lines for {args:?}"
+            text.lock().unwrap().is_empty(),
+            "no text output for {args:?}"
         );
     }
 }
@@ -944,7 +939,7 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
 #[tokio::test]
 async fn test_transcript_text_follow_drains_without_duplicates() {
     let _guard = FOLLOW_TESTS.lock().unwrap();
-    let lines = Arc::new(Mutex::new(Vec::new()));
+    let text = Arc::new(Mutex::new(String::new()));
     agent_run::cli::run_with(
         parse(&[
             "transcript",
@@ -969,19 +964,19 @@ async fn test_transcript_text_follow_drains_without_duplicates() {
                 ],
                 true,
             )),
-            lines.clone(),
+            text.clone(),
         ),
     )
     .await
     .unwrap();
-    assert_eq!(*lines.lock().unwrap(), vec!["one", "two"]);
+    assert_eq!(*text.lock().unwrap(), "one\ntwo\n");
 }
 
 /// Proves interrupting the viewer exits cleanly while the agent keeps running.
 #[tokio::test]
 async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
     let _guard = FOLLOW_TESTS.lock().unwrap();
-    let lines = Arc::new(Mutex::new(Vec::new()));
+    let text = Arc::new(Mutex::new(String::new()));
     let service = Arc::new(FakeService::new(
         vec![(
             0,
@@ -991,7 +986,7 @@ async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
     ));
     let runner = agent_run::cli::run_with(
         parse(&["transcript", AGENT_ID, "--follow", "--format", "text"]),
-        text_dependencies(service.clone(), lines.clone()),
+        text_dependencies(service.clone(), text.clone()),
     );
     let task = tokio::spawn(runner);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1005,7 +1000,7 @@ async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
         .expect("viewer exits on Ctrl-C")
         .unwrap()
         .unwrap();
-    assert_eq!(*lines.lock().unwrap(), vec!["hello"]);
+    assert_eq!(*text.lock().unwrap(), "hello\n");
     // The viewer has no cancellation path: the agent status stays untouched.
     assert_eq!(
         service
@@ -1023,7 +1018,7 @@ async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
 #[tokio::test]
 async fn test_transcript_text_streams_fragments_across_pages() {
     let _guard = FOLLOW_TESTS.lock().unwrap();
-    let lines = Arc::new(Mutex::new(Vec::new()));
+    let text = Arc::new(Mutex::new(String::new()));
     let rows = |seq: i64, content: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":"same-message"});
     agent_run::cli::run_with(
         parse(&[
@@ -1044,19 +1039,19 @@ async fn test_transcript_text_streams_fragments_across_pages() {
                 ],
                 true,
             )),
-            lines.clone(),
+            text.clone(),
         ),
     )
     .await
     .unwrap();
-    assert_eq!(*lines.lock().unwrap(), vec!["Hello world"]);
+    assert_eq!(*text.lock().unwrap(), "Hello world\n");
 }
 
 /// Proves escape sequences split across polling pages never leak payload.
 #[tokio::test]
 async fn test_transcript_text_consumes_escape_splits_across_pages() {
     let _guard = FOLLOW_TESTS.lock().unwrap();
-    let lines = Arc::new(Mutex::new(Vec::new()));
+    let text = Arc::new(Mutex::new(String::new()));
     let row = |seq: i64, content: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":"m"});
     agent_run::cli::run_with(
         parse(&[
@@ -1082,10 +1077,265 @@ async fn test_transcript_text_consumes_escape_splits_across_pages() {
                 ],
                 true,
             )),
-            lines.clone(),
+            text.clone(),
         ),
     )
     .await
     .unwrap();
-    assert_eq!(*lines.lock().unwrap(), vec!["bad red ok"]);
+    assert_eq!(*text.lock().unwrap(), "bad red ok\n");
+}
+
+/// Supplies pages while holding every poll after the first behind a barrier.
+///
+/// The viewer's second `transcript` call parks until the test releases it,
+/// modeling a producer that has journaled one fragment and is still running.
+struct PausingService {
+    /// Barrier the second and later polls wait on.
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl CliService for PausingService {
+    fn cancel(&self, _id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({"cancelled":true}))
+    }
+    fn steer(&self, _id: &AgentId, _text: &str) -> agent_run::Result<Value> {
+        Ok(json!({"accepted":true}))
+    }
+    fn list<'a>(&'a self, _query: Query) -> CliFuture<'a> {
+        Box::pin(async { Ok(json!({"items":[]})) })
+    }
+    fn answer(&self, id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({"agent_id":id,"status":"running"}))
+    }
+    fn agent(&self, id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({"agent_id":id,"status":"succeeded"}))
+    }
+    fn transcript(&self, _id: &AgentId, cursor: i64, _limit: usize) -> agent_run::Result<Value> {
+        if cursor >= 1 {
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("second poll barrier released");
+            Ok(
+                json!({"messages":[{"seq":2,"role":"assistant","content":" world","raw_ref":"m"}],"complete":true}),
+            )
+        } else {
+            Ok(
+                json!({"messages":[{"seq":1,"role":"assistant","content":"Hello","raw_ref":"m"}],"complete":false}),
+            )
+        }
+    }
+    fn models<'a>(&'a self) -> CliFuture<'a> {
+        Box::pin(async { Ok(json!([])) })
+    }
+    fn limits(&self) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+    fn capacity_order(&self) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+    fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+    fn delivery_cancel(&self, _id: &str) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+}
+
+/// Proves rendered bytes are sink-visible while the producer is still open:
+/// after page 1 and before page 2 exists, the raw output is exactly `Hello`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transcript_text_bytes_are_visible_before_the_stream_completes() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let text = Arc::new(Mutex::new(String::new()));
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<()>();
+    let sink = Arc::clone(&text);
+    let notify = chunk_tx.clone();
+    let dependencies = CliDependencies {
+        service: Arc::new(PausingService {
+            release: Mutex::new(released),
+        }),
+        broker: Arc::new(FakeBroker::new(Vec::new())),
+        output: Arc::new(|_| Ok(())),
+        text_output: Arc::new(move |chunk| {
+            sink.lock().unwrap().push_str(chunk);
+            let _ = notify.send(());
+            Ok(())
+        }),
+        doctor: Arc::new(|home| {
+            Ok(agent_run::doctor::Report {
+                home: home.to_owned(),
+                checked_at: 0.0,
+                findings: Vec::new(),
+            })
+        }),
+    };
+    let runner = tokio::spawn(agent_run::cli::run_with(
+        parse(&["transcript", AGENT_ID, "--follow", "--format", "text"]),
+        dependencies,
+    ));
+    chunk_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("first fragment reaches the sink");
+    // The producer's second poll is still parked behind the barrier: the
+    // viewer must already hold exactly the first fragment's bytes.
+    assert!(!runner.is_finished(), "viewer is still following");
+    assert_eq!(*text.lock().unwrap(), "Hello");
+    release.send(()).expect("release second poll");
+    tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("viewer drains and exits")
+        .unwrap()
+        .unwrap();
+    assert_eq!(*text.lock().unwrap(), "Hello world\n");
+}
+
+/// Drives the real `agent-run` binary against a live durable home.
+///
+/// Admits a row directly (the preparation `Service::start` performs, minus
+/// any launch), journals fragments from the test process while the viewer
+/// follows, and reads the child's pipe byte-exactly before it exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes() {
+    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let temp = tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let initialized = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args(["--home", home.to_str().unwrap(), "init"])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{initialized:?}");
+    // A configured-but-never-launched runtime satisfies request validation;
+    // the viewer only reads the journal, so the binary is never executed.
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary={}\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",
+            serde_json::json!("/bin/true"),
+            serde_json::json!(home.join("runtime").to_string_lossy().into_owned()),
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join("profiles")).unwrap();
+    std::fs::write(home.join("profiles/review.md"), "Review.\n").unwrap();
+    let mut request = agent_run::domain::StartRequest {
+        runtime: "mock".into(),
+        model: "fixture".into(),
+        profile: "review".into(),
+        task: "live pipe fixture".into(),
+        workdir: home.clone(),
+        write: false,
+        fast: false,
+        effort: None,
+        timeout_seconds: None,
+        read_roots: vec![],
+        output_schema: None,
+        orchestrator: None,
+        request_id: None,
+        account: None,
+        required_constraints: Default::default(),
+    };
+    request.validate().unwrap();
+    let config = agent_run::config::Config::load(&home).unwrap();
+    let mut store = agent_run::state::Store::open(&home).unwrap();
+    let (id, created) = store
+        .admit(&request, &config, &serde_json::json!({}), None)
+        .unwrap();
+    assert!(created, "expected a freshly admitted row");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "transcript",
+            &id.to_string(),
+            "--follow",
+            "--format",
+            "text",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr_handle = child.stderr.take().unwrap();
+    let pipe = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let writer = Arc::clone(&pipe);
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            writer.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let piperr = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stderr_handle = stderr_handle;
+        let mut err = Vec::new();
+        let _ = stderr_handle.read_to_end(&mut err);
+        err
+    });
+    // Producer side: journal the first fragment while the agent is running.
+    agent_run::state::Store::open(&home)
+        .unwrap()
+        .message(&id, "assistant", "Hello", None, Some("m1"))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while *pipe.lock().unwrap() != b"Hello".to_vec() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pipe must hold exactly `Hello`, held {:?}",
+            pipe.lock().unwrap()
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "viewer must still be running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The agent is still nonterminal: no terminal row exists, and the pipe
+    // holds the fragment alone — no newline, no reflow, no truncation.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(*pipe.lock().unwrap(), b"Hello".to_vec());
+    agent_run::state::Store::open(&home)
+        .unwrap()
+        .message(&id, "assistant", " world", None, Some("m1"))
+        .unwrap();
+    agent_run::state::Store::open(&home)
+        .unwrap()
+        .finish(
+            &id,
+            &agent_run::domain::Outcome::failure("fixture_complete"),
+            None,
+            None,
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "viewer drains and exits"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Exit is observed before the pipe reaches EOF; join the reader so the
+    // exact final bytes are captured, not just what was drained so far.
+    reader.join().expect("pipe reader finishes");
+    let status = child.wait().unwrap();
+    let stderr =
+        String::from_utf8_lossy(&piperr.join().expect("stderr reader finishes")).into_owned();
+    assert_eq!(
+        *pipe.lock().unwrap(),
+        b"Hello world\n".to_vec(),
+        "viewer exit {status:?}, stderr {stderr:?}"
+    );
 }

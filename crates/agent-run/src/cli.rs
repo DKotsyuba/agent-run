@@ -33,7 +33,11 @@ pub type CliFuture<'a> = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>
 /// Output callback used by [`CliDependencies`].
 pub type CliOutput = Arc<dyn Fn(&Value) -> Result<()> + Send + Sync>;
 
-/// Human-readable text sink used by the transcript viewer's text format.
+/// Raw text chunk sink used by the transcript viewer's text format.
+///
+/// The sink writes exactly the bytes it is given and flushes; the transcript
+/// renderer owns every intentional newline, so streamed fragments reach the
+/// pipe as soon as they are rendered.
 pub type CliTextOutput = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
 /// Output format of the `transcript` viewer.
@@ -155,7 +159,8 @@ pub struct CliDependencies {
     pub broker: Arc<dyn CliBroker>,
     /// JSON sink; production writes one newline-delimited value to stdout.
     pub output: CliOutput,
-    /// Text sink used by the transcript viewer's human-readable format.
+    /// Raw text chunk sink used by the transcript viewer's human-readable
+    /// format.
     pub text_output: CliTextOutput,
     /// Structured doctor report provider.
     pub doctor: DoctorRunner,
@@ -168,7 +173,7 @@ impl CliDependencies {
             service: Arc::new(Service::new(home.clone())),
             broker: Arc::new(SocketBroker { home }),
             output: Arc::new(emit),
-            text_output: Arc::new(write_line),
+            text_output: Arc::new(write_chunk),
             doctor: Arc::new(crate::doctor::run),
         }
     }
@@ -558,11 +563,14 @@ fn task_text(value: &str, max: usize) -> Result<String> {
     }
     Ok(text)
 }
-/// Writes one sanitized viewer text line followed by a newline to stdout.
-pub fn write_line(line: &str) -> Result<()> {
+/// Writes one raw viewer text chunk to stdout and flushes immediately.
+///
+/// The chunk is written exactly as supplied: the transcript renderer owns
+/// every intentional newline, so a streamed fragment becomes visible on the
+/// pipe the moment it is rendered instead of at a line boundary.
+pub fn write_chunk(chunk: &str) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
+    out.write_all(chunk.as_bytes())?;
     out.flush()?;
     Ok(())
 }
@@ -1056,7 +1064,8 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             // and JSON keeps piped consumers on the historical machine shape.
             let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
             // Streaming state persists across pages and polls so journal
-            // fragments of one model message render continuously.
+            // fragments of one model message render continuously; the sink
+            // writes each rendered chunk immediately.
             let mut renderer = crate::transcript::Renderer::default();
             if full {
                 let page = dependencies.service.transcript(&agent_id, cursor, limit)?;

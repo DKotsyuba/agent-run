@@ -109,7 +109,15 @@ Output is line-delimited JSON. `transcript --follow` streams a live view:
 model text, tool activity, and results as they arrive, exiting when the agent
 reaches a terminal state and its journal is drained; Ctrl-C exits only the
 viewer and never cancels the agent. `--format text|json` picks the rendering,
-defaulting to text on a terminal and JSON when output is piped. Other commands
+defaulting to text on a terminal and JSON when output is piped. In text mode
+each journal fragment is sanitized and written to the pipe immediately as it
+arrives — there is no line buffering — with one newline per message or tool
+row; untrusted roles, names, and content are stripped of terminal escape
+sequences. The Codex runtime journals deltas and completion tails of one
+message under a shared item identity, so they render as one continuous row;
+the Claude runtime currently journals assistant deltas without an item
+identity or a message-boundary row, so its consecutive assistant rows render
+as one continuous row as well. Other commands
 include `steer`, `cancel`, `models`, `limits`, `capacity order`,
 `delivery status`, and `doc`.
 
