@@ -327,3 +327,44 @@ async fn provider_supervisor_refuses_tampered_role_authority() {
     assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
     assert_eq!(process, None);
 }
+
+/// An OS refusal to spawn the configured engine proves no child existed and
+/// releases the first attempt without pretending that a process was cleaned.
+#[tokio::test]
+async fn provider_spawn_error_closes_owned_attempt_without_process() {
+    let (_temp, home) = home();
+    let path = home.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    let missing = home.join("missing-engine");
+    fs::write(
+        &path,
+        config.replace(
+            env!("CARGO_BIN_EXE_agent-run-fixture"),
+            missing.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(0))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Failed);
+    let (active, proof, process): (i64, Option<String>, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json,process_identity FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
+    assert_eq!(process, None);
+}

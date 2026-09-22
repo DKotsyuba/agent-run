@@ -89,6 +89,20 @@ impl Store {
         Ok(())
     }
 
+    /// Returns a pre-child OS spawn failure to the prepared phase so the
+    /// supervisor can certify never-spawned cleanup and close ownership.
+    pub fn provider_spawn_failed(&self, id: &AgentId, attempt: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE attempts SET phase='prepared' \
+             WHERE id=? AND agent_id=? AND ownership_active=1 AND phase='spawning' AND process_identity IS NULL",
+            params![attempt, id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
     /// Persists the inspected child leader identity immediately after spawn,
     /// before the supervisor can mark the agent running.
     pub fn provider_process(&self, id: &AgentId, attempt: &str, leader: &Identity) -> Result<()> {

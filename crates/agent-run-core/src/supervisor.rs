@@ -420,7 +420,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     )?;
     store.provider_spawning(id, &attempt_id)?;
     store.event(id, "phase", &json!({"phase":"spawning"}))?;
-    let mut process = Process::spawn(&planned.launch)?;
+    // Process::spawn yields Io only when the OS refused Command::spawn,
+    // before a child exists; other failures retain ownership for recovery.
+    let mut process = match Process::spawn(&planned.launch) {
+        Ok(process) => process,
+        Err(error @ Error::Io(_)) => {
+            store.provider_spawn_failed(id, &attempt_id)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let execution = async {
         let leader = process
             .owner
