@@ -139,11 +139,12 @@ impl AuthorizedRequest {
             return Err(invalid("authorized request leaves the provider origin"));
         }
         let secret = reader.read(&self.reference)?;
-        let header = match self.header {
+        let mut header = match self.header {
             CredentialHeader::Bearer => HeaderValue::from_str(&format!("Bearer {secret}")),
             CredentialHeader::XApiKey => HeaderValue::from_str(&secret),
         }
         .map_err(|_| invalid("credential cannot form an HTTP header"))?;
+        header.set_sensitive(true);
         let mut request = Request::new(method, target);
         request.headers_mut().insert(
             match self.header {

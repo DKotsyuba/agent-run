@@ -1,6 +1,9 @@
 # Provider configuration v2
 
 Schema v2 declares two native harnesses and any number of named providers.
+New capacity source kinds are `codex_appserver`, `lua`, and `none`; older
+v1 source names are migration input only. Lua collection configuration is
+owned by the quota integration.
 Provider ids are operator-chosen; names such as `codex-plus` and `glm` carry
 no built-in subscription or model-intelligence meaning. The orchestrator
 selects a configured model id. Profiles, skills, and MCP definitions remain
@@ -23,7 +26,7 @@ home = "/var/lib/agent-run/claude"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "native"
+limits_source = "codex_appserver"
 recommendations = ["Use for coding work."]
 
 [[providers.codex.models]]
@@ -40,7 +43,7 @@ account = "acct-personal"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "native"
+limits_source = "codex_appserver"
 priority_multiplier = 5.0
 
 [[providers.codex-plus.models]]
@@ -56,7 +59,7 @@ models = ["gpt"]
 harness = "claude-code"
 connection = { kind = "custom", endpoint = "https://gateway.example/api/anthropic", protocol = "messages" }
 auth_family = "anthropic"
-limits_source = "provider"
+limits_source = "lua"
 
 [[providers.glm.models]]
 id = "glm-5.3"

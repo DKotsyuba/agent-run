@@ -84,7 +84,7 @@ fn registry_keeps_global_identity_and_reference_metadata() {
     assert_eq!(selected, id.as_str());
     let provider: ProviderDefinition = serde_json::from_value(serde_json::json!({
         "id":"codex","harness":"codex","connection":{"kind":"native"},
-        "auth_family":"openai","limits_source":"native",
+        "auth_family":"openai","limits_source":"codex_appserver",
         "models":[{"id":"gpt"}],
         "bindings":[{"label":"personal","account":"acct-one"}]
     }))

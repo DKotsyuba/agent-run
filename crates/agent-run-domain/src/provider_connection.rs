@@ -87,14 +87,10 @@ pub enum ProviderProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitsSource {
-    /// Harness-native capacity telemetry.
-    Native,
-    /// Existing local codexbar bridge.
-    Codexbar,
-    /// Existing OmniRoute bridge.
-    Omniroute,
-    /// A provider-specific collector supplied by the quota side.
-    Provider,
+    /// Codex app-server capacity telemetry.
+    CodexAppserver,
+    /// Quota collection delegated to the Lua source.
+    Lua,
     /// No known capacity source.
     None,
 }

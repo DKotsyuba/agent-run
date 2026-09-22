@@ -19,6 +19,7 @@ them from `agent_run_domain::catalog` rather than redefining business types.
   settings, allowed parameter values, plain-text recommendations, and typed
   preserved restrictions. There is no model intelligence, classification, or
   scoring in the catalog.
+* V2 capacity source kinds are `codex_appserver`, `lua`, and `none`.
 * A registered account (`AccountRecord`) has an immutable global opaque
   `AccountId`, an auth family, a secret *reference*, and a status. A provider
   binding (`ProviderBinding`) carries a validated `AccountLabel`, an optional

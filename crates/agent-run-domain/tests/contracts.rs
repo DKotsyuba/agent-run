@@ -252,7 +252,7 @@ fn aliased_catalog() -> ProviderCatalog {
         auth_family: AuthFamily::from_str("openai").unwrap(),
         recommendations: vec![],
         priority_multiplier: PositiveFinite::try_from(1.0).unwrap(),
-        limits_source: LimitsSource::Native,
+        limits_source: LimitsSource::CodexAppserver,
         models: vec![model.clone()],
         bindings: vec![ProviderBinding {
             label: "plus".parse().unwrap(),

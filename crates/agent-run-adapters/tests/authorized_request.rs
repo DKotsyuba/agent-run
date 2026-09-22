@@ -28,7 +28,7 @@ fn catalog() -> ProviderCatalog {
         "providers":[{
             "id":"glm","harness":"claude-code",
             "connection":{"kind":"custom","endpoint":"https://api.example.com/base","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"provider",
+            "auth_family":"anthropic","limits_source":"lua",
             "models":[{"id":"glm-5.3","native_model":"glm-5.3[1m]"}],
             "bindings":[{"label":"work","account":"acct-work"}]
         }]
@@ -66,6 +66,8 @@ fn capability_binds_account_and_origin_without_exposing_a_token() {
         request.headers()["authorization"],
         "Bearer synthetic-secret"
     );
+    assert!(request.headers()["authorization"].is_sensitive());
+    assert!(!format!("{request:?}").contains("synthetic-secret"));
     assert_eq!(fake.0.load(Ordering::SeqCst), 1);
     assert!(AuthorizedRequest::new(
         &catalog,

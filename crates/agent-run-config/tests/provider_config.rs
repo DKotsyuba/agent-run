@@ -24,7 +24,7 @@ home = "{home}/claude"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "native"
+limits_source = "codex_appserver"
 recommendations = ["native subscription"]
 [[providers.codex.models]]
 id = "gpt"
@@ -40,7 +40,7 @@ account = "acct-native"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "native"
+limits_source = "codex_appserver"
 priority_multiplier = 5.0
 [[providers.codex-plus.models]]
 id = "gpt"
@@ -53,7 +53,7 @@ models = ["gpt"]
 harness = "claude-code"
 connection = {{ kind = "custom", endpoint = "https://api.example.com/messages", protocol = "messages" }}
 auth_family = "anthropic"
-limits_source = "provider"
+limits_source = "lua"
 [[providers.glm.models]]
 id = "glm-5.3"
 native_model = "glm-5.3[1m]"
@@ -153,6 +153,11 @@ fn v2_rejects_invalid_provider_contracts() {
     }
     let config = ProviderConfig::parse(&valid, home.path()).unwrap();
     assert!(config.resolve_catalog(vec![]).is_err());
+    for retired in ["native", "codexbar", "omniroute", "provider"] {
+        assert!(
+            ProviderConfig::parse(&valid.replace("codex_appserver", retired), home.path()).is_err()
+        );
+    }
 }
 
 /// Invalid revisions leave the caller's last valid parsed value untouched.
