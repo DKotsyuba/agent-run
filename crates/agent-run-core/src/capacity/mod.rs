@@ -2,6 +2,7 @@
 //! A failed collector never replaces good evidence with an invented zero.
 pub mod advice;
 pub mod omniroute;
+pub mod provider_ranking;
 pub mod ranking;
 pub mod sources;
 use crate::{config::Config, domain::now, error::invalid, state::Store, Result};
