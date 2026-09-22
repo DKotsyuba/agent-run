@@ -5,8 +5,9 @@ mod common;
 use agent_run_config::{
     config::Mcp,
     profiles,
-    role_plan::{resolve_role_plan, ResolvedRolePlan},
+    role_plan::{resolve_role_plan, role_from_authority, ResolvedRolePlan},
 };
+use agent_run_domain::catalog::ResolvedLaunchAuthority;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
@@ -80,6 +81,26 @@ Review the assigned change.\n";
     );
     assert_eq!(plan.config_revision.len(), 64);
     assert_eq!(ResolvedRolePlan::from_payload(&payload).unwrap(), plan);
+    let mut authority = ResolvedLaunchAuthority {
+        provider: "codex".parse().unwrap(),
+        harness: agent_run_domain::HarnessId::Codex,
+        protocol_endpoint: "https://api.example.com".into(),
+        model: "gpt-5.1".into(),
+        effort: None,
+        profile: plan.role_name.clone(),
+        workdir: root.clone(),
+        role_payload: payload.clone(),
+        assets_sha256: "a".repeat(64).parse().unwrap(),
+        eligible_accounts: vec!["acct-one".parse().unwrap()],
+    };
+    let actual_assets_sha256 = "a".repeat(64).parse().unwrap();
+    assert_eq!(
+        role_from_authority(&authority, &actual_assets_sha256).unwrap(),
+        plan
+    );
+    assert!(role_from_authority(&authority, &"b".repeat(64).parse().unwrap()).is_err());
+    authority.role_payload["grants"]["write"] = json!(true);
+    assert!(role_from_authority(&authority, &actual_assets_sha256).is_err());
 
     let again = resolve_role_plan(
         &profile,

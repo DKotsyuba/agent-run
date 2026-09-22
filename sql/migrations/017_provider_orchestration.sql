@@ -9,14 +9,18 @@ CREATE TABLE provider_accounts (
   secret_ref TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
   created_at REAL NOT NULL,
-  updated_at REAL NOT NULL
+  updated_at REAL NOT NULL,
+  UNIQUE (auth_family, secret_ref)
 );
 
-CREATE TABLE quota_capacity_revisions (
-  quota_key TEXT PRIMARY KEY,
-  capacity_revision INTEGER NOT NULL CHECK (capacity_revision >= 0),
+-- One committed revision for the entire scored snapshot. Each relevant quota
+-- mutation advances this singleton in the same transaction as its facts.
+CREATE TABLE quota_capacity_revision (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL CHECK (revision >= 0),
   updated_at REAL NOT NULL
 );
+INSERT INTO quota_capacity_revision VALUES (1, 0, 0.0);
 
 ALTER TABLE agents ADD COLUMN selection_intent TEXT
   CHECK (selection_intent IN ('auto', 'pinned'));
@@ -34,12 +38,34 @@ ALTER TABLE attempts ADD COLUMN ownership_active INTEGER NOT NULL DEFAULT 0
 CREATE INDEX idx_attempts_selected_account
   ON attempts(selected_account_id) WHERE selected_account_id IS NOT NULL;
 
+-- One attempt can reserve several physical pools. Keys are inserted with the
+-- selected account in the admission transaction and remain as durable facts
+-- after ownership releases; active counts join ownership_active.
+CREATE TABLE attempt_quota_keys (
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  quota_key TEXT NOT NULL,
+  PRIMARY KEY (attempt_id, quota_key)
+);
+CREATE INDEX idx_attempt_quota_keys_key ON attempt_quota_keys(quota_key);
+CREATE TRIGGER attempt_quota_keys_account_guard
+BEFORE INSERT ON attempt_quota_keys
+WHEN NOT EXISTS (
+  SELECT 1 FROM attempts
+  WHERE id = NEW.attempt_id AND selected_account_id IS NOT NULL
+    AND substr(NEW.quota_key, 1, length(selected_account_id) + 2) = selected_account_id || '::'
+    AND length(NEW.quota_key) > length(selected_account_id) + 2
+)
+BEGIN
+  SELECT RAISE(ABORT, 'quota key must belong to selected account');
+END;
+
 -- At most one attempt owns the agent's execution slot at any time. The
 -- ownership flag spans the whole orchestrated lifecycle: an attempt holds
 -- ownership from claim (prepared/starting) through running, account switch,
--- and cleanup-pending, and releases it (set to 0) only after verified process
--- teardown and cleanup proof. Legacy rows default to 0, so historical stores
--- with several open 'running' attempts and current release inserts that do
+-- and cleanup-pending. Consumers may release it only after verified process
+-- teardown and cleanup proof; this index enforces uniqueness only. Legacy
+-- rows default to 0, so historical stores with several open 'running'
+-- attempts and current release inserts that do
 -- not claim ownership migrate and keep working unchanged.
 CREATE UNIQUE INDEX idx_attempts_one_active
   ON attempts(agent_id) WHERE ownership_active = 1;

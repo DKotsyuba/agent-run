@@ -176,14 +176,33 @@ CREATE TABLE provider_accounts (
   secret_ref TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
   created_at REAL NOT NULL,
-  updated_at REAL NOT NULL
+  updated_at REAL NOT NULL,
+  UNIQUE (auth_family, secret_ref)
 );
 
-CREATE TABLE quota_capacity_revisions (
-  quota_key TEXT PRIMARY KEY,
-  capacity_revision INTEGER NOT NULL CHECK (capacity_revision >= 0),
+CREATE TABLE quota_capacity_revision (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL CHECK (revision >= 0),
   updated_at REAL NOT NULL
 );
+INSERT INTO quota_capacity_revision VALUES (1, 0, 0.0);
+
+CREATE TABLE attempt_quota_keys (
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  quota_key TEXT NOT NULL,
+  PRIMARY KEY (attempt_id, quota_key)
+);
+CREATE TRIGGER attempt_quota_keys_account_guard
+BEFORE INSERT ON attempt_quota_keys
+WHEN NOT EXISTS (
+  SELECT 1 FROM attempts
+  WHERE id = NEW.attempt_id AND selected_account_id IS NOT NULL
+    AND substr(NEW.quota_key, 1, length(selected_account_id) + 2) = selected_account_id || '::'
+    AND length(NEW.quota_key) > length(selected_account_id) + 2
+)
+BEGIN
+  SELECT RAISE(ABORT, 'quota key must belong to selected account');
+END;
 
 CREATE TABLE workflow_runs (
   id TEXT PRIMARY KEY,
@@ -276,6 +295,7 @@ CREATE INDEX idx_events_agent_seq ON events(agent_id, seq);
 CREATE INDEX idx_messages_agent_seq ON messages(agent_id, seq);
 CREATE INDEX idx_attempts_selected_account
   ON attempts(selected_account_id) WHERE selected_account_id IS NOT NULL;
+CREATE INDEX idx_attempt_quota_keys_key ON attempt_quota_keys(quota_key);
 CREATE UNIQUE INDEX idx_attempts_one_active
   ON attempts(agent_id) WHERE ownership_active = 1;
 CREATE INDEX idx_commands_due ON commands(agent_id, state, id);

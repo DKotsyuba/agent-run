@@ -733,13 +733,14 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     // Registry and quota revision tables start empty and admit typed facts.
     let account: agent_run_domain::AccountId = "acct-codex-native".parse().unwrap();
     let key = agent_run_domain::PhysicalQuotaKey::new(&account, "gpt-5.1").unwrap();
-    assert_eq!(store.quota_capacity_revision(&key).unwrap(), None);
+    let second_key = agent_run_domain::PhysicalQuotaKey::new(&account, "shared-tokens").unwrap();
+    assert_eq!(store.quota_capacity_revision().unwrap(), 0);
     assert_eq!(
         store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
         0
     );
 
-    let writable = Connection::open(&db_path).unwrap();
+    let mut writable = Connection::open(&db_path).unwrap();
     writable
         .execute(
             "INSERT INTO provider_accounts VALUES ('acct-codex-native','openai',\
@@ -747,13 +748,29 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
             [],
         )
         .unwrap();
-    writable
-        .execute(
-            "INSERT INTO quota_capacity_revisions VALUES (?1, 7, 1.0)",
-            params![key.as_str()],
+    assert!(writable.execute(
+        "INSERT INTO provider_accounts VALUES ('acct-alias','openai','keychain:codex','enabled',1.0,1.0)",
+        [],
+    ).is_err());
+    for (pool, expected) in [(&key, 1), (&second_key, 2)] {
+        let tx = writable.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,observed_at,payload_json) \
+             VALUES ('codex',?1,'5h','fixture',1.0,'null')",
+            [pool.as_str()],
         )
         .unwrap();
-    assert_eq!(store.quota_capacity_revision(&key).unwrap(), Some(7));
+        assert_eq!(
+            Store::advance_quota_capacity_revision(&tx).unwrap(),
+            expected
+        );
+        assert_eq!(Store::quota_capacity_revision_in(&tx).unwrap(), expected);
+        tx.commit().unwrap();
+        assert_eq!(store.quota_capacity_revision().unwrap(), expected);
+    }
+    // The second physical pool changed; the first pool's candidate revision
+    // is stale despite its own key remaining untouched.
+    assert_ne!(store.quota_capacity_revision().unwrap(), 1);
 
     // Legacy-style inserts (no ownership claim) still work beside the index,
     // even while another attempt holds ownership.
@@ -764,7 +781,6 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
             [],
         )
         .unwrap();
-
     // One owned attempt across distinct lifecycle states: a claim in the
     // prepared state already fences every later owned attempt.
     writable
@@ -775,6 +791,34 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
             [],
         )
         .unwrap();
+    for quota_key in [&key, &second_key] {
+        writable
+            .execute(
+                "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
+                [quota_key.as_str()],
+            )
+            .unwrap();
+    }
+    let other: agent_run_domain::AccountId = "acct-other".parse().unwrap();
+    let foreign_key = agent_run_domain::PhysicalQuotaKey::new(&other, "gpt-5.1").unwrap();
+    assert!(writable
+        .execute(
+            "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
+            [foreign_key.as_str()],
+        )
+        .is_err());
+    assert_eq!(
+        store
+            .active_reservation_counts(&[key.clone(), second_key.clone()])
+            .unwrap()[key.as_str()],
+        1
+    );
+    assert_eq!(
+        store
+            .active_reservation_counts(&[second_key.clone()])
+            .unwrap()[second_key.as_str()],
+        1
+    );
     for (id, number, state) in [
         ("att_orch_run", 4, "running"),
         ("att_orch_switch", 5, "account_switch"),
@@ -798,8 +842,16 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         );
     }
 
-    // Releasing ownership after verified cleanup frees the slot for the next
-    // attempt, and released rows stop counting as active.
+    // The index only enforces uniqueness: SQL permits release with NULL proof.
+    // The future session consumer must verify cleanup before this update.
+    let proof: Option<String> = writable
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE id='att_orch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(proof, None);
     writable
         .execute(
             "UPDATE attempts SET ownership_active=0, state='finished', finished_at=4.0 \
@@ -809,6 +861,12 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         .unwrap();
     assert_eq!(
         store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        0
+    );
+    assert_eq!(
+        store
+            .active_reservation_counts(&[key.clone(), second_key.clone()])
+            .unwrap()[key.as_str()],
         0
     );
     writable
@@ -822,5 +880,16 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     assert_eq!(
         store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
         1
+    );
+    writable
+        .execute(
+            "INSERT INTO attempt_quota_keys VALUES ('att_orch2', ?1)",
+            [key.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.active_reservation_counts(&[key, second_key]).unwrap()
+            ["acct-codex-native::shared-tokens"],
+        0
     );
 }

@@ -794,21 +794,53 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    /// Returns the committed capacity revision of one physical quota pool.
+    /// Returns the committed global revision of the entire quota snapshot.
     ///
-    /// `None` means no revision was ever committed for the pool, which
-    /// transactional admission treats as a mismatch against any candidate set
-    /// carrying a committed revision. Read-only: the session module owns the
-    /// `BEGIN IMMEDIATE` re-validation and never scores anything here.
-    pub fn quota_capacity_revision(&self, key: &PhysicalQuotaKey) -> Result<Option<i64>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT capacity_revision FROM quota_capacity_revisions WHERE quota_key=?",
+    /// Admission reads this inside `BEGIN IMMEDIATE` and compares it with
+    /// the producer's candidate revision. The store never scores candidates.
+    pub fn quota_capacity_revision(&self) -> Result<i64> {
+        Self::quota_capacity_revision_in(&self.conn)
+    }
+    /// Reads the same singleton inside a producer or admission transaction.
+    pub fn quota_capacity_revision_in(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT revision FROM quota_capacity_revision WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+    /// Advances the global snapshot revision inside the caller's transaction.
+    ///
+    /// Collectors must write every relevant quota fact and call this once
+    /// before committing that same transaction, preserving snapshot atomicity.
+    pub fn advance_quota_capacity_revision(tx: &Transaction<'_>) -> Result<i64> {
+        let changed = tx.execute(
+            "UPDATE quota_capacity_revision SET revision=revision+1,updated_at=? \
+             WHERE id=1 AND revision<9223372036854775807",
+            [now()],
+        )?;
+        if changed != 1 {
+            return Err(invalid("quota capacity revision cannot advance"));
+        }
+        Self::quota_capacity_revision_in(tx)
+    }
+    /// Counts active reservations for each exact physical pool, including
+    /// shared aliases and attempts consuming multiple pools.
+    pub fn active_reservation_counts(
+        &self,
+        keys: &[PhysicalQuotaKey],
+    ) -> Result<BTreeMap<String, u64>> {
+        let mut counts = BTreeMap::new();
+        for key in keys {
+            let open: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM attempt_quota_keys k JOIN attempts a ON a.id=k.attempt_id \
+                 WHERE k.quota_key=? AND a.ownership_active=1",
                 [key.as_str()],
                 |row| row.get(0),
-            )
-            .optional()?)
+            )?;
+            counts.insert(key.as_str().to_owned(), open as u64);
+        }
+        Ok(counts)
     }
     /// Counts owned orchestrated attempts per selected global account.
     ///

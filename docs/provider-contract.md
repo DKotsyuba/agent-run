@@ -10,20 +10,26 @@ them from `agent_run_domain::catalog` rather than redefining business types.
 * Harnesses are exactly `codex` and `claude-code` (`HarnessId`).
 * A provider (`ProviderDefinition`) binds one harness, one protocol endpoint,
   one auth family, an explicit model list, and account bindings. Provider ids
-  are arbitrary within the identifier grammar.
+  are arbitrary within the identifier grammar. Endpoints require HTTPS; an
+  explicit provider flag allows HTTP only for loopback fixtures. URL userinfo,
+  fragments, unsupported schemes, and harness/auth-family mismatches fail
+  validation.
 * Provider models are explicit: model id, optional native model, textual
   parameters (e.g. effort choices), plain-text recommendations, and explicit
   preserved restrictions. There is no model intelligence, classification, or
   scoring in the catalog.
 * A registered account (`AccountRecord`) has an immutable global opaque
   `AccountId`, an auth family, a secret *reference*, and a status. A provider
-  binding (`ProviderBinding`) carries a provider-local label, an optional
+  binding (`ProviderBinding`) carries a validated `AccountLabel`, an optional
   model subset that must be contained in the provider's models, and a positive
   finite multiplier defaulting to 1. A binding is valid only when its account
   is registered and the account auth family equals the provider auth family.
 * The same global account id may be bound under several providers or labels.
   Those aliases denote one physical account: one quota pool and one set of
-  reservations, never summed.
+  reservations, never summed. Separate account ids cannot register the same
+  canonical auth-family/secret-reference storage identity.
+* Wire deserialization runs the same whole-catalog checks as construction,
+  including duplicate ids, model subsets, registration, and auth families.
 * No secret bytes exist in any catalog type. Credentials are named by
   `SecretRef` (a storage reference such as a keychain label); the real
   resolver is a separate deliverable.
@@ -35,28 +41,56 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
 
 * `ResolvedLaunchAuthority` is the immutable authority frozen at admission:
   provider, harness, protocol endpoint, explicit model and effort, profile,
-  workdir, granted constraints, tool-assets digest, and the frozen eligible
-  account scope. Raw harness-native settings cannot override these owned
-  fields.
+  workdir, canonical resolved role payload, required tool-assets digest, and
+  frozen eligible account scope. The payload carries the operative prompt,
+  write/network/read grants, skill and MCP permissions, and required
+  constraints. Its initial auth reference records admission context, while
+  each attempt's validated credential lease supplies the active account.
+  Required constraints are obligations, not grants.
+  Admission must produce it from the resolved role plan and sealed assets.
+  Every launch/retry must reconstruct it with
+  `role_plan::role_from_authority` with a digest computed from the sealed
+  asset bytes. This validates the role payload, authority revision, and asset
+  proof. Consumers use those frozen role/tool semantics and bind the current
+  attempt lease for account auth without changing the frozen grants.
+  Domain validation checks the canonical role revision without depending on
+  config or core. Raw harness-native settings cannot override these fields.
 * `AttemptCredentials` is the mutable per-attempt lease: exactly one selected
-  global account plus a `SecretHandle`. The handle implements no serde trait,
-  so credential references cannot be serialized into configuration, the
-  database, snapshots, or logs.
+  enabled global account plus a coupled `SecretHandle` minted from that
+  account's catalog record and provider/model binding. Lease fields are
+  private; callers cannot pair account A with account B's reference. The
+  handle implements no serde trait. References name nonsecret storage
+  locations; credential bytes never enter the catalog or lease.
 
 ## C3 Quota admission contracts
 
+* `NormalizedQuotaSnapshot` carries collector facts per host-bound account
+  and explicit model: each physical key owns its source-labelled,
+  provider-reported windows with remaining percent, optional reset,
+  observation time, and validity. Unknown values remain absent. Validation
+  bounds membership and rejects foreign keys,
+  duplicate windows, invalid percentages, and nonfinite times. Scoring stays
+  outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
   auto or pinned intent, deterministically ordered candidates, and the
-  committed capacity revision the ordering was computed against. Producing and
-  ordering the set (scoring) belongs to the quota side.
+  committed capacity revision the ordering was computed against. Each
+  candidate carries the exact account-bound physical key set that admission
+  must reserve with the attempt. Producing and ordering the set (scoring)
+  belongs to the quota side. Unknown capacity
+  candidates follow known usable capacity; missing data is never invented.
 * Transactional admission (session side) re-validates the committed revision
   in `BEGIN IMMEDIATE`, filters by current account status and reservations,
   and persists the chosen account plus the attempt. The store exposes only the
   raw facts it owns: `Store::quota_capacity_revision` and
-  `Store::active_attempt_counts`; it performs no scoring.
+  `Store::active_attempt_counts` and `Store::active_reservation_counts`;
+  it performs no scoring. One global monotonic `quota_capacity_revision`
+  covers the entire scored snapshot. A quota producer advances it in the same
+  transaction as each relevant quota mutation, then reads that value for its
+  candidate set; admission compares that same singleton in its transaction.
+  A change to either of two pools invalidates a set scored before it.
 * Typed verdicts (`QuotaAdmissionError`) with stable machine names:
-  `selection_stale` (revision moved; quota recomputes outside the
-  transaction, at most three retries), `selection_busy` (retry budget spent,
+  `selection_stale` (revision moved; the future quota consumer recomputes
+  outside the transaction, at most three retries), `selection_busy` (retry budget spent,
   no admission attempted), `no_eligible_account` (no candidate currently
   registered, enabled, and in scope), and `quota_exhausted` (repeats an
   authoritative structured provider exhaustion fact only). None may
@@ -79,12 +113,17 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
     process identity, and cleanup/session proof facts.
   * `provider_accounts` — the account registry (global id, auth family,
     secret reference, status).
-  * `quota_capacity_revisions` — the committed capacity revision per physical
-    quota key (`PhysicalQuotaKey` = global account + physical lane).
+  * `quota_capacity_revision` — one committed monotonic revision for the
+    whole scored snapshot.
+  * `attempt_quota_keys` — the exact physical key set consumed by each
+    selected model/attempt. The insert guard ties keys to the selected
+    `AccountId`; active reservation counts join this set to owned attempts.
+    Alias labels share the same keys, while distinct lanes remain distinct.
 * `attempts.ownership_active` (default 0) marks the attempt that owns the
   agent's execution slot. Ownership spans the entire orchestrated lifecycle —
   claim (prepared/starting), running, account switch, and cleanup-pending —
-  and is released (set to 0) only after verified process teardown and cleanup
+  and must be released (set to 0) by the session consumer only after verified
+  process teardown and cleanup proof. The schema does not yet enforce that
   proof. The partial unique index `idx_attempts_one_active`
   (`ON attempts(agent_id) WHERE ownership_active = 1`) enforces at most one
   owned attempt per agent across all those states. Legacy rows and current
@@ -95,12 +134,13 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
 ## C5 Historical decoding
 
 * Stored `request_json` blobs and sealed artifacts are never rewritten. The
-  decoder (`decode_legacy_request`) maps historical runtime spellings to
-  catalog identities read-only:
-  * `codex`, `codex_appserver` → provider `codex`, harness `codex`
-  * `claude`, `claude_code`, `claude-code` → provider `claude-code`, harness
-    `claude-code`
-* Unknown runtimes are a typed refusal, never a guess. Resume of an old run
+  decoder (`decode_legacy_request`) retains the raw runtime spelling,
+  including arbitrary names such as `glm` and `main`. Recorded adapter
+  evidence or a verified migration-map entry supplies provider and harness.
+  Fixed Codex/Claude spellings reject conflicting adapter evidence; neither
+  spelling invents a provider identity. Without evidence, history remains
+  readable with unresolved provider/harness and resume must refuse.
+* Resume of an old run
   whose authority fields did not stay unchanged must block explicitly; unsafe
   permissive resumes are out of the question. Migration `017` is additive
   only: it adds nullable columns and new tables, requires no credential
@@ -114,5 +154,6 @@ Executable boundary coverage lives beside the contracts:
   authority/lease separation, legacy decoding:
   `crates/agent-run-domain/tests/contracts.rs`
 * migration equivalence for every historical version, legacy reads, ownership
-  exclusivity across states, and revision facts:
+  exclusivity across states, cross-account key rejection, physical reservation
+  counts, and global revision facts:
   `crates/agent-run-store/tests/state_migrations.rs`

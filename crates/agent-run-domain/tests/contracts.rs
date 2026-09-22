@@ -186,9 +186,10 @@ fn python_view_dtos_keep_field_order_and_nulls() {
 
 use agent_run_domain::catalog::{
     decode_legacy_request, legacy_runtime, AccountId, AccountRecord, AccountStatus,
-    AttemptCredentials, AuthFamily, HarnessId, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
-    ProviderDefinition, ProviderId, ProviderModel, QuotaAdmissionError, QuotaCandidate,
-    QuotaCandidateSet, ResolvedLaunchAuthority, SecretHandle, SecretRef, SelectionIntent,
+    AttemptCredentials, AuthFamily, HarnessId, LegacyRuntime, NormalizedQuotaSnapshot,
+    PhysicalQuotaKey, ProviderBinding, ProviderCatalog, ProviderDefinition, ProviderId,
+    ProviderModel, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, QuotaModelObservation,
+    QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretRef, SelectionIntent,
 };
 
 /// Builds one registered account bound by two provider aliases.
@@ -205,10 +206,11 @@ fn aliased_catalog() -> ProviderCatalog {
         id: ProviderId::from_str(id).unwrap(),
         harness: HarnessId::Codex,
         protocol_endpoint: "https://api.example.com".into(),
+        allow_loopback_http: false,
         auth_family: AuthFamily::from_str("openai").unwrap(),
         models: vec![model.clone()],
         bindings: vec![ProviderBinding {
-            label: "plus".into(),
+            label: "plus".parse().unwrap(),
             account: account.clone(),
             models: None,
             multiplier: PositiveFinite::try_from(1.0).unwrap(),
@@ -245,6 +247,8 @@ fn provider_alias_identity_shares_one_physical_quota_pool() {
     // A different account is a different pool even on the same lane.
     let other = AccountId::from_str("acct-claude-native").unwrap();
     assert_ne!(PhysicalQuotaKey::new(&other, "gpt-5.1").unwrap(), plus);
+    assert!(serde_json::from_value::<PhysicalQuotaKey>(json!("acct-codex-native::")).is_err());
+    assert!(serde_json::from_value::<PhysicalQuotaKey>(json!("not-a-key")).is_err());
 }
 
 /// Auth-family mismatches and unregistered accounts are rejected at catalog
@@ -271,6 +275,162 @@ fn provider_binding_requires_registered_matching_auth_family() {
     assert!(mismatched.is_err());
 }
 
+/// Catalog decoding and construction share validation for labels, duplicate
+/// identities, model subsets, endpoints, and account storage identities.
+#[test]
+fn catalog_wire_and_endpoint_reject_invalid_registration() {
+    assert!(serde_json::from_value::<ProviderBinding>(json!({
+        "label":"../outside", "account":"acct-codex-native"
+    }))
+    .is_err());
+    let valid = aliased_catalog();
+    let mut wire = serde_json::to_value(&valid).unwrap();
+    wire["providers"][1]["id"] = json!("codex-plus");
+    assert!(serde_json::from_value::<ProviderCatalog>(wire).is_err());
+    let mut wire = serde_json::to_value(&valid).unwrap();
+    let duplicate = wire["accounts"][0].clone();
+    wire["accounts"].as_array_mut().unwrap().push(duplicate);
+    assert!(serde_json::from_value::<ProviderCatalog>(wire).is_err());
+    let mut wire = serde_json::to_value(&valid).unwrap();
+    wire["providers"][0]["bindings"][0]["account"] = json!("acct-missing");
+    assert!(serde_json::from_value::<ProviderCatalog>(wire).is_err());
+    let mut wire = serde_json::to_value(&valid).unwrap();
+    wire["providers"][0]["bindings"][0]["models"] = json!(["missing"]);
+    assert!(serde_json::from_value::<ProviderCatalog>(wire).is_err());
+    let mut wire = serde_json::to_value(&valid).unwrap();
+    wire["providers"][0]["auth_family"] = json!("anthropic");
+    assert!(serde_json::from_value::<ProviderCatalog>(wire).is_err());
+
+    let mut provider = valid.providers()[0].clone();
+    provider.bindings[0].models = Some(vec!["missing".into()]);
+    assert!(ProviderCatalog::new(
+        vec![valid
+            .account(&"acct-codex-native".parse().unwrap())
+            .unwrap()
+            .clone()],
+        vec![provider]
+    )
+    .is_err());
+
+    let mut provider = valid.providers()[0].clone();
+    for endpoint in [
+        "",
+        "http://example.com",
+        "file:///tmp/x",
+        "https://user:pass@example.com",
+    ] {
+        provider.protocol_endpoint = endpoint.into();
+        assert!(provider.validate().is_err(), "{endpoint}");
+    }
+    provider.protocol_endpoint = "http://localhost:8080".into();
+    assert!(provider.validate().is_err());
+    provider.allow_loopback_http = true;
+    provider.validate().unwrap();
+    provider.protocol_endpoint = "http://[::1]:8080".into();
+    provider.validate().unwrap();
+    provider.protocol_endpoint = "http://example.com".into();
+    assert!(provider.validate().is_err());
+    provider.protocol_endpoint = "https://example.com".into();
+    provider.auth_family = "anthropic".parse().unwrap();
+    assert!(provider.validate().is_err());
+
+    let original = valid
+        .account(&"acct-codex-native".parse().unwrap())
+        .unwrap()
+        .clone();
+    let mut duplicate = original.clone();
+    duplicate.account_id = "acct-other".parse().unwrap();
+    assert!(ProviderCatalog::new(vec![original, duplicate], vec![]).is_err());
+    assert!(" keychain:codex".parse::<SecretRef>().is_err());
+}
+
+/// Every alias in one provider is returned, while a lease can only be minted
+/// from the selected account's own enabled catalog record and model scope.
+#[test]
+fn aliases_and_lease_scope_remain_bound_to_one_account() {
+    let mut provider = aliased_catalog().providers()[0].clone();
+    provider.bindings.push(ProviderBinding {
+        label: "backup".parse().unwrap(),
+        account: "acct-codex-native".parse().unwrap(),
+        models: None,
+        multiplier: PositiveFinite::try_from(1.0).unwrap(),
+    });
+    let record = aliased_catalog()
+        .account(&"acct-codex-native".parse().unwrap())
+        .unwrap()
+        .clone();
+    let catalog = ProviderCatalog::new(vec![record], vec![provider]).unwrap();
+    let account: AccountId = "acct-codex-native".parse().unwrap();
+    assert_eq!(
+        catalog
+            .aliases_of(&account)
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>(),
+        vec!["plus", "backup"]
+    );
+    assert!(AttemptCredentials::from_selected(
+        &catalog,
+        &"missing".parse().unwrap(),
+        "gpt-5.1",
+        &account
+    )
+    .is_err());
+    assert!(AttemptCredentials::from_selected(
+        &catalog,
+        &"codex-plus".parse().unwrap(),
+        "missing",
+        &account
+    )
+    .is_err());
+    assert!(AttemptCredentials::from_selected(
+        &catalog,
+        &"codex-plus".parse().unwrap(),
+        "gpt-5.1",
+        &"acct-other".parse().unwrap()
+    )
+    .is_err());
+}
+
+/// Collector observations preserve missing values and reject cross-account
+/// keys, invalid percentages, stale timing, and duplicate model membership.
+#[test]
+fn normalized_quota_snapshot_validates_physical_membership() {
+    let account: AccountId = "acct-codex-native".parse().unwrap();
+    let key = PhysicalQuotaKey::new(&account, "tokens").unwrap();
+    let mut snapshot = NormalizedQuotaSnapshot {
+        account: account.clone(),
+        models: vec![QuotaModelObservation {
+            model: "gpt-5.1".into(),
+            pools: vec![QuotaPoolObservation {
+                key,
+                windows: vec![QuotaWindow {
+                    source: "provider".into(),
+                    name: "5h".into(),
+                    remaining_percent: None,
+                    reset_at: None,
+                    observed_at: 1.0,
+                    valid_until: 2.0,
+                }],
+            }],
+        }],
+    };
+    snapshot.validate().unwrap();
+    snapshot.models[0].pools.push(QuotaPoolObservation {
+        key: PhysicalQuotaKey::new(&account, "requests").unwrap(),
+        windows: vec![],
+    });
+    snapshot.validate().unwrap();
+    snapshot.models[0].pools.push(QuotaPoolObservation {
+        key: PhysicalQuotaKey::new(&"acct-other".parse().unwrap(), "tokens").unwrap(),
+        windows: vec![],
+    });
+    assert!(snapshot.validate().is_err());
+    snapshot.models[0].pools.pop();
+    snapshot.models[0].pools[0].windows[0].remaining_percent = Some(101.0);
+    assert!(snapshot.validate().is_err());
+}
+
 /// Auto and pinned intents are distinct, persisted with the candidate set, and
 /// a pinned intent must appear among the ordered candidates.
 #[test]
@@ -279,6 +439,7 @@ fn quota_candidate_set_preserves_pinned_and_auto_intent() {
     let provider = ProviderId::from_str("codex-plus").unwrap();
     let candidate = QuotaCandidate {
         account: account.clone(),
+        physical_keys: vec![PhysicalQuotaKey::new(&account, "gpt-5.1").unwrap()],
         multiplier: PositiveFinite::try_from(1.0).unwrap(),
     };
     let mut set = QuotaCandidateSet {
@@ -293,6 +454,11 @@ fn quota_candidate_set_preserves_pinned_and_auto_intent() {
     assert_eq!(wire["intent"]["pinned"], "acct-codex-native");
     let round: QuotaCandidateSet = serde_json::from_value(wire).unwrap();
     assert_eq!(round, set);
+    set.candidates[0]
+        .physical_keys
+        .push(PhysicalQuotaKey::new(&"acct-other".parse().unwrap(), "gpt-5.1").unwrap());
+    assert!(set.validate().is_err());
+    set.candidates[0].physical_keys.pop();
 
     set.intent = SelectionIntent::Auto;
     set.validate().unwrap();
@@ -342,7 +508,15 @@ fn quota_admission_verdicts_are_typed_and_stable() {
 #[test]
 fn launch_authority_is_serializable_but_credential_leases_are_not() {
     let account = AccountId::from_str("acct-codex-native").unwrap();
-    let authority = ResolvedLaunchAuthority {
+    let mut role = json!({
+        "role_name": "engineer",
+        "prompt": "do work",
+        "grants": {"write": true, "network": false, "read_roots": ["/tmp"]},
+        "skills": [], "mcp": [], "required_constraints": []
+    });
+    let revision = agent_run_domain::canonical::sha256_hex(&role, true);
+    role["config_revision"] = json!(revision);
+    let mut authority = ResolvedLaunchAuthority {
         provider: ProviderId::from_str("codex-plus").unwrap(),
         harness: HarnessId::Codex,
         protocol_endpoint: "https://api.example.com".into(),
@@ -350,8 +524,8 @@ fn launch_authority_is_serializable_but_credential_leases_are_not() {
         effort: Some("high".into()),
         profile: "engineer".into(),
         workdir: "/tmp".into(),
-        grants: Default::default(),
-        assets_sha256: None,
+        role_payload: role,
+        assets_sha256: "a".repeat(64).parse().unwrap(),
         eligible_accounts: vec![account.clone()],
     };
     authority.validate().unwrap();
@@ -361,14 +535,20 @@ fn launch_authority_is_serializable_but_credential_leases_are_not() {
     assert!(wire.get("selected_account").is_none());
     assert!(wire.get("credentials").is_none());
 
-    let lease = AttemptCredentials {
-        secret: SecretHandle::from_reference("keychain:codex").unwrap(),
-        account,
-    };
-    assert_eq!(lease.secret.reference(), "keychain:codex");
+    let catalog = aliased_catalog();
+    let lease = AttemptCredentials::from_selected(
+        &catalog,
+        &"codex-plus".parse().unwrap(),
+        "gpt-5.1",
+        &account,
+    )
+    .unwrap();
+    assert_eq!(lease.secret().reference(), "keychain:codex");
     // SecretHandle is not Serialize/Deserialize by construction; this test
     // compiles only because the assertions below never serialize the lease.
-    assert_eq!(lease.account.as_str(), "acct-codex-native");
+    assert_eq!(lease.account().as_str(), "acct-codex-native");
+    authority.role_payload["grants"]["write"] = json!(false);
+    assert!(authority.validate().is_err());
 }
 
 /// Historical request_json decodes into current contracts without rewriting
@@ -383,21 +563,52 @@ fn legacy_request_json_decodes_without_rewriting_history() {
         "workdir": "/tmp",
         "account": "personal2"
     });
-    let decoded = decode_legacy_request(&stored).unwrap();
-    assert_eq!(decoded.provider.as_str(), "codex");
-    assert_eq!(decoded.harness, HarnessId::Codex);
+    let codex = LegacyRuntime {
+        provider: "codex".parse().unwrap(),
+        harness: HarnessId::Codex,
+    };
+    let decoded = decode_legacy_request(&stored, Some(&codex)).unwrap();
+    assert_eq!(decoded.provider.as_ref().unwrap().as_str(), "codex");
+    assert_eq!(decoded.harness, Some(HarnessId::Codex));
     assert_eq!(decoded.request.model, "gpt-5.1");
     assert_eq!(decoded.account.as_ref().unwrap().as_str(), "personal2");
     // The input value is untouched.
     assert_eq!(stored["runtime"], "codex");
 
-    let claude = decode_legacy_request(&json!({
-        "runtime": "claude", "model": "m", "profile": "p", "task": "t", "workdir": "/tmp"
-    }))
+    let claude = decode_legacy_request(
+        &json!({
+            "runtime": "claude", "model": "m", "profile": "p", "task": "t", "workdir": "/tmp"
+        }),
+        Some(&LegacyRuntime {
+            provider: "claude-code".parse().unwrap(),
+            harness: HarnessId::ClaudeCode,
+        }),
+    )
     .unwrap();
-    assert_eq!(claude.harness, HarnessId::ClaudeCode);
-    assert_eq!(
-        legacy_runtime("opencode").unwrap_err().to_string(),
-        "unknown historical runtime \"opencode\"; it has no provider mapping"
-    );
+    assert_eq!(claude.harness, Some(HarnessId::ClaudeCode));
+    assert_eq!(legacy_runtime("opencode"), None);
+    for (runtime, provider, harness) in [
+        ("glm", "glm", HarnessId::ClaudeCode),
+        ("main", "codex", HarnessId::Codex),
+        ("main", "claude-code", HarnessId::ClaudeCode),
+    ] {
+        let raw =
+            json!({"runtime":runtime, "model":"m", "profile":"p", "task":"t", "workdir":"/tmp"});
+        let evidence = LegacyRuntime {
+            provider: provider.parse().unwrap(),
+            harness,
+        };
+        let decoded = decode_legacy_request(&raw, Some(&evidence)).unwrap();
+        assert_eq!(decoded.request.runtime, runtime);
+        assert_eq!(decoded.provider.unwrap().as_str(), provider);
+        assert_eq!(decode_legacy_request(&raw, None).unwrap().provider, None);
+    }
+    assert!(decode_legacy_request(
+        &stored,
+        Some(&LegacyRuntime {
+            provider: "claude-code".parse().unwrap(),
+            harness: HarnessId::ClaudeCode
+        })
+    )
+    .is_err());
 }

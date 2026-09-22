@@ -40,35 +40,29 @@ These are the durable, checkable conditions enforced by the resume path
    per stale ancestor (`Error::Conflict` otherwise), and grant tampering in
    the recorded identity is an integrity refusal.
 
-## Why a real account switch cannot continue the same native session today
+## Account and history topology
 
-Native history is stored inside the account-scoped home:
+- Codex labelled login stores credentials in
+  `<app-home>/accounts/codex/<label>/auth.json`. The supervisor generates a
+  lineage/per-run `runtime_home` under the configured runtime home, and
+  materialization sets `CODEX_HOME` to that generated home. It links only
+  `auth.json` from the account credential home into the generated home.
+  Native thread history belongs to that generated home, not to the login
+  credential home.
+- Claude labelled execution sets `CLAUDE_CONFIG_DIR` to
+  `<configured-runtime-home>@<label>/claude-config`. Its account-scoped
+  config state and native session discovery need a separate continuity proof.
 
-- Codex: labelled accounts run with `CODEX_HOME = <app-home>/accounts/codex/<label>`
-  and thread history lives under that home; `codex login --account <label>`
-  writes credentials only there.
-- Claude family: labelled accounts run with
-  `CLAUDE_CONFIG_DIR = <runtime-home>@<label>/claude-config`, and sessions
-  live under that config dir.
-
-Selecting a different existing account therefore selects a different native
-home, and the native harnesses resolve `--resume <id>` / thread resume only
-inside the current home. No public API today can resume a native session
-recorded under account A while authenticating as existing account B.
-
-**Required product/API seam (not yet implemented):** either
-
-1. a native harness capability that resumes a session by an explicit
-   cross-home reference (session path or exported session), or
-2. an agent-run account-handoff operation that re-seals the recorded native
-   session (history plus grants) into the target account's home and records
-   the transfer in the launch identity before resume runs.
-
-Until one exists, a real A→B proof is pending; mocks and fixtures cannot
-establish it. Native fallback to a new conversation or a summary is not an
-acceptable substitute: absent history, a different session ID, changed
-grants, an unproved live process, or an ambiguous submitted turn must be
-reported as a typed unavailable/blocker.
+The current product guard requires the parent's labelled account to remain
+declared; it does not prove that native switching is impossible. A real A→B
+continuation must demonstrate the same native session ID and history with
+unchanged grants while authentication changes, through an explicit verified
+handoff at the session boundary. For Codex, that may reuse the sealed lineage
+home with a newly bound account credential, provided snapshot and process
+evidence remain valid. For Claude, the account config location needs a
+verified session-access path. Both remain unproven. A new conversation,
+summary, foreign session ID, changed grants, unproved live process, or
+ambiguous submitted turn cannot count as continuity.
 
 ## Repeatable fixture boundary and existing evidence
 
@@ -102,8 +96,10 @@ no fixture here claims to simulate provider quota exhaustion.
 ## Real native probe boundary
 
 A real opt-in probe is admissible only when it uses the normal authorized
-runtime authentication paths (for example `auth login`/`auth status` account
-selection through the public CLI) without reading or extracting credential
+runtime authentication paths (`agent-run login <runtime> --account <label>`
+or `agent-run auth <label> <runtime>`; the provider CLI runs `codex login`
+and `codex login status`, or `claude auth login` and
+`claude auth status --json`) without reading or extracting credential
 material. Such a probe must be harmless and tool-free, and it requires the
-seam above to select another existing account for the *same* native session;
+session seam above to select another existing account for the *same* native session;
 until then, no real probe is shipped and no successful canary is claimed.

@@ -13,7 +13,9 @@ use crate::{
     policy::{self, Constraint},
     profiles::{self, Profile},
 };
-use agent_run_domain::{canonical, error::invalid, Result};
+use agent_run_domain::{
+    canonical, catalog::ResolvedLaunchAuthority, error::invalid, Result, Sha256Digest,
+};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -363,6 +365,27 @@ impl ResolvedRolePlan {
         }
         Ok(plan)
     }
+}
+
+/// Reconstructs the frozen operative role from admitted launch authority.
+///
+/// Call before every launch or retry with `actual_assets_sha256` computed
+/// from the sealed asset bytes, then bind only the current attempt lease for
+/// account auth. It rejects digest, role-shape, or read-root validation
+/// failures; a changed live profile never supplies replacement grants.
+pub fn role_from_authority(
+    authority: &ResolvedLaunchAuthority,
+    actual_assets_sha256: &Sha256Digest,
+) -> Result<ResolvedRolePlan> {
+    authority.validate()?;
+    if actual_assets_sha256 != &authority.assets_sha256 {
+        return Err(invalid("authority tool assets digest mismatch"));
+    }
+    let plan = ResolvedRolePlan::from_payload(&authority.role_payload)?;
+    if plan.role_name != authority.profile {
+        return Err(invalid("authority role name differs from profile"));
+    }
+    Ok(plan)
 }
 
 /// Resolve one canonical profile against shared skill and MCP catalogs.

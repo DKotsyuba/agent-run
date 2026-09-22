@@ -17,8 +17,8 @@ mod common;
 
 use agent_run_core::service::{LaunchIdentity, Service};
 use agent_run_core::{policy, profiles};
-use agent_run_domain::Error;
 use agent_run_domain::domain::{Outcome, StartRequest};
+use agent_run_domain::Error;
 use serde_json::Value;
 use std::collections::BTreeSet;
 

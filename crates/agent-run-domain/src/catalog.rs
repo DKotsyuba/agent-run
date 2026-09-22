@@ -17,13 +17,15 @@
 //!   inferred classification.
 
 use crate::{
-    domain::{nonblank, Constraint, StartRequest},
+    canonical,
+    domain::nonblank,
     error::invalid,
     types::{AccountLabel, PositiveFinite, Sha256Digest},
     Error, Result,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr, sync::Arc};
+use url::Url;
 
 /// Validates an identifier fragment: nonempty, starts alphanumeric, continues
 /// with the established `alnum . _ -` grammar, and stays within `max` bytes.
@@ -240,11 +242,14 @@ impl SecretRef {
 impl FromStr for SecretRef {
     type Err = Error;
 
-    /// Parses a nonblank, NUL-free storage reference of at most 256 bytes.
+    /// Parses a nonblank, NUL-free canonical storage reference of at most
+    /// 256 bytes, rejecting leading or trailing whitespace.
     fn from_str(value: &str) -> Result<Self> {
         nonblank("secret ref", value)?;
-        if value.len() > 256 {
-            return Err(invalid("secret ref exceeds 256 bytes"));
+        if value.len() > 256 || value.trim() != value {
+            return Err(invalid(
+                "secret ref must be canonical and at most 256 bytes",
+            ));
         }
         Ok(Self(value.into()))
     }
@@ -369,7 +374,7 @@ fn multiplier_one() -> PositiveFinite {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderBinding {
     /// Provider-local alias label; unique within its provider.
-    pub label: String,
+    pub label: AccountLabel,
     /// The global account this alias resolves to.
     pub account: AccountId,
     /// Optional explicit model subset; `None` inherits the provider set.
@@ -389,6 +394,9 @@ pub struct ProviderDefinition {
     pub harness: HarnessId,
     /// Protocol endpoint the harness connects to.
     pub protocol_endpoint: String,
+    /// Allows HTTP only for a loopback endpoint used by local fixtures.
+    #[serde(default)]
+    pub allow_loopback_http: bool,
     /// Required account auth family; bindings must match it exactly.
     pub auth_family: AuthFamily,
     /// Explicit model offerings; duplicates are rejected.
@@ -401,6 +409,28 @@ impl ProviderDefinition {
     /// Validates self-containment: unique model ids, unique binding labels,
     /// and every declared binding model subset contained in the model set.
     pub fn validate(&self) -> Result<()> {
+        let endpoint = Url::parse(&self.protocol_endpoint)
+            .map_err(|_| invalid("invalid provider protocol endpoint"))?;
+        if endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.fragment().is_some()
+            || !(endpoint.scheme() == "https"
+                || (self.allow_loopback_http
+                    && endpoint.scheme() == "http"
+                    && matches!(
+                        endpoint.host_str(),
+                        Some("localhost" | "127.0.0.1" | "[::1]")
+                    )))
+        {
+            return Err(invalid("unsupported provider protocol endpoint"));
+        }
+        if !matches!(
+            (self.harness, self.auth_family.as_str()),
+            (HarnessId::Codex, "openai") | (HarnessId::ClaudeCode, "anthropic")
+        ) {
+            return Err(invalid("provider auth family does not match harness"));
+        }
         let mut model_ids = std::collections::BTreeSet::new();
         for model in &self.models {
             model.validate()?;
@@ -410,8 +440,7 @@ impl ProviderDefinition {
         }
         let mut labels = std::collections::BTreeSet::new();
         for binding in &self.bindings {
-            nonblank("binding label", &binding.label)?;
-            if !labels.insert(binding.label.clone()) {
+            if !labels.insert(binding.label.as_str()) {
                 return Err(invalid("provider binding labels must be unique"));
             }
             if let Some(subset) = &binding.models {
@@ -433,20 +462,20 @@ impl ProviderDefinition {
 
     /// Returns the binding with `label`, or `None` when the alias is absent.
     pub fn binding(&self, label: &str) -> Option<&ProviderBinding> {
-        self.bindings.iter().find(|b| b.label == label)
+        self.bindings.iter().find(|b| b.label.as_str() == label)
     }
 }
 
 /// The validated whole catalog: account registry plus provider definitions.
 ///
 /// Construction is the validation boundary: a [`ProviderCatalog`] exists only
-/// when every binding references a registered, enabled-family account whose
+/// when every binding references a registered account whose
 /// auth family equals the provider's, and no identity repeats. The same
 /// [`AccountId`] may appear under several providers or labels; that is the
 /// alias mechanism, and it denotes one shared physical account.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderCatalog {
-    accounts: BTreeMap<AccountId, AccountRecord>,
+    accounts: Vec<AccountRecord>,
     providers: Vec<ProviderDefinition>,
 }
 
@@ -458,7 +487,12 @@ impl ProviderCatalog {
     /// auth family differs from the provider's.
     pub fn new(accounts: Vec<AccountRecord>, providers: Vec<ProviderDefinition>) -> Result<Self> {
         let mut registry = BTreeMap::new();
+        let mut storage_identities = std::collections::HashSet::new();
         for account in accounts {
+            if !storage_identities.insert((account.auth_family.clone(), account.secret_ref.clone()))
+            {
+                return Err(invalid("credential storage identity must be unique"));
+            }
             if registry
                 .insert(account.account_id.clone(), account)
                 .is_some()
@@ -484,14 +518,14 @@ impl ProviderCatalog {
             }
         }
         Ok(Self {
-            accounts: registry,
+            accounts: registry.into_values().collect(),
             providers,
         })
     }
 
     /// Returns the registered record for a global account id, if any.
     pub fn account(&self, id: &AccountId) -> Option<&AccountRecord> {
-        self.accounts.get(id)
+        self.accounts.iter().find(|record| &record.account_id == id)
     }
 
     /// Returns every provider definition, in declaration order.
@@ -511,14 +545,30 @@ impl ProviderCatalog {
     pub fn aliases_of(&self, account: &AccountId) -> Vec<(&ProviderDefinition, &str)> {
         self.providers
             .iter()
-            .filter_map(|provider| {
+            .flat_map(|provider| {
                 provider
                     .bindings
                     .iter()
-                    .find(|b| &b.account == account)
-                    .map(|b| (provider, b.label.as_str()))
+                    .filter(move |b| &b.account == account)
+                    .map(move |b| (provider, b.label.as_str()))
             })
             .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderCatalog {
+    /// Reconstructs a catalog through the same checked boundary as `new`.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        /// Raw wire shape; checked construction follows deserialization.
+        #[derive(Deserialize)]
+        struct Wire {
+            accounts: Vec<AccountRecord>,
+            providers: Vec<ProviderDefinition>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.accounts, wire.providers).map_err(serde::de::Error::custom)
     }
 }
 
@@ -527,7 +577,7 @@ impl ProviderCatalog {
 /// The key is the global account id plus the physical lane (the provider-
 /// independent model mapping). Provider aliases of the same account produce
 /// the same key, so one pool backs them all.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct PhysicalQuotaKey(String);
 
@@ -548,13 +598,42 @@ impl PhysicalQuotaKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns whether this key names a lane owned by the given global account.
+    pub fn belongs_to(&self, account: &AccountId) -> bool {
+        self.0
+            .strip_prefix(account.as_str())
+            .and_then(|rest| rest.strip_prefix("::"))
+            .is_some_and(|lane| !lane.is_empty() && lane.len() <= 128 && !lane.contains('\0'))
+    }
 }
+
+impl<'de> Deserialize<'de> for PhysicalQuotaKey {
+    /// Validates account and lane syntax when a physical key crosses a wire.
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let (account, lane) = text
+            .split_once("::")
+            .ok_or_else(|| serde::de::Error::custom("quota key lacks account and lane"))?;
+        let account = AccountId::from_str(account).map_err(serde::de::Error::custom)?;
+        Self::new(&account, lane).map_err(serde::de::Error::custom)
+    }
+}
+
+pub use crate::legacy_provider::{
+    decode_legacy_request, legacy_runtime, DecodedLegacyRequest, LegacyRuntime,
+};
+pub use crate::quota_snapshot::{
+    NormalizedQuotaSnapshot, QuotaModelObservation, QuotaPoolObservation, QuotaWindow,
+};
 
 /// The immutable launch authority frozen at admission, before any attempt.
 ///
 /// Everything a launch must not change across retries lives here: provider,
 /// harness, endpoint, explicit model and effort, role profile, workdir,
-/// granted constraints, the tool-assets digest, and the frozen eligible
+/// a sealed operative role document, the tool-assets digest, and the frozen eligible
 /// account scope. Raw harness-native settings can never override these owned
 /// fields. Per-attempt choices deliberately do not appear here; they belong to
 /// [`AttemptCredentials`].
@@ -574,24 +653,39 @@ pub struct ResolvedLaunchAuthority {
     pub profile: String,
     /// Canonical absolute working directory.
     pub workdir: PathBuf,
-    /// Granted constraints; the constraint set retries must preserve.
-    pub grants: std::collections::BTreeSet<Constraint>,
-    /// Digest of the immutable tool assets, when a snapshot was sealed.
-    pub assets_sha256: Option<Sha256Digest>,
+    /// Canonical `ResolvedRolePlan::to_payload()` from the admitted profile:
+    /// prompt, write/network/read grants, skills, MCP tools, and required
+    /// constraints. Its initial auth reference is historical: consumers
+    /// validate the role, then bind current credentials from the attempt lease.
+    pub role_payload: serde_json::Value,
+    /// Digest of immutable tool assets; admission must seal them before launch.
+    pub assets_sha256: Sha256Digest,
     /// Accounts eligible at freeze time; later attempts intersect this scope
     /// with the currently registered and enabled bindings.
     pub eligible_accounts: Vec<AccountId>,
 }
 
 impl ResolvedLaunchAuthority {
-    /// Validates nonblank fields, an absolute workdir, and unique eligible
-    /// account scope. Does not touch the filesystem; freezing validated it.
+    /// Validates the sealed role revision, basic scope, and unique eligible
+    /// accounts. Consumers also reconstruct the config role plan and verify
+    /// the asset digest against bytes before each launch or retry.
     pub fn validate(&self) -> Result<()> {
         nonblank("model", &self.model)?;
         if let Some(effort) = &self.effort {
             nonblank("effort", effort)?;
         }
         nonblank("profile", &self.profile)?;
+        let mut role = self.role_payload.clone();
+        let revision = role
+            .as_object_mut()
+            .and_then(|object| object.remove("config_revision"))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| invalid("authority role payload lacks a revision"))?;
+        if role["role_name"] != self.profile || canonical::sha256_hex(&role, true) != revision {
+            return Err(invalid(
+                "authority role payload does not match its sealed revision",
+            ));
+        }
         if !self.workdir.is_absolute() {
             return Err(invalid("authority workdir must be absolute"));
         }
@@ -614,24 +708,13 @@ impl ResolvedLaunchAuthority {
 ///
 /// The handle carries no secret bytes and implements no serde trait, so it
 /// cannot cross a wire, enter configuration, or be logged by serialization.
-/// The real resolver that mints handles from native credential stores is a
-/// later deliverable; tests construct handles from opaque references only.
+/// The resolver mints handles only through a selected, in-scope catalog record.
 #[derive(Debug, Clone)]
 pub struct SecretHandle {
     reference: Arc<str>,
 }
 
 impl SecretHandle {
-    /// Mints an in-process handle to an already-resolved storage reference.
-    ///
-    /// `reference` names where the credential lives; it is the same value a
-    /// [`SecretRef`] carries and never contains secret bytes.
-    pub fn from_reference(reference: &str) -> Result<Self> {
-        Ok(Self {
-            reference: Arc::from(reference.parse::<SecretRef>()?.as_str()),
-        })
-    }
-
     /// Returns the storage reference this handle was minted from.
     pub fn reference(&self) -> &str {
         &self.reference
@@ -646,9 +729,60 @@ impl SecretHandle {
 #[derive(Debug, Clone)]
 pub struct AttemptCredentials {
     /// The global account selected for this attempt.
-    pub account: AccountId,
+    account: AccountId,
     /// The live credential lease; not serializable by construction.
-    pub secret: SecretHandle,
+    secret: SecretHandle,
+}
+
+impl AttemptCredentials {
+    /// Leases the selected enabled account only when its provider offers the
+    /// explicit model through a binding. Returns a validation error otherwise.
+    pub fn from_selected(
+        catalog: &ProviderCatalog,
+        provider: &ProviderId,
+        model: &str,
+        account: &AccountId,
+    ) -> Result<Self> {
+        let definition = catalog
+            .provider(provider)
+            .ok_or_else(|| invalid("unknown provider"))?;
+        if !definition
+            .models
+            .iter()
+            .any(|offering| offering.id == model)
+            || !definition.bindings.iter().any(|binding| {
+                &binding.account == account
+                    && binding
+                        .models
+                        .as_ref()
+                        .is_none_or(|models| models.iter().any(|id| id == model))
+            })
+        {
+            return Err(invalid("selected account is outside provider model scope"));
+        }
+        let record = catalog
+            .account(account)
+            .ok_or_else(|| invalid("unknown account"))?;
+        if record.status != AccountStatus::Enabled || record.auth_family != definition.auth_family {
+            return Err(invalid("selected account is not enabled for provider"));
+        }
+        Ok(Self {
+            account: account.clone(),
+            secret: SecretHandle {
+                reference: Arc::from(record.secret_ref.as_str()),
+            },
+        })
+    }
+
+    /// Returns the account bound to this immutable lease.
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+
+    /// Returns the nonsecret credential storage reference bound to this lease.
+    pub fn secret(&self) -> &SecretHandle {
+        &self.secret
+    }
 }
 
 /// Whether selection is automatic or pinned to one requested account.
@@ -666,6 +800,8 @@ pub enum SelectionIntent {
 pub struct QuotaCandidate {
     /// The global candidate account.
     pub account: AccountId,
+    /// Exact physical quota pools this model/attempt must reserve together.
+    pub physical_keys: Vec<PhysicalQuotaKey>,
     /// The candidate's effective positive finite multiplier.
     pub multiplier: PositiveFinite,
 }
@@ -691,17 +827,27 @@ pub struct QuotaCandidateSet {
 }
 
 impl QuotaCandidateSet {
-    /// Validates a nonblank model, unique candidate accounts, and that a
-    /// pinned intent's account appears exactly once among the candidates.
+    /// Validates nonblank model, distinct accounts and host-bound physical
+    /// key sets, and the pinned account's membership.
     pub fn validate(&self) -> Result<()> {
         nonblank("model", &self.model)?;
         let mut seen = std::collections::BTreeSet::new();
-        if self
-            .candidates
-            .iter()
-            .any(|c| !seen.insert(c.account.clone()))
-        {
-            return Err(invalid("quota candidates must not repeat an account"));
+        for candidate in &self.candidates {
+            if !seen.insert(candidate.account.clone()) {
+                return Err(invalid("quota candidates must not repeat an account"));
+            }
+            let mut keys = std::collections::BTreeSet::new();
+            if candidate.physical_keys.is_empty()
+                || candidate.physical_keys.len() > 32
+                || candidate
+                    .physical_keys
+                    .iter()
+                    .any(|key| !key.belongs_to(&candidate.account) || !keys.insert(key))
+            {
+                return Err(invalid(
+                    "candidate physical keys must be distinct and account-bound",
+                ));
+            }
         }
         if let SelectionIntent::Pinned(account) = &self.intent {
             if !seen.contains(account) {
@@ -804,78 +950,3 @@ impl fmt::Display for QuotaAdmissionError {
 }
 
 impl std::error::Error for QuotaAdmissionError {}
-
-/// The provider mapping for one decoded historical runtime name.
-///
-/// Historical `StartRequest.runtime` values map to the provider catalog
-/// without rewriting stored request blobs; the mapping is decode-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LegacyRuntime {
-    /// The provider the historical runtime resolves to.
-    pub provider: &'static str,
-    /// The harness that provider binds to.
-    pub harness: HarnessId,
-}
-
-/// Decodes one historical runtime name to its catalog mapping.
-///
-/// Known names are the Codex runtime spellings and the Claude runtime
-/// spellings; anything else is a typed invalid-input error, never a guess.
-pub fn legacy_runtime(runtime: &str) -> Result<LegacyRuntime> {
-    match runtime {
-        "codex" | "codex_appserver" => Ok(LegacyRuntime {
-            provider: "codex",
-            harness: HarnessId::Codex,
-        }),
-        "claude" | "claude_code" | "claude-code" => Ok(LegacyRuntime {
-            provider: "claude-code",
-            harness: HarnessId::ClaudeCode,
-        }),
-        other => Err(invalid(format!(
-            "unknown historical runtime {other:?}; it has no provider mapping"
-        ))),
-    }
-}
-
-/// One historical request decoded into current contracts.
-///
-/// The stored request JSON is read as-is; nothing is rewritten and no sealed
-/// artifact is touched. Resume decisions remain with the session module: an
-/// old resume whose authority fields did not stay unchanged must block
-/// explicitly rather than resume permissively.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DecodedLegacyRequest {
-    /// The historical request, decoded with current field semantics.
-    pub request: StartRequest,
-    /// The provider its runtime maps to.
-    pub provider: ProviderId,
-    /// The harness that provider binds to.
-    pub harness: HarnessId,
-    /// The historical account label, when one was recorded.
-    pub account: Option<AccountLabel>,
-}
-
-/// Decodes a stored historical `request_json` value into current contracts.
-///
-/// Read-only: validates nothing about the filesystem and never mutates the
-/// input value. Unknown runtimes and structurally invalid blobs are typed
-/// errors; callers preserve the original blob unchanged in every case.
-pub fn decode_legacy_request(value: &serde_json::Value) -> Result<DecodedLegacyRequest> {
-    let request: StartRequest = serde_json::from_value(value.clone()).map_err(|e| {
-        invalid(format!(
-            "historical request_json is not decodable as a stored request: {e}"
-        ))
-    })?;
-    nonblank("runtime", &request.runtime)?;
-    let mapped = legacy_runtime(&request.runtime)?;
-    Ok(DecodedLegacyRequest {
-        account: request
-            .account
-            .as_deref()
-            .map(AccountLabel::from_str)
-            .transpose()?,
-        provider: mapped.provider.parse()?,
-        harness: mapped.harness,
-        request,
-    })
-}
