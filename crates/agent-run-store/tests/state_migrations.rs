@@ -7,7 +7,7 @@
 //! replayed forward), so no Python process runs at test time.
 use agent_run_store::{migrations, Store, VERSION};
 use regex::Regex;
-use rusqlite::{params, Connection, DatabaseName};
+use rusqlite::{params, Connection, DatabaseName, TransactionBehavior};
 use std::path::Path;
 
 const V1_SCHEMA: &str = include_str!("fixtures/schema_v1.sql");
@@ -71,7 +71,7 @@ fn agent_count(conn: &Connection) -> i64 {
         .unwrap()
 }
 
-/// Every application table/index with insignificant whitespace and
+/// Every application table/index/trigger with insignificant whitespace and
 /// SQLite-added identifier quotes normalized away (mirrors Python's
 /// `_schema_objects` in `tests/test_state_migrations.py`).
 fn schema_objects(conn: &Connection) -> Vec<(String, String, String)> {
@@ -79,7 +79,7 @@ fn schema_objects(conn: &Connection) -> Vec<(String, String, String)> {
     let mut stmt = conn
         .prepare(
             "SELECT type, name, sql FROM sqlite_master \
-             WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'",
+             WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%'",
         )
         .unwrap();
     let mut rows: Vec<(String, String, String)> = stmt
@@ -129,6 +129,36 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
             "store migrated from v{version} drifted from a fresh schema"
         );
     }
+}
+
+/// The committed current-version binary fixture is a real current store,
+/// including its triggers and singleton quota revision, not a stale dev copy.
+#[test]
+fn current_binary_fixture_matches_fresh_schema() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let fixture = build_fixture(&db_path, VERSION);
+    assert_eq!(user_version(&fixture), VERSION);
+    assert_eq!(schema_objects(&fixture), fresh_schema_objects());
+    for required in [
+        "quota_capacity_revision",
+        "attempt_quota_keys",
+        "attempt_quota_keys_account_guard",
+        "attempts_selected_account_immutable",
+        "attempt_quota_keys_immutable",
+    ] {
+        assert!(schema_objects(&fixture)
+            .iter()
+            .any(|(_, name, _)| name == required));
+    }
+    drop(fixture);
+    assert_eq!(
+        Store::open(home.path())
+            .unwrap()
+            .quota_capacity_revision()
+            .unwrap(),
+        0
+    );
 }
 
 // --- (b) existing rows survive migration ---
@@ -783,7 +813,10 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         .unwrap();
     // One owned attempt across distinct lifecycle states: a claim in the
     // prepared state already fences every later owned attempt.
-    writable
+    let tx = writable
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    tx
         .execute(
             "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at, \
              selected_account_id, ownership_active) VALUES ('att_orch','ag-20260825-010203-0123456789',3,'prepared',\
@@ -792,13 +825,70 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         )
         .unwrap();
     for quota_key in [&key, &second_key] {
+        tx.execute(
+            "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
+            [quota_key.as_str()],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        Store::active_attempt_counts_in(&tx, &[account.clone()]).unwrap()[account.as_str()],
+        1
+    );
+    assert_eq!(
+        Store::active_reservation_counts_in(&tx, &[key.clone(), second_key.clone()]).unwrap()
+            [second_key.as_str()],
+        1
+    );
+    tx.commit().unwrap();
+    assert!(writable
+        .execute(
+            "UPDATE attempts SET selected_account_id='acct-other' WHERE id='att_orch'",
+            [],
+        )
+        .is_err());
+    assert!(writable
+        .execute(
+            "UPDATE attempts SET selected_account_id=NULL WHERE id='att_orch'",
+            [],
+        )
+        .is_err());
+    assert_eq!(
         writable
             .execute(
-                "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
-                [quota_key.as_str()],
+                "UPDATE attempts SET selected_account_id='acct-codex-native' WHERE id='att_orch'",
+                [],
             )
-            .unwrap();
-    }
+            .unwrap(),
+        1
+    );
+    assert!(writable.execute(
+        "UPDATE attempt_quota_keys SET quota_key='acct-other::gpt-5.1' WHERE attempt_id='att_orch' AND quota_key=?1",
+        [key.as_str()],
+    ).is_err());
+    assert!(writable.execute(
+        "UPDATE attempt_quota_keys SET attempt_id='att_legacy2' WHERE attempt_id='att_orch' AND quota_key=?1",
+        [key.as_str()],
+    ).is_err());
+    assert_eq!(writable.execute(
+        "UPDATE attempt_quota_keys SET quota_key=quota_key WHERE attempt_id='att_orch' AND quota_key=?1",
+        [key.as_str()],
+    ).unwrap(), 1);
+    assert_eq!(
+        writable
+            .execute(
+                "UPDATE attempts SET selected_account_id='acct-other' WHERE id='att_legacy2'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(writable
+        .execute(
+            "UPDATE attempts SET selected_account_id='acct-codex-native' WHERE id='att_legacy2'",
+            [],
+        )
+        .is_err());
     let other: agent_run_domain::AccountId = "acct-other".parse().unwrap();
     let foreign_key = agent_run_domain::PhysicalQuotaKey::new(&other, "gpt-5.1").unwrap();
     assert!(writable

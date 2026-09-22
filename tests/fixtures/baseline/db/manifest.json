@@ -349,7 +349,7 @@
     },
     {
       "file": "current-v17.sqlite",
-      "how_produced": "current-v16.sqlite replayed through Rust migration 017_provider_orchestration.sql; purely additive, no row data changed.",
+      "how_produced": "historical-v16.sqlite replayed through final unpublished migration 017_provider_orchestration.sql; historical rows preserved.",
       "rows": {
         "agents": 11,
         "attempts": 9,
@@ -368,9 +368,10 @@
         "workflow_runs": 0,
         "workflow_steps": 0,
         "provider_accounts": 0,
-        "quota_capacity_revisions": 0
+        "quota_capacity_revision": 1,
+        "attempt_quota_keys": 0
       },
-      "sha256": "e54510441f1bf3d7c52be9a9bc871a7b1bd7a748899f33e3ac860b163f4907af",
+      "sha256": "30a50135a978e87face3d7836ff1165cda0e36918d167ff042900fd0443878ce",
       "user_version": 17
     }
   ],

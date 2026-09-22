@@ -830,9 +830,17 @@ impl Store {
         &self,
         keys: &[PhysicalQuotaKey],
     ) -> Result<BTreeMap<String, u64>> {
+        Self::active_reservation_counts_in(&self.conn, keys)
+    }
+    /// Counts physical reservations through `conn`, including the caller's
+    /// uncommitted writes when it is an active admission transaction.
+    pub fn active_reservation_counts_in(
+        conn: &Connection,
+        keys: &[PhysicalQuotaKey],
+    ) -> Result<BTreeMap<String, u64>> {
         let mut counts = BTreeMap::new();
         for key in keys {
-            let open: i64 = self.conn.query_row(
+            let open: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM attempt_quota_keys k JOIN attempts a ON a.id=k.attempt_id \
                  WHERE k.quota_key=? AND a.ownership_active=1",
                 [key.as_str()],
@@ -850,9 +858,17 @@ impl Store {
     /// `ownership_active`. Accounts absent from `accounts` are not queried;
     /// absent rows count as zero.
     pub fn active_attempt_counts(&self, accounts: &[AccountId]) -> Result<BTreeMap<String, u64>> {
+        Self::active_attempt_counts_in(&self.conn, accounts)
+    }
+    /// Counts owned attempts through `conn`, including the caller's
+    /// uncommitted selections when it is an active admission transaction.
+    pub fn active_attempt_counts_in(
+        conn: &Connection,
+        accounts: &[AccountId],
+    ) -> Result<BTreeMap<String, u64>> {
         let mut counts = BTreeMap::new();
         for account in accounts {
-            let open: i64 = self.conn.query_row(
+            let open: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM attempts WHERE selected_account_id=? AND ownership_active=1",
                 [account.as_str()],
                 |row| row.get(0),

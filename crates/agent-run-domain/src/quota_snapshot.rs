@@ -7,7 +7,7 @@ use crate::{
     Result,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One physical quota window. Unknown remaining or reset data stays absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,13 +75,15 @@ pub struct NormalizedQuotaSnapshot {
 }
 
 impl NormalizedQuotaSnapshot {
-    /// Checks account ownership, unique model/key/window identities, and
-    /// bounded window facts before a quota producer scores the snapshot.
+    /// Checks account ownership, unique model/key/window identities, bounded
+    /// facts, and identical order-independent windows for shared physical
+    /// pools before a quota producer scores the snapshot.
     pub fn validate(&self) -> Result<()> {
         if self.models.len() > 256 {
             return Err(invalid("too many quota models"));
         }
         let mut models = BTreeSet::new();
+        let mut physical_windows = BTreeMap::new();
         for model in &self.models {
             nonblank("quota model", &model.model)?;
             if model.model.len() > 256
@@ -105,6 +107,14 @@ impl NormalizedQuotaSnapshot {
                     if !windows.insert((&window.source, &window.name)) {
                         return Err(invalid("quota window repeats"));
                     }
+                }
+                let mut canonical = pool.windows.clone();
+                canonical.sort_by(|a, b| (&a.source, &a.name).cmp(&(&b.source, &b.name)));
+                if physical_windows
+                    .insert(pool.key.clone(), canonical.clone())
+                    .is_some_and(|previous| previous != canonical)
+                {
+                    return Err(invalid("shared quota pool observations disagree"));
                 }
             }
         }

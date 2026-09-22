@@ -101,6 +101,14 @@ Review the assigned change.\n";
     assert!(role_from_authority(&authority, &"b".repeat(64).parse().unwrap()).is_err());
     authority.role_payload["grants"]["write"] = json!(true);
     assert!(role_from_authority(&authority, &actual_assets_sha256).is_err());
+    authority.role_payload = payload.clone();
+    authority.role_payload["grants"]["write"] = json!("invalid");
+    reseal(&mut authority.role_payload);
+    assert!(authority.validate().is_ok());
+    assert!(role_from_authority(&authority, &actual_assets_sha256).is_err());
+    authority.role_payload = payload.clone();
+    authority.profile = "other-role".into();
+    assert!(role_from_authority(&authority, &actual_assets_sha256).is_err());
 
     let again = resolve_role_plan(
         &profile,

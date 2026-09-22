@@ -203,6 +203,19 @@ WHEN NOT EXISTS (
 BEGIN
   SELECT RAISE(ABORT, 'quota key must belong to selected account');
 END;
+CREATE TRIGGER attempts_selected_account_immutable
+BEFORE UPDATE OF selected_account_id ON attempts
+WHEN OLD.selected_account_id IS NOT NULL
+  AND NEW.selected_account_id IS NOT OLD.selected_account_id
+BEGIN
+  SELECT RAISE(ABORT, 'selected account is immutable');
+END;
+CREATE TRIGGER attempt_quota_keys_immutable
+BEFORE UPDATE ON attempt_quota_keys
+WHEN NEW.attempt_id IS NOT OLD.attempt_id OR NEW.quota_key IS NOT OLD.quota_key
+BEGIN
+  SELECT RAISE(ABORT, 'attempt quota keys are immutable');
+END;
 
 CREATE TABLE workflow_runs (
   id TEXT PRIMARY KEY,

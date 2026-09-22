@@ -68,9 +68,10 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   and explicit model: each physical key owns its source-labelled,
   provider-reported windows with remaining percent, optional reset,
   observation time, and validity. Unknown values remain absent. Validation
-  bounds membership and rejects foreign keys,
-  duplicate windows, invalid percentages, and nonfinite times. Scoring stays
-  outside this DTO and the store.
+  bounds membership and rejects foreign keys, duplicate windows, invalid
+  percentages, and nonfinite times. Repeated physical keys across models
+  must have identical window sets and facts, regardless of window order.
+  Scoring stays outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
   auto or pinned intent, deterministically ordered candidates, and the
   committed capacity revision the ordering was computed against. Each
@@ -83,6 +84,7 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   and persists the chosen account plus the attempt. The store exposes only the
   raw facts it owns: `Store::quota_capacity_revision` and
   `Store::active_attempt_counts` and `Store::active_reservation_counts`;
+  matching `*_in` methods read through the admission transaction;
   it performs no scoring. One global monotonic `quota_capacity_revision`
   covers the entire scored snapshot. A quota producer advances it in the same
   transaction as each relevant quota mutation, then reads that value for its
@@ -119,6 +121,8 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
     selected model/attempt. The insert guard ties keys to the selected
     `AccountId`; active reservation counts join this set to owned attempts.
     Alias labels share the same keys, while distinct lanes remain distinct.
+    A legacy NULL account may be bound once; a non-NULL selection and
+    persisted quota keys cannot be changed to another identity.
 * `attempts.ownership_active` (default 0) marks the attempt that owns the
   agent's execution slot. Ownership spans the entire orchestrated lifecycle —
   claim (prepared/starting), running, account switch, and cleanup-pending —
@@ -130,6 +134,10 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   release inserts default to 0 and are therefore unaffected.
 * Historical messages with a NULL attempt id remain readable, and current
   inserts of `running` attempt 1 remain valid, until consumers transition.
+* Schema v17 is unpublished preparation. The committed `current-v17.sqlite`
+  fixture is rebuilt from `historical-v16.sqlite` plus final migration 017.
+  Intermediate local dev17 homes from earlier schema drafts are disposable;
+  no live repair or migration 018 is implied.
 
 ## C5 Historical decoding
 

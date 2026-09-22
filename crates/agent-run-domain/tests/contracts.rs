@@ -431,6 +431,65 @@ fn normalized_quota_snapshot_validates_physical_membership() {
     assert!(snapshot.validate().is_err());
 }
 
+/// Shared physical pools must carry one canonical observation across models;
+/// window order is immaterial, while missing or contradictory facts are not.
+#[test]
+fn shared_quota_pool_observations_agree_across_models() {
+    let account: AccountId = "acct".parse().unwrap();
+    let pool = QuotaPoolObservation {
+        key: PhysicalQuotaKey::new(&account, "shared").unwrap(),
+        windows: vec![
+            QuotaWindow {
+                source: "provider".into(),
+                name: "5h".into(),
+                remaining_percent: Some(90.0),
+                reset_at: None,
+                observed_at: 1.0,
+                valid_until: 2.0,
+            },
+            QuotaWindow {
+                source: "provider".into(),
+                name: "7d".into(),
+                remaining_percent: None,
+                reset_at: Some(5.0),
+                observed_at: 1.0,
+                valid_until: 2.0,
+            },
+        ],
+    };
+    let mut snapshot = NormalizedQuotaSnapshot {
+        account,
+        models: vec![
+            QuotaModelObservation {
+                model: "m1".into(),
+                pools: vec![pool.clone()],
+            },
+            QuotaModelObservation {
+                model: "m2".into(),
+                pools: vec![pool.clone()],
+            },
+        ],
+    };
+    snapshot.models[1].pools[0].windows.reverse();
+    snapshot.validate().unwrap();
+    snapshot.models[1].pools[0].windows[1].remaining_percent = Some(5.0);
+    assert!(snapshot.validate().is_err());
+    snapshot.models[1].pools[0].windows = vec![pool.windows[0].clone()];
+    assert!(snapshot.validate().is_err());
+    snapshot.models[1].pools[0].windows = pool.windows.clone();
+    snapshot.models[1].pools[0].windows[1].remaining_percent = Some(1.0);
+    assert!(snapshot.validate().is_err());
+    snapshot.models[1].pools[0].windows = pool.windows.clone();
+    snapshot.models[1].pools[0].windows[0].reset_at = Some(3.0);
+    assert!(snapshot.validate().is_err());
+    snapshot.models[1].pools[0].windows = pool.windows.clone();
+    snapshot.models[1].pools[0].windows[0].observed_at = 1.5;
+    assert!(snapshot.validate().is_err());
+    snapshot.models[1].pools[0].windows = pool.windows.clone();
+    snapshot.models[1].pools[0].windows[0].valid_until = 3.0;
+    assert!(snapshot.validate().is_err());
+}
+
 /// Auto and pinned intents are distinct, persisted with the candidate set, and
 /// a pinned intent must appear among the ordered candidates.
 #[test]

@@ -413,6 +413,8 @@ fn legacy_database_version_is_migrated_on_open() {
         let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
         db.execute_batch(
             "DROP TRIGGER attempt_quota_keys_account_guard; \
+             DROP TRIGGER attempts_selected_account_immutable; \
+             DROP TRIGGER attempt_quota_keys_immutable; \
              DROP INDEX idx_attempts_one_active; DROP INDEX idx_attempts_selected_account; \
              DROP INDEX idx_attempt_quota_keys_key; DROP TABLE attempt_quota_keys; \
              ALTER TABLE attempts DROP COLUMN selected_account_id; \

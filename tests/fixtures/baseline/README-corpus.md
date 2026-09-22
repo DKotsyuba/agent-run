@@ -7,6 +7,11 @@ Regenerate it only from the frozen `archive/python-legacy` branch with that
 branch's documented generator, then import an accepted result through a
 separately reviewed change.
 
+The additive `db/current-v17.sqlite` Rust preparation fixture is the one
+exception: it is rebuilt from immutable `db/historical-v16.sqlite` by applying
+the final unpublished migration 017, checkpointing WAL, and updating
+`db/manifest.json`. Intermediate local dev17 databases are disposable.
+
 ```sh
 git switch archive/python-legacy
 # Follow the frozen branch's compatibility-corpus instructions.
