@@ -100,3 +100,5 @@ continues serving existing launch consumers during staged integration. V1 is
 historical/migration input, not a promise of permanent public v1 launches.
 The [provider materialization contract](provider-materialization.md) names
 the sealed adapter APIs that consume this configuration.
+The [one-time migration plan](provider-migration.md) requires explicit
+runtime, model, account, and harness mappings before any later apply step.
