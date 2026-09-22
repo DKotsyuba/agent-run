@@ -146,6 +146,8 @@ fn current_binary_fixture_matches_fresh_schema() {
         "attempt_quota_keys_account_guard",
         "attempts_selected_account_immutable",
         "attempt_quota_keys_immutable",
+        "quota_exhaustion",
+        "idx_capacity_samples_account_key",
     ] {
         assert!(schema_objects(&fixture)
             .iter()
@@ -759,6 +761,14 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     assert_eq!(phase, None);
     assert_eq!(intent, None);
     assert_eq!(owned, 0);
+    let legacy_capacity: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT account_id,quota_key FROM capacity_samples LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy_capacity, (None, None));
 
     // Registry and quota revision tables start empty and admit typed facts.
     let account: agent_run_domain::AccountId = "acct-codex-native".parse().unwrap();
@@ -771,6 +781,7 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     );
 
     let mut writable = Connection::open(&db_path).unwrap();
+    writable.pragma_update(None, "foreign_keys", true).unwrap();
     writable
         .execute(
             "INSERT INTO provider_accounts VALUES ('acct-codex-native','openai',\
@@ -782,6 +793,59 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         "INSERT INTO provider_accounts VALUES ('acct-alias','openai','keychain:codex','enabled',1.0,1.0)",
         [],
     ).is_err());
+    writable.execute(
+        "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,account_id,quota_key) \
+         VALUES ('codex','tokens','5h','collector','null',?1,?2)",
+        params![account.as_str(), key.as_str()],
+    ).unwrap();
+    for (candidate_account, candidate_key) in [
+        (Some(account.as_str()), None),
+        (None, Some(key.as_str())),
+        (Some(account.as_str()), Some("acct-other::tokens")),
+        (Some("acct-missing"), Some("acct-missing::tokens")),
+    ] {
+        assert!(writable.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,account_id,quota_key) \
+             VALUES ('codex','tokens','5h','collector','null',?1,?2)",
+            params![candidate_account, candidate_key],
+        ).is_err());
+    }
+    writable.execute(
+        "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at,collector_revision) \
+         VALUES (?1,?2,'collector','5h',1.0,2.0,'revision-a')",
+        params![account.as_str(), key.as_str()],
+    ).unwrap();
+    assert!(writable.execute(
+        "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,collector_revision) \
+         VALUES (?1,?2,'collector','5h',3.0,'revision-b')",
+        params![account.as_str(), key.as_str()],
+    ).is_err());
+    for (candidate_account, candidate_key) in [
+        (account.as_str(), "acct-other::tokens"),
+        ("acct-missing", "acct-missing::tokens"),
+    ] {
+        assert!(writable
+            .execute(
+                "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at) \
+             VALUES (?1,?2,'collector','5h',1.0)",
+                params![candidate_account, candidate_key],
+            )
+            .is_err());
+    }
+    writable
+        .execute(
+            "DELETE FROM capacity_samples WHERE account_id=?1",
+            [account.as_str()],
+        )
+        .unwrap();
+    let latched: i64 = writable
+        .query_row(
+            "SELECT COUNT(*) FROM quota_exhaustion WHERE account_id=?1",
+            [account.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(latched, 1);
     for (pool, expected) in [(&key, 1), (&second_key, 2)] {
         let tx = writable.transaction().unwrap();
         tx.execute(

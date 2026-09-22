@@ -22,7 +22,7 @@ fn schema_initialization_and_reopen() {
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], 17);
-    assert_eq!(a["tables"], 19);
+    assert_eq!(a["tables"], 20);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     assert_eq!(
@@ -417,6 +417,9 @@ fn legacy_database_version_is_migrated_on_open() {
              DROP TRIGGER attempt_quota_keys_immutable; \
              DROP INDEX idx_attempts_one_active; DROP INDEX idx_attempts_selected_account; \
              DROP INDEX idx_attempt_quota_keys_key; DROP TABLE attempt_quota_keys; \
+             DROP INDEX idx_capacity_samples_account_key; \
+             ALTER TABLE capacity_samples DROP COLUMN quota_key; \
+             ALTER TABLE capacity_samples DROP COLUMN account_id; \
              ALTER TABLE attempts DROP COLUMN selected_account_id; \
              ALTER TABLE attempts DROP COLUMN phase; \
              ALTER TABLE attempts DROP COLUMN process_identity; \
@@ -426,7 +429,7 @@ fn legacy_database_version_is_migrated_on_open() {
              ALTER TABLE attempts DROP COLUMN ownership_active; \
              ALTER TABLE agents DROP COLUMN selection_intent; \
              ALTER TABLE agents DROP COLUMN requested_account_id; \
-             DROP TABLE provider_accounts; DROP TABLE quota_capacity_revision; \
+             DROP TABLE quota_exhaustion; DROP TABLE provider_accounts; DROP TABLE quota_capacity_revision; \
              DROP INDEX idx_agents_request_id; DROP TABLE reconciliation_cursors; \
              PRAGMA user_version=15;",
         )
