@@ -208,6 +208,16 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
         )
         .unwrap();
     assert!(attached >= 2);
+    let assistant_text: String = store
+        .conn
+        .query_row(
+            "SELECT COALESCE(group_concat(content, ''),'') FROM messages \
+             WHERE agent_id=? AND attempt_id=? AND role='assistant'",
+            rusqlite::params![id.as_str(), attempt],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(assistant_text.contains("fixture partial"));
     let deliveries: i64 = store
         .conn
         .query_row(
