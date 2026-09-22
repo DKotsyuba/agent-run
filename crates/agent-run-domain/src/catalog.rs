@@ -854,6 +854,10 @@ pub enum SelectionIntent {
 pub struct QuotaCandidate {
     /// The global candidate account.
     pub account: AccountId,
+    /// Producer-assigned rank group; lower ranks are preferred and only
+    /// equal ranks use admission's active-count/account-id tie-break.
+    #[serde(default)]
+    pub rank: u32,
     /// Exact physical quota pools this model/attempt must reserve together.
     pub physical_keys: Vec<PhysicalQuotaKey>,
     /// The candidate's effective positive finite multiplier.
@@ -886,7 +890,12 @@ impl QuotaCandidateSet {
     pub fn validate(&self) -> Result<()> {
         nonblank("model", &self.model)?;
         let mut seen = std::collections::BTreeSet::new();
+        let mut previous_rank = None;
         for candidate in &self.candidates {
+            if previous_rank.is_some_and(|rank| candidate.rank < rank) {
+                return Err(invalid("quota candidates must be ordered by rank"));
+            }
+            previous_rank = Some(candidate.rank);
             if !seen.insert(candidate.account.clone()) {
                 return Err(invalid("quota candidates must not repeat an account"));
             }

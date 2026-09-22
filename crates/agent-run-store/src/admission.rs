@@ -187,7 +187,7 @@ pub fn admit_with_config_revision(
 }
 
 /// Look up replay's namespace without creating or updating its session row.
-fn replay_session(
+pub(crate) fn replay_session(
     tx: &rusqlite::Transaction<'_>,
     request: &StartRequest,
 ) -> Result<Option<String>> {
@@ -204,7 +204,7 @@ fn replay_session(
 }
 
 /// Find an existing request id scoped by the already-resolved session id.
-fn replay_in_transaction(
+pub(crate) fn replay_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     request: &StartRequest,
     session: Option<&str>,
@@ -254,7 +254,7 @@ fn ensure_same_replay(
 }
 
 /// Upsert the session only for a new admission, after replay and capacity pass.
-fn upsert_session(
+pub(crate) fn upsert_session(
     tx: &rusqlite::Transaction<'_>,
     request: &StartRequest,
     accepted_at: f64,

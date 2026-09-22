@@ -128,6 +128,22 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Returns the validated canonical profile directory.
+    pub fn profiles_dir(&self) -> &Path {
+        self.profiles
+            .directory
+            .as_deref()
+            .expect("validated provider config")
+    }
+
+    /// Returns the validated canonical skill directory.
+    pub fn skills_dir(&self) -> &Path {
+        self.skills
+            .directory
+            .as_deref()
+            .expect("validated provider config")
+    }
+
     /// Parses and validates v2 TOML without writes or account-store access.
     ///
     /// `home` supplies defaults for existing role/skill catalogs. Cross

@@ -293,6 +293,11 @@ fn native_provider_keeps_login_and_model_alias() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "claude-sonnet");
+    assert!(plan
+        .launch
+        .args
+        .iter()
+        .any(|arg| arg == "--include-partial-messages"));
     assert!(!plan.launch.environment.contains_key("ANTHROPIC_BASE_URL"));
     assert!(!plan.launch.environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
     assert!(!plan.launch.environment.contains_key("ANTHROPIC_API_KEY"));
@@ -356,6 +361,11 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "glm-5.3[1m]");
+    assert!(plan
+        .launch
+        .args
+        .iter()
+        .any(|arg| arg == "--include-partial-messages"));
     assert_eq!(
         plan.launch.environment["ANTHROPIC_BASE_URL"],
         "https://gateway.example/api"

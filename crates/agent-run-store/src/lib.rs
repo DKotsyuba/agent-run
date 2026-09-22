@@ -13,6 +13,7 @@ pub mod lineage;
 pub mod migrations;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
+pub mod provider_admission;
 /// Python-compatible normalization and repair of cumulative run usage rows.
 pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
@@ -174,8 +175,10 @@ pub(crate) fn tx_event(
     data: &Value,
 ) -> Result<i64> {
     tx.execute(
-        "INSERT INTO events(agent_id,at,kind,from_status,to_status,data_json) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO events(agent_id,attempt_id,at,kind,from_status,to_status,data_json) \
+         VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?,?,?)",
         params![
+            id.as_str(),
             id.as_str(),
             now(),
             kind,
@@ -403,8 +406,15 @@ impl Store {
     }
     pub fn event(&self, id: &AgentId, kind: &str, data: &Value) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
-            params![id.as_str(), now(), kind, serde_json::to_string(data)?],
+            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) \
+             VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?)",
+            params![
+                id.as_str(),
+                id.as_str(),
+                now(),
+                kind,
+                serde_json::to_string(data)?
+            ],
         )?;
         Ok(())
     }
@@ -783,7 +793,22 @@ impl Store {
             "UPDATE agents SET status='running',started_at=?,process_group_id=? WHERE id=?",
             params![now(), pgid, id.as_str()],
         )?;
-        tx.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES(?,?,1,'running','{}',?)",params![format!("{}:1",id),id.as_str(),now()])?;
+        let provider: bool = tx.query_row(
+            "SELECT COALESCE(json_extract(identity_json,'$.provider_identity_version'),0)=2 FROM agents WHERE id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        if provider {
+            let changed = tx.execute(
+                "UPDATE attempts SET state='running' WHERE agent_id=? AND ownership_active=1 AND finished_at IS NULL",
+                [id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(Error::Conflict);
+            }
+        } else {
+            tx.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES(?,?,1,'running','{}',?)",params![format!("{}:1",id),id.as_str(),now()])?;
+        }
         tx_event(
             &tx,
             id,
@@ -893,8 +918,10 @@ impl Store {
             params![session, id.as_str()],
         )?;
         tx.execute(
-            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
+            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) \
+             VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?)",
             params![
+                id.as_str(),
                 id.as_str(),
                 now(),
                 "runtime_session",
@@ -920,8 +947,17 @@ impl Store {
         }
         let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
         self.conn.execute(
-            "INSERT INTO messages(agent_id,at,role,name,content,raw_ref) VALUES(?,?,?,?,?,?)",
-            params![id.as_str(), now(), role, name, content, raw_ref],
+            "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) \
+             VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?,?,?)",
+            params![
+                id.as_str(),
+                id.as_str(),
+                now(),
+                role,
+                name,
+                content,
+                raw_ref
+            ],
         )?;
         Ok(())
     }

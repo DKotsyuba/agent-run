@@ -568,6 +568,7 @@ fn quota_candidate_set_preserves_pinned_and_auto_intent() {
     let provider = ProviderId::from_str("codex-plus").unwrap();
     let candidate = QuotaCandidate {
         account: account.clone(),
+        rank: 0,
         physical_keys: vec![PhysicalQuotaKey::new(&account, "gpt-5.1").unwrap()],
         multiplier: PositiveFinite::try_from(1.0).unwrap(),
     };
@@ -598,6 +599,62 @@ fn quota_candidate_set_preserves_pinned_and_auto_intent() {
     set.intent = SelectionIntent::Pinned(account);
     let missing_pin = set.validate().unwrap_err();
     assert!(missing_pin.to_string().contains("pinned"));
+}
+
+/// Producer rank groups must be monotone; admission may compare active counts
+/// only after rank equality and never interpret a rank as a quota percentage.
+#[test]
+fn quota_candidate_rank_groups_are_ordered() {
+    let first: AccountId = "acct-first".parse().unwrap();
+    let second: AccountId = "acct-second".parse().unwrap();
+    let mut set = QuotaCandidateSet {
+        provider: "custom".parse().unwrap(),
+        model: "m".into(),
+        intent: SelectionIntent::Auto,
+        candidates: [(&first, 0), (&second, 1)]
+            .into_iter()
+            .map(|(account, rank)| QuotaCandidate {
+                account: account.clone(),
+                rank,
+                physical_keys: vec![PhysicalQuotaKey::new(account, "shared").unwrap()],
+                multiplier: PositiveFinite::try_from(1.0).unwrap(),
+            })
+            .collect(),
+        capacity_revision: 0,
+    };
+    set.validate().unwrap();
+    set.candidates[1].rank = 0;
+    set.validate().unwrap();
+    set.candidates[0].rank = 2;
+    assert!(set.validate().is_err());
+}
+
+/// New provider input has one explicit model and rejects legacy runtime or
+/// caller-supplied quota candidates before any service/store side effect.
+#[test]
+fn provider_start_request_is_strict_and_validated() {
+    let workdir = std::env::temp_dir().canonicalize().unwrap();
+    let input = json!({
+        "provider":"glm-user", "model":"fixture", "profile":"review",
+        "task":"inspect", "workdir":workdir, "account":"work"
+    });
+    let mut request: agent_run_domain::ProviderStartRequest =
+        serde_json::from_value(input.clone()).unwrap();
+    request.validate().unwrap();
+    assert_eq!(request.storage_projection().runtime, "glm-user");
+    for extra in ["runtime", "candidates", "quota_snapshot"] {
+        let mut invalid = input.clone();
+        invalid[extra] = json!("untrusted");
+        assert!(serde_json::from_value::<agent_run_domain::ProviderStartRequest>(invalid).is_err());
+    }
+    let mut blank = request.clone();
+    blank.model = " ".into();
+    assert!(blank.validate().is_err());
+    let mut invalid_label = input;
+    invalid_label["account"] = json!("../outside");
+    assert!(
+        serde_json::from_value::<agent_run_domain::ProviderStartRequest>(invalid_label).is_err()
+    );
 }
 
 /// Stale revision, busy, no-eligible-account, and exhaustion are distinct

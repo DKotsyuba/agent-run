@@ -14,10 +14,16 @@ use crate::{
     verify::{self, Proof},
     Error, Result,
 };
+use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
+use agent_run_domain::{
+    catalog::{AccountStatus, QuotaCandidateSet, ResolvedLaunchAuthority},
+    ProviderStartRequest, Sha256Digest,
+};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::str::FromStr;
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -35,6 +41,74 @@ pub struct LaunchIdentity {
     pub effective_policy: EffectivePolicy,
     pub runtime_home: Option<PathBuf>,
     pub snapshot_sha256: Option<String>,
+}
+
+/// Durable v2 admission authority; account credentials stay on the attempt.
+///
+/// The zero asset digest and absent runtime home mark preparation before the
+/// supervisor seals assets. No launch may use this pending identity as proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderLaunchIdentity {
+    /// Distinguishes new provider rows from historical runtime requests.
+    pub provider_identity_version: u32,
+    /// Exact hash of the strict provider request for replay.
+    pub replay_request_sha256: String,
+    /// Original explicit provider/model/account-label intent.
+    pub provider_request: ProviderStartRequest,
+    /// SHA-256 of exact config.toml bytes accepted at the request boundary.
+    pub provider_config_sha256: String,
+    /// Secret-free digest and ids of the operative normalized v2 config.
+    pub provider_config_snapshot: Value,
+    /// Frozen provider/model/role/scope; asset digest seals before spawning.
+    pub authority: ResolvedLaunchAuthority,
+    /// Per-lineage generated home once sealed.
+    pub runtime_home: Option<PathBuf>,
+    /// Runtime asset index digest once sealed.
+    pub snapshot_sha256: Option<String>,
+}
+
+impl ProviderLaunchIdentity {
+    /// Reads only an explicit v2 identity and verifies its raw provider
+    /// request matches the staged record projection and replay digest.
+    pub fn read(row: &Record) -> Result<Self> {
+        let identity: Self = serde_json::from_value(
+            row.identity
+                .clone()
+                .ok_or_else(|| invalid("provider launch identity is missing"))?,
+        )
+        .map_err(|_| invalid("provider launch identity is malformed"))?;
+        if identity.provider_identity_version != 2
+            || identity.provider_request.provider.as_str() != row.request.runtime
+            || identity.provider_request.model != row.request.model
+            || identity.provider_request.profile != row.request.profile
+            || identity.provider_request.task != row.request.task
+            || identity.provider_request.workdir != row.request.workdir
+            || identity.provider_request.effort != row.request.effort
+            || identity.provider_request.request_id != row.request.request_id
+            || identity.provider_request.orchestrator != row.request.orchestrator
+            || identity
+                .provider_request
+                .account
+                .as_ref()
+                .map(|label| label.as_str())
+                != row.request.account.as_deref()
+            || identity.authority.provider != identity.provider_request.provider
+            || identity.authority.model != identity.provider_request.model
+            || identity.authority.profile != identity.provider_request.profile
+            || identity.authority.workdir != identity.provider_request.workdir
+            || identity.replay_request_sha256
+                != agent_run_domain::canonical::sha256_hex(
+                    &serde_json::to_value(&identity.provider_request)?,
+                    true,
+                )
+        {
+            return Err(Error::Integrity(
+                "stored provider authority contradicts request".into(),
+            ));
+        }
+        Ok(identity)
+    }
 }
 impl LaunchIdentity {
     pub fn read(row: &Record) -> Result<Self> {
@@ -71,7 +145,15 @@ struct CachedConfig {
     /// Lowercase SHA-256 of the exact `config.toml` bytes.
     revision: String,
     /// Parsed and validated configuration for `revision`.
-    value: Config,
+    value: CachedConfigValue,
+}
+/// Exactly one validated schema for the currently active file revision.
+#[derive(Clone)]
+enum CachedConfigValue {
+    /// Historical consumer configuration.
+    Legacy(Config),
+    /// Provider-oriented schema v2 configuration.
+    Providers(ProviderConfig),
 }
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -145,9 +227,26 @@ impl Service {
             .write()
             .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?;
         let revision = cache.as_ref().map(|cached| cached.revision.as_str());
-        match Config::load_if_changed(&self.home, revision) {
-            Ok(None) => Ok(false),
-            Ok(Some((value, revision))) => {
+        let loaded = match ProviderConfig::load_if_changed(&self.home, revision) {
+            Ok(None) => return Ok(false),
+            Ok(Some((value, revision))) => Ok((CachedConfigValue::Providers(value), revision)),
+            Err(provider_error) => match Config::load_if_changed(&self.home, revision) {
+                Ok(None) => return Ok(false),
+                Ok(Some((value, revision))) => Ok((CachedConfigValue::Legacy(value), revision)),
+                Err(legacy_error) => Err(
+                    if matches!(
+                        cache.as_ref().map(|entry| &entry.value),
+                        Some(CachedConfigValue::Providers(_))
+                    ) {
+                        provider_error
+                    } else {
+                        legacy_error
+                    },
+                ),
+            },
+        };
+        match loaded {
+            Ok((value, revision)) => {
                 *cache = Some(CachedConfig { revision, value });
                 logging::config_reload(true, cache.as_ref().map(|c| c.revision.as_str()));
                 Ok(true)
@@ -166,8 +265,184 @@ impl Service {
             .read()
             .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
             .as_ref()
-            .map(|cached| cached.value.clone())
+            .and_then(|cached| match &cached.value {
+                CachedConfigValue::Legacy(value) => Some(value.clone()),
+                _ => None,
+            })
             .ok_or_else(|| Error::Runtime("configuration cache is empty".into()))
+    }
+
+    /// Loads schema v2 through the same last-valid exact-byte cache used by
+    /// historical starts; an invalid file never replaces the active value.
+    fn current_provider_config(&self) -> Result<(ProviderConfig, String)> {
+        self.refresh_config()?;
+        self.config
+            .read()
+            .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
+            .as_ref()
+            .and_then(|cached| match &cached.value {
+                CachedConfigValue::Providers(value) => {
+                    Some((value.clone(), cached.revision.clone()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| invalid("provider start requires schema_version 2"))
+    }
+
+    /// Admits a strict provider request from trusted Rust quota candidates.
+    /// The split lets offline tests drive the real supervisor executable
+    /// without asking a test binary to respawn itself as `agent-run`.
+    /// No transport accepts candidates from caller JSON.
+    pub fn admit_provider_trusted(
+        &self,
+        mut request: ProviderStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        request.validate()?;
+        if request.fast || request.output_schema.is_some() {
+            return Err(Error::Unsupported(
+                "provider fast mode and output schema await harness cutover".into(),
+            ));
+        }
+        if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
+            let store = Store::open(&self.home)?;
+            let row = store.get(&replay.agent_id)?;
+            return Ok(
+                json!({"agent_id":replay.agent_id,"attempt_id":replay.attempt_id,
+                "created":false,"agent":self.view(&store,&row)?}),
+            );
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let provider = catalog
+            .provider(&request.provider)
+            .ok_or_else(|| invalid("provider is not configured"))?;
+        let offering = provider
+            .models
+            .iter()
+            .find(|model| model.id == request.model)
+            .ok_or_else(|| invalid("model is not offered by provider"))?;
+        let pinned = request
+            .account
+            .as_ref()
+            .map(|label| {
+                provider
+                    .binding(label.as_str())
+                    .ok_or_else(|| invalid("account label is not bound to provider"))
+                    .map(|binding| binding.account.clone())
+            })
+            .transpose()?;
+        let mut profile = profiles::load_provider(&config, &request)?;
+        profile
+            .required_constraints
+            .extend(offering.restrictions.iter().copied());
+        let role = role_plan::resolve_role_plan(
+            &profile,
+            config.skills_dir(),
+            &config.mcp,
+            if request.account.is_some() {
+                "account"
+            } else {
+                "global"
+            },
+            request.account.as_ref().map(|label| label.as_str()),
+        )?;
+        let mut effective = request.storage_projection();
+        effective.write = profile.write;
+        effective.read_roots = profile.read_roots.clone();
+        effective.required_constraints = profile.required_constraints.clone();
+        effective.timeout_seconds = Some(
+            effective
+                .timeout_seconds
+                .unwrap_or(config.core.default_timeout_seconds),
+        );
+        let eligible_accounts = provider
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.contains(&request.model))
+            })
+            .filter(|binding| {
+                catalog
+                    .account(&binding.account)
+                    .is_some_and(|record| record.status == AccountStatus::Enabled)
+            })
+            .map(|binding| binding.account.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let authority = ResolvedLaunchAuthority {
+            provider: request.provider.clone(),
+            harness: provider.harness,
+            connection: provider.connection.clone(),
+            model: request.model.clone(),
+            effort: request.effort.clone(),
+            profile: profile.name,
+            workdir: request.workdir.clone(),
+            role_payload: role.to_payload(),
+            assets_sha256: Sha256Digest::from_str(&"0".repeat(64))?,
+            eligible_accounts,
+        };
+        let identity = ProviderLaunchIdentity {
+            provider_identity_version: 2,
+            replay_request_sha256: agent_run_domain::canonical::sha256_hex(
+                &serde_json::to_value(&request)?,
+                true,
+            ),
+            provider_request: request.clone(),
+            provider_config_sha256: revision,
+            provider_config_snapshot: config.snapshot()?,
+            authority: authority.clone(),
+            runtime_home: None,
+            snapshot_sha256: None,
+        };
+        let cap = config
+            .harnesses
+            .get(&provider.harness)
+            .ok_or_else(|| invalid("provider harness is not configured"))?
+            .max_active_agents;
+        let admission = Store::open(&self.home)?.admit_provider(
+            &request,
+            &effective,
+            &catalog,
+            &authority,
+            &candidates,
+            &serde_json::to_value(identity)?,
+            config.core.max_active_agents,
+            cap,
+            pinned.as_ref(),
+        )?;
+        let store = Store::open(&self.home)?;
+        let row = store.get(&admission.agent_id)?;
+        Ok(
+            json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
+            "created":admission.created,"agent":self.view(&store,&row)?}),
+        )
+    }
+
+    /// Admits trusted quota candidates and hands a newly owned attempt to
+    /// the normal detached supervisor; replay never launches another child.
+    pub async fn start_provider_trusted(
+        &self,
+        request: ProviderStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        let result = self.admit_provider_trusted(request, candidates)?;
+        if result["created"] == true {
+            let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
+            if let Err(error) = supervisor::launch(&self.home, &id).await {
+                Store::open(&self.home)?.event(
+                    &id,
+                    "supervisor_handoff_error",
+                    &json!({"kind":error.public().kind}),
+                )?;
+            }
+        }
+        Ok(result)
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;

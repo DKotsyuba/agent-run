@@ -6,12 +6,15 @@ use crate::{
     domain::{self, AgentId, Outcome, Status},
     error::invalid,
     fs, launch, process,
-    service::LaunchIdentity,
+    service::{LaunchIdentity, ProviderLaunchIdentity},
     state::Store,
     verify, Error, Result,
 };
+use agent_run_config::{provider_config::ProviderConfig, role_plan::ResolvedRolePlan};
+use agent_run_domain::catalog::HarnessId;
 use rusqlite::{params, TransactionBehavior};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::{ffi::OsStr, path::Path, time::Duration};
 
 /// Start one detached `_supervisor` session leader and return after its READY.
@@ -101,6 +104,14 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
         Err(error) => {
             let row = store.get(id)?;
             if !row.status.terminal() {
+                if row
+                    .identity
+                    .as_ref()
+                    .is_some_and(|value| value["provider_identity_version"] == 2)
+                    && !store.provider_never_spawned(id)?
+                {
+                    return Err(error);
+                }
                 let mut outcome = Outcome::failure(preparation_failure_kind(&error));
                 outcome.failure_text = Some(error.public().message);
                 if store.cancel_pending(id)? {
@@ -168,8 +179,10 @@ fn record_owner(store: &mut Store, id: &AgentId, owner: &process::Identity) -> R
         return Err(Error::Conflict);
     }
     tx.execute(
-        "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
+        "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) \
+         VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?)",
         params![
+            id.as_str(),
             id.as_str(),
             heartbeat,
             "supervisor_ready",
@@ -181,6 +194,14 @@ fn record_owner(store: &mut Store, id: &AgentId, owner: &process::Identity) -> R
 }
 /// Run one admitted agent through preparation, supervision, cleanup, and terminal storage.
 async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
+    let first = store.get(id)?;
+    if first
+        .identity
+        .as_ref()
+        .is_some_and(|value| value["provider_identity_version"] == 2)
+    {
+        return execute_provider(home, id, store).await;
+    }
     if store.cancel_pending(id)? {
         return cancelled_before_spawn(id, store);
     }
@@ -313,6 +334,169 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         Some(&evidence),
         cleanup.group_gone,
         last_progress_at,
+        domain::now(),
+        verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
+    )?;
+    store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
+    commands::complete_terminal(store, id)?;
+    Ok(())
+}
+
+/// Runs one admitted v2 attempt through the existing detached supervisor,
+/// process-identity fence, transcript, cleanup verifier, and terminal outbox.
+async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
+    if store.cancel_pending(id)? {
+        if !store.provider_never_spawned(id)? {
+            return Err(invalid("provider attempt was already spawning"));
+        }
+        return cancelled_before_spawn(id, store);
+    }
+    let mut row = store.get(id)?;
+    let mut identity = ProviderLaunchIdentity::read(&row)?;
+    let (config, revision) = ProviderConfig::load(home)?;
+    if revision != identity.provider_config_sha256
+        || config.snapshot()? != identity.provider_config_snapshot
+    {
+        return Err(Error::Integrity(
+            "provider configuration changed after admission".into(),
+        ));
+    }
+    let catalog = config.resolve_catalog(store.list_accounts()?)?;
+    let (attempt_id, account) = store.provider_attempt(id)?;
+    let harness = config
+        .harnesses
+        .get(&identity.authority.harness)
+        .ok_or_else(|| invalid("admitted provider harness is unavailable"))?;
+    let runtime_home = identity
+        .runtime_home
+        .clone()
+        .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
+    let agent_dir = home.join("agents").join(id.as_str());
+    fs::private_dir(&agent_dir)?;
+    store.event(id, "phase", &json!({"phase":"preparing"}))?;
+    if identity.runtime_home.is_none() {
+        let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
+        let (_, digest) = adapters::provider::materialize_selected(
+            &config,
+            &catalog,
+            &identity.authority.provider,
+            &identity.authority.model,
+            &account,
+            &role,
+            &identity.authority.workdir,
+            &runtime_home,
+            home,
+        )?;
+        identity.authority.assets_sha256 = digest.clone();
+        identity.snapshot_sha256 = Some(digest.as_str().into());
+        identity.runtime_home = Some(runtime_home.clone());
+        store.update_identity(
+            id,
+            &serde_json::to_value(&identity)?,
+            &format!("snapshot:v2:{}", digest.as_str()),
+        )?;
+    } else {
+        materialize::verify(&runtime_home, identity.authority.assets_sha256.as_str())?;
+    }
+    if store.cancel_pending(id)? {
+        if !store.provider_never_spawned(id)? {
+            return Err(invalid("provider attempt was already spawning"));
+        }
+        return cancelled_before_spawn(id, store);
+    }
+    row = store.get(id)?;
+    let host: BTreeMap<String, String> = std::env::vars().collect();
+    let planned = adapters::provider::plan_selected(
+        &config,
+        &catalog,
+        &identity.authority,
+        &account,
+        &runtime_home,
+        home,
+        &host,
+        &adapters::authorized_request::SystemCredentialReader,
+        &identity.provider_request.task,
+        None,
+    )?;
+    store.provider_spawning(id, &attempt_id)?;
+    store.event(id, "phase", &json!({"phase":"spawning"}))?;
+    let mut process = Process::spawn(&planned.launch)?;
+    let execution = async {
+        let leader = process
+            .owner
+            .leader
+            .as_ref()
+            .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
+        store.provider_process(id, &attempt_id, leader)?;
+        store.running(id, process.owner.pid)?;
+        crate::journal(
+            store,
+            id,
+            "user",
+            &identity.provider_request.task,
+            None,
+            None,
+        )?;
+        if identity.authority.harness == HarnessId::Codex {
+            let mut native_row = row.clone();
+            native_row.request.model = planned.native_model.clone();
+            crate::codex::run(
+                &mut process,
+                store,
+                &native_row,
+                &planned.runtime,
+                &planned.profile,
+                &runtime_home,
+            )
+            .await
+        } else {
+            crate::stream::run(
+                &mut process,
+                store,
+                &row,
+                planned.launch.initial_input.as_deref(),
+            )
+            .await
+        }
+    }
+    .await;
+    let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
+    let exit = process.reap().await;
+    let cleanup = cleanup?;
+    store.provider_cleanup(id, &attempt_id, &cleanup)?;
+    store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+    let cancelled = store.cancel_pending(id)?;
+    let mut result = match execution {
+        Ok(result) => result,
+        Err(error) => adapters::EngineResult {
+            outcome: Outcome::failure(match error {
+                Error::Integrity(_) => "runtime_integrity_failed",
+                Error::Validation(_) => "runtime_contract_rejected",
+                _ => "runtime_transport_failed",
+            }),
+            answer: None,
+            usage: None,
+        },
+    };
+    if result.outcome.exit_code.is_none() {
+        result.outcome.exit_code = exit;
+    }
+    let proof = match result.answer.as_deref() {
+        Some(text) if !text.trim().is_empty() => {
+            Some(verify::seal(&agent_dir, Path::new("answer.md"), text)?)
+        }
+        _ => None,
+    };
+    let evidence = match &proof {
+        Some(proof) => verify::AnswerProof::sealed(proof),
+        None => verify::AnswerProof::absent(agent_dir.join("answer.md")),
+    };
+    let outcome = verify::verify_completion(
+        Some(result.outcome),
+        cancelled.then_some(verify::StopReason::Cancel),
+        Some(&evidence),
+        cleanup.group_gone,
+        store.last_progress(id)?,
         domain::now(),
         verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
     )?;
