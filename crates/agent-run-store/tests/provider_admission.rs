@@ -420,3 +420,205 @@ fn concurrent_provider_admissions_share_one_committed_revision() {
         1
     );
 }
+
+/// Admits one auto run (`request_id`) that selects `acct-a`, then marks its
+/// attempt cleaned up with a recorded history seal (as the supervisor does
+/// at its cleanup boundary) while the logical agent stays running.
+fn cleaned_run(
+    home: &Path,
+    request_id: &str,
+    seal: bool,
+) -> (Store, agent_run_domain::domain::AgentId) {
+    let mut store = Store::open(home).unwrap();
+    let catalog = catalog(&store);
+    let request = provider_request(home, request_id);
+    let authority = authority(&catalog, home);
+    let revision = store.quota_capacity_revision().unwrap();
+    let admission = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(revision, &[("acct-a", 0), ("acct-b", 1)]),
+            &identity(&request, &authority),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(admission.account_id.as_str(), "acct-a");
+    let state = if seal {
+        json!({"native_history":{"seal":{"session":"s"}}}).to_string()
+    } else {
+        "{}".into()
+    };
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET phase='cleanup_complete',process_identity='p',cleanup_proof_json='{\"confirmed\":true}',adapter_state_json=? WHERE id=?",
+            rusqlite::params![state, admission.attempt_id],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [admission.agent_id.as_str()],
+        )
+        .unwrap();
+    (store, admission.agent_id)
+}
+
+/// Owned attempts and reservations of one agent: (owned attempt count,
+/// open physical-key reservations for `acct-a`, total attempts).
+fn ownership(store: &Store, id: &agent_run_domain::domain::AgentId) -> (i64, u64, i64) {
+    let count = |sql: &str| -> i64 {
+        store
+            .conn
+            .query_row(sql, [id.as_str()], |row| row.get(0))
+            .unwrap()
+    };
+    let reserved = Store::active_reservation_counts_in(
+        &store.conn,
+        &[PhysicalQuotaKey::new(&"acct-a".parse().unwrap(), "tokens").unwrap()],
+    )
+    .unwrap()
+    .into_values()
+    .sum();
+    (
+        count("SELECT COUNT(*) FROM attempts WHERE agent_id=? AND ownership_active=1"),
+        reserved,
+        count("SELECT COUNT(*) FROM attempts WHERE agent_id=?"),
+    )
+}
+
+/// After verified cleanup the next attempt goes to an untried account on the
+/// same logical agent, releasing A and reserving B exactly once; a stale
+/// revision, missing cleanup or seal, the already-tried account (also via an
+/// alias), a pending cancel and a second allocator are each refused with
+/// nothing written.
+#[test]
+fn next_attempt_allocation_is_atomic_and_evidence_bound() {
+    let home = home();
+    let path = home.path();
+    let (mut store, id) = cleaned_run(path, "next-1", true);
+    let catalog = catalog(&store);
+    let revision = store.quota_capacity_revision().unwrap();
+    // Stale candidates are refused.
+    let stale = store
+        .allocate_next_attempt(&id, &catalog, &candidates(revision - 1, &[("acct-b", 0)]))
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })
+    ));
+    // Only the already-tried account (or nothing new) is offered: refused.
+    let tried = store
+        .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-a", 0)]))
+        .unwrap_err();
+    assert!(matches!(
+        tried,
+        Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
+    ));
+    assert_eq!(ownership(&store, &id), (1, 1, 1));
+    // A better-ranked tried account never wins; B is allocated once.
+    let next = store
+        .allocate_next_attempt(
+            &id,
+            &catalog,
+            &candidates(revision, &[("acct-a", 0), ("acct-b", 1)]),
+        )
+        .unwrap();
+    assert_eq!(next.account_id.as_str(), "acct-b");
+    assert_eq!(next.number, 2);
+    assert_eq!(ownership(&store, &id), (1, 0, 2), "A released, B owned");
+    let event_attempt: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT attempt_id FROM events WHERE agent_id=? AND kind='attempt_allocated'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_attempt.as_deref(), Some(next.attempt_id.as_str()));
+    // B is not cleaned up yet: a second allocation is refused.
+    let revision = store.quota_capacity_revision().unwrap();
+    assert!(store
+        .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+        .is_err());
+    assert_eq!(ownership(&store, &id), (1, 0, 2));
+
+    // Missing continuation evidence and pending cancel refuse.
+    let (mut bare, bare_id) = cleaned_run(path, "next-2", false);
+    let revision = bare.quota_capacity_revision().unwrap();
+    let error = bare
+        .allocate_next_attempt(&bare_id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("continuation_unavailable"),
+        "{error}"
+    );
+    let (mut cancelled, cancel_id) = cleaned_run(path, "next-3", true);
+    cancelled.enqueue(&cancel_id, "cancel", &json!({})).unwrap();
+    let revision = cancelled.quota_capacity_revision().unwrap();
+    assert!(cancelled
+        .allocate_next_attempt(
+            &cancel_id,
+            &catalog,
+            &candidates(revision, &[("acct-b", 0)])
+        )
+        .is_err());
+    assert_eq!(ownership(&cancelled, &cancel_id).2, 1);
+}
+
+/// A pinned run never takes an attempt on another account.
+#[test]
+fn pinned_runs_never_allocate_another_account() {
+    let home = home();
+    let (mut store, id) = cleaned_run(home.path(), "pinned-1", true);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET selection_intent='pinned',requested_account_id='acct-a' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    let catalog = catalog(&store);
+    let revision = store.quota_capacity_revision().unwrap();
+    assert!(store
+        .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+        .is_err());
+    assert_eq!(ownership(&store, &id), (1, 1, 1));
+}
+
+/// Two concurrent allocators for one agent: exactly one owns the next
+/// attempt; there are never two owned attempts.
+#[test]
+fn concurrent_allocators_admit_one_next_attempt() {
+    let home = home();
+    let path = home.path().to_path_buf();
+    let (store, id) = cleaned_run(&path, "race-1", true);
+    let revision = store.quota_capacity_revision().unwrap();
+    drop(store);
+    let barrier = Arc::new(Barrier::new(2));
+    let wins: usize = (0..2)
+        .map(|_| {
+            let (path, id, barrier) = (path.clone(), id.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let mut store = Store::open(&path).unwrap();
+                let catalog = catalog(&store);
+                barrier.wait();
+                store
+                    .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+                    .is_ok() as usize
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+    assert_eq!(wins, 1);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(ownership(&store, &id), (1, 0, 2));
+}
