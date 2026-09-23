@@ -8,9 +8,7 @@
 
 use agent_run_core::capacity::{
     self, account_token_with, persist,
-    sources::{
-        self, claude_native, claude_oauth_token, normalize_codex, normalize_codexbar_accounts,
-    },
+    sources::{self, claude_native, claude_oauth_token, normalize_codex},
     Key, Route, Sample, Topology,
 };
 use serde_json::json;
@@ -54,15 +52,6 @@ fn shelf_sample(
     }
 }
 
-/// Returns one Codexbar account entry with a single five-hour window.
-fn codexbar_entry(email: &str) -> serde_json::Value {
-    json!({"usage":{
-        "accountEmail": email,
-        "updatedAt": "2026-09-02T12:00:00Z",
-        "primary": {"usedPercent": 50, "windowMinutes": 300}
-    }})
-}
-
 /// The epoch of the Python fixture's `2026-09-02T12:00:00Z` observation.
 const OBSERVED: f64 = 1_788_091_200.0;
 
@@ -74,7 +63,7 @@ fn collect_slice_validates_whole_slice_and_reports_shelf_life() {
         "primary",
         "five_hour",
         Some("team1"),
-        "codexbar",
+        "native",
         OBSERVED,
         Some(600.0),
     );
@@ -83,29 +72,16 @@ fn collect_slice_validates_whole_slice_and_reports_shelf_life() {
         "secondary",
         "weekly",
         Some("team1"),
-        "codexbar",
+        "native",
         OBSERVED,
         Some(300.0),
     );
-
-    // The Codexbar source routes exactly the configured account label.
-    let accounts: BTreeMap<String, String> =
-        [("team1".to_owned(), "team1@example.test".to_owned())]
-            .into_iter()
-            .collect();
-    let routed = normalize_codexbar_accounts(
-        "cortex-runtime",
-        &json!([codexbar_entry("team1@example.test")]),
-        &accounts,
-        Some("default@example.test"),
-    )
-    .expect("one configured Codexbar account is valid evidence");
 
     let slice = sources::slice_from_samples(
         "cortex-runtime",
         "cortex-runtime",
         vec![sample.clone(), shorter.clone()],
-        routed.topology.clone(),
+        Topology::default(),
         1_000.0,
     );
 
@@ -123,15 +99,6 @@ fn collect_slice_validates_whole_slice_and_reports_shelf_life() {
     // the longest one, and never the 900-second default while any sample
     // declares its own. A pool must not outlive its least-fresh constituent.
     assert_eq!(slice.valid_until, OBSERVED + 300.0);
-    assert_eq!(
-        routed
-            .topology
-            .routes
-            .iter()
-            .map(|route| route.account.as_deref())
-            .collect::<BTreeSet<_>>(),
-        [Some("team1")].into_iter().collect::<BTreeSet<_>>()
-    );
 }
 
 /// Records what "shortest positive" means for every non-positive declaration.
@@ -369,45 +336,6 @@ fn base_label_persists_beside_the_absent_account() {
     let order = capacity::order(home.path()).expect("order reads both scopes");
     assert_eq!(order["routes"].as_array().expect("routes").len(), 2);
     assert!(order["deferred"].as_array().expect("deferred").is_empty());
-}
-
-/// Mirrors `tests/test_capacity_identity.py::CapacityIdentityTests::test_codexbar_default_and_shared_labels_remain_independent`.
-#[test]
-fn codexbar_default_and_shared_labels_remain_independent() {
-    let accounts: BTreeMap<String, String> = [
-        ("default".to_owned(), "default@example.test".to_owned()),
-        ("shared".to_owned(), "shared@example.test".to_owned()),
-    ]
-    .into_iter()
-    .collect();
-    let entries = [
-        // Resolves to the absent account, whose token must not collide with
-        // either literal label below.
-        codexbar_entry("base@example.test"),
-        codexbar_entry("default@example.test"),
-        codexbar_entry("shared@example.test"),
-    ];
-    let topology = |order: Vec<serde_json::Value>| {
-        normalize_codexbar_accounts(
-            "runtime",
-            &serde_json::Value::Array(order),
-            &accounts,
-            Some("base@example.test"),
-        )
-        .expect("three known accounts are valid evidence")
-        .topology
-    };
-
-    let forward = topology(entries.to_vec());
-    assert_eq!(forward.routes.len(), 3);
-    assert_eq!(forward.pools.len(), 3);
-    assert!(forward.pools.iter().all(|pool| pool.keys.len() == 1));
-
-    let mut reversed = entries.to_vec();
-    reversed.reverse();
-    let backward = topology(reversed);
-    assert_eq!(forward.pools, backward.pools);
-    assert_eq!(forward.routes, backward.routes);
 }
 
 /// Mirrors `tests/test_capacity_identity.py::CapacityIdentityTests::test_account_tokens_are_injective_for_separator_like_labels`.

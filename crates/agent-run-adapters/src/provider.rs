@@ -418,8 +418,7 @@ pub fn plan_selected(
     } else if let CredentialRef::Named { label, .. } = &reference {
         environment.insert(
             "CLAUDE_CONFIG_DIR".into(),
-            materialize::account_home(app_home, config::Adapter::Claude, label.as_str())
-                .join("claude-config")
+            materialize::claude_account_config(app_home, &runtime.home, label.as_str())?
                 .to_string_lossy()
                 .into_owned(),
         );

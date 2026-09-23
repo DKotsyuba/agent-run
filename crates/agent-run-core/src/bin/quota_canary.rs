@@ -244,7 +244,9 @@ async fn run(arguments: &[String]) -> Result<Value, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent-run")))
         .ok_or_else(|| "HOME is unavailable".to_owned())?;
-    let secret = QuotaCredentialReader::from_host(app_home)
+    // Only the native login is read here, so the harness home is nominal.
+    let runtime_home = app_home.join("runtimes/claude/home");
+    let secret = QuotaCredentialReader::from_host(app_home, runtime_home)
         .ok_or_else(|| "HOME is unavailable".to_owned())?
         .read(&reference)
         .map_err(|_| "credential_unavailable".to_owned())?;

@@ -29,6 +29,7 @@ fn catalog() -> ProviderCatalog {
             "id":"glm","harness":"claude-code",
             "connection":{"kind":"custom","endpoint":"https://api.example.com/base","protocol":"messages"},
             "auth_family":"anthropic","limits_source":"lua",
+            "collector":{"script":"glm_quota","origins":["https://api.example.com"]},
             "models":[{"id":"glm-5.3","native_model":"glm-5.3[1m]"}],
             "bindings":[{"label":"work","account":"acct-work"}]
         }]

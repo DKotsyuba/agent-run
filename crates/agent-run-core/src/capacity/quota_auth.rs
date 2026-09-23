@@ -7,8 +7,7 @@
 //! with. Tokens never reach Lua, configuration, diagnostics, or the store; the
 //! custom-gateway reader keeps refusing native logins for gateway headers.
 
-use crate::adapters::materialize::account_home;
-use crate::config::Adapter;
+use crate::adapters::materialize::claude_account_config;
 use agent_run_adapters::authorized_request::{CredentialReader, SystemCredentialReader};
 use agent_run_domain::{catalog::HarnessId, CredentialRef, Error, Result};
 use serde_json::Value;
@@ -31,8 +30,9 @@ pub const BACKOFF_PERSIST_FAILED: &str = "backoff_persist_failed";
 ///
 /// Native Claude resolves the host login the provider adapter launches with
 /// (`CLAUDE_CONFIG_DIR` when set, else `~/.claude`); a named Claude label
-/// resolves only its own `accounts/claude/<label>/claude-config` directory
-/// under the agent-run home. Each directory is read as Claude Code itself
+/// resolves only the directory `auth login` and run materialization use,
+/// chosen by [`claude_account_config`] (an ambiguous legacy/canonical pair
+/// fails). Each directory is read as Claude Code itself
 /// reads it: the plaintext `.credentials.json` first, else the macOS
 /// Keychain item whose service is `Claude Code-credentials`, suffixed with
 /// `-<first 8 hex of sha256(config dir)>` whenever the directory is not the
@@ -42,51 +42,64 @@ pub const BACKOFF_PERSIST_FAILED: &str = "backoff_persist_failed";
 pub struct QuotaCredentialReader {
     /// Agent-run home owning labelled account directories.
     app_home: PathBuf,
+    /// Configured Claude harness home, locating legacy labelled logins.
+    runtime_home: PathBuf,
     /// Host native Claude config directory, and whether it was overridden
     /// through `CLAUDE_CONFIG_DIR` (which changes the Keychain service name).
     native: (PathBuf, bool),
 }
 
 impl QuotaCredentialReader {
-    /// Builds a reader over explicit homes; `native_override` states whether
-    /// `native_config` came from a `CLAUDE_CONFIG_DIR` override.
-    pub fn new(app_home: PathBuf, native_config: PathBuf, native_override: bool) -> Self {
+    /// Builds a reader over explicit homes: `app_home` is the agent-run home,
+    /// `runtime_home` the configured Claude harness home, and
+    /// `native_override` states whether `native_config` came from a
+    /// `CLAUDE_CONFIG_DIR` override.
+    pub fn new(
+        app_home: PathBuf,
+        runtime_home: PathBuf,
+        native_config: PathBuf,
+        native_override: bool,
+    ) -> Self {
         Self {
             app_home,
+            runtime_home,
             native: (native_config, native_override),
         }
     }
 
-    /// Builds the reader for `app_home` from the host environment exactly as
-    /// the native Claude login is resolved: a nonempty `CLAUDE_CONFIG_DIR`,
-    /// else `$HOME/.claude`. Returns `None` when neither is available.
-    pub fn from_host(app_home: PathBuf) -> Option<Self> {
+    /// Builds the reader for `app_home` and the Claude harness `runtime_home`
+    /// from the host environment exactly as the native Claude login is
+    /// resolved: a nonempty `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
+    /// Returns `None` when neither is available.
+    pub fn from_host(app_home: PathBuf, runtime_home: PathBuf) -> Option<Self> {
         if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
-            return Some(Self::new(app_home, PathBuf::from(dir), true));
+            return Some(Self::new(app_home, runtime_home, PathBuf::from(dir), true));
         }
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
         Some(Self::new(
             app_home,
+            runtime_home,
             PathBuf::from(home).join(".claude"),
             false,
         ))
     }
 
     /// Returns the config directory and whether it counts as overridden for
-    /// one Claude login; `label` absent selects the native login.
-    fn claude_config(&self, label: Option<&str>) -> (PathBuf, bool) {
-        match label {
+    /// one Claude login; `label` absent selects the native login. An
+    /// ambiguous labelled pair is an error.
+    fn claude_config(&self, label: Option<&str>) -> Result<(PathBuf, bool)> {
+        Ok(match label {
             None => self.native.clone(),
             Some(label) => (
-                account_home(&self.app_home, Adapter::Claude, label).join("claude-config"),
+                claude_account_config(&self.app_home, &self.runtime_home, label)?,
                 true,
             ),
-        }
+        })
     }
 
     /// Reads one Claude login's OAuth access token from its own store only.
     fn claude_oauth(&self, label: Option<&str>) -> Result<String> {
-        let (dir, overridden) = self.claude_config(label);
+        let (dir, overridden) = self.claude_config(label)?;
         let file = dir.join(".credentials.json");
         if file.is_file() {
             if let Some(token) = SystemCredentialReader

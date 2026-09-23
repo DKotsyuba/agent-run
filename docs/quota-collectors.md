@@ -155,8 +155,11 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   system reader does. Native and named **Claude** logins resolve only
   inside Rust through the account-home convention the provider adapter
   launches with: `native:claude-code` is the host login (`CLAUDE_CONFIG_DIR`
-  when set, else `~/.claude`); `named:claude-code:<label>` is only
-  `<home>/accounts/claude/<label>/claude-config`. Each directory is read
+  when set, else `~/.claude`); `named:claude-code:<label>` is only the
+  directory `auth login` and runs also use (`claude_account_config`):
+  `<home>/accounts/claude/<label>/claude-config`, or an earlier release's
+  `<claude harness home>@<label>/claude-config` when only that exists; both
+  existing is an ambiguity error. Each directory is read
   as Claude Code reads it — `.credentials.json`, else the Keychain item
   `Claude Code-credentials`, suffixed `-<first 8 hex of sha256(dir)>` for
   any explicit directory. A missing named store is an error and never
@@ -185,7 +188,10 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   through `record_quota_snapshot` only after a round fully succeeds.
 * The polling path dispatches on schema: `capacity collect` runs the
   account-scoped provider sources (Lua units plus Codex app-server units)
-  for a schema-v2 home, and the legacy per-runtime path otherwise. A home
+  for a schema-v2 home, and the legacy per-runtime path otherwise; there a
+  retired `codexbar` source is never invoked and reports the fixed
+  `codexbar_retired_migration_required` failure, keeping earlier samples.
+  A home
   that declares `schema_version = 2` but fails to load reports that error
   instead of falling back to the legacy sources. The round's `ok` is true
   only when no Lua or Codex row failed and the backoff ledger persisted.

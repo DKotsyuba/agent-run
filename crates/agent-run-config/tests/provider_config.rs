@@ -159,6 +159,13 @@ fn v2_rejects_invalid_provider_contracts() {
             ProviderConfig::parse(&valid.replace("codex_appserver", retired), home.path()).is_err()
         );
     }
+    // The retired CodexBar binary is schema-1 migration input only.
+    let with_codexbar = format!("{valid}\n[capacity]\ncodexbar_binary = \"/bin/true\"\n");
+    let error = ProviderConfig::parse(&with_codexbar, home.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("codexbar_binary is retired"),
+        "{error}"
+    );
 }
 
 /// Invalid revisions leave the caller's last valid parsed value untouched.

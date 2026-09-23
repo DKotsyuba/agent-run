@@ -105,9 +105,20 @@ are probed through the account's own reference (`native:codex` or
 accounts read only their own login store, with no fallback to the default
 login. Failures report fixed codes such as `credential_unavailable`, the
 round's `ok` is false when any source failed, and a v2 config that fails to
-load is an error rather than a switch to legacy sources. There is no CodexBar
-fallback on this path. See `docs/quota-collectors.md` for the per-source
-window mapping.
+load is an error rather than a switch to legacy sources. See
+`docs/quota-collectors.md` for the per-source window mapping.
+
+CodexBar is retired. Schema 2 rejects `capacity.codexbar_binary` and a
+`codexbar` limits source. A schema-1 file that still declares them keeps
+parsing so the one-time migration can read it, but a `codexbar` runtime is
+never invoked: each round reports it failed with
+`codexbar_retired_migration_required` and keeps its earlier samples.
+
+A labelled Claude login (`agent-run auth`/`login --account <label>`) is stored
+in `accounts/claude/<label>/claude-config` under the agent-run home, the same
+directory runs and quota collection read. A login made by an earlier release
+at `<runtime home>@<label>/claude-config` keeps working in place; if both
+directories exist the label is ambiguous and fails until one is removed.
 
 After manual edits, parse the TOML and run `agent-run doctor`. Doctor checks
 binaries and role assets; runtime start does not run language-toolchain

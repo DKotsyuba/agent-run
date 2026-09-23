@@ -864,7 +864,13 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
         crate::capacity::lua::ReqwestQuotaHttp::new(limits.http_response_body_bytes)
             .map_err(|_| Error::Runtime("quota transport unavailable".into()))?,
     );
-    let reader = QuotaCredentialReader::from_host(home.to_path_buf())
+    let claude_home = config
+        .harnesses
+        .get(&agent_run_domain::catalog::HarnessId::ClaudeCode)
+        .ok_or_else(|| crate::error::invalid("v2 requires the claude-code harness"))?
+        .home
+        .clone();
+    let reader = QuotaCredentialReader::from_host(home.to_path_buf(), claude_home)
         .ok_or_else(|| Error::Runtime("HOME is unavailable".into()))?;
     let retention = config.capacity.sample_retention;
     let mut backoff = AccountBackoff::load(home);

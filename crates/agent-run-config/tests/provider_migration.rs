@@ -19,6 +19,8 @@ fn old(home: &Path) -> Config {
         format!(
             r#"
 schema_version = 1
+[capacity]
+codexbar_binary = "/bin/true"
 [runtimes.main]
 enabled = true
 adapter = "codex"
@@ -35,7 +37,7 @@ adapter = "glm"
 binary = "/bin/true"
 home = "{home}/glm"
 models = ["glm-5.3"]
-limits_source = "none"
+limits_source = "codexbar"
 "#,
             home = home.display()
         ),
@@ -139,6 +141,8 @@ fn explicit_migration_plan_preserves_history_and_weights() {
     )
     .unwrap();
     assert!(plan.manual_review.is_empty());
+    // Retired CodexBar input (source and binary) migrates, but never carries.
+    assert!(plan.config.capacity.legacy_codexbar_binary.is_none());
     assert_eq!(fs::read(home.path().join("config.toml")).unwrap(), before);
     assert!(!home.path().join("state.db").exists());
     let catalog = plan.config.resolve_catalog(accounts()).unwrap();

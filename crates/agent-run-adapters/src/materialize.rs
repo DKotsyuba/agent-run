@@ -196,6 +196,37 @@ pub fn shell_command(args: &[String]) -> String {
 pub fn account_home(app_home: &Path, kind: Adapter, label: &str) -> PathBuf {
     app_home.join("accounts").join(kind.name()).join(label)
 }
+
+/// Returns the single `CLAUDE_CONFIG_DIR` of one labelled Claude login.
+///
+/// This is the one authority shared by `auth login`, run/provider
+/// materialization, and quota credential resolution. The canonical directory
+/// is `<app_home>/accounts/claude/<label>/claude-config`. Logins created by
+/// earlier releases live at `<runtime_home>@<label>/claude-config` (the
+/// runtime home's final component suffixed with `@<label>`) and stay usable in
+/// place without re-login or copying: when only that legacy directory exists
+/// it is returned. When neither exists the canonical directory is returned
+/// (it is not created here). When both exist and are not the same directory,
+/// ownership is ambiguous and a validation error is returned instead of
+/// silently choosing one; there is never a fallback to the default login.
+pub fn claude_account_config(app_home: &Path, runtime_home: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = account_home(app_home, Adapter::Claude, label).join("claude-config");
+    let name = runtime_home
+        .file_name()
+        .ok_or_else(|| invalid("Claude runtime home has no final path component"))?
+        .to_string_lossy()
+        .into_owned();
+    let legacy = runtime_home
+        .with_file_name(format!("{name}@{label}"))
+        .join("claude-config");
+    match (canonical.is_dir(), legacy.is_dir()) {
+        (true, true) if canonical.canonicalize().ok() != legacy.canonicalize().ok() => Err(
+            invalid("labelled Claude login exists in both account homes; remove one"),
+        ),
+        (false, true) => Ok(legacy),
+        _ => Ok(canonical),
+    }
+}
 pub fn environment(
     config: &Config,
     runtime: &Runtime,
@@ -255,8 +286,7 @@ pub fn environment_with_host(
         if let Some(a) = account {
             env.insert(
                 "CLAUDE_CONFIG_DIR".into(),
-                account_home(app_home, kind, a)
-                    .join("claude-config")
+                claude_account_config(app_home, &runtime.home, a)?
                     .to_string_lossy()
                     .into_owned(),
             );

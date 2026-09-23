@@ -49,8 +49,13 @@ These are the durable, checkable conditions enforced by the resume path
   `auth.json` from the account credential home into the generated home.
   Native thread history belongs to that generated home, not to the login
   credential home.
-- Claude labelled execution sets `CLAUDE_CONFIG_DIR` to
-  `<configured-runtime-home>@<label>/claude-config`. Its account-scoped
+- Claude labelled login, execution, and quota collection share one
+  `CLAUDE_CONFIG_DIR`, chosen by `materialize::claude_account_config`:
+  `<app-home>/accounts/claude/<label>/claude-config`, unless only a login
+  from an earlier release exists at
+  `<configured-runtime-home>@<label>/claude-config`, which is then used in
+  place. If both directories exist the label is ambiguous and login, runs,
+  and quota collection fail instead of choosing one. Its account-scoped
   config state and native session discovery need a separate continuity proof.
 
 The current product guard requires the parent's labelled account to remain

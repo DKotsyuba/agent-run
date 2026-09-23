@@ -69,7 +69,10 @@ pub struct MigrationPlan {
 /// from the global registry. Missing or extra mappings, unrepresented model
 /// aliases/accounts, incompatible harnesses, and untranslatable lane weights
 /// fail instead of guessing. The result retains old runtime spellings for
-/// `decode_legacy_request` and reports nonsecret manual-review markers.
+/// `decode_legacy_request` and reports nonsecret manual-review markers. The
+/// retired CodexBar inputs (`limits_source = "codexbar"`,
+/// `capacity.codexbar_binary`) are accepted but never carried: each mapping
+/// names its v2 source explicitly and the binary is dropped.
 pub fn plan_v1(
     old: &Config,
     harnesses: BTreeMap<HarnessId, HarnessConfig>,
@@ -222,7 +225,11 @@ pub fn plan_v1(
     let mut config = ProviderConfig {
         schema_version: 2,
         core: old.core.clone(),
-        capacity: old.capacity.clone(),
+        // The retired CodexBar binary is v1 input only and never carried over.
+        capacity: crate::config::Capacity {
+            legacy_codexbar_binary: None,
+            ..old.capacity.clone()
+        },
         delivery: old.delivery.clone(),
         profiles: old.profiles.clone(),
         skills: old.skills.clone(),

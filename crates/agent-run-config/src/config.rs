@@ -99,7 +99,12 @@ pub struct Capacity {
     pub sample_retention: usize,
     /// Maximum host-injected context characters; zero disables context injection.
     pub context_max_chars: usize,
-    pub codexbar_binary: PathBuf,
+    /// Retired `codexbar_binary` spelling, kept only so historical schema-1
+    /// files still parse for the one-time v1→v2 migration. Nothing invokes
+    /// it; when present it must be absolute, schema 2 rejects it, and the
+    /// migration drops it. Absent by default and then never serialized.
+    #[serde(rename = "codexbar_binary", skip_serializing_if = "Option::is_none")]
+    pub legacy_codexbar_binary: Option<PathBuf>,
 }
 impl Default for Capacity {
     fn default() -> Self {
@@ -107,7 +112,7 @@ impl Default for Capacity {
             collect_interval_seconds: 300,
             sample_retention: 1000,
             context_max_chars: 2500,
-            codexbar_binary: "/opt/homebrew/bin/codexbar".into(),
+            legacy_codexbar_binary: None,
         }
     }
 }
@@ -198,6 +203,9 @@ pub struct Runtime {
     pub hooks: Vec<Hook>,
     #[serde(default)]
     pub plugins: Vec<PathBuf>,
+    /// Schema-1 quota source spelling. `codexbar` still parses so historical
+    /// files stay migratable, but collection reports it as retired
+    /// (migration required) and never invokes CodexBar.
     #[serde(default)]
     pub limits_source: Option<String>,
     #[serde(default)]
@@ -429,7 +437,9 @@ impl Config {
         {
             return Err(invalid("invalid capacity bounds"));
         }
-        expand(&mut self.capacity.codexbar_binary)?;
+        if let Some(path) = &mut self.capacity.legacy_codexbar_binary {
+            expand(path)?;
+        }
         positive(
             self.delivery.retry_base_seconds,
             "delivery.retry_base_seconds",

@@ -744,23 +744,13 @@ pub fn launchd(
         json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
     })
 }
-/// Returns one Claude account's durable credential-state home.
-///
-/// Labelled Claude state lives beside the configured runtime home, with
-/// `@<label>` appended to its final component, so an account's credentials stay
-/// with the runtime they belong to instead of under the agent-run home.
-fn account_runtime_home(runtime_home: &Path, label: &str) -> PathBuf {
-    let name = runtime_home
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    runtime_home.with_file_name(format!("{name}@{label}"))
-}
-
 /// Builds one credential-isolated native login or post-login status command.
 ///
-/// Codex scopes labelled accounts below the agent-run home and Claude scopes
-/// them below the configured runtime home. `status` selects the provider's
+/// Codex scopes labelled accounts below the agent-run home; a labelled Claude
+/// login uses the directory chosen by
+/// [`crate::adapters::materialize::claude_account_config`], the same one runs
+/// and quota collection read, so an existing legacy login is refreshed in
+/// place and an ambiguous pair fails. `status` selects the provider's
 /// noninteractive verification invocation; both command forms retain no
 /// provider output in agent-run's JSON response.
 fn native_login_command(
@@ -802,7 +792,11 @@ fn native_login_command(
             }
             match account {
                 Some(label) => {
-                    let path = account_runtime_home(&runtime.home, label).join("claude-config");
+                    let path = crate::adapters::materialize::claude_account_config(
+                        home,
+                        &runtime.home,
+                        label,
+                    )?;
                     fs::private_dir(&path)?;
                     command.env("CLAUDE_CONFIG_DIR", path);
                 }

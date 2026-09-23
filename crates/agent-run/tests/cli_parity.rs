@@ -797,8 +797,10 @@ fn python_login_claude_account_and_status_failure_are_scoped_and_safe() {
         "auth login status failed for personal claude (exit 17)\n"
     );
     let captured = fs::read_to_string(&capture).expect("provider capture");
+    // Deliberate divergence from Python: a fresh labelled login lands in the
+    // canonical account home that runs and quota collection also read.
     let expected = home
-        .join("runtime-claude@personal/claude-config")
+        .join("accounts/claude/personal/claude-config")
         .display()
         .to_string();
     assert_eq!(

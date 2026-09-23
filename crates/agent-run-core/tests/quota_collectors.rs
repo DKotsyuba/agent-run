@@ -1116,7 +1116,8 @@ fn claude_native_and_named_logins_resolve_distinct_stores() {
         &app_home.join("accounts/claude/alpha/claude-config"),
         "alpha-token",
     );
-    let reader = QuotaCredentialReader::new(app_home, native, true);
+    let reader =
+        QuotaCredentialReader::new(app_home, root.path().join("runtime-claude"), native, true);
     let read = |reference: &str| reader.read(&CredentialRef::from_str(reference).unwrap());
     assert_eq!(read("native:claude-code").unwrap(), "native-token");
     assert_eq!(read("named:claude-code:alpha").unwrap(), "alpha-token");

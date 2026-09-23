@@ -189,6 +189,12 @@ impl ProviderConfig {
                 "v2 requires codex and claude-code harnesses and providers",
             ));
         }
+        // CodexBar is not a schema-2 source; its binary is migration input only.
+        if self.capacity.legacy_codexbar_binary.is_some() {
+            return Err(invalid(
+                "capacity.codexbar_binary is retired in schema 2; remove it",
+            ));
+        }
         let mut shared = Config {
             schema_version: 1,
             core: self.core.clone(),
