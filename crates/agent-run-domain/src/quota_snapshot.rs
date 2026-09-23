@@ -75,9 +75,14 @@ pub struct NormalizedQuotaSnapshot {
 }
 
 impl NormalizedQuotaSnapshot {
-    /// Checks account ownership, unique model/key/window identities, bounded
-    /// facts, and identical order-independent windows for shared physical
-    /// pools before a quota producer scores the snapshot.
+    /// Checks account ownership, unique model/key/window identities and
+    /// bounded facts before a quota producer scores the snapshot.
+    ///
+    /// Membership is per window, not per pool: models sharing a physical pool
+    /// may each carry only the `(source, window)` facts that govern them, so
+    /// their window sets can differ. One physical window
+    /// `(key, source, window)` repeated under several models must carry
+    /// identical facts.
     pub fn validate(&self) -> Result<()> {
         if self.models.len() > 256 {
             return Err(invalid("too many quota models"));

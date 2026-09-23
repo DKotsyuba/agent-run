@@ -1,7 +1,8 @@
 # Native session continuity across an account change
 
-Status: feasibility determined, fixture canary in place, real A→B account
-switch pending. This document records the exact conditions under which a
+Status: implemented. Explicit resume and automatic in-flight Codex A→B
+account switching are in place and proven live with two real native Codex
+logins; Claude-family continuation stays on the parent's account. This document records the exact conditions under which a
 native Codex or Claude-family session keeps its session ID, history, and
 grants across an account change, the product/API seam a real switch needs,
 and how the repeatable fixture boundary proves everything that can be proved
@@ -118,5 +119,9 @@ and a named one, same provider and model, read-only role) switched accounts
 after the first was disabled in the disposable registry and continued the
 same thread, recalling a nonce from the parent turn. Claude Code keeps its
 history per login directory, so its resume stays on the parent's account;
-cross-account Claude continuation is unverified. Automatic, in-flight
-quota-triggered failover is not implemented.
+cross-account Claude continuation is unverified and refused
+(`cross_account_continuation_unverified`). Automatic, in-flight
+quota-triggered Codex failover is implemented: after an authoritative
+`quota_exhausted` failure of an automatic run, the supervisor allocates the
+next eligible account and continues the same native thread (see
+`provider-contract.md`).

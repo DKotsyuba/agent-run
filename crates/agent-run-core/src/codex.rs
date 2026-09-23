@@ -731,12 +731,17 @@ pub async fn run(
                 if text.len() + delta.len() > verify::MAX_ANSWER {
                     return Err(invalid("assistant stream exceeds bound"));
                 }
-                if !delta.trim().is_empty() && !text.trim().is_empty() {
+                // Every visible delta is journaled on arrival (the first one
+                // included) so a follower sees it immediately; whitespace-only
+                // deltas wait for the next visible text or the completion.
+                // `emitted` stays cumulative, so completion journals only the
+                // unseen tail.
+                text.push_str(delta);
+                if !text.trim().is_empty() {
                     journal(store, &record.id, "assistant", text, None, Some(&key))?;
                     emitted.entry(key.clone()).or_default().push_str(text);
                     text.clear();
                 }
-                text.push_str(delta);
             }
             "item/completed" => {
                 let item = &p["item"];

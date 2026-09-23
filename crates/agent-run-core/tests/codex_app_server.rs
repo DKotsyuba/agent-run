@@ -89,6 +89,23 @@ fn streaming_plan() -> LaunchPlan {
     }
 }
 
+/// [`streaming_plan`] reduced to ONE visible delta, `Hello`, then a 2 s
+/// pause before the turn completes, with no later delta and no
+/// `item/completed`.
+fn lone_delta_plan() -> LaunchPlan {
+    let mut plan = streaming_plan();
+    let script = plan.args[1].replace(
+        SEQUENCE,
+        r#"printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"Hello"}}'; sleep 2; "#,
+    );
+    assert_ne!(script, plan.args[1]);
+    plan.args[1] = script;
+    plan
+}
+
+/// The streamed delta sequence [`lone_delta_plan`] replaces.
+const SEQUENCE: &str = r#"printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":"same"}}'; printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"item","delta":" \\n"}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"agentMessage","id":"item","text":"samesame \\n"}}}'; "#;
+
 /// Mirrors `test_codex_adapter.py::test_models_missing_cache_refreshes_live_roster_and_writes_cache`.
 /// Mirrors `test_codex_app_server.py::test_unknown_method_forwards_its_params`.
 #[tokio::test]
@@ -180,6 +197,58 @@ async fn python_test_codex_app_server_repeated_chunks_are_journaled_after_idle_p
         .collect::<Vec<_>>();
     assert_eq!(&messages[..2], ["same", "same"]);
     assert_eq!(messages[2].as_bytes(), [b' ', b'\\', b'n']);
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// The first visible Codex delta is journaled on arrival, not held until a
+/// later delta or the turn end: a follower polling during the pause after
+/// it already sees `Hello`.
+#[tokio::test]
+async fn first_codex_delta_is_journaled_on_arrival() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    request.validate().expect("fixture request");
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .expect("admit fixture");
+    let mut store = fixture.store();
+    let record = store.get(&id).expect("admitted row");
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).expect("owned Codex home");
+    let mut process = Process::spawn(&lone_delta_plan()).expect("fake app-server starts");
+    let runtime = runtime(fixture.path.join("runtime"));
+    let profile = profile();
+    let run = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime,
+        &profile,
+        &app_home,
+    );
+    // The delta arrives about 1 s in and the turn ends about 2 s later;
+    // polling stops at 2.5 s, inside that pause.
+    let follow = async {
+        let reader = fixture.store();
+        for _ in 0..50 {
+            let transcript = reader.transcript(&id, 0, 10).expect("read transcript");
+            if transcript["messages"]
+                .as_array()
+                .expect("transcript messages")
+                .iter()
+                .any(|message| message["role"] == "assistant" && message["content"] == "Hello")
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    };
+    let (_, seen) = tokio::join!(run, follow);
+    assert!(seen, "the first delta was not visible during the pause");
     drop(process.input.take());
     process.reap().await;
 }

@@ -13,14 +13,14 @@
 //! journal item, so a split CSI/OSC sequence can never leak its payload as
 //! controls or garbage.
 //!
-//! Upstream producer limitation, documented rather than patched here: the
-//! Codex core producer journals `item/agentMessage/delta` fragments and
-//! completion tails under one `itemId` `raw_ref`, so same-identity assistant
-//! rows are fragments of one message. The Claude core producer instead
-//! journals assistant deltas and completion tails with `raw_ref` set to `None`
-//! and emits no message-boundary row, so consecutive assistant rows join as
-//! one rendered item and no text-matching heuristic is invented to split
-//! them.
+//! Both core producers give assistant fragments a message identity in
+//! `raw_ref`: Codex journals `item/agentMessage/delta` fragments and
+//! completion tails under one `itemId`, and the Claude stream producer uses
+//! the engine's `message.id` (or a per-boundary `stream-message-<n>`
+//! fallback when the engine omits it). Same-identity assistant rows are
+//! fragments of one message; a different identity starts a new item. Older
+//! rows without any `raw_ref` still join consecutively, and no text-matching
+//! heuristic is invented to split them.
 
 use serde_json::Value;
 
