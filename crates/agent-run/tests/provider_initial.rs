@@ -1414,3 +1414,62 @@ async fn supervisor_records_are_bound_to_their_attempt() {
         .unwrap();
     assert_eq!(messages, 0);
 }
+
+/// The fake engine's authoritative `rate_limit_event` rejection crosses the
+/// adapter/supervisor boundary as a typed `native_failure` event bound to the
+/// attempt, with account/provider/model from the supervisor; the same JSON
+/// quoted in assistant text produces nothing.
+#[tokio::test]
+async fn quota_signals_cross_the_boundary_typed_and_attempt_bound() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let run = |task: &'static str, request_id: &'static str| {
+        let mut request = request(&home);
+        request.task = task.into();
+        request.request_id = Some(request_id.into());
+        let revision = Store::open(&home)
+            .unwrap()
+            .quota_capacity_revision()
+            .unwrap();
+        let admitted = service
+            .admit_provider_trusted(request, candidates(revision))
+            .unwrap();
+        serde_json::from_value::<AgentId>(admitted["agent_id"].clone()).unwrap()
+    };
+    let quota = run("fixture:quota", "quota-1");
+    run_to_end(&home, &quota).await;
+    let quoted = run("fixture:quota-text", "quota-2");
+    run_to_end(&home, &quoted).await;
+    let store = Store::open(&home).unwrap();
+    let failures = |id: &AgentId| -> Vec<(Option<String>, String)> {
+        store
+            .conn
+            .prepare("SELECT attempt_id,data_json FROM events WHERE agent_id=? AND kind='native_failure'")
+            .unwrap()
+            .query_map([id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let recorded = failures(&quota);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    let attempt: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM attempts WHERE agent_id=?",
+            [quota.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded[0].0.as_deref(), Some(attempt.as_str()));
+    let data: serde_json::Value = serde_json::from_str(&recorded[0].1).unwrap();
+    assert_eq!(data["class"], "quota_exhausted");
+    assert_eq!(data["signal"], "claude.rate_limit_event.rejected");
+    assert_eq!(data["window"], "five_hour");
+    assert_eq!(data["account"], "acct-work");
+    assert_eq!(data["provider"], "glm-user");
+    assert_eq!(data["attempt"], attempt.as_str());
+    assert_eq!(store.get(&quota).unwrap().status, Status::Failed);
+    assert!(failures(&quoted).is_empty(), "quoted text is not a signal");
+    assert_eq!(store.get(&quoted).unwrap().status, Status::Succeeded);
+}

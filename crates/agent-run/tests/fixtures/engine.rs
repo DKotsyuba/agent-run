@@ -143,7 +143,18 @@ fn main() {
         std::thread::sleep(Duration::from_secs(3));
     }
     native_history(&session, &task);
-    let failed = task == "fixture:error";
+    // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
+    // same JSON merely quoted in assistant text (which must not count).
+    let quota_frame = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1790200000},"uuid":"fixture-uuid","session_id":session});
+    if task == "fixture:quota" {
+        emit(quota_frame.clone());
+    }
+    if task == "fixture:quota-text" {
+        emit(
+            json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":quota_frame.to_string()}]}}),
+        );
+    }
+    let failed = task == "fixture:error" || task == "fixture:quota";
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );

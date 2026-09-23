@@ -7,6 +7,7 @@ pub mod command_policy;
 pub mod glm;
 pub mod io;
 pub mod materialize;
+pub mod native_failure;
 pub mod plugins;
 pub mod provider;
 pub mod redact;
@@ -109,4 +110,8 @@ pub struct EngineResult {
     pub outcome: Outcome,
     pub answer: Option<String>,
     pub usage: Option<serde_json::Value>,
+    /// Typed disposition of an authoritative native failure signal, when the
+    /// harness protocol reported one (see [`native_failure`]); never derived
+    /// from message text.
+    pub native_failure: Option<native_failure::NativeFailure>,
 }

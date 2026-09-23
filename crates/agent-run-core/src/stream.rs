@@ -251,6 +251,8 @@ pub async fn run(
     }
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
+    // The last authoritative quota rejection frame of this attempt, if any.
+    let mut native_quota: Option<crate::adapters::native_failure::NativeFailure> = None;
     let mut emitted = String::new();
     let mut saw_delta = false;
     let mut saw_answer = false;
@@ -282,6 +284,7 @@ pub async fn run(
                 if command == "cancel" {
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     return Ok(EngineResult {
+                        native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
                             exit_code: None,
@@ -362,6 +365,7 @@ pub async fn run(
                 outcome.runtime_session_id = session;
                 outcome.failure_text = diagnostic;
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome,
                     answer: None,
                     usage: None,
@@ -373,6 +377,7 @@ pub async fn run(
                 outcome.exit_code = code;
                 outcome.failure_text = process.diagnostic_tail();
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome,
                     answer: None,
                     usage: None,
@@ -546,6 +551,12 @@ pub async fn run(
                     }
                 }
             }
+            // Only a top-level protocol frame can carry quota evidence.
+            Some("rate_limit_event") => {
+                if let Some(failure) = crate::adapters::native_failure::claude_frame(&v) {
+                    native_quota = Some(failure);
+                }
+            }
             Some("result") => {
                 if final_result.is_some() {
                     continue;
@@ -583,7 +594,9 @@ pub async fn run(
                         "runtime did not confirm the resumed native session",
                     ));
                 }
+                let failed = outcome.status == Status::Failed;
                 final_result = Some(EngineResult {
+                    native_failure: native_quota.clone().filter(|_| failed),
                     outcome,
                     answer: text.filter(|s| !s.is_empty()),
                     usage: Some(usage),

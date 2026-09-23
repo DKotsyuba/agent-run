@@ -617,6 +617,7 @@ pub async fn run(
                         .await;
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     return Ok(EngineResult {
+                        native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
                             exit_code: None,
@@ -661,6 +662,7 @@ pub async fn run(
             Event::Json(v) => v,
             Event::Eof => {
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome: Outcome::failure("engine_transport_eof"),
                     answer: None,
                     usage,
@@ -668,6 +670,7 @@ pub async fn run(
             }
             Event::Failure(e) => {
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome: Outcome::failure(e),
                     answer: None,
                     usage,
@@ -839,7 +842,10 @@ pub async fn run(
                     outcome.failure_kind = Some(kind.into());
                     final_answer = None;
                 }
+                let native_failure = (turn.get("status").and_then(Value::as_str) == Some("failed"))
+                    .then(|| crate::adapters::native_failure::codex_turn_error(&turn["error"]));
                 return Ok(EngineResult {
+                    native_failure,
                     outcome,
                     answer: final_answer,
                     usage,

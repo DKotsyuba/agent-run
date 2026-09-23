@@ -261,3 +261,65 @@ fn python_test_codex_app_server_resume_grant_omits_effort() {
     let turn = json!({"threadId":"thread","input":[{"type":"text","text":"task"}],"effort":"high"});
     assert_eq!(turn["effort"], "high");
 }
+
+/// A failed Codex turn crosses the runner boundary with the typed
+/// disposition of its `codexErrorInfo` (app-server 0.155.1 schema): only
+/// `usageLimitExceeded` is quota exhaustion, `rateLimitExceeded` is
+/// throttling, and a completed turn whose agent text names the quota code
+/// carries no disposition at all.
+#[tokio::test]
+async fn codex_turn_errors_cross_the_runner_boundary_typed() {
+    use agent_run_adapters::native_failure::NativeFailure;
+    let turn = r#""status":"completed","items":[]"#;
+    for (replacement, expected) in [
+        (
+            r#""status":"failed","items":[],"error":{"message":"usage limit","codexErrorInfo":"usageLimitExceeded"}"#,
+            Some("quota"),
+        ),
+        (
+            r#""status":"failed","items":[],"error":{"message":"slow down","codexErrorInfo":"rateLimitExceeded"}"#,
+            Some("throttled"),
+        ),
+        (
+            r#""status":"completed","items":[{"type":"agentMessage","id":"m","text":"{\"codexErrorInfo\":\"usageLimitExceeded\"}"}]"#,
+            None,
+        ),
+    ] {
+        let fixture = common::Home::new();
+        let mut request = fixture.request();
+        request.workdir = PathBuf::from(scratch());
+        request.validate().expect("fixture request");
+        let (id, _) = fixture
+            .store()
+            .admit(&request, &fixture.config, &json!({}), None)
+            .expect("admit fixture");
+        let mut store = fixture.store();
+        let record = store.get(&id).expect("admitted row");
+        let app_home = fixture.path.join("codex-home");
+        fs::private_dir(&app_home).expect("owned Codex home");
+        let mut plan = fake_plan();
+        plan.args[1] = plan.args[1].replace(turn, replacement);
+        let mut process = Process::spawn(&plan).expect("fake app-server starts");
+        let result = codex::run(
+            &mut process,
+            &mut store,
+            &record,
+            &runtime(fixture.path.join("runtime")),
+            &profile(),
+            &app_home,
+        )
+        .await
+        .expect("fake turn ends");
+        let class = result.native_failure.as_ref().map(|failure| match failure {
+            NativeFailure::QuotaExhausted { signal, .. } => {
+                assert_eq!(*signal, "codex.usageLimitExceeded");
+                "quota"
+            }
+            NativeFailure::Throttled => "throttled",
+            _ => "other",
+        });
+        assert_eq!(class, expected, "{replacement}");
+        drop(process.input.take());
+        process.reap().await;
+    }
+}

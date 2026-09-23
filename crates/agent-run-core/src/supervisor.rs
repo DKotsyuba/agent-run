@@ -302,6 +302,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     let mut result = match execution {
         Ok(result) => result,
         Err(error) => adapters::EngineResult {
+            native_failure: None,
             outcome: Outcome::failure(match error {
                 Error::Integrity(_) => "runtime_integrity_failed",
                 Error::Validation(_) => "runtime_contract_rejected",
@@ -505,6 +506,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     let mut result = match execution {
         Ok(result) => result,
         Err(error) => adapters::EngineResult {
+            native_failure: None,
             outcome: Outcome::failure(match error {
                 Error::Integrity(_) => "runtime_integrity_failed",
                 Error::Validation(_) => "runtime_contract_rejected",
@@ -516,6 +518,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     };
     if result.outcome.exit_code.is_none() {
         result.outcome.exit_code = exit;
+    }
+    // A typed native failure is journaled with trusted supervisor context
+    // (never the payload's): this attempt, its account, provider and model.
+    if let Some(failure) = &result.native_failure {
+        let mut data = serde_json::to_value(failure)?;
+        data["attempt"] = json!(attempt_id);
+        data["account"] = json!(account);
+        data["provider"] = json!(identity.authority.provider);
+        data["model"] = json!(identity.authority.model);
+        store.event(id, "native_failure", &data)?;
     }
     let proof = match result.answer.as_deref() {
         Some(text) if !text.trim().is_empty() => {
