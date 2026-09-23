@@ -8,6 +8,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 - fix(supervisor): settle verified descendant cleanup after the process group exits instead of losing runs when short-lived helpers finish moments later
 - fix(supervisor): record bounded cleanup failures and route supervisor errors to their component log without persisting task text or credentials
+- fix(delivery): use schema-2 retry policy after migration so a claimed notice reaches a durable result instead of repeating a validation failure
 - 0.13.2 publishes a native artifact only for macOS Apple silicon; Linux x86-64 remains a non-blocking validation lane with no published artifact
 
 ## [0.13.1] - 2026-09-23

@@ -108,6 +108,8 @@ retrieve completion through `wait`, `answer`, or `list_agents`.
 Delivery attempts are leased, bounded, and retried with backoff. Persisted
 diagnostics contain safe classifications and redacted tails, never task or
 answer text, session IDs, argument or environment values, or credentials.
+The dispatcher reads retry policy from the active configuration schema, so
+schema-2 homes complete each claimed attempt before its lease can be retried.
 
 ## Capacity and diagnostics
 

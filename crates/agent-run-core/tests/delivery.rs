@@ -213,6 +213,30 @@ async fn unknown_transport_is_terminal_and_unbound_from_schedule() {
     assert_eq!(row.1, None);
 }
 
+/// Schema-2 homes use the same delivery policy and must finish a claimed
+/// notice rather than retrying the same row after a legacy-config parse error.
+#[tokio::test]
+async fn schema_two_delivery_completes_without_legacy_config() {
+    let home = common::Home::new();
+    std::fs::write(
+        home.path.join("config.toml"),
+        "schema_version = 2\n[delivery]\nretry_base_seconds = 2\nretry_cap_seconds = 60\nmax_attempts = 0\n",
+    )
+    .unwrap();
+    delivery(&home.path, "ntf_schema_two", "not-configured", "pending");
+
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let (state, attempts): (String, i64) = Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT state,attempts FROM deliveries WHERE id='ntf_schema_two'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), attempts), ("failed", 1));
+}
+
 /// Mirrors `tests/test_delivery_dispatch.py::test_never_bound_notice_for_a_terminal_agent_expires_after_the_window`.
 #[tokio::test]
 async fn unbound_terminal_delivery_expires_before_claiming() {
