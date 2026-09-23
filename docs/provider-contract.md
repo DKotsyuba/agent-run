@@ -342,3 +342,32 @@ harness, reserve, consume reset credits, write samples or start agents.
   keeps account-bound rows distinct by `account` and physical `pool`. No account id, label or secret reference is
   emitted. The orchestrator chooses provider, model, effort and profile;
   there is no automatic model choice or ability score.
+
+### Next attempt on one logical agent (store primitive)
+
+`Store::allocate_next_attempt` replaces a logical agent's cleaned-up attempt
+with the next one in one immediate transaction; explicit public resume stays
+a separate new logical child. It requires a nonterminal automatic provider
+run with no pending cancel, exactly one owned attempt carrying verified
+cleanup proof and a recorded native history seal, and trusted candidates at
+the current capacity revision. The chosen account must be in the frozen
+scope, enabled, and not tried by an earlier attempt of the same agent
+(aliases resolve to the same account). The agent keeps its own cap slot; the
+previous attempt's ownership and physical-key reservations are released and
+the new attempt is written exactly once. The automatic retry loop that will
+call it is not implemented yet.
+
+### Attempt-bound journaling and native failure signals
+
+A provider supervisor binds its store handle to its attempt, so every event,
+transcript message and runtime-session record it writes — including final,
+cleanup, history and failure records after ownership ends — carries that
+attempt id. Unbound handles keep the historical rule for logical records.
+
+Failed attempts carry a closed `NativeFailure` disposition classified only
+from authoritative protocol fields, never text: Codex `TurnError.
+codexErrorInfo` (`usageLimitExceeded` is quota exhaustion; throttling,
+generic 429, auth, context window and network stay separate), and Claude
+Code's top-level `rate_limit_event` rejecting a recognized usage window. The
+supervisor journals it as a `native_failure` event with the attempt, account,
+provider and model from its own context.
