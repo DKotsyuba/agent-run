@@ -886,3 +886,66 @@ async fn provider_resume_continues_the_proven_native_session() {
         .unwrap();
     assert_eq!(grandchildren, 0, "{pinned}");
 }
+
+/// Two concurrent explicit resumes of one parent (distinct request ids)
+/// admit exactly one child; the loser is refused and nothing else is written.
+#[tokio::test]
+async fn concurrent_provider_resumes_admit_one_child() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(0))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let session = parent.runtime_session_id.clone().unwrap();
+    let runtime_home = std::path::PathBuf::from(
+        parent.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    transcript(
+        &runtime_home,
+        &session,
+        &format!("{{\"sessionId\":\"{session}\"}}\n"),
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let results: Vec<bool> = (0..2)
+        .map(|index| {
+            let (home, barrier, parent) = (home.clone(), barrier.clone(), parent.clone());
+            std::thread::spawn(move || {
+                let service = Service::new(home);
+                barrier.wait();
+                service
+                    .admit_provider_resume(
+                        &parent,
+                        "fixture:answer".into(),
+                        None,
+                        Some(format!("race-{index}")),
+                        Some(
+                            serde_json::from_value(serde_json::json!({
+                                "transport":"fixture","external_session_id":"test-session"
+                            }))
+                            .unwrap(),
+                        ),
+                    )
+                    .is_ok()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
+    let children: i64 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE parent_agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children, 1);
+}

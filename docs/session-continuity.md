@@ -106,5 +106,17 @@ or `agent-run auth <label> <runtime>`; the provider CLI runs `codex login`
 and `codex login status`, or `claude auth login` and
 `claude auth status --json`) without reading or extracting credential
 material. Such a probe must be harmless and tool-free, and it requires the
-session seam above to select another existing account for the *same* native session;
-until then, no real probe is shipped and no successful canary is claimed.
+session seam above to select another existing account for the *same* native session.
+
+That seam is explicit provider resume (see `docs/provider-contract.md`):
+for Codex the native conversation lives in the run's own `CODEX_HOME`
+(`sessions/**/rollout-*-<thread>.jsonl`), and a resumed attempt only rebinds
+that home's `auth.json` link to the newly selected account after the parent
+is cleaned up, then continues with `thread/resume` on the same thread. A
+disposable-state probe with two real native Codex logins (the default login
+and a named one, same provider and model, read-only role) switched accounts
+after the first was disabled in the disposable registry and continued the
+same thread, recalling a nonce from the parent turn. Claude Code keeps its
+history per login directory, so its resume stays on the parent's account;
+cross-account Claude continuation is unverified. Automatic, in-flight
+quota-triggered failover is not implemented.
