@@ -36,3 +36,9 @@ refuse an older or interrupted home. `agent-run config rollback --snapshot
 <dir>` restores the verified v1 pair only if no later writes have changed it.
 The exact commands, refusal rules, and recovery sequence are in the embedded
 [`migrations` operator guide](../assets/operator_guide/migrations.md).
+
+The migration does not rewrite legacy profile files. Before admitting agents
+under schema 2, select a separate catalog of complete canonical roles and
+confirm `models` lists eligible roles for each intended provider. Claude Code
+loads declared plugins as a whole, so each role must list every skill those
+plugins export; an undeclared export is refused before launch.

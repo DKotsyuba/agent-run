@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-run"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-adapters"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-config"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-domain",
  "agent-run-platform",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-core"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-domain"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-platform"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-domain",
  "libc",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-store"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-config",
  "agent-run-core",
@@ -2252,7 +2252,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agent-run-platform",
  "rusqlite",

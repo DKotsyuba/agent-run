@@ -10,7 +10,10 @@ use agent_run_config::{
     role_plan::{resolve_role_plan, ResolvedRolePlan},
 };
 use agent_run_domain::{
-    catalog::{AccountRecord, AccountStatus, ProviderCatalog, ProviderId, ResolvedLaunchAuthority},
+    catalog::{
+        AccountRecord, AccountStatus, HarnessId, ProviderCatalog, ProviderId,
+        ResolvedLaunchAuthority,
+    },
     domain::Constraint,
     CredentialRef, Result, Sha256Digest,
 };
@@ -146,6 +149,98 @@ fn role(root: &Path, network: bool) -> ResolvedRolePlan {
         required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
     };
     resolve_role_plan(&profile, root, &BTreeMap::new(), "account", Some("work")).unwrap()
+}
+
+/// Claude Code providers admit every plugin skill declared by the frozen role
+/// and still refuse an undeclared skill shipped by the same plugin.
+#[test]
+fn claude_provider_uses_frozen_role_as_plugin_skill_allowlist() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let plugin = root.join("routing-plugin");
+    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        serde_json::json!({"name":"routing-plugin","version":"1.0.0"}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(plugin.join("skills/plugin-review")).unwrap();
+    fs::write(plugin.join("skills/plugin-review/SKILL.md"), "Review.").unwrap();
+    let skills = root.join("skills/plugin-review");
+    fs::create_dir_all(&skills).unwrap();
+    fs::write(skills.join("SKILL.md"), "Review.").unwrap();
+
+    let mut config = config(root, &fake_engine(root));
+    config
+        .harnesses
+        .get_mut(&HarnessId::ClaudeCode)
+        .unwrap()
+        .plugins
+        .push(plugin);
+    let catalog = catalog(&config);
+    let mut profile = Profile {
+        name: "review".into(),
+        body: "Review safely.".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec!["plugin-review".into()],
+        mcp: vec![],
+        required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+    };
+    let role = resolve_role_plan(
+        &profile,
+        &root.join("skills"),
+        &BTreeMap::new(),
+        "account",
+        Some("work"),
+    )
+    .unwrap();
+    for (provider, model, account) in [
+        ("claude-main", "sonnet", "acct-claude"),
+        ("glm-any", "glm", "acct-glm"),
+    ] {
+        let run_home = root.join(format!("{provider}-plugin-run"));
+        let (snapshot, _) = materialize_selected(
+            &config,
+            &catalog,
+            &provider.parse().unwrap(),
+            model,
+            &account.parse().unwrap(),
+            &role,
+            root,
+            &run_home,
+            root,
+        )
+        .unwrap();
+        assert_eq!(snapshot.plugin_paths.len(), 1);
+    }
+
+    profile.skills.clear();
+    let missing = resolve_role_plan(
+        &profile,
+        &root.join("skills"),
+        &BTreeMap::new(),
+        "account",
+        Some("work"),
+    )
+    .unwrap();
+    let error = materialize_selected(
+        &config,
+        &catalog,
+        &"claude-main".parse().unwrap(),
+        "sonnet",
+        &"acct-claude".parse().unwrap(),
+        &missing,
+        root,
+        &root.join("missing-plugin-skill-run"),
+        root,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unlisted: plugin-review"));
 }
 
 /// Constructs launch authority only after the runtime assets have been sealed.
