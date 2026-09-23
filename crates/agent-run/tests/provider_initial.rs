@@ -1920,3 +1920,104 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
         ) <= 1
     );
 }
+
+/// Runs a `codex-user` run whose attempt A holds at the fixture barrier
+/// before its exhausted terminal frame, applies `during` (given the run's
+/// native home) while A is held, then releases A and waits for the end.
+async fn held_codex_run(home: &Path, during: impl FnOnce(&Path)) -> AgentId {
+    let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
+        "provider":"codex-user","model":"fixture","profile":"review",
+        "task":"fixture:original-task","workdir":home,"request_id":"held-run",
+        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let admitted = Service::new(home.to_path_buf())
+        .admit_provider(request)
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(home, &id);
+    let mut held = None;
+    for _ in 0..400 {
+        let root = Store::open(home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .identity
+            .unwrap()["runtime_home"]
+            .as_str()
+            .map(std::path::PathBuf::from);
+        if let Some(root) = root.filter(|root| root.join("fixture-held").exists()) {
+            held = Some(root);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let root = held.expect("attempt A reached the barrier");
+    during(&root);
+    fs::write(root.join("fixture-release"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    id
+}
+
+/// The switch re-reads current policy and continuation evidence: a model
+/// restriction added while A ran, or a tool call left pending in A's native
+/// history, stops the run with the exact blocker and no attempt B.
+#[tokio::test]
+async fn switch_honors_current_policy_and_history_evidence() {
+    let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
+    let policy_home = home.clone();
+    let id = held_codex_run(&home, move |_| {
+        edit_config(&policy_home, |config| {
+            let models = config["providers"]["codex-user"]["models"]
+                .as_array_mut()
+                .unwrap();
+            models[0].as_table_mut().unwrap().insert(
+                "restrictions".into(),
+                toml::Value::Array(vec!["filesystem_read_isolation".into()]),
+            );
+        });
+    })
+    .await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("current_policy_refused"),
+        "{:?}",
+        row.failure_text
+    );
+    assert_eq!(attempts(&home, &id).len(), 1);
+
+    let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
+    let id = held_codex_run(&home, |root| {
+        let rollout = fs::read_dir(root.join("sessions/2026/09/23"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut file = fs::OpenOptions::new().append(true).open(rollout).unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            b"{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"pending\"}}\n",
+        )
+        .unwrap();
+    })
+    .await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("continuation_unavailable"),
+        "{:?}",
+        row.failure_text
+    );
+    assert_eq!(attempts(&home, &id).len(), 1);
+}
