@@ -2816,3 +2816,152 @@ async fn codex_source_buckets_govern_bound_models() {
         vec![("acct-cx-b".into(), vec!["acct-cx-b::codex".into()], true)]
     );
 }
+
+/// A home whose `glm-user` provider offers `fixture` and `other` (native
+/// `other-native`) through accounts acct-work and acct-b.
+fn two_model_home() -> (tempfile::TempDir, std::path::PathBuf) {
+    let extra = "[[providers.glm-user.models]]\nid = \"other\"\nnative_model = \"other-native\"\n\
+                 [[providers.glm-user.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n";
+    home_with(extra, &["acct-b"])
+}
+
+/// Accounts of the trusted candidates for `model`, in order.
+fn candidate_accounts(home: &Path, model: &str) -> Vec<String> {
+    ranked(home, "glm-user", model)
+        .into_iter()
+        .map(|c| c.0)
+        .collect()
+}
+
+/// (A) One pool with two windows: its exhausted `five_hour` membership
+/// survives retention pruning even when an unrelated newer sample exists and
+/// a stale (older observed, later inserted) row for the same window names
+/// another model. The exhaustion keeps excluding acct-work for `fixture` in
+/// ordinary selection and admission, until a fresh positive releases it.
+#[tokio::test]
+async fn latched_window_membership_survives_pruning_and_stale_rows() {
+    let (_temp, home) = two_model_home();
+    let now = agent_run::domain::now();
+    let reset = now + 3600.0;
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"codex","window":"five_hour","models":["fixture"],"remaining_percent":0.0,"reset_at":reset,"observed_at":now - 10.0},
+            {"pool":"codex","window":"seven_day","models":["fixture"],"remaining_percent":50.0,"observed_at":now - 9.0}
+        ]),
+        100,
+    );
+    // Later inserted, older observed, different binding decision.
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"codex","window":"five_hour","models":["other-native"],"remaining_percent":80.0,"observed_at":now - 7200.0}
+        ]),
+        100,
+    );
+    // An unrelated newest sample, then prune to one row.
+    record_round(
+        &home,
+        "acct-b",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"primary","window":"five_hour","models":["fixture","other-native"],"remaining_percent":40.0,"observed_at":now}
+        ]),
+        1,
+    );
+    assert_eq!(
+        candidate_accounts(&home, "fixture"),
+        vec!["acct-b".to_owned()],
+        "latched five_hour still governs fixture"
+    );
+    let service = Service::new(home.clone());
+    let mut request = request(&home);
+    request.account = None;
+    request.request_id = Some("window-prune".into());
+    let admitted = service.admit_provider(request).unwrap();
+    let chosen: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT selected_account_id FROM attempts WHERE id=?",
+            [admitted["attempt_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(chosen, "acct-b");
+    // Fresh positive evidence for the same window releases the latch.
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"codex","window":"five_hour","models":["fixture"],"remaining_percent":90.0,"observed_at":agent_run::domain::now()},
+            {"pool":"codex","window":"seven_day","models":["fixture"],"remaining_percent":50.0,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+    assert!(candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
+}
+
+/// (B) Two models share pool `credits`: `five_hour` governs both, the
+/// exhausted narrow `monthly` window governs only `fixture`. An incomplete
+/// later round (the narrow window omitted) must not carry that exhaustion
+/// into `other`: acct-work stays usable for `other` (selection and the
+/// public views), stays excluded for `fixture`, and a fresh positive for the
+/// narrow window releases it.
+#[tokio::test]
+async fn narrow_window_exhaustion_is_not_carried_into_other_models() {
+    let (_temp, home) = two_model_home();
+    let now = agent_run::domain::now();
+    let reset = now + 3600.0;
+    let both = serde_json::json!(["fixture", "other-native"]);
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"credits","window":"five_hour","models":both,"remaining_percent":60.0,"observed_at":now},
+            {"pool":"credits","window":"monthly","models":["fixture"],"remaining_percent":0.0,"reset_at":reset,"observed_at":now}
+        ]),
+        100,
+    );
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"credits","window":"five_hour","models":both,"remaining_percent":55.0,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+    let other = ranked(&home, "glm-user", "other");
+    let work = other
+        .iter()
+        .find(|c| c.0 == "acct-work")
+        .expect("acct-work serves other");
+    assert!(work.2, "acct-work is known-usable for other: {other:?}");
+    assert!(!candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
+    let models = Service::new(home.clone())
+        .models(
+            serde_json::from_value(serde_json::json!({"provider":"glm-user","model":"other"}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(models.to_string().contains("\"available\""), "{models}");
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"credits","window":"five_hour","models":both,"remaining_percent":55.0,"observed_at":agent_run::domain::now()},
+            {"pool":"credits","window":"monthly","models":["fixture"],"remaining_percent":30.0,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+    assert!(candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
+}

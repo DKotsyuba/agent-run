@@ -502,8 +502,9 @@ fn normalized_quota_snapshot_validates_physical_membership() {
     assert!(snapshot.validate().is_err());
 }
 
-/// Shared physical pools must carry one canonical observation across models;
-/// window order is immaterial, while missing or contradictory facts are not.
+/// Membership is per window: models sharing a physical pool may each observe
+/// only the windows that govern them, and window order is immaterial, but one
+/// physical window repeated under several models must carry the same fact.
 #[test]
 fn shared_quota_pool_observations_agree_across_models() {
     let account: AccountId = "acct".parse().unwrap();
@@ -545,7 +546,11 @@ fn shared_quota_pool_observations_agree_across_models() {
     snapshot.validate().unwrap();
     snapshot.models[1].pools[0].windows[1].remaining_percent = Some(5.0);
     assert!(snapshot.validate().is_err());
+    // m2 governed by the `5h` window only: a valid per-window membership.
     snapshot.models[1].pools[0].windows = vec![pool.windows[0].clone()];
+    snapshot.validate().unwrap();
+    // The same physical `5h` window with another value still disagrees.
+    snapshot.models[1].pools[0].windows[0].remaining_percent = Some(10.0);
     assert!(snapshot.validate().is_err());
     snapshot.models[1].pools[0].windows = pool.windows.clone();
     snapshot.models[1].pools[0].windows[1].remaining_percent = Some(1.0);

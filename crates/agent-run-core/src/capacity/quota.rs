@@ -102,6 +102,8 @@ pub fn normalize_collector_output(
     // whether or not their facts agree, so one physical window stays singular.
     let mut pools: BTreeMap<String, BTreeMap<(String, String), QuotaWindow>> = BTreeMap::new();
     let mut membership: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // The exact models each (pool, source, window) names.
+    let mut window_members: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
     let mut models_seen = BTreeSet::new();
     for entry in entries {
         let object = entry
@@ -204,13 +206,26 @@ pub fn normalize_collector_output(
                 .or_default()
                 .insert(pool.to_owned());
         }
+        window_members.insert(
+            (pool.to_owned(), scope.source.clone(), window.to_owned()),
+            window_models.clone(),
+        );
     }
     let mut models = Vec::new();
     for (model, lanes) in &membership {
         let mut pools_observed = Vec::new();
         for lane in lanes {
             let key = PhysicalQuotaKey::new(account, lane)?;
-            let mut windows: Vec<QuotaWindow> = pools[lane].values().cloned().collect();
+            // Only the windows that name this model govern it.
+            let mut windows: Vec<QuotaWindow> = pools[lane]
+                .iter()
+                .filter(|((source, name), _)| {
+                    window_members
+                        .get(&(lane.clone(), source.clone(), name.clone()))
+                        .is_some_and(|members| members.contains(model))
+                })
+                .map(|(_, window)| window.clone())
+                .collect();
             windows.sort_by(|a, b| (&a.source, &a.name).cmp(&(&b.source, &b.name)));
             pools_observed.push(QuotaPoolObservation { key, windows });
         }

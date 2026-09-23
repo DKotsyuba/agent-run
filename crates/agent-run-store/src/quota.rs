@@ -14,7 +14,7 @@ use agent_run_domain::{
     error::invalid,
     Result,
 };
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Shelf life granted to a latched exhausted fact whose provider reset time is
@@ -79,6 +79,59 @@ fn latched_windows(
     Ok(latched)
 }
 
+/// The model lanes each latched window of `account` governs, keyed by
+/// `(lane, window)`: the membership of that window's newest sample in the
+/// same `(observed_at, id)` order the ranker reads. `None` when the newest
+/// row records no valid `models` array (rows written before membership was
+/// recorded); such a window governs only the lane equal to its pool id, the
+/// same legacy rule the ranker applies — malformed metadata is never read as
+/// a model mapping.
+fn latched_membership(
+    tx: &rusqlite::Transaction<'_>,
+    account: &AccountId,
+    latched: &BTreeMap<(String, String), QuotaWindow>,
+) -> Result<BTreeMap<(String, String), Option<BTreeSet<String>>>> {
+    let mut membership = BTreeMap::new();
+    for (lane, window) in latched.keys() {
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM capacity_samples WHERE quota_key=?1 AND window=?2 \
+                 ORDER BY observed_at DESC,id DESC LIMIT 1",
+                params![format!("{}::{}", account.as_str(), lane), window],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let models = payload
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| {
+                value["models"].as_array().map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model.as_str().map(str::to_owned))
+                        .collect::<BTreeSet<_>>()
+                })
+            });
+        membership.insert((lane.clone(), window.clone()), models);
+    }
+    Ok(membership)
+}
+
+/// Whether latched window `(lane, window)` governs model lane `model`:
+/// through its recorded membership, or for a legacy row without membership,
+/// only when the pool id equals the model lane.
+fn window_governs(
+    membership: &BTreeMap<(String, String), Option<BTreeSet<String>>>,
+    lane: &str,
+    window: &str,
+    model: &str,
+) -> bool {
+    match membership.get(&(lane.to_owned(), window.to_owned())) {
+        Some(Some(models)) => models.contains(model),
+        _ => lane == model,
+    }
+}
+
 /// Extends one latched exhausted window's survival horizon without inventing a
 /// new observation time: validity reaches the known reset, or one TTL past
 /// `at` when the provider reported none.
@@ -112,13 +165,42 @@ fn authoritative_positive(window: &QuotaWindow, fact: &QuotaWindow, at: f64) -> 
 /// passed). Fresh exhaustion, fresh
 /// percentages, and expired resets are never overridden; carried facts keep
 /// their original observation times and collector source.
+///
+/// A latched window is carried only into models it governs according to
+/// `membership` (its newest recorded membership, see [`window_governs`]);
+/// it is never copied into another model that merely shares the pool, even
+/// when the window is omitted or unknown this round. Fresh positive or
+/// fresher zero evidence for the physical window seen under any model
+/// settles it for every model.
 pub fn retain_exhausted(
     exhausted: &BTreeMap<(String, String), QuotaWindow>,
+    membership: &BTreeMap<(String, String), Option<BTreeSet<String>>>,
     snapshot: &mut NormalizedQuotaSnapshot,
     account: &AccountId,
     at: f64,
 ) -> Result<()> {
+    let mut settled = BTreeSet::new();
+    for ((l, name), fact) in exhausted {
+        let observed = snapshot
+            .models
+            .iter()
+            .flat_map(|model| &model.pools)
+            .any(|pool| {
+                lane_of(&pool.key, account).ok() == Some(l.as_str())
+                    && pool.windows.iter().any(|w| {
+                        w.name == *name
+                            && (authoritative_positive(w, fact, at)
+                                || (w.remaining_percent == Some(0.0)
+                                    && w.observed_at > fact.observed_at
+                                    && w.observed_at <= at))
+                    })
+            });
+        if observed {
+            settled.insert((l.clone(), name.clone()));
+        }
+    }
     for model in &mut snapshot.models {
+        let model_lane = model.model.clone();
         for pool in &mut model.pools {
             let lane = lane_of(&pool.key, account)?.to_owned();
             // Only actually fresh positive evidence releases the latch: a
@@ -130,16 +212,8 @@ pub fn retain_exhausted(
             for ((l, name), fact) in exhausted {
                 if l != &lane
                     || fact.reset_at.is_some_and(|reset| reset <= at)
-                    || pool
-                        .windows
-                        .iter()
-                        .any(|w| w.name == *name && authoritative_positive(w, fact, at))
-                    || pool.windows.iter().any(|w| {
-                        w.name == *name
-                            && w.remaining_percent == Some(0.0)
-                            && w.observed_at > fact.observed_at
-                            && w.observed_at <= at
-                    })
+                    || settled.contains(&(l.clone(), name.clone()))
+                    || !window_governs(membership, l, name, &model_lane)
                 {
                     continue;
                 }
@@ -208,31 +282,45 @@ pub fn record_quota_snapshot(
             released.insert((lane.as_str(), name.as_str()));
         }
     }
+    let membership = latched_membership(&tx, &account, &exhausted)?;
     let mut snapshot = snapshot.clone();
-    retain_exhausted(&exhausted, &mut snapshot, &account, at)?;
+    retain_exhausted(&exhausted, &membership, &mut snapshot, &account, at)?;
 
     // One physical window is persisted exactly once with its full model
     // membership, however many configured models share the pool.
     let mut physical: BTreeMap<(&str, &str, &str), &QuotaWindow> = BTreeMap::new();
-    // Membership is recorded per physical window: a narrower window (for
-    // example a model-scoped credit window) never inherits every model of
-    // its pool.
+    for model in &snapshot.models {
+        for pool in &model.pools {
+            let lane = lane_of(&pool.key, &account)?;
+            for window in &pool.windows {
+                // Shared pools repeat identical facts across models (the
+                // validator proved it); only a latch carried into the models
+                // it governs can differ, and that exhausted fact wins.
+                let slot = physical
+                    .entry((lane, window.source.as_str(), window.name.as_str()))
+                    .or_insert(window);
+                if window.remaining_percent == Some(0.0) && slot.remaining_percent != Some(0.0) {
+                    *slot = window;
+                }
+            }
+        }
+    }
+    // Membership is recorded per physical window, and only for the models
+    // whose own view of that window is exactly the persisted fact: a narrower
+    // window never inherits every model of its pool, and a carried exhaustion
+    // never extends to a model that reported the window as unknown.
     let mut pool_models: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
     for model in &snapshot.models {
         for pool in &model.pools {
             let lane = lane_of(&pool.key, &account)?;
             for window in &pool.windows {
-                pool_models
-                    .entry((lane, window.name.as_str()))
-                    .or_default()
-                    .insert(model.model.as_str());
-            }
-            for window in &pool.windows {
-                // Shared pools repeat identical facts across models; the
-                // snapshot validator already proved them equal.
-                physical
-                    .entry((lane, window.source.as_str(), window.name.as_str()))
-                    .or_insert(window);
+                let key = (lane, window.source.as_str(), window.name.as_str());
+                if physical.get(&key).is_some_and(|chosen| *chosen == window) {
+                    pool_models
+                        .entry((lane, window.name.as_str()))
+                        .or_default()
+                        .insert(model.model.as_str());
+                }
             }
         }
     }
@@ -308,12 +396,15 @@ pub fn record_quota_snapshot(
         )?;
     }
     let revision = if mutations > 0 {
-        // Retention keeps the newest sample of every latched pool: that row
-        // carries the pool's model membership, which the latch needs to keep
-        // restricting exactly the models it governs.
+        // Retention keeps, for every latched physical window, that window's
+        // newest row in the ranker's (observed_at, id) order: it carries the
+        // membership the latch needs to keep restricting exactly the models
+        // it governs, independently of other windows and of insertion order.
         tx.execute(
             "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?) \
-             AND id NOT IN (SELECT MAX(id) FROM capacity_samples WHERE quota_key IN (SELECT quota_key FROM quota_exhaustion) GROUP BY quota_key)",
+             AND id NOT IN (SELECT id FROM (SELECT (SELECT s.id FROM capacity_samples s \
+               WHERE s.quota_key=q.quota_key AND s.window=q.window_id ORDER BY s.observed_at DESC,s.id DESC LIMIT 1) AS id \
+               FROM quota_exhaustion q) WHERE id IS NOT NULL)",
             [retention as i64],
         )?;
         Store::advance_quota_capacity_revision(&tx)?

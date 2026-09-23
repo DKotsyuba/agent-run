@@ -273,8 +273,26 @@ recorded) fall back to a pool id equal to the lane. All governing windows of
 all governing pools enter one model's score and exhaustion gates, and one
 pool is reserved once however many models or provider aliases it governs.
 
-Retention never deletes the newest row of a pool with an active exhaustion
-latch, so the latch keeps restricting exactly the models that row names. A
+Membership is per window end to end: the normalizer gives each model only
+the windows whose output names it, and a normalized snapshot may therefore
+show different subsets of one pool's windows under different models (one
+physical window repeated under several models must still carry the same
+fact). An exhaustion latch is carried through an incomplete round only into
+the models its window governed; it is never copied into another model that
+merely shares the pool.
+
+Retention never deletes, for any latched physical window, that window's
+newest row in the ranker's `(observed_at, id)` order, so the latch keeps
+restricting exactly the models that row names regardless of other windows,
+unrelated newer samples or later-inserted stale rows. A row whose payload
+has no valid `models` array is legacy: it governs only the lane equal to its
+pool id, in both the store and the ranker; malformed metadata is never read
+as a model mapping.
+
+Test layouts with pools such as `credits` and windows such as `monthly`
+exercise the per-window contract; they are not evidence about any native
+provider's quota semantics (the first-party GLM collector's own windows are
+unchanged). A
 latch written from an authoritative native signal (for example a Claude
 `rate_limit_event` rejection of a mapped `five_hour` window) records the
 observation itself as a zero-remaining row carrying the membership the

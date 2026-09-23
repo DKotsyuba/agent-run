@@ -108,13 +108,19 @@ impl NormalizedQuotaSnapshot {
                         return Err(invalid("quota window repeats"));
                     }
                 }
-                let mut canonical = pool.windows.clone();
-                canonical.sort_by(|a, b| (&a.source, &a.name).cmp(&(&b.source, &b.name)));
-                if physical_windows
-                    .insert(pool.key.clone(), canonical.clone())
-                    .is_some_and(|previous| previous != canonical)
-                {
-                    return Err(invalid("shared quota pool observations disagree"));
+                // Membership is per window: models sharing a pool may each
+                // observe only the windows that govern them, but one physical
+                // window repeated under several models must agree exactly.
+                for window in &pool.windows {
+                    if physical_windows
+                        .insert(
+                            (pool.key.clone(), window.source.clone(), window.name.clone()),
+                            window.clone(),
+                        )
+                        .is_some_and(|previous| previous != *window)
+                    {
+                        return Err(invalid("shared quota pool observations disagree"));
+                    }
                 }
             }
         }
