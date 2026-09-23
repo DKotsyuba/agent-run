@@ -4,6 +4,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-09-23
+
+- fix(claude): resumed Claude/GLM agents keep the parent's `--plugin-dir`
+  list; resume previously dropped every plugin, so agent-ide hooks and skill
+  plugins were missing (`unavailable: host_binding`, `Unknown skill`). Snapshots
+  from 0.12.5 and earlier rebuild the list from the recorded runtime and profile
+  or fail with an integrity error
+- 0.12.6 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.12.5] - 2026-09-22
 
 - fix(mcp): replace Desktop-launched MCP with the supplied signed Node frontend,

@@ -202,12 +202,14 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         }
     };
     let snapshot = if row.parent_agent_id.is_some() {
-        materialize::verify(
+        materialize::verify_for_resume(
             &runtime_home,
             identity
                 .snapshot_sha256
                 .as_deref()
                 .ok_or_else(|| invalid("resume snapshot proof missing"))?,
+            &runtime,
+            &identity.profile,
         )?
     } else {
         let (snapshot, digest) = materialize::materialize(

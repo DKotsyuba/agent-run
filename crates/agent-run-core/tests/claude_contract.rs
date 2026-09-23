@@ -103,6 +103,122 @@ fn flag<'a>(plan: &'a agent_run_adapters::LaunchPlan, name: &str) -> &'a str {
     &plan.args[index + 1]
 }
 
+/// Returns the ordered native plugin directories from a launch plan.
+fn plugin_dirs(plan: &agent_run_adapters::LaunchPlan) -> Vec<&str> {
+    plan.args
+        .windows(2)
+        .filter(|pair| pair[0] == "--plugin-dir")
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+/// A verified resume reuses both external and projected skill plugin paths.
+#[test]
+fn resumed_claude_and_glm_keep_verified_plugin_directories() {
+    for adapter in ["claude", "glm"] {
+        let temporary = tempfile::tempdir().expect("temporary fixture root");
+        let root = temporary.path();
+        let (config, mut runtime, mut request, mut profile) = fixture(root, false, false, "sonnet");
+        runtime.adapter = adapter.into();
+        request.runtime = adapter.into();
+        if adapter == "glm" {
+            runtime.auth = Some(
+                serde_json::from_value(json!({
+                    "kind": "environment", "names": ["ANTHROPIC_AUTH_TOKEN"]
+                }))
+                .unwrap(),
+            );
+        }
+        let plugin = root.join("external-plugin");
+        std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            r#"{"name":"external","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        runtime.plugins.push(plugin.clone());
+        profile.skills.push("local-skill".into());
+        let skill = root.join("skills").join(adapter).join("local-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "fixture skill").unwrap();
+        std::fs::create_dir_all(&request.workdir).unwrap();
+        let home = root.join("home");
+        let (first, digest) =
+            materialize::materialize(&config, &runtime, &request, &profile, &home, root).unwrap();
+        let resumed = materialize::verify_for_resume(&home, &digest, &runtime, &profile).unwrap();
+        assert_eq!(resumed, first);
+        assert_eq!(resumed.plugin_roots["external"], plugin);
+        let mut row = record(request);
+        let environment = BTreeMap::from([("HOME".into(), home.display().to_string())]);
+        let first_plan = plan_with_environment(
+            &config,
+            &runtime,
+            &row,
+            &profile,
+            &home,
+            &first,
+            environment.clone(),
+        )
+        .unwrap();
+        row.resume_of_runtime_session_id = Some("saved".into());
+        let resume_plan = plan_with_environment(
+            &config,
+            &runtime,
+            &row,
+            &profile,
+            &home,
+            &resumed,
+            environment,
+        )
+        .unwrap();
+        let skill_plugin = home.join("plugins/local-skill");
+        let expected = [plugin.to_str().unwrap(), skill_plugin.to_str().unwrap()];
+        assert_eq!(plugin_dirs(&first_plan), expected);
+        assert_eq!(plugin_dirs(&resume_plan), plugin_dirs(&first_plan));
+
+        let metadata = home.join(".agent-run-plugin-launch.json");
+        let mut altered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        altered["plugin_paths"][0] = json!(root.join("other-plugin"));
+        std::fs::write(&metadata, serde_json::to_vec_pretty(&altered).unwrap()).unwrap();
+        assert!(materialize::verify_for_resume(&home, &digest, &runtime, &profile).is_err());
+    }
+}
+
+/// An older verified index without launch metadata reconstructs its plugin paths.
+#[test]
+fn legacy_resume_reconstructs_plugin_directories() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let (_, mut runtime, _, mut profile) = fixture(root, false, false, "sonnet");
+    let plugin = root.join("external-plugin");
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        r#"{"name":"external","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    runtime.plugins.push(plugin.clone());
+    profile.skills.push("local-skill".into());
+    let home = root.join("legacy-home");
+    let mut publisher = materialize::Publisher::new(&home).unwrap();
+    publisher
+        .json(
+            "plugins/local-skill/.claude-plugin/plugin.json",
+            &json!({"name":"local-skill"}),
+        )
+        .unwrap();
+    let (_, digest) = publisher.finish().unwrap();
+    let recovered = materialize::verify_for_resume(&home, &digest, &runtime, &profile).unwrap();
+    assert_eq!(
+        recovered.plugin_paths,
+        [plugin.clone(), home.join("plugins/local-skill")]
+    );
+    assert_eq!(recovered.plugin_roots["external"], plugin);
+    std::fs::remove_dir_all(&plugin).unwrap();
+    assert!(materialize::verify_for_resume(&home, &digest, &runtime, &profile).is_err());
+}
+
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_describe_reports_api_version_and_supports_live_limits`.
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_validate_accepts_global_or_known_environment_auth`.
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_validate_refuses_unknown_hook_events`.
