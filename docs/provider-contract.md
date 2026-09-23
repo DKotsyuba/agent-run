@@ -401,8 +401,12 @@ tries to continue the same logical run on another account:
   event; at the cleanup boundary the sealed rollout must contain a user
   `message` whose `internal_chat_message_metadata_passthrough.turn_id` is
   that id with an `input_text` of that digest. A later automatic attempt
-  carries the proof of an earlier attempt of the same logical run; an
-  explicit-resume parent's turns never count and text is never matched.
+  carries the earlier attempt's proof (`task_proof`: the original turn id
+  and digest) only after re-finding that same original turn in its own
+  newly sealed rollout; its own continuation-control turn never counts, so
+  a history rewritten or truncated during a later attempt stops the next
+  switch. An explicit-resume parent's turns never count and text is never
+  matched.
   An early rejection before the input was recorded (meta-only history)
   refuses with `continuation_unavailable: the admitted task never reached
   native history`; nothing is replayed.

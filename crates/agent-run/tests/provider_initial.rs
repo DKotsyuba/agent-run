@@ -1625,13 +1625,24 @@ async fn superseded_quota_rejections_do_not_classify_the_failure() {
 /// linked auth files carry `auth` contents (`exhausted` makes its turns fail
 /// with `usageLimitExceeded`). Dummy files only; no real credential.
 fn codex_home(auth: [&str; 2]) -> (tempfile::TempDir, std::path::PathBuf) {
-    let extra = "[providers.codex-user]\nharness = \"codex\"\nconnection = { kind = \"native\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex-user.models]]\nid = \"fixture\"\n[[providers.codex-user.bindings]]\nlabel = \"a\"\naccount = \"acct-cx-a\"\n[[providers.codex-user.bindings]]\nlabel = \"b\"\naccount = \"acct-cx-b\"\n";
-    let (temp, home) = home_with(extra, &[]);
+    codex_home_with(&auth)
+}
+
+/// [`codex_home`] with one disposable fake account per `auth` entry,
+/// labelled `a`, `b`, `c`, … in that order.
+fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let labels = ["a", "b", "c"];
+    let mut extra = "[providers.codex-user]\nharness = \"codex\"\nconnection = { kind = \"native\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex-user.models]]\nid = \"fixture\"\n".to_owned();
+    for label in &labels[..auth.len()] {
+        extra.push_str(&format!(
+            "[[providers.codex-user.bindings]]\nlabel = \"{label}\"\naccount = \"acct-cx-{label}\"\n"
+        ));
+    }
+    let (temp, home) = home_with(&extra, &[]);
     let mut store = Store::open(&home).unwrap();
-    for ((label, account), content) in [("a", "acct-cx-a"), ("b", "acct-cx-b")]
-        .into_iter()
-        .zip(auth)
-    {
+    for (label, content) in labels.into_iter().zip(auth.iter().copied()) {
+        let account = format!("acct-cx-{label}");
+        let account = account.as_str();
         let dir = home.join("accounts/codex").join(label);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("auth.json"), content).unwrap();
@@ -1753,6 +1764,58 @@ async fn early_quota_rejection_with_meta_only_history_never_switches() {
         ),
         1
     );
+}
+
+/// Three disposable accounts: A proves the original admitted turn and
+/// exhausts; B continues A's thread, but its rollout becomes a structurally
+/// valid meta-only file before its own quota failure. The original task is
+/// no longer in the current native history, so C is never allocated or
+/// spawned and receives no continuation-control turn.
+#[tokio::test]
+async fn rewritten_history_after_a_switch_never_reaches_a_third_account() {
+    let (_temp, home) = codex_home_with(&["exhausted", "exhausted rewrite", "ok"]);
+    let id = codex_run(&home, "rewrite-1", None).await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed, "{:?}", row.failure_text);
+    assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("admitted task never reached native history"),
+        "{:?}",
+        row.failure_text
+    );
+    let attempts = attempts(&home, &id);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert!(attempts.iter().all(|attempt| attempt.1 != "acct-cx-c"));
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+            &id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+}
+
+/// The normal three-account chain whose history keeps the original turn:
+/// A and B exhaust, C continues the same thread and succeeds.
+#[tokio::test]
+async fn intact_history_carries_the_task_proof_through_two_switches() {
+    let (_temp, home) = codex_home_with(&["exhausted", "exhausted", "ok"]);
+    let id = codex_run(&home, "chain-1", None).await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    assert_eq!(attempts(&home, &id).len(), 3);
 }
 
 /// An explicit-resume child whose own turn never reached native history

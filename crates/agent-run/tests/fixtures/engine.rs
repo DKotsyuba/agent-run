@@ -232,8 +232,10 @@ fn native_history(session: &str, task: &str) {
 /// process and turn, like real ones. A turn fails with the authoritative
 /// `usageLimitExceeded` code when the linked `$CODEX_HOME/auth.json`
 /// contains `exhausted`; with `early` as well, it is rejected before the
-/// user input is recorded (meta-only history). Otherwise it completes with
-/// an agent message naming the thread.
+/// user input is recorded (meta-only history), and with `rewrite` the whole
+/// rollout is replaced by a structurally valid meta-only file before that
+/// failure (earlier turns vanish). Otherwise it completes with an agent
+/// message naming the thread.
 fn app_server() {
     let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
     let exhausted = std::fs::read_to_string(home.join("auth.json"))
@@ -320,6 +322,19 @@ fn app_server() {
                     }
                 }
                 if exhausted {
+                    if std::fs::read_to_string(home.join("auth.json"))
+                        .map(|text| text.contains("rewrite"))
+                        .unwrap_or(false)
+                    {
+                        std::fs::write(
+                            &rollout,
+                            format!(
+                                "{}\n",
+                                json!({"type":"session_meta","payload":{"id":thread}})
+                            ),
+                        )
+                        .expect("rewrite rollout");
+                    }
                     emit(
                         json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"failed","items":[],"error":{"message":"usage limit reached","codexErrorInfo":"usageLimitExceeded"}}}}),
                     );

@@ -849,33 +849,40 @@ fn history_evidence(
         Ok(seal) => {
             // Any failure to prove it (including changed history) is simply
             // unproven: automatic continuation then fails closed.
-            let task_proven = task_proven(store, id, attempt, &seal).unwrap_or(false);
+            let task_proof = task_proof(store, id, attempt, &seal).unwrap_or(None);
             json!({"native_history":{
                 "seal": seal,
                 "provider": identity.authority.provider,
                 "assets_sha256": identity.authority.assets_sha256,
                 "attempt": attempt,
-                "task_proven": task_proven,
+                "task_proven": task_proof.is_some(),
+                "task_proof": task_proof,
             }})
         }
         Err(error) => json!({"native_history_unavailable": error.to_string()}),
     }
 }
 
-/// Whether THIS logical run's admitted task provably reached native history
-/// by the end of `attempt`: either this attempt's own recorded
-/// `native_turn_started` turn (its id and input digest) appears as a user
-/// message in the sealed history, or an earlier attempt of the same logical
-/// agent already proved it (a later automatic attempt only continues that
-/// proven conversation). Earlier attempts of a different agent (an
-/// explicit-resume parent) never count, and neither does matching text.
-fn task_proven(
+/// The proof, as `{"turn","input_sha256"}`, that THIS logical run's
+/// original admitted task is present in the history sealed at the end of
+/// `attempt`; `None` when it is not provable.
+///
+/// The first attempt of a logical agent proves its own recorded
+/// `native_turn_started` turn (its id and input digest) against `seal`.
+/// Every later automatic attempt carries the previous attempt's proof only
+/// after re-finding that same original turn in its OWN new seal: its own
+/// turn is a continuation-control turn and never counts, and a previous
+/// attempt without a proof yields none. A rewritten or truncated current
+/// history therefore loses the proof even when an earlier seal had it.
+/// Attempts of a different agent (an explicit-resume parent) never count,
+/// and matching text is never used.
+fn task_proof(
     store: &Store,
     id: &AgentId,
     attempt: &str,
     seal: &crate::continuity::HistorySeal,
-) -> Result<bool> {
-    let prior: Option<String> = store
+) -> Result<Option<serde_json::Value>> {
+    let prior: Option<Option<String>> = store
         .conn
         .query_row(
             "SELECT adapter_state_json FROM attempts WHERE agent_id=?1 \
@@ -884,31 +891,37 @@ fn task_proven(
             rusqlite::params![id.as_str(), attempt],
             |row| row.get(0),
         )
-        .optional()?
-        .flatten();
-    if prior
-        .and_then(|state| serde_json::from_str::<serde_json::Value>(&state).ok())
-        .is_some_and(|state| state["native_history"]["task_proven"] == true)
-    {
-        return Ok(true);
-    }
-    let turn: Option<String> = store
-        .conn
-        .query_row(
-            "SELECT data_json FROM events WHERE agent_id=? AND attempt_id=? \
-             AND kind='native_turn_started' ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![id.as_str(), attempt],
-            |row| row.get(0),
-        )
         .optional()?;
-    let Some(turn) = turn.and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
-    else {
-        return Ok(false);
+    let candidate = match prior {
+        // A continuing attempt: only the carried original proof may qualify.
+        Some(state) => state
+            .and_then(|state| serde_json::from_str::<serde_json::Value>(&state).ok())
+            .map(|state| state["native_history"]["task_proof"].clone()),
+        // The first attempt: its own admitted turn.
+        None => store
+            .conn
+            .query_row(
+                "SELECT data_json FROM events WHERE agent_id=? AND attempt_id=? \
+                 AND kind='native_turn_started' ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![id.as_str(), attempt],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok()),
     };
-    match (turn["turn"].as_str(), turn["input_sha256"].as_str()) {
-        (Some(turn), Some(digest)) => crate::continuity::admitted_turn_recorded(seal, turn, digest),
-        _ => Ok(false),
-    }
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let (Some(turn), Some(digest)) = (
+        candidate["turn"].as_str(),
+        candidate["input_sha256"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    Ok(
+        crate::continuity::admitted_turn_recorded(seal, turn, digest)?
+            .then(|| json!({"turn": turn, "input_sha256": digest})),
+    )
 }
 /// The native history storage root a launch environment selects: `CODEX_HOME`
 /// for Codex; `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, for Claude Code.
