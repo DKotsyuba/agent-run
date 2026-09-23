@@ -44,7 +44,7 @@ impl Harness {
             claude = toml::Value::String(home.join("claude").to_string_lossy().into_owned()),
         );
         std::fs::write(home.join("config.toml"), config).unwrap();
-        std::fs::create_dir(home.join("profiles")).unwrap();
+        std::fs::create_dir_all(home.join("profiles")).unwrap();
         std::fs::write(home.join("profiles/review.md"), "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview.\n").unwrap();
         let registered = Command::new(env!("CARGO_BIN_EXE_agent-run"))
             .args([

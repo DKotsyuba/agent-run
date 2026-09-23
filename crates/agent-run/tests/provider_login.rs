@@ -40,6 +40,16 @@ fn fake(path: &Path, log: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// The library readiness report (`cli::doctor`) for `home`; no broker runs.
+fn readiness(home: &Path) -> Value {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(agent_run::cli::doctor(home))
+        .unwrap()
+}
+
 #[test]
 fn fresh_init_is_an_empty_v2_catalog() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -52,6 +62,21 @@ fn fresh_init_is_an_empty_v2_catalog() {
     );
     let (ok, models) = run(&home, &["models"]);
     assert!(ok, "{models}");
+    // Doctor sees a coherent home: an empty catalog is information, not an
+    // invalid config.
+    let (ok, doctor) = run(&home, &["doctor"]);
+    assert!(ok, "{doctor}");
+    let codes: Vec<&str> = doctor["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"provider_catalog_empty"), "{doctor}");
+    assert!(!codes.contains(&"config_invalid"), "{doctor}");
+    let empty = readiness(&home);
+    assert_eq!(empty["checks"].as_array().unwrap().len(), 1, "{empty}");
+    assert_eq!(empty["checks"][0]["name"], "state");
     let (ok, accounts) = run(&home, &["accounts", "list"]);
     assert!(
         ok && accounts["accounts"] == serde_json::json!([]),
@@ -154,6 +179,33 @@ fn login_resolves_provider_harness_and_bound_account() {
         !ok && unbound.to_string().contains("not bound"),
         "{unbound}"
     );
+
+    // Readiness and launchd rendering read the same schema-2 view.
+    let readiness = readiness(&home);
+    let names: Vec<&str> = readiness["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|check| check["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "state",
+            "harness:codex",
+            "harness:claude-code",
+            "claude",
+            "codex"
+        ],
+        "{readiness}"
+    );
+    assert_eq!(
+        readiness["checks"][4]["accounts"],
+        serde_json::json!(["acct-codex-p2", "acct-codex-native"])
+    );
+    assert_eq!(readiness["checks"][1]["executable"], true);
+    let (ok, plist) = run(&home, &["capacity", "launchd", "--binary", "/bin/true"]);
+    assert!(ok, "{plist}");
 
     let calls = fs::read_to_string(&log).unwrap();
     let lines: Vec<&str> = calls.lines().collect();

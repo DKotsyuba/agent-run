@@ -584,11 +584,10 @@ struct Paused {
 impl Paused {
     /// Starts the apply and waits (at most 30 s) until it reaches `step`.
     fn start(home: &Home, step: &str) -> Self {
-        let control = tempfile::tempdir_in("/tmp").unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
-            .arg("--home")
-            .arg(&home.root)
-            .args([
+        Self::spawn(
+            home,
+            step,
+            &[
                 "config",
                 "migrate",
                 "--mapping",
@@ -596,7 +595,17 @@ impl Paused {
                 "--apply",
                 "--from-release",
                 &home.path("old-release"),
-            ])
+            ],
+        )
+    }
+
+    /// Starts `args` and waits (at most 30 s) until it reaches `step`.
+    fn spawn(home: &Home, step: &str, args: &[&str]) -> Self {
+        let control = tempfile::tempdir_in("/tmp").unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(&home.root)
+            .args(args)
             .env(
                 "AGENT_RUN_MIGRATE_PAUSE",
                 format!("{step}:{}", control.path().display()),
@@ -613,6 +622,12 @@ impl Paused {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         panic!("migration never reached {step}");
+    }
+
+    /// Lets the paused process continue and returns whether it succeeded.
+    fn finish(&mut self) -> bool {
+        fs::write(self.control.path().join("release"), "").unwrap();
+        self.child.wait().unwrap().success()
     }
 }
 
@@ -713,4 +728,149 @@ fn external_config_edit_during_publication_is_kept() {
     assert_eq!(version(&home.root), 16);
     assert_eq!(history(&home.root), rows);
     assert!(!home.root.join("migrations/in-progress.json").exists());
+}
+
+/// One committed-or-refused write from a fresh connection that never waits:
+/// the marker `'w'` is appended to the first agent's task.
+fn try_write(home: &Path) -> rusqlite::Result<usize> {
+    let conn = rusqlite::Connection::open(home.join("state.db"))?;
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    write_with(&conn)
+}
+
+/// The marker write through an existing connection.
+fn write_with(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE agents SET task=task||'w' WHERE id=(SELECT min(id) FROM agents)",
+        [],
+    )
+}
+
+/// Whether a write was refused by SQLite locking (not committed).
+fn refused_busy(result: rusqlite::Result<usize>) -> bool {
+    matches!(
+        result,
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// How many first-agent tasks carry the committed marker write.
+fn markers(home: &Path) -> usize {
+    history(home)
+        .iter()
+        .take(1)
+        .filter(|row| row.contains("w\")"))
+        .count()
+}
+
+/// Writers that arrive between the live check and the replacement — for
+/// apply and for rollback, in the fixture's WAL mode and in rollback-journal
+/// mode — are refused by the database lease rather than overwritten; once
+/// the operation completes the same write commits and survives.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn writers_during_publication_are_refused_not_overwritten() {
+    for journal in ["wal", "delete"] {
+        let home = Home::new();
+        home.finish_agents();
+        let preopened = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+        preopened.busy_timeout(std::time::Duration::ZERO).unwrap();
+        if journal == "delete" {
+            let mode: String = preopened
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+        } else {
+            // A WAL handle that is open while the lease is taken refuses it;
+            // that case is covered separately below.
+            drop(preopened);
+        }
+        let mut paused = Paused::start(&home, "staged");
+        assert!(
+            refused_busy(try_write(&home.root)),
+            "{journal}: apply fresh writer"
+        );
+        if journal == "delete" {
+            // An idle rollback-journal handle holds no lock when the lease is
+            // taken; its later write is refused too.
+            let handle = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+            handle.busy_timeout(std::time::Duration::ZERO).unwrap();
+            assert!(refused_busy(write_with(&handle)), "{journal}: idle handle");
+        }
+        assert!(paused.finish(), "{journal}: apply completes");
+        assert_eq!(version(&home.root), 17);
+        assert_eq!(markers(&home.root), 0, "{journal}: nothing was committed");
+
+        let snapshot = fs::read_dir(home.root.join("migrations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("COMPLETE").is_file())
+            .unwrap();
+        let snapshot = snapshot.to_string_lossy().into_owned();
+        let mut paused = Paused::spawn(
+            &home,
+            "rollback_checked",
+            &["config", "rollback", "--snapshot", &snapshot],
+        );
+        assert!(
+            refused_busy(try_write(&home.root)),
+            "{journal}: rollback writer"
+        );
+        assert!(paused.finish(), "{journal}: rollback completes");
+        assert_eq!(version(&home.root), 16);
+        assert_eq!(
+            try_write(&home.root).unwrap(),
+            1,
+            "{journal}: writer resumes"
+        );
+        assert_eq!(markers(&home.root), 1, "{journal}: its write is kept");
+    }
+}
+
+/// A process that already holds the WAL database open makes apply and
+/// rollback refuse before anything is written; after it closes they proceed.
+#[test]
+fn a_preopened_wal_handle_refuses_the_lease() {
+    let home = Home::new();
+    home.finish_agents();
+    let db = sha(&home.root.join("state.db"));
+    let config = sha(&home.root.join("config.toml"));
+    let holder = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+    let _: i64 = holder
+        .query_row("SELECT count(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    let (ok, refused) = home.apply("mapping.toml", false);
+    assert!(!ok && refused.to_string().contains("in use"), "{refused}");
+    assert_eq!(sha(&home.root.join("state.db")), db);
+    assert_eq!(sha(&home.root.join("config.toml")), config);
+    assert!(
+        !home.root.join("migrations").exists()
+            || fs::read_dir(home.root.join("migrations")).unwrap().count() == 0
+    );
+    drop(holder);
+    let (ok, applied) = home.apply("mapping.toml", false);
+    assert!(ok, "{applied}");
+    let snapshot = applied["snapshot"].as_str().unwrap();
+
+    let holder = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+    let _: i64 = holder
+        .query_row("SELECT count(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    let (ok, refused) = run(
+        &home.root,
+        &["config", "rollback", "--snapshot", snapshot],
+        false,
+    );
+    assert!(!ok && refused.to_string().contains("in use"), "{refused}");
+    assert_eq!(version(&home.root), 17);
+    assert!(!home.root.join("migrations/in-progress.json").exists());
+    drop(holder);
+    let (ok, rolled) = run(
+        &home.root,
+        &["config", "rollback", "--snapshot", snapshot],
+        false,
+    );
+    assert!(ok, "{rolled}");
+    assert_eq!(version(&home.root), 16);
 }

@@ -700,19 +700,51 @@ pub fn init(home: &Path) -> Result<Value> {
         let file=format!("profiles/{name}.md");let text=format!("+++\nrevision = \"rust-role-v1\"\nwrite = {write}\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\n{body}\n");
         if dir.optional(Path::new(&file),1024*1024)?.is_none(){dir.write(Path::new(&file),text.as_bytes(),0o600)?;}
     }
-    let _ = Config::load(home)?;
+    let _ = operator_config(home)?;
     let store = Store::initialize(home)?;
     let _ = store.health()?;
     Ok(json!({"home":home,"config":home.join("config.toml"),"state":home.join("state.db")}))
+}
+/// The operator view of either schema: a valid schema-2 config's shared
+/// controls with the config itself, or a schema-1 config.
+fn operator_config(
+    home: &Path,
+) -> Result<(
+    Config,
+    Option<agent_run_config::provider_config::ProviderConfig>,
+)> {
+    match agent_run_config::provider_config::ProviderConfig::load(home) {
+        Ok((v2, _)) => Ok((v2.shared(), Some(v2))),
+        Err(_) => Ok((Config::load(home)?, None)),
+    }
 }
 pub fn doc(topic: &str) -> Result<&'static str> {
     crate::dispatch::doc(topic)
 }
 pub async fn doctor(home: &Path) -> Result<Value> {
-    let cfg = Config::load(home)?;
+    let (cfg, v2) = operator_config(home)?;
     let store = Store::open(home)?;
     let mut checks = vec![json!({"name":"state","result":store.health()?})];
     drop(store);
+    // A schema-2 home reports its harness executables and each provider's
+    // bound accounts; an empty catalog simply has none.
+    if let Some(v2) = &v2 {
+        use std::os::unix::fs::PermissionsExt;
+        for (id, harness) in &v2.harnesses {
+            let executable = std::fs::metadata(&harness.binary)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            checks.push(json!({"name":format!("harness:{}", id.as_str()),"executable":executable}));
+        }
+        for (id, provider) in &v2.providers {
+            let accounts: Vec<&str> = provider
+                .bindings
+                .iter()
+                .map(|b| b.account.as_str())
+                .collect();
+            checks.push(json!({"name":id.as_str(),"harness":provider.harness.as_str(),"accounts":accounts,"limits_source":provider.limits_source}));
+        }
+    }
     for (name, runtime) in cfg.runtimes.iter().filter(|(_, r)| r.enabled) {
         use std::os::unix::fs::PermissionsExt;
         let executable = std::fs::metadata(&runtime.binary)
@@ -1360,7 +1392,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 &home,
                 binary,
                 "capacity",
-                Config::load(&home)?.capacity.collect_interval_seconds,
+                operator_config(&home)?.0.capacity.collect_interval_seconds,
                 &label,
                 stdout_log,
                 stderr_log.unwrap_or_else(|| home.join("capacity-worker.err.log")),
@@ -1387,7 +1419,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 &home,
                 binary,
                 "delivery",
-                Config::load(&home)?.delivery.retry_base_seconds.ceil() as u64,
+                operator_config(&home)?.0.delivery.retry_base_seconds.ceil() as u64,
                 &label,
                 stdout_log,
                 stderr_log.unwrap_or_else(|| home.join("delivery-worker.err.log")),

@@ -68,7 +68,7 @@ fn home() -> (tempfile::TempDir, PathBuf) {
         toml::Value::String(home.join("runtime").to_string_lossy().into_owned()),
     );
     std::fs::write(home.join("config.toml"), config).unwrap();
-    std::fs::create_dir(home.join("profiles")).unwrap();
+    std::fs::create_dir_all(home.join("profiles")).unwrap();
     std::fs::write(home.join("profiles/review.md"), "Review.\n").unwrap();
     (temp, home)
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 #[test]
 fn python_test_snapshots_fixture_is_read_only_and_bounded() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/baseline/db/current-v16.sqlite");
+        .join("../../tests/fixtures/baseline/db/current-v17.sqlite");
     let snapshot = diagnostic_snapshot(&fixture, 1_759_000_100.0, 256).unwrap();
     assert!(!snapshot.agents.is_empty());
     assert!(!snapshot.capacity.is_empty());

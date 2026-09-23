@@ -184,9 +184,15 @@ broker startup lock for its whole run (a running broker makes it refuse; no
 broker can start meanwhile), refuses while any agent is active, and every
 newly started command — including a capacity or delivery job — refuses with
 `migration_required` while the database is older, or `migration_incomplete`
-while a journal exists. A job that had already opened the store before the
-migration began is not excluded by these; if it writes, the row digest check
-below refuses publication or rollback rather than discarding its write.
+while a journal exists. For a process that already has the store open, apply
+and rollback take an exclusive SQLite lease on the live database before the
+first live read and keep it — through the snapshot, the checks, the
+replacement, the config and journal steps — until the journal is cleared:
+if any other process holds the database open, they refuse ("in use") before
+writing anything, and a writer arriving while the lease is held is refused
+with `SQLITE_BUSY` until it is released, so no committed write is replaced.
+Nothing is killed; stop such processes and rerun. Recovery only rolls back
+to the v1 pair; there is no roll-forward.
 
 `--from-release` names the installed release directory — a sealed release
 as built by `xtask release` — not a bare executable. Its `COMPLETE`,
@@ -233,7 +239,10 @@ switch the installed pointer. The snapshot is never modified.
 `agent-run init` on a home without `config.toml` writes the explicitly empty
 schema-2 catalog `schema_version = 2` (no harness, provider or account;
 `models` lists nothing and nothing can start until they are declared). A
-schema-1 `config.toml` never initializes a new state database.
+schema-1 `config.toml` never initializes a new state database. `doctor`
+reports such a home as `provider_catalog_empty` (information), not as an
+invalid configuration; a configured schema-2 home is checked through its
+harness executables.
 
 In a schema-2 home, `agent-run auth <account> <provider>` and
 `agent-run login <provider> [--account <account>]` take a native-connection

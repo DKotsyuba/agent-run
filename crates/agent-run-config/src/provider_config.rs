@@ -161,6 +161,22 @@ impl ProviderConfig {
         Ok(config)
     }
 
+    /// The shared service controls as a runtime-free schema-1 view, for
+    /// operator surfaces (doctor, launchd rendering) common to both schemas.
+    pub fn shared(&self) -> Config {
+        Config {
+            schema_version: 1,
+            core: self.core.clone(),
+            capacity: self.capacity.clone(),
+            delivery: self.delivery.clone(),
+            profiles: self.profiles.clone(),
+            skills: self.skills.clone(),
+            mcp: self.mcp.clone(),
+            environments: self.environments.clone(),
+            runtimes: BTreeMap::new(),
+        }
+    }
+
     /// Reads at most one MiB of `config.toml`; returns `None` for the same
     /// byte revision and never replaces a caller's last valid config on error.
     pub fn load_if_changed(home: &Path, revision: Option<&str>) -> Result<Option<(Self, String)>> {

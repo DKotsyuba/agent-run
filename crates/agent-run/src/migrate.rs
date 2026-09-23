@@ -27,12 +27,17 @@
 //!   digest. Anything else — a third-party config edit, a later row write —
 //!   is left exactly as found and refused.
 //!
-//! Limits: the broker lock excludes brokers, and the `migration_required` /
-//! `migration_incomplete` gate refuses every newly started command, including
-//! the capacity and delivery jobs; a writer that opened the store before the
-//! migration started is not excluded, so those jobs must be stopped first. A
-//! write that lands anyway changes the row digest and makes publication or
-//! rollback refuse instead of discarding it.
+//! Writer exclusion: besides the broker lock and the `migration_required` /
+//! `migration_incomplete` gate for newly started commands, apply and rollback
+//! hold one exclusive SQLite lease on the live database ([`lease`]) from
+//! before the first live read until the journal is cleared. Every live read
+//! (active agents, row digest, the snapshot backup) and every replacement run
+//! through that same connection. A process that already holds the database
+//! open makes acquisition refuse before anything is written; a writer that
+//! arrives later is refused `SQLITE_BUSY` until the lease is released, so no
+//! committed write is ever replaced.
+//!
+//! Limit: recovery only rolls back to the v1 pair; there is no roll-forward.
 
 use crate::{config::Config, fs, state::Store, Result};
 use agent_run_config::{
@@ -141,11 +146,6 @@ fn read_only_at(path: &Path) -> Result<Connection> {
     )?)
 }
 
-/// [`read_only_at`] for the live database of `home`.
-fn read_only(home: &Path) -> Result<Connection> {
-    read_only_at(&db_path(home))
-}
-
 /// Counts active agents through `conn` (any supported schema).
 fn active_agents(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
@@ -188,10 +188,30 @@ fn content_digest(conn: &Connection) -> Result<String> {
     Ok(fs::sha256(text.as_bytes()))
 }
 
-/// The live database's row digest and active-agent count.
-fn live_state(home: &Path) -> Result<(String, i64)> {
-    let live = read_only(home)?;
-    Ok((content_digest(&live)?, active_agents(&live)?))
+/// Takes the exclusive lease on the live database: a read-write connection in
+/// `locking_mode=EXCLUSIVE` that runs one empty `BEGIN EXCLUSIVE` and then
+/// keeps the file lock, with no transaction open, until it is dropped. Any
+/// connection that already has the database open or in use makes this
+/// refuse (`SQLITE_BUSY`, no waiting); while it is held every other
+/// connection's read or write is refused. The same connection must serve all
+/// live reads and be the backup destination: closing it releases the lock.
+fn lease(home: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(db_path(home), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let mode: String = conn.query_row("PRAGMA locking_mode=EXCLUSIVE", [], |row| row.get(0))?;
+    if mode != "exclusive" {
+        return Err(invalid("state database refused exclusive locking mode"));
+    }
+    conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;").map_err(|_| {
+        invalid("state database is in use by another process; stop every agent-run process on this home first")
+    })?;
+    Ok(conn)
+}
+
+/// The live database's row digest and active-agent count, read through the
+/// lease.
+fn live_state(live: &Connection) -> Result<(String, i64)> {
+    Ok((content_digest(live)?, active_agents(live)?))
 }
 
 /// Facts of the installed pre-migration release, read from its verified seal
@@ -277,13 +297,12 @@ fn clear_journal(home: &Path) -> Result<()> {
 }
 
 /// Replaces the live database's content with `source`'s in one SQLite backup
-/// transaction (crash-safe through SQLite's own journal), then checkpoints so
-/// the main file carries the result.
-fn replace_db(home: &Path, source: &Path) -> Result<()> {
+/// transaction (crash-safe through SQLite's own journal) whose destination is
+/// the lease itself, then checkpoints so the main file carries the result.
+/// The lease stays held throughout and afterwards.
+fn replace_db(live: &mut Connection, source: &Path) -> Result<()> {
     let from = read_only_at(source)?;
-    let mut live = Connection::open_with_flags(db_path(home), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    live.busy_timeout(std::time::Duration::from_secs(5))?;
-    let done = rusqlite::backup::Backup::new(&from, &mut live)?.step(-1)?;
+    let done = rusqlite::backup::Backup::new(&from, live)?.step(-1)?;
     if !matches!(done, rusqlite::backup::StepResult::Done) {
         return Err(invalid("state database replacement did not complete"));
     }
@@ -393,8 +412,9 @@ pub fn migrate(
     let _lock = exclusive(home)?;
     // Everything below runs with brokers excluded. Refusals write nothing.
     require_no_journal(home)?;
-    let source = read_only(home)?;
-    if active_agents(&source)? > 0 {
+    let mut live = lease(home)?;
+    let source = &live;
+    if active_agents(source)? > 0 {
         return Err(invalid("active agents must finish before a config switch"));
     }
     if std::fs::read(home.join("config.toml"))? != config_bytes {
@@ -411,7 +431,6 @@ pub fn migrate(
     write_new(&dir.join("config.v1.toml"), &config_bytes)?;
     write_new(&dir.join("mapping.toml"), &mapping_bytes)?;
     source.backup(rusqlite::DatabaseName::Main, dir.join("state.db"), None)?;
-    drop(source);
     std::fs::set_permissions(dir.join("state.db"), std::fs::Permissions::from_mode(0o400))?;
     let backup = read_only_at(&dir.join("state.db"))?;
     let backup_version: i64 = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -478,7 +497,7 @@ pub fn migrate(
                 "config.toml changed during migration; nothing was published",
             ));
         }
-        if live_state(home)?.0 != source_digest {
+        if live_state(&live)?.0 != source_digest {
             return Err(invalid(
                 "state changed during migration (a writer was still running); nothing was published",
             ));
@@ -492,13 +511,21 @@ pub fn migrate(
     write_journal(home, &journal)?;
     // The pair changes from here; a failure restores only what this
     // operation provably published.
-    match publish(home, &dir, &stage, &config_bytes, &rendered, &journal) {
+    match publish(
+        home,
+        &mut live,
+        &dir,
+        &stage,
+        &config_bytes,
+        &rendered,
+        &journal,
+    ) {
         Ok(applied) => {
             clear_journal(home)?;
             let _ = std::fs::remove_dir_all(&stage);
             Ok(json!({"applied": true, "snapshot": dir, "record": applied, "plan": summary}))
         }
-        Err(error) => match recover(home, &dir, &journal) {
+        Err(error) => match recover(home, &mut live, &dir, &journal) {
             Ok(()) => {
                 clear_journal(home)?;
                 let _ = std::fs::remove_dir_all(&stage);
@@ -520,10 +547,11 @@ fn require_no_journal(home: &Path) -> Result<()> {
 }
 
 /// Publishes the staged target: replaces the database, writes the v2 config only over the exact
-/// planned bytes, then the applied record. Called under the broker lock with
-/// the journal written.
+/// planned bytes, then the applied record. Called under the broker lock and
+/// the database lease with the journal written.
 fn publish(
     home: &Path,
+    live: &mut Connection,
     snapshot: &Path,
     stage: &Path,
     config_bytes: &[u8],
@@ -531,7 +559,7 @@ fn publish(
     journal: &Value,
 ) -> Result<Value> {
     let expect = |key: &str| journal[key].as_str().unwrap_or_default().to_owned();
-    replace_db(home, &stage.join("state.db"))?;
+    replace_db(live, &stage.join("state.db"))?;
     checkpoint("after_db")?;
     if std::fs::read(home.join("config.toml"))? != config_bytes {
         return Err(invalid(
@@ -558,9 +586,9 @@ fn publish(
 /// other content is a third-party edit and is kept), the database only when
 /// every row equals the recorded target (a source-equal database is already
 /// restored; any other content refuses). Refuses with active agents.
-fn recover(home: &Path, snapshot: &Path, journal: &Value) -> Result<()> {
+fn recover(home: &Path, live: &mut Connection, snapshot: &Path, journal: &Value) -> Result<()> {
     let expect = |key: &str| journal[key].as_str().unwrap_or_default().to_owned();
-    let (digest, active) = live_state(home)?;
+    let (digest, active) = live_state(live)?;
     if active > 0 {
         return Err(invalid("active agents must finish before rollback"));
     }
@@ -576,8 +604,8 @@ fn recover(home: &Path, snapshot: &Path, journal: &Value) -> Result<()> {
         fs::Dir::open(home)?.write(Path::new("config.toml"), &v1, 0o600)?;
     }
     if digest != source {
-        replace_db(home, &snapshot.join("state.db"))?;
-        if live_state(home)?.0 != source {
+        replace_db(live, &snapshot.join("state.db"))?;
+        if live_state(live)?.0 != source {
             return Err(invalid("restored database does not match the snapshot"));
         }
     }
@@ -621,6 +649,7 @@ pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
         ));
     }
     let _lock = exclusive(home)?;
+    let mut live = lease(home)?;
     let pending: Option<Value> = match std::fs::read(journal_path(home)) {
         Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -663,7 +692,7 @@ pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
             "config.toml changed after migration; rollback would discard it",
         ));
     }
-    let (digest, active) = live_state(home)?;
+    let (digest, active) = live_state(&live)?;
     if active > 0 {
         return Err(invalid("active agents must finish before rollback"));
     }
@@ -674,9 +703,11 @@ pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
             "state changed after migration (rows written); rollback cannot preserve them",
         ));
     }
+    checkpoint("rollback_checked")?;
     write_journal(home, &journal)?;
-    recover(home, &dir, &journal)?;
+    recover(home, &mut live, &dir, &journal)?;
     clear_journal(home)?;
+    drop(live);
     let _ = std::fs::remove_dir_all(dir.with_extension("stage"));
     Ok(json!({
         "rolled_back": true,
