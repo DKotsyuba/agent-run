@@ -354,8 +354,38 @@ the current capacity revision. The chosen account must be in the frozen
 scope, enabled, and not tried by an earlier attempt of the same agent
 (aliases resolve to the same account). The agent keeps its own cap slot; the
 previous attempt's ownership and physical-key reservations are released and
-the new attempt is written exactly once. The automatic retry loop that will
-call it is not implemented yet.
+the new attempt is written exactly once. It also requires that attempt's recorded
+authoritative `quota_exhausted` native failure, and closes it as
+`exhausted` in the same transaction.
+
+### Automatic account switch within one logical run
+
+When a provider attempt ends with an authoritative quota exhaustion, the
+supervisor records the native failure and history seal on that attempt and
+tries to continue the same logical run on another account:
+
+- Codex only. Its conversation lives in the run's own `CODEX_HOME`, so only
+  the account's auth link is rebound. Claude Code keeps history per login;
+  cross-account continuation is unverified there and refused
+  (`cross_account_continuation_unverified`).
+- Automatic runs only (`pinned_account` otherwise), never after a cancel,
+  and only while the current configuration still permits the frozen
+  execution (`current_policy_refused`). The next account comes from trusted
+  ranker candidates (frozen scope ∩ current bindings, never an account tried
+  by this run) through the atomic allocation, with bounded stale-revision
+  recomputes (`no_eligible_account`, `selection_busy`); an unsealable history
+  (for example a pending tool call) refuses with `continuation_unavailable`.
+- The next attempt re-verifies the previous attempt's seal against the root
+  its launch plan selects, resumes the same thread (`thread/resume`) and, as
+  Codex app-server requires `input` on `turn/start`, sends one fixed internal
+  control turn asking it to continue the same task. The original task is
+  neither resent nor journaled again; the run keeps its start time and its
+  one logical slot, and yields one final answer and delivery.
+- A blocked switch ends the run failed with `quota_exhausted` and
+  `failover_blocked: <reason>`.
+- Exhaustion is not fed into the physical-quota latch: Codex's
+  `usageLimitExceeded` names no window, so it only excludes that account for
+  this run; Claude windows are not mapped to physical lanes yet.
 
 ### Attempt-bound journaling and native failure signals
 
