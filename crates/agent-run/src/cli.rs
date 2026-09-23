@@ -269,6 +269,11 @@ pub enum Command {
         label: String,
         runtime: String,
     },
+    /// One-time schema-1 → schema-2 configuration migration and rollback.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage global account references without invoking native login.
     Accounts {
         #[command(subcommand)]
@@ -495,6 +500,34 @@ pub enum Api {
     },
 }
 /// Capacity worker commands retained from the Python operator surface.
+/// Configuration migration commands (see `crate::migrate`).
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Plan (`--dry-run`) or apply (`--apply`) the v1 → v2 migration from an
+    /// explicit operator mapping file; apply snapshots config and state first.
+    #[command(group(ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
+    Migrate {
+        /// TOML mapping: `[harnesses.*]` and one `[runtimes.<v1 name>]` each.
+        #[arg(long)]
+        mapping: PathBuf,
+        /// Print the plan and rendered config; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Snapshot, then atomically publish the v2 config.
+        #[arg(long)]
+        apply: bool,
+        /// Acknowledge one dry-run manual_review marker (repeat for each).
+        #[arg(long = "ack")]
+        ack: Vec<String>,
+    },
+    /// Restore the v1 config from one verified migration snapshot.
+    Rollback {
+        /// The snapshot directory printed by `config migrate --apply`.
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Capacity {
     Collect {
@@ -1259,6 +1292,17 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             }
             return Ok(code);
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Migrate {
+                mapping,
+                dry_run: _,
+                apply,
+                ack,
+            } => (dependencies.output)(&crate::migrate::migrate(&home, &mapping, apply, &ack)?)?,
+            ConfigCommand::Rollback { snapshot } => {
+                (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?
+            }
+        },
         Command::Accounts { command } => match command {
             AccountCommand::Register {
                 id,

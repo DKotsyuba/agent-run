@@ -123,3 +123,62 @@ directories exist the label is ambiguous and fails until one is removed.
 After manual edits, parse the TOML and run `agent-run doctor`. Doctor checks
 binaries and role assets; runtime start does not run language-toolchain
 readiness probes.
+
+## One-time migration to schema 2
+
+The migration is explicit: nothing is guessed. Register every account first
+(`agent-run accounts register --id ... --auth-family ... --reference
+native:codex|named:codex:<label>|env:...|keychain:<service>:<account>`); the
+reference names an existing store and no credential value is read. Then write
+a mapping file naming the two harnesses and, for each v1 runtime, its provider
+id, harness, connection, auth family, v2 limits source (and collector for
+`lua`), an explicit native model for every historical model, the account used
+for requests that omitted an account (`global_account`), an account for every
+v1 label, and optional recommendation prose:
+
+```toml
+[harnesses.codex]
+binary = "/absolute/path/to/codex"
+home = "/absolute/path/to/agent-run/runtimes/codex/home"
+[harnesses.claude-code]
+binary = "/absolute/path/to/claude"
+home = "/absolute/path/to/agent-run/runtimes/claude/home"
+[runtimes.codex]
+provider = "codex"
+harness = "codex"
+connection = { kind = "native" }
+auth_family = "openai"
+limits_source = "codex_appserver"
+global_account = "acct-codex-native"
+labelled_accounts = { personal2 = "acct-codex-personal2" }
+recommendations = []
+[runtimes.codex.native_models]
+"gpt-6-sol" = "gpt-6-sol"
+[runtimes.codex.model_recommendations]
+"gpt-6-sol" = ["Use for connected implementation, cross-system diagnosis, security or concurrency reasoning, and substantive reviews with interacting constraints."]
+```
+
+```sh
+agent-run config migrate --mapping mapping.toml --dry-run
+agent-run config migrate --mapping mapping.toml --apply [--ack <marker>]...
+agent-run config rollback --snapshot <home>/migrations/<time>-v1-to-v2
+```
+
+The dry run prints the rendered schema-2 config, its SHA-256, the historical
+runtime map and any `manual_review` markers (for example a runtime with an
+`auth` table); apply requires `--ack` for exactly those markers. Missing,
+extra or ambiguous runtimes, models, labels or lane weights
+(`priority_lane_multipliers`) are refused, never dropped. Apply refuses while
+any agent is active or a broker answers on `api.sock` (stop it; nothing is
+killed), writes `<home>/migrations/<time>-v1-to-v2/` with the exact v1 config,
+an online SQLite backup (never a copy of the live main file), and
+`manifest.json` (binary path, version and SHA-256, config and backup digests,
+agent count), writes `COMPLETE` last, then atomically replaces `config.toml`.
+The database itself is not modified, so historical agents, answers,
+transcripts and artifacts stay readable as before.
+
+Rollback restores only the v1 `config.toml`, and only while the snapshot
+matches its manifest, `config.toml` is still exactly the migrated file, the
+agent count is unchanged and nothing is live. It cannot preserve work created
+after the migration and refuses instead; the snapshot's `state.db` is a
+disaster-recovery copy to restore manually with everything stopped.

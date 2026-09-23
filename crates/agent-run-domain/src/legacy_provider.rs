@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 /// Explicit recorded adapter evidence or a verified migration-map entry for
 /// a historical request. The raw runtime spelling is never renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LegacyRuntime {
     /// The recorded provider identity, including arbitrary names such as glm.
     pub provider: ProviderId,

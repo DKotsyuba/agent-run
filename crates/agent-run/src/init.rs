@@ -29,7 +29,10 @@ pub fn initialize(home: &Path) -> Result<Value> {
     {
         dir.write(Path::new("config.toml"), b"schema_version = 1\n", 0o600)?;
     }
-    let _ = Config::load(home)?;
+    // A valid schema-2 provider config is accepted as is; otherwise schema 1.
+    if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
+        let _ = Config::load(home)?;
+    }
     let store = Store::initialize(home)?;
     drop(store);
     Ok(json!({"home": path(home), "config": path(&config), "state": path(&home.join("state.db"))}))

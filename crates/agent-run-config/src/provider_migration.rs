@@ -17,6 +17,7 @@ use agent_run_domain::{
     types::PositiveFinite,
     Result,
 };
+use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -27,7 +28,8 @@ use std::{
 /// Every v1 model requires an explicit native alias, including identity
 /// aliases. Every old account label and the omitted/global selector require
 /// explicit global account ids. No credential bytes appear here.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeMapping {
     /// New arbitrary provider id, never inferred from the v1 runtime name.
     pub provider: ProviderId,
@@ -42,15 +44,39 @@ pub struct RuntimeMapping {
     /// Explicit first-party collector binding for a Lua source; supplied by
     /// the mapping caller because a script identity is never inferred from a
     /// runtime name.
+    #[serde(default)]
     pub collector: Option<CollectorBinding>,
+    /// Operator-authored provider recommendation prose, copied verbatim.
+    #[serde(default)]
+    pub recommendations: Vec<String>,
+    /// Operator-authored recommendation prose per historical model id,
+    /// copied verbatim; every key must name a historical model.
+    #[serde(default)]
+    pub model_recommendations: BTreeMap<String, Vec<String>>,
     /// One native model id per historical public model id.
     pub native_models: BTreeMap<String, String>,
     /// Model-specific hard constraints to carry into v2.
+    #[serde(default)]
     pub model_restrictions: BTreeMap<String, Vec<Constraint>>,
     /// Account used when the old request omitted its account label.
     pub global_account: AccountId,
     /// Global ids for every declared v1 account label.
+    #[serde(default)]
     pub labelled_accounts: BTreeMap<String, AccountId>,
+}
+
+/// The operator-authored migration mapping file (TOML) for [`plan_v1`].
+///
+/// `harnesses` declares both v2 harnesses; `runtimes` maps every enabled v1
+/// runtime name to its explicit provider, accounts, native models and
+/// optional recommendation prose. Unknown keys are rejected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationMapping {
+    /// The two native harness declarations of the new config.
+    pub harnesses: BTreeMap<HarnessId, HarnessConfig>,
+    /// One explicit mapping per historical runtime name.
+    pub runtimes: BTreeMap<String, RuntimeMapping>,
 }
 
 /// Read-only migration output for review and later coordinated publication.
@@ -118,6 +144,7 @@ pub fn plan_v1(
             || !mapped
                 .model_restrictions
                 .keys()
+                .chain(mapped.model_recommendations.keys())
                 .all(|model| old_models.contains(model))
         {
             return Err(invalid(
@@ -170,9 +197,13 @@ pub fn plan_v1(
                 native_model: mapped.native_models.get(id).cloned(),
                 params: BTreeMap::new(),
                 allowed_params: BTreeMap::new(),
-                recommendations: vec![],
                 restrictions: mapped
                     .model_restrictions
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default(),
+                recommendations: mapped
+                    .model_recommendations
                     .get(id)
                     .cloned()
                     .unwrap_or_default(),
@@ -184,7 +215,7 @@ pub fn plan_v1(
             auth_family: mapped.auth_family.clone(),
             models,
             bindings,
-            recommendations: vec![],
+            recommendations: mapped.recommendations.clone(),
             priority_multiplier: provider_weight,
             limits_source: mapped.limits_source,
             collector: mapped.collector.clone(),
