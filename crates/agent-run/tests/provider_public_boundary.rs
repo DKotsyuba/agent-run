@@ -289,3 +289,44 @@ async fn selection_busy_survives_every_public_transport() {
         .unwrap();
     assert_eq!(admitted, 0);
 }
+
+/// A role profile that is a symlink escaping the configured profile root is
+/// refused with the typed `PathEscapeError` class on the CLI, MCP and socket
+/// clients alike (never collapsed into `ValidationError`), without echoing
+/// the escaped target; an ordinary malformed argument stays
+/// `ValidationError`.
+#[tokio::test]
+async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
+    let broker = Broker::start();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("escaped-profile.md");
+    std::fs::copy(broker.home.join("profiles/review.md"), &target).unwrap();
+    std::fs::remove_file(broker.home.join("profiles/review.md")).unwrap();
+    std::os::unix::fs::symlink(&target, broker.home.join("profiles/review.md")).unwrap();
+    broker.assert_refused("PathEscapeError").await;
+    let output = cli(
+        &broker.home,
+        &[
+            "start",
+            "--provider",
+            "glm-user",
+            "--model",
+            "fixture",
+            "--profile",
+            "review",
+            "--task",
+            "fixture:answer",
+            "--workdir",
+            broker.home.to_str().unwrap(),
+        ],
+    );
+    let shown = String::from_utf8_lossy(&output.stderr);
+    assert!(!shown.contains(outside.path().to_str().unwrap()), "{shown}");
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let malformed = client
+        .call("start", Some(json!({"provider":"glm-user","bogus":true})))
+        .await
+        .unwrap_err();
+    assert!(matches!(malformed, Error::Validation(_)), "{malformed:?}");
+    assert_eq!(malformed.public().kind, "ValidationError");
+}

@@ -237,7 +237,7 @@ Notes for the loop:
 | -32700 | unparseable line, or line over 1 MiB |
 | -32600 | not a JSON-RPC 2.0 request; batch array; bad `id` |
 | -32601 | unknown method |
-| -32602 | invalid params (message carries the validation detail) |
+| -32602 | invalid params (message carries the validation detail); a more specific class such as `PathEscapeError` is kept in `error.data.code` |
 | -32000 | domain error; `error.data.code` holds the agent-run error class (e.g. `AgentNotFound`, `selection_busy`, `no_eligible_account`, `quota_exhausted`), plus context fields |
 | -32603 | internal error (bounded message, details in server log) |
 

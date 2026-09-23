@@ -408,7 +408,13 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
             Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
             Err(e) => {
                 if e.rpc_code() == -32602 {
-                    err(id, -32602, &e.public().message, None)
+                    // Invalid-params responses stay bare for ordinary
+                    // validation; a more specific typed class (for example
+                    // `PathEscapeError`) keeps its code in `data`.
+                    let public = e.public();
+                    let data = (public.kind != "ValidationError")
+                        .then(|| json!({"code":public.kind,"message":public.message}));
+                    err(id, -32602, &public.message, data)
                 } else {
                     domain_err(id, &e)
                 }
@@ -715,11 +721,12 @@ pub async fn client(home: &Path, method: &str, params: Value) -> Result<Value> {
 
 /// Decodes one broker JSON-RPC error object, shared by every client.
 ///
-/// `-32602` is a validation error; any other error keeps the broker's
-/// `data.code` and bounded `data` as [`Error::Broker`], whose public
-/// rendering reports that code when it is allowlisted, so the CLI, MCP and
-/// socket clients show the same class. The message is bounded to 512
-/// characters.
+/// A `-32602` response is a validation error unless its `data.code` names
+/// another allowlisted public class (for example `PathEscapeError`); every
+/// such typed error keeps the broker's `data.code` and bounded `data` as
+/// [`Error::Broker`], whose public rendering reports that code when it is
+/// allowlisted, so the CLI, MCP and socket clients show the same class. The
+/// message is bounded to 512 characters.
 fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
     let message: String = object
         .get("message")
@@ -728,7 +735,13 @@ fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
         .chars()
         .take(512)
         .collect();
-    if object.get("code").and_then(Value::as_i64) == Some(-32602) {
+    let typed = object
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .and_then(agent_run_domain::MachineCode::from_wire)
+        .is_some_and(|code| code != agent_run_domain::MachineCode::ValidationError);
+    if object.get("code").and_then(Value::as_i64) == Some(-32602) && !typed {
         return Error::Validation(message);
     }
     let (broker_error_code, broker_error_data) = object
