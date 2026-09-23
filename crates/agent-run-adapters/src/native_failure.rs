@@ -22,7 +22,16 @@
 //!   "rateLimitType"?:"five_hour"|"seven_day"|"seven_day_opus"|
 //!   "seven_day_sonnet"|"seven_day_overage_included"|"overage",...},
 //!   "uuid","session_id"}`. Only `rejected` with a recognized usage window
-//!   is quota exhaustion; anything else carries no exhaustion evidence.
+//!   is quota exhaustion; anything else carries no exhaustion evidence. The
+//!   same schema types the top-level assistant frame's optional `error` as
+//!   one of `authentication_failed`, `oauth_org_not_allowed`,
+//!   `account_on_hold`, `verification_required`, `billing_error`,
+//!   `rate_limit`, `overloaded`, `invalid_request`, `model_not_found`,
+//!   `server_error`, `unknown`, `max_output_tokens`,
+//!   `cloud_credential_error`. [`ClaudeSignals`] tracks both in order: a
+//!   later `allowed`/`allowed_warning` (or malformed) rate-limit event clears
+//!   a rejection, and a later assistant error of another class is the
+//!   terminal cause instead.
 //!
 //! Account, provider, model and attempt are never taken from these payloads;
 //! the supervisor attaches them from its own trusted context.
@@ -123,9 +132,69 @@ pub fn claude_frame(frame: &Value) -> Option<NativeFailure> {
     })
 }
 
+/// The current authoritative native state of one Claude Code attempt, fed
+/// every top-level stdout frame in order and asked once at the failed result.
+#[derive(Debug, Default)]
+pub struct ClaudeSignals {
+    /// Frames observed so far (orders the two signals below).
+    seen: u64,
+    /// The latest rate-limit state: `Some` only while a rejection stands.
+    rejected: Option<(u64, NativeFailure)>,
+    /// The latest main-loop assistant `error` control and when it came.
+    error: Option<(u64, String)>,
+}
+
+impl ClaudeSignals {
+    /// Observes one top-level frame. Rate-limit events replace the standing
+    /// state (a rejection of a known window sets it; any other status or a
+    /// malformed event clears it). A main-loop assistant frame's `error`
+    /// control is recorded; subagent frames (non-null `parent_tool_use_id`)
+    /// and every text field are ignored.
+    pub fn observe(&mut self, frame: &Value) {
+        self.seen += 1;
+        match frame["type"].as_str() {
+            Some("rate_limit_event") => {
+                self.rejected = claude_frame(frame).map(|failure| (self.seen, failure));
+            }
+            Some("assistant") if frame["parent_tool_use_id"].is_null() => {
+                if let Some(error) = frame["error"].as_str() {
+                    self.error = Some((self.seen, error.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The disposition of a failed turn from the current state: quota
+    /// exhaustion only while a rejection stands and no later assistant error
+    /// of another class ended the turn; otherwise that error's class, or
+    /// `None` when no authoritative control was seen.
+    pub fn terminal(&self) -> Option<NativeFailure> {
+        let later_error = self.error.as_ref().filter(|(at, _)| {
+            self.rejected
+                .as_ref()
+                .is_none_or(|(rejected, _)| at > rejected)
+        });
+        match (later_error, &self.rejected) {
+            (Some((_, error)), _) if error != "rate_limit" => Some(match error.as_str() {
+                "authentication_failed"
+                | "oauth_org_not_allowed"
+                | "account_on_hold"
+                | "verification_required"
+                | "cloud_credential_error" => NativeFailure::Auth,
+                "overloaded" => NativeFailure::Throttled,
+                _ => NativeFailure::Other,
+            }),
+            (_, Some((_, failure))) => Some(failure.clone()),
+            (Some(_), None) => Some(NativeFailure::Throttled),
+            (None, None) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{claude_frame, codex_turn_error, NativeFailure};
+    use super::{claude_frame, codex_turn_error, ClaudeSignals, NativeFailure};
     use serde_json::json;
 
     /// Only `usageLimitExceeded` is exhaustion; throttling, generic 429,
@@ -218,5 +287,56 @@ mod tests {
         ] {
             assert_eq!(claude_frame(&frame), None, "{frame}");
         }
+    }
+
+    /// Signal order decides: a standing rejection is quota; an `allowed`
+    /// event or a later non-rate-limit assistant error supersedes it; a
+    /// rate-limit assistant error without a rejection is throttling; subagent
+    /// errors and quoted text never count.
+    #[test]
+    fn claude_signal_state_follows_protocol_order() {
+        let rejected = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day"}});
+        let allowed = json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}});
+        let error = |kind: &str| json!({"type":"assistant","parent_tool_use_id":null,"error":kind,"message":{"content":[]}});
+        let run = |frames: &[&serde_json::Value]| {
+            let mut state = ClaudeSignals::default();
+            for frame in frames {
+                state.observe(frame);
+            }
+            state.terminal()
+        };
+        assert!(matches!(
+            run(&[&rejected]),
+            Some(NativeFailure::QuotaExhausted { .. })
+        ));
+        assert!(matches!(
+            run(&[&rejected, &error("rate_limit")]),
+            Some(NativeFailure::QuotaExhausted { .. })
+        ));
+        assert_eq!(run(&[&rejected, &allowed]), None);
+        assert_eq!(
+            run(&[&rejected, &error("authentication_failed")]),
+            Some(NativeFailure::Auth)
+        );
+        assert_eq!(
+            run(&[&rejected, &error("server_error")]),
+            Some(NativeFailure::Other)
+        );
+        assert_eq!(run(&[&error("rate_limit")]), Some(NativeFailure::Throttled));
+        assert!(matches!(
+            run(&[&error("authentication_failed"), &rejected]),
+            Some(NativeFailure::QuotaExhausted { .. })
+        ));
+        let subagent = json!({"type":"assistant","parent_tool_use_id":"t1","error":"authentication_failed","message":{"content":[]}});
+        assert!(matches!(
+            run(&[&rejected, &subagent]),
+            Some(NativeFailure::QuotaExhausted { .. })
+        ));
+        let quoted = json!({"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":rejected.to_string()}]}});
+        assert_eq!(run(&[&quoted]), None);
+        assert_eq!(
+            run(&[&json!({"type":"rate_limit_event","rate_limit_info":7})]),
+            None
+        );
     }
 }

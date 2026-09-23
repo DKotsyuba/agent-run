@@ -146,15 +146,29 @@ fn main() {
     // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
     // same JSON merely quoted in assistant text (which must not count).
     let quota_frame = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1790200000},"uuid":"fixture-uuid","session_id":session});
-    if task == "fixture:quota" {
+    if task == "fixture:quota" || task.starts_with("fixture:quota-then-") {
         emit(quota_frame.clone());
+    }
+    // A later protocol state supersedes the rejection: the window is allowed
+    // again, or the turn ends on an assistant error of another class.
+    if task == "fixture:quota-then-allowed" {
+        emit(
+            json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"uuid":"fixture-uuid-2","session_id":session}),
+        );
+    }
+    if task == "fixture:quota-then-auth" {
+        emit(
+            json!({"type":"assistant","session_id":session,"parent_tool_use_id":null,"error":"authentication_failed","message":{"content":[{"type":"text","text":"login required"}]}}),
+        );
     }
     if task == "fixture:quota-text" {
         emit(
             json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":quota_frame.to_string()}]}}),
         );
     }
-    let failed = task == "fixture:error" || task == "fixture:quota";
+    let failed = task == "fixture:error"
+        || task == "fixture:quota"
+        || task.starts_with("fixture:quota-then-");
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );

@@ -251,8 +251,9 @@ pub async fn run(
     }
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
-    // The last authoritative quota rejection frame of this attempt, if any.
-    let mut native_quota: Option<crate::adapters::native_failure::NativeFailure> = None;
+    // The attempt's current authoritative native state (rate-limit events
+    // and assistant error controls, in protocol order).
+    let mut signals = crate::adapters::native_failure::ClaudeSignals::default();
     let mut emitted = String::new();
     let mut saw_delta = false;
     let mut saw_answer = false;
@@ -402,6 +403,8 @@ pub async fn run(
             store.runtime_session(&record.id, s)?;
             session = Some(s.into());
         }
+        // Only top-level protocol frames feed the native signal state.
+        signals.observe(&v);
         match v.get("type").and_then(Value::as_str) {
             Some("stream_event") => {
                 let event = &v["event"];
@@ -551,12 +554,6 @@ pub async fn run(
                     }
                 }
             }
-            // Only a top-level protocol frame can carry quota evidence.
-            Some("rate_limit_event") => {
-                if let Some(failure) = crate::adapters::native_failure::claude_frame(&v) {
-                    native_quota = Some(failure);
-                }
-            }
             Some("result") => {
                 if final_result.is_some() {
                     continue;
@@ -596,7 +593,7 @@ pub async fn run(
                 }
                 let failed = outcome.status == Status::Failed;
                 final_result = Some(EngineResult {
-                    native_failure: native_quota.clone().filter(|_| failed),
+                    native_failure: signals.terminal().filter(|_| failed),
                     outcome,
                     answer: text.filter(|s| !s.is_empty()),
                     usage: Some(usage),

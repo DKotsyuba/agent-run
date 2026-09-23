@@ -10,6 +10,7 @@ use agent_run_domain::{
     catalog::{AccountRecord, AccountStatus, QuotaCandidate, QuotaCandidateSet, SelectionIntent},
     AccountId, PositiveFinite, ProviderStartRequest,
 };
+use rusqlite::OptionalExtension;
 use std::{
     fs,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -1472,4 +1473,43 @@ async fn quota_signals_cross_the_boundary_typed_and_attempt_bound() {
     assert_eq!(store.get(&quota).unwrap().status, Status::Failed);
     assert!(failures(&quoted).is_empty(), "quoted text is not a signal");
     assert_eq!(store.get(&quoted).unwrap().status, Status::Succeeded);
+}
+
+/// A rejection that a later protocol state supersedes is not the terminal
+/// cause: an `allowed` event, or an assistant `authentication_failed` error
+/// after the rejection, ends the failed turn without a quota disposition.
+#[tokio::test]
+async fn superseded_quota_rejections_do_not_classify_the_failure() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    for (task, request_id, expected) in [
+        ("fixture:quota-then-allowed", "sup-1", None),
+        ("fixture:quota-then-auth", "sup-2", Some("auth")),
+        ("fixture:quota", "sup-3", Some("quota_exhausted")),
+    ] {
+        let mut request = request(&home);
+        request.task = task.into();
+        request.request_id = Some(request_id.into());
+        let revision = Store::open(&home)
+            .unwrap()
+            .quota_capacity_revision()
+            .unwrap();
+        let admitted = service
+            .admit_provider_trusted(request, candidates(revision))
+            .unwrap();
+        let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        run_to_end(&home, &id).await;
+        let store = Store::open(&home).unwrap();
+        assert_eq!(store.get(&id).unwrap().status, Status::Failed, "{task}");
+        let class: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT json_extract(data_json,'$.class') FROM events WHERE agent_id=? AND kind='native_failure'",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(class.as_deref(), expected, "{task}");
+    }
 }
