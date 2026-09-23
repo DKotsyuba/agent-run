@@ -231,16 +231,12 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         }
     };
     let snapshot = if row.parent_agent_id.is_some() {
-        // The stored launch runtime and profile, never current config, are
-        // the only authority for reconstructing an older home's plugins.
-        materialize::verify_for_resume(
+        materialize::verify(
             &runtime_home,
             identity
                 .snapshot_sha256
                 .as_deref()
                 .ok_or_else(|| invalid("resume snapshot proof missing"))?,
-            &runtime,
-            &identity.profile,
         )?
     } else {
         let (snapshot, digest) = materialize::materialize(

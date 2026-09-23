@@ -183,7 +183,7 @@ fn hook_manifest_path(value: Option<&Value>) -> Result<PathBuf> {
 }
 
 /// Reads one usable plugin manifest and returns its safe identity and hook path.
-pub(crate) fn manifest(path: &Path) -> Result<(String, String, PathBuf)> {
+fn manifest(path: &Path) -> Result<(String, String, PathBuf)> {
     let dir = fs::Dir::open(path)?;
     for file in [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"] {
         if let Some(data) = dir.optional(Path::new(file), 64 * 1024)? {
