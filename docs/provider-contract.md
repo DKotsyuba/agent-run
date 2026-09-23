@@ -81,8 +81,14 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   provider-reported windows with remaining percent, optional reset,
   observation time, and validity. Unknown values remain absent. Validation
   bounds membership and rejects foreign keys, duplicate windows, invalid
-  percentages, and nonfinite times. Repeated physical keys across models
-  must have identical window sets and facts, regardless of window order.
+  percentages, and nonfinite times. Membership is per physical window
+  `(key, source, window)`: models sharing a pool may each carry only the
+  windows that govern them, and one physical window repeated under several
+  models must carry identical facts. The store persists each physical
+  window's own members, and the ranker applies samples and durable latches
+  only to the models of that exact `(key, source, window)`, so after a
+  collector source switch a carried latch keeps restricting only its own
+  models and the new source's facts never release or extend it.
   Scoring stays outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
   auto or pinned intent, deterministically ordered rank groups, and the

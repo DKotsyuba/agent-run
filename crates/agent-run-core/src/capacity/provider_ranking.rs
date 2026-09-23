@@ -49,14 +49,17 @@ struct AccountFacts {
     /// Only rows carrying an explicit account/quota key identity appear.
     history: BTreeMap<PhysicalQuotaKey, BTreeMap<Key, Vec<Sample>>>,
     /// Durable exhaustion latches per physical key: each entry is one latched
-    /// window's name and reset instant, with `None` meaning "until a later
-    /// observation supersedes it". Latches survive sample retention.
-    latches: BTreeMap<PhysicalQuotaKey, Vec<(String, Option<f64>)>>,
-    /// The model lanes each physical window governs, from that window's newest
-    /// sample (`payload_json.models`, written by `record_quota_snapshot` from
-    /// the normalized snapshot) paired with the sample's `(observed_at, id)`
-    /// order. A window whose newest sample records no membership has `None`.
-    membership: BTreeMap<(PhysicalQuotaKey, String), WindowMembership>,
+    /// window's source, name and reset instant, with `None` meaning "until a
+    /// later observation supersedes it". Latches survive sample retention.
+    latches: BTreeMap<PhysicalQuotaKey, Vec<(String, String, Option<f64>)>>,
+    /// The model lanes each physical window `(key, source, window)` governs,
+    /// from that window's newest sample (`payload_json.models`, written by
+    /// `record_quota_snapshot` from the normalized snapshot) paired with the
+    /// sample's `(observed_at, id)` order. The source is part of the identity:
+    /// the same window name from another source (a carried latch after a
+    /// source switch) keeps its own members. A window whose newest sample
+    /// records no membership has `None`.
+    membership: BTreeMap<(PhysicalQuotaKey, String, String), WindowMembership>,
 }
 
 /// One physical window's newest recorded membership: the `(observed_at, id)`
@@ -65,8 +68,8 @@ struct AccountFacts {
 type WindowMembership = ((f64, i64), Option<BTreeSet<String>>);
 
 impl AccountFacts {
-    /// Whether window `window` of pool `key` governs the model `lane` (its
-    /// native alias).
+    /// Whether window `window` observed by `source` on pool `key` governs the
+    /// model `lane` (its native alias).
     ///
     /// The window's newest recorded membership must name the lane exactly: a
     /// pool id is never read as a model name, so `primary`, `secondary` or
@@ -79,10 +82,14 @@ impl AccountFacts {
         &self,
         account: &AccountId,
         key: &PhysicalQuotaKey,
+        source: &str,
         window: &str,
         lane: &str,
     ) -> bool {
-        match self.membership.get(&(key.clone(), window.to_owned())) {
+        match self
+            .membership
+            .get(&(key.clone(), source.to_owned(), window.to_owned()))
+        {
             Some((_, Some(models))) => models.contains(lane),
             _ => {
                 key.as_str()
@@ -97,14 +104,14 @@ impl AccountFacts {
     /// fabricated for unobserved lanes.
     fn lane_keys(&self, account: &AccountId, lane: &str) -> BTreeSet<PhysicalQuotaKey> {
         let sampled = self.history.iter().filter(|(key, windows)| {
-            windows
-                .keys()
-                .any(|identity| self.governs(account, key, &identity.window, lane))
+            windows.keys().any(|identity| {
+                self.governs(account, key, &identity.source, &identity.window, lane)
+            })
         });
         let latched = self.latches.iter().filter(|(key, latches)| {
             latches
                 .iter()
-                .any(|(window, _)| self.governs(account, key, window, lane))
+                .any(|(source, window, _)| self.governs(account, key, source, window, lane))
         });
         sampled
             .map(|(key, _)| key.clone())
@@ -133,10 +140,11 @@ impl AccountFacts {
         self.latches
             .get(key)?
             .iter()
-            .filter(|(window, reset)| {
-                self.governs(account, key, window, lane) && reset.is_none_or(|reset| reset > at)
+            .filter(|(source, window, reset)| {
+                self.governs(account, key, source, window, lane)
+                    && reset.is_none_or(|reset| reset > at)
             })
-            .map(|(_, reset)| *reset)
+            .map(|(_, _, reset)| *reset)
             .min_by(|a, b| {
                 (a.is_none(), a.unwrap_or(f64::INFINITY))
                     .partial_cmp(&(b.is_none(), b.unwrap_or(f64::INFINITY)))
@@ -233,7 +241,11 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
                             .collect::<BTreeSet<_>>()
                     })
                 });
-            let window = (key.clone(), sample.key.window.clone());
+            let window = (
+                key.clone(),
+                sample.key.source.clone(),
+                sample.key.window.clone(),
+            );
             let newest = account_facts
                 .membership
                 .get(&window)
@@ -250,12 +262,16 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
                 .push(sample);
         }
         let mut statement = tx.prepare(
-            "SELECT quota_key,window_id,reset_at FROM quota_exhaustion WHERE account_id=?",
+            "SELECT quota_key,source,window_id,reset_at FROM quota_exhaustion WHERE account_id=?",
         )?;
         let rows = statement.query_map([account.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                (row.get::<_, String>(1)?, row.get::<_, Option<f64>>(2)?),
+                (
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ),
             ))
         })?;
         for row in rows {
@@ -348,7 +364,7 @@ fn score_lane(
             if let Some(windows) = account_facts.history.get(key) {
                 // Only windows that govern this model lane enter its score.
                 for (identity, history) in windows.iter().filter(|(identity, _)| {
-                    account_facts.governs(account, key, &identity.window, lane)
+                    account_facts.governs(account, key, &identity.source, &identity.window, lane)
                 }) {
                     pool_keys.insert(identity.clone());
                     forecasts.push(forecast(identity, history, at));

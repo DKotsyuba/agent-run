@@ -629,3 +629,69 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
     );
     assert!(listed[1].1.as_f64().is_some_and(f64::is_finite), "{order}");
 }
+
+/// A collector source switch with a carried latch stays source-scoped from
+/// the normalizer through the store, the ranker, the public order and
+/// ordinary admission: source `s1` exhausted only `m-a`'s `five_hour`
+/// window; source `s2` then reports the same pool/window name for `m-b`
+/// only. `m-a` stays exhausted (its carried latch is not released by
+/// `s2`'s unrelated fact) and `m-b` stays available (it never inherits
+/// `s1`'s exhaustion).
+#[tokio::test]
+async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
+    use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
+    let temp = ranking_home();
+    let root = temp.path();
+    fs::write(
+        root.join("config.toml"),
+        format!(
+            "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
+            r = root.display()
+        ),
+    )
+    .unwrap();
+    agent_run_store::Store::open(root)
+        .unwrap()
+        .conn
+        .execute("DELETE FROM capacity_samples", [])
+        .unwrap();
+    let account = "acct-a".parse().unwrap();
+    let now = agent_run_core::domain::now();
+    let round = |source: &str, model: &str, remaining: f64, observed: f64| {
+        let scope = CollectorScope {
+            runtime: "g".into(),
+            source: source.into(),
+            models: ["m-a".to_owned(), "m-b".to_owned()].into(),
+        };
+        let raw = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
+            "models":[model],"remaining_percent":remaining,"reset_at":now + 3600.0,
+            "observed_at":observed}]});
+        let snapshot = normalize_collector_output(&account, &scope, &raw, now, 256, 256).unwrap();
+        agent_run_store::quota::record_quota_snapshot(root, "g", &snapshot, 100, now).unwrap();
+    };
+    round("s1", "m-a", 0.0, now - 5.0);
+    round("s2", "m-b", 50.0, now - 1.0);
+    let service = Service::new(root.to_path_buf());
+    let status = |model: &str| {
+        let order = service
+            .capacity_order(CapacityOrderQuery {
+                model: Some(model.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        order["providers"][0]["models"][0]["quota"]["status"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(status("m-a"), "exhausted");
+    assert_eq!(status("m-b"), "available");
+    let request = |model: &str, id: &str| -> agent_run_domain::ProviderStartRequest {
+        serde_json::from_value(json!({"provider":"g","model":model,"profile":"review",
+            "task":"task","workdir":root,"request_id":id}))
+        .unwrap()
+    };
+    let refused = service.admit_provider(request("m-a", "adm-a")).unwrap_err();
+    assert_eq!(refused.public().kind, "quota_exhausted", "{refused:?}");
+    service.admit_provider(request("m-b", "adm-b")).unwrap();
+}
