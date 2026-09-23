@@ -573,6 +573,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         };
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
         let exit = process.reap().await;
+        #[cfg(feature = "test-fixtures")]
+        let cleanup = injected_cleanup_error(home, &attempt_id, store, cleanup)?;
         let cleanup = cleanup?;
         store.provider_cleanup(id, &attempt_id, &cleanup)?;
         store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
@@ -956,6 +958,33 @@ fn spawn_barrier(home: &Path, attempt: &str, store: &Store) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+/// Test-only: when `<home>/fixture-cleanup-error-<n>` exists for this
+/// attempt's number `n`, report the cleanup observation as unavailable, as
+/// the platform does when it cannot observe the group. Absent in production.
+#[cfg(feature = "test-fixtures")]
+fn injected_cleanup_error(
+    home: &Path,
+    attempt: &str,
+    store: &Store,
+    cleanup: Result<process::Cleanup>,
+) -> Result<Result<process::Cleanup>> {
+    let number: u32 =
+        store
+            .conn
+            .query_row("SELECT number FROM attempts WHERE id=?", [attempt], |row| {
+                row.get(0)
+            })?;
+    if home
+        .join(format!("fixture-cleanup-error-{number}"))
+        .exists()
+    {
+        return Ok(Err(Error::Runtime(
+            "process cleanup observation unavailable".into(),
+        )));
+    }
+    Ok(cleanup)
 }
 
 /// The provider run's one overall deadline: its durable admission time plus

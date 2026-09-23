@@ -2506,3 +2506,47 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
         vec!["leader_gone_descendants_unverifiable".to_owned()]
     );
 }
+
+/// An unobservable cleanup of the exhausted attempt A ends the supervisor
+/// without success, switch or release: the run stays unproven until
+/// reconciliation marks it lost, and A stays owned with a typed
+/// `attempt_cleanup_unresolved` blocker; no attempt B exists.
+#[tokio::test]
+async fn cleanup_error_never_switches_or_releases() {
+    let (_temp, home) = codex_home(["exhausted", "ok"]);
+    fs::write(home.join("fixture-cleanup-error-1"), "").unwrap();
+    let id = codex_admit(&home, "cleanup-error", None);
+    let mut child = supervisor(&home, &id);
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !exit.success(),
+        "the supervisor reports the unproven cleanup"
+    );
+    let service = Service::new(home.clone());
+    service.reconcile().unwrap();
+    service.reconcile().unwrap();
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::Lost, "{:?}", row.failure_text);
+    let attempts = attempts(&home, &id);
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].3, 1, "unproven cleanup keeps ownership");
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='attempt_cleanup_unresolved'",
+            &id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='account_switched'",
+            &id
+        ),
+        0
+    );
+}
