@@ -103,7 +103,7 @@ async fn run(arguments: &[String]) -> Result<Value, String> {
     let secret = QuotaCredentialReader::new(claude_home)
         .read(&reference)
         .map_err(|error| error.to_string().chars().take(96).collect::<String>())?;
-    let url = format!("https://{origin}{path}");
+    let url = format!("{origin}{path}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
