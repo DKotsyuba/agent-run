@@ -86,17 +86,30 @@ impl Store {
         Ok((attempt, account.parse()?))
     }
 
-    /// Marks the owned attempt as entering spawn before any child is created.
-    pub fn provider_spawning(&self, id: &AgentId, attempt: &str) -> Result<()> {
+    /// Claims the owned prepared attempt for spawning before any child is
+    /// created. Returns `false`, changing nothing, when a cancel is pending or
+    /// claimed: the claim and the cancel check are one statement, so an
+    /// accepted cancel can never race past this boundary.
+    pub fn provider_spawning(&self, id: &AgentId, attempt: &str) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE attempts SET phase='spawning',state='starting' \
-             WHERE id=? AND agent_id=? AND ownership_active=1 AND phase='prepared'",
+             WHERE id=?1 AND agent_id=?2 AND ownership_active=1 AND phase='prepared' \
+             AND NOT EXISTS (SELECT 1 FROM commands WHERE agent_id=?2 AND kind='cancel' AND state IN ('pending','claimed'))",
             params![attempt, id.as_str()],
         )?;
-        if changed != 1 {
-            return Err(Error::Conflict);
+        if changed == 1 {
+            return Ok(true);
         }
-        Ok(())
+        let cancelled: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='cancel' AND state IN ('pending','claimed'))",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        if cancelled {
+            Ok(false)
+        } else {
+            Err(Error::Conflict)
+        }
     }
 
     /// Returns a pre-child OS spawn failure to the prepared phase so the

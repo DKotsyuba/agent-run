@@ -269,6 +269,13 @@ fn app_server() {
                 emit(json!({"id":id,"result":echo}));
             }
             "turn/start" => {
+                // `slow` in the auth file makes each turn take 1.5 s.
+                if std::fs::read_to_string(home.join("auth.json"))
+                    .map(|text| text.contains("slow"))
+                    .unwrap_or(false)
+                {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
                 turns += 1;
                 let turn = format!("turn-{turns}");
                 let input = params["input"][0]["text"].as_str().unwrap_or("").to_owned();

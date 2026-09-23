@@ -466,7 +466,41 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 session,
             )?;
         }
-        store.provider_spawning(id, &attempt_id)?;
+        #[cfg(feature = "test-fixtures")]
+        spawn_barrier(home, &attempt_id, store)?;
+        // A switched attempt re-checks, at the handoff itself, that its
+        // selected account is still enabled and the current configuration
+        // still permits the frozen execution; otherwise it never spawns.
+        if continuing.is_some() {
+            if let Some(blocker) = handoff_blocker(home, store, &account, &identity)? {
+                if !store.provider_never_spawned(id)? {
+                    return Err(invalid("provider attempt was already spawning"));
+                }
+                store.event(id, "failover_blocked", &json!({"reason":blocker}))?;
+                let mut outcome = Outcome::failure("quota_exhausted");
+                outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
+                store.finish(id, &outcome, None, None)?;
+                return commands::complete_terminal(store, id);
+            }
+        }
+        // The run's one overall deadline (admission time + its timeout) is
+        // re-read from durable state before every spawn; an expired run never
+        // spawns another attempt.
+        let deadline = run_deadline(store, id)?;
+        if domain::now() >= deadline && !store.cancel_pending(id)? {
+            if !store.provider_never_spawned(id)? {
+                return Err(invalid("provider attempt was already spawning"));
+            }
+            return timed_out_before_spawn(id, store);
+        }
+        // The spawn claim itself refuses while a cancel is pending, so an
+        // accepted cancel can never race past this boundary.
+        if !store.provider_spawning(id, &attempt_id)? {
+            if !store.provider_never_spawned(id)? {
+                return Err(invalid("provider attempt was already spawning"));
+            }
+            return cancelled_before_spawn(id, store);
+        }
         store.event(id, "phase", &json!({"phase":"spawning"}))?;
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
@@ -479,6 +513,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Err(error) => return Err(error),
         };
         let switched = continuing.is_some();
+        let remaining = std::time::Duration::from_secs_f64((deadline - domain::now()).max(0.0));
         let execution = async {
             let leader = process
                 .owner
@@ -529,8 +564,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 )
                 .await
             }
-        }
-        .await;
+        };
+        // Only the remainder of the run's deadline is available to this
+        // attempt; on expiry the runner is dropped and the group cleaned.
+        let (execution, expired) = match tokio::time::timeout(remaining, execution).await {
+            Ok(execution) => (execution, false),
+            Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
+        };
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
         let exit = process.reap().await;
         let cleanup = cleanup?;
@@ -579,7 +619,12 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             state["native_failure"] = data;
         }
         store.provider_history(id, &attempt_id, &state)?;
-        if quota && !cancelled && result.outcome.status == Status::Failed {
+        // Cancellation wins over expiry; an expired run takes no next attempt.
+        let expired = expired || domain::now() >= run_deadline(store, id)?;
+        if expired && !cancelled {
+            store.event(id, "run_deadline_expired", &json!({"deadline":deadline}))?;
+        }
+        if quota && !cancelled && !expired && result.outcome.status == Status::Failed {
             match failover(home, id, store, &identity) {
                 Ok(next) => {
                     store.event(id, "account_switched", &next)?;
@@ -609,7 +654,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         };
         let outcome = verify::verify_completion(
             Some(result.outcome),
-            cancelled.then_some(verify::StopReason::Cancel),
+            if cancelled {
+                Some(verify::StopReason::Cancel)
+            } else {
+                expired.then_some(verify::StopReason::Timeout)
+            },
             Some(&evidence),
             cleanup.group_gone,
             store.last_progress(id)?,
@@ -812,6 +861,72 @@ fn history_root(
                     .map(|home| std::path::PathBuf::from(home).join(".claude"))
             }),
     }
+}
+/// Why a switched attempt must not spawn after all: its account is no longer
+/// enabled (`account_revoked_at_handoff`) or the current configuration no
+/// longer permits the frozen execution (`current_policy_refused`).
+fn handoff_blocker(
+    home: &Path,
+    store: &Store,
+    account: &agent_run_domain::catalog::AccountId,
+    identity: &ProviderLaunchIdentity,
+) -> Result<Option<&'static str>> {
+    let enabled = store
+        .account(account)?
+        .is_some_and(|record| record.status == agent_run_domain::catalog::AccountStatus::Enabled);
+    if !enabled {
+        return Ok(Some("account_revoked_at_handoff"));
+    }
+    let permitted = agent_run_config::provider_config::ProviderConfig::load(home)
+        .ok()
+        .is_some_and(|(current, _)| {
+            crate::service::current_policy_permits(&current, identity, &identity.provider_request)
+                .is_ok()
+        });
+    Ok((!permitted).then_some("current_policy_refused"))
+}
+
+/// Test-only handoff barrier: when `<home>/fixture-pause-spawn-<n>` exists
+/// for this attempt's number `n`, write `fixture-paused-spawn-<n>` and wait
+/// (at most 20 s) for `fixture-resume-spawn-<n>`. Absent in production.
+#[cfg(feature = "test-fixtures")]
+fn spawn_barrier(home: &Path, attempt: &str, store: &Store) -> Result<()> {
+    let number: u32 =
+        store
+            .conn
+            .query_row("SELECT number FROM attempts WHERE id=?", [attempt], |row| {
+                row.get(0)
+            })?;
+    if !home.join(format!("fixture-pause-spawn-{number}")).exists() {
+        return Ok(());
+    }
+    std::fs::write(home.join(format!("fixture-paused-spawn-{number}")), "")?;
+    for _ in 0..400 {
+        if home.join(format!("fixture-resume-spawn-{number}")).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The provider run's one overall deadline: its durable admission time plus
+/// its stored timeout. It spans every attempt and preparation; a switch never
+/// restarts it.
+fn run_deadline(store: &Store, id: &AgentId) -> Result<f64> {
+    Ok(store.conn.query_row(
+        "SELECT created_at + timeout_seconds FROM agents WHERE id=?",
+        [id.as_str()],
+        |row| row.get(0),
+    )?)
+}
+/// Ends a run whose deadline expired before its next attempt spawned; the
+/// caller has already closed that attempt with never-spawned evidence.
+fn timed_out_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
+    let mut outcome = Outcome::failure("timed_out");
+    outcome.status = Status::TimedOut;
+    store.finish(id, &outcome, None, None)?;
+    commands::complete_terminal(store, id)
 }
 fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
     let mut outcome = Outcome::failure("cancelled_before_spawn");

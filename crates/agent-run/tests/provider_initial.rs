@@ -2083,3 +2083,206 @@ async fn reconcile_closes_a_never_spawned_owned_attempt() {
     assert!(proof.contains("never_spawned"), "{proof}");
     assert_eq!(attempts(&home, &id).len(), 2);
 }
+
+/// Admits one automatic `codex-user` run with an optional timeout, without
+/// starting its supervisor.
+fn codex_admit(home: &Path, request_id: &str, timeout: Option<f64>) -> AgentId {
+    let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
+        "provider":"codex-user","model":"fixture","profile":"review",
+        "task":"fixture:original-task","workdir":home,"request_id":request_id,
+        "timeout_seconds":timeout,
+        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let admitted = Service::new(home.to_path_buf())
+        .admit_provider(request)
+        .unwrap();
+    serde_json::from_value(admitted["agent_id"].clone()).unwrap()
+}
+
+/// (created_at, finished_at) of the agent and of attempt `number`.
+fn times(home: &Path, id: &AgentId, number: u32) -> ((f64, f64), (f64, f64)) {
+    let store = Store::open(home).unwrap();
+    let agent = store
+        .conn
+        .query_row(
+            "SELECT created_at,finished_at FROM agents WHERE id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let attempt = store
+        .conn
+        .query_row(
+            "SELECT created_at,finished_at FROM attempts WHERE agent_id=? AND number=?",
+            rusqlite::params![id.as_str(), number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (agent, attempt)
+}
+
+/// One deadline spans the whole run: A (a 1.5 s exhausted turn) consumes part
+/// of a 5 s budget, B hangs and is stopped at the ORIGINAL deadline — not 5 s
+/// after B started (a fresh budget would end at least ~7 s after admission) — with confirmed cleanup, `timed_out` once, and no third
+/// attempt.
+#[tokio::test]
+async fn one_deadline_spans_attempts_and_cleans_a_hung_engine() {
+    let (_temp, home) = codex_home(["exhausted-slow", "ok-hold"]);
+    let id = codex_admit(&home, "deadline-1", Some(5.0));
+    run_to_end(&home, &id).await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::TimedOut, "{:?}", row.failure_text);
+    let attempts = attempts(&home, &id);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert!(
+        attempts.iter().all(|attempt| attempt.3 == 0),
+        "{attempts:?}"
+    );
+    let ((created, finished), (b_created, b_finished)) = times(&home, &id, 2);
+    assert!(b_created - created >= 1.4, "A consumed part of the budget");
+    assert!(
+        finished - created < 6.3,
+        "B only had the remainder: {}",
+        finished - created
+    );
+    assert!(
+        b_finished - b_created < 5.0 - 1.4,
+        "B's own runtime was the remainder"
+    );
+    let proof: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE agent_id=? AND number=2",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(proof.contains("\"confirmed\":true"), "{proof}");
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+}
+
+/// A deadline that expires while A finishes (positioned by shortening the
+/// durable timeout during A) allocates and spawns no B.
+#[tokio::test]
+async fn expiry_between_attempts_spawns_no_next_attempt() {
+    let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
+    let shorten = home.clone();
+    let id = held_codex_run(&home, move |_| {
+        Store::open(&shorten)
+            .unwrap()
+            .conn
+            .execute("UPDATE agents SET timeout_seconds=0.001", [])
+            .unwrap();
+    })
+    .await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::TimedOut, "{:?}", row.failure_text);
+    assert_eq!(attempts(&home, &id).len(), 1);
+}
+
+/// Handoff barrier after B was allocated and planned but before it spawned:
+/// a cancel accepted there, a revoked account, or a newly refused policy each
+/// stop B from spawning (never-spawned evidence, no process), with the typed
+/// outcome and one delivery.
+#[tokio::test]
+async fn handoff_after_allocation_honours_cancel_and_revocation() {
+    for case in ["cancel", "revoke", "policy"] {
+        let (_temp, home) = codex_home(["exhausted", "ok"]);
+        let id = codex_admit(&home, "handoff-1", None);
+        fs::write(home.join("fixture-pause-spawn-2"), "").unwrap();
+        let mut child = supervisor(&home, &id);
+        for _ in 0..400 {
+            if home.join("fixture-paused-spawn-2").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            home.join("fixture-paused-spawn-2").exists(),
+            "{case}: B paused"
+        );
+        match case {
+            "cancel" => {
+                Service::new(home.clone()).cancel(&id).unwrap();
+            }
+            "revoke" => Store::open(&home)
+                .unwrap()
+                .disable_account(&"acct-cx-b".parse().unwrap())
+                .unwrap(),
+            _ => edit_config(&home, |config| {
+                config["providers"]["codex-user"]["models"][0]
+                    .as_table_mut()
+                    .unwrap()
+                    .insert(
+                        "restrictions".into(),
+                        toml::Value::Array(vec!["filesystem_read_isolation".into()]),
+                    );
+            }),
+        }
+        fs::write(home.join("fixture-resume-spawn-2"), "").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let row = Store::open(&home).unwrap().get(&id).unwrap();
+        let (process, proof, owned): (Option<String>, String, i64) = Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT process_identity,cleanup_proof_json,ownership_active FROM attempts WHERE agent_id=? AND number=2",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(process.is_none(), "{case}: B never spawned");
+        assert!(proof.contains("never_spawned"), "{case}: {proof}");
+        assert_eq!(owned, 0, "{case}");
+        match case {
+            "cancel" => assert_eq!(row.status, Status::Cancelled),
+            "revoke" => assert!(
+                row.failure_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("account_revoked_at_handoff"),
+                "{:?}",
+                row.failure_text
+            ),
+            _ => assert!(
+                row.failure_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("current_policy_refused"),
+                "{:?}",
+                row.failure_text
+            ),
+        }
+        assert_eq!(
+            count(
+                &home,
+                "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+                &id
+            ),
+            1,
+            "{case}"
+        );
+        assert_eq!(
+            count(
+                &home,
+                "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+                &id
+            ),
+            1,
+            "{case}"
+        );
+    }
+}
