@@ -860,6 +860,23 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        // A parent that already has a child is refused for that reason (the
+        // child's own turns legitimately changed the parent's sealed history);
+        // the unique parent index remains the final authority.
+        let existing: Option<String> = Store::open(&self.home)?
+            .conn
+            .query_row(
+                "SELECT id FROM agents WHERE parent_agent_id=? LIMIT 1",
+                [parent.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(child) = existing {
+            return Err(invalid(format!(
+                "agent {} has already been resumed by {child}",
+                parent.id
+            )));
+        }
         let session = parent
             .runtime_session_id
             .as_deref()

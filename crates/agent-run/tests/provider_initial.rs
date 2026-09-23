@@ -900,6 +900,10 @@ async fn provider_resume_continues_the_proven_native_session() {
         .unwrap();
     assert_eq!(selected, "acct-work");
     assert!(cleanup.is_some());
+    // After the child ran (and appended to the native history), a second
+    // resume of the parent is refused as already resumed.
+    let again = resume("resume-4").unwrap_err().to_string();
+    assert!(again.contains("already been resumed"), "{again}");
     // The child's own attempt sealed the continued history (both turns).
     assert_eq!(
         attempt_state(&home, &child_id)["native_history"]["seal"]["records"],
