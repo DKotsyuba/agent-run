@@ -460,6 +460,11 @@ async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
         .unwrap();
     assert_eq!(result["created"], true);
     assert_eq!(result["agent"]["status"], "failed", "{result}");
+    // The exported DTO accepts the real provider start response.
+    let typed: agent_run_domain::views::StartResult =
+        serde_json::from_value(result.clone()).unwrap();
+    assert_eq!(typed.attempt_id.as_deref(), result["attempt_id"].as_str());
+    assert!(typed.attempt_id.is_some());
     let id: AgentId = serde_json::from_value(result["agent_id"].clone()).unwrap();
     let store = Store::open(&home).unwrap();
     let row = store.get(&id).unwrap();

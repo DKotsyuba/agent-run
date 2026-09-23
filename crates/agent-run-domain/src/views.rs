@@ -123,6 +123,10 @@ pub struct StartResult {
     pub agent_id: AgentId,
     /// Whether this call created rather than replayed admission.
     pub created: bool,
+    /// The provider attempt the admission (or its replay) owns; absent in
+    /// historical runtime start responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     /// Immediately committed status snapshot.
     pub agent: AgentView,
 }

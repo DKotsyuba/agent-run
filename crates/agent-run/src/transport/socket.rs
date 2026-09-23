@@ -1,7 +1,7 @@
 //! Bounded LF-delimited JSON-RPC 2.0 over a private same-user Unix socket.
 use super::frame;
 use crate::{dispatch, service::Service, Error, Result};
-use agent_run_domain::types::StartRequest;
+use agent_run_domain::ProviderStartRequest;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
@@ -43,6 +43,8 @@ pub struct BrokerStartResult {
     pub agent_id: String,
     /// Whether this request admitted a new row rather than replaying one.
     pub created: bool,
+    /// The provider attempt the admission owns; absent from legacy brokers.
+    pub attempt_id: Option<String>,
 }
 
 /// The split broker stream retained by one [`BrokerClient`] session.
@@ -134,8 +136,10 @@ impl BrokerClient {
         unreachable!("the bounded broker retry loop always returns")
     }
 
-    /// Serializes a typed start request and rejects malformed broker acknowledgements.
-    pub async fn start(&self, request: &StartRequest) -> Result<BrokerStartResult> {
+    /// Serializes the strict schema-2 provider start request the broker
+    /// dispatcher accepts (never the retired `runtime` shape) and rejects
+    /// malformed broker acknowledgements.
+    pub async fn start(&self, request: &ProviderStartRequest) -> Result<BrokerStartResult> {
         let params = serde_json::to_value(request)?;
         let result = self.call("start", Some(params)).await?;
         let Some(object) = result.as_object() else {
@@ -153,9 +157,19 @@ impl BrokerClient {
                 "broker returned an invalid start result".into(),
             ));
         };
+        let attempt_id = match object.get("attempt_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(attempt)) => Some(attempt.clone()),
+            Some(_) => {
+                return Err(Error::Runtime(
+                    "broker returned an invalid start result".into(),
+                ))
+            }
+        };
         Ok(BrokerStartResult {
             agent_id: agent_id.into(),
             created,
+            attempt_id,
         })
     }
 
