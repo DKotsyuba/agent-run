@@ -615,6 +615,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             data["account"] = json!(account);
             data["provider"] = json!(identity.authority.provider);
             data["model"] = json!(identity.authority.model);
+            if let Some((lane, window)) = latch_mapping(&identity, failure) {
+                let reset = data["resets_at"].as_f64();
+                store.latch_native_exhaustion(
+                    &account,
+                    lane,
+                    window,
+                    "claude-rate-limit-event",
+                    domain::now(),
+                    reset,
+                )?;
+                data["latched"] = json!({"lane":lane,"window":window});
+            }
             store.event(id, "native_failure", &data)?;
             state["native_failure"] = data;
         }
@@ -862,6 +874,42 @@ fn history_root(
             }),
     }
 }
+/// The exact physical pool of an authoritative exhaustion, when the
+/// provider's own collector mapping establishes it: a Claude Code provider
+/// whose limits come from the first-party `anthropic_usage` collector maps
+/// `five_hour` to `primary`/`five_hour` and `seven_day` to
+/// `secondary`/`seven_day` (both over every bound model, as that collector
+/// records them). Model-scoped weekly windows, overage, Codex's windowless
+/// `usageLimitExceeded` and every other provider stay unmapped: they only
+/// exclude the account for this run.
+fn latch_mapping(
+    identity: &ProviderLaunchIdentity,
+    failure: &adapters::native_failure::NativeFailure,
+) -> Option<(&'static str, &'static str)> {
+    let adapters::native_failure::NativeFailure::QuotaExhausted {
+        window: Some(window),
+        ..
+    } = failure
+    else {
+        return None;
+    };
+    let provider = identity
+        .provider_config
+        .providers
+        .get(&identity.authority.provider)?;
+    if identity.authority.harness != HarnessId::ClaudeCode
+        || provider.limits_source != agent_run_domain::LimitsSource::Lua
+        || provider.collector.as_ref()?.script != "anthropic_usage"
+    {
+        return None;
+    }
+    match window.as_str() {
+        "five_hour" => Some(("primary", "five_hour")),
+        "seven_day" => Some(("secondary", "seven_day")),
+        _ => None,
+    }
+}
+
 /// Why a switched attempt must not spawn after all: its account is no longer
 /// enabled (`account_revoked_at_handoff`) or the current configuration no
 /// longer permits the frozen execution (`current_policy_refused`).

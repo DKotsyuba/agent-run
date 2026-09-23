@@ -153,6 +153,12 @@ fn main() {
     if task == "fixture:quota" || task.starts_with("fixture:quota-then-") {
         emit(quota_frame.clone());
     }
+    // A model-scoped weekly window (no exact physical pool mapping).
+    if task == "fixture:quota-opus" {
+        emit(
+            json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day_opus"},"uuid":"fixture-uuid-3","session_id":session}),
+        );
+    }
     // A later protocol state supersedes the rejection: the window is allowed
     // again, or the turn ends on an assistant error of another class.
     if task == "fixture:quota-then-allowed" {
@@ -172,6 +178,7 @@ fn main() {
     }
     let failed = task == "fixture:error"
         || task == "fixture:quota"
+        || task == "fixture:quota-opus"
         || task.starts_with("fixture:quota-then-");
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),

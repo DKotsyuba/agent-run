@@ -2286,3 +2286,65 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
         );
     }
 }
+
+/// An authoritative Claude window rejection whose physical pool the
+/// provider's `anthropic_usage` collector mapping establishes (`five_hour` →
+/// `primary`) is latched once under the collector's own physical identity
+/// with the capacity revision advanced; a model-scoped `seven_day_opus`
+/// rejection latches nothing. (The ranker resolves lanes by model alias, so
+/// selection does not yet consult these collector-keyed pools.)
+#[tokio::test]
+async fn mapped_claude_windows_feed_the_exhaustion_latch() {
+    for (task, latched) in [("fixture:quota", true), ("fixture:quota-opus", false)] {
+        let (_temp, home) = home();
+        edit_config(&home, |config| {
+            let provider = config["providers"]["glm-user"].as_table_mut().unwrap();
+            provider.insert("limits_source".into(), "lua".into());
+            let mut collector = toml::map::Map::new();
+            collector.insert("script".into(), "anthropic_usage".into());
+            collector.insert(
+                "origins".into(),
+                toml::Value::Array(vec!["https://gateway.example".into()]),
+            );
+            provider.insert("collector".into(), toml::Value::Table(collector));
+        });
+        let service = Service::new(home.clone());
+        let mut request = request(&home);
+        request.task = task.into();
+        let revision = Store::open(&home)
+            .unwrap()
+            .quota_capacity_revision()
+            .unwrap();
+        let admitted = service
+            .admit_provider_trusted(request, candidates(revision))
+            .unwrap();
+        let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        run_to_end(&home, &id).await;
+        let store = Store::open(&home).unwrap();
+        let rows: Vec<(String, String, String)> = store
+            .conn
+            .prepare("SELECT quota_key,window_id,source FROM quota_exhaustion")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        if latched {
+            assert_eq!(
+                rows,
+                vec![(
+                    "acct-work::primary".to_owned(),
+                    "five_hour".to_owned(),
+                    "claude-rate-limit-event".to_owned()
+                )],
+                "{task}"
+            );
+            assert!(
+                store.quota_capacity_revision().unwrap() > revision + 1,
+                "{task}"
+            );
+        } else {
+            assert!(rows.is_empty(), "{task}: {rows:?}");
+        }
+    }
+}

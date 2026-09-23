@@ -314,3 +314,42 @@ pub fn record_quota_snapshot(
     tx.commit()?;
     Ok(revision)
 }
+
+impl Store {
+    /// Latches one authoritative native exhaustion of an exactly mapped
+    /// physical window (`account::lane`, `window`) from `source`, in one
+    /// immediate transaction that advances `quota_capacity_revision` once.
+    ///
+    /// The fact is released only by the existing rules: its reset passing, or
+    /// a newer authoritative positive observation of the same lane and
+    /// window; an older positive sample never clears it. Callers must pass
+    /// only a window whose physical pool the provider's own collector mapping
+    /// establishes; unknown windows are never latched.
+    pub fn latch_native_exhaustion(
+        &mut self,
+        account: &AccountId,
+        lane: &str,
+        window: &str,
+        source: &str,
+        observed_at: f64,
+        reset_at: Option<f64>,
+    ) -> Result<i64> {
+        if lane.is_empty() || window.is_empty() || source.trim().is_empty() {
+            return Err(invalid("invalid native exhaustion latch"));
+        }
+        let quota_key = PhysicalQuotaKey::new(account, lane)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at,collector_revision) \
+             VALUES(?,?,?,?,?,?,NULL) \
+             ON CONFLICT(account_id,quota_key,source,window_id) DO UPDATE SET \
+             observed_at=MAX(observed_at,excluded.observed_at),reset_at=excluded.reset_at",
+            params![account.as_str(), quota_key.as_str(), source, window, observed_at, reset_at],
+        )?;
+        let revision = Store::advance_quota_capacity_revision(&tx)?;
+        tx.commit()?;
+        Ok(revision)
+    }
+}
