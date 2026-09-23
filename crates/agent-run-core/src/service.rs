@@ -924,7 +924,11 @@ impl Service {
         // policy refusal is reported as such.
         current_policy_permits(&current, &frozen, &request)?;
         // Only the seal recorded at the parent's cleanup boundary is trusted.
-        verify_recorded_history(&adapter_state, &frozen, &runtime_home, session)?;
+        // At admission only Codex's root is known (its run home); the
+        // handoff binds every harness to the launch plan's actual root.
+        let expected_root = (authority.harness == agent_run_domain::catalog::HarnessId::Codex)
+            .then_some(runtime_home.as_path());
+        verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
         let bound: std::collections::BTreeSet<_> = offered
             .bindings
             .iter()
@@ -1410,14 +1414,14 @@ pub(crate) fn current_policy_permits(
 
 /// Verifies the native-history seal the supervisor recorded in the parent's
 /// last attempt (`adapter_state_json.native_history`) against the file it
-/// names. The seal must exist, be bound to the parent's session, harness,
-/// assets digest and (for Codex) its runtime home, and the file must still
-/// have the exact sealed bytes. A missing seal fails closed: history is never
+/// names. The seal must exist, be bound to the parent's session, harness and
+/// assets digest, name `expected_root` (when given) as its storage root, and
+/// the file must still have the exact sealed bytes. A missing seal fails closed: history is never
 /// adopted for the first time here.
 pub(crate) fn verify_recorded_history(
     adapter_state: &str,
     frozen: &ProviderLaunchIdentity,
-    runtime_home: &std::path::Path,
+    expected_root: Option<&std::path::Path>,
     session: &str,
 ) -> Result<()> {
     let unavailable =
@@ -1439,8 +1443,8 @@ pub(crate) fn verify_recorded_history(
             "native history seal is bound to another authority",
         ));
     }
-    if frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex
-        && runtime_home.canonicalize().ok().as_deref() != Some(seal.root.as_path())
+    if expected_root
+        .is_some_and(|root| root.canonicalize().ok().as_deref() != Some(seal.root.as_path()))
     {
         return Err(unavailable(
             "native history seal names another storage root",

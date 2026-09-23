@@ -416,13 +416,21 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         },
     )?;
     // A resumed attempt re-verifies the parent's recorded history seal at the
-    // handoff itself, not only at admission.
+    // handoff itself, bound to the history root this exact launch plan
+    // selects: a seal for one directory never authorizes a launch whose
+    // environment points the harness at another.
     if let (Some(session), Some(parent)) = (&row.resume_of_runtime_session_id, &row.parent_agent_id)
     {
+        let planned_root = history_root(identity.authority.harness, &planned.launch.environment)
+            .ok_or_else(|| {
+                Error::Unsupported(
+                    "continuation_unavailable: the launch plan names no native storage".into(),
+                )
+            })?;
         crate::service::verify_recorded_history(
             &store.latest_attempt_state(parent)?,
             &identity,
-            &runtime_home,
+            Some(&planned_root),
             session,
         )?;
     }
@@ -546,18 +554,7 @@ fn history_evidence(
         Ok(Some(session)) => session,
         _ => return json!({"native_history_unavailable":"no native session was recorded"}),
     };
-    let root = match identity.authority.harness {
-        HarnessId::Codex => environment.get("CODEX_HOME").map(std::path::PathBuf::from),
-        HarnessId::ClaudeCode => environment
-            .get("CLAUDE_CONFIG_DIR")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                environment
-                    .get("HOME")
-                    .map(|home| std::path::PathBuf::from(home).join(".claude"))
-            }),
-    };
-    let Some(root) = root else {
+    let Some(root) = history_root(identity.authority.harness, environment) else {
         return json!({"native_history_unavailable":"the attempt named no native storage"});
     };
     match crate::continuity::seal(identity.authority.harness, &root, &session) {
@@ -568,6 +565,25 @@ fn history_evidence(
             "attempt": attempt,
         }}),
         Err(error) => json!({"native_history_unavailable": error.to_string()}),
+    }
+}
+/// The native history storage root a launch environment selects: `CODEX_HOME`
+/// for Codex; `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, for Claude Code.
+/// Shared by sealing and the resume handoff so both use one derivation.
+fn history_root(
+    harness: HarnessId,
+    environment: &BTreeMap<String, String>,
+) -> Option<std::path::PathBuf> {
+    match harness {
+        HarnessId::Codex => environment.get("CODEX_HOME").map(std::path::PathBuf::from),
+        HarnessId::ClaudeCode => environment
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                environment
+                    .get("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".claude"))
+            }),
     }
 }
 fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {

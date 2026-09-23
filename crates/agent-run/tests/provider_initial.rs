@@ -1298,3 +1298,80 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
         }
     }
 }
+
+/// The handoff binds the parent's seal to the history root the child's
+/// launch plan actually selects: a seal recorded for another (equally valid)
+/// root passes admission but is refused before spawn, with no process and
+/// both histories byte-identical.
+#[tokio::test]
+async fn handoff_refuses_a_seal_for_another_history_root() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "root-parent").await;
+    let mut state = attempt_state(&home, &id);
+    let seal = state["native_history"]["seal"].clone();
+    let planned = std::path::PathBuf::from(seal["root"].as_str().unwrap());
+    let relative = seal["relative"].as_str().unwrap().to_owned();
+    let other = home.join("other-claude-config");
+    fs::create_dir_all(other.join(&relative).parent().unwrap()).unwrap();
+    fs::copy(planned.join(&relative), other.join(&relative)).unwrap();
+    let other = other.canonicalize().unwrap();
+    state["native_history"]["seal"]["root"] = other.to_string_lossy().into_owned().into();
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE attempts SET adapter_state_json=? WHERE agent_id=?",
+            rusqlite::params![state.to_string(), id.as_str()],
+        )
+        .unwrap();
+    let before = (
+        fs::read(planned.join(&relative)).unwrap(),
+        fs::read(other.join(&relative)).unwrap(),
+    );
+    let child = service
+        .admit_provider_resume(
+            &Store::open(&home).unwrap().get(&id).unwrap(),
+            "fixture:answer".into(),
+            None,
+            Some("root-child".into()),
+            None,
+        )
+        .unwrap();
+    let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    let mut supervisor = supervisor(&home, &child);
+    let _ = tokio::time::timeout(Duration::from_secs(20), supervisor.wait())
+        .await
+        .unwrap();
+    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    assert!(
+        row.status.terminal() && row.status != Status::Succeeded,
+        "{:?}",
+        row.status
+    );
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("another storage root"),
+        "{:?}",
+        row.failure_text
+    );
+    let process: Option<String> = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT process_identity FROM attempts WHERE agent_id=?",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(process.is_none(), "no process was spawned");
+    assert_eq!(
+        (
+            fs::read(planned.join(&relative)).unwrap(),
+            fs::read(other.join(&relative)).unwrap()
+        ),
+        before
+    );
+}
