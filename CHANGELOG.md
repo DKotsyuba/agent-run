@@ -10,6 +10,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   provider and model, resolves accounts from the registry, and ranks them from
   account-scoped quota observations. A schema-1 home must run the one-time
   paired `config migrate` (state schema 16 to 17) before any other command
+- feat: provider catalog exposes configured models and recommendations without
+  account choices; Codex app-server and bounded Claude/GLM collectors replace
+  CodexBar for quota readings
+- feat: `transcript --follow --format text` streams model output and tool
+  activity as the run proceeds
 - feat: explicit provider resume continues the recorded native session as a
   new logical child; an authoritative quota exhaustion switches a Codex run to
   another account within the same logical run (Claude Code and custom
