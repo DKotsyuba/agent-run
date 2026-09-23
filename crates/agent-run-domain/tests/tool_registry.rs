@@ -17,8 +17,28 @@ fn registry_matches_python_golden_field_by_field() {
     assert_eq!(actual.len(), 11);
     assert_eq!(actual.len(), expected.len());
 
-    for (definition, (actual, expected)) in registry().iter().zip(actual.iter().zip(expected)) {
+    for (definition, (actual, mut expected)) in registry()
+        .iter()
+        .zip(actual.iter().zip(expected.into_iter()))
+    {
         assert_eq!(actual["name"], expected["name"]);
+        // The schema-2 catalog reads extend the baseline: their descriptions
+        // keep the Python text as a prefix, and they add only the exact
+        // optional nullable string filters pinned here.
+        let filters: &[&str] = match definition.name.as_str() {
+            "models" => &["model", "profile", "provider"],
+            "capacity_order" => &["model"],
+            _ => &[],
+        };
+        if !filters.is_empty() {
+            let base = expected["description"].as_str().unwrap();
+            assert!(actual["description"].as_str().unwrap().starts_with(base));
+            expected["description"] = actual["description"].clone();
+            for name in filters {
+                expected["inputSchema"]["properties"][name] =
+                    serde_json::json!({"type": ["string", "null"]});
+            }
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }

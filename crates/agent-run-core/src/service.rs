@@ -318,18 +318,29 @@ impl Service {
     ///    stale, this returns `selection_busy` and nothing was admitted.
     ///    There is no sleep or polling; every other error returns as is.
     pub fn admit_provider(&self, request: ProviderStartRequest) -> Result<Value> {
-        self.admit_provider_observed(request, &mut |_| Ok(()))
+        self.admit_provider_ranked(request, &mut |_| Ok(()))
     }
 
     /// [`Self::admit_provider`] with a hook run after each candidate set is
     /// computed and before its admission transaction, receiving the
     /// zero-based submission number.
     ///
-    /// Test seam for deterministic races (a revision advance, an account
-    /// disable) between the ranking read and the store transaction. The hook
-    /// cannot see or change candidates; its error aborts the call unchanged.
-    #[doc(hidden)]
+    /// Test-only seam (feature `test-fixtures`) for deterministic races (a
+    /// revision advance, an account disable) between the ranking read and
+    /// the store transaction. The hook cannot see or change candidates; its
+    /// error aborts the call unchanged.
+    #[cfg(feature = "test-fixtures")]
     pub fn admit_provider_observed(
+        &self,
+        request: ProviderStartRequest,
+        before_admission: &mut dyn FnMut(u32) -> Result<()>,
+    ) -> Result<Value> {
+        self.admit_provider_ranked(request, before_admission)
+    }
+
+    /// Ranked admission shared by [`Self::admit_provider`] and its test seam;
+    /// `before_admission` runs between each ranking and its submission.
+    fn admit_provider_ranked(
         &self,
         request: ProviderStartRequest,
         before_admission: &mut dyn FnMut(u32) -> Result<()>,
@@ -951,13 +962,63 @@ impl Service {
         let mut store = Store::open(&self.home)?;
         Ok(reconcile::reconcile(&mut store, 100)?.len())
     }
-    pub async fn models(&self) -> Result<Value> {
-        crate::capacity::models(&self.home).await
+    /// Returns the active cached config revision after the request-boundary
+    /// digest check; an invalid edit keeps the last valid revision active.
+    fn active_config(&self) -> Result<CachedConfig> {
+        self.refresh_config()?;
+        self.config
+            .read()
+            .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
+            .clone()
+            .ok_or_else(|| Error::Runtime("configuration cache is empty".into()))
+    }
+
+    /// Public `models` read.
+    ///
+    /// A schema-2 config returns the revisioned provider catalog of
+    /// [`crate::capacity::provider_catalog::models`] with exact `query`
+    /// filters. A schema-1 config keeps its historical runtime roster, which
+    /// probes each runtime; filters there are `Unsupported`.
+    pub async fn models(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
+        let active = self.active_config()?;
+        match &active.value {
+            CachedConfigValue::Providers(config) => crate::capacity::provider_catalog::models(
+                &self.home,
+                config,
+                &active.revision,
+                &query,
+            ),
+            CachedConfigValue::Legacy(_) if query.is_empty() => {
+                crate::capacity::models(&self.home).await
+            }
+            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
+                "models filters require schema_version 2".into(),
+            )),
+        }
     }
     pub fn limits(&self) -> Result<Value> {
         crate::capacity::limits(&self.home)
     }
-    pub fn capacity_order(&self) -> Result<Value> {
-        crate::capacity::order(&self.home)
+
+    /// Public `capacity_order` read: the provider-only order of
+    /// [`crate::capacity::provider_catalog::order`] for schema 2, or the
+    /// historical route order for schema 1 (where a model filter is
+    /// `Unsupported`).
+    pub fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
+        let active = self.active_config()?;
+        match &active.value {
+            CachedConfigValue::Providers(config) => crate::capacity::provider_catalog::order(
+                &self.home,
+                config,
+                &active.revision,
+                &query,
+            ),
+            CachedConfigValue::Legacy(_) if query.model.is_none() => {
+                crate::capacity::order(&self.home)
+            }
+            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
+                "capacity_order model filter requires schema_version 2".into(),
+            )),
+        }
     }
 }

@@ -1,9 +1,16 @@
 [
   {
-    "description": "Return the committed, transport-neutral capacity routing order.",
+    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 this lists PROVIDERS (never accounts) by descending score, each with every offered model's own status (available, unknown = configured but not yet observed, priority_overflow, exhausted, no_eligible_account) and best priority, plus config_revision and capacity_revision. Optional exact model filter keeps providers offering that model, ranked by it. Read-only: no quota collection, reservation, or start. Choosing provider, model, effort, and profile stays with the caller.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "name": "capacity_order",
@@ -352,10 +359,29 @@
     "resultShape": null
   },
   {
-    "description": "List enabled runtime model rosters with capability and health evidence.",
+    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog: config_revision, capacity_revision, roles_sha256, canonical profiles with their grants, and providers in capacity order with harness, connection kind, recommendations, and every explicit model offering (native_model, default params, allowed_params, hard restrictions, recommendations, admissible profiles, cached quota status). Optional exact provider, profile, and model filters; unknown values are validation errors. Read-only over current config, roles, and committed observations; recommendations are configured prose, not a ranking. The caller alone chooses provider, model, effort, and profile.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "name": "models",

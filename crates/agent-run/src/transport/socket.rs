@@ -563,7 +563,10 @@ pub async fn serve_at_with_options(
         return Err(crate::error::invalid("socket deadlines must be positive"));
     }
     agent_run_core::logging::configure(home, "api");
-    let _ = crate::config::Config::load(home)?;
+    // Either a valid schema-2 provider config or a valid schema-1 config.
+    if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
+        let _ = crate::config::Config::load(home)?;
+    }
     let _ = crate::state::Store::open(home)?;
     let directory = std::fs::symlink_metadata(home)?;
     // SAFETY: geteuid is a read-only process identity query.

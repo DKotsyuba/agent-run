@@ -249,3 +249,29 @@ Executable boundary coverage lives beside the contracts:
   exclusivity across states, cross-account key rejection, physical reservation
   counts, and global revision facts:
   `crates/agent-run-store/tests/state_migrations.rs`
+
+## C6 Public catalog reads
+
+`models` and `capacity_order` (shared registry `assets/tools.json`, one
+dispatch for CLI, broker socket and MCP) are read-only over one validated
+config revision from the service's exact-byte last-valid cache, the canonical
+role files, and one committed quota read. They never collect quota, call a
+harness, reserve, consume reset credits, write samples or start agents.
+
+* `capacity_order` returns providers, never provider/account pairs, ranked
+  by `capacity::provider_ranking` (known before unknown; exhausted, disabled
+  and ineligible accounts excluded). Each offered model keeps its own
+  `status` and `best_priority`; the optional exact `model` filter ranks
+  providers by that model alone.
+* `models` adds the explicit offerings (`native_model`, `params`,
+  `allowed_params`, `restrictions`, `recommendations`), provider
+  recommendations, harness and connection kind, canonical role grants, and
+  for each offering the roles admission would accept: the role loads as a
+  canonical provider role, its plan resolves, and the effective policy with
+  the model's restrictions admits on that harness — the same checks a start
+  applies. Exact `provider`/`profile`/`model` filters; unknown values are
+  validation errors.
+* Results carry `config_revision`, `capacity_revision`, `observed_at`, and
+  (`models`) `roles_sha256`. No account id, label or secret reference is
+  emitted. The orchestrator chooses provider, model, effort and profile;
+  there is no automatic model choice or ability score.

@@ -30,7 +30,7 @@ rusqlite.workspace = true
 tempfile.workspace = true
 
 [features]
-test-fixtures = []
+test-fixtures = ["agent-run-core/test-fixtures"]
 
 [[bin]]
 name = "agent-run"

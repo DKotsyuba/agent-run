@@ -5,6 +5,7 @@ pub mod codex_quota;
 pub mod collectors;
 pub mod lua;
 pub mod omniroute;
+pub mod provider_catalog;
 pub mod provider_ranking;
 pub mod quota;
 pub mod quota_auth;

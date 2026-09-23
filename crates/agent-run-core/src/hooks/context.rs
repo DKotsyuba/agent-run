@@ -42,18 +42,23 @@ pub struct ContextResult {
 /// only the bounded `task_summary` projection is eligible for display.
 pub fn build(home: &Path, reference: &OrchestratorRef, at: Option<f64>) -> Result<ContextResult> {
     reference.validate()?;
-    let config = Config::load(home)?;
+    // A schema-2 home renders the provider-only order; schema 1 keeps routes.
+    let providers = agent_run_config::provider_config::ProviderConfig::load(home).ok();
+    let max_chars = match &providers {
+        Some((config, _)) => config.capacity.context_max_chars,
+        None => Config::load(home)?.capacity.context_max_chars,
+    };
     let now = at.unwrap_or_else(now);
     if !now.is_finite() || now < 0.0 {
         return Err(invalid("now must be a finite nonnegative number"));
     }
-    let budget = config
-        .capacity
-        .context_max_chars
-        .min(CONTEXT_HARD_LIMIT_CHARS);
+    let budget = max_chars.min(CONTEXT_HARD_LIMIT_CHARS);
     let mut store = Store::open(home)?;
     let prior_session = store.find_orchestrator_session(reference)?;
-    let capacity_text = capacity_block(home)?;
+    let capacity_text = match &providers {
+        Some((config, revision)) => provider_block(home, config, revision)?,
+        None => capacity_block(home)?,
+    };
     let agents = match &prior_session {
         Some(session) => store.active_context(session, now, 1000)?,
         None => Vec::new(),
@@ -103,6 +108,46 @@ pub fn build(home: &Path, reference: &OrchestratorRef, at: Option<f64>) -> Resul
         injected: !text.is_empty(),
         text,
     })
+}
+
+/// Renders the schema-2 provider-only capacity order: one line per provider
+/// with each offered model's cached status, never an account or credential.
+/// It is read-only standing, not a choice; the caller picks provider/model.
+fn provider_block(
+    home: &Path,
+    config: &agent_run_config::provider_config::ProviderConfig,
+    revision: &str,
+) -> Result<String> {
+    let order = capacity::provider_catalog::order(home, config, revision, &Default::default())?;
+    let providers = order["providers"]
+        .as_array()
+        .ok_or_else(|| invalid("provider order has invalid providers"))?;
+    let mut lines = vec!["Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; use models for roles and recommendations. unknown = configured but not yet observed.".to_owned()];
+    if providers.is_empty() {
+        lines.push("No configured providers.".into());
+    }
+    for (index, entry) in providers.iter().enumerate() {
+        let models = entry["models"]
+            .as_array()
+            .ok_or_else(|| invalid("provider order has invalid models"))?
+            .iter()
+            .map(|model| {
+                format!(
+                    "{}:{}",
+                    json_ascii(model["model"].as_str().unwrap_or_default()),
+                    model["status"].as_str().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        lines.push(format!(
+            "{}. provider={}; models=[{}]",
+            index + 1,
+            json_ascii(entry["provider"].as_str().unwrap_or_default()),
+            models
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// Renders the ordered capacity routes without exposing measurements or credentials.

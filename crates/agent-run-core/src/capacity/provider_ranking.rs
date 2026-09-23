@@ -593,6 +593,22 @@ pub fn provider_order_at(
     hard_ineligible: &BTreeSet<AccountId>,
     at: f64,
 ) -> Result<ProviderCapacityOrder> {
+    provider_order_for_model_at(store, catalog, hard_ineligible, None, at)
+}
+
+/// [`provider_order_at`] restricted to one exact provider-visible `model`.
+///
+/// With `Some(model)` only providers explicitly offering that model appear,
+/// each carrying just that offering, so its score and rank come from that
+/// model's own lane under the same formula and ordering. `None` keeps every
+/// offering. An unoffered model yields an empty provider list.
+pub fn provider_order_for_model_at(
+    store: &Store,
+    catalog: &ProviderCatalog,
+    hard_ineligible: &BTreeSet<AccountId>,
+    model: Option<&str>,
+    at: f64,
+) -> Result<ProviderCapacityOrder> {
     if !at.is_finite() || at < 0.0 {
         return Err(invalid("ranking clock must be finite and nonnegative"));
     }
@@ -607,7 +623,11 @@ pub fn provider_order_at(
     for definition in catalog.providers() {
         let mut models: Vec<ProviderModelOrder> = Vec::new();
         let mut available: Vec<f64> = Vec::new();
-        for offering in &definition.models {
+        for offering in definition
+            .models
+            .iter()
+            .filter(|offering| model.is_none_or(|model| offering.id == model))
+        {
             let usable = current_eligible(
                 &snapshot,
                 catalog,
@@ -647,6 +667,9 @@ pub fn provider_order_at(
                 status: status.to_owned(),
                 best_priority,
             });
+        }
+        if models.is_empty() {
+            continue;
         }
         let best = available.into_iter().fold(f64::NEG_INFINITY, f64::max);
         let score = best

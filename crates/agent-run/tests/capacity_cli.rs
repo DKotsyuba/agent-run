@@ -66,7 +66,7 @@ impl CliService for CapacityServiceFake {
     }
 
     /// Returns an empty model list for commands outside this fixture's scope.
-    fn models<'a>(&'a self) -> CliFuture<'a> {
+    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(async { Ok(json!([])) })
     }
 
@@ -76,7 +76,10 @@ impl CliService for CapacityServiceFake {
     }
 
     /// Returns the fixed order payload and records one service-shaped call.
-    fn capacity_order(&self) -> agent_run::Result<Value> {
+    fn capacity_order(
+        &self,
+        _query: agent_run_domain::CapacityOrderQuery,
+    ) -> agent_run::Result<Value> {
         *self.calls.lock().expect("call counter lock") += 1;
         Ok(self.payload.clone())
     }
@@ -235,11 +238,13 @@ async fn test_order_emits_the_service_shape_once() {
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_order_rejects_unexpected_arguments`
 #[test]
 fn test_order_rejects_unexpected_arguments() {
-    let parsed = Cli::try_parse_from(["agent-run", "capacity", "order", "--model", "m"]);
+    // `--model` is the schema-2 exact model filter; any other flag still fails.
+    let parsed = Cli::try_parse_from(["agent-run", "capacity", "order", "--account", "a"]);
     assert!(
         parsed.is_err(),
         "unexpected order flags must fail at parsing"
     );
+    assert!(Cli::try_parse_from(["agent-run", "capacity", "order", "--model", "m"]).is_ok());
 }
 
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_real_state_reorders_and_explains_nonworking_runtimes`
@@ -253,14 +258,18 @@ fn test_real_state_reorders_and_explains_nonworking_runtimes() {
     }
 
     let service = agent_run_core::service::Service::new(scratch.path().into());
-    let first = service.capacity_order().expect("first order");
+    let first = service
+        .capacity_order(Default::default())
+        .expect("first order");
     assert_eq!(route_runtimes(&first), vec!["alpha", "beta"]);
     assert_eq!(first["omitted"][0]["runtime"], "empty");
     assert_eq!(first["unavailable_runtimes"], json!(["missing"]));
 
     persist_sample(scratch.path(), "alpha", 20.0, now());
     persist_sample(scratch.path(), "beta", 90.0, now());
-    let second = service.capacity_order().expect("second order");
+    let second = service
+        .capacity_order(Default::default())
+        .expect("second order");
     assert_eq!(route_runtimes(&second), vec!["beta", "alpha"]);
 }
 

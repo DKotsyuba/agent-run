@@ -716,7 +716,10 @@ async fn python_test_service_empty_roster_has_reason() {
         .unwrap()
         .replace("binary=\"/usr/bin/true\"", "binary=\"/does/not/exist\"");
     std::fs::write(home.path.join("config.toml"), config).unwrap();
-    let value = Service::new(home.path.clone()).models().await.unwrap();
+    let value = Service::new(home.path.clone())
+        .models(Default::default())
+        .await
+        .unwrap();
     assert!(value["mock"]["models"].is_array());
     assert!(value["mock"]["reason"].is_string());
 }
@@ -729,7 +732,10 @@ async fn python_test_service_roster_reason_is_bounded() {
         .unwrap()
         .replace("binary=\"/usr/bin/true\"", "binary=\"/does/not/exist\"");
     std::fs::write(home.path.join("config.toml"), config).unwrap();
-    let value = Service::new(home.path.clone()).models().await.unwrap();
+    let value = Service::new(home.path.clone())
+        .models(Default::default())
+        .await
+        .unwrap();
     assert!(value["mock"]["reason"].as_str().unwrap_or_default().len() <= 128);
 }
 
@@ -737,7 +743,10 @@ async fn python_test_service_roster_reason_is_bounded() {
 #[tokio::test]
 async fn python_test_service_models_do_not_create_isolated_cache() {
     let home = common::Home::new();
-    let value = Service::new(home.path.clone()).models().await.unwrap();
+    let value = Service::new(home.path.clone())
+        .models(Default::default())
+        .await
+        .unwrap();
     assert!(!home.path.join("runtimes/mock/cache/models.json").exists());
     assert!(value["mock"]["models"].is_array());
 }

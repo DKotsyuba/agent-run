@@ -112,18 +112,12 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             let topic = a.topic.as_deref().unwrap_or("index");
             Ok(json!({"topic":topic,"text":doc(topic)?}))
         }
-        "models" => {
-            let _: Empty = args(raw)?;
-            service.models().await
-        }
+        "models" => service.models(args(raw)?).await,
         "limits" => {
             let _: Empty = args(raw)?;
             service.limits()
         }
-        "capacity_order" => {
-            let _: Empty = args(raw)?;
-            service.capacity_order()
-        }
+        "capacity_order" => service.capacity_order(args(raw)?),
         // Socket-only control/discovery methods; not part of the eleven MCP tools.
         "tools" => {
             let _: Empty = args(raw)?;

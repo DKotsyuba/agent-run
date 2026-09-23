@@ -77,8 +77,9 @@ pub struct ProviderLaunchPlan {
 }
 
 /// Returns one v1-shaped runtime solely to reuse the established asset and
-/// grant materializer; no v1 provider selection or GLM adapter is invoked.
-fn runtime(config: &ProviderConfig, harness: HarnessId, model: &str) -> Result<Runtime> {
+/// grant materializer and policy evaluation; no v1 provider selection or GLM
+/// adapter is invoked. Errors when `harness` is not configured.
+pub fn runtime(config: &ProviderConfig, harness: HarnessId, model: &str) -> Result<Runtime> {
     let native = config
         .harnesses
         .get(&harness)

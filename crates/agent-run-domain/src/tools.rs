@@ -203,7 +203,9 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         ("start", "effort" | "output_schema" | "orchestrator" | "request_id" | "account")
         | ("resume", "timeout_seconds" | "request_id" | "orchestrator")
         | ("list_agents", "orchestrator" | "after_revision")
-        | ("doc", "topic") => Some(ArgumentDefault::Null),
+        | ("doc", "topic")
+        | ("models", "provider" | "profile" | "model")
+        | ("capacity_order", "model") => Some(ArgumentDefault::Null),
         ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),
         ("transcript", "limit") => Some(ArgumentDefault::Integer(200)),

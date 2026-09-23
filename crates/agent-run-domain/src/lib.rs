@@ -33,6 +33,6 @@ pub use types::{
     PositiveFinite, ProcessBirthProof, RelativeOwnedPath, RuntimeName, Sha256Digest,
 };
 pub use views::{
-    AgentPage, AgentView, AnswerView, CleanupView, CommandView, DeliveryView, MessageView,
-    StartResult, TranscriptPage,
+    AgentPage, AgentView, AnswerView, CapacityOrderQuery, CleanupView, CommandView, DeliveryView,
+    MessageView, ModelsQuery, StartResult, TranscriptPage,
 };

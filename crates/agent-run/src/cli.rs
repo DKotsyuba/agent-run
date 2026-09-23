@@ -83,12 +83,12 @@ pub trait CliService: Send + Sync {
     fn agent(&self, id: &AgentId) -> Result<Value>;
     /// Read one bounded transcript page.
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value>;
-    /// Return the configured model roster.
-    fn models<'a>(&'a self) -> CliFuture<'a>;
+    /// Return the configured model roster or schema-2 provider catalog.
+    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
     /// Return the configured capacity limits.
     fn limits(&self) -> Result<Value>;
-    /// Return the ordered capacity view.
-    fn capacity_order(&self) -> Result<Value>;
+    /// Return the ordered capacity view, optionally for one exact model.
+    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value>;
     /// Return one completion-delivery status view.
     fn delivery_status(&self, id: &AgentId) -> Result<Value>;
     /// Cancel one completion-delivery attempt.
@@ -122,14 +122,14 @@ impl CliService for Service {
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
     }
-    fn models<'a>(&'a self) -> CliFuture<'a> {
-        Box::pin(Service::models(self))
+    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
+        Box::pin(Service::models(self, query))
     }
     fn limits(&self) -> Result<Value> {
         Service::limits(self)
     }
-    fn capacity_order(&self) -> Result<Value> {
-        Service::capacity_order(self)
+    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
+        Service::capacity_order(self, query)
     }
     fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         Service::delivery_status(self, id)
@@ -231,7 +231,18 @@ pub enum Command {
         #[arg(long, value_enum)]
         format: Option<TranscriptFormat>,
     },
-    Models,
+    /// Model roster, or the schema-2 provider catalog with exact filters.
+    Models {
+        /// Exact configured provider id.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Exact canonical role/profile name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exact provider-visible model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
     Limits,
     Doc {
         topic: Option<String>,
@@ -490,7 +501,12 @@ pub enum Capacity {
         #[arg(long, required = true)]
         once: bool,
     },
-    Order,
+    /// Capacity order; schema 2 lists providers, optionally for one model.
+    Order {
+        /// Exact provider-visible model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
     Launchd {
         #[arg(long)]
         binary: PathBuf,
@@ -1133,7 +1149,20 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 renderer.finish(&mut |line| (dependencies.text_output)(line))?;
             }
         }
-        Command::Models => (dependencies.output)(&dependencies.service.models().await?)?,
+        Command::Models {
+            provider,
+            profile,
+            model,
+        } => (dependencies.output)(
+            &dependencies
+                .service
+                .models(agent_run_domain::ModelsQuery {
+                    provider,
+                    profile,
+                    model,
+                })
+                .await?,
+        )?,
         Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
@@ -1164,7 +1193,11 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             )?)?,
         },
         Command::Capacity { command } => match command {
-            Capacity::Order => (dependencies.output)(&dependencies.service.capacity_order()?)?,
+            Capacity::Order { model } => (dependencies.output)(
+                &dependencies
+                    .service
+                    .capacity_order(agent_run_domain::CapacityOrderQuery { model })?,
+            )?,
             Capacity::Launchd {
                 binary,
                 label,

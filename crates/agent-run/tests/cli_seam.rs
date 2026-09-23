@@ -83,13 +83,16 @@ impl CliService for FakeService {
             .map(|(_, page)| page.clone())
             .ok_or_else(|| invalid("missing transcript fixture"))
     }
-    fn models<'a>(&'a self) -> CliFuture<'a> {
+    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(async { Ok(json!([])) })
     }
     fn limits(&self) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
-    fn capacity_order(&self) -> agent_run::Result<Value> {
+    fn capacity_order(
+        &self,
+        _query: agent_run_domain::CapacityOrderQuery,
+    ) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
@@ -1178,13 +1181,16 @@ impl CliService for PausingService {
             )
         }
     }
-    fn models<'a>(&'a self) -> CliFuture<'a> {
+    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(async { Ok(json!([])) })
     }
     fn limits(&self) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
-    fn capacity_order(&self) -> agent_run::Result<Value> {
+    fn capacity_order(
+        &self,
+        _query: agent_run_domain::CapacityOrderQuery,
+    ) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
