@@ -257,4 +257,20 @@ mod tests {
         assert!(prove(HarnessId::ClaudeCode, temp.path(), "s1").is_err());
         assert!(prove(HarnessId::ClaudeCode, temp.path(), "../s1").is_err());
     }
+
+    /// A result preceding its tool call cannot prove that later call finished.
+    #[test]
+    fn tool_results_must_follow_the_calls_they_acknowledge() {
+        let temp = tempfile::tempdir().unwrap();
+        let body = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"c1\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"c1\"}}\n"
+        );
+        rollout(temp.path(), "s1", body);
+        assert!(
+            prove(HarnessId::Codex, temp.path(), "s1").is_err(),
+            "an earlier result must not acknowledge a later pending call"
+        );
+    }
 }

@@ -887,6 +887,61 @@ async fn provider_resume_continues_the_proven_native_session() {
     assert_eq!(grandchildren, 0, "{pinned}");
 }
 
+/// A newly required unsupported isolation boundary must revoke continuation,
+/// even when the provider and public model names remain unchanged.
+#[tokio::test]
+async fn provider_resume_honors_new_model_restrictions() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let original = request(&home);
+    let provider = original.provider.to_string();
+    let model = original.model.clone();
+    let admitted = service
+        .admit_provider_trusted(original, candidates(0))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let session = parent.runtime_session_id.as_deref().unwrap();
+    let runtime_home = std::path::PathBuf::from(
+        parent.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    transcript(
+        &runtime_home,
+        session,
+        &format!("{{\"sessionId\":\"{session}\"}}\n"),
+    );
+    let path = home.join("config.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let offering = config["providers"][&provider]["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|offering| offering["id"].as_str() == Some(model.as_str()))
+        .unwrap();
+    offering.as_table_mut().unwrap().insert(
+        "restrictions".into(),
+        toml::Value::Array(vec![toml::Value::String(
+            "filesystem_read_isolation".into(),
+        )]),
+    );
+    fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    let resumed = service.admit_provider_resume(
+        &parent,
+        "fixture:answer".into(),
+        None,
+        Some("revoked-resume".into()),
+        None,
+    );
+    assert!(
+        resumed.is_err(),
+        "resume ignored current model restrictions"
+    );
+    assert_eq!(rows(&home), (1, 1), "a refused resume creates no child");
+}
+
 /// Two concurrent explicit resumes of one parent (distinct request ids)
 /// admit exactly one child; the loser is refused and nothing else is written.
 #[tokio::test]
