@@ -124,17 +124,19 @@ After manual edits, parse the TOML and run `agent-run doctor`. Doctor checks
 binaries and role assets; runtime start does not run language-toolchain
 readiness probes.
 
-## One-time migration to schema 2
+## One-time paired migration to schema 2
 
-The migration is explicit: nothing is guessed. Register every account first
-(`agent-run accounts register --id ... --auth-family ... --reference
-native:codex|named:codex:<label>|env:...|keychain:<service>:<account>`); the
-reference names an existing store and no credential value is read. Then write
-a mapping file naming the two harnesses and, for each v1 runtime, its provider
-id, harness, connection, auth family, v2 limits source (and collector for
-`lua`), an explicit native model for every historical model, the account used
-for requests that omitted an account (`global_account`), an account for every
-v1 label, and optional recommendation prose:
+This release pairs the schema-2 config with state database schema 17. While
+the home still has an older database, every command except `config` and
+`doc` refuses with `migration_required` instead of opening it (opening would
+upgrade it unpaired); the broker refuses to start the same way.
+
+Write one mapping file. It names the two harnesses, declares every global
+account by nonsecret reference (no credential value is read), and maps each v1
+runtime to its provider id, harness, connection, auth family, v2 limits source
+(and collector for `lua`), an explicit native model for every historical
+model, the account for requests that omitted an account (`global_account`), an
+account for every v1 label, and optional recommendation prose:
 
 ```toml
 [harnesses.codex]
@@ -143,6 +145,12 @@ home = "/absolute/path/to/agent-run/runtimes/codex/home"
 [harnesses.claude-code]
 binary = "/absolute/path/to/claude"
 home = "/absolute/path/to/agent-run/runtimes/claude/home"
+[accounts.acct-codex-native]
+auth_family = "openai"
+reference = "native:codex"
+[accounts.acct-codex-personal2]
+auth_family = "openai"
+reference = "named:codex:personal2"
 [runtimes.codex]
 provider = "codex"
 harness = "codex"
@@ -151,7 +159,6 @@ auth_family = "openai"
 limits_source = "codex_appserver"
 global_account = "acct-codex-native"
 labelled_accounts = { personal2 = "acct-codex-personal2" }
-recommendations = []
 [runtimes.codex.native_models]
 "gpt-6-sol" = "gpt-6-sol"
 [runtimes.codex.model_recommendations]
@@ -160,25 +167,34 @@ recommendations = []
 
 ```sh
 agent-run config migrate --mapping mapping.toml --dry-run
-agent-run config migrate --mapping mapping.toml --apply [--ack <marker>]...
-agent-run config rollback --snapshot <home>/migrations/<time>-v1-to-v2
+agent-run config migrate --mapping mapping.toml --apply \
+  --from-binary /path/to/installed/agent-run [--ack <marker>]...
+agent-run config rollback --snapshot <home>/migrations/<id>-v1-to-v2
 ```
 
-The dry run prints the rendered schema-2 config, its SHA-256, the historical
-runtime map and any `manual_review` markers (for example a runtime with an
-`auth` table); apply requires `--ack` for exactly those markers. Missing,
-extra or ambiguous runtimes, models, labels or lane weights
-(`priority_lane_multipliers`) are refused, never dropped. Apply refuses while
-any agent is active or a broker answers on `api.sock` (stop it; nothing is
-killed), writes `<home>/migrations/<time>-v1-to-v2/` with the exact v1 config,
-an online SQLite backup (never a copy of the live main file), and
-`manifest.json` (binary path, version and SHA-256, config and backup digests,
-agent count), writes `COMPLETE` last, then atomically replaces `config.toml`.
-The database itself is not modified, so historical agents, answers,
-transcripts and artifacts stay readable as before.
+The dry run renders and validates the schema-2 config and reports the
+database's current schema; it reads the database only through its file
+header (or a read-only connection when live WAL frames exist) and writes
+nothing. Invalid input and every refusal write nothing either.
 
-Rollback restores only the v1 `config.toml`, and only while the snapshot
-matches its manifest, `config.toml` is still exactly the migrated file, the
-agent count is unchanged and nothing is live. It cannot preserve work created
-after the migration and refuses instead; the snapshot's `state.db` is a
-disaster-recovery copy to restore manually with everything stopped.
+`--apply` holds the broker startup lock for its whole run (a running broker
+makes it refuse; no broker can start meanwhile), refuses while any agent is
+active, and re-checks that `config.toml` still has the exact bytes it planned
+from. It then creates a new snapshot directory exclusively — the exact v1
+config, the mapping, an online SQLite backup read through a read-only
+connection, and `manifest.json` recording the installed binary
+(`--from-binary`: path, SHA-256, `--version` output) and this binary, the
+config, mapping and backup digests, the source schema and a logical digest of
+every row — writes `COMPLETE` last and makes the snapshot read-only. Only then
+does it run the numbered store migration (the database *is* upgraded, to
+schema 17), register the declared accounts and atomically publish the v2
+config, followed by `<snapshot>.applied.json`. If any of those steps fails,
+the snapshot database and the original config are restored.
+
+Rollback restores the whole pair — the v1 config and the snapshot database
+(schema 16 with its exact rows) — and only while the live config and every
+database row still equal the applied record, nothing is live, and the
+recorded pre-migration binary still exists with its recorded digest; it then
+names that binary for the operator to run again. Any post-migration write (an
+agent, an event, an account change, a quota sample) makes rollback refuse: it
+cannot preserve that work. The snapshot is never modified.

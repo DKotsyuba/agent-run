@@ -563,6 +563,8 @@ pub async fn serve_at_with_options(
         return Err(crate::error::invalid("socket deadlines must be positive"));
     }
     agent_run_core::logging::configure(home, "api");
+    // An older database is only ever upgraded by the paired config migration.
+    crate::migrate::require_current_store(home)?;
     // Either a valid schema-2 provider config or a valid schema-1 config.
     if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
         let _ = crate::config::Config::load(home)?;

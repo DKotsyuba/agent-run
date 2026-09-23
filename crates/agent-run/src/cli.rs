@@ -502,24 +502,32 @@ pub enum Api {
 /// Configuration migration commands (see `crate::migrate`).
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Plan (`--dry-run`) or apply (`--apply`) the v1 → v2 migration from an
+    /// Plan (`--dry-run`) or apply (`--apply`) the paired migration (v1 config
+    /// and older state database → v2 config and current database) from an
     /// explicit operator mapping file; apply snapshots config and state first.
     #[command(group(ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
     Migrate {
-        /// TOML mapping: `[harnesses.*]` and one `[runtimes.<v1 name>]` each.
+        /// TOML mapping: `[harnesses.*]`, `[accounts.<id>]` and one
+        /// `[runtimes.<v1 name>]` each.
         #[arg(long)]
         mapping: PathBuf,
         /// Print the plan and rendered config; write nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Snapshot, then atomically publish the v2 config.
+        /// Snapshot, then migrate the database, register the declared accounts
+        /// and atomically publish the v2 config under the broker lock.
         #[arg(long)]
         apply: bool,
         /// Acknowledge one dry-run manual_review marker (repeat for each).
         #[arg(long = "ack")]
         ack: Vec<String>,
+        /// The installed pre-migration agent-run executable (required with
+        /// `--apply`); rollback verifies and returns to it.
+        #[arg(long)]
+        from_binary: Option<PathBuf>,
     },
-    /// Restore the v1 config from one verified migration snapshot.
+    /// Restore the v1 config and original database from one verified
+    /// snapshot while nothing changed since the migration.
     Rollback {
         /// The snapshot directory printed by `config migrate --apply`.
         #[arg(long)]
@@ -927,6 +935,15 @@ async fn login(
 /// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home.clone())?;
+    // An older state database must be migrated together with its config;
+    // no other command may open (and so auto-upgrade) it first.
+    // The permission hook helper never opens the database.
+    if !matches!(
+        cli.command,
+        Command::Config { .. } | Command::Doc { .. } | Command::PermissionRequest { .. }
+    ) {
+        crate::migrate::require_current_store(&home)?;
+    }
     if matches!(&cli.command, Command::Mcp) {
         transport::mcp::exec_desktop_frontend(&home)?;
     }
@@ -1301,7 +1318,14 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 dry_run: _,
                 apply,
                 ack,
-            } => (dependencies.output)(&crate::migrate::migrate(&home, &mapping, apply, &ack)?)?,
+                from_binary,
+            } => (dependencies.output)(&crate::migrate::migrate(
+                &home,
+                &mapping,
+                apply,
+                &ack,
+                from_binary.as_deref(),
+            )?)?,
             ConfigCommand::Rollback { snapshot } => {
                 (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?
             }

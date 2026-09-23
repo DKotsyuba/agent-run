@@ -77,6 +77,37 @@ pub struct MigrationMapping {
     pub harnesses: BTreeMap<HarnessId, HarnessConfig>,
     /// One explicit mapping per historical runtime name.
     pub runtimes: BTreeMap<String, RuntimeMapping>,
+    /// Every global account the mappings name, declared by nonsecret
+    /// reference (`native:`, `named:`, `env:`, `file:`, `keychain:`); these
+    /// become the enabled registry rows of the migrated store. No credential
+    /// value is read.
+    #[serde(default)]
+    pub accounts: BTreeMap<AccountId, AccountDeclaration>,
+}
+
+/// One nonsecret account declaration of a [`MigrationMapping`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountDeclaration {
+    /// Credential family matching the providers that bind the account.
+    pub auth_family: AuthFamily,
+    /// Existing credential store location; never a credential value.
+    pub reference: agent_run_domain::catalog::SecretRef,
+}
+
+impl MigrationMapping {
+    /// Returns the declared accounts as enabled registry records.
+    pub fn account_records(&self) -> Vec<AccountRecord> {
+        self.accounts
+            .iter()
+            .map(|(id, declared)| AccountRecord {
+                account_id: id.clone(),
+                auth_family: declared.auth_family.clone(),
+                secret_ref: declared.reference.clone(),
+                status: agent_run_domain::catalog::AccountStatus::Enabled,
+            })
+            .collect()
+    }
 }
 
 /// Read-only migration output for review and later coordinated publication.
