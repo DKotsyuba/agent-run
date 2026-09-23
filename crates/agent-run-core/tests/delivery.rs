@@ -674,6 +674,7 @@ async fn claude_uds_peer_close_is_ambiguous() {
     let socket = temporary.path().join("inbox.sock");
     claude_descriptor(&registry, "ambiguous", &socket);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let linger = libc::linger {
@@ -692,10 +693,19 @@ async fn claude_uds_peer_close_is_ambiguous() {
         };
         assert_eq!(result, 0);
         drop(stream);
+        // The connection is now reset from the peer side.
+        closed_tx.send(()).unwrap();
     });
+    // The write happens only after the peer has reset the connection, so
+    // it is an interrupted write by construction (no race with the close).
     let send = tokio::spawn({
         let registry = registry.clone();
-        async move { claude::send(&registry, "ambiguous", &notice()).await }
+        async move {
+            claude::send_after(&registry, "ambiguous", &notice(), async {
+                closed_rx.await.unwrap();
+            })
+            .await
+        }
     });
     let evidence = send.await.unwrap();
     peer.await.unwrap();
@@ -750,13 +760,32 @@ async fn desktop_relay_missing_endpoint_is_retryable() {
     assert_eq!(evidence.classifier, "relay_unavailable");
 }
 
+/// Creates a stale relay socket at `path` and proves it is stale: connecting
+/// must be refused. On macOS a listener's close-on-exec flag is set after the
+/// socket is created, so a child spawned concurrently by another test in this
+/// process can inherit the listener and keep the "stale" socket accepting;
+/// such an inode is replaced (bounded attempts) until the precondition holds.
+async fn stale_socket(path: &Path) {
+    for _ in 0..50 {
+        let _ = std::fs::remove_file(path);
+        drop(tokio::net::UnixListener::bind(path).unwrap());
+        match tokio::net::UnixStream::connect(path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+            _ => continue,
+        }
+    }
+    panic!(
+        "could not create a provably stale socket at {}",
+        path.display()
+    );
+}
+
 /// Ensures discovery reaches a live endpoint after more than sixteen stale sockets.
 #[tokio::test]
 async fn desktop_relay_discovers_live_endpoint_after_stale_inventory() {
     let root = tempfile::tempdir().unwrap();
     for index in 0..16 {
-        let path = root.path().join(format!("ar-cdx-v3-stale-{index:02}.sock"));
-        drop(tokio::net::UnixListener::bind(path).unwrap());
+        stale_socket(&root.path().join(format!("ar-cdx-v3-stale-{index:02}.sock"))).await;
     }
     let path = root.path().join("ar-cdx-v3-zz-live.sock");
     let peer = fake_relay(&path, "accepted").await;
