@@ -1835,3 +1835,88 @@ async fn claude_exhaustion_never_switches_accounts() {
         .contains("cross_account_continuation_unverified"));
     assert_eq!(attempts(&home, &id).len(), 1);
 }
+
+/// A supervisor killed while the switched attempt B is running leaves one
+/// owned attempt and a live native process; reconciliation then ends the one
+/// logical run without success, allocates nothing further and delivers at
+/// most once. The closed attempt A keeps its `exhausted` state; B, whose
+/// process was still alive, is marked lost but keeps its ownership (and
+/// reservation) because no cleanup was proven — nothing is released on an
+/// unproven assumption.
+#[tokio::test]
+async fn crash_after_the_switch_reconciles_without_a_duplicate() {
+    let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
+    let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
+        "provider":"codex-user","model":"fixture","profile":"review",
+        "task":"fixture:original-task","workdir":home,"request_id":"crash-switch",
+        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let service = Service::new(home.clone());
+    let admitted = service.admit_provider(request).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    let mut held = None;
+    for _ in 0..400 {
+        let root = Store::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .identity
+            .unwrap()["runtime_home"]
+            .as_str()
+            .map(std::path::PathBuf::from);
+        if let Some(root) = root.filter(|root| root.join("fixture-held").exists()) {
+            held = Some(root);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let root = held.expect("attempt B reached the barrier");
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+    assert_eq!(attempts(&home, &id).len(), 2);
+    let reconciled = service.reconcile().unwrap();
+    fs::write(root.join("fixture-release"), "").unwrap();
+    assert!(reconciled >= 1, "the orphaned run was reconciled");
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert!(
+        row.status.terminal() && row.status != Status::Succeeded,
+        "{:?}",
+        row.status
+    );
+    let attempts = attempts(&home, &id);
+    assert_eq!(
+        attempts.len(),
+        2,
+        "no attempt after the crash: {attempts:?}"
+    );
+    assert_eq!(
+        (attempts[0].2.as_str(), attempts[0].3),
+        ("exhausted", 0),
+        "{attempts:?}"
+    );
+    assert_eq!(
+        (attempts[1].2.as_str(), attempts[1].3),
+        ("lost", 1),
+        "{attempts:?}"
+    );
+    let proof: Option<String> = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE agent_id=? AND number=2",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(proof.is_none(), "B's cleanup was never proven");
+    assert!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ) <= 1
+    );
+}

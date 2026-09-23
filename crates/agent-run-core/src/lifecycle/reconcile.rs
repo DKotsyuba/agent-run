@@ -381,7 +381,9 @@ fn guarded_lost(
         ],
     )?;
     tx.execute(
-        "UPDATE attempts SET state='lost',finished_at=? WHERE agent_id=?",
+        // Only unfinished attempts are lost; an attempt already closed (for
+        // example exhausted before an in-place account switch) keeps its state.
+        "UPDATE attempts SET state='lost',finished_at=? WHERE agent_id=? AND finished_at IS NULL",
         params![finished_at, expected.id.as_str()],
     )?;
     tx.execute(
