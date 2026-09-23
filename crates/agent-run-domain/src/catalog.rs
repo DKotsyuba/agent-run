@@ -249,7 +249,10 @@ impl FromStr for SecretRef {
     type Err = Error;
 
     /// Parses a nonblank, NUL-free canonical storage reference of at most
-    /// 256 bytes, rejecting leading or trailing whitespace.
+    /// 256 bytes, rejecting leading or trailing whitespace, and requires the
+    /// complete typed [`crate::CredentialRef`] grammar (`native:`, `named:`,
+    /// `env:`, absolute `file:` or `keychain:<service>:<account>`), so raw
+    /// or token-like text never enters a catalog, even over the wire.
     fn from_str(value: &str) -> Result<Self> {
         nonblank("secret ref", value)?;
         if value.len() > 256 || value.trim() != value {
@@ -257,7 +260,9 @@ impl FromStr for SecretRef {
                 "secret ref must be canonical and at most 256 bytes",
             ));
         }
-        Ok(Self(value.into()))
+        let reference = Self(value.into());
+        crate::CredentialRef::from_secret(&reference)?;
+        Ok(reference)
     }
 }
 
@@ -389,6 +394,22 @@ impl ProviderModel {
             return Err(invalid("model restrictions must not repeat"));
         }
         Ok(())
+    }
+
+    /// Accepts an orchestrator-selected `effort` only when this offering
+    /// permits it.
+    ///
+    /// Absence is always accepted (the configured default applies). A chosen
+    /// value must appear in `allowed_params["effort"]` when that list is
+    /// configured; without such a list any nonblank effort passes through
+    /// unchanged. Returns a validation error for a value outside the list.
+    pub fn permits_effort(&self, effort: Option<&str>) -> Result<()> {
+        match (effort, self.allowed_params.get("effort")) {
+            (Some(value), Some(allowed)) if !allowed.iter().any(|choice| choice == value) => {
+                Err(invalid("effort is not allowed for this model"))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -549,7 +570,9 @@ pub struct ProviderDefinition {
 
 impl ProviderDefinition {
     /// Validates self-containment: unique model ids, unique binding labels,
-    /// and every declared binding model subset contained in the model set.
+    /// every declared binding model subset contained in the model set, and a
+    /// `codex_appserver` limits source only on the codex harness with a
+    /// native connection.
     pub fn validate(&self) -> Result<()> {
         if self.models.is_empty() {
             return Err(invalid("provider must offer at least one model"));
@@ -568,6 +591,15 @@ impl ProviderDefinition {
             nonblank("provider recommendation", advice)?;
         }
         self.connection.validate(self.harness)?;
+        // The app-server probe reads only a native Codex login; no other
+        // harness or connection can ever produce its observations.
+        if self.limits_source == LimitsSource::CodexAppserver
+            && (self.harness != HarnessId::Codex || self.connection != ProviderConnection::Native)
+        {
+            return Err(invalid(
+                "codex_appserver limits require the codex harness and a native connection",
+            ));
+        }
         if !matches!(
             (self.harness, self.auth_family.as_str()),
             (HarnessId::Codex, "openai") | (HarnessId::ClaudeCode, "anthropic")
@@ -626,8 +658,9 @@ impl ProviderCatalog {
     /// Validates and freezes `accounts` and `providers` into a catalog.
     ///
     /// Rejects duplicate account or provider ids, invalid provider
-    /// definitions, bindings to unregistered accounts, and bindings whose
-    /// auth family differs from the provider's.
+    /// definitions, bindings to unregistered accounts, bindings whose
+    /// auth family differs from the provider's, and `codex_appserver`
+    /// providers bound to an account that is not a native or named Codex login.
     pub fn new(accounts: Vec<AccountRecord>, providers: Vec<ProviderDefinition>) -> Result<Self> {
         let mut registry = BTreeMap::new();
         let mut storage_identities = std::collections::HashSet::new();
@@ -656,6 +689,22 @@ impl ProviderCatalog {
                 if account.auth_family != provider.auth_family {
                     return Err(invalid(
                         "binding auth family must equal the provider auth family",
+                    ));
+                }
+                // Only native or named Codex logins are probeable app-server
+                // sources; a custom key bound here would never be observed.
+                if provider.limits_source == LimitsSource::CodexAppserver
+                    && !matches!(
+                        crate::CredentialRef::from_secret(&account.secret_ref)?,
+                        crate::CredentialRef::Native(HarnessId::Codex)
+                            | crate::CredentialRef::Named {
+                                harness: HarnessId::Codex,
+                                ..
+                            }
+                    )
+                {
+                    return Err(invalid(
+                        "codex_appserver limits require native or named codex account logins",
                     ));
                 }
             }

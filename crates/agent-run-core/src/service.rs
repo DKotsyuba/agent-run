@@ -414,6 +414,7 @@ impl Service {
             .iter()
             .find(|model| model.id == request.model)
             .ok_or_else(|| invalid("model is not offered by provider"))?;
+        offering.permits_effort(request.effort.as_deref())?;
         // Harness options run through the existing launch mechanisms: fast
         // is the codex service tier, output_schema the claude answer schema.
         if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
@@ -1283,7 +1284,8 @@ impl Service {
 
 /// Refuses a provider resume when the current configuration no longer
 /// permits the parent's frozen execution: the offering's native model alias
-/// changed, a current hard model restriction is absent from the frozen role,
+/// changed, its configured effort choices exclude the requested effort, a
+/// current hard model restriction is absent from the frozen role,
 /// the current canonical role no longer grants something the frozen role
 /// used (write, network, external read roots, a read root, a skill or MCP
 /// server) or requires a constraint the frozen role lacks, or the current
@@ -1319,6 +1321,9 @@ pub(crate) fn current_policy_permits(
         != then.native_model.as_deref().unwrap_or(&then.id)
     {
         return refuse("native model alias");
+    }
+    if now.permits_effort(request.effort.as_deref()).is_err() {
+        return refuse("effort");
     }
     let role =
         agent_run_config::role_plan::ResolvedRolePlan::from_payload(&authority.role_payload)?;

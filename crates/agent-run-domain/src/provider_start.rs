@@ -46,7 +46,9 @@ pub struct ProviderStartRequest {
     /// Existing output schema for supporting harnesses.
     #[serde(default)]
     pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Positive timeout metadata; the supervisor does not treat it as a deadline.
+    /// Whole-run deadline in seconds from admission, bounded by
+    /// [`crate::domain::MAX_TIMEOUT_SECONDS`]; absence takes the configured
+    /// default. Every attempt runs only for the remainder.
     #[serde(default)]
     pub timeout_seconds: Option<f64>,
     /// Scoped idempotency key.

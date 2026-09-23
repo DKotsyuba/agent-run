@@ -214,8 +214,12 @@ fn credential_references_are_typed_storage_locations() {
             "{reference}"
         );
     }
+    // Raw token-like text is not a storage reference at the catalog boundary.
+    assert!("fake-raw-token".parse::<SecretRef>().is_err());
+    assert!("keychain:codex".parse::<SecretRef>().is_err());
+    assert!(serde_json::from_value::<SecretRef>(serde_json::json!("sk-fake-raw")).is_err());
     assert_eq!(
-        format!("{:?}", "fake-raw-token".parse::<SecretRef>().unwrap()),
+        format!("{:?}", "env:FAKE_RAW_TOKEN".parse::<SecretRef>().unwrap()),
         "SecretRef(<redacted>)"
     );
 }
@@ -243,12 +247,7 @@ fn aliased_catalog() -> ProviderCatalog {
     let make = |id: &str| ProviderDefinition {
         id: ProviderId::from_str(id).unwrap(),
         harness: HarnessId::Codex,
-        connection: ProviderConnection::Custom {
-            endpoint: "https://api.example.com".into(),
-            protocol: ProviderProtocol::Responses,
-            auth_header: Default::default(),
-            allow_loopback_http: false,
-        },
+        connection: ProviderConnection::Native,
         auth_family: AuthFamily::from_str("openai").unwrap(),
         recommendations: vec![],
         priority_multiplier: PositiveFinite::try_from(1.0).unwrap(),
@@ -266,7 +265,7 @@ fn aliased_catalog() -> ProviderCatalog {
         vec![AccountRecord {
             account_id: account.clone(),
             auth_family: AuthFamily::from_str("openai").unwrap(),
-            secret_ref: SecretRef::from_str("keychain:codex").unwrap(),
+            secret_ref: SecretRef::from_str("native:codex").unwrap(),
             status: AccountStatus::Enabled,
         }],
         vec![make("codex-plus"), make("codex-pro")],
@@ -299,6 +298,38 @@ fn provider_alias_identity_shares_one_physical_quota_pool() {
 
 /// Auth-family mismatches and unregistered accounts are rejected at catalog
 /// construction; the binding never silently widens eligibility.
+/// A `codex_appserver` limits source is accepted only where the app-server
+/// probe can observe it: the codex harness, a native connection, and native
+/// or named Codex account logins.
+#[test]
+fn codex_appserver_source_requires_a_probeable_native_codex_login() {
+    let catalog = aliased_catalog();
+    let account = vec![catalog
+        .account(&AccountId::from_str("acct-codex-native").unwrap())
+        .unwrap()
+        .clone()];
+    let provider = catalog.providers()[0].clone();
+    assert!(ProviderCatalog::new(account.clone(), vec![provider.clone()]).is_ok());
+    let mut custom = provider.clone();
+    custom.connection = ProviderConnection::Custom {
+        endpoint: "https://api.example.com".into(),
+        protocol: ProviderProtocol::Responses,
+        auth_header: Default::default(),
+        allow_loopback_http: false,
+    };
+    assert!(custom.validate().is_err());
+    let mut claude = provider.clone();
+    claude.harness = HarnessId::ClaudeCode;
+    claude.auth_family = AuthFamily::from_str("anthropic").unwrap();
+    assert!(claude.validate().is_err());
+    let mut keyed = account.clone();
+    keyed[0].secret_ref = SecretRef::from_str("env:FAKE_CODEX_KEY").unwrap();
+    assert!(ProviderCatalog::new(keyed, vec![provider.clone()]).is_err());
+    let mut named = account;
+    named[0].secret_ref = SecretRef::from_str("named:codex:work").unwrap();
+    assert!(ProviderCatalog::new(named, vec![provider]).is_ok());
+}
+
 #[test]
 fn provider_binding_requires_registered_matching_auth_family() {
     let account = AccountId::from_str("acct-claude-native").unwrap();
@@ -313,7 +344,7 @@ fn provider_binding_requires_registered_matching_auth_family() {
         vec![AccountRecord {
             account_id: account,
             auth_family: AuthFamily::from_str("anthropic").unwrap(),
-            secret_ref: SecretRef::from_str("keychain:claude").unwrap(),
+            secret_ref: SecretRef::from_str("keychain:agent-run:claude").unwrap(),
             status: AccountStatus::Enabled,
         }],
         vec![wrong],
@@ -358,7 +389,10 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
     )
     .is_err());
 
+    // Endpoint checks are independent of the limits source; a custom
+    // connection cannot carry the app-server source.
     let mut provider = valid.providers()[0].clone();
+    provider.limits_source = LimitsSource::None;
     for endpoint in [
         "",
         "http://example.com",
@@ -737,7 +771,7 @@ fn launch_authority_is_serializable_but_credential_leases_are_not() {
         &account,
     )
     .unwrap();
-    assert_eq!(lease.secret().reference(), "keychain:codex");
+    assert_eq!(lease.secret().reference(), "native:codex");
     assert_eq!(format!("{:?}", lease.secret()), "SecretHandle(<redacted>)");
     // SecretHandle is not Serialize/Deserialize by construction; this test
     // compiles only because the assertions below never serialize the lease.

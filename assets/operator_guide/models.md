@@ -44,7 +44,8 @@ files can change without a config edit.
 `models` lists, per provider (in capacity order): `harness`, connection
 `kind`/`protocol`, `auth_family`, `limits_source`, `priority_multiplier`,
 `score`, provider `recommendations`, and every explicit offering with its
-`native_model`, default `params`, `allowed_params` (for example efforts),
+`native_model`, default `params`, `allowed_params` (for example efforts; a
+chosen `effort` outside the list is refused at start and resume),
 hard `restrictions`, model `recommendations`, the canonical `profiles`
 admission would accept for it, and cached `quota`: `status` (`available`,
 `unknown` = no current sample, `priority_overflow`, `exhausted`,

@@ -418,9 +418,10 @@ impl Config {
         if self.schema_version != 1 {
             return Err(invalid("unsupported config schema_version"));
         }
-        positive(
-            self.core.default_timeout_seconds,
-            "core.default_timeout_seconds",
+        agent_run_domain::domain::timeout_seconds(self.core.default_timeout_seconds).map_err(
+            |_| {
+                invalid("core.default_timeout_seconds must be positive, finite and at most 2592000")
+            },
         )?;
         if self.core.max_active_agents == 0 || self.core.max_active_agents > 4096 {
             return Err(invalid("max_active_agents must be 1..4096"));

@@ -69,8 +69,8 @@ account = "acct-glm"
 /// Returns fake global account records without credential bytes.
 fn accounts() -> Vec<AccountRecord> {
     [
-        ("acct-native", "openai", "keychain:fake-openai"),
-        ("acct-glm", "anthropic", "keychain:fake-glm"),
+        ("acct-native", "openai", "native:codex"),
+        ("acct-glm", "anthropic", "keychain:agent-run:fake-glm"),
     ]
     .into_iter()
     .map(|(id, family, reference)| AccountRecord {

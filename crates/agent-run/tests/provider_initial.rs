@@ -731,6 +731,48 @@ async fn provider_harness_options_are_validated_and_carried() {
     );
 }
 
+/// Configured effort choices and the timeout bound are enforced before any
+/// row exists: an effort outside `allowed_params.effort` and an absurd
+/// `timeout_seconds` (initial or as a resume override) are validation errors
+/// that write nothing, while an allowed effort is admitted.
+#[tokio::test]
+async fn provider_effort_and_timeout_are_bounded_before_admission() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let parent = completed_parent(&home, &service, "bounded-parent").await;
+    edit_config(&home, |config| {
+        let offering = &mut config["providers"]["glm-user"]["models"][0];
+        offering.as_table_mut().unwrap().insert(
+            "allowed_params".into(),
+            toml::from_str::<toml::Value>("effort = [\"medium\", \"high\"]").unwrap(),
+        );
+    });
+    let mut low = request_for(&home, "glm-user", "effort-low", None);
+    low.effort = Some("low".into());
+    let refused = service.admit_provider(low).unwrap_err();
+    assert_eq!(refused.machine_code().as_str(), "ValidationError");
+    let mut huge = request_for(&home, "glm-user", "timeout-huge", None);
+    huge.timeout_seconds = Some(1e308);
+    let refused = service.admit_provider(huge).unwrap_err();
+    assert_eq!(refused.machine_code().as_str(), "ValidationError");
+    let parent_row = Store::open(&home).unwrap().get(&parent).unwrap();
+    let refused = service
+        .admit_provider_resume(
+            &parent_row,
+            "fixture:answer".into(),
+            Some(1e308),
+            Some("resume-huge".into()),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(refused.machine_code().as_str(), "ValidationError");
+    assert_eq!(rows(&home), (1, 1), "refused requests write nothing");
+    let mut high = request_for(&home, "glm-user", "effort-high", None);
+    high.effort = Some("high".into());
+    service.admit_provider(high).unwrap();
+    assert_eq!(rows(&home).0, 2);
+}
+
 /// Runs one admitted provider agent to its terminal state through the real
 /// supervisor executable (bounded to 20 s).
 async fn run_to_end(home: &Path, id: &AgentId) {

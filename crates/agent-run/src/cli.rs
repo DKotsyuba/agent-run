@@ -328,8 +328,11 @@ pub enum AccountCommand {
         #[arg(long)]
         auth_family: AuthFamily,
         /// Nonsecret native/named/env/file/Keychain storage reference.
+        ///
+        /// Taken as text and parsed by the handler, so a rejected value (for
+        /// example a pasted raw token) is never echoed in the parse error.
         #[arg(long)]
-        reference: SecretRef,
+        reference: String,
     },
     /// List registered account metadata without full storage references.
     List,
@@ -390,7 +393,7 @@ pub struct Start {
     #[arg(
         long = "timeout",
         id = "timeout",
-        help = "Legacy metadata only; does not stop execution"
+        help = "Whole-run deadline in seconds, at most 2592000; defaults to core.default_timeout_seconds"
     )]
     pub timeout_seconds: Option<f64>,
     #[arg(long = "read-root", id = "read_root")]
@@ -1477,6 +1480,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 auth_family,
                 reference,
             } => {
+                let reference: SecretRef = reference.parse()?;
                 let source = CredentialRef::from_secret(&reference)?;
                 let record = AccountRecord {
                     account_id: id.clone(),

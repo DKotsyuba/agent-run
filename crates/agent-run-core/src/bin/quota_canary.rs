@@ -15,7 +15,9 @@
 //! resolves the host native Claude login through the quota reader (the
 //! same store the provider adapter launches with). Beyond key and field
 //! names, only allowlisted scalar window/scope facts are printed (see
-//! `facts`); credential failures print one fixed code.
+//! `facts`); credential failures print one fixed code. Every reported
+//! string, key names included, is bounded and finally scrubbed against the
+//! credential used (see `scrub`), so an endpoint echoing it cannot print it.
 
 use agent_run_adapters::authorized_request::CredentialReader;
 use agent_run_core::capacity::collectors::QuotaCredentialReader;
@@ -25,6 +27,47 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 /// Upper bound on the inspected response body.
 const BODY_MAX: usize = 2 * 1024 * 1024;
+/// Longest remote key name or spelling copied into the report verbatim.
+const NAME_MAX: usize = 48;
+/// Most remote key names reported per object.
+const NAMES_MAX: usize = 64;
+
+/// Bounds one provider-controlled name: longer names become `<long>`.
+fn name(text: &str) -> &str {
+    if text.len() <= NAME_MAX {
+        text
+    } else {
+        "<long>"
+    }
+}
+
+/// Replaces every string and object key of `report` that contains `secret`
+/// with `<redacted>`; an empty `secret` leaves the report unchanged.
+///
+/// This is the canary's last output step, independent of the production Lua
+/// response scrubber: whatever a permitted endpoint echoes, the credential
+/// bytes that authorized the request never reach stdout.
+fn scrub(report: Value, secret: &str) -> Value {
+    let clean = |text: String| {
+        if !secret.is_empty() && text.contains(secret) {
+            "<redacted>".to_owned()
+        } else {
+            text
+        }
+    };
+    match report {
+        Value::String(text) => Value::String(clean(text)),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(|item| scrub(item, secret)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (clean(key), scrub(item, secret)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
 
 /// Extracts only the normalized shape facts of one quota payload.
 fn shape(body: &str) -> Value {
@@ -34,7 +77,7 @@ fn shape(body: &str) -> Value {
     let root = value.get("data").unwrap_or(&value);
     let mut keys: Vec<&str> = root
         .as_object()
-        .map(|map| map.keys().map(String::as_str).collect())
+        .map(|map| map.keys().take(NAMES_MAX).map(|key| name(key)).collect())
         .unwrap_or_default();
     keys.sort_unstable();
     let limits = root
@@ -46,14 +89,14 @@ fn shape(body: &str) -> Value {
                 .map(|entry| {
                     let mut fields: Vec<&str> = entry
                         .as_object()
-                        .map(|map| map.keys().map(String::as_str).collect())
+                        .map(|map| map.keys().take(NAMES_MAX).map(|key| name(key)).collect())
                         .unwrap_or_default();
                     fields.sort_unstable();
                     let kind = entry
                         .get("kind")
                         .or_else(|| entry.get("type"))
                         .and_then(Value::as_str)
-                        .unwrap_or("<absent>");
+                        .map_or("<absent>", name);
                     json!({"kind": kind, "fields": fields, "facts": facts(entry)})
                 })
                 .collect::<Vec<_>>()
@@ -138,7 +181,7 @@ fn reduce(value: &Value, depth: u8) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .take(16)
-                .map(|(key, item)| (key.clone(), reduce(item, depth - 1)))
+                .map(|(key, item)| (name(key).to_owned(), reduce(item, depth - 1)))
                 .collect(),
         ),
     }
@@ -258,10 +301,10 @@ async fn run(arguments: &[String]) -> Result<Value, String> {
         .map_err(|_| "transport unavailable".to_owned())?;
     let mut request = client.get(&url);
     if kind == "glm" {
-        request = request.header("authorization", secret);
+        request = request.header("authorization", secret.as_str());
     } else {
         request = request
-            .bearer_auth(secret)
+            .bearer_auth(&secret)
             .header("anthropic-beta", "oauth-2025-04-20");
     }
     let mut response = request
@@ -287,9 +330,38 @@ async fn run(arguments: &[String]) -> Result<Value, String> {
         body.extend_from_slice(&chunk);
     }
     let body = String::from_utf8_lossy(&body).into_owned();
-    Ok(json!({
-        "status": status,
-        "retry_after_seconds": retry_after,
-        "shape": shape(&body),
-    }))
+    Ok(scrub(
+        json!({
+            "status": status,
+            "retry_after_seconds": retry_after,
+            "shape": shape(&body),
+        }),
+        &secret,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixture endpoint echoing the dummy credential as a key name, a
+    /// `kind` spelling or a scope value cannot surface it in the report.
+    #[test]
+    fn echoed_credential_never_reaches_the_report() {
+        let secret = "fixture-credential-0000";
+        let body = json!({
+            "fixture-credential-0000": 1,
+            "limits": [
+                {"kind": "fixture-credential-0000", "unit": 3},
+                {"type": "x-fixture-credential-0000-y", "scope": {"fixture-credential-0000": "fixture-credential-0000"}},
+                {("k".repeat(NAME_MAX + 1)): 1, "kind": "k".repeat(NAME_MAX + 1)}
+            ]
+        })
+        .to_string();
+        let report = scrub(json!({"status": 200, "shape": shape(&body)}), secret).to_string();
+        assert!(!report.contains(secret), "{report}");
+        assert!(report.contains("<redacted>"), "{report}");
+        assert!(!report.contains(&"k".repeat(NAME_MAX + 1)), "{report}");
+        assert!(report.contains("<long>"), "{report}");
+    }
 }

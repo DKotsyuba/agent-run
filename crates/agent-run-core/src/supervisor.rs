@@ -513,7 +513,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Err(error) => return Err(error),
         };
         let switched = continuing.is_some();
-        let remaining = std::time::Duration::from_secs_f64((deadline - domain::now()).max(0.0));
+        // Admission bounds new timeouts, but an older stored row may not be:
+        // the conversion is checked and saturates (tokio clamps an
+        // unrepresentable timeout) instead of panicking after the spawn.
+        let remaining = std::time::Duration::try_from_secs_f64((deadline - domain::now()).max(0.0))
+            .unwrap_or(Duration::MAX);
         let execution = async {
             let leader = process
                 .owner

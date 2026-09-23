@@ -19,7 +19,11 @@ them from `agent_run_domain::catalog` rather than redefining business types.
   settings, allowed parameter values, plain-text recommendations, and typed
   preserved restrictions. There is no model intelligence, classification, or
   scoring in the catalog.
-* V2 capacity source kinds are `codex_appserver`, `lua`, and `none`. A
+* V2 capacity source kinds are `codex_appserver`, `lua`, and `none`.
+  `codex_appserver` is accepted only on the codex harness with a native
+  connection whose bound accounts are native or named Codex logins; any
+  other combination is refused at catalog resolution because the app-server
+  probe could never observe it. A
   `lua` source must additionally bind an explicit `CollectorBinding`: a
   first-party collector script identity plus one to eight exact HTTPS (or
   fixture loopback HTTP) origins. Neither a script identity nor a
@@ -130,7 +134,9 @@ The public `start` tool (CLI `agent-run start`, broker socket, MCP) takes a
 `ProviderStartRequest`: required `provider`, `model`, `profile`, `task`,
 `workdir`, plus optional `account` (a provider-local label pin), `effort`,
 `write`, `read_roots`, `timeout_seconds`, `request_id`, `orchestrator` and
-`required_constraints`. It is served by `Service::start_provider` inside the
+`required_constraints`. When the offering configures
+`allowed_params.effort`, a chosen `effort` outside that list is a
+`ValidationError`. It is served by `Service::start_provider` inside the
 resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
 `ValidationError`; there is no runtime alias. A repeated `request_id` returns
@@ -395,7 +401,10 @@ tries to continue the same logical run on another account:
 ### One run deadline, handoff serialization and recovery
 
 - A provider run has one deadline: its admission time (`created_at`) plus
-  its stored `timeout_seconds`, re-read before every spawn. Each attempt runs
+  its stored `timeout_seconds`, re-read before every spawn. A requested or
+  resume-override timeout, and `core.default_timeout_seconds`, must be
+  positive, finite and at most 2592000 seconds (30 days); anything else is
+  refused before a row is written. Each attempt runs
   only for the remainder; on expiry the runner is dropped, the process group
   cleaned, and the run ends `timed_out` once. An expired run allocates or
   spawns no further attempt; a pending cancel wins over expiry.

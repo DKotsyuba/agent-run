@@ -219,7 +219,8 @@ pub struct StartRequest {
     pub fast: bool,
     #[serde(default)]
     pub effort: Option<String>,
-    /// Legacy metadata only. Never an execution deadline.
+    /// The run's whole-run deadline in seconds from admission, at most
+    /// [`MAX_TIMEOUT_SECONDS`]; absence takes the configured default.
     #[serde(default)]
     pub timeout_seconds: Option<f64>,
     #[serde(default)]
@@ -264,9 +265,7 @@ impl StartRequest {
             }
         }
         if let Some(v) = self.timeout_seconds {
-            if !v.is_finite() || v <= 0.0 {
-                return Err(invalid("timeout_seconds must be positive and finite"));
-            }
+            timeout_seconds(v)?;
         }
         self.workdir = existing_dir(&self.workdir)?;
         self.read_roots = self
@@ -286,6 +285,22 @@ impl StartRequest {
         }
         Ok(())
     }
+}
+/// The largest accepted run timeout: 30 days in seconds.
+///
+/// The bound keeps `created_at + timeout` and every remaining-time duration
+/// representable, so an accepted timeout can never overflow a runtime clock.
+pub const MAX_TIMEOUT_SECONDS: f64 = 30.0 * 24.0 * 3600.0;
+
+/// Accepts a run timeout in seconds that is finite, positive and at most
+/// [`MAX_TIMEOUT_SECONDS`]; anything else is a validation error.
+pub fn timeout_seconds(value: f64) -> Result<f64> {
+    if !value.is_finite() || value <= 0.0 || value > MAX_TIMEOUT_SECONDS {
+        return Err(invalid(
+            "timeout_seconds must be positive, finite and at most 2592000",
+        ));
+    }
+    Ok(value)
 }
 pub fn existing_dir(path: &std::path::Path) -> Result<PathBuf> {
     if !path.is_absolute() {

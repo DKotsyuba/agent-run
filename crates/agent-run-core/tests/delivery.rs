@@ -1459,10 +1459,12 @@ async fn bounded_dispatch_drains_backlog_and_leaves_overflow_due() {
             stream.write_all(reply).await.unwrap();
         }
     });
+    // The whole result is printed on failure: an intermittent (0, 0) second
+    // pass must be distinguishable as locked out versus an empty claim.
     let first = dispatch_with_batch(&home.path, 2).await.unwrap();
-    assert_eq!((first.claimed, first.delivered), (2, 2));
+    assert_eq!((first.claimed, first.delivered), (2, 2), "{first:?}");
     let second = dispatch(&home.path).await.unwrap();
-    assert_eq!((second.claimed, second.delivered), (1, 1));
+    assert_eq!((second.claimed, second.delivered), (1, 1), "{second:?}");
     peer.await.unwrap();
 }
 

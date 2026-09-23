@@ -101,7 +101,8 @@ per round however many provider aliases bind it. `limits_source = "lua"`
 providers bind a collector (`glm_quota`, `anthropic_usage`, or a custom
 `script_file` with an explicit `auth` placement); `codex_appserver` providers
 are probed through the account's own reference (`native:codex` or
-`named:codex:<label>`), never a provider label. Native and named Claude
+`named:codex:<label>`), never a provider label; they must use the codex
+harness and a native connection. Native and named Claude
 accounts read only their own login store, with no fallback to the default
 login. Failures report fixed codes such as `credential_unavailable`, the
 round's `ok` is false when any source failed, and a v2 config that fails to

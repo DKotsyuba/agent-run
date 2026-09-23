@@ -72,7 +72,7 @@ fn home() -> tempfile::TempDir {
     write_config(root, "native subscription");
     let mut store = agent_run_store::Store::open(root).unwrap();
     for (id, family, reference) in [
-        ("acct-codex", "openai", "keychain:secret-codex:ref"),
+        ("acct-codex", "openai", "named:codex:secret-codex"),
         ("acct-glm", "anthropic", "keychain:secret-glm:ref"),
     ] {
         store

@@ -31,9 +31,8 @@ fn registry_keeps_global_identity_and_reference_metadata() {
     assert!(store
         .register_account(&record("acct-two", "openai", "native:codex"))
         .is_err());
-    assert!(store
-        .register_account(&record("acct-two", "openai", "raw-fake-token"))
-        .is_err());
+    // Raw token-like text is refused before it can even form a record.
+    assert!("raw-fake-token".parse::<SecretRef>().is_err());
     assert!(store
         .register_account(&record("acct-wrong", "anthropic", "native:codex"))
         .is_err());
