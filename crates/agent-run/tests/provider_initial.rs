@@ -1375,3 +1375,42 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
         before
     );
 }
+
+/// Every record a provider supervisor journals — phases, transcript, runtime
+/// session, cleanup, history evidence and the terminal events — carries its
+/// attempt id, including those written after ownership was released.
+#[tokio::test]
+async fn supervisor_records_are_bound_to_their_attempt() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "bound-parent").await;
+    let store = Store::open(&home).unwrap();
+    let attempt: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unbound: Vec<String> = store
+        .conn
+        .prepare(
+            "SELECT kind FROM events WHERE agent_id=? AND (attempt_id IS NULL OR attempt_id!=?)",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![id.as_str(), attempt], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(unbound.is_empty(), "{unbound:?}");
+    let messages: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND (attempt_id IS NULL OR attempt_id!=?)",
+            rusqlite::params![id.as_str(), attempt],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 0);
+}

@@ -622,3 +622,75 @@ fn concurrent_allocators_admit_one_next_attempt() {
     let store = Store::open(&path).unwrap();
     assert_eq!(ownership(&store, &id), (1, 0, 2));
 }
+
+/// Late records keep their originating attempt: after the next attempt is
+/// allocated, a handle bound to the released attempt still writes that
+/// attempt's id (never the new owner's, never NULL); an unbound handle
+/// keeps the historical rule (current owner); a binding naming another
+/// agent's attempt records NULL rather than a guess.
+#[test]
+fn late_records_keep_their_originating_attempt() {
+    let home = home();
+    let (mut store, id) = cleaned_run(home.path(), "late-1", true);
+    let first: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let catalog = catalog(&store);
+    let revision = store.quota_capacity_revision().unwrap();
+    let next = store
+        .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+        .unwrap();
+    let mut late = Store::open(home.path()).unwrap();
+    late.bind_attempt(&first);
+    late.event(&id, "process_cleanup", &json!({"late":true}))
+        .unwrap();
+    late.message(&id, "assistant", "final words", None, None)
+        .unwrap();
+    store.event(&id, "unbound", &json!({})).unwrap();
+    let (_, other) = cleaned_run(home.path(), "late-2", true);
+    let mut foreign = Store::open(home.path()).unwrap();
+    foreign.bind_attempt(&first);
+    foreign.event(&other, "foreign", &json!({})).unwrap();
+    let attempt_of = |sql: &str, agent: &str| -> Option<String> {
+        store
+            .conn
+            .query_row(sql, [agent], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        attempt_of(
+            "SELECT attempt_id FROM events WHERE agent_id=? AND kind='process_cleanup'",
+            id.as_str()
+        )
+        .as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        attempt_of(
+            "SELECT attempt_id FROM messages WHERE agent_id=? AND content='final words'",
+            id.as_str()
+        )
+        .as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        attempt_of(
+            "SELECT attempt_id FROM events WHERE agent_id=? AND kind='unbound'",
+            id.as_str()
+        )
+        .as_deref(),
+        Some(next.attempt_id.as_str())
+    );
+    assert_eq!(
+        attempt_of(
+            "SELECT attempt_id FROM events WHERE agent_id=? AND kind='foreign'",
+            other.as_str()
+        ),
+        None
+    );
+}

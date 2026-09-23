@@ -356,6 +356,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     let config = identity.provider_config.clone();
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
     let (attempt_id, account) = store.provider_attempt(id)?;
+    // Everything this supervisor journals originates from this attempt,
+    // including final and cleanup records written after ownership ends.
+    store.bind_attempt(&attempt_id);
     let harness = config
         .harnesses
         .get(&identity.authority.harness)

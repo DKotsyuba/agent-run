@@ -61,6 +61,12 @@ pub(crate) const MIGRATION_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Store {
     pub conn: Connection,
     pub home: PathBuf,
+    /// The attempt this handle writes for, once a supervisor binds it:
+    /// events, transcript messages and runtime-session records then carry
+    /// exactly this attempt id (checked to belong to the agent), also after
+    /// its ownership was released. Unbound handles keep the historical rule
+    /// (the agent's currently owned attempt, else NULL for logical records).
+    attempt: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -170,6 +176,12 @@ impl Record {
         })
     }
 }
+/// SQL for the attempt id of a record written for agent `?1` by a handle
+/// bound to attempt `?2`: exactly that attempt when bound (NULL if it is not
+/// the agent's), otherwise the agent's currently owned attempt, else NULL.
+const ATTEMPT_OF: &str =
+    "CASE WHEN ?2 IS NOT NULL THEN (SELECT id FROM attempts WHERE id=?2 AND agent_id=?1) \
+     ELSE (SELECT id FROM attempts WHERE agent_id=?1 AND ownership_active=1) END";
 pub(crate) fn tx_event(
     tx: &Transaction<'_>,
     id: &AgentId,
@@ -370,6 +382,7 @@ impl Store {
         Ok(Self {
             conn,
             home: home.to_path_buf(),
+            attempt: None,
         })
     }
     pub fn health(&self) -> Result<Value> {
@@ -408,13 +421,23 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::NotFound(id.to_string()))
     }
+    /// Binds every later event, message and runtime-session record written
+    /// through this handle to `attempt` (see [`Store`]'s `attempt` field).
+    pub fn bind_attempt(&mut self, attempt: &str) {
+        self.attempt = Some(attempt.to_owned());
+    }
+    /// The attempt this handle is bound to, if any.
+    pub fn bound_attempt(&self) -> Option<&str> {
+        self.attempt.as_deref()
+    }
     pub fn event(&self, id: &AgentId, kind: &str, data: &Value) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) \
-             VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?)",
+            &format!(
+                "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?1,{ATTEMPT_OF},?3,?4,?5)"
+            ),
             params![
                 id.as_str(),
-                id.as_str(),
+                self.attempt,
                 now(),
                 kind,
                 serde_json::to_string(data)?
@@ -922,11 +945,12 @@ impl Store {
             params![session, id.as_str()],
         )?;
         tx.execute(
-            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) \
-             VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?)",
+            &format!(
+                "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?1,{ATTEMPT_OF},?3,?4,?5)"
+            ),
             params![
                 id.as_str(),
-                id.as_str(),
+                self.attempt,
                 now(),
                 "runtime_session",
                 json!({"id":session}).to_string()
@@ -951,11 +975,12 @@ impl Store {
         }
         let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
         self.conn.execute(
-            "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) \
-             VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?,?,?)",
+            &format!(
+                "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) VALUES(?1,{ATTEMPT_OF},?3,?4,?5,?6,?7)"
+            ),
             params![
                 id.as_str(),
-                id.as_str(),
+                self.attempt,
                 now(),
                 role,
                 name,
