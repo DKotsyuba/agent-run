@@ -539,3 +539,43 @@ fn native_signal_latch_survives_stale_positive_and_releases_on_fresh() {
         "a newer positive observation releases it"
     );
 }
+
+/// One account, pool and window name observed by two sources, as after a
+/// collector source switch with a carried latch: `s1` governs only
+/// `glm-4.7`, `s2` only `glm-4.6`. Each persisted physical row claims only
+/// its own source's members; neither inherits the other's model.
+#[test]
+fn same_window_name_from_two_sources_keeps_separate_membership() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let window = |source: &str, remaining: f64| {
+        json!({"source": source, "name": "five_hour", "remaining_percent": remaining,
+               "reset_at": 2000.0, "observed_at": 1000.0, "valid_until": 1900.0})
+    };
+    let snapshot: agent_run_domain::catalog::NormalizedQuotaSnapshot =
+        serde_json::from_value(json!({
+            "account": "acct-main",
+            "models": [
+                {"model": "glm-4.6", "pools": [{"key": "acct-main::primary", "windows": [window("s2", 50.0)]}]},
+                {"model": "glm-4.7", "pools": [{"key": "acct-main::primary", "windows": [window("s1", 0.0)]}]}
+            ]
+        }))
+        .unwrap();
+    snapshot.validate().unwrap();
+    record_quota_snapshot(home.path(), "glm", &snapshot, 100, 1500.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let members = |source: &str| -> Value {
+        let payload: String = store
+            .conn
+            .query_row(
+                "SELECT payload_json FROM capacity_samples WHERE window='five_hour' AND source=?",
+                [source],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&payload).unwrap()["models"].clone()
+    };
+    assert_eq!(members("s1"), json!(["glm-4.7"]));
+    assert_eq!(members("s2"), json!(["glm-4.6"]));
+}

@@ -307,8 +307,11 @@ pub fn record_quota_snapshot(
     // Membership is recorded per physical window, and only for the models
     // whose own view of that window is exactly the persisted fact: a narrower
     // window never inherits every model of its pool, and a carried exhaustion
-    // never extends to a model that reported the window as unknown.
-    let mut pool_models: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    // never extends to a model that reported the window as unknown. It is
+    // keyed by the full physical identity (lane, source, window): the same
+    // window name from another source (a carried latch after a source
+    // switch) is a different fact with its own members.
+    let mut pool_models: BTreeMap<(&str, &str, &str), BTreeSet<&str>> = BTreeMap::new();
     for model in &snapshot.models {
         for pool in &model.pools {
             let lane = lane_of(&pool.key, &account)?;
@@ -316,7 +319,7 @@ pub fn record_quota_snapshot(
                 let key = (lane, window.source.as_str(), window.name.as_str());
                 if physical.get(&key).is_some_and(|chosen| *chosen == window) {
                     pool_models
-                        .entry((lane, window.name.as_str()))
+                        .entry(key)
                         .or_default()
                         .insert(model.model.as_str());
                 }
@@ -324,11 +327,11 @@ pub fn record_quota_snapshot(
         }
     }
     let mut mutations = 0usize;
-    for ((lane, _source, _name), window) in &physical {
+    for (identity @ (lane, _source, _name), window) in &physical {
         window.validate()?;
         let quota_key = format!("{}::{}", account.as_str(), lane);
         let models = pool_models
-            .get(&(*lane, window.name.as_str()))
+            .get(identity)
             .map(|set| serde_json::json!({ "models": set.iter().collect::<Vec<_>>() }));
         tx.execute(
             "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
