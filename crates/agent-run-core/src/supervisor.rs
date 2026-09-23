@@ -415,6 +415,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             output_schema: identity.provider_request.output_schema.as_ref(),
         },
     )?;
+    // A resumed attempt re-verifies the parent's recorded history seal at the
+    // handoff itself, not only at admission.
+    if let (Some(session), Some(parent)) = (&row.resume_of_runtime_session_id, &row.parent_agent_id)
+    {
+        crate::service::verify_recorded_history(
+            &store.latest_attempt_state(parent)?,
+            &identity,
+            &runtime_home,
+            session,
+        )?;
+    }
     store.provider_spawning(id, &attempt_id)?;
     store.event(id, "phase", &json!({"phase":"spawning"}))?;
     // Process::spawn yields Io only when the OS refused Command::spawn,
@@ -471,6 +482,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     let cleanup = cleanup?;
     store.provider_cleanup(id, &attempt_id, &cleanup)?;
     store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+    let history = history_evidence(
+        store,
+        id,
+        &attempt_id,
+        &identity,
+        &planned.launch.environment,
+    );
+    store.provider_history(id, &attempt_id, &history)?;
     let cancelled = store.cancel_pending(id)?;
     let mut result = match execution {
         Ok(result) => result,
@@ -509,6 +528,47 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
     commands::complete_terminal(store, id)?;
     Ok(())
+}
+/// Seals the finished attempt's native history at its cleanup boundary, in
+/// the storage root the attempt's own environment named (`CODEX_HOME`, or
+/// `CLAUDE_CONFIG_DIR` falling back to `$HOME/.claude`). Returns the adapter
+/// state to record: `native_history` with the seal bound to provider, assets
+/// and attempt, or `native_history_unavailable` with the reason. Never fails
+/// the finished task itself.
+fn history_evidence(
+    store: &Store,
+    id: &AgentId,
+    attempt: &str,
+    identity: &ProviderLaunchIdentity,
+    environment: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    let session = match store.get(id).map(|row| row.runtime_session_id) {
+        Ok(Some(session)) => session,
+        _ => return json!({"native_history_unavailable":"no native session was recorded"}),
+    };
+    let root = match identity.authority.harness {
+        HarnessId::Codex => environment.get("CODEX_HOME").map(std::path::PathBuf::from),
+        HarnessId::ClaudeCode => environment
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                environment
+                    .get("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".claude"))
+            }),
+    };
+    let Some(root) = root else {
+        return json!({"native_history_unavailable":"the attempt named no native storage"});
+    };
+    match crate::continuity::seal(identity.authority.harness, &root, &session) {
+        Ok(seal) => json!({"native_history":{
+            "seal": seal,
+            "provider": identity.authority.provider,
+            "assets_sha256": identity.authority.assets_sha256,
+            "attempt": attempt,
+        }}),
+        Err(error) => json!({"native_history_unavailable": error.to_string()}),
+    }
 }
 fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
     let mut outcome = Outcome::failure("cancelled_before_spawn");

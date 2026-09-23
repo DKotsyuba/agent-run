@@ -873,13 +873,13 @@ impl Service {
                     "continuation_unavailable: parent runtime assets no longer verify".into(),
                 )
             })?;
-        let (prefer, intent, pinned_id): (String, String, Option<String>) =
+        let (prefer, intent, pinned_id, adapter_state): (String, String, Option<String>, String) =
             Store::open(&self.home)?.conn.query_row(
-                "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id \
+                "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id,t.adapter_state_json \
                  FROM attempts t JOIN agents a ON a.id=t.agent_id \
                  WHERE t.agent_id=? ORDER BY t.number DESC LIMIT 1",
                 [parent.id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
         let prefer: agent_run_domain::catalog::AccountId = prefer.parse()?;
         // The current configuration may only narrow the frozen authority.
@@ -902,13 +902,12 @@ impl Service {
                 "provider, harness, connection or model changed since the parent ran; resume refused",
             ));
         };
-        let history_root = match authority.harness {
-            agent_run_domain::catalog::HarnessId::Codex => runtime_home.clone(),
-            agent_run_domain::catalog::HarnessId::ClaudeCode => {
-                self.claude_history_root(&frozen, &accounts, &prefer, &runtime_home)?
-            }
-        };
-        crate::continuity::prove(authority.harness, &history_root, session)?;
+        // Current policy must still permit the frozen execution; it is never
+        // replaced by the current one. Checked before the history proof so a
+        // policy refusal is reported as such.
+        current_policy_permits(&current, &frozen, &request)?;
+        // Only the seal recorded at the parent's cleanup boundary is trusted.
+        verify_recorded_history(&adapter_state, &frozen, &runtime_home, session)?;
         let bound: std::collections::BTreeSet<_> = offered
             .bindings
             .iter()
@@ -966,8 +965,7 @@ impl Service {
             runtime_home: Some(runtime_home),
             snapshot_sha256: frozen.snapshot_sha256.clone(),
         })?;
-        let cap = frozen
-            .provider_config
+        let cap = current
             .harnesses
             .get(&authority.harness)
             .ok_or_else(|| invalid("provider harness is not configured"))?
@@ -1021,50 +1019,6 @@ impl Service {
         )
     }
 
-    /// The Claude config directory holding `account`'s session history: the
-    /// labelled login directory for a `named:` reference, the host's
-    /// `CLAUDE_CONFIG_DIR` (or `~/.claude`) for the native login, and the
-    /// run's own `claude-config` for a custom-gateway provider.
-    fn claude_history_root(
-        &self,
-        frozen: &ProviderLaunchIdentity,
-        accounts: &[agent_run_domain::catalog::AccountRecord],
-        account: &agent_run_domain::catalog::AccountId,
-        runtime_home: &std::path::Path,
-    ) -> Result<PathBuf> {
-        use agent_run_domain::CredentialRef;
-        if !matches!(
-            frozen.authority.connection,
-            agent_run_domain::catalog::ProviderConnection::Native
-        ) {
-            return Ok(runtime_home.join("claude-config"));
-        }
-        let record = accounts
-            .iter()
-            .find(|record| &record.account_id == account)
-            .ok_or_else(|| invalid("parent account is no longer registered"))?;
-        Ok(match CredentialRef::from_secret(&record.secret_ref)? {
-            CredentialRef::Named { label, .. } => {
-                let harness = frozen
-                    .provider_config
-                    .harnesses
-                    .get(&frozen.authority.harness)
-                    .ok_or_else(|| invalid("provider harness is not configured"))?;
-                adapters::materialize::claude_account_config(
-                    &self.home,
-                    &harness.home,
-                    label.as_str(),
-                )?
-            }
-            _ => std::env::var_os("CLAUDE_CONFIG_DIR")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
-                })
-                .ok_or_else(|| invalid("HOME is missing"))?,
-        })
-    }
     /// Enqueues one durable cancellation and returns the agent's public view.
     ///
     /// The pending command is persisted exactly as [`Store::enqueue`] records
@@ -1304,4 +1258,176 @@ impl Service {
             )),
         }
     }
+}
+
+/// Refuses a provider resume when the current configuration no longer
+/// permits the parent's frozen execution: the offering's native model alias
+/// changed, a current hard model restriction is absent from the frozen role,
+/// the current canonical role no longer grants something the frozen role
+/// used (write, network, external read roots, a read root, a skill or MCP
+/// server) or requires a constraint the frozen role lacks, or the current
+/// harness policy rejects the frozen grants. Advice and ranking weights are
+/// not compared. The frozen authority is never replaced by the current one.
+pub(crate) fn current_policy_permits(
+    current: &ProviderConfig,
+    frozen: &ProviderLaunchIdentity,
+    request: &ProviderStartRequest,
+) -> Result<()> {
+    let authority = &frozen.authority;
+    let refuse = |what: &str| {
+        Err(invalid(format!(
+            "current policy no longer permits the parent's frozen execution ({what}); resume refused"
+        )))
+    };
+    let offering = |config: &ProviderConfig| {
+        config
+            .providers
+            .get(&authority.provider)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.id == authority.model)
+            })
+            .cloned()
+    };
+    let (Some(now), Some(then)) = (offering(current), offering(&frozen.provider_config)) else {
+        return refuse("model offering");
+    };
+    if now.native_model.as_deref().unwrap_or(&now.id)
+        != then.native_model.as_deref().unwrap_or(&then.id)
+    {
+        return refuse("native model alias");
+    }
+    let role =
+        agent_run_config::role_plan::ResolvedRolePlan::from_payload(&authority.role_payload)?;
+    if !now
+        .restrictions
+        .iter()
+        .all(|restriction| role.required_constraints.contains(restriction))
+    {
+        return refuse("model restrictions");
+    }
+    let Ok(mut profile) = profiles::load_provider(current, request) else {
+        return refuse("canonical role");
+    };
+    profile
+        .required_constraints
+        .extend(now.restrictions.iter().copied());
+    let Ok(now_role) = role_plan::resolve_role_plan(
+        &profile,
+        current.skills_dir(),
+        &current.mcp,
+        if request.account.is_some() {
+            "account"
+        } else {
+            "global"
+        },
+        request.account.as_ref().map(|label| label.as_str()),
+    ) else {
+        return refuse("role assets");
+    };
+    let ids = |items: &[String]| {
+        items
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let frozen_skills = ids(&role
+        .skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<Vec<_>>());
+    let frozen_mcp = ids(&role
+        .mcp
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>());
+    let now_skills = ids(&now_role
+        .skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<Vec<_>>());
+    let now_mcp = ids(&now_role
+        .mcp
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>());
+    if (role.write && !now_role.write)
+        || (role.network && !now_role.network)
+        || (role.allow_external_read_roots && !now_role.allow_external_read_roots)
+        || !role
+            .read_roots
+            .iter()
+            .all(|root| now_role.read_roots.contains(root))
+        || !frozen_skills.is_subset(&now_skills)
+        || !frozen_mcp.is_subset(&now_mcp)
+        || !now_role
+            .required_constraints
+            .is_subset(&role.required_constraints)
+    {
+        return refuse("role grants");
+    }
+    let runtime = adapters::provider::runtime(current, authority.harness, &authority.model)?;
+    let frozen_profile = Profile {
+        name: role.role_name.clone(),
+        body: role.prompt.clone(),
+        write: role.write,
+        network: role.network,
+        revision: role.role_revision.clone(),
+        canonical: true,
+        allow_external_read_roots: role.allow_external_read_roots,
+        read_roots: role.read_roots.clone(),
+        skills: frozen_skills.into_iter().collect(),
+        mcp: frozen_mcp.into_iter().collect(),
+        required_constraints: role.required_constraints.clone(),
+    };
+    if policy::evaluate(authority.provider.as_str(), &runtime, &frozen_profile)
+        .admit()
+        .is_err()
+    {
+        return refuse("harness policy");
+    }
+    Ok(())
+}
+
+/// Verifies the native-history seal the supervisor recorded in the parent's
+/// last attempt (`adapter_state_json.native_history`) against the file it
+/// names. The seal must exist, be bound to the parent's session, harness,
+/// assets digest and (for Codex) its runtime home, and the file must still
+/// have the exact sealed bytes. A missing seal fails closed: history is never
+/// adopted for the first time here.
+pub(crate) fn verify_recorded_history(
+    adapter_state: &str,
+    frozen: &ProviderLaunchIdentity,
+    runtime_home: &std::path::Path,
+    session: &str,
+) -> Result<()> {
+    let unavailable =
+        |reason: &str| Error::Unsupported(format!("continuation_unavailable: {reason}"));
+    let state: Value = serde_json::from_str(adapter_state)
+        .map_err(|_| unavailable("parent attempt state is unreadable"))?;
+    let record = &state["native_history"];
+    if record.is_null() {
+        return Err(unavailable(
+            "the parent attempt recorded no native history seal",
+        ));
+    }
+    let seal: crate::continuity::HistorySeal = serde_json::from_value(record["seal"].clone())
+        .map_err(|_| unavailable("the parent's native history seal is malformed"))?;
+    if record["assets_sha256"] != frozen.authority.assets_sha256.as_str()
+        || record["provider"] != frozen.authority.provider.as_str()
+    {
+        return Err(unavailable(
+            "native history seal is bound to another authority",
+        ));
+    }
+    if frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex
+        && runtime_home.canonicalize().ok().as_deref() != Some(seal.root.as_path())
+    {
+        return Err(unavailable(
+            "native history seal names another storage root",
+        ));
+    }
+    crate::continuity::verify(&seal, frozen.authority.harness, session)
 }

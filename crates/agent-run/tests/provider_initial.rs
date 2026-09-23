@@ -741,6 +741,20 @@ async fn run_to_end(home: &Path, id: &AgentId) {
     assert!(exit.success(), "supervisor exit: {exit}");
 }
 
+/// Returns the parsed adapter state of `id`'s latest attempt.
+fn attempt_state(home: &Path, id: &AgentId) -> serde_json::Value {
+    let text: String = Store::open(home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT adapter_state_json FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
 /// Writes the Claude native transcript for `session` under the run's
 /// custom-gateway config directory, as the harness itself would.
 fn transcript(runtime_home: &Path, session: &str, body: &str) {
@@ -796,19 +810,47 @@ async fn provider_resume_continues_the_proven_native_session() {
             )
             .unwrap()
     };
+    // The supervisor sealed the history the harness wrote before completing.
+    let state = attempt_state(&home, &id);
+    let seal = &state["native_history"]["seal"];
+    assert_eq!(seal["session"], session.as_str(), "{state}");
+    assert_eq!(seal["records"], 4, "{state}");
+    let history = runtime_home.join(format!(
+        "claude-config/projects/-fixture-workdir/{session}.jsonl"
+    ));
+    let sealed = fs::read(&history).unwrap();
+    // A same-session rewrite (last complete line dropped) is detected.
+    let text = String::from_utf8(sealed.clone()).unwrap();
+    let kept: String = text
+        .lines()
+        .take(3)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&history, kept).unwrap();
     let refused = resume("resume-1").unwrap_err().to_string();
-    assert!(refused.contains("continuation_unavailable"), "{refused}");
-    let open_tool = format!(
-        "{{\"sessionId\":\"{session}\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\"}}]}}}}\n"
+    assert!(refused.contains("changed since it was sealed"), "{refused}");
+    fs::write(&history, &sealed).unwrap();
+    // A parent without a recorded seal fails closed; the history present on
+    // disk is never adopted as a new baseline.
+    let recorded = serde_json::to_string(&state).unwrap();
+    let set_state = |value: &str| {
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE attempts SET adapter_state_json=? WHERE agent_id=?",
+                rusqlite::params![value, id.as_str()],
+            )
+            .unwrap();
+    };
+    set_state("{}");
+    let refused = resume("resume-1").unwrap_err().to_string();
+    assert!(
+        refused.contains("recorded no native history seal"),
+        "{refused}"
     );
-    transcript(&runtime_home, &session, &open_tool);
-    let refused = resume("resume-1").unwrap_err().to_string();
-    assert!(refused.contains("unresolved tool call"), "{refused}");
+    set_state(&recorded);
     assert_eq!(children(), 0, "a refusal admits nothing");
-    let closed = format!(
-        "{open_tool}{{\"sessionId\":\"{session}\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t1\"}}]}}}}\n"
-    );
-    transcript(&runtime_home, &session, &closed);
 
     let child = resume("resume-1").unwrap();
     assert_eq!(child["created"], true, "{child}");
@@ -858,6 +900,11 @@ async fn provider_resume_continues_the_proven_native_session() {
         .unwrap();
     assert_eq!(selected, "acct-work");
     assert!(cleanup.is_some());
+    // The child's own attempt sealed the continued history (both turns).
+    assert_eq!(
+        attempt_state(&home, &child_id)["native_history"]["seal"]["records"],
+        8
+    );
 
     // The pinned account is disabled: resume refuses instead of switching.
     Store::open(&home)
@@ -954,17 +1001,6 @@ async fn concurrent_provider_resumes_admit_one_child() {
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
     let parent = Store::open(&home).unwrap().get(&id).unwrap();
-    let session = parent.runtime_session_id.clone().unwrap();
-    let runtime_home = std::path::PathBuf::from(
-        parent.identity.as_ref().unwrap()["runtime_home"]
-            .as_str()
-            .unwrap(),
-    );
-    transcript(
-        &runtime_home,
-        &session,
-        &format!("{{\"sessionId\":\"{session}\"}}\n"),
-    );
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let results: Vec<bool> = (0..2)
         .map(|index| {
@@ -1003,4 +1039,258 @@ async fn concurrent_provider_resumes_admit_one_child() {
         )
         .unwrap();
     assert_eq!(children, 1);
+}
+
+/// Runs one pinned parent to completion and returns its id.
+async fn completed_parent(home: &Path, service: &Service, request_id: &str) -> AgentId {
+    let mut request = request(home);
+    request.request_id = Some(request_id.into());
+    let revision = Store::open(home)
+        .unwrap()
+        .quota_capacity_revision()
+        .unwrap();
+    let admitted = service
+        .admit_provider_trusted(request, candidates(revision))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(home, &id).await;
+    id
+}
+
+/// Rewrites config.toml through `edit` on its parsed TOML.
+fn edit_config(home: &Path, edit: impl FnOnce(&mut toml::Value)) {
+    let path = home.join("config.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut config);
+    fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+}
+
+/// Current policy is enforced on resume without replacing the frozen
+/// execution: a changed native model alias, a role that now requires a new
+/// constraint, and a full current harness cap each refuse with a policy (or
+/// capacity) error — never the missing-proof refusal — and admit nothing.
+#[tokio::test]
+async fn provider_resume_enforces_current_alias_role_and_cap() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "policy-parent").await;
+    let parent = || Store::open(&home).unwrap().get(&id).unwrap();
+    let resume = |request_id: &str| {
+        service
+            .admit_provider_resume(
+                &parent(),
+                "fixture:answer".into(),
+                None,
+                Some(request_id.into()),
+                None,
+            )
+            .map_err(|error| error.to_string())
+    };
+    let original = fs::read_to_string(home.join("config.toml")).unwrap();
+    edit_config(&home, |config| {
+        config["providers"]["glm-user"]["models"][0]
+            .as_table_mut()
+            .unwrap()
+            .insert("native_model".into(), "other-native".into());
+    });
+    let alias = resume("alias").unwrap_err();
+    assert!(alias.contains("native model alias"), "{alias}");
+    fs::write(home.join("config.toml"), &original).unwrap();
+
+    let profile = home.join("profiles/review.md");
+    let role = fs::read_to_string(&profile).unwrap();
+    fs::write(
+        &profile,
+        role.replace(
+            "required_constraints = []",
+            "required_constraints = [\"filesystem_read_isolation\"]",
+        ),
+    )
+    .unwrap();
+    let grants = resume("grants").unwrap_err();
+    assert!(
+        grants.contains("role grants") || grants.contains("harness policy"),
+        "{grants}"
+    );
+    fs::write(&profile, &role).unwrap();
+
+    edit_config(&home, |config| {
+        config["harnesses"]["claude-code"]
+            .as_table_mut()
+            .unwrap()
+            .insert("max_active_agents".into(), 1.into());
+    });
+    let mut busy = request(&home);
+    busy.request_id = Some("occupies-the-cap".into());
+    let revision = Store::open(&home)
+        .unwrap()
+        .quota_capacity_revision()
+        .unwrap();
+    service
+        .admit_provider_trusted(busy, candidates(revision))
+        .unwrap();
+    let capped = resume("capped").unwrap_err();
+    assert!(capped.to_lowercase().contains("capacity"), "{capped}");
+    let children: i64 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE parent_agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children, 0);
+}
+
+/// A resumed child cancelled between admission and spawn never starts a
+/// process, releases its own attempt with never-spawned proof, and leaves
+/// the sealed native history byte-identical.
+#[tokio::test]
+async fn cancelled_resume_never_spawns_or_touches_history() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "cancel-parent").await;
+    let seal = attempt_state(&home, &id)["native_history"]["seal"].clone();
+    let history = std::path::Path::new(seal["root"].as_str().unwrap())
+        .join(seal["relative"].as_str().unwrap());
+    let before = fs::read(&history).unwrap();
+    let child = service
+        .admit_provider_resume(
+            &Store::open(&home).unwrap().get(&id).unwrap(),
+            "fixture:answer".into(),
+            None,
+            Some("cancelled-child".into()),
+            None,
+        )
+        .unwrap();
+    let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    service.cancel(&child).unwrap();
+    run_to_end(&home, &child).await;
+    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    assert_eq!(row.status, Status::Cancelled);
+    let (process, active, proof): (Option<String>, i64, String) = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT process_identity,ownership_active,cleanup_proof_json FROM attempts WHERE agent_id=?",
+            [child.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(process.is_none());
+    assert_eq!(active, 0);
+    assert!(proof.contains("never_spawned"), "{proof}");
+    assert_eq!(fs::read(&history).unwrap(), before);
+}
+
+/// One selector case: name, candidate intent, (account, rank) candidates,
+/// pinned account, and the expected selection (`None` = refused).
+type SelectorCase<'a> = (
+    &'a str,
+    SelectionIntent,
+    Vec<(&'a AccountId, u32)>,
+    Option<&'a AccountId>,
+    Option<&'a AccountId>,
+);
+
+/// The store selector for a resume keeps the parent's account while it is a
+/// valid candidate even when another ranks better, moves only when it is no
+/// longer a candidate, and a pinned resume never moves.
+#[tokio::test]
+async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
+    use agent_run_store::provider_admission::ProviderResume;
+    let extra = "[[providers.glm-user.bindings]]\nlabel = \"alt\"\naccount = \"acct-alt\"\n";
+    let (_temp, home) = home_with(extra, &["acct-alt"]);
+    let service = Service::new(home.clone());
+    let work: AccountId = "acct-work".parse().unwrap();
+    let alt: AccountId = "acct-alt".parse().unwrap();
+    let set = |intent: SelectionIntent, accounts: &[(&AccountId, u32)]| QuotaCandidateSet {
+        provider: "glm-user".parse().unwrap(),
+        model: "fixture".into(),
+        intent,
+        candidates: accounts
+            .iter()
+            .map(|(account, rank)| QuotaCandidate {
+                account: (*account).clone(),
+                rank: *rank,
+                physical_keys: vec![
+                    agent_run_domain::PhysicalQuotaKey::new(account, "tokens").unwrap()
+                ],
+                multiplier: PositiveFinite::try_from(1.0).unwrap(),
+                quota_known: true,
+            })
+            .collect(),
+        capacity_revision: Store::open(&home)
+            .unwrap()
+            .quota_capacity_revision()
+            .unwrap(),
+    };
+    // Each case needs its own terminal parent (one child per parent).
+    let cases: [SelectorCase<'_>; 3] = [
+        (
+            "keep",
+            SelectionIntent::Auto,
+            vec![(&alt, 0), (&work, 1)],
+            None,
+            Some(&work),
+        ),
+        (
+            "move",
+            SelectionIntent::Auto,
+            vec![(&alt, 0)],
+            None,
+            Some(&alt),
+        ),
+        (
+            "pinned",
+            SelectionIntent::Pinned(work.clone()),
+            vec![(&alt, 0)],
+            Some(&work),
+            None,
+        ),
+    ];
+    for (name, intent, accounts, pinned, expected) in cases {
+        let id = completed_parent(&home, &service, &format!("{name}-parent")).await;
+        let parent = Store::open(&home).unwrap().get(&id).unwrap();
+        let mut identity = parent.identity.clone().unwrap();
+        let mut request: ProviderStartRequest =
+            serde_json::from_value(identity["provider_request"].clone()).unwrap();
+        request.task = "fixture:answer".into();
+        request.request_id = Some(format!("{name}-child"));
+        identity["provider_request"] = serde_json::to_value(&request).unwrap();
+        identity["replay_request_sha256"] =
+            agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request).unwrap(), true)
+                .into();
+        identity["authority"]["eligible_accounts"] = serde_json::json!(["acct-alt", "acct-work"]);
+        let authority: agent_run_domain::catalog::ResolvedLaunchAuthority =
+            serde_json::from_value(identity["authority"].clone()).unwrap();
+        let mut effective = parent.request.clone();
+        effective.task = request.task.clone();
+        effective.request_id = request.request_id.clone();
+        let config: agent_run_config::provider_config::ProviderConfig =
+            serde_json::from_value(identity["provider_config"].clone()).unwrap();
+        let catalog = config
+            .resolve_catalog(Store::open(&home).unwrap().list_accounts().unwrap())
+            .unwrap();
+        let result = Store::open(&home).unwrap().admit_provider_resume(
+            &request,
+            &effective,
+            &catalog,
+            &authority,
+            &set(intent, &accounts),
+            &identity,
+            8,
+            None,
+            pinned,
+            ProviderResume {
+                parent: &id,
+                prefer: &work,
+            },
+        );
+        match expected {
+            Some(account) => assert_eq!(&result.unwrap().account_id, account, "{name}"),
+            None => assert!(result.is_err(), "{name}: a pinned resume never switches"),
+        }
+    }
 }

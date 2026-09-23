@@ -142,6 +142,7 @@ fn main() {
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
     }
+    native_history(&session, &task);
     let failed = task == "fixture:error";
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
@@ -149,5 +150,36 @@ fn main() {
     if task == "fixture:nonzero-after-result" {
         io::stdout().flush().expect("fixture stdout");
         std::process::exit(3);
+    }
+}
+
+/// Appends this turn to a Claude-shaped native transcript, as the real
+/// harness does before its result: `$CLAUDE_CONFIG_DIR/projects/
+/// -fixture-workdir/<session>.jsonl` with the user task, one completed tool
+/// call and the assistant text. Nothing is written without a config dir.
+fn native_history(session: &str, task: &str) {
+    let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&root).join("projects/-fixture-workdir");
+    std::fs::create_dir_all(&dir).expect("fixture history dir");
+    let path = dir.join(format!("{session}.jsonl"));
+    let turn = std::fs::read_to_string(&path)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    let tool = format!("toolu-fixture-{turn}");
+    let lines = [
+        json!({"sessionId":session,"type":"user","message":{"role":"user","content":[{"type":"text","text":task}]}}),
+        json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"tool_use","id":tool}]}}),
+        json!({"sessionId":session,"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":tool}]}}),
+        json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"text","text":"fixture final answer"}]}}),
+    ];
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("fixture history");
+    for line in lines {
+        writeln!(file, "{line}").expect("fixture history write");
     }
 }

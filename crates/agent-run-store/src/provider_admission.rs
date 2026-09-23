@@ -144,6 +144,31 @@ impl Store {
         Ok(())
     }
 
+    /// Records the attempt's continuation evidence (`native_history` seal or
+    /// `native_history_unavailable` reason) in its adapter state, only after
+    /// its cleanup proof; the value is metadata, never credential material.
+    pub fn provider_history(&self, id: &AgentId, attempt: &str, state: &Value) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE attempts SET adapter_state_json=? \
+             WHERE id=? AND agent_id=? AND phase='cleanup_complete'",
+            params![serde_json::to_string(state)?, attempt, id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
+    /// Returns the adapter state of an agent's latest attempt (`{}` when it
+    /// recorded nothing).
+    pub fn latest_attempt_state(&self, id: &AgentId) -> Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT adapter_state_json FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
+            [id.as_str()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Certifies an attempt that remained prepared never spawned a child.
     /// This is only for cancellation or preparation failure before spawn.
     pub fn provider_never_spawned(&self, id: &AgentId) -> Result<bool> {

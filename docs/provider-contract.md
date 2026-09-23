@@ -163,12 +163,27 @@ intact. A terminal provider run resumes explicitly through the existing
   conversation in the run's own `CODEX_HOME`, so only the auth link is
   rebound after cleanup; Claude Code keeps history per login, so it resumes
   on the parent's account only (cross-account continuation is unverified).
+- The current configuration must still permit the frozen execution: the
+  offering's native model alias is unchanged, its current hard restrictions
+  are already in the frozen role, the current canonical role still grants
+  everything the frozen role used and requires nothing new, and the current
+  harness policy and caps admit it. Otherwise resume refuses; the current
+  authority never replaces the frozen one. Advice and weights are ignored.
+- At each provider attempt's cleanup boundary the supervisor seals the
+  native history of its session in the storage root that attempt actually
+  used (`CODEX_HOME`, or the Claude config directory): one regular file
+  read through an anchored no-follow descriptor under a 64 MiB bound,
+  complete line-delimited JSON naming the session, tool calls in a
+  chronological lifecycle (unique nonempty ids, each result answering an
+  earlier pending call, none left pending), recorded with root, relative
+  path, length, SHA-256 and record count in the attempt's adapter state
+  (or a recorded reason when no seal was possible; the task outcome is
+  unchanged). Resume admission and the supervisor handoff verify that seal
+  against the file's exact bytes; a missing seal or any change refuses with
+  `Unsupported` (`continuation_unavailable`) and writes nothing. History is
+  never adopted for the first time during resume.
 - In the admission transaction the parent must be terminal, its process
-  group gone and every attempt cleanup-proven. Before admission the native
-  history for that exact session must exist in the expected storage root,
-  be complete line-delimited JSON, name the session and have no tool call
-  without its result; otherwise `Unsupported`
-  (`continuation_unavailable`) and nothing is written.
+  group gone and every attempt cleanup-proven.
 
 Automatic in-flight quota failover is not part of resume.
 
