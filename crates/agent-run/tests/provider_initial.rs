@@ -1613,7 +1613,7 @@ async fn exhausted_account_switches_within_the_same_logical_run() {
     assert_eq!((attempts[1].1.as_str(), attempts[1].3), ("acct-cx-b", 0));
     assert_eq!(
         Service::new(home.clone()).answer(&id).unwrap()["content"],
-        format!("fixture codex answer on {thread}")
+        format!("fixture  \u{1b}[31mcodex answer on {thread}")
     );
     // The original task is journaled once; the switch sends only the control.
     assert_eq!(
@@ -2347,4 +2347,107 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
             assert!(rows.is_empty(), "{task}: {rows:?}");
         }
     }
+}
+
+/// Reads from `pipe` until `needle` appears (bounded to 20 s); returns all
+/// bytes read so far.
+fn read_until(pipe: &mut std::process::ChildStdout, needle: &str) -> String {
+    use std::io::Read;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut buffer = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut chunk = [0u8; 4096];
+    // A blocking pipe read runs on a helper thread so the wait stays bounded.
+    // SAFETY: `dup` returns a fresh descriptor of the viewer's live pipe that
+    // this File solely owns and closes.
+    let mut owned = unsafe { std::fs::File::from_raw_fd(libc::dup(pipe.as_raw_fd())) };
+    std::thread::spawn(move || loop {
+        match owned.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if sender.send(chunk[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    while !buffer.contains(needle) && std::time::Instant::now() < deadline {
+        if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(100)) {
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+    buffer
+}
+
+/// The real `transcript --follow` viewer on a pipe, across an automatic
+/// switch: the original task is visible while attempt B is still running
+/// (before the producer completes); interrupting the viewer leaves the run
+/// going; a second viewer then follows the same logical id to the end and
+/// shows B's streamed answer exactly once, whitespace kept and the terminal
+/// escape removed.
+#[tokio::test]
+async fn follow_viewer_spans_attempts_and_survives_interrupt() {
+    let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
+    let id = codex_admit(&home, "viewer-1", None);
+    let mut child = supervisor(&home, &id);
+    let root = loop {
+        let root = Store::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .identity
+            .unwrap()["runtime_home"]
+            .as_str()
+            .map(std::path::PathBuf::from);
+        if let Some(root) = root.filter(|root| root.join("fixture-held").exists()) {
+            break root;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let viewer = |home: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(home)
+            .args(["transcript", id.as_str(), "--follow", "--format", "text"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = viewer(&home);
+    let early = read_until(first.stdout.as_mut().unwrap(), "fixture:original-task");
+    assert!(early.contains("fixture:original-task"), "{early:?}");
+    // SAFETY: SIGINT to the viewer process this test spawned.
+    unsafe { libc::kill(first.id() as i32, libc::SIGINT) };
+    assert!(
+        first.wait().unwrap().code().is_some(),
+        "viewer exited on interrupt"
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Running
+    );
+    let mut second = viewer(&home);
+    fs::write(root.join("fixture-release"), "").unwrap();
+    let output = read_until(second.stdout.as_mut().unwrap(), "answer on");
+    tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = second.wait();
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+    assert_eq!(output.matches("answer on").count(), 1, "{output:?}");
+    assert!(
+        output.contains("fixture  codex answer on"),
+        "whitespace kept: {output:?}"
+    );
+    assert!(!output.contains('\u{1b}'), "escape sanitized: {output:?}");
+    assert_eq!(
+        output.matches("fixture:original-task").count(),
+        1,
+        "{output:?}"
+    );
 }

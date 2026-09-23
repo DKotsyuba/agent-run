@@ -1291,6 +1291,13 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     )?;
                 }
             } else {
+                // The interrupt listener is installed before the first page,
+                // so a Ctrl-C at any point ends only the viewer, gracefully.
+                let mut interrupt = follow
+                    .then(|| {
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    })
+                    .transpose()?;
                 loop {
                     let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
                     if text {
@@ -1328,7 +1335,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     }
                     // Interrupting the viewer never cancels the supervised
                     // agent; the resident supervisor keeps running it.
-                    tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+                    if let Some(interrupt) = interrupt.as_mut() {
+                        tokio::select! {_=interrupt.recv()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+                    }
                 }
                 // Flush the tail of the streamed item on any viewer exit.
                 renderer.finish(&mut |line| (dependencies.text_output)(line))?;

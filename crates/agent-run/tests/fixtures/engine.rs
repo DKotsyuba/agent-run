@@ -311,7 +311,16 @@ fn app_server() {
                         json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"failed","items":[],"error":{"message":"usage limit reached","codexErrorInfo":"usageLimitExceeded"}}}}),
                     );
                 } else {
-                    let text = format!("fixture codex answer on {thread}");
+                    // Streamed as two deltas (leading whitespace and a
+                    // terminal escape included) before the completed item.
+                    let head = "fixture  \u{1b}[31mcodex ".to_owned();
+                    let tail = format!("answer on {thread}");
+                    let text = format!("{head}{tail}");
+                    for delta in [&head, &tail] {
+                        emit(
+                            json!({"method":"item/agentMessage/delta","params":{"threadId":thread,"turnId":turn,"itemId":format!("msg-{turns}"),"delta":delta}}),
+                        );
+                    }
                     append(
                         &rollout,
                         &json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":text}}),
