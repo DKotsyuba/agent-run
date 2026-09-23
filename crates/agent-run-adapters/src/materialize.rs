@@ -8,6 +8,7 @@ use agent_run_platform::{
     fs::{self, Dir},
     snapshot_tree,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -76,13 +77,18 @@ pub fn apply_environment_overrides(
 }
 /// Launch-time paths derived while materializing one generated home.
 ///
-/// The durable proof is the Python-v1 runtime index; this value deliberately
-/// remains process-local because plugin launch paths are not snapshot metadata.
-#[derive(Debug, Clone, Default)]
+/// Claude-family launch paths are stored in an indexed file so verified resumes
+/// reuse their original order and plugin roots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    /// Ordered paths passed to the native CLI as `--plugin-dir`.
     pub plugin_paths: Vec<PathBuf>,
+    /// Manifest names and the matching runtime-visible plugin roots.
     pub plugin_roots: BTreeMap<String, PathBuf>,
 }
+/// Indexed launch metadata for Claude-family runtimes.
+const PLUGIN_LAUNCH: &str = ".agent-run-plugin-launch.json";
 /// Builds one Python-v1 managed runtime home before its manifest/index freeze.
 pub struct Publisher {
     pub root: PathBuf,
@@ -156,17 +162,19 @@ impl Publisher {
         Ok((self.snapshot, digest))
     }
 }
+/// Verifies indexed runtime artifacts and returns any recorded plugin launch paths.
+///
+/// Older indexes have no plugin launch file and return an empty snapshot; resume
+/// callers must use `verify_for_resume` to recover those paths from stored grants.
 pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
     let dir = Dir::open(root)?;
     let raw = dir.read(Path::new(snapshot_tree::RUNTIME_SNAPSHOT_INDEX), 64 * 1024)?;
-    let revision = serde_json::from_slice::<Value>(&raw)
-        .ok()
-        .and_then(|document| {
-            document
-                .get("materialize_revision")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+    let document: Value = serde_json::from_slice(&raw)
+        .map_err(|_| Error::Integrity("runtime snapshot index is malformed".into()))?;
+    let revision = document
+        .get("materialize_revision")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
         .ok_or_else(|| Error::Integrity("runtime snapshot index is malformed".into()))?;
     let inspection = snapshot_tree::inspect_runtime_snapshots(root, &revision, expected)
         .map_err(|_| Error::Integrity("runtime snapshot index was modified".into()))?;
@@ -175,7 +183,75 @@ pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
             "generated runtime snapshot was modified".into(),
         ));
     }
-    Ok(Snapshot::default())
+    let indexed = document["files"]
+        .as_array()
+        .is_some_and(|files| files.iter().any(|file| file["path"] == PLUGIN_LAUNCH));
+    match (indexed, dir.optional(Path::new(PLUGIN_LAUNCH), 64 * 1024)?) {
+        (true, Some(raw)) => serde_json::from_slice(&raw)
+            .map_err(|_| Error::Integrity("plugin launch metadata is malformed".into())),
+        (false, None) => Ok(Snapshot::default()),
+        _ => Err(Error::Integrity(
+            "plugin launch metadata is not indexed".into(),
+        )),
+    }
+}
+/// Verifies a resume home, reconstructing launch paths only for legacy indexes.
+///
+/// The runtime and profile must come from the recorded launch identity. A legacy
+/// plugin source that cannot be inspected fails closed instead of dropping flags.
+pub fn verify_for_resume(
+    root: &Path,
+    expected: &str,
+    runtime: &Runtime,
+    profile: &Profile,
+) -> Result<Snapshot> {
+    let snapshot = verify(root, expected)?;
+    if Dir::open(root)?
+        .optional(Path::new(PLUGIN_LAUNCH), 64 * 1024)?
+        .is_some()
+    {
+        return Ok(snapshot);
+    }
+    let kind = runtime.kind()?;
+    if !matches!(kind, Adapter::Claude | Adapter::Glm) {
+        return Ok(snapshot);
+    }
+    let mut legacy = Snapshot::default();
+    for source in &runtime.plugins {
+        let base = source
+            .file_name()
+            .ok_or_else(|| Error::Integrity("legacy plugin path is invalid".into()))?;
+        let path = if runtime
+            .plugin_snapshot_assets
+            .contains_key(&base.to_string_lossy().to_string())
+        {
+            root.join("declared-plugins").join(base)
+        } else {
+            source.clone()
+        };
+        let (name, _, _) = super::plugins::manifest(&path)
+            .map_err(|_| Error::Integrity("legacy plugin source is unavailable".into()))?;
+        if legacy.plugin_roots.insert(name, path.clone()).is_some() {
+            return Err(Error::Integrity(
+                "legacy plugin names are duplicated".into(),
+            ));
+        }
+        legacy.plugin_paths.push(path);
+    }
+    for skill in &profile.skills {
+        let owned = super::plugins::plugin_skill_dir(&runtime.plugins, skill)
+            .map_err(|_| Error::Integrity("legacy plugin skill source is unavailable".into()))?;
+        if owned.is_none() {
+            let path = root.join("plugins").join(skill);
+            if !path.is_dir() {
+                return Err(Error::Integrity(
+                    "legacy skill plugin is unavailable".into(),
+                ));
+            }
+            legacy.plugin_paths.push(path);
+        }
+    }
+    Ok(legacy)
 }
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
@@ -659,6 +735,9 @@ pub fn materialize(
             marker.as_bytes(),
             0o600,
         )?;
+    }
+    if matches!(kind, Adapter::Claude | Adapter::Glm) {
+        p.json(PLUGIN_LAUNCH, &serde_json::to_value(&p.snapshot)?)?;
     }
     p.finish()
 }
