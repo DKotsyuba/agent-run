@@ -1513,3 +1513,325 @@ async fn superseded_quota_rejections_do_not_classify_the_failure() {
         assert_eq!(class.as_deref(), expected, "{task}");
     }
 }
+
+/// A home with a native Codex provider `codex-user` (model `fixture`, served
+/// by the fixture app-server) bound to accounts `acct-cx-a`/`acct-cx-b`, whose
+/// linked auth files carry `auth` contents (`exhausted` makes its turns fail
+/// with `usageLimitExceeded`). Dummy files only; no real credential.
+fn codex_home(auth: [&str; 2]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let extra = "[providers.codex-user]\nharness = \"codex\"\nconnection = { kind = \"native\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex-user.models]]\nid = \"fixture\"\n[[providers.codex-user.bindings]]\nlabel = \"a\"\naccount = \"acct-cx-a\"\n[[providers.codex-user.bindings]]\nlabel = \"b\"\naccount = \"acct-cx-b\"\n";
+    let (temp, home) = home_with(extra, &[]);
+    let mut store = Store::open(&home).unwrap();
+    for ((label, account), content) in [("a", "acct-cx-a"), ("b", "acct-cx-b")]
+        .into_iter()
+        .zip(auth)
+    {
+        let dir = home.join("accounts/codex").join(label);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("auth.json"), content).unwrap();
+        store
+            .register_account(&AccountRecord {
+                account_id: account.parse().unwrap(),
+                auth_family: "openai".parse().unwrap(),
+                secret_ref: format!("named:codex:{label}").parse().unwrap(),
+                status: AccountStatus::Enabled,
+            })
+            .unwrap();
+    }
+    (temp, home)
+}
+
+/// Admits one ranked `codex-user` run (optionally pinned) and runs its
+/// supervisor to the end.
+async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> AgentId {
+    let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
+        "provider":"codex-user","model":"fixture","profile":"review",
+        "task":"fixture:original-task","workdir":home,"request_id":request_id,"account":account,
+        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let admitted = Service::new(home.to_path_buf())
+        .admit_provider(request)
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(home, &id).await;
+    id
+}
+
+/// (number, account, state, ownership, finished) of every attempt, in order.
+fn attempts(home: &Path, id: &AgentId) -> Vec<(u32, String, String, i64, bool)> {
+    Store::open(home)
+        .unwrap()
+        .conn
+        .prepare("SELECT number,selected_account_id,state,ownership_active,finished_at IS NOT NULL FROM attempts WHERE agent_id=? ORDER BY number")
+        .unwrap()
+        .query_map([id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// One count query for `id`.
+fn count(home: &Path, sql: &str, id: &AgentId) -> i64 {
+    Store::open(home)
+        .unwrap()
+        .conn
+        .query_row(sql, [id.as_str()], |row| row.get(0))
+        .unwrap()
+}
+
+/// Automatic in-flight switch: A's authoritative usage-limit failure closes
+/// A, allocates B on the same logical agent, continues the same native thread
+/// with one internal control turn (the original task is sent and journaled
+/// once), and yields exactly one success, answer and delivery.
+#[tokio::test]
+async fn exhausted_account_switches_within_the_same_logical_run() {
+    let (_temp, home) = codex_home(["exhausted", "ok"]);
+    let id = codex_run(&home, "switch-1", None).await;
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(
+        row.status,
+        Status::Succeeded,
+        "{:?} {:?}",
+        row.failure_kind,
+        row.failure_text
+    );
+    let thread = row.runtime_session_id.clone().unwrap();
+    let attempts = attempts(&home, &id);
+    assert_eq!(attempts.len(), 2, "{attempts:?}");
+    assert_eq!(
+        (
+            attempts[0].1.as_str(),
+            attempts[0].2.as_str(),
+            attempts[0].3,
+            attempts[0].4
+        ),
+        ("acct-cx-a", "exhausted", 0, true)
+    );
+    assert_eq!((attempts[1].1.as_str(), attempts[1].3), ("acct-cx-b", 0));
+    assert_eq!(
+        Service::new(home.clone()).answer(&id).unwrap()["content"],
+        format!("fixture codex answer on {thread}")
+    );
+    // The original task is journaled once; the switch sends only the control.
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+            &id
+        ),
+        1
+    );
+    let rollout = fs::read_to_string(
+        std::path::Path::new(
+            row.identity.as_ref().unwrap()["runtime_home"]
+                .as_str()
+                .unwrap(),
+        )
+        .join(format!(
+            "sessions/2026/09/23/rollout-fixture-{thread}.jsonl"
+        )),
+    )
+    .unwrap();
+    let inputs: Vec<String> = rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["payload"]["role"] == "user")
+        .map(|record| record["payload"]["content"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(inputs.len(), 2, "{inputs:?}");
+    assert!(inputs[0].contains("fixture:original-task"));
+    assert!(!inputs[1].contains("fixture:original-task"));
+    assert!(inputs[1].contains(agent_run::supervisor::CONTINUATION_CONTROL));
+    // Attempt-bound evidence and exactly one delivery.
+    let bound = |kind: &str| -> Option<u32> {
+        store
+            .conn
+            .query_row(
+                "SELECT t.number FROM events e JOIN attempts t ON t.id=e.attempt_id WHERE e.agent_id=? AND e.kind=?",
+                rusqlite::params![id.as_str(), kind],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    };
+    assert_eq!(bound("native_failure"), Some(1));
+    assert_eq!(bound("continuation_control"), Some(2));
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM agents WHERE root_agent_id=?",
+            &id
+        ),
+        1
+    );
+}
+
+/// Bounded stops: both accounts exhausted, a pinned run, and the only other
+/// account disabled now each end the one logical run failed with
+/// `quota_exhausted` and the exact blocker, with one delivery and no further
+/// attempt than the proven ones.
+#[tokio::test]
+async fn exhausted_runs_stop_with_the_exact_blocker() {
+    for (auth, pin, disable, blocker, tried) in [
+        (
+            ["exhausted", "exhausted"],
+            None,
+            None,
+            "no_eligible_account",
+            2,
+        ),
+        (["exhausted", "ok"], Some("a"), None, "pinned_account", 1),
+        (
+            ["exhausted", "ok"],
+            None,
+            Some("acct-cx-b"),
+            "no_eligible_account",
+            1,
+        ),
+    ] {
+        let (_temp, home) = codex_home(auth);
+        if let Some(account) = disable {
+            Store::open(&home)
+                .unwrap()
+                .disable_account(&account.parse().unwrap())
+                .unwrap();
+        }
+        let id = codex_run(&home, "stop-1", pin).await;
+        let row = Store::open(&home).unwrap().get(&id).unwrap();
+        assert_eq!(row.status, Status::Failed, "{blocker}");
+        assert_eq!(
+            row.failure_kind.as_deref(),
+            Some("quota_exhausted"),
+            "{blocker}"
+        );
+        assert!(
+            row.failure_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains(blocker),
+            "{:?}",
+            row.failure_text
+        );
+        let attempts = attempts(&home, &id);
+        assert_eq!(attempts.len(), tried, "{blocker}: {attempts:?}");
+        assert!(
+            attempts.iter().all(|attempt| attempt.3 == 0),
+            "no owned attempt remains"
+        );
+        assert_eq!(
+            count(
+                &home,
+                "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+                &id
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &home,
+                "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+                &id
+            ),
+            1
+        );
+    }
+}
+
+/// A cancel that arrives while the exhausted attempt is finishing wins: no
+/// next attempt is allocated and the run ends cancelled with one delivery.
+#[tokio::test]
+async fn cancel_during_the_exhausted_attempt_prevents_the_switch() {
+    let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
+    let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
+        "provider":"codex-user","model":"fixture","profile":"review",
+        "task":"fixture:original-task","workdir":home,"request_id":"cancel-switch",
+        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let service = Service::new(home.clone());
+    let admitted = service.admit_provider(request).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    let runtime_home = || {
+        Store::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .identity
+            .unwrap()["runtime_home"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+    };
+    let mut held = None;
+    for _ in 0..400 {
+        if let Some(root) = runtime_home().filter(|root| root.join("fixture-held").exists()) {
+            held = Some(root);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let root = held.expect("attempt A reached the barrier");
+    service.cancel(&id).unwrap();
+    fs::write(root.join("fixture-release"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::Cancelled, "{:?}", row.failure_text);
+    assert_eq!(
+        attempts(&home, &id).len(),
+        1,
+        "no next attempt after cancel"
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+}
+
+/// Claude Code keeps history per login: an exhausted Claude-harness run with
+/// a second bound account still stops with the cross-account blocker.
+#[tokio::test]
+async fn claude_exhaustion_never_switches_accounts() {
+    let extra = "[[providers.glm-user.bindings]]\nlabel = \"alt\"\naccount = \"acct-alt\"\n";
+    let (_temp, home) = home_with(extra, &["acct-alt"]);
+    let service = Service::new(home.clone());
+    let mut request = request(&home);
+    request.task = "fixture:quota".into();
+    request.account = None;
+    request.request_id = Some("claude-stop".into());
+    let revision = Store::open(&home)
+        .unwrap()
+        .quota_capacity_revision()
+        .unwrap();
+    let mut set = candidates(revision);
+    set.intent = SelectionIntent::Auto;
+    let admitted = service.admit_provider_trusted(request, set).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
+    assert!(row
+        .failure_text
+        .as_deref()
+        .unwrap_or_default()
+        .contains("cross_account_continuation_unverified"));
+    assert_eq!(attempts(&home, &id).len(), 1);
+}

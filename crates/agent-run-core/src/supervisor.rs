@@ -356,200 +356,412 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     let mut identity = ProviderLaunchIdentity::read(&row)?;
     let config = identity.provider_config.clone();
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
-    let (attempt_id, account) = store.provider_attempt(id)?;
-    // Everything this supervisor journals originates from this attempt,
-    // including final and cleanup records written after ownership ends.
-    store.bind_attempt(&attempt_id);
-    let harness = config
-        .harnesses
-        .get(&identity.authority.harness)
-        .ok_or_else(|| invalid("admitted provider harness is unavailable"))?;
-    let runtime_home = identity
-        .runtime_home
-        .clone()
-        .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
-    let agent_dir = home.join("agents").join(id.as_str());
-    fs::private_dir(&agent_dir)?;
-    store.event(id, "phase", &json!({"phase":"preparing"}))?;
-    if identity.runtime_home.is_none() {
-        let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
-        let (_, digest) = adapters::provider::materialize_selected(
+    // `continuing` is set only after an in-flight account switch: the native
+    // session of this agent's PREVIOUS attempt and that attempt's recorded
+    // adapter state (its history seal). Explicit-resume lineage stays on
+    // `row.resume_of_runtime_session_id` and is used only by the first attempt.
+    let mut continuing: Option<(String, String)> = None;
+    loop {
+        let (attempt_id, account) = store.provider_attempt(id)?;
+        // Everything this supervisor journals originates from this attempt,
+        // including final and cleanup records written after ownership ends.
+        store.bind_attempt(&attempt_id);
+        let harness = config
+            .harnesses
+            .get(&identity.authority.harness)
+            .ok_or_else(|| invalid("admitted provider harness is unavailable"))?;
+        let runtime_home = identity
+            .runtime_home
+            .clone()
+            .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
+        let agent_dir = home.join("agents").join(id.as_str());
+        fs::private_dir(&agent_dir)?;
+        store.event(id, "phase", &json!({"phase":"preparing"}))?;
+        if identity.runtime_home.is_none() {
+            let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
+            let (_, digest) = adapters::provider::materialize_selected(
+                &config,
+                &catalog,
+                &identity.authority.provider,
+                &identity.authority.model,
+                &account,
+                &role,
+                &identity.authority.workdir,
+                &runtime_home,
+                home,
+            )?;
+            identity.authority.assets_sha256 = digest.clone();
+            identity.snapshot_sha256 = Some(digest.as_str().into());
+            identity.runtime_home = Some(runtime_home.clone());
+            store.update_identity(
+                id,
+                &serde_json::to_value(&identity)?,
+                &format!("snapshot:v2:{}", digest.as_str()),
+            )?;
+        } else {
+            materialize::verify(&runtime_home, identity.authority.assets_sha256.as_str())?;
+        }
+        if store.cancel_pending(id)? {
+            if !store.provider_never_spawned(id)? {
+                return Err(invalid("provider attempt was already spawning"));
+            }
+            return cancelled_before_spawn(id, store);
+        }
+        row = store.get(id)?;
+        let catalog = config.resolve_catalog(store.list_accounts()?)?;
+        let host: BTreeMap<String, String> = std::env::vars().collect();
+        let resume_session = continuing
+            .as_ref()
+            .map(|(session, _)| session.as_str())
+            .or(row.resume_of_runtime_session_id.as_deref());
+        // A switched attempt never resends the original task: it continues
+        // the native thread with one explicit internal control turn.
+        let task = if continuing.is_some() {
+            CONTINUATION_CONTROL
+        } else {
+            identity.provider_request.task.as_str()
+        };
+        let planned = adapters::provider::plan_selected_with(
             &config,
             &catalog,
-            &identity.authority.provider,
-            &identity.authority.model,
+            &identity.authority,
             &account,
-            &role,
-            &identity.authority.workdir,
             &runtime_home,
             home,
+            &host,
+            &adapters::authorized_request::SystemCredentialReader,
+            task,
+            resume_session,
+            adapters::provider::LaunchOptions {
+                fast: identity.provider_request.fast,
+                output_schema: identity.provider_request.output_schema.as_ref(),
+            },
         )?;
-        identity.authority.assets_sha256 = digest.clone();
-        identity.snapshot_sha256 = Some(digest.as_str().into());
-        identity.runtime_home = Some(runtime_home.clone());
-        store.update_identity(
-            id,
-            &serde_json::to_value(&identity)?,
-            &format!("snapshot:v2:{}", digest.as_str()),
-        )?;
-    } else {
-        materialize::verify(&runtime_home, identity.authority.assets_sha256.as_str())?;
-    }
-    if store.cancel_pending(id)? {
-        if !store.provider_never_spawned(id)? {
-            return Err(invalid("provider attempt was already spawning"));
-        }
-        return cancelled_before_spawn(id, store);
-    }
-    row = store.get(id)?;
-    let host: BTreeMap<String, String> = std::env::vars().collect();
-    let planned = adapters::provider::plan_selected_with(
-        &config,
-        &catalog,
-        &identity.authority,
-        &account,
-        &runtime_home,
-        home,
-        &host,
-        &adapters::authorized_request::SystemCredentialReader,
-        &identity.provider_request.task,
-        row.resume_of_runtime_session_id.as_deref(),
-        adapters::provider::LaunchOptions {
-            fast: identity.provider_request.fast,
-            output_schema: identity.provider_request.output_schema.as_ref(),
-        },
-    )?;
-    // A resumed attempt re-verifies the parent's recorded history seal at the
-    // handoff itself, bound to the history root this exact launch plan
-    // selects: a seal for one directory never authorizes a launch whose
-    // environment points the harness at another.
-    if let (Some(session), Some(parent)) = (&row.resume_of_runtime_session_id, &row.parent_agent_id)
-    {
-        let planned_root = history_root(identity.authority.harness, &planned.launch.environment)
+        // Any continuation re-verifies its recorded history seal at the
+        // handoff itself, bound to the history root this exact launch plan
+        // selects: a seal for one directory never authorizes a launch whose
+        // environment points the harness at another. In-flight switches use
+        // this agent's previous attempt; explicit resume uses the parent.
+        if let Some(session) = resume_session {
+            let planned_root = history_root(
+                identity.authority.harness,
+                &planned.launch.environment,
+            )
             .ok_or_else(|| {
                 Error::Unsupported(
                     "continuation_unavailable: the launch plan names no native storage".into(),
                 )
             })?;
-        crate::service::verify_recorded_history(
-            &store.latest_attempt_state(parent)?,
-            &identity,
-            Some(&planned_root),
-            session,
-        )?;
-    }
-    store.provider_spawning(id, &attempt_id)?;
-    store.event(id, "phase", &json!({"phase":"spawning"}))?;
-    // Process::spawn yields Io only when the OS refused Command::spawn,
-    // before a child exists; other failures retain ownership for recovery.
-    let mut process = match Process::spawn(&planned.launch) {
-        Ok(process) => process,
-        Err(error @ Error::Io(_)) => {
-            store.provider_spawn_failed(id, &attempt_id)?;
-            return Err(error);
+            let recorded = match (&continuing, &row.parent_agent_id) {
+                (Some((_, state)), _) => state.clone(),
+                (None, Some(parent)) => store.latest_attempt_state(parent)?,
+                (None, None) => {
+                    return Err(invalid("a resumed attempt has no recorded history source"))
+                }
+            };
+            crate::service::verify_recorded_history(
+                &recorded,
+                &identity,
+                Some(&planned_root),
+                session,
+            )?;
         }
-        Err(error) => return Err(error),
-    };
-    let execution = async {
-        let leader = process
-            .owner
-            .leader
-            .as_ref()
-            .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
-        store.provider_process(id, &attempt_id, leader)?;
-        store.running(id, process.owner.pid)?;
-        crate::journal(
+        store.provider_spawning(id, &attempt_id)?;
+        store.event(id, "phase", &json!({"phase":"spawning"}))?;
+        // Process::spawn yields Io only when the OS refused Command::spawn,
+        // before a child exists; other failures retain ownership for recovery.
+        let mut process = match Process::spawn(&planned.launch) {
+            Ok(process) => process,
+            Err(error @ Error::Io(_)) => {
+                store.provider_spawn_failed(id, &attempt_id)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let switched = continuing.is_some();
+        let execution = async {
+            let leader = process
+                .owner
+                .leader
+                .as_ref()
+                .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
+            store.provider_process(id, &attempt_id, leader)?;
+            if switched {
+                // The logical run is already running; its start time (and
+                // so any deadline) is kept. No user entry is journaled.
+                store.provider_rerunning(id, &attempt_id, process.owner.pid)?;
+                store.event(
+                    id,
+                    "continuation_control",
+                    &json!({"session":resume_session,"account":account}),
+                )?;
+            } else {
+                store.running(id, process.owner.pid)?;
+                crate::journal(
+                    store,
+                    id,
+                    "user",
+                    &identity.provider_request.task,
+                    None,
+                    None,
+                )?;
+            }
+            let mut native_row = row.clone();
+            native_row.request.task = task.to_owned();
+            native_row.resume_of_runtime_session_id = resume_session.map(str::to_owned);
+            if identity.authority.harness == HarnessId::Codex {
+                native_row.request.model = planned.native_model.clone();
+                crate::codex::run(
+                    &mut process,
+                    store,
+                    &native_row,
+                    &planned.runtime,
+                    &planned.profile,
+                    &runtime_home,
+                )
+                .await
+            } else {
+                crate::stream::run(
+                    &mut process,
+                    store,
+                    &native_row,
+                    planned.launch.initial_input.as_deref(),
+                )
+                .await
+            }
+        }
+        .await;
+        let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
+        let exit = process.reap().await;
+        let cleanup = cleanup?;
+        store.provider_cleanup(id, &attempt_id, &cleanup)?;
+        store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+        let cancelled = store.cancel_pending(id)?;
+        let mut result = match execution {
+            Ok(result) => result,
+            Err(error) => adapters::EngineResult {
+                native_failure: None,
+                outcome: Outcome::failure(match error {
+                    Error::Integrity(_) => "runtime_integrity_failed",
+                    Error::Validation(_) => "runtime_contract_rejected",
+                    _ => "runtime_transport_failed",
+                }),
+                answer: None,
+                usage: None,
+            },
+        };
+        #[cfg(feature = "test-fixtures")]
+        inject_native_failure(&mut result, &attempt_id, store, id)?;
+        if result.outcome.exit_code.is_none() {
+            result.outcome.exit_code = exit;
+        }
+        // Continuation evidence and the typed native failure are recorded on
+        // the attempt; the failure carries trusted supervisor context (never
+        // the payload's): this attempt, its account, provider and model.
+        let mut state = history_evidence(
             store,
             id,
-            "user",
-            &identity.provider_request.task,
-            None,
-            None,
+            &attempt_id,
+            &identity,
+            &planned.launch.environment,
+        );
+        let quota = matches!(
+            result.native_failure,
+            Some(adapters::native_failure::NativeFailure::QuotaExhausted { .. })
+        );
+        if let Some(failure) = &result.native_failure {
+            let mut data = serde_json::to_value(failure)?;
+            data["attempt"] = json!(attempt_id);
+            data["account"] = json!(account);
+            data["provider"] = json!(identity.authority.provider);
+            data["model"] = json!(identity.authority.model);
+            store.event(id, "native_failure", &data)?;
+            state["native_failure"] = data;
+        }
+        store.provider_history(id, &attempt_id, &state)?;
+        if quota && !cancelled && result.outcome.status == Status::Failed {
+            match failover(home, id, store, &identity) {
+                Ok(next) => {
+                    store.event(id, "account_switched", &next)?;
+                    let session = store
+                        .get(id)?
+                        .runtime_session_id
+                        .ok_or_else(|| invalid("switched run lost its native session"))?;
+                    continuing = Some((session, state.to_string()));
+                    continue;
+                }
+                Err(blocker) => {
+                    store.event(id, "failover_blocked", &json!({"reason":blocker}))?;
+                    result.outcome.failure_kind = Some("quota_exhausted".into());
+                    result.outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
+                }
+            }
+        }
+        let proof = match result.answer.as_deref() {
+            Some(text) if !text.trim().is_empty() => {
+                Some(verify::seal(&agent_dir, Path::new("answer.md"), text)?)
+            }
+            _ => None,
+        };
+        let evidence = match &proof {
+            Some(proof) => verify::AnswerProof::sealed(proof),
+            None => verify::AnswerProof::absent(agent_dir.join("answer.md")),
+        };
+        let outcome = verify::verify_completion(
+            Some(result.outcome),
+            cancelled.then_some(verify::StopReason::Cancel),
+            Some(&evidence),
+            cleanup.group_gone,
+            store.last_progress(id)?,
+            domain::now(),
+            verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
         )?;
-        if identity.authority.harness == HarnessId::Codex {
-            let mut native_row = row.clone();
-            native_row.request.model = planned.native_model.clone();
-            crate::codex::run(
-                &mut process,
-                store,
-                &native_row,
-                &planned.runtime,
-                &planned.profile,
-                &runtime_home,
-            )
-            .await
-        } else {
-            crate::stream::run(
-                &mut process,
-                store,
-                &row,
-                planned.launch.initial_input.as_deref(),
-            )
-            .await
+        store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
+        commands::complete_terminal(store, id)?;
+        return Ok(());
+    }
+}
+
+/// The explicit internal control turn a switched attempt sends to continue
+/// the native conversation. Codex app-server 0.155.1 requires `input` on
+/// `turn/start` and `thread/resume` takes none, so a continuation needs one
+/// turn; this fixed text is that control — never the original task, a
+/// summary or synthesized history.
+pub const CONTINUATION_CONTROL: &str = "The previous turn stopped because the account's usage limit was reached. Continue the same task from where it stopped, without repeating completed steps.";
+
+/// Moves an exhausted run to its next account, or names why it cannot.
+///
+/// Only Codex continues across accounts (its conversation lives in the
+/// run's own `CODEX_HOME`); Claude Code keeps history per login, so cross-
+/// account continuation is refused. The current configuration must still
+/// permit the frozen execution, the run must be automatic and not
+/// cancelled, and the next account comes from trusted ranker candidates
+/// (frozen scope ∩ current bindings, never an account tried before) through
+/// the atomic store allocation, with bounded stale-revision recomputes.
+/// Returns the `account_switched` event data, or the typed blocker.
+fn failover(
+    home: &Path,
+    id: &AgentId,
+    store: &mut Store,
+    identity: &ProviderLaunchIdentity,
+) -> std::result::Result<serde_json::Value, String> {
+    let authority = &identity.authority;
+    if authority.harness != HarnessId::Codex {
+        return Err("cross_account_continuation_unverified".into());
+    }
+    if store
+        .cancel_pending(id)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("cancelled".into());
+    }
+    let intent: String = store
+        .conn
+        .query_row(
+            "SELECT selection_intent FROM agents WHERE id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if intent != "auto" {
+        return Err("pinned_account".into());
+    }
+    let (current, _) = agent_run_config::provider_config::ProviderConfig::load(home)
+        .map_err(|_| "current_config_unavailable".to_owned())?;
+    crate::service::current_policy_permits(&current, identity, &identity.provider_request)
+        .map_err(|_| "current_policy_refused".to_owned())?;
+    let accounts = store.list_accounts().map_err(|error| error.to_string())?;
+    let bound: std::collections::BTreeSet<_> = current
+        .providers
+        .get(&authority.provider)
+        .map(|provider| {
+            provider
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    binding
+                        .models
+                        .as_ref()
+                        .is_none_or(|models| models.contains(&authority.model))
+                })
+                .map(|binding| binding.account.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let frozen = identity
+        .provider_config
+        .resolve_catalog(accounts)
+        .map_err(|error| error.to_string())?;
+    let hard: std::collections::BTreeSet<_> = frozen
+        .provider(&authority.provider)
+        .map(|definition| {
+            definition
+                .bindings
+                .iter()
+                .map(|binding| binding.account.clone())
+                .filter(|account| {
+                    !bound.contains(account) || !authority.eligible_accounts.contains(account)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for _ in 0..=crate::service::PROVIDER_STALE_RETRIES {
+        let candidates = crate::capacity::provider_ranking::provider_candidates(
+            store,
+            &frozen,
+            &authority.provider,
+            &authority.model,
+            None,
+            &hard,
+        )
+        .map_err(|_| "no_eligible_account".to_owned())?;
+        match store.allocate_next_attempt(id, &frozen, &candidates) {
+            Ok(next) => {
+                return Ok(json!({"previous":next.released,"attempt":next.attempt_id,
+                    "number":next.number,"account":next.account_id}))
+            }
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::SelectionStale { .. },
+            )) => continue,
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::NoEligibleAccount { .. },
+            )) => return Err("no_eligible_account".into()),
+            Err(error) => return Err(error.to_string()),
         }
     }
-    .await;
-    let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
-    let exit = process.reap().await;
-    let cleanup = cleanup?;
-    store.provider_cleanup(id, &attempt_id, &cleanup)?;
-    store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
-    let history = history_evidence(
-        store,
-        id,
-        &attempt_id,
-        &identity,
-        &planned.launch.environment,
-    );
-    store.provider_history(id, &attempt_id, &history)?;
-    let cancelled = store.cancel_pending(id)?;
-    let mut result = match execution {
-        Ok(result) => result,
-        Err(error) => adapters::EngineResult {
-            native_failure: None,
-            outcome: Outcome::failure(match error {
-                Error::Integrity(_) => "runtime_integrity_failed",
-                Error::Validation(_) => "runtime_contract_rejected",
-                _ => "runtime_transport_failed",
-            }),
-            answer: None,
-            usage: None,
-        },
+    Err("selection_busy".into())
+}
+
+/// Test-only controlled failure injection: `AGENT_RUN_INJECT_QUOTA=<n>` makes
+/// attempt number `n` of every provider run report an authoritative Codex
+/// usage-limit failure, so the automatic switch can be exercised against a
+/// real harness without draining any quota. Absent in production builds.
+#[cfg(feature = "test-fixtures")]
+fn inject_native_failure(
+    result: &mut adapters::EngineResult,
+    attempt: &str,
+    store: &Store,
+    id: &AgentId,
+) -> Result<()> {
+    let Some(target) = std::env::var("AGENT_RUN_INJECT_QUOTA")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return Ok(());
     };
-    if result.outcome.exit_code.is_none() {
-        result.outcome.exit_code = exit;
-    }
-    // A typed native failure is journaled with trusted supervisor context
-    // (never the payload's): this attempt, its account, provider and model.
-    if let Some(failure) = &result.native_failure {
-        let mut data = serde_json::to_value(failure)?;
-        data["attempt"] = json!(attempt_id);
-        data["account"] = json!(account);
-        data["provider"] = json!(identity.authority.provider);
-        data["model"] = json!(identity.authority.model);
-        store.event(id, "native_failure", &data)?;
-    }
-    let proof = match result.answer.as_deref() {
-        Some(text) if !text.trim().is_empty() => {
-            Some(verify::seal(&agent_dir, Path::new("answer.md"), text)?)
-        }
-        _ => None,
-    };
-    let evidence = match &proof {
-        Some(proof) => verify::AnswerProof::sealed(proof),
-        None => verify::AnswerProof::absent(agent_dir.join("answer.md")),
-    };
-    let outcome = verify::verify_completion(
-        Some(result.outcome),
-        cancelled.then_some(verify::StopReason::Cancel),
-        Some(&evidence),
-        cleanup.group_gone,
-        store.last_progress(id)?,
-        domain::now(),
-        verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
+    let number: u32 = store.conn.query_row(
+        "SELECT number FROM attempts WHERE id=? AND agent_id=?",
+        rusqlite::params![attempt, id.as_str()],
+        |row| row.get(0),
     )?;
-    store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
-    commands::complete_terminal(store, id)?;
+    if number == target {
+        result.outcome.status = Status::Failed;
+        result.outcome.failure_kind = Some("codex_usageLimitExceeded".into());
+        result.answer = None;
+        result.native_failure = Some(adapters::native_failure::codex_turn_error(
+            &json!({"message":"injected","codexErrorInfo":"usageLimitExceeded"}),
+        ));
+    }
     Ok(())
 }
 /// Seals the finished attempt's native history at its cleanup boundary, in

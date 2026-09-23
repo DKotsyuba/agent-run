@@ -449,9 +449,9 @@ fn cleaned_run(
         .unwrap();
     assert_eq!(admission.account_id.as_str(), "acct-a");
     let state = if seal {
-        json!({"native_history":{"seal":{"session":"s"}}}).to_string()
+        json!({"native_history":{"seal":{"session":"s"}},"native_failure":{"class":"quota_exhausted"}}).to_string()
     } else {
-        "{}".into()
+        json!({"native_failure":{"class":"quota_exhausted"}}).to_string()
     };
     store
         .conn

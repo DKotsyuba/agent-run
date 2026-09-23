@@ -159,6 +159,30 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a switched attempt's spawned child as running on an agent that is
+    /// already running: records the new process group and the attempt state,
+    /// without a status transition and without touching `started_at`, so the
+    /// logical run's start (and any deadline derived from it) is preserved.
+    pub fn provider_rerunning(&mut self, id: &AgentId, attempt: &str, pgid: i32) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = tx.execute(
+            "UPDATE agents SET process_group_id=? WHERE id=? AND status='running'",
+            params![pgid, id.as_str()],
+        )?;
+        let owned = tx.execute(
+            "UPDATE attempts SET state='running' WHERE id=? AND agent_id=? AND ownership_active=1 \
+             AND phase='spawning' AND process_identity IS NOT NULL",
+            params![attempt, id.as_str()],
+        )?;
+        if agent != 1 || owned != 1 {
+            return Err(Error::Conflict);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns the adapter state of an agent's latest attempt (`{}` when it
     /// recorded nothing).
     pub fn latest_attempt_state(&self, id: &AgentId) -> Result<String> {
@@ -547,7 +571,8 @@ impl Store {
     ///
     /// Requires: the agent is a nonterminal provider run with no pending or
     /// claimed cancel; its latest attempt is the only owned one, has verified
-    /// cleanup proof and a recorded native history seal (the continuation
+    /// cleanup proof, a recorded authoritative `quota_exhausted` native
+    /// failure and a recorded native history seal (the continuation
     /// evidence); the selection intent is automatic (a pinned run never
     /// switches); `candidates` are for the agent's frozen provider and model
     /// at the current capacity revision. The chosen account must be in the
@@ -638,6 +663,11 @@ impl Store {
             return Err(invalid("the previous attempt has no verified cleanup"));
         }
         let evidence: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
+        if evidence["native_failure"]["class"] != "quota_exhausted" {
+            return Err(invalid(
+                "only a recorded authoritative quota exhaustion allows another attempt",
+            ));
+        }
         if evidence["native_history"]["seal"].is_null() {
             return Err(Error::Unsupported(
                 "continuation_unavailable: the previous attempt recorded no native history seal"
@@ -679,9 +709,12 @@ impl Store {
             None,
             &tried,
         )?;
+        // Close the exhausted attempt durably and release its ownership (and
+        // with it its physical-key reservations) in the same transaction.
         let released = tx.execute(
-            "UPDATE attempts SET ownership_active=0 WHERE id=? AND agent_id=? AND ownership_active=1",
-            params![previous, id.as_str()],
+            "UPDATE attempts SET ownership_active=0,state='exhausted',finished_at=? \
+             WHERE id=? AND agent_id=? AND ownership_active=1",
+            params![now(), previous, id.as_str()],
         )?;
         if released != 1 {
             return Err(Error::Conflict);

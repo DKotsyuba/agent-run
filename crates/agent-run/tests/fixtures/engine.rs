@@ -23,6 +23,10 @@ fn main() {
         ));
         return;
     }
+    if args.first().map(String::as_str) == Some("app-server") {
+        app_server();
+        return;
+    }
     if args.iter().any(|s| s == "--version") {
         println!("agent-run offline fixture 1.0");
         return;
@@ -207,4 +211,120 @@ fn native_history(session: &str, task: &str) {
     for line in lines {
         writeln!(file, "{line}").expect("fixture history write");
     }
+}
+
+/// A minimal Codex app-server (JSON lines over stdio) for provider tests.
+///
+/// Answers `initialize`, `model/list` (model `fixture`), `thread/start` or
+/// `thread/resume` (echoing the requested grant and keeping the resumed
+/// thread id) and `turn/start`. It keeps a Codex-shaped rollout in
+/// `$CODEX_HOME/sessions/.../rollout-fixture-<thread>.jsonl` with the turn
+/// input. A turn fails with the authoritative `usageLimitExceeded` code when
+/// the linked `$CODEX_HOME/auth.json` contains `exhausted`; otherwise it
+/// completes with an agent message naming the thread.
+fn app_server() {
+    let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
+    let exhausted = std::fs::read_to_string(home.join("auth.json"))
+        .map(|text| text.contains("exhausted"))
+        .unwrap_or(false);
+    let mut thread = String::new();
+    let mut turns = 0;
+    for line in io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (Some(id), Some(method)) = (request.get("id").cloned(), request["method"].as_str())
+        else {
+            continue;
+        };
+        let params = &request["params"];
+        match method {
+            "model/list" => emit(json!({"id":id,"result":{"data":[{"id":"fixture"}]}})),
+            "thread/start" | "thread/resume" => {
+                thread = params["threadId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("019a-fixture-{}", std::process::id()));
+                let rollout = rollout_path(&home, &thread);
+                if method == "thread/start" {
+                    std::fs::create_dir_all(rollout.parent().unwrap()).expect("rollout dir");
+                    append(
+                        &rollout,
+                        &json!({"type":"session_meta","payload":{"id":thread}}),
+                    );
+                }
+                let mut echo = json!({
+                    "model":params["model"],"cwd":params["cwd"],"approvalPolicy":params["approvalPolicy"],
+                    "sandbox":{"type":"readOnly","networkAccess":false},
+                    "runtimeWorkspaceRoots":params.get("runtimeWorkspaceRoots").cloned().unwrap_or_else(|| json!([params["cwd"]])),
+                    "thread":{"id":thread,"status":{"type":"idle"}},"threadId":thread,
+                });
+                if let Some(profile) = params["permissions"].as_str() {
+                    echo["activePermissionProfile"] = json!({"id":profile});
+                }
+                if let Some(reviewer) = params.get("approvalsReviewer") {
+                    echo["approvalsReviewer"] = reviewer.clone();
+                }
+                emit(json!({"id":id,"result":echo}));
+            }
+            "turn/start" => {
+                turns += 1;
+                let turn = format!("turn-{turns}");
+                let input = params["input"][0]["text"].as_str().unwrap_or("").to_owned();
+                let rollout = rollout_path(&home, &thread);
+                append(
+                    &rollout,
+                    &json!({"type":"response_item","payload":{"type":"message","role":"user","content":input}}),
+                );
+                emit(json!({"id":id,"result":{"turn":{"id":turn}}}));
+                // `hold` in the auth file pauses before the terminal frame
+                // until the test releases it (a deterministic barrier).
+                let hold = std::fs::read_to_string(home.join("auth.json"))
+                    .map(|text| text.contains("hold"))
+                    .unwrap_or(false);
+                if hold {
+                    std::fs::write(home.join("fixture-held"), "").expect("fixture hold marker");
+                    for _ in 0..400 {
+                        if home.join("fixture-release").exists() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                if exhausted {
+                    emit(
+                        json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"failed","items":[],"error":{"message":"usage limit reached","codexErrorInfo":"usageLimitExceeded"}}}}),
+                    );
+                } else {
+                    let text = format!("fixture codex answer on {thread}");
+                    append(
+                        &rollout,
+                        &json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":text}}),
+                    );
+                    emit(
+                        json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"completed","items":[{"type":"agentMessage","id":format!("msg-{turns}"),"text":text}]}}}),
+                    );
+                }
+            }
+            _ => emit(json!({"id":id,"result":{}})),
+        }
+    }
+}
+
+/// The fixture rollout file of `thread` below `home`.
+fn rollout_path(home: &std::path::Path, thread: &str) -> std::path::PathBuf {
+    home.join(format!(
+        "sessions/2026/09/23/rollout-fixture-{thread}.jsonl"
+    ))
+}
+
+/// Appends one JSON line to a fixture rollout.
+fn append(path: &std::path::Path, value: &Value) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("fixture rollout");
+    writeln!(file, "{value}").expect("fixture rollout write");
 }
