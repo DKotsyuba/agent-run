@@ -88,7 +88,12 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   window's own members, and the ranker applies samples and durable latches
   only to the models of that exact `(key, source, window)`, so after a
   collector source switch a carried latch keeps restricting only its own
-  models and the new source's facts never release or extend it.
+  models and the new source's facts never release or extend it. Latch
+  lookup, membership, carry and sample retention all use that full
+  identity (retention always keeps each latched window's own newest row),
+  and a latch is released only by its reset passing or by fresh positive
+  (or fresher zero) evidence for the same pool and window, from any source,
+  that covers every model it governs; a stale positive never releases it.
   Scoring stays outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
   auto or pinned intent, deterministically ordered rank groups, and the

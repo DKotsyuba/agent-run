@@ -31,16 +31,21 @@ fn lane_of<'a>(key: &'a PhysicalQuotaKey, account: &AccountId) -> Result<&'a str
         .ok_or_else(|| invalid("quota key does not belong to snapshot account"))
 }
 
-/// Reads the durable exhaustion latch for one global account.
+/// One physical quota window: `(lane, source, window)`. The source is part
+/// of the identity, exactly as in the snapshot, the persisted membership and
+/// the ranker: the same window name from another source is another fact.
+type WindowKey = (String, String, String);
+
+/// Reads the durable exhaustion latches of one global account, one per
+/// physical window [`WindowKey`].
 ///
 /// Latch rows live in `quota_exhaustion`, keyed by account, physical key,
 /// stable collector source, and provider window, so they are independent of
-/// rolling sample retention and of script revisions. Matching in
-/// [`retain_exhausted`] is by lane and window across sources.
+/// rolling sample retention and of script revisions.
 fn latched_windows(
     tx: &rusqlite::Transaction<'_>,
     account: &AccountId,
-) -> Result<BTreeMap<(String, String), QuotaWindow>> {
+) -> Result<BTreeMap<WindowKey, QuotaWindow>> {
     let mut stmt = tx.prepare(
         "SELECT quota_key,source,window_id,observed_at,reset_at FROM quota_exhaustion WHERE account_id=?1",
     )?;
@@ -65,7 +70,7 @@ fn latched_windows(
             continue;
         }
         latched.insert(
-            (lane, window_id.clone()),
+            (lane, source.clone(), window_id.clone()),
             QuotaWindow {
                 source,
                 name: window_id,
@@ -79,29 +84,30 @@ fn latched_windows(
     Ok(latched)
 }
 
-/// Recorded model membership per latched `(lane, window)`; `None` for a
+/// Recorded model membership per latched physical window; `None` for a
 /// legacy row without a valid `models` array.
-type WindowMembership = BTreeMap<(String, String), Option<BTreeSet<String>>>;
+type WindowMembership = BTreeMap<WindowKey, Option<BTreeSet<String>>>;
 
-/// The model lanes each latched window of `account` governs, keyed by
-/// `(lane, window)`: the membership of that window's newest sample in the
-/// same `(observed_at, id)` order the ranker reads. `None` when the newest
-/// row records no valid `models` array (rows written before membership was
-/// recorded); such a window governs only the lane equal to its pool id, the
-/// same legacy rule the ranker applies — malformed metadata is never read as
-/// a model mapping.
+/// The model lanes each latched window of `account` governs, keyed by its
+/// [`WindowKey`]: the membership of that exact `(lane, source, window)`'s
+/// newest sample in the same `(observed_at, id)` order the ranker reads.
+/// Another source's sample of the same window name never stands in for it.
+/// `None` when that newest row records no valid `models` array (rows
+/// written before membership was recorded); such a window governs only the
+/// lane equal to its pool id, the same legacy rule the ranker applies —
+/// malformed metadata is never read as a model mapping.
 fn latched_membership(
     tx: &rusqlite::Transaction<'_>,
     account: &AccountId,
-    latched: &BTreeMap<(String, String), QuotaWindow>,
+    latched: &BTreeMap<WindowKey, QuotaWindow>,
 ) -> Result<WindowMembership> {
     let mut membership = BTreeMap::new();
-    for (lane, window) in latched.keys() {
+    for (lane, source, window) in latched.keys() {
         let payload: Option<String> = tx
             .query_row(
-                "SELECT payload_json FROM capacity_samples WHERE quota_key=?1 AND window=?2 \
-                 ORDER BY observed_at DESC,id DESC LIMIT 1",
-                params![format!("{}::{}", account.as_str(), lane), window],
+                "SELECT payload_json FROM capacity_samples WHERE quota_key=?1 AND source=?2 \
+                 AND window=?3 ORDER BY observed_at DESC,id DESC LIMIT 1",
+                params![format!("{}::{}", account.as_str(), lane), source, window],
                 |row| row.get(0),
             )
             .optional()?
@@ -116,19 +122,66 @@ fn latched_membership(
                         .collect::<BTreeSet<_>>()
                 })
             });
-        membership.insert((lane.clone(), window.clone()), models);
+        membership.insert((lane.clone(), source.clone(), window.clone()), models);
     }
     Ok(membership)
 }
 
-/// Whether latched window `(lane, window)` governs model lane `model`:
-/// through its recorded membership, or for a legacy row without membership,
-/// only when the pool id equals the model lane.
-fn window_governs(membership: &WindowMembership, lane: &str, window: &str, model: &str) -> bool {
-    match membership.get(&(lane.to_owned(), window.to_owned())) {
+/// Whether latched window `key` governs model lane `model`: through its
+/// recorded membership, or for a legacy row without membership, only when
+/// the pool id equals the model lane.
+fn window_governs(membership: &WindowMembership, key: &WindowKey, model: &str) -> bool {
+    match membership.get(key) {
         Some(Some(models)) => models.contains(model),
-        _ => lane == model,
+        _ => key.0 == model,
     }
+}
+
+/// The latches this round's evidence settles: fresh positive evidence
+/// ([`authoritative_positive`]) or a fresher zero (observed after the latch
+/// and not after `at`) for the same pool and window name, from any source,
+/// that COVERS every model the latch governs. A latch with recorded
+/// membership is settled only when each governed model reports such a
+/// window in its own view, so a newer observation of another model set (for
+/// example after a collector source switch) never releases it; a legacy
+/// latch without membership keeps the historical any-model rule.
+fn settled_latches(
+    exhausted: &BTreeMap<WindowKey, QuotaWindow>,
+    membership: &WindowMembership,
+    snapshot: &NormalizedQuotaSnapshot,
+    account: &AccountId,
+    at: f64,
+) -> BTreeSet<WindowKey> {
+    let mut settled = BTreeSet::new();
+    for (key, fact) in exhausted {
+        let (lane, _, name) = key;
+        let settles = |window: &QuotaWindow| {
+            window.name == *name
+                && (authoritative_positive(window, fact, at)
+                    || (window.remaining_percent == Some(0.0)
+                        && window.observed_at > fact.observed_at
+                        && window.observed_at <= at))
+        };
+        let reports = |model: &agent_run_domain::catalog::QuotaModelObservation| {
+            model.pools.iter().any(|pool| {
+                lane_of(&pool.key, account).ok() == Some(lane.as_str())
+                    && pool.windows.iter().any(settles)
+            })
+        };
+        let covered = match membership.get(key) {
+            Some(Some(governed)) => governed.iter().all(|governed| {
+                snapshot
+                    .models
+                    .iter()
+                    .any(|model| model.model == *governed && reports(model))
+            }),
+            _ => snapshot.models.iter().any(reports),
+        };
+        if covered {
+            settled.insert(key.clone());
+        }
+    }
+    settled
 }
 
 /// Extends one latched exhausted window's survival horizon without inventing a
@@ -166,53 +219,34 @@ fn authoritative_positive(window: &QuotaWindow, fact: &QuotaWindow, at: f64) -> 
 /// their original observation times and collector source.
 ///
 /// A latched window is carried only into models it governs according to
-/// `membership` (its newest recorded membership, see [`window_governs`]);
-/// it is never copied into another model that merely shares the pool, even
-/// when the window is omitted or unknown this round. Fresh positive or
-/// fresher zero evidence for the physical window seen under any model
-/// settles it for every model.
+/// `membership` (the newest recorded membership of that exact source's
+/// window, see [`window_governs`]); it is never copied into another model
+/// that merely shares the pool, even when the window is omitted or unknown
+/// this round. Only evidence that covers every governed model settles it
+/// (see [`settled_latches`]).
 pub fn retain_exhausted(
-    exhausted: &BTreeMap<(String, String), QuotaWindow>,
+    exhausted: &BTreeMap<WindowKey, QuotaWindow>,
     membership: &WindowMembership,
     snapshot: &mut NormalizedQuotaSnapshot,
     account: &AccountId,
     at: f64,
 ) -> Result<()> {
-    let mut settled = BTreeSet::new();
-    for ((l, name), fact) in exhausted {
-        let observed = snapshot
-            .models
-            .iter()
-            .flat_map(|model| &model.pools)
-            .any(|pool| {
-                lane_of(&pool.key, account).ok() == Some(l.as_str())
-                    && pool.windows.iter().any(|w| {
-                        w.name == *name
-                            && (authoritative_positive(w, fact, at)
-                                || (w.remaining_percent == Some(0.0)
-                                    && w.observed_at > fact.observed_at
-                                    && w.observed_at <= at))
-                    })
-            });
-        if observed {
-            settled.insert((l.clone(), name.clone()));
-        }
-    }
+    let settled = settled_latches(exhausted, membership, snapshot, account, at);
     for model in &mut snapshot.models {
         let model_lane = model.model.clone();
         for pool in &mut model.pools {
             let lane = lane_of(&pool.key, account)?.to_owned();
-            // Only actually fresh positive evidence releases the latch: a
+            // Only actually fresh covering evidence releases the latch: a
             // stale or expired positive observation never revives capacity,
-            // and unknown or missing data displaces nothing. Matching is by
-            // physical window name across collector sources, so a source
-            // change neither forks the pool nor strands the fact.
+            // and unknown or missing data displaces nothing. The carried fact
+            // replaces this model's same-named windows from any source.
             let mut carried: Vec<QuotaWindow> = Vec::new();
-            for ((l, name), fact) in exhausted {
+            for (key, fact) in exhausted {
+                let (l, _, name) = key;
                 if l != &lane
                     || fact.reset_at.is_some_and(|reset| reset <= at)
-                    || settled.contains(&(l.clone(), name.clone()))
-                    || !window_governs(membership, l, name, &model_lane)
+                    || settled.contains(key)
+                    || !window_governs(membership, key, &model_lane)
                 {
                     continue;
                 }
@@ -264,24 +298,17 @@ pub fn record_quota_snapshot(
         return Err(invalid("quota account is not registered"));
     }
     let exhausted = latched_windows(&tx, &account)?;
-    let mut released = BTreeSet::new();
-    for ((lane, name), fact) in &exhausted {
-        if fact.reset_at.is_some_and(|reset| reset <= at)
-            || snapshot
-                .models
-                .iter()
-                .flat_map(|model| &model.pools)
-                .any(|pool| {
-                    lane_of(&pool.key, &account).ok() == Some(lane.as_str())
-                        && pool.windows.iter().any(|window| {
-                            window.name == *name && authoritative_positive(window, fact, at)
-                        })
-                })
-        {
-            released.insert((lane.as_str(), name.as_str()));
-        }
-    }
     let membership = latched_membership(&tx, &account, &exhausted)?;
+    // A latch is released when its reset passed or this round's evidence
+    // covers every model it governs; a settling fresher zero is re-latched
+    // below under its own source.
+    let mut released = settled_latches(&exhausted, &membership, snapshot, &account, at);
+    released.extend(
+        exhausted
+            .iter()
+            .filter(|(_, fact)| fact.reset_at.is_some_and(|reset| reset <= at))
+            .map(|(key, _)| key.clone()),
+    );
     let mut snapshot = snapshot.clone();
     retain_exhausted(&exhausted, &membership, &mut snapshot, &account, at)?;
 
@@ -357,11 +384,11 @@ pub fn record_quota_snapshot(
 
     // Release old latches before inserting this round's exhausted facts: a
     // new zero observed after a reset must remain latched.
-    for (lane, name) in &released {
+    for (lane, source, name) in &released {
         let quota_key = format!("{}::{}", account.as_str(), lane);
         mutations += tx.execute(
-            "DELETE FROM quota_exhaustion WHERE account_id=?1 AND quota_key=?2 AND window_id=?3",
-            params![account.as_str(), quota_key, name],
+            "DELETE FROM quota_exhaustion WHERE account_id=?1 AND quota_key=?2 AND source=?3 AND window_id=?4",
+            params![account.as_str(), quota_key, source, name],
         )?;
     }
 
@@ -371,7 +398,7 @@ pub fn record_quota_snapshot(
         if window.remaining_percent != Some(0.0)
             || window.reset_at.is_some_and(|reset| reset <= at)
             || exhausted
-                .get(&(lane.to_string(), name.to_string()))
+                .get(&(lane.to_string(), source.to_string(), name.to_string()))
                 .is_some_and(|fact| window.observed_at < fact.observed_at)
         {
             continue;
@@ -392,20 +419,18 @@ pub fn record_quota_snapshot(
             ],
         )?;
         mutations += 1;
-        mutations += tx.execute(
-            "DELETE FROM quota_exhaustion WHERE account_id=?1 AND quota_key=?2 AND window_id=?3 AND source<>?4",
-            params![account.as_str(), quota_key, name, source],
-        )?;
     }
     let revision = if mutations > 0 {
-        // Retention keeps, for every latched physical window, that window's
-        // newest row in the ranker's (observed_at, id) order: it carries the
-        // membership the latch needs to keep restricting exactly the models
-        // it governs, independently of other windows and of insertion order.
+        // Retention keeps, for every latched physical window, that exact
+        // (key, source, window)'s newest row in the ranker's (observed_at,
+        // id) order: it carries the membership the latch needs to keep
+        // restricting exactly the models it governs, independently of other
+        // sources' rows of the same window name and of insertion order.
         tx.execute(
             "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?) \
              AND id NOT IN (SELECT id FROM (SELECT (SELECT s.id FROM capacity_samples s \
-               WHERE s.quota_key=q.quota_key AND s.window=q.window_id ORDER BY s.observed_at DESC,s.id DESC LIMIT 1) AS id \
+               WHERE s.quota_key=q.quota_key AND s.source=q.source AND s.window=q.window_id \
+               ORDER BY s.observed_at DESC,s.id DESC LIMIT 1) AS id \
                FROM quota_exhaustion q) WHERE id IS NOT NULL)",
             [retention as i64],
         )?;
@@ -429,7 +454,8 @@ impl Store {
     ///
     /// The fact is released only by the existing rules: its reset passing, or
     /// a newer authoritative positive observation of the same lane and
-    /// window; an older positive sample never clears it. Callers must pass
+    /// window that covers every model this latch governs; an older positive
+    /// sample, or one covering only other models, never clears it. Callers must pass
     /// only a window whose physical pool the provider's own collector mapping
     /// establishes; unknown windows are never latched.
     // The physical identity (account, runtime, lane, window, source), the

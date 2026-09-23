@@ -694,3 +694,100 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
     assert_eq!(refused.public().kind, "quota_exhausted", "{refused:?}");
     service.admit_provider(request("m-b", "adm-b")).unwrap();
 }
+
+/// Retention `1` source switch: `s1` exhausted `m-a` on `primary/five_hour`;
+/// a newer `s2` observation of the same pool/window covering only `m-b`
+/// (unknown or positive) neither prunes the `s1` membership the latch needs
+/// nor releases it, so `m-a` stays excluded through the order and ordinary
+/// admission while `m-b` is admitted. A stale `s2` positive that covers
+/// `m-a` cannot release it; a fresh one can.
+#[tokio::test]
+async fn cross_source_latch_survives_small_retention_and_releases_only_on_coverage() {
+    use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
+    for second in [None, Some(50.0)] {
+        let temp = ranking_home();
+        let root = temp.path();
+        fs::write(
+            root.join("config.toml"),
+            format!(
+                "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
+                r = root.display()
+            ),
+        )
+        .unwrap();
+        agent_run_store::Store::open(root)
+            .unwrap()
+            .conn
+            .execute("DELETE FROM capacity_samples", [])
+            .unwrap();
+        let account = "acct-a".parse().unwrap();
+        let now = agent_run_core::domain::now();
+        let round =
+            |source: &str, models: &[&str], remaining: Option<f64>, observed: f64, valid: f64| {
+                let scope = CollectorScope {
+                    runtime: "g".into(),
+                    source: source.into(),
+                    models: ["m-a".to_owned(), "m-b".to_owned()].into(),
+                };
+                let raw = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
+                "models":models,"remaining_percent":remaining,"reset_at":now + 3600.0,
+                "observed_at":observed,"valid_until":valid}]});
+                let snapshot =
+                    normalize_collector_output(&account, &scope, &raw, now, 256, 256).unwrap();
+                agent_run_store::quota::record_quota_snapshot(root, "g", &snapshot, 1, now)
+                    .unwrap();
+            };
+        round("s1", &["m-a"], Some(0.0), now - 5.0, now + 3600.0);
+        round("s2", &["m-b"], second, now - 1.0, now + 600.0);
+        let service = Service::new(root.to_path_buf());
+        let status = |model: &str| {
+            let order = service
+                .capacity_order(CapacityOrderQuery {
+                    model: Some(model.into()),
+                })
+                .unwrap();
+            order["providers"][0]["models"][0]["quota"]["status"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let latches = || -> Vec<String> {
+            let store = agent_run_store::Store::open(root).unwrap();
+            let mut statement = store
+                .conn
+                .prepare("SELECT source||'/'||window_id FROM quota_exhaustion ORDER BY source")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(status("m-a"), "exhausted", "{second:?}");
+        assert_eq!(latches(), ["s1/five_hour"], "{second:?}");
+        let request = |model: &str, id: &str| -> agent_run_domain::ProviderStartRequest {
+            serde_json::from_value(json!({"provider":"g","model":model,"profile":"review",
+                "task":"task","workdir":root,"request_id":id}))
+            .unwrap()
+        };
+        let refused = service.admit_provider(request("m-a", "adm-a")).unwrap_err();
+        assert_eq!(
+            refused.public().kind,
+            "quota_exhausted",
+            "{second:?}: {refused:?}"
+        );
+        service.admit_provider(request("m-b", "adm-b")).unwrap();
+        // A stale s2 positive covering m-a (validity already expired) keeps
+        // the latch; a fresh one releases it.
+        round("s2", &["m-a", "m-b"], Some(40.0), now - 1.0, now - 0.5);
+        assert_eq!(status("m-a"), "exhausted", "{second:?}: stale positive");
+        assert_eq!(latches(), ["s1/five_hour"], "{second:?}");
+        round("s2", &["m-a", "m-b"], Some(40.0), now - 0.5, now + 600.0);
+        assert_eq!(
+            latches(),
+            Vec::<String>::new(),
+            "{second:?}: fresh covering positive"
+        );
+        assert_ne!(status("m-a"), "exhausted", "{second:?}");
+    }
+}
