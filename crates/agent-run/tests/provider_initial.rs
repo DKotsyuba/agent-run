@@ -729,3 +729,160 @@ async fn provider_harness_options_are_validated_and_carried() {
         Status::Succeeded
     );
 }
+
+/// Runs one admitted provider agent to its terminal state through the real
+/// supervisor executable (bounded to 20 s).
+async fn run_to_end(home: &Path, id: &AgentId) {
+    let mut child = supervisor(home, id);
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exit.success(), "supervisor exit: {exit}");
+}
+
+/// Writes the Claude native transcript for `session` under the run's
+/// custom-gateway config directory, as the harness itself would.
+fn transcript(runtime_home: &Path, session: &str, body: &str) {
+    let dir = runtime_home.join("claude-config/projects/-fixture-workdir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{session}.jsonl")), body).unwrap();
+}
+
+/// Explicit provider resume: unprovable native history refuses with
+/// `continuation_unavailable` and admits nothing; a proven history admits one
+/// child that keeps the parent's authority, assets, runtime home and native
+/// session, replays by request id, refuses a second child, and resumes the
+/// same native session through the real supervisor. A pinned account that
+/// became unavailable is never switched away from.
+#[tokio::test]
+async fn provider_resume_continues_the_proven_native_session() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(0))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(parent.status, Status::Succeeded);
+    let session = parent.runtime_session_id.clone().unwrap();
+    let runtime_home = std::path::PathBuf::from(
+        parent.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    let orchestrator: agent_run::domain::OrchestratorRef = serde_json::from_value(
+        serde_json::json!({"transport":"fixture","external_session_id":"test-session"}),
+    )
+    .unwrap();
+    let resume = |request_id: &str| {
+        service.admit_provider_resume(
+            &Store::open(&home).unwrap().get(&id).unwrap(),
+            "fixture:answer".into(),
+            None,
+            Some(request_id.into()),
+            Some(orchestrator.clone()),
+        )
+    };
+    let children = || -> i64 {
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE parent_agent_id=?",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let refused = resume("resume-1").unwrap_err().to_string();
+    assert!(refused.contains("continuation_unavailable"), "{refused}");
+    let open_tool = format!(
+        "{{\"sessionId\":\"{session}\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\"}}]}}}}\n"
+    );
+    transcript(&runtime_home, &session, &open_tool);
+    let refused = resume("resume-1").unwrap_err().to_string();
+    assert!(refused.contains("unresolved tool call"), "{refused}");
+    assert_eq!(children(), 0, "a refusal admits nothing");
+    let closed = format!(
+        "{open_tool}{{\"sessionId\":\"{session}\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t1\"}}]}}}}\n"
+    );
+    transcript(&runtime_home, &session, &closed);
+
+    let child = resume("resume-1").unwrap();
+    assert_eq!(child["created"], true, "{child}");
+    let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    let row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    assert_eq!(row.parent_agent_id.as_ref(), Some(&id));
+    assert_eq!(row.root_agent_id, id);
+    assert_eq!(row.sequence, 2);
+    assert_eq!(
+        row.resume_of_runtime_session_id.as_deref(),
+        Some(session.as_str())
+    );
+    let (parent_identity, child_identity) = (
+        parent.identity.clone().unwrap(),
+        row.identity.clone().unwrap(),
+    );
+    for key in ["runtime_home", "snapshot_sha256", "provider_config_sha256"] {
+        assert_eq!(parent_identity[key], child_identity[key], "{key}");
+    }
+    assert_eq!(
+        parent_identity["authority"]["assets_sha256"],
+        child_identity["authority"]["assets_sha256"]
+    );
+    assert_eq!(
+        parent_identity["authority"]["role_payload"],
+        child_identity["authority"]["role_payload"]
+    );
+    let replay = resume("resume-1").unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], child["agent_id"]);
+    let second = resume("resume-2").unwrap_err().to_string();
+    assert!(second.contains("already been resumed"), "{second}");
+    assert_eq!(children(), 1);
+
+    run_to_end(&home, &child_id).await;
+    let row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    assert_eq!(row.runtime_session_id.as_deref(), Some(session.as_str()));
+    let (selected, cleanup): (String, Option<String>) = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT selected_account_id,cleanup_proof_json FROM attempts WHERE agent_id=?",
+            [child_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(selected, "acct-work");
+    assert!(cleanup.is_some());
+
+    // The pinned account is disabled: resume refuses instead of switching.
+    Store::open(&home)
+        .unwrap()
+        .disable_account(&"acct-work".parse().unwrap())
+        .unwrap();
+    let pinned = service
+        .admit_provider_resume(
+            &Store::open(&home).unwrap().get(&child_id).unwrap(),
+            "fixture:answer".into(),
+            None,
+            Some("resume-3".into()),
+            Some(orchestrator.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(!pinned.contains("continuation_unavailable"), "{pinned}");
+    let grandchildren: i64 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE parent_agent_id=?",
+            [child_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(grandchildren, 0, "{pinned}");
+}

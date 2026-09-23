@@ -711,9 +711,9 @@ impl Service {
     /// The parent must be terminal with a native session and a sealed Rust launch
     /// identity. Snapshot continuations retain the parent's immutable revision;
     /// legacy revisions remain pending until their supervisor rematerializes them.
-    /// On a schema-2 home every resume is a typed `Unsupported` refusal that
-    /// writes nothing: `legacy_continuation_unavailable` for a schema-1 run and
-    /// `provider_resume_unavailable` for a provider run.
+    /// On a schema-2 home a schema-1 run refuses with
+    /// `legacy_continuation_unavailable` and writes nothing; a provider run
+    /// continues through [`Self::admit_provider_resume`].
     pub async fn resume(
         &self,
         id: &AgentId,
@@ -731,18 +731,19 @@ impl Service {
         // On a schema-2 home no continuation is remapped to a provider or
         // replayed as a summary: the history stays readable and the refusal is
         // typed. Explicit provider resume is a separate, later contract.
+        let provider_row = parent
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity["provider_identity_version"] == 2);
+        if provider_row {
+            let result =
+                self.admit_provider_resume(&parent, task, timeout, request_id, orchestrator)?;
+            self.hand_off_provider(&result).await?;
+            return Ok(result);
+        }
         if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
-            let provider_row = parent
-                .identity
-                .as_ref()
-                .is_some_and(|identity| identity["provider_identity_version"] == 2);
             return Err(Error::Unsupported(
-                if provider_row {
-                    "provider_resume_unavailable: explicit provider resume is not yet supported"
-                } else {
-                    "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable"
-                }
-                .into(),
+                "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
             ));
         }
         let mut identity = LaunchIdentity::read(&parent)?;
@@ -808,6 +809,261 @@ impl Service {
             }
             Err(error) => Err(error),
         }
+    }
+    /// Admits an explicit resume of a terminal provider run as a new logical
+    /// child, without launching it; [`Self::resume`] hands a created child
+    /// to the supervisor.
+    ///
+    /// The child keeps the parent's provider, harness, explicit model,
+    /// workdir, role grants, sealed assets, frozen configuration, runtime
+    /// home and native session; only the task text, timeout, orchestrator and
+    /// the per-attempt account lease change. A request-id replay is answered
+    /// before any configuration or quota read. The parent's selection intent
+    /// is kept: a pinned run never switches; an automatic run keeps its
+    /// previous account while that account is still a valid candidate and
+    /// switches only when it is not (disabled, exhausted or no longer bound).
+    /// Claude Code keeps session history per login, so it resumes only on the
+    /// parent's own account.
+    ///
+    /// Refuses with `continuation_unavailable` when the sealed assets or the
+    /// native history cannot be proved (see [`crate::continuity::prove`]),
+    /// and with a validation error when the current configuration no longer
+    /// offers the provider, harness, connection or model. Admission itself
+    /// proves the parent terminal, quiescent and cleaned up, and admits at
+    /// most one child per parent.
+    pub fn admit_provider_resume(
+        &self,
+        parent: &Record,
+        task: String,
+        timeout: Option<f64>,
+        request_id: Option<String>,
+        orchestrator: Option<OrchestratorRef>,
+    ) -> Result<Value> {
+        let frozen = ProviderLaunchIdentity::read(parent)?;
+        let mut request = frozen.provider_request.clone();
+        request.task = task;
+        request.request_id = request_id;
+        request.timeout_seconds = timeout.or(frozen.provider_request.timeout_seconds);
+        if orchestrator.is_some() {
+            request.orchestrator = orchestrator;
+        }
+        request.validate()?;
+        // Replay of the original resume intent precedes every mutable read.
+        if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
+            let store = Store::open(&self.home)?;
+            let row = store.get(&replay.agent_id)?;
+            if row.parent_agent_id.as_ref() != Some(&parent.id) {
+                return Err(Error::Conflict);
+            }
+            return Ok(
+                json!({"agent_id":replay.agent_id,"attempt_id":replay.attempt_id,
+                "created":false,"agent":self.view(&store,&row)?}),
+            );
+        }
+        let session = parent
+            .runtime_session_id
+            .as_deref()
+            .ok_or_else(|| invalid("resume requires a native session ID"))?;
+        let runtime_home = frozen.runtime_home.clone().ok_or_else(|| {
+            Error::Unsupported("continuation_unavailable: parent has no sealed runtime home".into())
+        })?;
+        adapters::materialize::verify(&runtime_home, frozen.authority.assets_sha256.as_str())
+            .map_err(|_| {
+                Error::Unsupported(
+                    "continuation_unavailable: parent runtime assets no longer verify".into(),
+                )
+            })?;
+        let (prefer, intent, pinned_id): (String, String, Option<String>) =
+            Store::open(&self.home)?.conn.query_row(
+                "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id \
+                 FROM attempts t JOIN agents a ON a.id=t.agent_id \
+                 WHERE t.agent_id=? ORDER BY t.number DESC LIMIT 1",
+                [parent.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let prefer: agent_run_domain::catalog::AccountId = prefer.parse()?;
+        // The current configuration may only narrow the frozen authority.
+        let (current, _) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let now_catalog = current.resolve_catalog(accounts.clone())?;
+        let authority = &frozen.authority;
+        let offered = now_catalog
+            .provider(&authority.provider)
+            .filter(|definition| {
+                definition.harness == authority.harness
+                    && definition.connection == authority.connection
+                    && definition
+                        .models
+                        .iter()
+                        .any(|model| model.id == authority.model)
+            });
+        let Some(offered) = offered else {
+            return Err(invalid(
+                "provider, harness, connection or model changed since the parent ran; resume refused",
+            ));
+        };
+        let history_root = match authority.harness {
+            agent_run_domain::catalog::HarnessId::Codex => runtime_home.clone(),
+            agent_run_domain::catalog::HarnessId::ClaudeCode => {
+                self.claude_history_root(&frozen, &accounts, &prefer, &runtime_home)?
+            }
+        };
+        crate::continuity::prove(authority.harness, &history_root, session)?;
+        let bound: std::collections::BTreeSet<_> = offered
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.contains(&authority.model))
+            })
+            .map(|binding| binding.account.clone())
+            .collect();
+        let mut child_authority = authority.clone();
+        child_authority.eligible_accounts.retain(|account| {
+            bound.contains(account)
+                && (authority.harness == agent_run_domain::catalog::HarnessId::Codex
+                    || *account == prefer)
+        });
+        let frozen_catalog = frozen.provider_config.resolve_catalog(accounts)?;
+        let hard: std::collections::BTreeSet<_> = frozen_catalog
+            .provider(&authority.provider)
+            .map(|definition| {
+                definition
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.account.clone())
+                    .filter(|account| !child_authority.eligible_accounts.contains(account))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pinned = match (intent.as_str(), pinned_id) {
+            ("pinned", Some(id)) => Some(id.parse::<agent_run_domain::catalog::AccountId>()?),
+            ("auto", None) => None,
+            _ => {
+                return Err(Error::Integrity(
+                    "parent selection intent is malformed".into(),
+                ))
+            }
+        };
+        let mut effective = parent.request.clone();
+        effective.task = request.task.clone();
+        effective.request_id = request.request_id.clone();
+        effective.timeout_seconds = request.timeout_seconds.or(parent.request.timeout_seconds);
+        effective.orchestrator = request.orchestrator.clone();
+        let identity = serde_json::to_value(ProviderLaunchIdentity {
+            provider_identity_version: 2,
+            replay_request_sha256: agent_run_domain::canonical::sha256_hex(
+                &serde_json::to_value(&request)?,
+                true,
+            ),
+            provider_request: request.clone(),
+            provider_config_sha256: frozen.provider_config_sha256.clone(),
+            provider_config: frozen.provider_config.clone(),
+            provider_config_snapshot: frozen.provider_config_snapshot.clone(),
+            authority: child_authority.clone(),
+            runtime_home: Some(runtime_home),
+            snapshot_sha256: frozen.snapshot_sha256.clone(),
+        })?;
+        let cap = frozen
+            .provider_config
+            .harnesses
+            .get(&authority.harness)
+            .ok_or_else(|| invalid("provider harness is not configured"))?
+            .max_active_agents;
+        let pin_label = request.account.as_ref().map(|label| label.as_str());
+        let mut submission = 0;
+        let admission = loop {
+            let store = Store::open(&self.home)?;
+            let candidates = crate::capacity::provider_ranking::provider_candidates(
+                &store,
+                &frozen_catalog,
+                &authority.provider,
+                &authority.model,
+                pin_label,
+                &hard,
+            )?;
+            match Store::open(&self.home)?.admit_provider_resume(
+                &request,
+                &effective,
+                &frozen_catalog,
+                &child_authority,
+                &candidates,
+                &identity,
+                current.core.max_active_agents,
+                cap,
+                pinned.as_ref(),
+                agent_run_store::provider_admission::ProviderResume {
+                    parent: &parent.id,
+                    prefer: &prefer,
+                },
+            ) {
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < PROVIDER_STALE_RETRIES =>
+                {
+                    submission += 1;
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
+                    return Err(QuotaAdmissionError::SelectionBusy {
+                        stale_retries: PROVIDER_STALE_RETRIES,
+                    }
+                    .into());
+                }
+                result => break result?,
+            }
+        };
+        let store = Store::open(&self.home)?;
+        let row = store.get(&admission.agent_id)?;
+        Ok(
+            json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
+            "created":admission.created,"agent":self.view(&store,&row)?}),
+        )
+    }
+
+    /// The Claude config directory holding `account`'s session history: the
+    /// labelled login directory for a `named:` reference, the host's
+    /// `CLAUDE_CONFIG_DIR` (or `~/.claude`) for the native login, and the
+    /// run's own `claude-config` for a custom-gateway provider.
+    fn claude_history_root(
+        &self,
+        frozen: &ProviderLaunchIdentity,
+        accounts: &[agent_run_domain::catalog::AccountRecord],
+        account: &agent_run_domain::catalog::AccountId,
+        runtime_home: &std::path::Path,
+    ) -> Result<PathBuf> {
+        use agent_run_domain::CredentialRef;
+        if !matches!(
+            frozen.authority.connection,
+            agent_run_domain::catalog::ProviderConnection::Native
+        ) {
+            return Ok(runtime_home.join("claude-config"));
+        }
+        let record = accounts
+            .iter()
+            .find(|record| &record.account_id == account)
+            .ok_or_else(|| invalid("parent account is no longer registered"))?;
+        Ok(match CredentialRef::from_secret(&record.secret_ref)? {
+            CredentialRef::Named { label, .. } => {
+                let harness = frozen
+                    .provider_config
+                    .harnesses
+                    .get(&frozen.authority.harness)
+                    .ok_or_else(|| invalid("provider harness is not configured"))?;
+                adapters::materialize::claude_account_config(
+                    &self.home,
+                    &harness.home,
+                    label.as_str(),
+                )?
+            }
+            _ => std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+                })
+                .ok_or_else(|| invalid("HOME is missing"))?,
+        })
     }
     /// Enqueues one durable cancellation and returns the agent's public view.
     ///

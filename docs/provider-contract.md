@@ -140,11 +140,37 @@ harness as the answer-schema instruction, through the same launch
 mechanisms as before; setting either on the other harness is a
 `ValidationError` before any row is written. On a schema-1 home `start` fails until the config is migrated.
 
-Resume on a schema-2 home is a typed refusal, never a remap or prompt
-replay: a schema-1 run returns `Unsupported`
-(`legacy_continuation_unavailable`) with its history intact, and a provider
-run returns `Unsupported` (`provider_resume_unavailable`) until explicit
-provider resume is implemented.
+Resume on a schema-2 home is never a remap or prompt replay. A schema-1 run
+returns `Unsupported` (`legacy_continuation_unavailable`) with its history
+intact. A terminal provider run resumes explicitly through the existing
+`resume` tool/CLI/socket as a new logical child
+(`Service::admit_provider_resume`):
+
+- The child keeps the parent's provider, harness, explicit model, workdir,
+  role grants, sealed assets, frozen configuration, runtime home and native
+  session id. Only the task text, timeout, orchestrator and the per-attempt
+  account lease change.
+- A repeated `request_id` returns the original child and account before any
+  configuration or quota read; one parent admits at most one child, and a
+  different request id for the same parent is refused.
+- The current configuration may only narrow the frozen authority: the
+  provider, harness, connection and model must still be offered, and the
+  eligible accounts are the frozen scope intersected with the current
+  bindings. A changed connection or model refuses.
+- A pinned run never switches. An automatic run keeps its previous account
+  while that account is still a candidate and switches only when it is not
+  (disabled, exhausted, unbound); rank alone never moves it. Codex keeps its
+  conversation in the run's own `CODEX_HOME`, so only the auth link is
+  rebound after cleanup; Claude Code keeps history per login, so it resumes
+  on the parent's account only (cross-account continuation is unverified).
+- In the admission transaction the parent must be terminal, its process
+  group gone and every attempt cleanup-proven. Before admission the native
+  history for that exact session must exist in the expected storage root,
+  be complete line-delimited JSON, name the session and have no tool call
+  without its result; otherwise `Unsupported`
+  (`continuation_unavailable`) and nothing is written.
+
+Automatic in-flight quota failover is not part of resume.
 
 ### Mechanical account choice
 

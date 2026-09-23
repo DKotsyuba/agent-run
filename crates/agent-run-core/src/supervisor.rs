@@ -409,7 +409,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         &host,
         &adapters::authorized_request::SystemCredentialReader,
         &identity.provider_request.task,
-        None,
+        row.resume_of_runtime_session_id.as_deref(),
         adapters::provider::LaunchOptions {
             fast: identity.provider_request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
