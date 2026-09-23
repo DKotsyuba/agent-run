@@ -168,7 +168,7 @@ labelled_accounts = { personal2 = "acct-codex-personal2" }
 ```sh
 agent-run config migrate --mapping mapping.toml --dry-run
 agent-run config migrate --mapping mapping.toml --apply \
-  --from-binary /path/to/installed/agent-run [--ack <marker>]...
+  --from-release <prefix>/releases/<installed version> [--ack <marker>]...
 agent-run config rollback --snapshot <home>/migrations/<id>-v1-to-v2
 ```
 
@@ -177,24 +177,69 @@ database's current schema; it reads the database only through its file
 header (or a read-only connection when live WAL frames exist) and writes
 nothing. Invalid input and every refusal write nothing either.
 
-`--apply` holds the broker startup lock for its whole run (a running broker
-makes it refuse; no broker can start meanwhile), refuses while any agent is
-active, and re-checks that `config.toml` still has the exact bytes it planned
-from. It then creates a new snapshot directory exclusively — the exact v1
-config, the mapping, an online SQLite backup read through a read-only
-connection, and `manifest.json` recording the installed binary
-(`--from-binary`: path, SHA-256, `--version` output) and this binary, the
-config, mapping and backup digests, the source schema and a logical digest of
-every row — writes `COMPLETE` last and makes the snapshot read-only. Only then
-does it run the numbered store migration (the database *is* upgraded, to
-schema 17), register the declared accounts and atomically publish the v2
-config, followed by `<snapshot>.applied.json`. If any of those steps fails,
-the snapshot database and the original config are restored.
+Rollout preconditions. Stop the resident broker and unload the capacity and
+delivery launchd jobs first (`launchctl bootout gui/$(id -u)/<label>`), and
+let active agents finish. The migration enforces what it can: it holds the
+broker startup lock for its whole run (a running broker makes it refuse; no
+broker can start meanwhile), refuses while any agent is active, and every
+newly started command — including a capacity or delivery job — refuses with
+`migration_required` while the database is older, or `migration_incomplete`
+while a journal exists. A job that had already opened the store before the
+migration began is not excluded by these; if it writes, the row digest check
+below refuses publication or rollback rather than discarding its write.
 
-Rollback restores the whole pair — the v1 config and the snapshot database
-(schema 16 with its exact rows) — and only while the live config and every
-database row still equal the applied record, nothing is live, and the
-recorded pre-migration binary still exists with its recorded digest; it then
-names that binary for the operator to run again. Any post-migration write (an
-agent, an event, an account change, a quota sample) makes rollback refuse: it
-cannot preserve that work. The snapshot is never modified.
+`--from-release` names the installed release directory — a sealed release
+as built by `xtask release` — not a bare executable. Its `COMPLETE`,
+`SHA256SUMS` and `metadata.json` must verify, and the schema its metadata
+records must equal the database's schema and be older than this binary's;
+nothing is executed to learn its version. An unsealed, tampered or
+incompatible release is refused before anything is written.
+
+`--apply` then re-checks that `config.toml` still has the exact bytes it
+planned from and creates a new snapshot directory exclusively — the exact v1
+config, the mapping, an online SQLite backup, and `manifest.json` recording
+the old release (path, version, schema, binary and `SHA256SUMS` digests), this
+binary (digest and schema), the config, mapping and backup digests, the
+source schema and a logical digest of every row — writes `COMPLETE` last and
+makes the snapshot read-only. The numbered migration (to schema 17) and the
+declared accounts are applied to a staged copy of the snapshot database. Only
+then does it write `migrations/in-progress.json`, the journal recording the
+source and target row digests and both config digests, and publish: the live
+database is replaced from the staged target in one SQLite transaction, the v2
+config is written (only over the exact v1 bytes), then
+`<snapshot>.applied.json`, and the journal is removed.
+
+If publication fails, only what this operation provably published is undone:
+the database is restored while every row still equals the staged target, the
+config is returned to v1 only while it equals the v2 bytes it wrote. A config
+edited by someone else meanwhile is kept as is. If the process is killed, the
+journal stays, every ordinary command refuses with `migration_incomplete`,
+and `config rollback --snapshot <dir>` recovers from it.
+
+Rollback (and recovery) restores the whole pair — the v1 config and the
+snapshot database (schema 16 with its exact rows). It needs this snapshot's
+applied record or its own journal, a live config equal to the snapshot's v1
+or v2 bytes, every database row equal to the recorded source or target
+digest, no active agent, and the recorded release still sealed with its
+recorded digests. A matching config alone never authorizes replacing the
+database: any post-migration write (an agent, an event, an account change, a
+quota sample) makes rollback refuse and leaves config, database and journal
+untouched. Rollback is itself journalled, so an interrupted rollback is
+finished by rerunning it. It returns the release to reinstall; it does not
+switch the installed pointer. The snapshot is never modified.
+
+## New homes and native login
+
+`agent-run init` on a home without `config.toml` writes the explicitly empty
+schema-2 catalog `schema_version = 2` (no harness, provider or account;
+`models` lists nothing and nothing can start until they are declared). A
+schema-1 `config.toml` never initializes a new state database.
+
+In a schema-2 home, `agent-run auth <account> <provider>` and
+`agent-run login <provider> [--account <account>]` take a native-connection
+provider id and one of its bindings, by provider-local label or global
+account id (optional when the provider binds exactly one). The login runs the
+provider's harness executable against the bound account's own storage:
+`native:<harness>` is the harness's global login, `named:codex:<label>` is
+`accounts/codex/<label>`, `named:claude-code:<label>` the labelled Claude
+directory. `login` accepts Claude Code providers only.

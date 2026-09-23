@@ -521,13 +521,15 @@ pub enum ConfigCommand {
         /// Acknowledge one dry-run manual_review marker (repeat for each).
         #[arg(long = "ack")]
         ack: Vec<String>,
-        /// The installed pre-migration agent-run executable (required with
-        /// `--apply`); rollback verifies and returns to it.
+        /// The installed pre-migration sealed release directory (required
+        /// with `--apply`); its seal and schema are verified, and rollback
+        /// returns to it.
         #[arg(long)]
-        from_binary: Option<PathBuf>,
+        from_release: Option<PathBuf>,
     },
     /// Restore the v1 config and original database from one verified
-    /// snapshot while nothing changed since the migration.
+    /// snapshot while nothing changed since the migration; also recovers an
+    /// interrupted migration or rollback of that snapshot.
     Rollback {
         /// The snapshot directory printed by `config migrate --apply`.
         #[arg(long)]
@@ -811,12 +813,13 @@ pub fn launchd(
 /// provider output in agent-run's JSON response.
 fn native_login_command(
     home: &Path,
-    runtime: &crate::config::Runtime,
+    binary: &Path,
+    runtime_home: &Path,
     kind: Adapter,
     account: Option<&str>,
     status: bool,
 ) -> Result<tokio::process::Command> {
-    let mut command = tokio::process::Command::new(&runtime.binary);
+    let mut command = tokio::process::Command::new(binary);
     // Only PATH and HOME are needed to locate the provider binary and run its
     // browser flow; every other inherited variable, including explicit
     // credential variables, is withheld from the interactive child.
@@ -850,7 +853,7 @@ fn native_login_command(
                 Some(label) => {
                     let path = crate::adapters::materialize::claude_account_config(
                         home,
-                        &runtime.home,
+                        runtime_home,
                         label,
                     )?;
                     fs::private_dir(&path)?;
@@ -889,18 +892,32 @@ async fn login(
     account: Option<&str>,
     claude_only: bool,
 ) -> Result<(i32, Value)> {
-    let cfg = Config::load(home)?;
-    let runtime = cfg.runtime(name)?;
-    let kind = runtime.kind()?;
+    let target = match agent_run_config::provider_config::ProviderConfig::load(home) {
+        Ok((cfg, _)) => provider_login_target(home, &cfg, name, account, claude_only)?,
+        Err(_) => {
+            let cfg = Config::load(home)?;
+            let runtime = cfg.runtime(name)?;
+            let kind = runtime.kind()?;
+            let account = runtime.selected_account(account)?;
+            LoginTarget {
+                binary: runtime.binary.clone(),
+                runtime_home: runtime.home.clone(),
+                kind,
+                label: account.clone(),
+                reply: json!({"account":account,"runtime":if kind == Adapter::Claude {"claude"} else {name},"status":"ok"}),
+            }
+        }
+    };
+    let kind = target.kind;
     if claude_only && kind != Adapter::Claude {
         return Err(invalid(format!(
             "login supports Claude only; use agent-run auth <label> {name}"
         )));
     }
-    let account = runtime.selected_account(account)?;
+    let (binary, runtime_home, account) = (&target.binary, &target.runtime_home, &target.label);
     let account_name = account.as_deref().unwrap_or("default");
     // Interactive native authentication owns its prompts and credential storage.
-    let status = native_login_command(home, runtime, kind, account.as_deref(), false)?
+    let status = native_login_command(home, binary, runtime_home, kind, account.as_deref(), false)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -911,7 +928,7 @@ async fn login(
         eprintln!("auth login failed for {account_name} {name} (exit {code})");
         return Ok((code, Value::Null));
     }
-    let status = native_login_command(home, runtime, kind, account.as_deref(), true)?
+    let status = native_login_command(home, binary, runtime_home, kind, account.as_deref(), true)?
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -922,10 +939,93 @@ async fn login(
         eprintln!("auth login status failed for {account_name} {name} (exit {code})");
         return Ok((code, Value::Null));
     }
-    Ok((
-        0,
-        json!({"account":account,"runtime":if kind == Adapter::Claude {"claude"} else {name},"status":"ok"}),
-    ))
+    Ok((0, target.reply))
+}
+
+/// One resolved native login: the harness executable and state root, the
+/// adapter family, the protected account label (`None` = the harness's
+/// native global login) and the success reply.
+struct LoginTarget {
+    binary: PathBuf,
+    runtime_home: PathBuf,
+    kind: Adapter,
+    label: Option<String>,
+    reply: Value,
+}
+
+/// Resolves a schema-2 login: `name` is a native-connection provider, the
+/// account is one of its bindings (by provider-local label or global account
+/// id; optional only when it has exactly one), and the credential storage is
+/// the registered account's own `native:<harness>` or
+/// `named:<harness>:<label>` reference on that provider's harness.
+fn provider_login_target(
+    home: &Path,
+    cfg: &agent_run_config::provider_config::ProviderConfig,
+    name: &str,
+    account: Option<&str>,
+    claude_only: bool,
+) -> Result<LoginTarget> {
+    use agent_run_domain::{
+        catalog::{HarnessId, ProviderConnection},
+        credential_ref::CredentialRef,
+    };
+    let provider = name
+        .parse()
+        .ok()
+        .and_then(|id| cfg.providers.get(&id))
+        .ok_or_else(|| invalid("unknown provider"))?;
+    if claude_only && provider.harness != HarnessId::ClaudeCode {
+        return Err(invalid(format!(
+            "login supports Claude only; use agent-run auth <label> {name}"
+        )));
+    }
+    if provider.connection != ProviderConnection::Native {
+        return Err(invalid(
+            "auth login is supported only for native-login providers",
+        ));
+    }
+    let binding = match account {
+        Some(wanted) => provider
+            .bindings
+            .iter()
+            .find(|binding| binding.label.as_str() == wanted || binding.account.as_str() == wanted),
+        None if provider.bindings.len() == 1 => provider.bindings.first(),
+        None => {
+            return Err(invalid(
+                "provider binds several accounts; name one with --account",
+            ))
+        }
+    }
+    .ok_or_else(|| invalid("account is not bound to this provider"))?;
+    let record = Store::open(home)?
+        .account(&binding.account)?
+        .ok_or_else(|| invalid("bound account is not registered"))?;
+    let label = match CredentialRef::from_secret(&record.secret_ref)? {
+        CredentialRef::Native(harness) if harness == provider.harness => None,
+        CredentialRef::Named { harness, label } if harness == provider.harness => {
+            Some(label.as_str().to_owned())
+        }
+        _ => {
+            return Err(invalid(
+                "account is not a native login of this provider's harness",
+            ))
+        }
+    };
+    let harness = cfg
+        .harnesses
+        .get(&provider.harness)
+        .ok_or_else(|| invalid("provider harness is not configured"))?;
+    let kind = match provider.harness {
+        HarnessId::Codex => Adapter::Codex,
+        HarnessId::ClaudeCode => Adapter::Claude,
+    };
+    Ok(LoginTarget {
+        binary: harness.binary.clone(),
+        runtime_home: harness.home.clone(),
+        kind,
+        label,
+        reply: json!({"account": binding.account, "provider": name, "status": "ok"}),
+    })
 }
 /// Executes one parsed command and returns its public process exit status.
 ///
@@ -1318,13 +1418,13 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 dry_run: _,
                 apply,
                 ack,
-                from_binary,
+                from_release,
             } => (dependencies.output)(&crate::migrate::migrate(
                 &home,
                 &mapping,
                 apply,
                 &ack,
-                from_binary.as_deref(),
+                from_release.as_deref(),
             )?)?,
             ConfigCommand::Rollback { snapshot } => {
                 (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?

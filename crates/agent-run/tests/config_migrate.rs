@@ -22,7 +22,7 @@ fn run(home: &Path, args: &[&str], fault: bool) -> (bool, Value) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
     command.arg("--home").arg(home).args(args);
     if fault {
-        command.env("AGENT_RUN_MIGRATE_FAULT", "1");
+        command.env("AGENT_RUN_MIGRATE_FAULT", "after_db");
     }
     let output = command.output().unwrap();
     let text = if output.status.success() {
@@ -71,9 +71,36 @@ fn history(home: &Path) -> Vec<String> {
     rows
 }
 
+/// Seals `dir` the way `xtask release` does (`bin/agent-run`,
+/// `metadata.json`, `SHA256SUMS`, `COMPLETE`). The binary is a script
+/// stand-in: this is fixture evidence of release metadata, not of a genuine
+/// executable.
+fn seal(dir: &Path, schema: u32) {
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    fs::write(
+        dir.join("bin/agent-run"),
+        "#!/bin/sh
+echo 'agent-run 0.12.4'
+",
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("bin/agent-run"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        dir.join("metadata.json"),
+        format!("{{\"version\":\"0.12.4\",\"format\":1,\"schema_version\":{schema}}}\n"),
+    )
+    .unwrap();
+    let sums = ["bin/agent-run", "metadata.json"]
+        .iter()
+        .map(|name| format!("{}  {name}\n", sha(&dir.join(name))))
+        .collect::<String>();
+    fs::write(dir.join("SHA256SUMS"), sums).unwrap();
+    fs::write(dir.join("COMPLETE"), "complete\n").unwrap();
+}
+
 /// A private disposable home holding a copy of the untouched v16 fixture, a
 /// schema-1 config, an explicit mapping (with account declarations) and a
-/// stand-in for the installed pre-migration binary.
+/// sealed stand-in for the installed pre-migration release.
 struct Home {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -99,9 +126,7 @@ impl Home {
         .unwrap();
         fs::write(root.join("mapping.toml"), mapping(&root, true)).unwrap();
         fs::write(root.join("bad.toml"), mapping(&root, false)).unwrap();
-        let old = root.join("old-agent-run");
-        fs::write(&old, "#!/bin/sh\necho 'agent-run 0.12.4'\n").unwrap();
-        fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+        seal(&root.join("old-release"), 16);
         Self { _temp: temp, root }
     }
 
@@ -112,7 +137,7 @@ impl Home {
 
     /// Runs `config migrate --apply` with the given mapping.
     fn apply(&self, mapping: &str, fault: bool) -> (bool, Value) {
-        let (mapping, old) = (self.path(mapping), self.path("old-agent-run"));
+        let (mapping, old) = (self.path(mapping), self.path("old-release"));
         run(
             &self.root,
             &[
@@ -121,7 +146,7 @@ impl Home {
                 "--mapping",
                 &mapping,
                 "--apply",
-                "--from-binary",
+                "--from-release",
                 &old,
             ],
             fault,
@@ -234,10 +259,37 @@ fn planning_and_refusals_never_touch_the_old_pair() {
         false,
     );
     assert!(
-        !ok && missing.to_string().contains("--from-binary"),
+        !ok && missing.to_string().contains("--from-release"),
         "{missing}"
     );
-    unchanged("apply without old binary");
+    unchanged("apply without old release");
+    // An unrelated or incompatible release is refused before any change.
+    let incompatible = home.root.join("new-release");
+    seal(&incompatible, 17);
+    let tampered = home.root.join("tampered-release");
+    seal(&tampered, 16);
+    fs::write(tampered.join("bin/agent-run"), "#!/bin/sh\n").unwrap();
+    for (release, reason) in [
+        (&incompatible, "supports schema 17"),
+        (&tampered, "not a sealed release"),
+        (&home.root.join("config.toml"), "not a sealed release"),
+    ] {
+        let (ok, refused) = run(
+            &home.root,
+            &[
+                "config",
+                "migrate",
+                "--mapping",
+                &home.path("mapping.toml"),
+                "--apply",
+                "--from-release",
+                &release.to_string_lossy(),
+            ],
+            false,
+        );
+        assert!(!ok && refused.to_string().contains(reason), "{refused}");
+        unchanged(reason);
+    }
     let (ok, running) = home.apply("mapping.toml", false);
     assert!(
         !ok && running.to_string().contains("active agents"),
@@ -290,9 +342,11 @@ fn apply_and_rollback_move_the_whole_pair() {
     let manifest: Value =
         serde_json::from_slice(&fs::read(snapshot.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["source_schema_version"], 16);
-    assert_eq!(manifest["old_binary"]["version"], "agent-run 0.12.4");
+    assert_eq!(manifest["old_release"]["version"], "0.12.4");
+    assert_eq!(manifest["old_release"]["schema_version"], 16);
+    assert_eq!(manifest["target_binary"]["schema_version"], 17);
     assert_ne!(
-        manifest["old_binary"]["sha256"],
+        manifest["old_release"]["binary_sha256"],
         manifest["target_binary"]["sha256"]
     );
     let (ok, accounts) = run(&home.root, &["accounts", "list"], false);
@@ -319,8 +373,8 @@ fn apply_and_rollback_move_the_whole_pair() {
     .map(|name| (name.to_string(), sha(&snapshot.join(name))))
     .collect();
 
-    // Rollback binds the recorded old binary: a changed executable refuses.
-    let old = home.root.join("old-agent-run");
+    // Rollback binds the recorded old release: a changed executable refuses.
+    let old = home.root.join("old-release/bin/agent-run");
     let original = fs::read(&old).unwrap();
     fs::write(&old, [original.as_slice(), b"# changed\n"].concat()).unwrap();
     let snapshot_text = snapshot.to_string_lossy().into_owned();
@@ -330,7 +384,7 @@ fn apply_and_rollback_move_the_whole_pair() {
         false,
     );
     assert!(
-        !ok && changed.to_string().contains("pre-migration binary"),
+        !ok && changed.to_string().contains("pre-migration release"),
         "{changed}"
     );
     fs::write(&old, &original).unwrap();
@@ -413,7 +467,7 @@ fn snapshots_are_exclusive_and_immutable() {
         false,
     );
     assert!(ok, "{rolled}");
-    assert_eq!(rolled["run_binary"]["path"], home.path("old-agent-run"));
+    assert_eq!(rolled["run_release"]["path"], home.path("old-release"));
     assert_eq!(rolled["state_schema_version"], 16);
     assert_eq!(fs::read(home.root.join("config.toml")).unwrap(), config_v1);
     assert_eq!(version(&home.root), 16);
@@ -429,8 +483,8 @@ fn snapshots_are_exclusive_and_immutable() {
                     "--mapping",
                     &home.path("mapping.toml"),
                     "--apply",
-                    "--from-binary",
-                    &home.path("old-agent-run"),
+                    "--from-release",
+                    &home.path("old-release"),
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -475,14 +529,188 @@ fn late_publish_failure_restores_the_original_pair() {
     assert_eq!(version(&home.root), 16);
     assert_eq!(sha(&home.root.join("config.toml")), config);
     assert_eq!(history(&home.root), rows);
-    let snapshot = fs::read_dir(home.root.join("migrations"))
+    let entries: Vec<PathBuf> = fs::read_dir(home.root.join("migrations"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    assert!(snapshot.join("COMPLETE").is_file());
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "only the snapshot remains: {entries:?}");
+    assert!(entries[0].join("COMPLETE").is_file());
     let (ok, retry) = home.apply("mapping.toml", false);
     assert!(ok, "{retry}");
     assert_eq!(version(&home.root), 17);
+}
+
+/// A resumed-looking pair (old config restored by hand) with an active agent
+/// in the migrated database still refuses rollback without writing.
+#[test]
+fn resumed_rollback_refuses_active_agents() {
+    let home = Home::new();
+    home.finish_agents();
+    let old_config = fs::read(home.root.join("config.toml")).unwrap();
+    let (ok, applied) = home.apply("mapping.toml", false);
+    assert!(ok, "{applied}");
+    let snapshot = applied["snapshot"].as_str().unwrap();
+    rusqlite::Connection::open(home.root.join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=(SELECT min(id) FROM agents)",
+            [],
+        )
+        .unwrap();
+    fs::write(home.root.join("config.toml"), &old_config).unwrap();
+    let before = sha(&home.root.join("state.db"));
+    let (ok, refused) = run(
+        &home.root,
+        &["config", "rollback", "--snapshot", snapshot],
+        false,
+    );
+    assert!(
+        !ok && refused.to_string().contains("active agents"),
+        "{refused}"
+    );
+    assert_eq!(sha(&home.root.join("state.db")), before);
+    assert_eq!(version(&home.root), 17);
+}
+
+/// A bounded, owned `config migrate --apply` child held at one publication
+/// step; killed on drop if a test fails first.
+#[cfg(feature = "test-fixtures")]
+struct Paused {
+    child: std::process::Child,
+    control: tempfile::TempDir,
+}
+
+#[cfg(feature = "test-fixtures")]
+impl Paused {
+    /// Starts the apply and waits (at most 30 s) until it reaches `step`.
+    fn start(home: &Home, step: &str) -> Self {
+        let control = tempfile::tempdir_in("/tmp").unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(&home.root)
+            .args([
+                "config",
+                "migrate",
+                "--mapping",
+                &home.path("mapping.toml"),
+                "--apply",
+                "--from-release",
+                &home.path("old-release"),
+            ])
+            .env(
+                "AGENT_RUN_MIGRATE_PAUSE",
+                format!("{step}:{}", control.path().display()),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let paused = Self { child, control };
+        for _ in 0..600 {
+            if paused.control.path().join("paused").exists() {
+                return paused;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("migration never reached {step}");
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+impl Drop for Paused {
+    /// Never leaves the child running.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A process killed between the database and config steps (or between the
+/// config and the applied record) leaves a journal: ordinary commands refuse
+/// the half-published pair, a later row write makes recovery refuse without
+/// overwriting it, and a clean state is recovered to config1+DB16.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn interrupted_apply_is_gated_and_recovered_from_evidence() {
+    for step in ["after_db", "after_config"] {
+        let home = Home::new();
+        home.finish_agents();
+        let rows = history(&home.root);
+        let config_v1 = fs::read(home.root.join("config.toml")).unwrap();
+        let mut paused = Paused::start(&home, step);
+        paused.child.kill().unwrap();
+        assert!(!paused.child.wait().unwrap().success(), "{step}: killed");
+        let journal = home.root.join("migrations/in-progress.json");
+        assert!(journal.is_file(), "{step}: journal survives the kill");
+        assert_eq!(version(&home.root), 17, "{step}: database was published");
+        assert_eq!(
+            fs::read(home.root.join("config.toml")).unwrap() == config_v1,
+            step == "after_db",
+            "{step}: config state"
+        );
+        for command in [&["accounts", "list"][..], &["agents"][..], &["init"][..]] {
+            let (ok, gated) = run(&home.root, command, false);
+            assert!(
+                !ok && gated.to_string().contains("migration_incomplete"),
+                "{step} {command:?}: {gated}"
+            );
+        }
+        let snapshot: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        let snapshot = snapshot["snapshot"].as_str().unwrap().to_owned();
+        let rollback = || {
+            run(
+                &home.root,
+                &["config", "rollback", "--snapshot", &snapshot],
+                false,
+            )
+        };
+        if step == "after_config" {
+            // A write after the interruption is never discarded.
+            let db = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+            db.execute("UPDATE agents SET task=task||'!'", []).unwrap();
+            drop(db);
+            let before = sha(&home.root.join("state.db"));
+            let (ok, refused) = rollback();
+            assert!(
+                !ok && refused.to_string().contains("state changed"),
+                "{refused}"
+            );
+            assert_eq!(sha(&home.root.join("state.db")), before);
+            assert!(journal.is_file(), "refusal keeps the journal");
+            let db = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+            db.execute("UPDATE agents SET task=substr(task,1,length(task)-1)", [])
+                .unwrap();
+        }
+        let (ok, recovered) = rollback();
+        assert!(ok, "{step}: {recovered}");
+        assert!(!journal.exists(), "{step}: journal cleared");
+        assert_eq!(fs::read(home.root.join("config.toml")).unwrap(), config_v1);
+        assert_eq!(version(&home.root), 16);
+        assert_eq!(history(&home.root), rows);
+        let (ok, retry) = home.apply("mapping.toml", false);
+        assert!(ok, "{step}: retry {retry}");
+        assert_eq!(version(&home.root), 17);
+    }
+}
+
+/// A config edit that lands while the database is already published is kept;
+/// only the database this operation owned is restored.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn external_config_edit_during_publication_is_kept() {
+    let home = Home::new();
+    home.finish_agents();
+    let rows = history(&home.root);
+    let mut paused = Paused::start(&home, "after_db");
+    let edited = b"schema_version = 1\n# edited by the operator\n";
+    fs::write(home.root.join("config.toml"), edited).unwrap();
+    fs::write(paused.control.path().join("release"), "").unwrap();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(paused.child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert!(!paused.child.wait().unwrap().success());
+    assert!(stderr.contains("new content is kept"), "{stderr}");
+    assert_eq!(fs::read(home.root.join("config.toml")).unwrap(), edited);
+    assert_eq!(version(&home.root), 16);
+    assert_eq!(history(&home.root), rows);
+    assert!(!home.root.join("migrations/in-progress.json").exists());
 }

@@ -124,9 +124,12 @@ pub struct ProviderConfig {
     /// Named nonsecret environment defaults.
     #[serde(default)]
     pub environments: BTreeMap<String, Environment>,
-    /// Exactly the Codex and Claude Code native harness declarations.
+    /// Exactly the Codex and Claude Code native harness declarations (or
+    /// none, with no providers: the explicitly empty catalog).
+    #[serde(default)]
     pub harnesses: BTreeMap<HarnessId, HarnessConfig>,
     /// Arbitrary named providers, resolved against the account registry.
+    #[serde(default)]
     pub providers: BTreeMap<ProviderId, ProviderSettings>,
 }
 
@@ -178,15 +181,20 @@ impl ProviderConfig {
 
     /// Validates shared v1 controls using their existing rules and checks all
     /// v2 harness and provider declarations without consulting account state.
+    ///
+    /// A file with neither harnesses nor providers is the explicitly empty
+    /// catalog a fresh `init` writes: valid, with nothing to start or collect.
     pub fn validate(&mut self, home: &Path) -> Result<()> {
+        let empty = self.harnesses.is_empty() && self.providers.is_empty();
         if self.schema_version != 2
-            || self.harnesses.len() != 2
-            || !self.harnesses.contains_key(&HarnessId::Codex)
-            || !self.harnesses.contains_key(&HarnessId::ClaudeCode)
-            || self.providers.is_empty()
+            || (!empty
+                && (self.harnesses.len() != 2
+                    || !self.harnesses.contains_key(&HarnessId::Codex)
+                    || !self.harnesses.contains_key(&HarnessId::ClaudeCode)
+                    || self.providers.is_empty()))
         {
             return Err(invalid(
-                "v2 requires codex and claude-code harnesses and providers",
+                "v2 requires codex and claude-code harnesses and providers, or neither",
             ));
         }
         // CodexBar is not a schema-2 source; its binary is migration input only.

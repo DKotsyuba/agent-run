@@ -40,6 +40,9 @@ impl Harness {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // The captured Python session ran against an empty schema-1 home;
+        // `init` now seeds schema 2, so the legacy config is restored here.
+        std::fs::write(home.join("config.toml"), "schema_version = 1\n").unwrap();
         Self {
             temp,
             home,

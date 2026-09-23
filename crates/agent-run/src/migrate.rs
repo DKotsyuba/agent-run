@@ -5,26 +5,34 @@
 //!   the state database for writing: no numbered migration, no account
 //!   registration, no config change. The database is only read through its
 //!   file header or a read-only connection.
-//! * `--apply` holds the broker startup lock (`.api.sock.lock`) for its whole
-//!   duration: a running broker makes it refuse, and a broker cannot start
-//!   while it runs. It refuses active agents, then writes an exclusive,
-//!   read-only snapshot (original config bytes, an online SQLite backup taken
-//!   through a read-only connection, the mapping, `manifest.json` with the old
-//!   and new binary identities and digests, `COMPLETE` last). Only then does
-//!   it run the numbered store migration, register the mapping's declared
-//!   accounts and publish the v2 config — after re-checking the config bytes
-//!   it planned from. Any failure after the database was touched restores the
-//!   snapshot database and the original config. Success records
-//!   `<snapshot>.applied.json` with the published config digest and a logical
-//!   digest of every database row.
-//! * `rollback` restores the verified config/database pair only while both
-//!   still equal the applied record (any later row change — an event, an
-//!   account, a quota sample, an attempt update — is a divergence) and the
-//!   recorded old binary still has its recorded digest; the operator points
-//!   the installation back at that binary.
+//! * `--apply` names the installed pre-migration release (`--from-release`), a
+//!   sealed release directory whose `COMPLETE`/`SHA256SUMS`/`metadata.json`
+//!   must verify and whose recorded schema must equal the database's; nothing
+//!   is executed to learn its version. It holds the broker startup lock
+//!   (`.api.sock.lock`) throughout, refuses active agents, and writes an
+//!   exclusive, read-only snapshot (original config bytes, an online SQLite
+//!   backup, the mapping, `manifest.json`, `COMPLETE` last). The numbered
+//!   migration and the declared accounts are applied to a staged copy of the
+//!   snapshot database, never to the live file.
+//! * Publication is journalled: `migrations/in-progress.json` records the
+//!   snapshot and the exact source and target row digests and config digests
+//!   before anything live changes. The live database is then replaced from the
+//!   staged target in one SQLite backup transaction, the v2 config is written
+//!   (only while the config still has the exact bytes planned from), then
+//!   `<snapshot>.applied.json`, and the journal is removed. While a journal
+//!   exists every ordinary command and the broker refuse (`migration_incomplete`).
+//! * Failure recovery and `rollback` touch only state they can prove: the
+//!   config only while it equals the v1 or v2 bytes of this snapshot, the
+//!   database only while every row equals the recorded source or target
+//!   digest. Anything else — a third-party config edit, a later row write —
+//!   is left exactly as found and refused.
 //!
-//! Limits: the pair is restored as a whole or not at all; work done after the
-//! migration cannot be preserved by rollback, which refuses instead.
+//! Limits: the broker lock excludes brokers, and the `migration_required` /
+//! `migration_incomplete` gate refuses every newly started command, including
+//! the capacity and delivery jobs; a writer that opened the store before the
+//! migration started is not excluded, so those jobs must be stopped first. A
+//! write that lands anyway changes the row digest and makes publication or
+//! rollback refuse instead of discarding it.
 
 use crate::{config::Config, fs, state::Store, Result};
 use agent_run_config::{
@@ -32,6 +40,7 @@ use agent_run_config::{
     provider_migration::{plan_v1, MigrationMapping},
 };
 use agent_run_domain::error::invalid;
+use agent_run_platform::release;
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
@@ -45,6 +54,11 @@ use std::{
 /// The state database file of `home`.
 fn db_path(home: &Path) -> PathBuf {
     home.join("state.db")
+}
+
+/// The durable record of an apply or rollback in progress.
+fn journal_path(home: &Path) -> PathBuf {
+    home.join("migrations").join("in-progress.json")
 }
 
 /// Reads the SQLite `user_version` without opening a connection: the file
@@ -72,10 +86,21 @@ pub fn stored_version(home: &Path) -> Result<Option<i64>> {
     ))
 }
 
-/// Refuses every ordinary command while the home still has a state database
-/// older than this binary's schema: opening it would run the numbered
-/// migration unpaired with the config. `config migrate` is the only way on.
+/// Refuses every ordinary command while a migration or rollback is
+/// unfinished, or while the home still has a state database older than this
+/// binary's schema: opening it would run the numbered migration unpaired with
+/// the config. `config migrate` / `config rollback` are the only ways on.
 pub fn require_current_store(home: &Path) -> Result<()> {
+    if journal_path(home).exists() {
+        let snapshot = std::fs::read(journal_path(home))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|journal| journal["snapshot"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "<snapshot>".into());
+        return Err(invalid(format!(
+            "migration_incomplete: an interrupted config migration or rollback holds this home; run `agent-run config rollback --snapshot {snapshot}`"
+        )));
+    }
     match stored_version(home)? {
         Some(version) if version < agent_run_store::VERSION => Err(invalid(format!(
             "migration_required: state database is schema v{version}; run `agent-run config migrate` before any other command"
@@ -99,12 +124,12 @@ fn exclusive(home: &Path) -> Result<std::fs::File> {
     Ok(lock)
 }
 
-/// Opens the state database strictly read-only. Without live WAL frames the
+/// Opens a state database strictly read-only. Without live WAL frames the
 /// main file is complete, so it is opened `immutable` and SQLite creates no
 /// `-wal`/`-shm` side files; otherwise the existing side files are read.
-fn read_only(home: &Path) -> Result<Connection> {
-    let path = db_path(home);
-    if home.join("state.db-wal").exists() {
+fn read_only_at(path: &Path) -> Result<Connection> {
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    if wal.exists() {
         return Ok(Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -114,6 +139,11 @@ fn read_only(home: &Path) -> Result<Connection> {
         format!("file:{}?immutable=1", path.display()),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?)
+}
+
+/// [`read_only_at`] for the live database of `home`.
+fn read_only(home: &Path) -> Result<Connection> {
+    read_only_at(&db_path(home))
 }
 
 /// Counts active agents through `conn` (any supported schema).
@@ -158,16 +188,27 @@ fn content_digest(conn: &Connection) -> Result<String> {
     Ok(fs::sha256(text.as_bytes()))
 }
 
-/// Records one binary's path, SHA-256 and `--version` output.
-fn binary_identity(path: &Path) -> Result<Value> {
-    let bytes = std::fs::read(path).map_err(|_| invalid("binary is unreadable"))?;
-    let version = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    Ok(json!({"path": path, "sha256": fs::sha256(&bytes), "version": version}))
+/// The live database's row digest and active-agent count.
+fn live_state(home: &Path) -> Result<(String, i64)> {
+    let live = read_only(home)?;
+    Ok((content_digest(&live)?, active_agents(&live)?))
+}
+
+/// Facts of the installed pre-migration release, read from its verified seal
+/// (never by executing it): path, metadata version and supported schema, and
+/// the digests of its binary and `SHA256SUMS`.
+fn old_release(dir: &Path) -> Result<Value> {
+    release::verify(dir)
+        .map_err(|error| invalid(format!("--from-release is not a sealed release: {error}")))?;
+    let metadata: Value = serde_json::from_slice(&std::fs::read(dir.join("metadata.json"))?)?;
+    Ok(json!({
+        "path": dir,
+        "version": metadata["version"],
+        "schema_version": release::schema_version(dir).map_err(invalid)?,
+        "binary": dir.join("bin/agent-run"),
+        "binary_sha256": fs::sha256(&std::fs::read(dir.join("bin/agent-run"))?),
+        "sha256sums_sha256": fs::sha256(&std::fs::read(dir.join("SHA256SUMS"))?),
+    }))
 }
 
 /// Plans from exact config and mapping bytes; reads no database.
@@ -219,47 +260,97 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Atomically replaces the live database with `source`'s bytes: a private
-/// temporary copy is synced, stale WAL/shm files are removed, then renamed.
-fn restore_db(home: &Path, source: &Path) -> Result<()> {
-    let temporary = home.join(format!(".state.db.restore-{}", uuid::Uuid::new_v4()));
-    std::fs::copy(source, &temporary)?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::File::open(&temporary)?.sync_all()?;
-    for side in ["state.db-wal", "state.db-shm"] {
-        match std::fs::remove_file(home.join(side)) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-            _ => {}
-        }
-    }
-    std::fs::rename(&temporary, db_path(home))?;
+/// Durably records the operation in progress (temp write, rename, dir sync).
+fn write_journal(home: &Path, journal: &Value) -> Result<()> {
+    fs::Dir::open(&home.join("migrations"))?.write(
+        Path::new("in-progress.json"),
+        &fs::canonical_json(journal)?,
+        0o600,
+    )
+}
+
+/// Durably removes the journal once the pair is proven consistent again.
+fn clear_journal(home: &Path) -> Result<()> {
+    std::fs::remove_file(journal_path(home))?;
+    std::fs::File::open(home.join("migrations"))?.sync_all()?;
     Ok(())
 }
 
-/// `config migrate --mapping FILE (--dry-run | --apply --from-binary OLD) [--ack M]...`.
+/// Replaces the live database's content with `source`'s in one SQLite backup
+/// transaction (crash-safe through SQLite's own journal), then checkpoints so
+/// the main file carries the result.
+fn replace_db(home: &Path, source: &Path) -> Result<()> {
+    let from = read_only_at(source)?;
+    let mut live = Connection::open_with_flags(db_path(home), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    live.busy_timeout(std::time::Duration::from_secs(5))?;
+    let done = rusqlite::backup::Backup::new(&from, &mut live)?.step(-1)?;
+    if !matches!(done, rusqlite::backup::StepResult::Done) {
+        return Err(invalid("state database replacement did not complete"));
+    }
+    live.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    Ok(())
+}
+
+/// Test-only fault and pause points between the publication steps, so a
+/// test can return an error or hold (and kill) the real process there.
+/// `AGENT_RUN_MIGRATE_PAUSE=<step>:<dir>` writes `<dir>/paused` and waits
+/// for `<dir>/release`.
+#[cfg(feature = "test-fixtures")]
+fn checkpoint(step: &str) -> Result<()> {
+    if std::env::var("AGENT_RUN_MIGRATE_FAULT").as_deref() == Ok(step) {
+        return Err(invalid(format!("injected migration fault at {step}")));
+    }
+    if let Some((at, dir)) = std::env::var("AGENT_RUN_MIGRATE_PAUSE")
+        .ok()
+        .as_deref()
+        .and_then(|value| value.split_once(':'))
+        .map(|(at, dir)| (at.to_owned(), PathBuf::from(dir)))
+    {
+        if at == step {
+            std::fs::write(dir.join("paused"), step)?;
+            for _ in 0..600 {
+                if dir.join("release").exists() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            return Err(invalid("migration pause was never released"));
+        }
+    }
+    Ok(())
+}
+
+/// Production builds have no fault or pause points.
+#[cfg(not(feature = "test-fixtures"))]
+fn checkpoint(_step: &str) -> Result<()> {
+    Ok(())
+}
+
+/// `config migrate --mapping FILE (--dry-run | --apply --from-release DIR) [--ack M]...`.
 ///
 /// Dry run returns the rendered v2 config, its digest, the historical
 /// runtime map, manual-review markers and the database's current schema
 /// version, and writes nothing. Apply is the paired operation described in
-/// the module documentation; `from_binary` is the currently installed
-/// (old) agent-run executable the rollback must return to.
+/// the module documentation; `from_release` is the installed (old) sealed
+/// release the rollback returns to.
 pub fn migrate(
     home: &Path,
     mapping_path: &Path,
     apply: bool,
     acks: &[String],
-    from_binary: Option<&Path>,
+    from_release: Option<&Path>,
 ) -> Result<Value> {
     let config_bytes = std::fs::read(home.join("config.toml"))?;
     let mapping_bytes = std::fs::read(mapping_path)?;
     let (rendered, legacy_runtime_map, review, mapping) =
         plan(home, &config_bytes, &mapping_bytes)?;
+    let source_version = stored_version(home)?;
     let summary = json!({
         "config_toml": rendered,
         "config_sha256": fs::sha256(rendered.as_bytes()),
         "legacy_runtime_map": legacy_runtime_map,
         "manual_review": review,
-        "state_schema_version": stored_version(home)?,
+        "state_schema_version": source_version,
         "target_schema_version": agent_run_store::VERSION,
     });
     if !apply {
@@ -271,20 +362,37 @@ pub fn migrate(
             "--ack must name exactly every manual_review marker of the dry run",
         ));
     }
-    let from_binary = from_binary
-        .ok_or_else(|| invalid("--apply requires --from-binary <installed agent-run>"))?;
-    let old_binary = binary_identity(from_binary)?;
-    let target_binary = binary_identity(&std::env::current_exe()?)?;
-    if old_binary["sha256"] == target_binary["sha256"] {
-        return Err(invalid(
-            "--from-binary must be the installed pre-migration agent-run, not this one",
-        ));
+    let from_release = from_release
+        .ok_or_else(|| invalid("--apply requires --from-release <installed sealed release>"))?;
+    let source_version = source_version
+        .ok_or_else(|| invalid("config migrate expects an existing state database"))?;
+    let old = old_release(from_release)?;
+    if old["schema_version"].as_i64() != Some(source_version) {
+        return Err(invalid(format!(
+            "--from-release supports schema {} but the state database is schema {source_version}",
+            old["schema_version"]
+        )));
     }
-    if !db_path(home).is_file() {
-        return Err(invalid("config migrate expects an existing state database"));
+    if source_version >= agent_run_store::VERSION {
+        return Err(invalid(format!(
+            "state database schema {source_version} is not older than target schema {}",
+            agent_run_store::VERSION
+        )));
+    }
+    let target_exe = std::env::current_exe()?;
+    let target = json!({
+        "path": target_exe,
+        "sha256": fs::sha256(&std::fs::read(&target_exe)?),
+        "schema_version": agent_run_store::VERSION,
+    });
+    if old["binary_sha256"] == target["sha256"] {
+        return Err(invalid(
+            "--from-release must be the installed pre-migration release, not this binary",
+        ));
     }
     let _lock = exclusive(home)?;
     // Everything below runs with brokers excluded. Refusals write nothing.
+    require_no_journal(home)?;
     let source = read_only(home)?;
     if active_agents(&source)? > 0 {
         return Err(invalid("active agents must finish before a config switch"));
@@ -297,29 +405,26 @@ pub fn migrate(
     let root = home.join("migrations");
     fs::private_dir(&root)?;
     let at = crate::domain::now();
-    let dir = root.join(format!(
-        "{}-{}-v1-to-v2",
-        at as u64,
-        uuid::Uuid::new_v4().simple()
-    ));
+    let name = format!("{}-{}-v1-to-v2", at as u64, uuid::Uuid::new_v4().simple());
+    let dir = root.join(&name);
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     write_new(&dir.join("config.v1.toml"), &config_bytes)?;
     write_new(&dir.join("mapping.toml"), &mapping_bytes)?;
     source.backup(rusqlite::DatabaseName::Main, dir.join("state.db"), None)?;
+    drop(source);
     std::fs::set_permissions(dir.join("state.db"), std::fs::Permissions::from_mode(0o400))?;
-    let backup = Connection::open_with_flags(
-        format!("file:{}?immutable=1", dir.join("state.db").display()),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )?;
-    let source_version: i64 = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let backup = read_only_at(&dir.join("state.db"))?;
+    let backup_version: i64 = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let source_digest = content_digest(&backup)?;
     drop(backup);
-    drop(source);
+    if backup_version != source_version {
+        return Err(invalid("state database changed schema while snapshotting"));
+    }
     let manifest = json!({
         "kind": "agent-run-paired-migration",
         "created_at": at,
-        "old_binary": old_binary,
-        "target_binary": target_binary,
+        "old_release": old,
+        "target_binary": target,
         "v1_config_sha256": fs::sha256(&config_bytes),
         "mapping_sha256": fs::sha256(&mapping_bytes),
         "v2_config_sha256": fs::sha256(rendered.as_bytes()),
@@ -333,49 +438,111 @@ pub fn migrate(
     write_new(&dir.join("manifest.json"), &fs::canonical_json(&manifest)?)?;
     write_new(&dir.join("COMPLETE"), b"")?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))?;
-    // The pair changes from here; any failure restores the snapshot pair.
-    match publish(home, &dir, &config_bytes, &rendered, &mapping) {
+
+    // The target is built on a staged copy; the live pair is still untouched.
+    let stage = root.join(format!("{name}.stage"));
+    std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    let target_digest = (|| {
+        std::fs::copy(dir.join("state.db"), stage.join("state.db"))?;
+        std::fs::set_permissions(
+            stage.join("state.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        let mut store = Store::open(&stage)?;
+        for record in mapping.account_records() {
+            store.register_account(&record)?;
+        }
+        drop(store);
+        checkpoint("staged")?;
+        content_digest(&read_only_at(&stage.join("state.db"))?)
+    })();
+    let target_digest = match target_digest {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(error);
+        }
+    };
+    let journal = json!({
+        "operation": "apply",
+        "snapshot": dir,
+        "source_state_sha256": source_digest,
+        "target_state_sha256": target_digest,
+        "v1_config_sha256": fs::sha256(&config_bytes),
+        "v2_config_sha256": fs::sha256(rendered.as_bytes()),
+    });
+    // Nothing live has changed yet: a refusal here only drops the stage.
+    let unchanged = (|| {
+        if std::fs::read(home.join("config.toml"))? != config_bytes {
+            return Err(invalid(
+                "config.toml changed during migration; nothing was published",
+            ));
+        }
+        if live_state(home)?.0 != source_digest {
+            return Err(invalid(
+                "state changed during migration (a writer was still running); nothing was published",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = unchanged {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(error);
+    }
+    write_journal(home, &journal)?;
+    // The pair changes from here; a failure restores only what this
+    // operation provably published.
+    match publish(home, &dir, &stage, &config_bytes, &rendered, &journal) {
         Ok(applied) => {
+            clear_journal(home)?;
+            let _ = std::fs::remove_dir_all(&stage);
             Ok(json!({"applied": true, "snapshot": dir, "record": applied, "plan": summary}))
         }
-        Err(error) => {
-            restore_db(home, &dir.join("state.db"))?;
-            if std::fs::read(home.join("config.toml"))? != config_bytes {
-                fs::Dir::open(home)?.write(Path::new("config.toml"), &config_bytes, 0o600)?;
+        Err(error) => match recover(home, &dir, &journal) {
+            Ok(()) => {
+                clear_journal(home)?;
+                let _ = std::fs::remove_dir_all(&stage);
+                Err(error)
             }
-            Err(error)
-        }
+            Err(unrecovered) => Err(invalid(format!(
+                "{error}; recovery refused, the journal is kept: {unrecovered}"
+            ))),
+        },
     }
 }
 
-/// Runs the numbered store migration, registers the declared accounts and
-/// publishes the v2 config after re-checking the original config bytes, then
-/// writes the applied record. Called only with brokers excluded.
+/// Refuses while another operation's journal is present.
+fn require_no_journal(home: &Path) -> Result<()> {
+    if journal_path(home).exists() {
+        return require_current_store(home);
+    }
+    Ok(())
+}
+
+/// Publishes the staged target: replaces the database, writes the v2 config only over the exact
+/// planned bytes, then the applied record. Called under the broker lock with
+/// the journal written.
 fn publish(
     home: &Path,
     snapshot: &Path,
+    stage: &Path,
     config_bytes: &[u8],
     rendered: &str,
-    mapping: &MigrationMapping,
+    journal: &Value,
 ) -> Result<Value> {
-    let mut store = Store::open(home)?;
-    for record in mapping.account_records() {
-        store.register_account(&record)?;
-    }
-    drop(store);
-    #[cfg(feature = "test-fixtures")]
-    if std::env::var_os("AGENT_RUN_MIGRATE_FAULT").is_some() {
-        return Err(invalid("injected migration publish fault"));
-    }
+    let expect = |key: &str| journal[key].as_str().unwrap_or_default().to_owned();
+    replace_db(home, &stage.join("state.db"))?;
+    checkpoint("after_db")?;
     if std::fs::read(home.join("config.toml"))? != config_bytes {
         return Err(invalid(
-            "config.toml changed during migration; nothing was published",
+            "config.toml changed during migration; its new content is kept",
         ));
     }
     fs::Dir::open(home)?.write(Path::new("config.toml"), rendered.as_bytes(), 0o600)?;
+    checkpoint("after_config")?;
     let record = json!({
         "v2_config_sha256": fs::sha256(rendered.as_bytes()),
-        "state_content_sha256": content_digest(&read_only(home)?)?,
+        "state_content_sha256": expect("target_state_sha256"),
         "applied_at": crate::domain::now(),
     });
     write_new(
@@ -385,74 +552,136 @@ fn publish(
     Ok(record)
 }
 
-/// `config rollback --snapshot DIR`: restores the verified original pair.
+/// Returns the pair to the snapshot's v1 config and source database, touching
+/// each side only while it provably is this operation's own state: the
+/// config only when it equals the recorded v2 bytes (v1 is left alone, any
+/// other content is a third-party edit and is kept), the database only when
+/// every row equals the recorded target (a source-equal database is already
+/// restored; any other content refuses). Refuses with active agents.
+fn recover(home: &Path, snapshot: &Path, journal: &Value) -> Result<()> {
+    let expect = |key: &str| journal[key].as_str().unwrap_or_default().to_owned();
+    let (digest, active) = live_state(home)?;
+    if active > 0 {
+        return Err(invalid("active agents must finish before rollback"));
+    }
+    let source = expect("source_state_sha256");
+    if digest != source && digest != expect("target_state_sha256") {
+        return Err(invalid(
+            "state changed after migration (rows written); rollback cannot preserve them",
+        ));
+    }
+    let current = fs::sha256(&std::fs::read(home.join("config.toml"))?);
+    if current == expect("v2_config_sha256") {
+        let v1 = std::fs::read(snapshot.join("config.v1.toml"))?;
+        fs::Dir::open(home)?.write(Path::new("config.toml"), &v1, 0o600)?;
+    }
+    if digest != source {
+        replace_db(home, &snapshot.join("state.db"))?;
+        if live_state(home)?.0 != source {
+            return Err(invalid("restored database does not match the snapshot"));
+        }
+    }
+    Ok(())
+}
+
+/// `config rollback --snapshot DIR`: returns the home to the snapshot's
+/// verified v1 config and schema-`source` database, and recovers an
+/// interrupted apply or rollback of that snapshot.
 ///
 /// Refuses unless the snapshot is complete and matches its manifest, the
-/// applied record exists, the live config and every database row still equal
-/// what the migration published, no broker or agent is live, and the recorded
-/// old binary still has its recorded digest. Restores the config and then the
-/// database; the operator then runs the recorded old binary.
+/// recorded old release still verifies with its recorded binary and
+/// `SHA256SUMS` digests, and there is proof of what this snapshot published:
+/// its applied record or its own journal. The live config must equal the
+/// snapshot's v1 or v2 bytes and every live row the recorded source or target
+/// digest, with no active agent — a matching config alone never authorizes
+/// replacing the database. The operation itself is journalled, so an
+/// interrupted rollback is resumed by rerunning it.
 pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
     let dir: PathBuf = snapshot.to_path_buf();
     if !dir.join("COMPLETE").is_file() {
         return Err(invalid("migration snapshot is incomplete"));
     }
     let manifest: Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
-    let applied: Value = serde_json::from_slice(
-        &std::fs::read(dir.with_extension("applied.json"))
-            .map_err(|_| invalid("migration was never applied from this snapshot"))?,
-    )?;
-    let v1 = std::fs::read(dir.join("config.v1.toml"))?;
     let expect = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
+    let v1 = std::fs::read(dir.join("config.v1.toml"))?;
     if fs::sha256(&v1) != expect(&manifest, "v1_config_sha256")
         || fs::sha256(&std::fs::read(dir.join("state.db"))?)
             != expect(&manifest, "state_backup_sha256")
     {
         return Err(invalid("migration snapshot does not match its manifest"));
     }
-    let old = &manifest["old_binary"];
-    let old_path = PathBuf::from(old["path"].as_str().unwrap_or_default());
-    if std::fs::read(&old_path)
-        .map(|bytes| fs::sha256(&bytes))
-        .ok()
-        .as_deref()
-        != old["sha256"].as_str()
-    {
+    let old = &manifest["old_release"];
+    let release_dir = PathBuf::from(old["path"].as_str().unwrap_or_default());
+    if old_release(&release_dir).ok().is_none_or(|now| {
+        now["binary_sha256"] != old["binary_sha256"]
+            || now["sha256sums_sha256"] != old["sha256sums_sha256"]
+    }) {
         return Err(invalid(
-            "the recorded pre-migration binary is missing or changed; restore it first",
+            "the recorded pre-migration release is missing, unsealed or changed; restore it first",
         ));
     }
     let _lock = exclusive(home)?;
+    let pending: Option<Value> = match std::fs::read(journal_path(home)) {
+        Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(journal) = &pending {
+        let owner = journal["snapshot"]
+            .as_str()
+            .and_then(|path| Path::new(path).canonicalize().ok());
+        if owner.is_none() || owner != dir.canonicalize().ok() {
+            return Err(invalid(
+                "another snapshot's migration or rollback is unfinished; recover that one",
+            ));
+        }
+    }
+    let journal = match pending {
+        Some(journal) => journal,
+        None => {
+            let applied: Value = serde_json::from_slice(
+                &std::fs::read(dir.with_extension("applied.json"))
+                    .map_err(|_| invalid("migration was never applied from this snapshot"))?,
+            )?;
+            json!({
+                "operation": "rollback",
+                "snapshot": dir,
+                "source_state_sha256": manifest["state_content_sha256"],
+                "target_state_sha256": applied["state_content_sha256"],
+                "v1_config_sha256": manifest["v1_config_sha256"],
+                "v2_config_sha256": manifest["v2_config_sha256"],
+            })
+        }
+    };
+    // Every precondition is checked before the journal is (re)written, so a
+    // refusal leaves the home exactly as found.
     let current = fs::sha256(&std::fs::read(home.join("config.toml"))?);
-    let resuming = current == expect(&manifest, "v1_config_sha256");
-    if !resuming && current != expect(&applied, "v2_config_sha256") {
+    if current != expect(&journal, "v1_config_sha256")
+        && current != expect(&journal, "v2_config_sha256")
+    {
         return Err(invalid(
             "config.toml changed after migration; rollback would discard it",
         ));
     }
-    if !resuming {
-        let live = read_only(home)?;
-        if active_agents(&live)? > 0 {
-            return Err(invalid("active agents must finish before rollback"));
-        }
-        if content_digest(&live)? != expect(&applied, "state_content_sha256") {
-            return Err(invalid(
-                "state changed after migration (rows written); rollback cannot preserve them",
-            ));
-        }
-        drop(live);
-        fs::Dir::open(home)?.write(Path::new("config.toml"), &v1, 0o600)?;
+    let (digest, active) = live_state(home)?;
+    if active > 0 {
+        return Err(invalid("active agents must finish before rollback"));
     }
-    // Config is schema 1 now; a failed database restore leaves a newer
-    // database that the old binary refuses, and this command can be rerun.
-    restore_db(home, &dir.join("state.db"))?;
-    if content_digest(&read_only(home)?)? != expect(&manifest, "state_content_sha256") {
-        return Err(invalid("restored database does not match the snapshot"));
+    if digest != expect(&journal, "source_state_sha256")
+        && digest != expect(&journal, "target_state_sha256")
+    {
+        return Err(invalid(
+            "state changed after migration (rows written); rollback cannot preserve them",
+        ));
     }
+    write_journal(home, &journal)?;
+    recover(home, &dir, &journal)?;
+    clear_journal(home)?;
+    let _ = std::fs::remove_dir_all(dir.with_extension("stage"));
     Ok(json!({
         "rolled_back": true,
         "config_sha256": fs::sha256(&v1),
         "state_schema_version": manifest["source_schema_version"],
-        "run_binary": old,
+        "run_release": old,
     }))
 }

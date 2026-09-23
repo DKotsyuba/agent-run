@@ -37,7 +37,9 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-pub const VERSION: i64 = 17;
+/// The current schema; the canonical value lives with the sealed-release
+/// metadata so release, deployment and migration agree on it.
+pub const VERSION: i64 = agent_run_platform::release::STORE_SCHEMA_VERSION;
 pub const ACTIVE_SQL: &str = "('created','starting','running','cancelling')";
 /// How long an ordinary store connection waits out a competing writer before
 /// giving up with `SQLITE_BUSY`.

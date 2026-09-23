@@ -176,12 +176,15 @@ fn models_between(
                 .iter()
                 .map(move |offering| (provider.id.as_str(), offering.id.as_str()))
         })
-        .next()
-        .ok_or_else(|| invalid("no provider offers a model"))?;
-    let names = match &query.profile {
-        Some(name) => vec![name.clone()],
-        None => role_names(config),
+        .next();
+    // An explicitly empty catalog offers nothing, so no role is admissible.
+    let names = match (&query.profile, any) {
+        (Some(_), None) => return Err(invalid("profile filter names no canonical role")),
+        (_, None) => vec![],
+        (Some(name), Some(_)) => vec![name.clone()],
+        (None, Some(_)) => role_names(config),
     };
+    let any = any.unwrap_or_default();
     let mut roles = Vec::new();
     let mut profiles_out = Vec::new();
     for name in names {

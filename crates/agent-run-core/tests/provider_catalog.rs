@@ -242,7 +242,12 @@ async fn recommendation_edits_are_reflected_by_revision() {
         codex["recommendations"],
         json!(["prefer for long refactors"])
     );
-    fs::write(root.join("config.toml"), "schema_version = 2\n").unwrap();
+    // Harnesses without providers is neither a catalog nor the empty one.
+    fs::write(
+        root.join("config.toml"),
+        "schema_version = 2\n[harnesses.codex]\nbinary = '/bin/true'\nhome = '/tmp'\n",
+    )
+    .unwrap();
     assert!(service.models(ModelsQuery::default()).await.is_err());
 }
 
