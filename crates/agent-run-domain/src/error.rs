@@ -13,6 +13,9 @@ pub enum MachineCode {
     SelectionBusy,
     /// No currently eligible account remains for the explicit provider/model.
     NoEligibleAccount,
+    /// Every eligible account is authoritatively quota-exhausted until a
+    /// known reset; distinct from active-slot `CapacityExhausted`.
+    QuotaExhausted,
     /// The caller supplied an invalid public value.
     ValidationError,
     /// A derived path escaped its declared owned root.
@@ -46,6 +49,7 @@ impl MachineCode {
             Self::SelectionStale => "selection_stale",
             Self::SelectionBusy => "selection_busy",
             Self::NoEligibleAccount => "no_eligible_account",
+            Self::QuotaExhausted => "quota_exhausted",
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
             Self::AgentNotFound => "AgentNotFound",
@@ -59,6 +63,35 @@ impl MachineCode {
             Self::IOError => "IOError",
             Self::StorageError => "StorageError",
         }
+    }
+
+    /// Every public machine code, in declaration order.
+    pub const ALL: [Self; 16] = [
+        Self::SelectionStale,
+        Self::SelectionBusy,
+        Self::NoEligibleAccount,
+        Self::QuotaExhausted,
+        Self::ValidationError,
+        Self::PathEscapeError,
+        Self::AgentNotFound,
+        Self::StateTransitionError,
+        Self::RequestConflict,
+        Self::CapacityExhausted,
+        Self::Unsupported,
+        Self::BrokerUnavailable,
+        Self::AnswerIntegrityError,
+        Self::RuntimeError,
+        Self::IOError,
+        Self::StorageError,
+    ];
+
+    /// Resolves an exact public spelling received from the broker.
+    ///
+    /// This is the allowlist for broker-carried codes: only a spelling that
+    /// [`Self::as_str`] produces is accepted, anything else returns `None`
+    /// and the caller keeps its generic category.
+    pub fn from_wire(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.as_str() == code)
     }
 }
 
@@ -166,7 +199,12 @@ pub struct PublicError {
 }
 impl Error {
     /// Returns the stable machine code without formatting untrusted source diagnostics.
-    pub const fn machine_code(&self) -> MachineCode {
+    ///
+    /// A broker-returned error keeps the broker's own code when it is an
+    /// exact allowlisted spelling ([`MachineCode::from_wire`]), so the CLI and
+    /// MCP renderers report the same type as the socket; an absent or unknown
+    /// broker code stays `RuntimeError`.
+    pub fn machine_code(&self) -> MachineCode {
         match self {
             Self::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }) => {
                 MachineCode::SelectionStale
@@ -177,7 +215,9 @@ impl Error {
             Self::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. }) => {
                 MachineCode::NoEligibleAccount
             }
-            Self::QuotaAdmission(_) => MachineCode::CapacityExhausted,
+            Self::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { .. }) => {
+                MachineCode::QuotaExhausted
+            }
             Self::Validation(_) | Self::Json(_) => MachineCode::ValidationError,
             Self::PathEscape(_) => MachineCode::PathEscapeError,
             Self::NotFound(_) => MachineCode::AgentNotFound,
@@ -187,6 +227,10 @@ impl Error {
             Self::Unsupported(_) => MachineCode::Unsupported,
             Self::BrokerUnavailable => MachineCode::BrokerUnavailable,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
+            Self::Broker {
+                broker_error_code: Some(code),
+                ..
+            } => MachineCode::from_wire(code).unwrap_or(MachineCode::RuntimeError),
             Self::Runtime(_) | Self::Broker { .. } => MachineCode::RuntimeError,
             Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
@@ -195,7 +239,7 @@ impl Error {
     }
 
     /// Returns JSON-RPC, MCP, and CLI mappings shared by every public transport.
-    pub const fn protocol_mapping(&self) -> ProtocolMapping {
+    pub fn protocol_mapping(&self) -> ProtocolMapping {
         let code = self.machine_code();
         ProtocolMapping {
             json_rpc_code: if matches!(

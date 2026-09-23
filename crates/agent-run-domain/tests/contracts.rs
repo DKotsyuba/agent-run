@@ -723,6 +723,34 @@ fn quota_admission_verdicts_are_typed_and_stable() {
         account: AccountId::from_str("acct-codex-native").unwrap(),
     };
     assert_eq!(exhausted.kind(), "quota_exhausted");
+    // Authoritative quota exhaustion keeps its own public code, distinct
+    // from active-slot capacity exhaustion.
+    let public = agent_run_domain::Error::QuotaAdmission(exhausted.clone()).public();
+    assert_eq!(public.kind, "quota_exhausted");
+    assert_eq!(
+        agent_run_domain::Error::Capacity.public().kind,
+        "CapacityExhausted"
+    );
+    // A broker-returned domain code survives the shared renderer every
+    // transport (socket, CLI, MCP) uses; unknown codes stay generic.
+    let broker = |code: Option<&str>| agent_run_domain::Error::Broker {
+        message: "refused".into(),
+        broker_error_code: code.map(str::to_owned),
+        broker_error_data: None,
+    };
+    for code in [
+        "selection_busy",
+        "no_eligible_account",
+        "quota_exhausted",
+        "RequestConflict",
+    ] {
+        assert_eq!(broker(Some(code)).public().kind, code);
+    }
+    assert_eq!(
+        broker(Some("secret-ish free text")).public().kind,
+        "RuntimeError"
+    );
+    assert_eq!(broker(None).public().kind, "RuntimeError");
     let wire = serde_json::to_value(&stale).unwrap();
     assert_eq!(
         serde_json::from_value::<QuotaAdmissionError>(wire).unwrap(),

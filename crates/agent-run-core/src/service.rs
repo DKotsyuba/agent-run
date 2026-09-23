@@ -550,22 +550,40 @@ impl Service {
     /// to the normal detached provider-aware supervisor; a replayed admission
     /// (`created=false`) never launches another child or reserves again.
     pub async fn start_provider(&self, request: ProviderStartRequest) -> Result<Value> {
-        let result = self.admit_provider(request)?;
-        self.hand_off_provider(&result).await?;
+        let mut result = self.admit_provider(request)?;
+        self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
 
     /// Launches the supervisor for a newly created provider admission only;
     /// a launch failure is recorded as a `supervisor_handoff_error` event.
-    async fn hand_off_provider(&self, result: &Value) -> Result<()> {
+    ///
+    /// A definite pre-spawn failure (`Error::Io`: the OS refused the spawn,
+    /// or the child died before its PID proof and so owns nothing) certifies
+    /// the still-prepared attempt as never spawned, ends the run `failed`
+    /// with `supervisor_spawn_failed`, completes its terminal delivery once,
+    /// and refreshes `result["agent"]` so the caller returns the durable
+    /// terminal view. Any other launch failure is ambiguous: ownership is
+    /// retained for reconciliation. A replay (`created=false`) launches
+    /// nothing.
+    async fn hand_off_provider(&self, result: &mut Value) -> Result<()> {
         if result["created"] == true {
             let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
             if let Err(error) = supervisor::launch(&self.home, &id).await {
-                Store::open(&self.home)?.event(
+                let mut store = Store::open(&self.home)?;
+                store.event(
                     &id,
                     "supervisor_handoff_error",
                     &json!({"kind":error.public().kind}),
                 )?;
+                if matches!(error, Error::Io(_)) && store.provider_never_spawned(&id)? {
+                    let mut outcome = Outcome::failure("supervisor_spawn_failed");
+                    outcome.failure_text = Some("the run supervisor could not be started".into());
+                    store.finish(&id, &outcome, None, None)?;
+                    crate::commands::complete_terminal(&mut store, &id)?;
+                    let row = store.get(&id)?;
+                    result["agent"] = self.view(&store, &row)?;
+                }
             }
         }
         Ok(())
@@ -578,8 +596,8 @@ impl Service {
         request: ProviderStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
-        let result = self.admit_provider_trusted(request, candidates)?;
-        self.hand_off_provider(&result).await?;
+        let mut result = self.admit_provider_trusted(request, candidates)?;
+        self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
@@ -737,9 +755,9 @@ impl Service {
             .as_ref()
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
-            let result =
+            let mut result =
                 self.admit_provider_resume(&parent, task, timeout, request_id, orchestrator)?;
-            self.hand_off_provider(&result).await?;
+            self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
         if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {

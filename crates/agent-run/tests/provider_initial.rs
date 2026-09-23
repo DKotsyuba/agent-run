@@ -445,6 +445,56 @@ async fn provider_spawn_error_closes_owned_attempt_without_process() {
     assert_eq!(process, None);
 }
 
+/// A definite supervisor spawn refusal while the broker stays alive does not
+/// strand the admitted run: the prepared attempt is certified never spawned,
+/// the run ends `failed` once with one terminal delivery record, and the
+/// start result already carries that durable terminal view.
+#[tokio::test]
+async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
+    let (_temp, home) = home();
+    fs::write(home.join("fixture-supervisor-spawn-error"), "").unwrap();
+    let service = Service::new(home.clone());
+    let result = service
+        .start_provider_trusted(request(&home), candidates(0))
+        .await
+        .unwrap();
+    assert_eq!(result["created"], true);
+    assert_eq!(result["agent"]["status"], "failed", "{result}");
+    let id: AgentId = serde_json::from_value(result["agent_id"].clone()).unwrap();
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(row.failure_kind.as_deref(), Some("supervisor_spawn_failed"));
+    let (active, proof): (i64, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
+    let terminal: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='status'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(terminal >= 1);
+    let deliveries: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(deliveries <= 1, "at most one terminal delivery record");
+}
+
 /// A second enabled account on `glm-user` and an alias provider binding the
 /// first account again under another label.
 const TWO_ACCOUNTS: &str = r#"

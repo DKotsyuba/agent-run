@@ -22,6 +22,14 @@ use std::{ffi::OsStr, path::Path, time::Duration};
 /// Spawning is `posix_spawn(POSIX_SPAWN_SETSID)`-first (`launch.rs`). A failed
 /// READY read does not cancel the already admitted durable job.
 pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
+    // Test-only: `<home>/fixture-supervisor-spawn-error` makes the OS-level
+    // spawn refusal observable without a real exhausted process table.
+    #[cfg(feature = "test-fixtures")]
+    if home.join("fixture-supervisor-spawn-error").exists() {
+        return Err(Error::Io(std::io::Error::other(
+            "injected supervisor spawn refusal",
+        )));
+    }
     let program = std::env::current_exe()?;
     let (home, id) = (home.to_path_buf(), id.clone());
     let launched = tokio::task::spawn_blocking(move || {

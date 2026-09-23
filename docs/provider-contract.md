@@ -108,7 +108,8 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   `selection_stale` (revision moved; the quota consumer recomputes
   outside the transaction, at most three retries), `selection_busy` (retry budget spent,
   no admission attempted), `no_eligible_account` (no candidate currently
-  registered, enabled, and in scope), and `quota_exhausted` (repeats an
+  registered, enabled, and in scope), and `quota_exhausted` (its own
+  public machine code, never `CapacityExhausted`; repeats an
   authoritative structured provider exhaustion fact only). None may
   masquerade as another.
 * Pinned requests select exactly the requested account and disable failover;

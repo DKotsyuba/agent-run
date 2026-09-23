@@ -238,11 +238,13 @@ Notes for the loop:
 | -32600 | not a JSON-RPC 2.0 request; batch array; bad `id` |
 | -32601 | unknown method |
 | -32602 | invalid params (message carries the validation detail) |
-| -32000 | domain error; `error.data.code` holds the agent-run error class (e.g. `UnknownAgent`), plus context fields |
+| -32000 | domain error; `error.data.code` holds the agent-run error class (e.g. `AgentNotFound`, `selection_busy`, `no_eligible_account`, `quota_exhausted`), plus context fields |
 | -32603 | internal error (bounded message, details in server log) |
 
 Treat `-32602`/`-32000` as actionable (fix the request / the referenced
-id); `-32603` as a bug to report.
+id); `-32603` as a bug to report. The CLI (`error.type`) and MCP tool
+errors report the same class the broker returned; only an unknown class is
+rendered as `RuntimeError`.
 
 ## Versioning and compatibility
 
