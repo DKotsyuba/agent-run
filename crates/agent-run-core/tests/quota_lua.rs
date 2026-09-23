@@ -629,7 +629,7 @@ async fn registry_rejects_non_compiling_replacement_and_keeps_valid_revision() {
     assert!(registry
         .install(
             "glm",
-            CollectorScript::new(&" ".repeat(4097)),
+            CollectorScript::new(" ".repeat(4097)),
             &small_source_limit
         )
         .is_err());

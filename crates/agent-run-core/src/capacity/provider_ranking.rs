@@ -737,7 +737,7 @@ pub fn provider_order_filtered_at(
                         if best_priority.is_none_or(|best| *priority > best) {
                             best_priority = Some(*priority);
                         }
-                        status_rank = status_rank.min(0);
+                        status_rank = 0;
                     }
                     LaneVerdict::Unknown => status_rank = status_rank.min(1),
                     LaneVerdict::Overflow => status_rank = status_rank.min(2),

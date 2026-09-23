@@ -21,7 +21,7 @@ const AGENT_ID: &str = "ag-20260826-120000-0123456789";
 
 /// Serializes follow-mode tests: the SIGINT test signals the whole process, so
 /// no other test may hold a Ctrl-C handler while it runs.
-static FOLLOW_TESTS: Mutex<()> = Mutex::new(());
+static FOLLOW_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Records broker method and payload pairs while returning fixed responses.
 struct FakeBroker {
@@ -501,7 +501,7 @@ async fn test_transcript_is_bounded_unless_full_is_explicit() {
 /// Mirrors `tests/test_cli.py::test_transcript_follow_polls_without_duplicates_until_terminal_and_drained`.
 #[tokio::test]
 async fn test_transcript_follow_polls_without_duplicates_until_terminal_and_drained() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let service = Arc::new(FakeService::new(
         vec![
             (0, json!({"messages":[{"seq":1}],"complete":false})),
@@ -941,7 +941,7 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
 /// Proves text follow drains terminal journals in durable order without repeats.
 #[tokio::test]
 async fn test_transcript_text_follow_drains_without_duplicates() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let text = Arc::new(Mutex::new(String::new()));
     agent_run::cli::run_with(
         parse(&[
@@ -979,7 +979,7 @@ async fn test_transcript_text_follow_drains_without_duplicates() {
 /// including an extra empty poll before the process-wide signal is delivered.
 #[tokio::test]
 async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let text = Arc::new(Mutex::new(String::new()));
     let service = Arc::new(FakeService::new(
         vec![
@@ -1024,7 +1024,7 @@ async fn test_transcript_viewer_interrupt_leaves_the_agent_running() {
 /// viewer must render `Hello`, ` `, `world` from three pages as one line.
 #[tokio::test]
 async fn test_transcript_text_streams_fragments_across_pages() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let text = Arc::new(Mutex::new(String::new()));
     let rows = |seq: i64, content: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":"same-message"});
     agent_run::cli::run_with(
@@ -1063,7 +1063,7 @@ async fn test_transcript_text_streams_fragments_across_pages() {
 /// native messages.
 #[tokio::test]
 async fn test_transcript_text_renders_two_claude_messages_distinctly() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let text = Arc::new(Mutex::new(String::new()));
     let row = |seq: i64, content: &str, raw_ref: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":raw_ref});
     agent_run::cli::run_with(
@@ -1105,7 +1105,7 @@ async fn test_transcript_text_renders_two_claude_messages_distinctly() {
 /// Proves escape sequences split across polling pages never leak payload.
 #[tokio::test]
 async fn test_transcript_text_consumes_escape_splits_across_pages() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let text = Arc::new(Mutex::new(String::new()));
     let row = |seq: i64, content: &str| json!({"seq":seq,"role":"assistant","content":content,"raw_ref":"m"});
     agent_run::cli::run_with(
@@ -1205,7 +1205,7 @@ impl CliService for PausingService {
 /// after page 1 and before page 2 exists, the raw output is exactly `Hello`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_transcript_text_bytes_are_visible_before_the_stream_completes() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let text = Arc::new(Mutex::new(String::new()));
     let (release, released) = std::sync::mpsc::channel::<()>();
     let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<()>();
@@ -1257,7 +1257,7 @@ async fn test_transcript_text_bytes_are_visible_before_the_stream_completes() {
 /// follows, and reads the child's pipe byte-exactly before it exits.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes() {
-    let _guard = FOLLOW_TESTS.lock().unwrap();
+    let _guard = FOLLOW_TESTS.lock().await;
     let temp = tempdir().unwrap();
     let home = temp.path().canonicalize().unwrap();
     let initialized = Command::new(env!("CARGO_BIN_EXE_agent-run"))

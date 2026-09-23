@@ -53,6 +53,7 @@ use std::{
 /// the process boundary between polling rounds. This is a cooperative bound
 /// only — it never invents quota facts, and skipped rounds leave the previous
 /// samples and durable exhaustion latch untouched.
+#[derive(Default)]
 pub struct AccountBackoff {
     entries: BTreeMap<(String, String), (u32, f64)>,
 }
@@ -63,14 +64,6 @@ const BASE_DELAY_SECONDS: f64 = 60.0;
 pub const MAX_DELAY_SECONDS: f64 = 900.0;
 /// Failure count at which the cap is reached; further failures stay there.
 const MAX_FAILURES: u32 = 5;
-
-impl Default for AccountBackoff {
-    fn default() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-        }
-    }
-}
 
 impl AccountBackoff {
     /// Returns whether `account`'s `source` round is suppressed at `at`.
@@ -91,7 +84,7 @@ impl AccountBackoff {
         let delay = BASE_DELAY_SECONDS
             * 2_f64
                 .powi((failures.min(MAX_FAILURES) - 1) as i32)
-                .min(MAX_DELAY_SECONDS / BASE_DELAY_SECONDS) as f64;
+                .min(MAX_DELAY_SECONDS / BASE_DELAY_SECONDS);
         let until = at + delay.min(MAX_DELAY_SECONDS);
         self.entries.insert(key, (failures, until));
         until
@@ -678,12 +671,7 @@ fn capability(
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| crate::error::invalid("invalid collector origin"))?;
-    Ok(AuthCapability::new(
-        account.clone(),
-        placement.clone(),
-        value.into(),
-        origins,
-    )?)
+    AuthCapability::new(account.clone(), placement.clone(), value.into(), origins)
 }
 
 /// Runs one account-scoped quota collection round for a whole catalog.

@@ -776,7 +776,9 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     let second_key = agent_run_domain::PhysicalQuotaKey::new(&account, "shared-tokens").unwrap();
     assert_eq!(store.quota_capacity_revision().unwrap(), 0);
     assert_eq!(
-        store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        store
+            .active_attempt_counts(std::slice::from_ref(&account))
+            .unwrap()["acct-codex-native"],
         0
     );
 
@@ -896,7 +898,8 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         .unwrap();
     }
     assert_eq!(
-        Store::active_attempt_counts_in(&tx, &[account.clone()]).unwrap()[account.as_str()],
+        Store::active_attempt_counts_in(&tx, std::slice::from_ref(&account)).unwrap()
+            [account.as_str()],
         1
     );
     assert_eq!(
@@ -969,7 +972,7 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     );
     assert_eq!(
         store
-            .active_reservation_counts(&[second_key.clone()])
+            .active_reservation_counts(std::slice::from_ref(&second_key))
             .unwrap()[second_key.as_str()],
         1
     );
@@ -1014,7 +1017,9 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         )
         .unwrap();
     assert_eq!(
-        store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        store
+            .active_attempt_counts(std::slice::from_ref(&account))
+            .unwrap()["acct-codex-native"],
         0
     );
     assert_eq!(
@@ -1032,7 +1037,9 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         )
         .unwrap();
     assert_eq!(
-        store.active_attempt_counts(&[account.clone()]).unwrap()["acct-codex-native"],
+        store
+            .active_attempt_counts(std::slice::from_ref(&account))
+            .unwrap()["acct-codex-native"],
         1
     );
     writable

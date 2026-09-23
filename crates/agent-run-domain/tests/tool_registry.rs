@@ -17,10 +17,7 @@ fn registry_matches_python_golden_field_by_field() {
     assert_eq!(actual.len(), 11);
     assert_eq!(actual.len(), expected.len());
 
-    for (definition, (actual, mut expected)) in registry()
-        .iter()
-        .zip(actual.iter().zip(expected.into_iter()))
-    {
+    for (definition, (actual, mut expected)) in registry().iter().zip(actual.iter().zip(expected)) {
         assert_eq!(actual["name"], expected["name"]);
         // The schema-2 catalog reads extend the baseline: their descriptions
         // keep the Python text as a prefix, and they add only the exact

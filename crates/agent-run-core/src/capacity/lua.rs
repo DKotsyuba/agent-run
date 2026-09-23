@@ -782,6 +782,9 @@ impl HttpState {
 /// Fresh failures are typed [`CollectorError`] categories with static text.
 /// The VM exposes base Lua only; hook deadlines cannot preempt native host
 /// calls mid-call, so the wall timeout is cooperative rather than real-time.
+// Script, scope, account, models, clock, limits, transport, capability and
+// origin are distinct trust inputs; bundling them would hide which is which.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_collector(
     script: &CollectorScript,
     scope: &CollectorScope,
@@ -835,6 +838,8 @@ pub async fn run_collector(
 
 /// One invocation's base-only VM lifecycle; the outer timeout can cancel
 /// pending HTTP work, while synchronous Lua work checks its hook deadline.
+// Mirrors `run_collector`'s distinct trust inputs plus the invocation deadline.
+#[allow(clippy::too_many_arguments)]
 async fn invoke(
     script: &CollectorScript,
     scope: &CollectorScope,

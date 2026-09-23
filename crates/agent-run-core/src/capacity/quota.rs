@@ -83,7 +83,7 @@ pub fn normalize_collector_output(
     let envelope = raw
         .as_object()
         .ok_or_else(|| invalid("quota_output_malformed"))?;
-    if envelope.contains_key("version") == false
+    if !envelope.contains_key("version")
         || envelope.get("version").and_then(Value::as_i64) != Some(1)
         || envelope
             .keys()

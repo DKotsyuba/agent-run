@@ -84,7 +84,7 @@ pub fn runtime(config: &ProviderConfig, harness: HarnessId, model: &str) -> Resu
         .harnesses
         .get(&harness)
         .ok_or_else(|| invalid("unknown harness"))?;
-    Ok(serde_json::from_value(json!({
+    serde_json::from_value(json!({
         "enabled": true,
         "adapter": match harness { HarnessId::Codex => "codex", HarnessId::ClaudeCode => "claude" },
         "binary": native.binary,
@@ -100,7 +100,7 @@ pub fn runtime(config: &ProviderConfig, harness: HarnessId, model: &str) -> Resu
         "environment": native.environment,
         "rust": native.rust,
     }))
-    .map_err(|_| invalid("cannot translate validated harness settings"))?)
+    .map_err(|_| invalid("cannot translate validated harness settings"))
 }
 
 /// Returns existing shared role, skill, MCP, and environment declarations for

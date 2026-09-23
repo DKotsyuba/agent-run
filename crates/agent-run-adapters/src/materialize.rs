@@ -449,6 +449,8 @@ pub fn materialize(
 
 /// Seals provider-specific native settings and nonsecret launch metadata into
 /// the same verified runtime index as skills, MCP, hooks, and permissions.
+// Each argument is an independent, already-validated input of the one seal.
+#[allow(clippy::too_many_arguments)]
 pub fn materialize_provider(
     config: &Config,
     runtime: &Runtime,
@@ -644,9 +646,7 @@ fn materialize_with_provider(
             });
             let auth_target = if custom {
                 None
-            } else if provider.is_some() {
-                Some("auth.json")
-            } else if request.account.is_some() {
+            } else if provider.is_some() || request.account.is_some() {
                 Some("auth.json")
             } else if let Some(Auth::FileLink { target, .. }) = &runtime.auth {
                 Some(target.as_str())
