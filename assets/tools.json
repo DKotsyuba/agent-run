@@ -107,7 +107,7 @@
           "type": "array",
           "uniqueItems": true
         },
-        "runtime": {
+        "provider": {
           "type": "string"
         },
         "task": {
@@ -124,7 +124,7 @@
         }
       },
       "required": [
-        "runtime",
+        "provider",
         "model",
         "profile",
         "task",

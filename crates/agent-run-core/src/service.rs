@@ -704,6 +704,9 @@ impl Service {
     /// The parent must be terminal with a native session and a sealed Rust launch
     /// identity. Snapshot continuations retain the parent's immutable revision;
     /// legacy revisions remain pending until their supervisor rematerializes them.
+    /// On a schema-2 home every resume is a typed `Unsupported` refusal that
+    /// writes nothing: `legacy_continuation_unavailable` for a schema-1 run and
+    /// `provider_resume_unavailable` for a provider run.
     pub async fn resume(
         &self,
         id: &AgentId,
@@ -716,6 +719,23 @@ impl Service {
         if !parent.status.terminal() || parent.runtime_session_id.is_none() {
             return Err(invalid(
                 "resume requires a terminal run with a native session ID",
+            ));
+        }
+        // On a schema-2 home no continuation is remapped to a provider or
+        // replayed as a summary: the history stays readable and the refusal is
+        // typed. Explicit provider resume is a separate, later contract.
+        if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
+            let provider_row = parent
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity["provider_identity_version"] == 2);
+            return Err(Error::Unsupported(
+                if provider_row {
+                    "provider_resume_unavailable: explicit provider resume is not yet supported"
+                } else {
+                    "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable"
+                }
+                .into(),
             ));
         }
         let mut identity = LaunchIdentity::read(&parent)?;

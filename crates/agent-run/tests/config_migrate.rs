@@ -151,9 +151,17 @@ fn migrate_apply_and_rollback_preserve_history() {
     assert!(!ok, "{bad}");
     assert_eq!(fs::read_to_string(home.join("config.toml")).unwrap(), v1);
 
+    // Make the fixture run terminal and resumable-looking (a Rust-valid id
+    // and a native session) so the schema-2 refusal is the only gate left.
     rusqlite::Connection::open(home.join("state.db"))
         .unwrap()
-        .execute("UPDATE agents SET status='succeeded'", [])
+        .execute_batch(
+            r#"PRAGMA foreign_keys=OFF;
+             UPDATE agents SET status='succeeded',runtime_session_id='native-session-1',
+               id='ag-20260101-000000-0000000001',root_agent_id='ag-20260101-000000-0000000001',
+               request_json='{"runtime":"codex","model":"gpt-6-sol","profile":"review","task":"t","workdir":"/tmp"}';
+             UPDATE events SET agent_id='ag-20260101-000000-0000000001';"#,
+        )
         .unwrap();
     // Terminal now; this is the history the migration must not touch.
     let before = history(&home);
@@ -178,6 +186,30 @@ fn migrate_apply_and_rollback_preserve_history() {
     let text = models.to_string();
     assert!(text.contains("Use for connected implementation"), "{text}");
     assert_eq!(history(&home), before, "migration never rewrites history");
+    // A schema-1 run is never remapped or replayed under schema 2.
+    let id: String = rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .query_row("SELECT id FROM agents", [], |row| row.get(0))
+        .unwrap();
+    let refused = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(agent_run::service::Service::new(home.clone()).resume(
+            &id.parse().unwrap(),
+            "continue".into(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        refused.machine_code().as_str(),
+        "Unsupported",
+        "{refused:?}"
+    );
+    assert!(refused
+        .to_string()
+        .contains("legacy_continuation_unavailable"));
+    assert_eq!(history(&home), before, "a refused resume writes nothing");
 
     // A post-migration config edit is divergence: rollback refuses.
     let migrated = fs::read(home.join("config.toml")).unwrap();

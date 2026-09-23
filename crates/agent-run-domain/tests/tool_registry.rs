@@ -39,6 +39,11 @@ fn registry_matches_python_golden_field_by_field() {
                     serde_json::json!({"type": ["string", "null"]});
             }
         }
+        // Schema-2 cutover: public start names a configured provider instead of
+        // a legacy runtime; nothing else in its input schema changes.
+        if definition.name == "start" {
+            rename_runtime_to_provider(&mut expected);
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }
@@ -119,4 +124,21 @@ fn registry_exposes_python_optional_argument_defaults() {
             .default,
         Some(ArgumentDefault::Integer(100))
     );
+}
+
+/// Applies the one deliberate start-schema change over the Python baseline:
+/// the required `runtime` property becomes the required `provider`.
+fn rename_runtime_to_provider(tool: &mut Value) {
+    let schema = &mut tool["inputSchema"];
+    let runtime = schema["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime")
+        .expect("baseline start declares runtime");
+    schema["properties"]["provider"] = runtime;
+    for name in schema["required"].as_array_mut().unwrap() {
+        if name == "runtime" {
+            *name = Value::from("provider");
+        }
+    }
 }

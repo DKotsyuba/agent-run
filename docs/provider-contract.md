@@ -124,6 +124,27 @@ for a newly created admission. `Service::admit_provider_trusted` exposes the
 same admission without spawning for offline supervisor fixtures. Neither is a
 public CLI/MCP/JSON-RPC quota-candidate endpoint.
 
+### Public start (schema 2)
+
+The public `start` tool (CLI `agent-run start`, broker socket, MCP) takes a
+`ProviderStartRequest`: required `provider`, `model`, `profile`, `task`,
+`workdir`, plus optional `account` (a provider-local label pin), `effort`,
+`write`, `read_roots`, `timeout_seconds`, `request_id`, `orchestrator` and
+`required_constraints`. It is served by `Service::start_provider` inside the
+resident broker: the CLI never admits in its own one-shot process. A legacy
+`runtime` field (CLI `--runtime`) is an unknown argument and a
+`ValidationError`; there is no runtime alias. A repeated `request_id` returns
+the original admission (`created=false`). `fast` and `output_schema` remain
+in the schema but the provider launch path does not yet carry them, so a
+request setting either is refused with `Unsupported` before any row is
+written. On a schema-1 home `start` fails until the config is migrated.
+
+Resume on a schema-2 home is a typed refusal, never a remap or prompt
+replay: a schema-1 run returns `Unsupported`
+(`legacy_continuation_unavailable`) with its history intact, and a provider
+run returns `Unsupported` (`provider_resume_unavailable`) until explicit
+provider resume is implemented.
+
 ### Mechanical account choice
 
 `Service::admit_provider` (and `Service::start_provider`, which then hands a

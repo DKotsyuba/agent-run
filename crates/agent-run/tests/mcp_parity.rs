@@ -160,6 +160,17 @@ fn extend_start_description(value: &mut Value) {
                         1,
                     );
                 }
+                // Schema-2 cutover: the start schema names a provider (pinned by the
+                // domain `tool_registry` test); take it from the registry.
+                if object.contains_key("inputSchema") {
+                    object.insert(
+                        "inputSchema".into(),
+                        agent_run_domain::tool("start")
+                            .unwrap()
+                            .input_schema
+                            .clone(),
+                    );
+                }
             }
             if let Some(name @ ("models" | "capacity_order")) =
                 object.get("name").and_then(Value::as_str)

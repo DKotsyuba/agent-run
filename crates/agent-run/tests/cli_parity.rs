@@ -131,7 +131,7 @@ fn python_cli_spec_command_surface_is_present() {
         let path = row["command"].as_str().expect("command name");
         let mut command = command_at(&root, path);
         command.build();
-        let expected_options = row["actions"]
+        let mut expected_options = row["actions"]
             .as_array()
             .expect("actions")
             .iter()
@@ -153,6 +153,18 @@ fn python_cli_spec_command_surface_is_present() {
             // test below pins that surface instead.
             .filter(|option| option != "--version" && option != "-V")
             .collect::<BTreeSet<_>>();
+        // Deliberate schema-2 divergences from the Python capture: start names a
+        // provider instead of a runtime, and the catalog reads take exact filters.
+        let (removed, added): (&[&str], &[&str]) = match path {
+            "start" => (&["--runtime"], &["--provider"]),
+            "models" => (&[], &["--provider", "--profile", "--model"]),
+            "capacity order" => (&[], &["--model"]),
+            _ => (&[], &[]),
+        };
+        for option in removed {
+            assert!(expected_options.remove(*option), "{path} {option}");
+        }
+        expected_options.extend(added.iter().map(|option| (*option).to_owned()));
         assert_eq!(actual_options, expected_options, "options for {path}");
         for action in row["actions"].as_array().expect("actions") {
             if action["option_strings"]
@@ -232,7 +244,7 @@ async fn python_start_refuses_a_missing_broker() {
         "--home",
         home.path().to_str().expect("UTF-8 temporary path"),
         "start",
-        "--runtime",
+        "--provider",
         "codex",
         "--model",
         "model",

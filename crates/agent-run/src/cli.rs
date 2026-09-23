@@ -2,10 +2,9 @@
 use crate::{
     capacity,
     config::{Adapter, Config},
-    domain::{AgentId, OrchestratorRef, StartRequest},
+    domain::{AgentId, OrchestratorRef},
     error::invalid,
     fs, hooks,
-    policy::Constraint,
     service::{Query, Service},
     state::Store,
     transport, Result,
@@ -17,7 +16,6 @@ use agent_run_domain::{
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -372,8 +370,9 @@ impl SessionArgs {
 /// The resident-broker start command's shell request fields.
 #[derive(Args, Debug)]
 pub struct Start {
+    /// Configured provider id (schema 2); pair it with an explicit `--model`.
     #[arg(long)]
-    pub runtime: String,
+    pub provider: String,
     #[arg(long)]
     pub model: String,
     #[arg(long)]
@@ -968,27 +967,31 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             } else {
                 None
             };
-            let mut request = StartRequest {
-                runtime: a.runtime,
-                model: a.model,
-                profile: a.profile,
-                task,
-                workdir: absolute(&a.workdir.unwrap_or(std::env::current_dir()?))?,
-                write: a.write,
-                fast: a.fast,
-                effort: a.effort,
-                timeout_seconds: a.timeout_seconds,
-                read_roots: a
-                    .read_roots
-                    .iter()
-                    .map(|p| absolute(p))
-                    .collect::<Result<_>>()?,
-                output_schema: schema,
-                orchestrator: a.session.resolve()?,
-                request_id: a.request_id,
-                account: a.account,
-                required_constraints: BTreeSet::<Constraint>::new(),
-            };
+            // The strict provider request; the broker admits it (never this
+            // one-shot process) and chooses the account unless one is named.
+            let read_roots = a
+                .read_roots
+                .iter()
+                .map(|p| absolute(p))
+                .collect::<Result<Vec<_>>>()?;
+            let mut request: agent_run_domain::ProviderStartRequest =
+                serde_json::from_value(json!({
+                    "provider": a.provider,
+                    "model": a.model,
+                    "profile": a.profile,
+                    "task": task,
+                    "workdir": absolute(&a.workdir.unwrap_or(std::env::current_dir()?))?,
+                    "write": a.write,
+                    "fast": a.fast,
+                    "effort": a.effort,
+                    "timeout_seconds": a.timeout_seconds,
+                    "read_roots": read_roots,
+                    "output_schema": schema,
+                    "orchestrator": a.session.resolve()?,
+                    "request_id": a.request_id,
+                    "account": a.account,
+                }))
+                .map_err(|_| invalid("invalid provider start arguments"))?;
             request.validate()?;
             let result = dependencies
                 .broker

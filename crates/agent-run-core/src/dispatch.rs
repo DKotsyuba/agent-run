@@ -1,6 +1,6 @@
 //! One tool inventory and strict argument decoder for every public transport.
 use crate::{
-    domain::{AgentId, OrchestratorRef, StartRequest},
+    domain::{AgentId, OrchestratorRef},
     error::invalid,
     service::{Query, Service},
     Result,
@@ -77,7 +77,13 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
-        "start" => service.start(args::<StartRequest>(raw)?).await,
+        // Public initial start is provider + explicit model only; a legacy
+        // `runtime` payload is an unknown field (ValidationError).
+        "start" => {
+            service
+                .start_provider(args::<agent_run_domain::ProviderStartRequest>(raw)?)
+                .await
+        }
         "resume" => {
             let a: Resume = args(raw)?;
             service

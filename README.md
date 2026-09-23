@@ -95,7 +95,8 @@ external service manager such as systemd. Linux is not a qualified or published
 ## Use the CLI
 
 ```bash
-agent-run start --runtime codex --model gpt-5.6-sol --profile role-review \
+agent-run models                       # providers, explicit models, roles, standing
+agent-run start --provider codex --model gpt-6-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
 agent-run agents
