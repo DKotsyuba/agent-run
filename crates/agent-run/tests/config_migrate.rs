@@ -365,6 +365,35 @@ fn apply_and_rollback_move_the_whole_pair() {
     }
 }
 
+/// Restoring the old config alone cannot authorize discarding later database
+/// writes: an interrupted-looking pair still requires divergence checks.
+#[test]
+fn old_config_does_not_bypass_rollback_divergence() {
+    let home = Home::new();
+    home.finish_agents();
+    let old_config = fs::read(home.root.join("config.toml")).unwrap();
+    let (ok, applied) = home.apply("mapping.toml", false);
+    assert!(ok, "{applied}");
+    let snapshot = applied["snapshot"].as_str().unwrap();
+    let (ok, changed) = run(
+        &home.root,
+        &["accounts", "disable", "acct-codex-personal2"],
+        false,
+    );
+    assert!(ok, "{changed}");
+    fs::write(home.root.join("config.toml"), &old_config).unwrap();
+    let before = sha(&home.root.join("state.db"));
+    let (ok, result) = run(
+        &home.root,
+        &["config", "rollback", "--snapshot", snapshot],
+        false,
+    );
+    assert!(!ok, "rollback discarded a later database write: {result}");
+    assert_eq!(sha(&home.root.join("state.db")), before);
+    assert_eq!(version(&home.root), 17);
+    assert_eq!(fs::read(home.root.join("config.toml")).unwrap(), old_config);
+}
+
 /// Rollback of an untouched migration restores the pair; a second apply
 /// writes a new, distinct snapshot and never touches the first; two
 /// concurrent applies cannot both proceed.
