@@ -231,28 +231,72 @@ struct OwnedAttempt {
 /// cleanup cannot be proven the attempt stays owned and one typed
 /// `attempt_cleanup_unresolved` event records why; unknown or denied
 /// observations are simply retried by the next periodic pass. At most
-/// `limit` attempts are examined per call.
+/// `limit` attempts are examined per call, fairly: a persistent cursor
+/// resumes after the last attempt examined and wraps around. Process
+/// observation and signalling happen outside any write transaction; each
+/// release is its own short transaction. Like the terminal path, a release
+/// does not advance `quota_capacity_revision`: admission recounts active
+/// reservations inside its own transaction.
 fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
-    let rows: Vec<OwnedAttempt> = store
+    // Fair paging over the existing reconciliation cursor: each pass resumes
+    // after the last attempt it examined and wraps around, so a permanently
+    // unprovable old attempt cannot starve newer releasable ones.
+    let select = "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id,t.created_at \
+         FROM attempts t JOIN agents a ON a.id=t.agent_id \
+         WHERE t.ownership_active=1 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')";
+    let cursor: Option<(f64, String)> = store
         .conn
-        .prepare(
-            "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id \
-             FROM attempts t JOIN agents a ON a.id=t.agent_id \
-             WHERE t.ownership_active=1 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out') \
-             ORDER BY t.created_at,t.id LIMIT ?",
-        )?
-        .query_map([limit as i64], |row| {
-            Ok(OwnedAttempt {
-                id: row.get(0)?,
-                agent: row.get(1)?,
-                phase: row.get(2)?,
-                token: row.get(3)?,
-                birth: row.get(4)?,
-                proof: row.get(5)?,
-                group: row.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        .query_row(
+            "SELECT created_at,agent_id FROM reconciliation_cursors WHERE name='orphaned_attempts'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let page = |tail: &str, args: &[&dyn rusqlite::ToSql]| -> Result<Vec<(OwnedAttempt, f64)>> {
+        Ok(store
+            .conn
+            .prepare(&format!("{select}{tail}"))?
+            .query_map(args, |row| {
+                Ok((
+                    OwnedAttempt {
+                        id: row.get(0)?,
+                        agent: row.get(1)?,
+                        phase: row.get(2)?,
+                        token: row.get(3)?,
+                        birth: row.get(4)?,
+                        proof: row.get(5)?,
+                        group: row.get(6)?,
+                    },
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    };
+    let limit = limit as i64;
+    let mut rows = match &cursor {
+        Some((at, id)) => page(
+            " AND (t.created_at > ?1 OR (t.created_at = ?1 AND t.id > ?2)) ORDER BY t.created_at,t.id LIMIT ?3",
+            &[at, id, &limit],
+        )?,
+        None => page(" ORDER BY t.created_at,t.id LIMIT ?1", &[&limit])?,
+    };
+    if let Some((at, id)) = &cursor {
+        let remaining = limit - rows.len() as i64;
+        if remaining > 0 {
+            rows.extend(page(
+                " AND (t.created_at < ?1 OR (t.created_at = ?1 AND t.id <= ?2)) ORDER BY t.created_at,t.id LIMIT ?3",
+                &[at, id, &remaining],
+            )?);
+        }
+    }
+    if let Some((last, created)) = rows.last() {
+        store.conn.execute(
+            "INSERT INTO reconciliation_cursors(name,created_at,agent_id) VALUES('orphaned_attempts',?,?) \
+             ON CONFLICT(name) DO UPDATE SET created_at=excluded.created_at,agent_id=excluded.agent_id",
+            params![created, last.id],
+        )?;
+    }
+    let rows: Vec<OwnedAttempt> = rows.into_iter().map(|(attempt, _)| attempt).collect();
     for attempt in rows {
         let confirmed = attempt
             .proof
