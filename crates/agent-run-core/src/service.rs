@@ -17,9 +17,13 @@ use crate::{
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
 use agent_run_domain::{
-    catalog::{AccountStatus, QuotaCandidateSet, ResolvedLaunchAuthority},
+    catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
     ProviderStartRequest, Sha256Digest,
 };
+
+/// Most `selection_stale` recalculations after the initial selection in
+/// [`Service::admit_provider`]: four admission submissions in total.
+pub const PROVIDER_STALE_RETRIES: u32 = 3;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -293,14 +297,91 @@ impl Service {
             .ok_or_else(|| invalid("provider start requires schema_version 2"))
     }
 
+    /// Admits a strict provider request, choosing its account mechanically
+    /// from persisted quota evidence; nothing is spawned.
+    ///
+    /// The orchestrator chooses provider, model, effort and profile; this
+    /// only picks the account. Order of work:
+    ///
+    /// 1. A repeated `request_id` with the identical request returns the
+    ///    original admission (`created=false`) before any config, account or
+    ///    quota read; a different request under that id is `Conflict`.
+    /// 2. The current valid v2 config and account registry resolve the
+    ///    launch authority once; that config revision is frozen into the row.
+    /// 3. Candidates come from
+    ///    [`crate::capacity::provider_ranking::provider_candidates`] outside
+    ///    every write transaction (the request's account label, if any, is a
+    ///    pin with no failover), then the store validates and commits.
+    /// 4. `selection_stale` recomputes from persisted facts and resubmits:
+    ///    one initial selection plus at most [`PROVIDER_STALE_RETRIES`]
+    ///    recalculations. If the last of those four submissions is also
+    ///    stale, this returns `selection_busy` and nothing was admitted.
+    ///    There is no sleep or polling; every other error returns as is.
+    pub fn admit_provider(&self, request: ProviderStartRequest) -> Result<Value> {
+        self.admit_provider_observed(request, &mut |_| Ok(()))
+    }
+
+    /// [`Self::admit_provider`] with a hook run after each candidate set is
+    /// computed and before its admission transaction, receiving the
+    /// zero-based submission number.
+    ///
+    /// Test seam for deterministic races (a revision advance, an account
+    /// disable) between the ranking read and the store transaction. The hook
+    /// cannot see or change candidates; its error aborts the call unchanged.
+    #[doc(hidden)]
+    pub fn admit_provider_observed(
+        &self,
+        request: ProviderStartRequest,
+        before_admission: &mut dyn FnMut(u32) -> Result<()>,
+    ) -> Result<Value> {
+        self.admit_provider_with(
+            request,
+            PROVIDER_STALE_RETRIES,
+            &mut |store, catalog, request, attempt| {
+                let pin = request.account.as_ref().map(|label| label.as_str());
+                let candidates = crate::capacity::provider_ranking::provider_candidates(
+                    store,
+                    catalog,
+                    &request.provider,
+                    &request.model,
+                    pin,
+                    &std::collections::BTreeSet::new(),
+                )?;
+                before_admission(attempt)?;
+                Ok(candidates)
+            },
+        )
+    }
+
     /// Admits a strict provider request from trusted Rust quota candidates.
     /// The split lets offline tests drive the real supervisor executable
     /// without asking a test binary to respawn itself as `agent-run`.
-    /// No transport accepts candidates from caller JSON.
+    /// No transport accepts candidates from caller JSON. A fixed set cannot
+    /// become fresh, so `selection_stale` returns without retry.
     pub fn admit_provider_trusted(
         &self,
-        mut request: ProviderStartRequest,
+        request: ProviderStartRequest,
         candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        self.admit_provider_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+    }
+
+    /// Shared admission: replay first, authority once, then up to
+    /// `stale_retries + 1` submissions of freshly produced candidates.
+    ///
+    /// `produce` builds one candidate set from the committed store state for
+    /// the resolved catalog; it runs outside any write transaction and gets
+    /// the zero-based submission number. See [`Self::admit_provider`].
+    fn admit_provider_with(
+        &self,
+        mut request: ProviderStartRequest,
+        stale_retries: u32,
+        produce: &mut dyn FnMut(
+            &Store,
+            &agent_run_domain::catalog::ProviderCatalog,
+            &ProviderStartRequest,
+            u32,
+        ) -> Result<QuotaCandidateSet>,
     ) -> Result<Value> {
         request.validate()?;
         if request.fast || request.output_schema.is_some() {
@@ -410,17 +491,34 @@ impl Service {
             .get(&provider.harness)
             .ok_or_else(|| invalid("provider harness is not configured"))?
             .max_active_agents;
-        let admission = Store::open(&self.home)?.admit_provider(
-            &request,
-            &effective,
-            &catalog,
-            &authority,
-            &candidates,
-            &serde_json::to_value(identity)?,
-            config.core.max_active_agents,
-            cap,
-            pinned.as_ref(),
-        )?;
+        let identity = serde_json::to_value(identity)?;
+        let mut submission = 0;
+        let admission = loop {
+            let candidates = produce(&Store::open(&self.home)?, &catalog, &request, submission)?;
+            match Store::open(&self.home)?.admit_provider(
+                &request,
+                &effective,
+                &catalog,
+                &authority,
+                &candidates,
+                &identity,
+                config.core.max_active_agents,
+                cap,
+                pinned.as_ref(),
+            ) {
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if stale_retries > 0 && submission == stale_retries =>
+                {
+                    return Err(QuotaAdmissionError::SelectionBusy { stale_retries }.into());
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < stale_retries =>
+                {
+                    submission += 1;
+                }
+                result => break result?,
+            }
+        };
         let store = Store::open(&self.home)?;
         let row = store.get(&admission.agent_id)?;
         Ok(
@@ -429,14 +527,18 @@ impl Service {
         )
     }
 
-    /// Admits trusted quota candidates and hands a newly owned attempt to
-    /// the normal detached supervisor; replay never launches another child.
-    pub async fn start_provider_trusted(
-        &self,
-        request: ProviderStartRequest,
-        candidates: QuotaCandidateSet,
-    ) -> Result<Value> {
-        let result = self.admit_provider_trusted(request, candidates)?;
+    /// Admits through [`Self::admit_provider`] and hands a newly owned attempt
+    /// to the normal detached provider-aware supervisor; a replayed admission
+    /// (`created=false`) never launches another child or reserves again.
+    pub async fn start_provider(&self, request: ProviderStartRequest) -> Result<Value> {
+        let result = self.admit_provider(request)?;
+        self.hand_off_provider(&result).await?;
+        Ok(result)
+    }
+
+    /// Launches the supervisor for a newly created provider admission only;
+    /// a launch failure is recorded as a `supervisor_handoff_error` event.
+    async fn hand_off_provider(&self, result: &Value) -> Result<()> {
         if result["created"] == true {
             let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
             if let Err(error) = supervisor::launch(&self.home, &id).await {
@@ -447,6 +549,18 @@ impl Service {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Admits trusted quota candidates and hands a newly owned attempt to
+    /// the normal detached supervisor; replay never launches another child.
+    pub async fn start_provider_trusted(
+        &self,
+        request: ProviderStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        let result = self.admit_provider_trusted(request, candidates)?;
+        self.hand_off_provider(&result).await?;
         Ok(result)
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {

@@ -8,6 +8,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum MachineCode {
     /// Candidate ordering was computed against an older committed snapshot.
     SelectionStale,
+    /// The stale-retry budget was spent; nothing was admitted. Contention,
+    /// never provider exhaustion.
+    SelectionBusy,
     /// No currently eligible account remains for the explicit provider/model.
     NoEligibleAccount,
     /// The caller supplied an invalid public value.
@@ -41,6 +44,7 @@ impl MachineCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SelectionStale => "selection_stale",
+            Self::SelectionBusy => "selection_busy",
             Self::NoEligibleAccount => "no_eligible_account",
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
@@ -166,6 +170,9 @@ impl Error {
         match self {
             Self::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }) => {
                 MachineCode::SelectionStale
+            }
+            Self::QuotaAdmission(QuotaAdmissionError::SelectionBusy { .. }) => {
+                MachineCode::SelectionBusy
             }
             Self::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. }) => {
                 MachineCode::NoEligibleAccount

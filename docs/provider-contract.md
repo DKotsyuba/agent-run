@@ -101,7 +101,7 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   candidate set; admission compares that same singleton in its transaction.
   A change to either of two pools invalidates a set scored before it.
 * Typed verdicts (`QuotaAdmissionError`) with stable machine names:
-  `selection_stale` (revision moved; the future quota consumer recomputes
+  `selection_stale` (revision moved; the quota consumer recomputes
   outside the transaction, at most three retries), `selection_busy` (retry budget spent,
   no admission attempted), `no_eligible_account` (no candidate currently
   registered, enabled, and in scope), and `quota_exhausted` (repeats an
@@ -122,9 +122,37 @@ this request plus a **trusted Rust** `QuotaCandidateSet`, admits one logical
 agent and first attempt atomically, then launches the normal supervisor only
 for a newly created admission. `Service::admit_provider_trusted` exposes the
 same admission without spawning for offline supervisor fixtures. Neither is a
-public CLI/MCP/JSON-RPC quota-candidate endpoint; the final public dispatch
-hook must obtain candidates from the quota producer and retry
-`selection_stale` only after fresh production outside the transaction.
+public CLI/MCP/JSON-RPC quota-candidate endpoint.
+
+### Mechanical account choice
+
+`Service::admit_provider` (and `Service::start_provider`, which then hands a
+newly created attempt to the provider-aware supervisor) is the ordinary
+consumer. The orchestrator still names provider, model, effort and profile
+explicitly; only the account is chosen here, mechanically:
+
+1. **Replay first.** A repeated `request_id` with the identical request
+   returns the original admission (`created=false`) before config, account
+   registry or quota is read, so later config, provider, account or quota
+   changes cannot alter it; a different request under that id is
+   `RequestConflict`. Replay never reserves again or spawns a supervisor.
+2. The current valid v2 config (exact-byte revision; an invalid edit keeps
+   the last valid one) and the registry resolve the launch authority once;
+   that revision is frozen into the admitted row and used for execution.
+3. `provider_candidates` ranks accounts from persisted evidence outside
+   every write transaction: known usable before unknown, exhausted,
+   disabled and model-ineligible accounts excluded whatever their
+   multiplier; a request account label is a pin with no failover. No token
+   budget is derived and no reset credit is consumed.
+4. `Store::admit_provider` revalidates under `BEGIN IMMEDIATE` (revision,
+   current registry status, caps) and breaks ties only among equal ranks by
+   active load (shared by every alias of a global account), then id.
+5. On `selection_stale` the consumer recomputes from persisted facts and
+   resubmits: **one initial selection plus at most three recalculations**
+   (`PROVIDER_STALE_RETRIES = 3`, four submissions in total). A fourth stale
+   submission returns `selection_busy` with no agent, attempt or
+   reservation. There is no sleep or polling, and every other error returns
+   unchanged — never relabelled as exhaustion.
 
 `agents.identity_json.provider_identity_version=2` and its request hash prove
 new provider identity independently of the historical `runtime` read-model

@@ -81,6 +81,12 @@ fn supervisor(home: &Path, id: &AgentId) -> tokio::process::Child {
 /// Creates a disposable schema-v2 home with one arbitrary Claude Messages
 /// provider and one registered fake environment reference.
 fn home() -> (tempfile::TempDir, std::path::PathBuf) {
+    home_with("", &[])
+}
+
+/// [`home`] plus `extra` TOML appended to the config (more bindings,
+/// providers, or core caps) and more enabled fake-token accounts.
+fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::Builder::new()
         .prefix("ar-provider-")
         .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
@@ -114,20 +120,30 @@ native_model = "fixture"
 [[providers.glm-user.bindings]]
 label = "work"
 account = "acct-work"
-"#,
+{extra}"#,
             root = root.display()
         ),
     )
     .unwrap();
-    Store::open(&root)
-        .unwrap()
-        .register_account(&AccountRecord {
-            account_id: "acct-work".parse().unwrap(),
-            auth_family: "anthropic".parse().unwrap(),
-            secret_ref: "env:FAKE_TOKEN".parse().unwrap(),
-            status: AccountStatus::Enabled,
-        })
-        .unwrap();
+    let mut store = Store::open(&root).unwrap();
+    for (index, id) in std::iter::once("acct-work")
+        .chain(accounts.iter().copied())
+        .enumerate()
+    {
+        // Each account needs its own reference; only the first is ever run.
+        let reference = match index {
+            0 => "env:FAKE_TOKEN".to_owned(),
+            n => format!("env:FAKE_TOKEN_{n}"),
+        };
+        store
+            .register_account(&AccountRecord {
+                account_id: id.parse().unwrap(),
+                auth_family: "anthropic".parse().unwrap(),
+                secret_ref: reference.parse().unwrap(),
+                status: AccountStatus::Enabled,
+            })
+            .unwrap();
+    }
     (temp, root)
 }
 
@@ -426,4 +442,262 @@ async fn provider_spawn_error_closes_owned_attempt_without_process() {
     assert_eq!(active, 0);
     assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
     assert_eq!(process, None);
+}
+
+/// A second enabled account on `glm-user` and an alias provider binding the
+/// first account again under another label.
+const TWO_ACCOUNTS: &str = r#"
+[[providers.glm-user.bindings]]
+label = "alt"
+account = "acct-alt"
+[providers.glm-alias]
+harness = "claude-code"
+connection = { kind = "custom", endpoint = "https://gateway.example/api", protocol = "messages" }
+auth_family = "anthropic"
+limits_source = "none"
+[[providers.glm-alias.models]]
+id = "fixture"
+native_model = "fixture"
+[[providers.glm-alias.bindings]]
+label = "shared"
+account = "acct-work"
+"#;
+
+/// One strict request on `provider` with `request_id` and optional pin label.
+fn request_for(
+    home: &Path,
+    provider: &str,
+    request_id: &str,
+    pin: Option<&str>,
+) -> ProviderStartRequest {
+    let mut request = request(home);
+    request.provider = provider.parse().unwrap();
+    request.request_id = Some(request_id.into());
+    request.account = pin.map(|label| label.parse().unwrap());
+    request
+}
+
+/// Returns the admitted attempt's selected global account.
+fn selected(home: &Path, admitted: &serde_json::Value) -> String {
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    Store::open(home)
+        .unwrap()
+        .provider_attempt(&id)
+        .unwrap()
+        .1
+        .as_str()
+        .to_owned()
+}
+
+/// Counts `(agents, attempts)` rows, proving what was (not) admitted.
+fn rows(home: &Path) -> (i64, i64) {
+    let store = Store::open(home).unwrap();
+    let count = |table: &str| {
+        store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    (count("agents"), count("attempts"))
+}
+
+/// Advances the committed quota revision, as a concurrent collector would.
+fn bump_revision(home: &Path) -> agent_run_domain::Result<()> {
+    let mut store = Store::open(home)?;
+    let tx = store.conn.transaction()?;
+    Store::advance_quota_capacity_revision(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The ordinary entry computes its own candidates from persisted evidence
+/// and the admitted attempt completes through the real supervisor.
+#[tokio::test]
+async fn provider_ordinary_admission_ranks_itself_and_completes() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let admitted = service.admit_provider(request(&home)).unwrap();
+    assert_eq!(admitted["created"], true);
+    assert_eq!(selected(&home, &admitted), "acct-work");
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    assert!(tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+}
+
+/// Replay returns the original admission before config, registry or quota
+/// is read; a different request under the same id is a typed conflict.
+#[tokio::test]
+async fn provider_replay_precedes_changed_config_and_quota() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let original = request_for(&home, "glm-user", "replay-1", None);
+    let admitted = service.admit_provider(original.clone()).unwrap();
+    bump_revision(&home).unwrap();
+    Store::open(&home)
+        .unwrap()
+        .disable_account(&"acct-work".parse().unwrap())
+        .unwrap();
+    fs::write(home.join("config.toml"), "schema_version=2\n").unwrap();
+    let replay = service
+        .admit_provider_observed(original.clone(), &mut |_| {
+            panic!("replay must not rank or submit")
+        })
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], admitted["agent_id"]);
+    let mut conflicting = original;
+    conflicting.task = "fixture:other".into();
+    assert!(matches!(
+        service.admit_provider(conflicting),
+        Err(agent_run_domain::Error::Conflict)
+    ));
+    assert_eq!(rows(&home), (1, 1));
+}
+
+/// A revision moved between ranking and admission is recomputed; a
+/// revision that keeps moving stops after exactly one initial selection
+/// plus three recalculations with `selection_busy` and no rows.
+#[tokio::test]
+async fn provider_stale_selection_recomputes_at_most_three_times() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let mut seen = Vec::new();
+    let admitted = service
+        .admit_provider_observed(
+            request_for(&home, "glm-user", "stale-once", None),
+            &mut |n| {
+                seen.push(n);
+                if n == 0 {
+                    bump_revision(&home)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(admitted["created"], true);
+    assert_eq!(seen, [0, 1]);
+
+    let mut seen = Vec::new();
+    let busy = service
+        .admit_provider_observed(
+            request_for(&home, "glm-user", "stale-always", None),
+            &mut |n| {
+                seen.push(n);
+                bump_revision(&home)
+            },
+        )
+        .unwrap_err();
+    assert_eq!(seen, [0, 1, 2, 3]);
+    assert!(matches!(
+        busy,
+        agent_run_domain::Error::QuotaAdmission(
+            agent_run_domain::catalog::QuotaAdmissionError::SelectionBusy { stale_retries: 3 }
+        )
+    ));
+    assert_eq!(busy.machine_code().as_str(), "selection_busy");
+    assert_eq!(rows(&home), (1, 1), "selection_busy admitted nothing");
+}
+
+/// A pin never falls through to another account, while auto selection
+/// skips a disabled account; a disable racing the transaction is caught by
+/// the store's current-registry guard.
+#[tokio::test]
+async fn provider_pin_and_disable_race_never_fall_through() {
+    let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
+    let service = Service::new(home.clone());
+    let raced = service.admit_provider_observed(
+        request_for(&home, "glm-user", "race", Some("work")),
+        &mut |_| Store::open(&home)?.disable_account(&"acct-work".parse().unwrap()),
+    );
+    let code = |result: agent_run_domain::Result<serde_json::Value>| {
+        result.unwrap_err().machine_code().as_str()
+    };
+    assert_eq!(code(raced), "no_eligible_account");
+    assert_eq!(rows(&home), (0, 0));
+    let pinned = service.admit_provider(request_for(&home, "glm-user", "pinned", Some("work")));
+    assert_eq!(code(pinned), "no_eligible_account");
+    assert_eq!(rows(&home), (0, 0), "a pin never falls over to acct-alt");
+    let auto = service
+        .admit_provider(request_for(&home, "glm-user", "auto", None))
+        .unwrap();
+    assert_eq!(selected(&home, &auto), "acct-alt");
+}
+
+/// Equal quota ranks break ties by active load then id, and an alias label
+/// on another provider shares its global account's load.
+#[tokio::test]
+async fn provider_equal_ranks_balance_load_across_aliases() {
+    let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
+    let service = Service::new(home.clone());
+    let alias = service
+        .admit_provider(request_for(&home, "glm-alias", "alias", Some("shared")))
+        .unwrap();
+    assert_eq!(selected(&home, &alias), "acct-work");
+    let first = service
+        .admit_provider(request_for(&home, "glm-user", "auto-1", None))
+        .unwrap();
+    assert_eq!(
+        selected(&home, &first),
+        "acct-alt",
+        "acct-work already busy"
+    );
+    let second = service
+        .admit_provider(request_for(&home, "glm-user", "auto-2", None))
+        .unwrap();
+    assert_eq!(selected(&home, &second), "acct-alt", "equal load: lower id");
+    let third = service
+        .admit_provider(request_for(&home, "glm-user", "auto-3", None))
+        .unwrap();
+    assert_eq!(selected(&home, &third), "acct-work", "lower load wins");
+}
+
+/// Concurrent submissions never double-create one request id and never
+/// exceed the global active cap.
+#[tokio::test]
+async fn provider_concurrent_admissions_respect_replay_and_caps() {
+    let (_temp, home) = home_with("[core]\nmax_active_agents = 2\n", &[]);
+    let service = Service::new(home.clone());
+    let same = request_for(&home, "glm-user", "same", None);
+    let outcomes: Vec<_> = (0..6)
+        .map(|_| {
+            let (service, request) = (service.clone(), same.clone());
+            std::thread::spawn(move || service.admit_provider(request))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect();
+    assert_eq!(outcomes.iter().filter(|o| o["created"] == true).count(), 1);
+    assert!(outcomes
+        .iter()
+        .all(|o| o["agent_id"] == outcomes[0]["agent_id"]));
+    assert_eq!(rows(&home), (1, 1));
+    let distinct: Vec<_> = (0..6)
+        .map(|n| {
+            let (service, request) = (
+                service.clone(),
+                request_for(&home, "glm-user", &format!("cap-{n}"), None),
+            );
+            std::thread::spawn(move || service.admit_provider(request))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(distinct.iter().filter(|o| o.is_ok()).count(), 1);
+    assert!(distinct
+        .iter()
+        .filter_map(|o| o.as_ref().err())
+        .all(|error| matches!(error, agent_run_domain::Error::Capacity)));
+    assert_eq!(rows(&home), (2, 2));
 }
