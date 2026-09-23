@@ -79,6 +79,10 @@ fn latched_windows(
     Ok(latched)
 }
 
+/// Recorded model membership per latched `(lane, window)`; `None` for a
+/// legacy row without a valid `models` array.
+type WindowMembership = BTreeMap<(String, String), Option<BTreeSet<String>>>;
+
 /// The model lanes each latched window of `account` governs, keyed by
 /// `(lane, window)`: the membership of that window's newest sample in the
 /// same `(observed_at, id)` order the ranker reads. `None` when the newest
@@ -90,7 +94,7 @@ fn latched_membership(
     tx: &rusqlite::Transaction<'_>,
     account: &AccountId,
     latched: &BTreeMap<(String, String), QuotaWindow>,
-) -> Result<BTreeMap<(String, String), Option<BTreeSet<String>>>> {
+) -> Result<WindowMembership> {
     let mut membership = BTreeMap::new();
     for (lane, window) in latched.keys() {
         let payload: Option<String> = tx
@@ -120,12 +124,7 @@ fn latched_membership(
 /// Whether latched window `(lane, window)` governs model lane `model`:
 /// through its recorded membership, or for a legacy row without membership,
 /// only when the pool id equals the model lane.
-fn window_governs(
-    membership: &BTreeMap<(String, String), Option<BTreeSet<String>>>,
-    lane: &str,
-    window: &str,
-    model: &str,
-) -> bool {
+fn window_governs(membership: &WindowMembership, lane: &str, window: &str, model: &str) -> bool {
     match membership.get(&(lane.to_owned(), window.to_owned())) {
         Some(Some(models)) => models.contains(model),
         _ => lane == model,
@@ -174,7 +173,7 @@ fn authoritative_positive(window: &QuotaWindow, fact: &QuotaWindow, at: f64) -> 
 /// settles it for every model.
 pub fn retain_exhausted(
     exhausted: &BTreeMap<(String, String), QuotaWindow>,
-    membership: &BTreeMap<(String, String), Option<BTreeSet<String>>>,
+    membership: &WindowMembership,
     snapshot: &mut NormalizedQuotaSnapshot,
     account: &AccountId,
     at: f64,
