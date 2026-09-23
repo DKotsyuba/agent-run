@@ -506,9 +506,11 @@ fn native_signal_latch_survives_stale_positive_and_releases_on_fresh() {
     store
         .latch_native_exhaustion(
             &account(),
+            "glm",
             "primary",
             "five_hour",
             "claude-rate-limit-event",
+            &BTreeSet::from(["glm-4.7".to_owned(), "glm-4.6".to_owned()]),
             1600.0,
             None,
         )

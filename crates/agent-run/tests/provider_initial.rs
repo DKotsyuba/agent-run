@@ -2290,9 +2290,9 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
 /// An authoritative Claude window rejection whose physical pool the
 /// provider's `anthropic_usage` collector mapping establishes (`five_hour` →
 /// `primary`) is latched once under the collector's own physical identity
-/// with the capacity revision advanced; a model-scoped `seven_day_opus`
-/// rejection latches nothing. (The ranker resolves lanes by model alias, so
-/// selection does not yet consult these collector-keyed pools.)
+/// with the capacity revision advanced, and the ranker then excludes that
+/// account through the pool's recorded model membership; a model-scoped
+/// `seven_day_opus` rejection latches nothing.
 #[tokio::test]
 async fn mapped_claude_windows_feed_the_exhaustion_latch() {
     for (task, latched) in [("fixture:quota", true), ("fixture:quota-opus", false)] {
@@ -2342,6 +2342,28 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
             assert!(
                 store.quota_capacity_revision().unwrap() > revision + 1,
                 "{task}"
+            );
+            let (config, _) =
+                agent_run_config::provider_config::ProviderConfig::load(&home).unwrap();
+            let catalog = config
+                .resolve_catalog(store.list_accounts().unwrap())
+                .unwrap();
+            let ranked = agent_run::capacity::provider_ranking::provider_candidates(
+                &store,
+                &catalog,
+                &"glm-user".parse().unwrap(),
+                "fixture",
+                None,
+                &Default::default(),
+            );
+            assert!(
+                ranked
+                    .map(|set| set
+                        .candidates
+                        .iter()
+                        .all(|c| c.account.as_str() != "acct-work"))
+                    .unwrap_or(true),
+                "{task}: the latched account is not a candidate"
             );
         } else {
             assert!(rows.is_empty(), "{task}: {rows:?}");
@@ -2548,5 +2570,249 @@ async fn cleanup_error_never_switches_or_releases() {
             &id
         ),
         0
+    );
+}
+
+/// Records one normalized first-party collector round for `account`.
+fn record_round(
+    home: &Path,
+    account: &str,
+    runtime: &str,
+    windows: serde_json::Value,
+    retention: usize,
+) {
+    let at = agent_run::domain::now();
+    let scope = agent_run::capacity::quota::CollectorScope {
+        runtime: runtime.into(),
+        source: "anthropic-usage".into(),
+        models: ["fixture".to_owned(), "other-native".to_owned()].into(),
+    };
+    let snapshot = agent_run::capacity::quota::normalize_collector_output(
+        &account.parse().unwrap(),
+        &scope,
+        &serde_json::json!({"version":1,"windows":windows}),
+        at,
+        256,
+        256,
+    )
+    .unwrap();
+    agent_run::state::quota::record_quota_snapshot(home, runtime, &snapshot, retention, at)
+        .unwrap();
+}
+
+/// Summary of trusted candidates: (account, physical keys) in rank order.
+fn ranked(home: &Path, provider: &str, model: &str) -> Vec<(String, Vec<String>, bool)> {
+    let store = Store::open(home).unwrap();
+    let (config, _) = agent_run_config::provider_config::ProviderConfig::load(home).unwrap();
+    let catalog = config
+        .resolve_catalog(store.list_accounts().unwrap())
+        .unwrap();
+    agent_run::capacity::provider_ranking::provider_candidates(
+        &store,
+        &catalog,
+        &provider.parse().unwrap(),
+        model,
+        None,
+        &Default::default(),
+    )
+    .map(|set| {
+        set.candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.account.as_str().to_owned(),
+                    c.physical_keys
+                        .iter()
+                        .map(|k| k.as_str().to_owned())
+                        .collect(),
+                    c.quota_known,
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Producer → store → ranker → views → admission compose through recorded
+/// pool membership, with pool ids that are not model names:
+///
+/// * acct-work: general `primary` pool exhausted → excluded for both models;
+/// * acct-b: `credits` window exhausted but governing only `fixture` →
+///   excluded for `fixture`, available for `other` (its reservation keys name
+///   only the governing `primary` pool);
+/// * acct-c: `primary` positive → the ordinary admission picks it and reserves
+///   `acct-c::primary`; the alias provider sees the same single physical key;
+/// * the latch keeps excluding acct-work after retention pruning and after an
+///   older positive sample; when acct-c's newest membership drops `other`,
+///   the older membership no longer makes acct-c known for it.
+#[tokio::test]
+async fn collector_pool_membership_governs_ranking_views_and_admission() {
+    let extra = "[[providers.glm-user.models]]\nid = \"other\"\nnative_model = \"other-native\"\n\
+                 [[providers.glm-user.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n\
+                 [[providers.glm-user.bindings]]\nlabel = \"c\"\naccount = \"acct-c\"\n\
+                 [providers.glm-alias]\nharness = \"claude-code\"\nconnection = { kind = \"custom\", endpoint = \"https://gateway.example/api\", protocol = \"messages\" }\n\
+                 auth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.glm-alias.models]]\nid = \"fixture\"\n\
+                 [[providers.glm-alias.bindings]]\nlabel = \"shared\"\naccount = \"acct-c\"\n";
+    let (_temp, home) = home_with(extra, &["acct-b", "acct-c"]);
+    let reset = agent_run::domain::now() + 3600.0;
+    let both = serde_json::json!(["fixture", "other-native"]);
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":0.0,"reset_at":reset,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+    record_round(
+        &home,
+        "acct-b",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":70.0,"observed_at":agent_run::domain::now()},
+            {"pool":"credits","window":"monthly_mcp","models":["fixture"],"remaining_percent":0.0,"reset_at":reset,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+    record_round(
+        &home,
+        "acct-c",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":50.0,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+
+    let fixture = ranked(&home, "glm-user", "fixture");
+    assert_eq!(
+        fixture,
+        vec![("acct-c".into(), vec!["acct-c::primary".into()], true)],
+        "{fixture:?}"
+    );
+    let other = ranked(&home, "glm-user", "other");
+    let accounts: Vec<&str> = other.iter().map(|c| c.0.as_str()).collect();
+    assert!(!accounts.contains(&"acct-work"), "{other:?}");
+    let b = other
+        .iter()
+        .find(|c| c.0 == "acct-b")
+        .expect("acct-b serves other");
+    assert_eq!(
+        b.1,
+        vec!["acct-b::primary".to_owned()],
+        "credits does not govern other"
+    );
+    // The alias provider shares acct-c's one physical pool, not a copy.
+    assert_eq!(
+        ranked(&home, "glm-alias", "fixture"),
+        vec![("acct-c".into(), vec!["acct-c::primary".into()], true)]
+    );
+
+    // Public views read the same membership.
+    let service = Service::new(home.clone());
+    let order = service
+        .capacity_order(serde_json::from_value(serde_json::json!({})).unwrap())
+        .unwrap();
+    assert!(order.to_string().contains("glm-user"), "{order}");
+    let models = service
+        .models(serde_json::from_value(serde_json::json!({"provider":"glm-user"})).unwrap())
+        .await
+        .unwrap();
+    let text = models.to_string();
+    assert!(text.contains("\"available\""), "{text}");
+
+    // Ordinary admission selects acct-c and reserves its governing pool.
+    let mut request = request(&home);
+    request.account = None;
+    request.request_id = Some("membership-admit".into());
+    let admitted = service.admit_provider(request).unwrap();
+    let attempt = admitted["attempt_id"].as_str().unwrap().to_owned();
+    let store = Store::open(&home).unwrap();
+    let keys: Vec<String> = store
+        .conn
+        .prepare("SELECT quota_key FROM attempt_quota_keys WHERE attempt_id=?")
+        .unwrap()
+        .query_map([&attempt], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(keys, vec!["acct-c::primary".to_owned()]);
+
+    // Retention pruning (keep 1 sample) and an older positive sample never
+    // lift acct-work's latched restriction.
+    for _ in 0..3 {
+        record_round(
+            &home,
+            "acct-b",
+            "glm-user",
+            serde_json::json!([
+                {"pool":"primary","window":"five_hour","models":both,"remaining_percent":60.0,"observed_at":agent_run::domain::now()}
+            ]),
+            1,
+        );
+    }
+    record_round(
+        &home,
+        "acct-work",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"primary","window":"five_hour","models":both,"remaining_percent":90.0,"observed_at":agent_run::domain::now() - 7200.0}
+        ]),
+        1,
+    );
+    let fixture = ranked(&home, "glm-user", "fixture");
+    assert!(fixture.iter().all(|c| c.0 != "acct-work"), "{fixture:?}");
+
+    // acct-c's newest membership drops `other`: its older membership no
+    // longer makes acct-c known for that model.
+    record_round(
+        &home,
+        "acct-c",
+        "glm-user",
+        serde_json::json!([
+            {"pool":"primary","window":"five_hour","models":["fixture"],"remaining_percent":50.0,"observed_at":agent_run::domain::now()}
+        ]),
+        100,
+    );
+    let other = ranked(&home, "glm-user", "other");
+    let c = other
+        .iter()
+        .find(|c| c.0 == "acct-c")
+        .expect("acct-c stays eligible");
+    assert!(
+        !c.2 && c.1.is_empty(),
+        "acct-c is unknown for other now: {other:?}"
+    );
+}
+
+/// The real Codex source mapping composes with the ranker: the general
+/// `codex` bucket (not a model name) governs the bound model; an exhausted
+/// general bucket excludes that account and the other is selected with the
+/// `codex` pool as its reservation key.
+#[tokio::test]
+async fn codex_source_buckets_govern_bound_models() {
+    let (_temp, home) = codex_home(["ok", "ok"]);
+    let at = agent_run::domain::now();
+    let models: std::collections::BTreeSet<String> = ["fixture".to_owned()].into();
+    for (account, used) in [("acct-cx-a", 100.0), ("acct-cx-b", 20.0)] {
+        let response = serde_json::json!({"rateLimitsByLimitId":{"codex":{
+            "primary":{"usedPercent":used,"windowDurationMins":300,"resetsAt":at + 3600.0}
+        }}});
+        let (snapshot, skipped) = agent_run::capacity::codex_quota::codex_snapshot(
+            &account.parse().unwrap(),
+            "codex-user",
+            &models,
+            &response,
+            at,
+        )
+        .unwrap();
+        assert_eq!(skipped, 0);
+        agent_run::state::quota::record_quota_snapshot(&home, "codex-user", &snapshot, 100, at)
+            .unwrap();
+    }
+    assert_eq!(
+        ranked(&home, "codex-user", "fixture"),
+        vec![("acct-cx-b".into(), vec!["acct-cx-b::codex".into()], true)]
     );
 }

@@ -256,3 +256,27 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   `quota_canary codex [label]` (with `AGENT_RUN_HOME`, optional
   `CODEX_BINARY`) prints only bucket ids, `limitName`, window minutes and
   used percent. Tokens, bodies, and headers are never printed.
+
+## Pool membership consumed by selection
+
+A physical pool id (`primary`, `secondary`, `credits`, `codex`,
+`model:<key>`) is never a model name. `record_quota_snapshot` stores, on
+every persisted window row, the exact model lanes (native alias, else model
+id — the names each collector unit is built with) that window governs, in
+`payload_json.models`, per window rather than per pool, so a narrower window
+never inherits every model of its pool. Account selection, the `models` and
+`capacity_order` views and admission reservations consume that membership:
+a window governs a model only when its newest row names that model's lane;
+an older row's membership never authorizes a model the newest one dropped.
+Only rows with no recorded membership (written before membership was
+recorded) fall back to a pool id equal to the lane. All governing windows of
+all governing pools enter one model's score and exhaustion gates, and one
+pool is reserved once however many models or provider aliases it governs.
+
+Retention never deletes the newest row of a pool with an active exhaustion
+latch, so the latch keeps restricting exactly the models that row names. A
+latch written from an authoritative native signal (for example a Claude
+`rate_limit_event` rejection of a mapped `five_hour` window) records the
+observation itself as a zero-remaining row carrying the membership the
+collector mapping defines. No schema change is needed: the membership was
+already persisted in `payload_json`.

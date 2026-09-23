@@ -214,14 +214,19 @@ pub fn record_quota_snapshot(
     // One physical window is persisted exactly once with its full model
     // membership, however many configured models share the pool.
     let mut physical: BTreeMap<(&str, &str, &str), &QuotaWindow> = BTreeMap::new();
-    let mut pool_models: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    // Membership is recorded per physical window: a narrower window (for
+    // example a model-scoped credit window) never inherits every model of
+    // its pool.
+    let mut pool_models: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
     for model in &snapshot.models {
         for pool in &model.pools {
             let lane = lane_of(&pool.key, &account)?;
-            pool_models
-                .entry(lane)
-                .or_default()
-                .insert(model.model.as_str());
+            for window in &pool.windows {
+                pool_models
+                    .entry((lane, window.name.as_str()))
+                    .or_default()
+                    .insert(model.model.as_str());
+            }
             for window in &pool.windows {
                 // Shared pools repeat identical facts across models; the
                 // snapshot validator already proved them equal.
@@ -236,7 +241,7 @@ pub fn record_quota_snapshot(
         window.validate()?;
         let quota_key = format!("{}::{}", account.as_str(), lane);
         let models = pool_models
-            .get(lane)
+            .get(&(*lane, window.name.as_str()))
             .map(|set| serde_json::json!({ "models": set.iter().collect::<Vec<_>>() }));
         tx.execute(
             "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -303,8 +308,12 @@ pub fn record_quota_snapshot(
         )?;
     }
     let revision = if mutations > 0 {
+        // Retention keeps the newest sample of every latched pool: that row
+        // carries the pool's model membership, which the latch needs to keep
+        // restricting exactly the models it governs.
         tx.execute(
-            "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?)",
+            "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?) \
+             AND id NOT IN (SELECT MAX(id) FROM capacity_samples WHERE quota_key IN (SELECT quota_key FROM quota_exhaustion) GROUP BY quota_key)",
             [retention as i64],
         )?;
         Store::advance_quota_capacity_revision(&tx)?
@@ -320,21 +329,31 @@ impl Store {
     /// physical window (`account::lane`, `window`) from `source`, in one
     /// immediate transaction that advances `quota_capacity_revision` once.
     ///
+    /// The same transaction records the observation itself as a zero-remaining
+    /// sample of that pool whose membership is `models` (the model lanes the
+    /// pool governs, as the collector mapping defines them), so the ranker
+    /// applies the latch to exactly those models; `runtime` is the provider.
+    ///
     /// The fact is released only by the existing rules: its reset passing, or
     /// a newer authoritative positive observation of the same lane and
     /// window; an older positive sample never clears it. Callers must pass
     /// only a window whose physical pool the provider's own collector mapping
     /// establishes; unknown windows are never latched.
+    // The physical identity (account, runtime, lane, window, source), the
+    // membership and the timing are each independent facts of one observation.
+    #[allow(clippy::too_many_arguments)]
     pub fn latch_native_exhaustion(
         &mut self,
         account: &AccountId,
+        runtime: &str,
         lane: &str,
         window: &str,
         source: &str,
+        models: &BTreeSet<String>,
         observed_at: f64,
         reset_at: Option<f64>,
     ) -> Result<i64> {
-        if lane.is_empty() || window.is_empty() || source.trim().is_empty() {
+        if lane.is_empty() || window.is_empty() || source.trim().is_empty() || models.is_empty() {
             return Err(invalid("invalid native exhaustion latch"));
         }
         let quota_key = PhysicalQuotaKey::new(account, lane)?;
@@ -347,6 +366,23 @@ impl Store {
              ON CONFLICT(account_id,quota_key,source,window_id) DO UPDATE SET \
              observed_at=MAX(observed_at,excluded.observed_at),reset_at=excluded.reset_at",
             params![account.as_str(), quota_key.as_str(), source, window, observed_at, reset_at],
+        )?;
+        tx.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
+             VALUES(?,?,?,?,?,0.0,?,?,?,?,?,?)",
+            params![
+                runtime,
+                lane,
+                window,
+                account.as_str(),
+                source,
+                reset_at,
+                observed_at,
+                reset_at.unwrap_or(observed_at + UNRESET_EXHAUSTION_TTL_SECONDS),
+                serde_json::json!({"models": models}).to_string(),
+                account.as_str(),
+                quota_key.as_str(),
+            ],
         )?;
         let revision = Store::advance_quota_capacity_revision(&tx)?;
         tx.commit()?;

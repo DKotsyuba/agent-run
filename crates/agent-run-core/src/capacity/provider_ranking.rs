@@ -48,45 +48,95 @@ struct AccountFacts {
     /// Newest-first sample history per window identity, per physical key.
     /// Only rows carrying an explicit account/quota key identity appear.
     history: BTreeMap<PhysicalQuotaKey, BTreeMap<Key, Vec<Sample>>>,
-    /// Durable exhaustion latch resets per physical key; each entry is one
-    /// latched window's reset instant, with `None` meaning "until a later
+    /// Durable exhaustion latches per physical key: each entry is one latched
+    /// window's name and reset instant, with `None` meaning "until a later
     /// observation supersedes it". Latches survive sample retention.
-    latches: BTreeMap<PhysicalQuotaKey, Vec<Option<f64>>>,
+    latches: BTreeMap<PhysicalQuotaKey, Vec<(String, Option<f64>)>>,
+    /// The model lanes each physical window governs, from that window's newest
+    /// sample (`payload_json.models`, written by `record_quota_snapshot` from
+    /// the normalized snapshot) paired with the sample's `(observed_at, id)`
+    /// order. A window whose newest sample records no membership has `None`.
+    membership: BTreeMap<(PhysicalQuotaKey, String), WindowMembership>,
 }
 
+/// One physical window's newest recorded membership: the `(observed_at, id)`
+/// order of the sample it came from and its model lanes (`None` when that
+/// sample recorded none).
+type WindowMembership = ((f64, i64), Option<BTreeSet<String>>);
+
 impl AccountFacts {
-    /// Returns every physical key of this account observed on `lane`, from
-    /// sample history or durable latches; either proves real membership and
-    /// nothing is fabricated for unobserved lanes.
+    /// Whether window `window` of pool `key` governs the model `lane` (its
+    /// native alias).
+    ///
+    /// The window's newest recorded membership must name the lane exactly: a
+    /// pool id is never read as a model name, so `primary`, `secondary` or
+    /// `model:<x>` pools count only through membership, and an older sample's
+    /// membership never authorizes a model the newest one dropped. Only a
+    /// window with no recorded membership at all (rows written before
+    /// membership was recorded, or test rows without it) falls back to the
+    /// pool id equalling the lane exactly.
+    fn governs(
+        &self,
+        account: &AccountId,
+        key: &PhysicalQuotaKey,
+        window: &str,
+        lane: &str,
+    ) -> bool {
+        match self.membership.get(&(key.clone(), window.to_owned())) {
+            Some((_, Some(models))) => models.contains(lane),
+            _ => {
+                key.as_str()
+                    .strip_prefix(&format!("{}::", account.as_str()))
+                    == Some(lane)
+            }
+        }
+    }
+
+    /// Returns every physical pool of this account with at least one window
+    /// (sampled or latched) that governs the model `lane`; nothing is
+    /// fabricated for unobserved lanes.
     fn lane_keys(&self, account: &AccountId, lane: &str) -> BTreeSet<PhysicalQuotaKey> {
-        let prefix = format!("{}::", account.as_str());
-        self.history
-            .keys()
-            .chain(self.latches.keys())
-            .filter(|key| key.as_str().strip_prefix(&prefix) == Some(lane))
-            .cloned()
+        let sampled = self.history.iter().filter(|(key, windows)| {
+            windows
+                .keys()
+                .any(|identity| self.governs(account, key, &identity.window, lane))
+        });
+        let latched = self.latches.iter().filter(|(key, latches)| {
+            latches
+                .iter()
+                .any(|(window, _)| self.governs(account, key, window, lane))
+        });
+        sampled
+            .map(|(key, _)| key.clone())
+            .chain(latched.map(|(key, _)| key.clone()))
             .collect()
     }
 
-    /// Whether an active durable latch blocks `key` at epoch `at`: a `None`
-    /// or future reset keeps the restriction, while a passed reset releases
-    /// it without inventing fresh positive capacity.
-    fn latched(&self, key: &PhysicalQuotaKey, at: f64) -> bool {
-        self.latches.get(key).is_some_and(|resets| {
-            resets
-                .iter()
-                .any(|reset| reset.is_none_or(|reset| reset > at))
-        })
+    /// Whether an active durable latch on a window of `key` that governs
+    /// `lane` blocks it at epoch `at`: a `None` or future reset keeps the
+    /// restriction, while a passed reset releases it without inventing fresh
+    /// positive capacity.
+    fn latched(&self, account: &AccountId, key: &PhysicalQuotaKey, lane: &str, at: f64) -> bool {
+        self.latch_reset(account, key, lane, at).is_some()
     }
 
-    /// Returns the earliest still-active latch reset on `key`, preferring
-    /// finite resets over open-ended ones; `None` when nothing is latched.
-    fn latch_reset(&self, key: &PhysicalQuotaKey, at: f64) -> Option<Option<f64>> {
+    /// Returns the earliest still-active reset among `key`'s latched windows
+    /// that govern `lane`, preferring finite resets over open-ended ones;
+    /// `None` when nothing applicable is latched.
+    fn latch_reset(
+        &self,
+        account: &AccountId,
+        key: &PhysicalQuotaKey,
+        lane: &str,
+        at: f64,
+    ) -> Option<Option<f64>> {
         self.latches
             .get(key)?
             .iter()
-            .filter(|reset| reset.is_none_or(|reset| reset > at))
-            .copied()
+            .filter(|(window, reset)| {
+                self.governs(account, key, window, lane) && reset.is_none_or(|reset| reset > at)
+            })
+            .map(|(_, reset)| *reset)
             .min_by(|a, b| {
                 (a.is_none(), a.unwrap_or(f64::INFINITY))
                     .partial_cmp(&(b.is_none(), b.unwrap_or(f64::INFINITY)))
@@ -138,13 +188,14 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
     for account in scope {
         let prefix = format!("{}::", account.as_str());
         let mut statement = tx.prepare(
-            "SELECT quota_key,runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until \
+            "SELECT quota_key,runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,id \
              FROM capacity_samples WHERE account_id=? \
              ORDER BY quota_key,runtime,lane,window,target,source,observed_at DESC,id DESC",
         )?;
         let rows = statement.query_map([account.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
+                (row.get::<_, Option<String>>(10)?, row.get::<_, i64>(11)?),
                 Sample {
                     key: Key {
                         runtime: row.get(1)?,
@@ -161,14 +212,36 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
             ))
         })?;
         for row in rows {
-            let (text, sample) = row?;
+            let (text, (payload, id), sample) = row?;
             let lane = text.strip_prefix(&prefix).ok_or_else(|| {
                 invalid("capacity sample quota key does not belong to its account")
             })?;
             let key = PhysicalQuotaKey::new(account, lane)?;
-            facts
+            let account_facts = facts
                 .get_mut(account)
-                .expect("scope accounts are pre-seeded")
+                .expect("scope accounts are pre-seeded");
+            // The newest sample of a pool decides its current membership.
+            let order = (sample.observed_at.unwrap_or(f64::NEG_INFINITY), id);
+            let models = payload
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| {
+                    value["models"].as_array().map(|models| {
+                        models
+                            .iter()
+                            .filter_map(|model| model.as_str().map(str::to_owned))
+                            .collect::<BTreeSet<_>>()
+                    })
+                });
+            let window = (key.clone(), sample.key.window.clone());
+            let newest = account_facts
+                .membership
+                .get(&window)
+                .is_none_or(|(seen, _)| order > *seen);
+            if newest {
+                account_facts.membership.insert(window, (order, models));
+            }
+            account_facts
                 .history
                 .entry(key)
                 .or_default()
@@ -176,10 +249,14 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
                 .or_default()
                 .push(sample);
         }
-        let mut statement =
-            tx.prepare("SELECT quota_key,reset_at FROM quota_exhaustion WHERE account_id=?")?;
+        let mut statement = tx.prepare(
+            "SELECT quota_key,window_id,reset_at FROM quota_exhaustion WHERE account_id=?",
+        )?;
         let rows = statement.query_map([account.as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, Option<f64>>(2)?),
+            ))
         })?;
         for row in rows {
             let (text, latch) = row?;
@@ -250,11 +327,14 @@ fn score_lane(
         let empty = AccountFacts::default();
         let account_facts = facts.get(account).unwrap_or(&empty);
         let keys = account_facts.lane_keys(account, lane);
-        if let Some(key) = keys.iter().find(|key| account_facts.latched(key, at)) {
+        if let Some(key) = keys
+            .iter()
+            .find(|key| account_facts.latched(account, key, lane, at))
+        {
             verdicts.insert(
                 account.clone(),
                 LaneVerdict::Exhausted {
-                    reset_at: account_facts.latch_reset(key, at).flatten(),
+                    reset_at: account_facts.latch_reset(account, key, lane, at).flatten(),
                 },
             );
             keys_by_account.insert(account.clone(), keys);
@@ -266,7 +346,10 @@ fn score_lane(
         for key in &keys {
             let mut pool_keys = BTreeSet::new();
             if let Some(windows) = account_facts.history.get(key) {
-                for (identity, history) in windows {
+                // Only windows that govern this model lane enter its score.
+                for (identity, history) in windows.iter().filter(|(identity, _)| {
+                    account_facts.governs(account, key, &identity.window, lane)
+                }) {
                     pool_keys.insert(identity.clone());
                     forecasts.push(forecast(identity, history, at));
                 }

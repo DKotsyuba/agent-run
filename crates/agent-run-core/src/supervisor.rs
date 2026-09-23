@@ -621,9 +621,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 let reset = data["resets_at"].as_f64();
                 store.latch_native_exhaustion(
                     &account,
+                    identity.authority.provider.as_str(),
                     lane,
                     window,
                     "claude-rate-limit-event",
+                    &governed_lanes(&identity, &account),
                     domain::now(),
                     reset,
                 )?;
@@ -910,6 +912,41 @@ fn latch_mapping(
         "seven_day" => Some(("secondary", "seven_day")),
         _ => None,
     }
+}
+
+/// The model lanes (native alias, else id) a general `anthropic_usage` pool
+/// of `account` governs for this provider: every provider model the
+/// account's bindings admit, exactly as that collector builds its unit.
+fn governed_lanes(
+    identity: &ProviderLaunchIdentity,
+    account: &agent_run_domain::catalog::AccountId,
+) -> std::collections::BTreeSet<String> {
+    let Some(provider) = identity
+        .provider_config
+        .providers
+        .get(&identity.authority.provider)
+    else {
+        return Default::default();
+    };
+    provider
+        .bindings
+        .iter()
+        .filter(|binding| &binding.account == account)
+        .flat_map(|binding| {
+            provider.models.iter().filter(move |model| {
+                binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&model.id))
+            })
+        })
+        .map(|model| {
+            model
+                .native_model
+                .clone()
+                .unwrap_or_else(|| model.id.clone())
+        })
+        .collect()
 }
 
 /// Why a switched attempt must not spawn after all: its account is no longer
