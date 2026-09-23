@@ -249,29 +249,7 @@ impl BrokerClient {
             let Some(object) = error.as_object() else {
                 return Err(ClientAttemptError::Transport);
             };
-            let message = object
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("broker request failed")
-                .to_owned();
-            if object.get("code").and_then(Value::as_i64) == Some(-32602) {
-                return Err(ClientAttemptError::Domain(Error::Validation(message)));
-            }
-            let (broker_error_code, broker_error_data) = object
-                .get("data")
-                .and_then(Value::as_object)
-                .map(|data| {
-                    (
-                        data.get("code").and_then(Value::as_str).map(str::to_owned),
-                        Some(Value::Object(data.clone())),
-                    )
-                })
-                .unwrap_or((None, None));
-            return Err(ClientAttemptError::Domain(Error::Broker {
-                message,
-                broker_error_code,
-                broker_error_data,
-            }));
+            return Err(ClientAttemptError::Domain(broker_error(object)));
         }
         value
             .get("result")
@@ -735,6 +713,41 @@ pub async fn client(home: &Path, method: &str, params: Value) -> Result<Value> {
     .await
 }
 
+/// Decodes one broker JSON-RPC error object, shared by every client.
+///
+/// `-32602` is a validation error; any other error keeps the broker's
+/// `data.code` and bounded `data` as [`Error::Broker`], whose public
+/// rendering reports that code when it is allowlisted, so the CLI, MCP and
+/// socket clients show the same class. The message is bounded to 512
+/// characters.
+fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
+    let message: String = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("broker request failed")
+        .chars()
+        .take(512)
+        .collect();
+    if object.get("code").and_then(Value::as_i64) == Some(-32602) {
+        return Error::Validation(message);
+    }
+    let (broker_error_code, broker_error_data) = object
+        .get("data")
+        .and_then(Value::as_object)
+        .map(|data| {
+            (
+                data.get("code").and_then(Value::as_str).map(str::to_owned),
+                Some(Value::Object(data.clone())),
+            )
+        })
+        .unwrap_or((None, None));
+    Error::Broker {
+        message,
+        broker_error_code,
+        broker_error_data,
+    }
+}
+
 /// Calls the broker, bounding wait observations and retrying only timed-out observations.
 async fn client_with_wait_deadlines(
     home: &Path,
@@ -801,20 +814,10 @@ async fn client_with_wait_deadlines(
             return Err(crate::error::invalid("invalid broker response identity"));
         }
         if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("broker request failed")
-                .chars()
-                .take(512)
-                .collect();
-            return Err(
-                if error.get("code").and_then(Value::as_i64) == Some(-32602) {
-                    Error::Validation(message)
-                } else {
-                    Error::Runtime(message)
-                },
-            );
+            return Err(error
+                .as_object()
+                .map(broker_error)
+                .unwrap_or_else(|| Error::Runtime("broker request failed".into())));
         }
         if is_wait && value["result"]["timed_out"] == true {
             continue;
