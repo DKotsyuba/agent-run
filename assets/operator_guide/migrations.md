@@ -67,6 +67,15 @@ database's current schema; it reads the database only through its file
 header (or a read-only connection when live WAL frames exist) and writes
 nothing. Invalid input and every refusal write nothing either.
 
+Schema 2 requires canonical role files with explicit `revision`, `write`,
+`network`, `allow_external_read_roots`, `skills`, `mcp`, and
+`required_constraints` fields. Migration does not rewrite legacy role files.
+Preserve the old profile directory for rollback, prepare a separate canonical
+catalog, and point `profiles.directory` at it before admitting agents. Verify
+that `models` lists the expected roles for each provider. Claude Code loads
+plugins as a whole: every plugin-exported skill must appear in the selected
+role's skill list, or the launch is refused before the engine starts.
+
 Rollout preconditions. Stop the resident broker and unload the capacity and
 delivery launchd jobs first (`launchctl bootout gui/$(id -u)/<label>`), and
 let active agents finish. The migration enforces what it can: it holds the

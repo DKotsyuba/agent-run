@@ -4,6 +4,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-09-23
+
+- fix(claude): schema-2 Claude Code and custom gateway launches use the
+  admitted canonical role's skill list to authorize whole-plugin exports;
+  undeclared plugin skills still fail before the engine starts
+- fix(doctor): flag a schema-2 home whose profile catalog has no canonical
+  roles, before an operator resumes agent launches
+- 0.13.1 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.13.0] - 2026-09-23
 
 - feat!: schema-2 provider configuration; public `start` takes an explicit

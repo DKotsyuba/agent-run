@@ -142,7 +142,8 @@ fn profile(role: &ResolvedRolePlan) -> Profile {
 /// `role` must be the admitted canonical role, `workdir` an existing absolute
 /// directory, and `account` an enabled in-scope registered identity. Returns
 /// the digest to persist in `ResolvedLaunchAuthority.assets_sha256`; no
-/// credential value enters the generated files or returned digest.
+/// credential value enters the generated files or returned digest. Claude Code
+/// plugin skills are allowed only when the frozen role declares them.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_selected(
     config: &ProviderConfig,
@@ -190,8 +191,12 @@ pub fn materialize_selected(
     if !workdir.is_absolute() || !workdir.is_dir() {
         return Err(invalid("provider workdir must exist"));
     }
-    let runtime = runtime(config, definition.harness, model)?;
-    policy::evaluate(provider.as_str(), &runtime, &profile(&role)).admit()?;
+    let role_profile = profile(&role);
+    let mut runtime = runtime(config, definition.harness, model)?;
+    if definition.harness == HarnessId::ClaudeCode {
+        runtime.skills = role_profile.skills.clone();
+    }
+    policy::evaluate(provider.as_str(), &runtime, &role_profile).admit()?;
     let selected_label = match &reference {
         CredentialRef::Named { label, .. } => Some(label.as_str()),
         _ => None,
@@ -208,7 +213,7 @@ pub fn materialize_selected(
         .ok_or_else(|| invalid("v2 config snapshot lacks a digest"))?
         .to_owned();
     let config = shared(config);
-    if profile(&role)
+    if role_profile
         .mcp
         .iter()
         .any(|name| !config.mcp.contains_key(name))
@@ -225,7 +230,7 @@ pub fn materialize_selected(
         &config,
         &runtime,
         &request,
-        &profile(&role),
+        &role_profile,
         home,
         app_home,
         definition,

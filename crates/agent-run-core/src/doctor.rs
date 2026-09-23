@@ -122,12 +122,15 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     };
     let config_path = report.home.join("config.toml");
     plaintext_secrets(&config_path, &mut report.findings);
-    let config = match (
+    let (config, provider_starts_configured) = match (
         agent_run_config::provider_config::ProviderConfig::load(&report.home),
         Config::load(&report.home),
     ) {
-        (Ok((v2, _)), _) => providers(&v2, &mut report.findings),
-        (_, Ok(config)) => config,
+        (Ok((v2, _)), _) => {
+            let configured = !v2.providers.is_empty();
+            (providers(&v2, &mut report.findings), configured)
+        }
+        (_, Ok(config)) => (config, false),
         (Err(_), Err(_)) => {
             add(
                 &mut report.findings,
@@ -139,7 +142,12 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
             return Ok(report);
         }
     };
-    configuration(&config, &report.home, &mut report.findings);
+    configuration(
+        &config,
+        &report.home,
+        provider_starts_configured,
+        &mut report.findings,
+    );
     let snapshot = match state::diagnostics::diagnostic_snapshot(
         &report.home.join("state.db"),
         report.checked_at,
@@ -349,8 +357,14 @@ fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Checks static configuration artifacts which have direct local evidence.
-fn configuration(config: &Config, home: &Path, findings: &mut Vec<Finding>) {
+/// Checks static configuration artifacts; configured schema-2 providers
+/// require canonical roles even though shared controls have no runtimes.
+fn configuration(
+    config: &Config,
+    home: &Path,
+    provider_starts_configured: bool,
+    findings: &mut Vec<Finding>,
+) {
     for (name, server) in config.mcp.iter().take(LIMIT) {
         if !executable(&server.command) {
             add(
@@ -363,6 +377,15 @@ fn configuration(config: &Config, home: &Path, findings: &mut Vec<Finding>) {
         }
     }
     let canonical_roles = roles(config, home, findings);
+    if provider_starts_configured && !canonical_roles {
+        add(
+            findings,
+            "canonical_role_required",
+            "error",
+            "profiles",
+            "schema-2 provider starts require complete canonical role files",
+        );
+    }
     let trusted = [
         home.to_path_buf(),
         resolved(&home.join("standalone").join("current")),
@@ -1233,6 +1256,46 @@ mod tests {
             .detail
             .contains(&format!("expected v{}", crate::state::VERSION)));
         assert!(!report.ok());
+    }
+
+    /// Configured schema-2 providers require canonical roles; a deliberately
+    /// empty catalog remains clean until a provider can actually start.
+    #[test]
+    fn provider_doctor_requires_canonical_roles() {
+        let home = tempfile::tempdir().unwrap();
+        let profiles = home.path().join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        std::fs::write(home.path().join("config.toml"), "schema_version = 2\n").unwrap();
+        let role = profiles.join("review.md");
+        std::fs::write(&role, "+++\nwrite = false\n+++\nReview.\n").unwrap();
+        let report = run(home.path()).unwrap();
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "canonical_role_required"));
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "schema_version = 2\n[harnesses.codex]\nbinary = '/bin/true'\nhome = '{0}/codex'\n[harnesses.claude-code]\nbinary = '/bin/true'\nhome = '{0}/claude'\n[providers.codex]\nharness = 'codex'\nconnection = {{ kind = 'native' }}\nauth_family = 'openai'\nlimits_source = 'codex_appserver'\n[[providers.codex.models]]\nid = 'gpt'\n[[providers.codex.bindings]]\nlabel = 'global'\naccount = 'acct'\n",
+                home.path().display()
+            ),
+        )
+        .unwrap();
+        let report = run(home.path()).unwrap();
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "canonical_role_required"));
+        std::fs::write(
+            &role,
+            "+++\nrevision = 'v2'\nwrite = false\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview.\n",
+        )
+        .unwrap();
+        let report = run(home.path()).unwrap();
+        assert!(!report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "canonical_role_required"));
     }
 
     /// Builds one enabled runtime fixture from Python-equivalent config fields.
