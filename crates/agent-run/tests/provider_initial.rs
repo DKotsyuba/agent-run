@@ -1837,12 +1837,12 @@ async fn claude_exhaustion_never_switches_accounts() {
 }
 
 /// A supervisor killed while the switched attempt B is running leaves one
-/// owned attempt and a live native process; reconciliation then ends the one
-/// logical run without success, allocates nothing further and delivers at
-/// most once. The closed attempt A keeps its `exhausted` state; B, whose
-/// process was still alive, is marked lost but keeps its ownership (and
-/// reservation) because no cleanup was proven — nothing is released on an
-/// unproven assumption.
+/// owned attempt and a live native process. Reconciliation ends the one
+/// logical run without success and allocates nothing further; its periodic
+/// orphan pass then re-adopts B's recorded leader (same token and birth),
+/// terminates the verified group and releases B only on confirmed cleanup.
+/// A second periodic pass changes nothing. The closed attempt A keeps its
+/// `exhausted` state and there is at most one delivery.
 #[tokio::test]
 async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
@@ -1878,8 +1878,19 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     let _ = child.wait().await;
     assert_eq!(attempts(&home, &id).len(), 2);
     let reconciled = service.reconcile().unwrap();
-    fs::write(root.join("fixture-release"), "").unwrap();
     assert!(reconciled >= 1, "the orphaned run was reconciled");
+    let pid = Store::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap()
+        .process_group_id
+        .unwrap();
+    assert_eq!(
+        service.reconcile().unwrap(),
+        0,
+        "a second periodic pass is a no-op"
+    );
+    fs::write(root.join("fixture-release"), "").unwrap();
     let row = Store::open(&home).unwrap().get(&id).unwrap();
     assert!(
         row.status.terminal() && row.status != Status::Succeeded,
@@ -1899,10 +1910,10 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     );
     assert_eq!(
         (attempts[1].2.as_str(), attempts[1].3),
-        ("lost", 1),
+        ("lost", 0),
         "{attempts:?}"
     );
-    let proof: Option<String> = Store::open(&home)
+    let proof: String = Store::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -1911,7 +1922,22 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(proof.is_none(), "B's cleanup was never proven");
+    let proof: serde_json::Value = serde_json::from_str(&proof).unwrap();
+    assert_eq!(proof["confirmed"], true, "{proof}");
+    assert_eq!(proof["reconciled"], true, "{proof}");
+    // SAFETY: signal 0 only probes the recorded (now expected gone) group.
+    let probe = unsafe { libc::kill(-pid, 0) };
+    assert_eq!(probe, -1, "B's process group is gone");
+    let event_attempt: u32 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT t.number FROM events e JOIN attempts t ON t.id=e.attempt_id WHERE e.agent_id=? AND e.kind='attempt_cleanup_reconciled'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_attempt, 2);
     assert!(
         count(
             &home,
@@ -2020,4 +2046,40 @@ async fn switch_honors_current_policy_and_history_evidence() {
         row.failure_text
     );
     assert_eq!(attempts(&home, &id).len(), 1);
+}
+
+/// A terminal run that still owns a `prepared` attempt with no recorded
+/// child (a crash between allocation and spawn) is closed by reconciliation
+/// with exact never-spawned evidence, and nothing else changes.
+#[tokio::test]
+async fn reconcile_closes_a_never_spawned_owned_attempt() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "never-parent").await;
+    let store = Store::open(&home).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,selected_account_id,phase,ownership_active) \
+             VALUES('att_orphan',?,2,'prepared','{}',0,'acct-work','prepared',1)",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute("UPDATE agents SET status='lost' WHERE id=?", [id.as_str()])
+        .unwrap();
+    service.reconcile().unwrap();
+    let (owned, proof): (i64, String) = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json FROM attempts WHERE id='att_orphan'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(owned, 0);
+    assert!(proof.contains("never_spawned"), "{proof}");
+    assert_eq!(attempts(&home, &id).len(), 2);
 }

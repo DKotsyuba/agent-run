@@ -192,7 +192,152 @@ where
             changed.push(row.id);
         }
     }
+    release_orphaned_attempts(store, limit)?;
     Ok(changed)
+}
+
+/// Grace between SIGTERM and SIGKILL when recovering an orphaned attempt.
+const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// One provider attempt still owned by a terminal logical run.
+struct OwnedAttempt {
+    /// Attempt id.
+    id: String,
+    /// Owning logical agent.
+    agent: String,
+    /// Lifecycle phase (`prepared`, `spawning`, `cleanup_complete`, ...).
+    phase: Option<String>,
+    /// Recorded leader token, once a child was spawned.
+    token: Option<String>,
+    /// Recorded leader birth time.
+    birth: Option<f64>,
+    /// Recorded cleanup proof, when the supervisor finished it.
+    proof: Option<String>,
+    /// The run's recorded process group (the attempt leader's pid).
+    group: Option<i32>,
+}
+
+/// Releases provider attempts that a terminal logical run still owns (for
+/// example a switched attempt whose supervisor died), only on proof:
+///
+/// * a recorded confirmed cleanup proof is simply honoured;
+/// * a `prepared` attempt that never recorded a child closes with exact
+///   never-spawned evidence;
+/// * a recorded leader that still observes as the same process (token and
+///   birth) is re-adopted and its verified group terminated; ownership is
+///   released only when the cleanup evidence is confirmed.
+///
+/// A dead, reused, unknown or denied leader is never signalled. When
+/// cleanup cannot be proven the attempt stays owned and one typed
+/// `attempt_cleanup_unresolved` event records why; unknown or denied
+/// observations are simply retried by the next periodic pass. At most
+/// `limit` attempts are examined per call.
+fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
+    let rows: Vec<OwnedAttempt> = store
+        .conn
+        .prepare(
+            "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id \
+             FROM attempts t JOIN agents a ON a.id=t.agent_id \
+             WHERE t.ownership_active=1 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out') \
+             ORDER BY t.created_at,t.id LIMIT ?",
+        )?
+        .query_map([limit as i64], |row| {
+            Ok(OwnedAttempt {
+                id: row.get(0)?,
+                agent: row.get(1)?,
+                phase: row.get(2)?,
+                token: row.get(3)?,
+                birth: row.get(4)?,
+                proof: row.get(5)?,
+                group: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for attempt in rows {
+        let confirmed = attempt
+            .proof
+            .as_deref()
+            .and_then(|proof| serde_json::from_str::<serde_json::Value>(proof).ok())
+            .is_some_and(|proof| proof["confirmed"] == true || proof["never_spawned"] == true);
+        let outcome = match (&attempt.token, attempt.birth, attempt.group) {
+            _ if confirmed && attempt.phase.as_deref() == Some("cleanup_complete") => Ok(None),
+            (None, _, _) if attempt.phase.as_deref() == Some("prepared") => {
+                Ok(Some(json!({"never_spawned":true,"reconciled":true})))
+            }
+            (Some(token), Some(birth), Some(pid)) if pid > 1 => {
+                match process::observe(Some(pid), Some(token), Some(birth)) {
+                    ProcessState::Alive => {
+                        let mut owned = process::OwnedProcess::adopt(process::Identity {
+                            pid,
+                            ppid: 0,
+                            group: pid,
+                            birth,
+                            token: token.clone(),
+                            zombie: false,
+                        });
+                        match owned.cleanup_blocking(ORPHAN_GRACE) {
+                            Ok(cleanup) if cleanup.confirmed => {
+                                let mut proof = serde_json::to_value(&cleanup)?;
+                                proof["reconciled"] = json!(true);
+                                Ok(Some(proof))
+                            }
+                            Ok(_) => Err("cleanup_unconfirmed"),
+                            Err(_) => continue,
+                        }
+                    }
+                    ProcessState::Dead | ProcessState::Reused => {
+                        Err("leader_gone_descendants_unverifiable")
+                    }
+                    ProcessState::Unknown | ProcessState::Denied | ProcessState::NotStarted => {
+                        continue
+                    }
+                }
+            }
+            _ => Err("no_process_evidence"),
+        };
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match outcome {
+            Ok(proof) => {
+                let released = match &proof {
+                    Some(proof) => tx.execute(
+                        "UPDATE attempts SET cleanup_proof_json=?,phase='cleanup_complete',ownership_active=0 \
+                         WHERE id=? AND ownership_active=1",
+                        params![proof.to_string(), attempt.id],
+                    )?,
+                    None => tx.execute(
+                        "UPDATE attempts SET ownership_active=0 WHERE id=? AND ownership_active=1",
+                        [&attempt.id],
+                    )?,
+                };
+                if released == 1 {
+                    tx.execute(
+                        "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,?,?)",
+                        params![attempt.agent, attempt.id, now(), "attempt_cleanup_reconciled",
+                            proof.unwrap_or_else(|| json!({"recorded_proof":true})).to_string()],
+                    )?;
+                }
+            }
+            Err(reason) => {
+                let recorded: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE attempt_id=? AND kind='attempt_cleanup_unresolved' \
+                     AND json_extract(data_json,'$.reason')=?)",
+                    params![attempt.id, reason],
+                    |row| row.get(0),
+                )?;
+                if !recorded {
+                    tx.execute(
+                        "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,?,?)",
+                        params![attempt.agent, attempt.id, now(), "attempt_cleanup_unresolved",
+                            json!({"reason":reason}).to_string()],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// Return whether an OS state affirmatively proves the recorded owner is gone.

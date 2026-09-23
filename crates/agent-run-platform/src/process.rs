@@ -523,6 +523,20 @@ impl OwnedProcess {
             descendants_observed,
         }
     }
+    /// Re-adopt a group from a durably recorded leader identity (for example
+    /// after the owning supervisor died). Nothing is assumed: the leader must
+    /// still observe as the same process (token and birth) before any signal,
+    /// and descendants count as verified only through a later snapshot taken
+    /// while that leader is alive.
+    pub fn adopt(leader: Identity) -> Self {
+        let pid = leader.pid;
+        Self {
+            known: BTreeMap::from([(pid, leader.clone())]),
+            leader: Some(leader),
+            pid,
+            descendants_observed: false,
+        }
+    }
     /// Record descendants visible from a complete native process snapshot.
     ///
     /// Captured identities accumulate in `known` and survive later refreshes, so
@@ -637,6 +651,33 @@ impl OwnedProcess {
             },
         }
     }
+    /// Blocking twin of [`Self::cleanup`] for synchronous recovery paths: the
+    /// same verified-group signalling and evidence, sleeping the thread.
+    pub fn cleanup_blocking(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
+        let mut signals = Vec::new();
+        self.refresh();
+        if self.group_observation() == GroupObservation::Unknown {
+            return Err(Error::Runtime(
+                "process cleanup observation unavailable".into(),
+            ));
+        }
+        for (signal, name, wait) in [
+            (libc::SIGTERM, "SIGTERM", grace),
+            (libc::SIGKILL, "SIGKILL", std::time::Duration::from_secs(2)),
+        ] {
+            if self.gone() {
+                break;
+            }
+            if self.signal(signal).unwrap_or(false) {
+                signals.push(name.into());
+            }
+            let until = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < until && !self.gone() {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        self.evidence(signals)
+    }
     /// Terminate the verified group and return separate group/descendant evidence.
     pub async fn cleanup(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
@@ -664,6 +705,10 @@ impl OwnedProcess {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
+        self.evidence(signals)
+    }
+    /// Final group and descendant observation after `signals` were sent.
+    fn evidence(&self, signals: Vec<String>) -> Result<Cleanup> {
         let group = self.group_observation();
         if group == GroupObservation::Unknown {
             return Err(Error::Runtime(
