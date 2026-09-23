@@ -871,7 +871,7 @@ async fn reader_errors_never_carry_secret_text() {
     impl CredentialReader for LeakyReader {
         fn read(&self, _reference: &CredentialRef) -> agent_run_domain::Result<String> {
             Err(agent_run_domain::Error::Validation(format!(
-                "boom: {GLM_SECRET}"
+                "credential unavailable: {GLM_SECRET}"
             )))
         }
     }
