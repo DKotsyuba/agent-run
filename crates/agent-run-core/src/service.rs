@@ -1301,8 +1301,9 @@ impl Service {
 }
 
 /// Refuses a provider resume when the current configuration no longer
-/// permits the parent's frozen execution: the offering's native model alias
-/// changed, its configured effort choices exclude the requested effort, a
+/// permits the parent's frozen execution: the provider no longer runs the
+/// frozen harness through the frozen connection, the offering's native model
+/// alias changed, its configured effort choices exclude the requested effort, a
 /// current hard model restriction is absent from the frozen role,
 /// the current canonical role no longer grants something the frozen role
 /// used (write, network, external read roots, a read root, a skill or MCP
@@ -1335,6 +1336,19 @@ pub(crate) fn current_policy_permits(
     let (Some(now), Some(then)) = (offering(current), offering(&frozen.provider_config)) else {
         return refuse("model offering");
     };
+    // The one offer identity guard shared by explicit resume, automatic
+    // allocation and the switch handoff: the current provider must still
+    // run the frozen harness through the frozen connection (endpoint,
+    // protocol, header style), never a different one under the same id.
+    if current
+        .providers
+        .get(&authority.provider)
+        .is_none_or(|settings| {
+            settings.harness != authority.harness || settings.connection != authority.connection
+        })
+    {
+        return refuse("harness or connection");
+    }
     if now.native_model.as_deref().unwrap_or(&now.id)
         != then.native_model.as_deref().unwrap_or(&then.id)
     {

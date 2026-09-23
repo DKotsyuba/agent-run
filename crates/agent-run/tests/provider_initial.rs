@@ -2283,12 +2283,13 @@ async fn expiry_between_attempts_spawns_no_next_attempt() {
 }
 
 /// Handoff barrier after B was allocated and planned but before it spawned:
-/// a cancel accepted there, a revoked account, or a newly refused policy each
+/// a cancel accepted there, a revoked account, a newly refused policy, a
+/// swapped provider connection, or a removed binding each
 /// stop B from spawning (never-spawned evidence, no process), with the typed
 /// outcome and one delivery.
 #[tokio::test]
 async fn handoff_after_allocation_honours_cancel_and_revocation() {
-    for case in ["cancel", "revoke", "policy"] {
+    for case in ["cancel", "revoke", "policy", "connection", "unbind"] {
         let (_temp, home) = codex_home(["exhausted", "ok"]);
         let id = codex_admit(&home, "handoff-1", None);
         fs::write(home.join("fixture-pause-spawn-2"), "").unwrap();
@@ -2311,6 +2312,23 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
                 .unwrap()
                 .disable_account(&"acct-cx-b".parse().unwrap())
                 .unwrap(),
+            // A valid custom gateway under the same provider id must not
+            // inherit the frozen native connection's switch.
+            "connection" => edit_config(&home, |config| {
+                config["providers"]["codex-user"].as_table_mut().unwrap().insert(
+                    "connection".into(),
+                    toml::from_str::<toml::Value>(
+                        "kind = \"custom\"\nendpoint = \"https://gateway.example/v1\"\nprotocol = \"responses\"",
+                    )
+                    .unwrap(),
+                );
+            }),
+            "unbind" => edit_config(&home, |config| {
+                config["providers"]["codex-user"]["bindings"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|binding| binding["label"].as_str() != Some("b"));
+            }),
             _ => edit_config(&home, |config| {
                 config["providers"]["codex-user"]["models"][0]
                     .as_table_mut()
@@ -2349,12 +2367,20 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
                 "{:?}",
                 row.failure_text
             ),
+            "unbind" => assert!(
+                row.failure_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("account_unbound_at_handoff"),
+                "{:?}",
+                row.failure_text
+            ),
             _ => assert!(
                 row.failure_text
                     .as_deref()
                     .unwrap_or_default()
                     .contains("current_policy_refused"),
-                "{:?}",
+                "{case}: {:?}",
                 row.failure_text
             ),
         }

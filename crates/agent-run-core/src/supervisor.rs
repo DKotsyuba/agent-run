@@ -748,23 +748,7 @@ fn failover(
     crate::service::current_policy_permits(&current, identity, &identity.provider_request)
         .map_err(|_| "current_policy_refused".to_owned())?;
     let accounts = store.list_accounts().map_err(|error| error.to_string())?;
-    let bound: std::collections::BTreeSet<_> = current
-        .providers
-        .get(&authority.provider)
-        .map(|provider| {
-            provider
-                .bindings
-                .iter()
-                .filter(|binding| {
-                    binding
-                        .models
-                        .as_ref()
-                        .is_none_or(|models| models.contains(&authority.model))
-                })
-                .map(|binding| binding.account.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let bound = current_bindings(&current, authority);
     let frozen = identity
         .provider_config
         .resolve_catalog(accounts)
@@ -962,8 +946,10 @@ fn governed_lanes(
 }
 
 /// Why a switched attempt must not spawn after all: its account is no longer
-/// enabled (`account_revoked_at_handoff`) or the current configuration no
-/// longer permits the frozen execution (`current_policy_refused`).
+/// enabled (`account_revoked_at_handoff`), the current configuration no
+/// longer permits the frozen execution including its harness and connection
+/// (`current_policy_refused`), or the account is no longer bound to the
+/// provider for the model (`account_unbound_at_handoff`).
 fn handoff_blocker(
     home: &Path,
     store: &Store,
@@ -976,13 +962,45 @@ fn handoff_blocker(
     if !enabled {
         return Ok(Some("account_revoked_at_handoff"));
     }
-    let permitted = agent_run_config::provider_config::ProviderConfig::load(home)
-        .ok()
-        .is_some_and(|(current, _)| {
-            crate::service::current_policy_permits(&current, identity, &identity.provider_request)
-                .is_ok()
-        });
-    Ok((!permitted).then_some("current_policy_refused"))
+    let Ok((current, _)) = agent_run_config::provider_config::ProviderConfig::load(home) else {
+        return Ok(Some("current_policy_refused"));
+    };
+    if crate::service::current_policy_permits(&current, identity, &identity.provider_request)
+        .is_err()
+    {
+        return Ok(Some("current_policy_refused"));
+    }
+    if !current_bindings(&current, &identity.authority).contains(account) {
+        return Ok(Some("account_unbound_at_handoff"));
+    }
+    Ok(None)
+}
+
+/// The global accounts the current configuration still binds to the frozen
+/// provider for the frozen model (a binding without a model subset binds
+/// every model). Empty when the provider is no longer configured. Current
+/// bindings only narrow the frozen authority; they never add an account.
+fn current_bindings(
+    current: &agent_run_config::provider_config::ProviderConfig,
+    authority: &agent_run_domain::catalog::ResolvedLaunchAuthority,
+) -> std::collections::BTreeSet<agent_run_domain::catalog::AccountId> {
+    current
+        .providers
+        .get(&authority.provider)
+        .map(|provider| {
+            provider
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    binding
+                        .models
+                        .as_ref()
+                        .is_none_or(|models| models.contains(&authority.model))
+                })
+                .map(|binding| binding.account.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Test-only handoff barrier: when `<home>/fixture-pause-spawn-<n>` exists

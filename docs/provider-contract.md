@@ -377,7 +377,8 @@ tries to continue the same logical run on another account:
   (`cross_account_continuation_unverified`).
 - Automatic runs only (`pinned_account` otherwise), never after a cancel,
   and only while the current configuration still permits the frozen
-  execution (`current_policy_refused`). The next account comes from trusted
+  execution, including the same harness and connection (endpoint, protocol,
+  header style) under the provider id (`current_policy_refused`). The next account comes from trusted
   ranker candidates (frozen scope ∩ current bindings, never an account tried
   by this run) through the atomic allocation, with bounded stale-revision
   recomputes (`no_eligible_account`, `selection_busy`); an unsealable history
@@ -411,9 +412,11 @@ tries to continue the same logical run on another account:
   spawns no further attempt; a pending cancel wins over expiry.
 - The spawn claim refuses in the same statement while a cancel is pending or
   claimed. A switched attempt re-checks at that boundary that its account is
-  still enabled and the current configuration still permits the frozen
-  execution (`account_revoked_at_handoff`, `current_policy_refused`) and
-  otherwise never spawns (never-spawned evidence).
+  still enabled, still bound to the provider for the model, and the current
+  configuration still permits the frozen execution
+  (`account_revoked_at_handoff`, `account_unbound_at_handoff`,
+  `current_policy_refused`) and otherwise never spawns (never-spawned
+  evidence).
 - Periodic reconciliation releases provider attempts still owned by a
   terminal run only on proof: a recorded confirmed cleanup, never-spawned
   evidence for a prepared attempt without a child, or a re-adopted recorded
