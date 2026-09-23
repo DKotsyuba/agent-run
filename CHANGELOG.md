@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-09-24
+
+- fix(supervisor): settle verified descendant cleanup after the process group exits instead of losing runs when short-lived helpers finish moments later
+- fix(supervisor): record bounded cleanup failures and route supervisor errors to their component log without persisting task text or credentials
+- 0.13.2 publishes a native artifact only for macOS Apple silicon; Linux x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.13.1] - 2026-09-23
 
 - fix(claude): schema-2 Claude Code and custom gateway launches use the

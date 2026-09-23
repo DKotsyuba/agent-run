@@ -652,10 +652,18 @@ impl OwnedProcess {
         }
     }
     /// Blocking twin of [`Self::cleanup`] for synchronous recovery paths: the
-    /// same verified-group signalling and evidence, sleeping the thread.
+    /// same verified-group signalling and bounded evidence settling, sleeping
+    /// the thread. Observation retries never authorize a new signal.
     pub fn cleanup_blocking(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
         self.refresh();
+        let observation_deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while self.group_observation() == GroupObservation::Unknown
+            && std::time::Instant::now() < observation_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         if self.group_observation() == GroupObservation::Unknown {
             return Err(Error::Runtime(
                 "process cleanup observation unavailable".into(),
@@ -676,12 +684,31 @@ impl OwnedProcess {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
-        self.evidence(signals)
+        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result = self.evidence(signals.clone());
+            if result
+                .as_ref()
+                .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
+                || std::time::Instant::now() >= settle_deadline
+            {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
-    /// Terminate the verified group and return separate group/descendant evidence.
+    /// Terminate the verified group and await full group/descendant evidence for
+    /// at most two further seconds. Observation retries never authorize signals.
     pub async fn cleanup(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
         self.refresh();
+        let observation_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        while self.group_observation() == GroupObservation::Unknown
+            && tokio::time::Instant::now() < observation_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         if self.group_observation() == GroupObservation::Unknown {
             return Err(Error::Runtime(
                 "process cleanup observation unavailable".into(),
@@ -705,7 +732,18 @@ impl OwnedProcess {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
-        self.evidence(signals)
+        let settle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result = self.evidence(signals.clone());
+            if result
+                .as_ref()
+                .is_ok_and(|proof| proof.confirmed || proof.descendants_gone.is_none())
+                || tokio::time::Instant::now() >= settle_deadline
+            {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
     /// Final group and descendant observation after `signals` were sent.
     fn evidence(&self, signals: Vec<String>) -> Result<Cleanup> {
@@ -844,6 +882,37 @@ mod tests {
         assert_eq!(cleanup.descendants_gone, None);
         assert_eq!(cleanup.scope, "process_group");
         assert!(!cleanup.confirmed);
+        assert!(cleanup.signals.is_empty());
+    }
+
+    /// A captured helper outside the leader's group can outlive that group
+    /// briefly; cleanup must wait for its exact identity before confirming.
+    #[tokio::test]
+    async fn cleanup_waits_for_captured_descendant_after_group_exit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sleep")
+            .arg("0.5")
+            .spawn()
+            .expect("spawn helper");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let helper_identity = inspect(helper.id() as i32).expect("inspect helper");
+        assert_ne!(helper_identity.group, owned.pid);
+        owned.known.insert(helper_identity.pid, helper_identity);
+        leader.wait().expect("reap leader");
+
+        let cleanup = owned
+            .cleanup(std::time::Duration::from_millis(50))
+            .await
+            .expect("cleanup observation available");
+        helper.wait().expect("reap helper");
+        assert!(cleanup.confirmed);
+        assert_eq!(cleanup.descendants_gone, Some(true));
         assert!(cleanup.signals.is_empty());
     }
 }

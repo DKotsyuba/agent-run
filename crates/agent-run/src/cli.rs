@@ -1067,7 +1067,8 @@ fn provider_login_target(
 /// Success writes JSON (except the stdio server), while expected failures
 /// propagate as typed errors for `main` to render as the Python-compatible
 /// JSON error envelope. `start` and `resume` exclusively call the resident
-/// socket broker.
+/// socket broker. Long-lived API and supervisor processes select their own
+/// component log before the process-wide logger is initialized.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home.clone())?;
     // An older state database must be migrated together with its config;
@@ -1082,14 +1083,13 @@ pub async fn run(cli: Cli) -> Result<i32> {
     if matches!(&cli.command, Command::Mcp) {
         transport::mcp::exec_desktop_frontend(&home)?;
     }
-    agent_run_core::logging::configure(
-        &home,
-        if matches!(&cli.command, Command::Mcp) {
-            "mcp"
-        } else {
-            "cli"
-        },
-    );
+    let component = match &cli.command {
+        Command::Mcp => "mcp",
+        Command::Api { .. } => "api",
+        Command::Supervisor { .. } => "supervisor",
+        _ => "cli",
+    };
+    agent_run_core::logging::configure(&home, component);
     run_with(cli, CliDependencies::production(home)).await
 }
 

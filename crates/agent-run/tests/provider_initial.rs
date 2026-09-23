@@ -2877,9 +2877,20 @@ async fn cleanup_error_never_switches_or_releases() {
     service.reconcile().unwrap();
     let row = Store::open(&home).unwrap().get(&id).unwrap();
     assert_eq!(row.status, Status::Lost, "{:?}", row.failure_text);
+    let supervisor_log = fs::read_to_string(home.join("logs/supervisor.log")).unwrap();
+    assert!(supervisor_log.contains("class=RuntimeError"));
     let attempts = attempts(&home, &id);
     assert_eq!(attempts.len(), 1, "{attempts:?}");
     assert_eq!(attempts[0].3, 1, "unproven cleanup keeps ownership");
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='process_cleanup_unavailable'",
+            &id
+        ),
+        1,
+        "cleanup observation failure is durable and safe to diagnose"
+    );
     assert_eq!(
         count(
             &home,

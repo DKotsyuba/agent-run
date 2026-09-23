@@ -30,6 +30,12 @@ requires both the original group and every readable captured descendant to be
 gone. Escaped descendants are not signalled individually, and group
 disappearance alone does not claim wider tree cleanup.
 
+After the original group exits, cleanup waits up to two seconds for captured
+descendants to exit and for transient observation failures to clear. These
+retries only inspect process identities; they never authorize another signal.
+If the complete proof still cannot be established, a provider attempt keeps
+its ownership and records a bounded cleanup diagnostic for investigation.
+
 macOS uses native process APIs and a start-time-only sysctl fallback when
 same-user relationship fields are unavailable. Linux reads `/proc`; its boot ID
 prevents start-tick reuse across reboots. Both platforms fail closed when group
