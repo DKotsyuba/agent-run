@@ -251,5 +251,6 @@ id); `-32603` as a bug to report.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 16. Older resident processes refuse a
-  newer database and must be restarted after an upgrade migrates it.
+- The current database schema is version 17, reached through the paired
+  `agent-run config migrate`. Older resident processes refuse a newer database
+  and must be restarted after an upgrade migrates it.
