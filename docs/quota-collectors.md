@@ -106,6 +106,16 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   its trailing slash (Lua has no string library to do that itself). Scripts
   concatenate endpoint paths onto it; every request still re-authorizes
   against the full allowlist and budget.
+* Bounded host helpers replace the absent libraries: `ctx.json.decode` /
+  `ctx.json.encode` (decoded JSON `null` is the `ctx.json.null` sentinel,
+  distinct from an absent field), `ctx.time.rfc3339` (RFC 3339 → Unix
+  seconds or `nil`), and `ctx.text.tokens` (≤128-byte text → at most 16
+  ASCII-lowercased alphanumeric tokens, for case-insensitive model-name
+  membership). There is still no string, pattern, or coroutine library.
+* `retry-after` on a throttled response accepts delay-seconds or an
+  HTTP-date (measured against the host clock); positive horizons clamp to
+  900 s, and a throttle without a usable horizon is still the typed
+  rate-limit outcome.
 
 ## Account-scoped driver (`capacity::collectors`)
 
@@ -121,10 +131,14 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   identity is never inferred from a provider's name; an unknown script
   identity surfaces as the typed `collector_unknown` round failure, and a
   first-party identity cannot be overridden by a script file. Custom
-  scripts install through the retained-script registry: a replacement is
-  installed only when it verifies and compiles, so a bad file edit never
-  displaces the last valid revision, and script files carry no
-  credentials.
+  scripts install through the retained-script registry under their
+  complete source identity — script id plus canonical script file — so two
+  configurations reusing one id never share code. The file is read through
+  a 256 KiB bound (never allocating past it); a replacement is installed
+  only when it verifies and compiles, and each accepted revision is also
+  kept at `capacity/scripts/<sha256(identity)>.lua`, so a missing,
+  oversized, or invalid edit falls back to the last valid revision in this
+  process and in later polling rounds. Script files carry no credentials.
 * Every alias of one `(global account, script)` must declare the exact
   same binding; a contradiction is rejected during planning, before any
   credential access or network request, in either declaration order. One
@@ -138,13 +152,22 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
 * Credentials come only from the account registry's protected reference
   through the quota-side `QuotaCredentialReader`: environment, private
   file, and Keychain stores resolve at request time exactly as the shared
-  system reader does; native and named **Claude** logins resolve through
-  the Claude harness's own OAuth store (its credentials file, else the
-  service-keyed Keychain item) and only inside Rust; native Codex logins
-  are refused because Codex quota travels through app-server metadata.
-  The generic custom-gateway reader keeps its own native refusal
-  unchanged. Resolved bytes go straight into the redacted
-  `AuthCapability` — never configuration, reports, or the store. GLM quota
+  system reader does. Native and named **Claude** logins resolve only
+  inside Rust through the account-home convention the provider adapter
+  launches with: `native:claude-code` is the host login (`CLAUDE_CONFIG_DIR`
+  when set, else `~/.claude`); `named:claude-code:<label>` is only
+  `<home>/accounts/claude/<label>/claude-config`. Each directory is read
+  as Claude Code reads it — `.credentials.json`, else the Keychain item
+  `Claude Code-credentials`, suffixed `-<first 8 hex of sha256(dir)>` for
+  any explicit directory. A missing named store is an error and never
+  falls back to the default login. Codex logins are refused here because
+  Codex quota travels through app-server metadata. The generic
+  custom-gateway reader keeps its own native refusal unchanged. Every
+  resolution failure is reported as the one fixed `credential_unavailable`
+  code — reader text is never forwarded, whatever it starts with — and
+  store and ledger failures are the fixed `store_failed` /
+  `backoff_persist_failed` codes. Resolved bytes go straight into the
+  redacted `AuthCapability` — never configuration, reports, or the store. GLM quota
   uses `RawAuthorization` (the quota endpoint is not the inference
   gateway's Bearer form); Anthropic OAuth uses `BearerAuthorization` plus
   the script-supplied `anthropic-beta` header.
@@ -162,38 +185,68 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   through `record_quota_snapshot` only after a round fully succeeds.
 * The polling path dispatches on schema: `capacity collect` runs the
   account-scoped provider sources (Lua units plus Codex app-server units)
-  for a schema-v2 home, and the legacy per-runtime path otherwise.
-  CodexAppserver providers produce the same explicit account/pool
-  observations through `account/rateLimits/read` per bound label — reusing
-  the verified isolated probe and cleanup contract — normalized by the
-  same closed version-1 validation and keyed by the registered
+  for a schema-v2 home, and the legacy per-runtime path otherwise. A home
+  that declares `schema_version = 2` but fails to load reports that error
+  instead of falling back to the legacy sources. The round's `ok` is true
+  only when no Lua or Codex row failed and the backoff ledger persisted.
+* CodexAppserver providers are probed once per registered account, however
+  many provider aliases bind it, through `account/rateLimits/read` with the
+  verified isolated probe and cleanup contract. The probe login comes from
+  the account's protected reference — `native:codex` is the host login
+  (`CODEX_HOME`, else `~/.codex`), `named:codex:<label>` is
+  `<home>/accounts/codex/<label>` — never from a provider display label.
+  Buckets (`rateLimitsByLimitId`, or the legacy single `rateLimits`) map to
+  models only by the provider's own naming: a bucket whose `limitName`
+  token sequence equals a bound model's native spelling governs that model
+  alone; the general `codex` bucket governs the remaining bound models;
+  any other bucket (live example: `base_model_inference` named
+  `gpt-reserve`) has no known membership, is not applied to any model, and
+  is counted in the row's `unmapped_lanes`. Observations are normalized by
+  the same closed version-1 validation and keyed by the registered
   `AccountId`, which is what provider ranking consumes.
 
 ## First-party collectors
 
-* `glm_quota` (source identity `glm-quota`) follows the official
-  `glm-plan-usage` contract: `GET {origin}/api/monitor/usage/quota/limit`,
-  payload root `data` when present else the top-level object, `limits[]`
-  entries with `type` and `percentage`. `TOKENS_LIMIT.percentage` is the
-  five-hour token usage and is reported as the remaining share of one
-  `primary` pool's `five_hour` window. `TIME_LIMIT` is monthly MCP usage
-  and does not govern inference quota, so it is not reported; the official
-  contract establishes no weekly or reset fields and none are invented.
+* `glm_quota` (source identity `glm-quota`) calls
+  `GET {origin}/api/monitor/usage/quota/limit`; the payload root is `data`
+  when present, else the top-level object. Current Coding Plan accounts
+  return one `CREDIT_LIMIT` entry per window (the five-hour and weekly
+  pools documented at <https://zcode.z.ai/en/docs/usage-stats>). Their
+  `unit`/`number` encoding — `3`/`5` five hours, `6`/`1` one week — and
+  `nextResetTime` in epoch milliseconds, `usage` total and `currentValue`
+  used, come from an observed payload
+  (<https://github.com/robinebers/openusage/issues/1104>) and were
+  cross-checked against the live account; they are not published schema.
+  The older official `TOKENS_LIMIT` (bare `percentage` = five-hour usage,
+  as in the official `query-usage.mjs`) is still accepted. Both land in the
+  `primary` pool as distinct `five_hour` / `seven_day` windows.
+  `percentage` must agree with the counts within one point (the provider
+  rounds it); `remaining` is ignored because live values are not
+  `usage - currentValue`. `TIME_LIMIT` (monthly MCP) is never converted
+  into inference capacity. Unknown types, window encodings, out-of-range
+  numbers, or resets outside years 1–9999 fail the round typed.
 * `anthropic_usage` (source identity `anthropic-usage`) calls
   `GET {origin}/api/oauth/usage` with the Bearer capability and the
-  `anthropic-beta: oauth-2025-04-20` header. Only kinds with a recorded
-  contract are reported: `session` → `primary`/`five_hour` and
-  `weekly_all` → `secondary`/`seven_day`. Model-scoped weekly kinds and
-  every unknown kind are ignored — an all-model pool for them would
-  invent governing quota — and a payload with no known kind fails typed.
-  The live envelope has not been re-verified against a live endpoint; a
-  contract drift surfaces as the engine's typed failure categories, never
-  as invented windows.
-* Live-contract evidence is tracked separately from these fixture-verified
-  paths: the GLM field names come from the official plugin source; the
-  Anthropic live schema remains an open verification gate. The
-  credential-safe canary `cargo run -p agent-run-core --bin quota_canary --
-  <glm|anthropic> [origin|claude_home]` performs one real read-only
-  request against an approved account and prints only normalized facts
-  (status, typed failure, bounded retry-after, top-level keys, limits
-  field names and kinds) — never tokens, bodies, or headers.
+  `anthropic-beta: oauth-2025-04-20` header, and reads only `limits[]`; the
+  parallel top-level `five_hour` / `seven_day*` objects describe the same
+  pools and are never added in. `session` → `primary`/`five_hour` and
+  `weekly_all` → `secondary`/`seven_day` over every bound model;
+  `weekly_scoped` → its own `model:<key>`/`seven_day` pool over exactly
+  the bound models its `scope.model` names (exact `id`, or every
+  `display_name` token present in the model name — live payloads carry
+  `{"display_name": "Fable", "id": null}`). A scoped limit naming no bound
+  model does not apply to the account. `is_active` only marks the
+  currently binding limit (live: `true` on the critical scoped entry), so
+  it never filters. Unknown kinds, a non-null `scope.surface`, unusable
+  model scopes, scopes on general kinds, and invalid percents or resets
+  fail the round typed instead of inventing or dropping a governing pool.
+* The credential-safe canary `cargo run -p agent-run-core --bin
+  quota_canary -- <glm|anthropic> [origin]` performs one real read-only
+  request against an approved account and prints only normalized facts:
+  status, typed failure, bounded retry-after, top-level keys, `limits[]`
+  field names and kinds, and an allowlist of scalar window/scope facts
+  (`unit`, `number`, `percentage`/`percent`, count consistency, reset
+  horizon, `group`, `is_active`, `severity`, reduced `scope`).
+  `quota_canary codex [label]` (with `AGENT_RUN_HOME`, optional
+  `CODEX_BINARY`) prints only bucket ids, `limitName`, window minutes and
+  used percent. Tokens, bodies, and headers are never printed.

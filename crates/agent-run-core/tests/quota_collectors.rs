@@ -586,9 +586,10 @@ async fn credential_resolution_is_per_account_and_refuses_native_logins() {
         .find(|entry| entry["account"] == "acct-native")
         .unwrap();
     assert_eq!(native["status"], "failed");
+    // Reader text never passes through; only the one fixed code does.
     assert_eq!(
-        native["issues"][0],
-        "native login remains owned by the harness"
+        native["issues"],
+        serde_json::json!(["credential_unavailable"])
     );
     // No credential or reference text appears anywhere in the report.
     let text = report.to_string();
@@ -864,17 +865,94 @@ async fn retry_after_horizon_suppresses_later_rounds() {
     assert_eq!(client.issued(), 1, "aliases shared the suppression");
 }
 
+/// HTTP-date Retry-After values are honored, clamped to the 900 s cap, and
+/// a throttle without a usable horizon stays the typed rate-limit outcome.
+#[tokio::test]
+async fn retry_after_http_date_and_bounds() {
+    let bound = account("acct-glm");
+    for (header, horizon) in [
+        (
+            Some(
+                (chrono::Utc::now() + chrono::Duration::seconds(300))
+                    .format("%a, %d %b %Y %H:%M:%S GMT")
+                    .to_string(),
+            ),
+            Some(300.0),
+        ),
+        (Some("86400".to_owned()), Some(900.0)),
+        (Some("soon".to_owned()), None),
+        (None, None),
+    ] {
+        let home = tempdir().unwrap();
+        let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
+        registered(home.path(), &accounts);
+        let catalog = catalog(
+            vec![lua_provider(
+                "glm-a",
+                "glm_quota",
+                "https://open.bigmodel.cn",
+                ("m", None),
+                &bound,
+            )],
+            &accounts,
+        );
+        let throttled = QuotaHttpResponse {
+            status: 503,
+            headers: header
+                .iter()
+                .map(|value| ("retry-after".to_owned(), value.clone()))
+                .collect(),
+            body: Vec::new(),
+        };
+        let mut backoff = AccountBackoff::default();
+        let start = now_epoch();
+        let report = collect_provider_quota(
+            home.path(),
+            &catalog,
+            64,
+            &limits(),
+            FakeHttp::new(vec![throttled]),
+            &FakeReader,
+            &mut backoff,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report["results"][0]["issues"][0], "quota_collector_rate_limited",
+            "{header:?}"
+        );
+        // The exponential default is 60 s; a parsed horizon extends it.
+        let expected = horizon.unwrap_or(60.0);
+        assert!(backoff.suppressed(&bound, "glm-quota", start + expected - 5.0));
+        assert!(!backoff.suppressed(&bound, "glm-quota", start + expected + 5.0));
+    }
+}
+
 /// A credential reader echoing secret text cannot reach the round report.
 #[tokio::test]
 async fn reader_errors_never_carry_secret_text() {
-    struct LeakyReader;
+    /// Echoes the secret behind a plain or a trusted-looking prefix.
+    struct LeakyReader(&'static str);
     impl CredentialReader for LeakyReader {
         fn read(&self, _reference: &CredentialRef) -> agent_run_domain::Result<String> {
             Err(agent_run_domain::Error::Validation(format!(
-                "credential unavailable: {GLM_SECRET}"
+                "{}{GLM_SECRET}",
+                self.0
             )))
         }
     }
+    for prefix in [
+        "boom ",
+        "credential unavailable: ",
+        "invalid ",
+        "native login ",
+    ] {
+        reader_error_is_fixed(LeakyReader(prefix)).await;
+    }
+}
+
+/// Runs one leaky reader through a real round and checks the fixed code.
+async fn reader_error_is_fixed(reader: impl CredentialReader) {
     let home = tempdir().unwrap();
     let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
     registered(home.path(), &accounts);
@@ -896,7 +974,7 @@ async fn reader_errors_never_carry_secret_text() {
         64,
         &limits(),
         client,
-        &LeakyReader,
+        &reader,
         &mut backoff,
     )
     .await
@@ -906,7 +984,10 @@ async fn reader_errors_never_carry_secret_text() {
         !text.contains(GLM_SECRET),
         "report leaked reader text: {text}"
     );
-    assert!(text.contains("credential_unavailable"));
+    assert_eq!(
+        report["results"][0]["issues"],
+        serde_json::json!(["credential_unavailable"])
+    );
 }
 
 /// The durable ledger survives the process boundary between polling rounds.
@@ -1007,4 +1088,313 @@ account = "acct-glm"
     // Whether the live endpoint answers depends on the host; the dispatch
     // itself is the contract under test.
     assert!(row["status"].is_string());
+}
+
+/// Writes one private Claude credential document holding `token`.
+fn claude_store(dir: &Path, token: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let file = dir.join(".credentials.json");
+    std::fs::write(
+        &file,
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"{token}"}}}}"#),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Native and named Claude logins resolve their own distinct stores, and a
+/// missing named store never falls back to the default login.
+#[test]
+fn claude_native_and_named_logins_resolve_distinct_stores() {
+    use agent_run_core::capacity::collectors::QuotaCredentialReader;
+    let root = tempdir().unwrap();
+    let app_home = root.path().join("agent-run");
+    let native = root.path().join("native-claude");
+    claude_store(&native, "native-token");
+    claude_store(
+        &app_home.join("accounts/claude/alpha/claude-config"),
+        "alpha-token",
+    );
+    let reader = QuotaCredentialReader::new(app_home, native, true);
+    let read = |reference: &str| reader.read(&CredentialRef::from_str(reference).unwrap());
+    assert_eq!(read("native:claude-code").unwrap(), "native-token");
+    assert_eq!(read("named:claude-code:alpha").unwrap(), "alpha-token");
+    let missing = read("named:claude-code:beta").unwrap_err().to_string();
+    assert!(!missing.contains("native-token") && !missing.contains("alpha-token"));
+    assert!(read("native:codex").is_err());
+    assert!(read("named:codex:alpha").is_err());
+}
+
+/// Keychain service names follow Claude Code's own per-directory rule.
+#[test]
+fn claude_keychain_service_is_directory_scoped() {
+    use agent_run_core::capacity::quota_auth::keychain_service;
+    assert_eq!(
+        keychain_service(Path::new("/x/.claude"), false),
+        "Claude Code-credentials"
+    );
+    let a = keychain_service(Path::new("/a/claude-config"), true);
+    let b = keychain_service(Path::new("/b/claude-config"), true);
+    assert!(a.starts_with("Claude Code-credentials-") && a.len() == 32);
+    assert_ne!(a, b);
+}
+
+/// Runs one GLM round over `body` and returns the report.
+async fn glm_round(home: &Path, body: &str) -> serde_json::Value {
+    let accounts = [("acct-glm", "anthropic", "env:GLM_QUOTA_TOKEN")];
+    registered(home, &accounts);
+    let catalog = catalog(
+        vec![lua_provider(
+            "glm-main",
+            "glm_quota",
+            "https://api.z.ai",
+            ("glm-5.3", None),
+            &account("acct-glm"),
+        )],
+        &accounts,
+    );
+    let client = FakeHttp::new(vec![response(200, body)]);
+    let mut backoff = AccountBackoff::default();
+    collect_provider_quota(
+        home,
+        &catalog,
+        64,
+        &limits(),
+        client,
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap()
+}
+
+/// The live CREDIT_LIMIT shape yields distinct five-hour and weekly windows
+/// with epoch-millisecond resets; inconsistent or unknown shapes fail typed.
+#[tokio::test]
+async fn glm_credit_limits_map_verified_windows() {
+    let home = tempdir().unwrap();
+    // Numbers mirror the live normalized canary: 23 % of five hours, 44 % of
+    // the week, counts agreeing within rounding, `remaining` not a difference.
+    let body = r#"{"code":200,"data":{"level":"pro","limits":[
+        {"type":"CREDIT_LIMIT","unit":3,"number":5,"percentage":23,"usage":1000,"currentValue":233,"remaining":900,"nextResetTime":1900000000000},
+        {"type":"CREDIT_LIMIT","unit":6,"number":1,"percentage":44,"usage":5000,"currentValue":2210,"remaining":1,"nextResetTime":1900300000000},
+        {"type":"TIME_LIMIT","percentage":90,"currentValue":900,"usage":1000}
+    ]}}"#;
+    let report = glm_round(home.path(), body).await;
+    assert_eq!(report["results"][0]["status"], "collected", "{report}");
+    assert_eq!(
+        stored(home.path(), "acct-glm"),
+        vec![
+            (
+                "primary".to_owned(),
+                "five_hour".to_owned(),
+                Some(77.0),
+                "glm-quota".to_owned()
+            ),
+            (
+                "primary".to_owned(),
+                "seven_day".to_owned(),
+                Some(56.0),
+                "glm-quota".to_owned()
+            ),
+        ]
+    );
+    let conn = Connection::open(home.path().join("state.db")).unwrap();
+    let reset: f64 = conn
+        .query_row(
+            "SELECT reset_at FROM capacity_samples WHERE window='seven_day'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reset, 1_900_300_000.0);
+    for bad in [
+        // percentage contradicts the absolute counts
+        r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"percentage":10,"usage":100,"currentValue":50}]}}"#,
+        // unverified window encoding is never guessed
+        r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":5,"number":1,"percentage":10}]}}"#,
+        // monthly MCP usage alone is not inference capacity
+        r#"{"data":{"limits":[{"type":"TIME_LIMIT","percentage":10}]}}"#,
+        // unknown limit families fail instead of being dropped
+        r#"{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":10},{"type":"NEW_LIMIT","percentage":99}]}}"#,
+        // resets outside the representable range
+        r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"percentage":10,"nextResetTime":-5}]}}"#,
+    ] {
+        let home = tempdir().unwrap();
+        let report = glm_round(home.path(), bad).await;
+        assert_eq!(report["results"][0]["status"], "failed", "{bad}");
+        assert!(stored(home.path(), "acct-glm").is_empty());
+    }
+}
+
+/// Runs one Anthropic round over `body` for a provider serving two models.
+async fn anthropic_round(home: &Path, body: &str) -> serde_json::Value {
+    let accounts = [("acct-claude", "anthropic", "env:CLAUDE_QUOTA_TOKEN")];
+    registered(home, &accounts);
+    let mut provider = lua_provider(
+        "claude-main",
+        "anthropic_usage",
+        "https://api.anthropic.com",
+        ("claude-sonnet-5", None),
+        &account("acct-claude"),
+    );
+    let mut fable = provider.models[0].clone();
+    fable.id = "claude-fable-5-1".into();
+    provider.models.push(fable);
+    let catalog = catalog(vec![provider], &accounts);
+    let client = FakeHttp::new(vec![response(200, body)]);
+    let mut backoff = AccountBackoff::default();
+    collect_provider_quota(
+        home,
+        &catalog,
+        64,
+        &limits(),
+        client,
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap()
+}
+
+/// A model-scoped weekly limit governs exactly the model it names; unknown
+/// scope semantics fail typed instead of being ignored.
+#[tokio::test]
+async fn anthropic_scoped_limits_govern_only_their_models() {
+    let home = tempdir().unwrap();
+    // The live normalized envelope: general limits plus an active,
+    // critical weekly limit scoped to one model by display name.
+    let body = r#"{"five_hour":{"utilization":2},"seven_day_opus":{"utilization":1},"limits":[
+        {"kind":"session","group":"session","is_active":false,"percent":2,"resets_at":"2030-01-01T00:00:00Z","scope":null,"severity":"normal"},
+        {"kind":"weekly_all","group":"weekly","is_active":false,"percent":59,"resets_at":"2030-01-02T00:00:00Z","scope":null,"severity":"normal"},
+        {"kind":"weekly_scoped","group":"weekly","is_active":true,"percent":96,"resets_at":"2030-01-03T00:00:00Z","scope":{"model":{"display_name":"Fable","id":null},"surface":null},"severity":"critical"}
+    ]}"#;
+    let report = anthropic_round(home.path(), body).await;
+    assert_eq!(report["results"][0]["status"], "collected", "{report}");
+    let rows = stored(home.path(), "acct-claude");
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.0.as_str(), row.1.as_str(), row.2))
+            .collect::<Vec<_>>(),
+        vec![
+            ("model:fable", "seven_day", Some(4.0)),
+            ("primary", "five_hour", Some(98.0)),
+            ("secondary", "seven_day", Some(41.0)),
+        ]
+    );
+    let conn = Connection::open(home.path().join("state.db")).unwrap();
+    let scoped: String = conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE lane='model:fable'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(scoped.contains("claude-fable-5-1") && !scoped.contains("claude-sonnet-5"));
+    for bad in [
+        r#"{"limits":[{"kind":"session","percent":2},{"kind":"weekly_new","percent":99}]}"#,
+        r#"{"limits":[{"kind":"weekly_scoped","percent":99,"scope":{"model":{"display_name":"Fable"},"surface":"web"}}]}"#,
+        r#"{"limits":[{"kind":"weekly_scoped","percent":99,"scope":{"model":{"id":null,"display_name":null}}}]}"#,
+        r#"{"limits":[{"kind":"session","percent":2,"resets_at":"not-a-time"}]}"#,
+        r#"{"limits":[{"kind":"session","percent":2,"scope":{"model":{"display_name":"Fable"}}}]}"#,
+    ] {
+        let home = tempdir().unwrap();
+        let report = anthropic_round(home.path(), bad).await;
+        assert_eq!(report["results"][0]["status"], "failed", "{bad}");
+        assert!(stored(home.path(), "acct-claude").is_empty());
+    }
+}
+
+/// A custom script whose single window reports `remaining` for all models.
+fn custom_script(remaining: u32) -> String {
+    format!(
+        "collect = function(ctx)\n  local m = {{}}\n  for n, _ in pairs(ctx.models) do m[#m + 1] = n end\n  return {{ version = 1, windows = {{ {{ pool = \"primary\", window = \"five_hour\", models = m, remaining_percent = {remaining}, observed_at = ctx.now }} }} }}\nend\n"
+    )
+}
+
+/// Runs one round of custom id `team_quota` bound to `file` for `acct`.
+async fn custom_round(home: &Path, acct: &str, file: &Path) -> serde_json::Value {
+    let accounts = [(acct, "anthropic", "env:GLM_QUOTA_TOKEN")];
+    if !home.join("state.db").exists() {
+        registered(home, &accounts);
+    }
+    let mut provider = lua_provider(
+        "team",
+        "team_quota",
+        "https://quota.example",
+        ("model-a", None),
+        &account(acct),
+    );
+    provider.collector = Some(CollectorBinding {
+        script: "team_quota".into(),
+        origins: vec!["https://quota.example/".into()],
+        script_file: Some(file.to_path_buf()),
+        auth: Some(agent_run_domain::catalog::CredentialPlacement::BearerAuthorization),
+    });
+    let catalog = catalog(vec![provider], &accounts);
+    let mut backoff = AccountBackoff::default();
+    collect_provider_quota(
+        home,
+        &catalog,
+        64,
+        &limits(),
+        FakeHttp::new(vec![]),
+        &FakeReader,
+        &mut backoff,
+    )
+    .await
+    .unwrap()
+}
+
+/// One custom id over two files never shares code; oversized replacements
+/// are refused before allocation, and the durable last-valid copy serves a
+/// fresh process whose file went bad.
+#[tokio::test]
+async fn custom_scripts_bind_to_their_full_source_identity() {
+    use sha2::{Digest, Sha256};
+    let root = tempdir().unwrap();
+    let (file_a, file_b) = (root.path().join("a.lua"), root.path().join("b.lua"));
+    std::fs::write(&file_a, custom_script(11)).unwrap();
+    std::fs::write(&file_b, custom_script(22)).unwrap();
+    let (home_a, home_b) = (tempdir().unwrap(), tempdir().unwrap());
+    custom_round(home_a.path(), "acct-a", &file_a).await;
+    custom_round(home_b.path(), "acct-b", &file_b).await;
+    assert_eq!(stored(home_a.path(), "acct-a")[0].2, Some(11.0));
+    assert_eq!(stored(home_b.path(), "acct-b")[0].2, Some(22.0));
+    // An oversized replacement keeps the retained revision in this process.
+    std::fs::write(&file_a, "-- ".repeat(200 * 1024)).unwrap();
+    let report = custom_round(home_a.path(), "acct-a", &file_a).await;
+    assert_eq!(report["results"][0]["status"], "collected", "{report}");
+    // A fresh identity whose file is bad uses the durable copy a previous
+    // polling round left behind.
+    let file_c = root.path().join("c.lua");
+    std::fs::write(&file_c, "collect = ").unwrap();
+    let identity = format!(
+        "team_quota\n{}",
+        std::fs::canonicalize(&file_c).unwrap().display()
+    );
+    let digest: String = Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let home_c = tempdir().unwrap();
+    std::fs::create_dir_all(home_c.path().join("capacity/scripts")).unwrap();
+    std::fs::write(
+        home_c.path().join(format!("capacity/scripts/{digest}.lua")),
+        custom_script(33),
+    )
+    .unwrap();
+    let report = custom_round(home_c.path(), "acct-c", &file_c).await;
+    assert_eq!(report["results"][0]["status"], "collected", "{report}");
+    assert_eq!(stored(home_c.path(), "acct-c")[0].2, Some(33.0));
+    // Without any retained revision a bad file is a typed failure.
+    let home_d = tempdir().unwrap();
+    let file_d = root.path().join("d.lua");
+    std::fs::write(&file_d, "collect = ").unwrap();
+    let report = custom_round(home_d.path(), "acct-d", &file_d).await;
+    assert_eq!(
+        report["results"][0]["issues"][0],
+        "quota_collector_output_invalid_collector_script_unavailable"
+    );
 }

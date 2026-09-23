@@ -3,25 +3,27 @@
 //! One global [`AccountId`] owns one physical quota pool per lane across every
 //! provider alias, so this driver collects once per `(account, collector)`
 //! pair per round regardless of how many labels or providers bind it.
-//! Credentials are resolved in Rust only: explicit protected stores
-//! (environment, private file, Keychain) through the shared
-//! [`CredentialReader`], plus a narrow quota-only bridge that reads the
-//! Claude harness's own OAuth store for native/named Claude logins — tokens
-//! are never exported to Lua, configuration, diagnostics, or the store, and
-//! the generic custom-gateway reader's native refusal is left untouched.
-//! All network work happens outside every database transaction; persistence
-//! goes through [`agent_run_store::quota::record_quota_snapshot`] only after
-//! a collector round has fully succeeded.
+//! Credentials are resolved in Rust only through
+//! [`QuotaCredentialReader`] (see [`super::quota_auth`]); tokens are never
+//! exported to Lua, configuration, diagnostics, or the store, and every
+//! resolution failure is the one fixed `credential_unavailable` code.
+//! Codex accounts are observed through the app-server probe in
+//! [`super::codex_quota`]. All network work happens outside every database
+//! transaction; persistence goes through
+//! [`agent_run_store::quota::record_quota_snapshot`] only after a collector
+//! round has fully succeeded.
 
+pub use super::quota_auth::QuotaCredentialReader;
+use super::quota_auth::{BACKOFF_PERSIST_FAILED, CREDENTIAL_UNAVAILABLE, STORE_FAILED};
 use crate::{
     capacity::lua::{
         run_collector, AllowedOrigin, AuthCapability, AuthPlacement, CollectorError,
         CollectorLimits, CollectorScript, QuotaHttpClient, ScriptRegistry,
     },
-    capacity::quota::{normalize_collector_output, CollectorScope},
+    capacity::quota::CollectorScope,
     domain::now,
 };
-use agent_run_adapters::authorized_request::{CredentialReader, SystemCredentialReader};
+use agent_run_adapters::authorized_request::CredentialReader;
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_domain::{
     catalog::{
@@ -31,9 +33,11 @@ use agent_run_domain::{
     CredentialRef, Error, Result,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    io::Read,
+    path::Path,
     str::FromStr,
     sync::{Arc, Mutex, OnceLock},
 };
@@ -139,88 +143,15 @@ impl AccountBackoff {
 
 /// Process-wide retained-script registry for configured custom collectors.
 ///
-/// A custom script revision is installed only when it verifies and compiles;
-/// a rejected replacement never displaces the retained valid revision, so a
-/// bad file edit cannot break a working polling loop.
+/// Entries are keyed by the complete source identity (script id plus the
+/// canonical script file), so two configurations reusing one custom id never
+/// share code. A revision is installed only when it verifies and compiles; a
+/// rejected replacement never displaces the retained valid revision. The
+/// durable copy under `capacity/scripts/` carries that guarantee across the
+/// process boundary between polling rounds.
 fn custom_registry() -> &'static Mutex<ScriptRegistry> {
     static REGISTRY: OnceLock<Mutex<ScriptRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(ScriptRegistry::default()))
-}
-
-/// Quota-side protected resolver including the narrow native-login bridge.
-///
-/// Explicit env/file/Keychain references delegate to the shared system
-/// reader unchanged. Native and named Claude logins resolve through the
-/// Claude harness's own store (credentials file, else the service-keyed
-/// Keychain item) and only inside Rust; native Codex logins are refused
-/// because Codex quota travels through app-server metadata, not an
-/// exportable token. This does not alter the custom-gateway reader, which
-/// keeps refusing native logins for gateway headers.
-pub struct QuotaCredentialReader {
-    claude_home: PathBuf,
-}
-
-impl QuotaCredentialReader {
-    /// Builds the reader for the configured Claude harness home.
-    pub fn new(claude_home: PathBuf) -> Self {
-        Self { claude_home }
-    }
-
-    /// Reads the Claude harness's own OAuth token without exporting it.
-    fn claude_oauth(&self) -> Result<String> {
-        let file = self.claude_home.join(".credentials.json");
-        if file.is_file() {
-            let secret = SystemCredentialReader
-                .read(&CredentialRef::File(file))
-                .ok()
-                .filter(|text| !text.is_empty());
-            if let Some(text) = secret {
-                if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    let token = value
-                        .pointer("/claudeAiOauth/accessToken")
-                        .or_else(|| value.get("accessToken"))
-                        .and_then(Value::as_str)
-                        .filter(|token| !token.is_empty());
-                    if let Some(token) = token {
-                        return Ok(token.to_owned());
-                    }
-                }
-            }
-        }
-        // Claude's legacy Keychain item is keyed by service only.
-        agent_run_platform::keychain::generic_password_service("Claude Code-credentials")
-            .and_then(|text| {
-                serde_json::from_str::<Value>(&text).ok().and_then(|value| {
-                    value
-                        .pointer("/claudeAiOauth/accessToken")
-                        .or_else(|| value.get("accessToken"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-            })
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| crate::error::invalid("claude native quota token is unavailable"))
-    }
-}
-
-impl CredentialReader for QuotaCredentialReader {
-    fn read(&self, reference: &CredentialRef) -> Result<String> {
-        match reference {
-            CredentialRef::Native(agent_run_domain::catalog::HarnessId::ClaudeCode)
-            | CredentialRef::Named {
-                harness: agent_run_domain::catalog::HarnessId::ClaudeCode,
-                ..
-            } => self.claude_oauth(),
-            CredentialRef::Native(agent_run_domain::catalog::HarnessId::Codex)
-            | CredentialRef::Named {
-                harness: agent_run_domain::catalog::HarnessId::Codex,
-                ..
-            } => Err(crate::error::invalid(
-                "codex quota uses app-server metadata; no exportable token",
-            )),
-            _ => SystemCredentialReader.read(reference),
-        }
-    }
 }
 
 /// One first-party collector: identity, credential placement, and script.
@@ -236,23 +167,42 @@ pub struct FirstPartyCollector {
     pub script: &'static str,
 }
 
-/// First-party GLM plan-usage collector (official `query-usage` contract).
+/// First-party GLM Coding Plan usage collector.
 ///
 /// `GET {origin}/api/monitor/usage/quota/limit` with the raw `Authorization`
 /// token the engine injects (the quota endpoint is not the inference
 /// gateway's Bearer style). The payload root is `data` when present, else the
-/// top-level object; `limits` entries carry `type` and `percentage`.
-/// `TOKENS_LIMIT.percentage` is the five-hour token usage in the official
-/// script, reported here as the remaining share of one `primary` pool.
-/// `TIME_LIMIT` is monthly MCP usage and does not govern inference quota, so
-/// it is deliberately not reported; no weekly or reset fields exist in the
-/// official contract and none are invented.
+/// top-level object. Two `limits[].type` families govern inference:
+///
+/// - current `CREDIT_LIMIT` pools, one entry per window, whose `unit`/`number`
+///   encoding is `3`/`5` for five hours and `6`/`1` for one week (observed on
+///   the live account and in the reporting author's payload), with
+///   `nextResetTime` in epoch milliseconds, `usage` as the total and
+///   `currentValue` as the used amount;
+/// - the older official `TOKENS_LIMIT`, whose bare `percentage` is the
+///   five-hour usage (the same `unit`/`number` encoding applies when present).
+///
+/// Every window lands in the `primary` pool under a distinct `five_hour` or
+/// `seven_day` identity. `percentage` must agree with the absolute counts
+/// within one point when both are present (the provider rounds it); counts
+/// alone derive it. `remaining` is not used: live values do not equal
+/// `usage - currentValue`. `TIME_LIMIT` is monthly MCP usage and is never
+/// converted into inference capacity. Any other type, window encoding,
+/// out-of-range number, or reset outside year 1..9999 fails the round typed
+/// rather than inventing or silently omitting a pool.
 const GLM_QUOTA: FirstPartyCollector = FirstPartyCollector {
     id: "glm_quota",
     source: "glm-quota",
     placement: AuthPlacement::RawAuthorization,
     script: r#"
 collect = function(ctx)
+  local null = ctx.json.null
+  local function present(value)
+    return value ~= nil and value ~= null
+  end
+  local function number(value)
+    return type(value) == "number" and value == value
+  end
   local models = {}
   for name, _ in pairs(ctx.models) do
     models[#models + 1] = name
@@ -264,28 +214,79 @@ collect = function(ctx)
     error("quota endpoint status")
   end
   local payload = ctx.json.decode(response.body)
+  if type(payload) ~= "table" then
+    error("quota payload malformed")
+  end
   local data = payload.data
-  if data == nil then
+  if not present(data) then
     data = payload
   end
-  local limits = data.limits
-  if limits == nil then
+  if type(data) ~= "table" or type(data.limits) ~= "table" then
     error("quota payload has no limits")
   end
   local windows = {}
-  for _, item in ipairs(limits) do
-    if item.type == "TOKENS_LIMIT" and item.percentage ~= nil then
+  for _, item in ipairs(data.limits) do
+    if type(item) ~= "table" then
+      error("quota limit malformed")
+    end
+    local kind = item.type
+    if kind == "TOKENS_LIMIT" or kind == "CREDIT_LIMIT" then
+      local window = nil
+      if kind == "TOKENS_LIMIT" and not present(item.unit) and not present(item.number) then
+        window = "five_hour"
+      elseif item.unit == 3 and item.number == 5 then
+        window = "five_hour"
+      elseif item.unit == 6 and item.number == 1 then
+        window = "seven_day"
+      else
+        error("quota limit window unknown")
+      end
+      local used = nil
+      if present(item.percentage) then
+        if not number(item.percentage) or item.percentage < 0 or item.percentage > 100 then
+          error("quota percentage invalid")
+        end
+        used = item.percentage
+      end
+      if present(item.usage) or present(item.currentValue) then
+        local total = item.usage
+        local current = item.currentValue
+        if not number(total) or not number(current) or total <= 0
+          or current < 0 or current > total then
+          error("quota counts invalid")
+        end
+        local counted = current * 100.0 / total
+        if used == nil then
+          used = counted
+        elseif used - counted > 1.0 or counted - used > 1.0 then
+          error("quota counts disagree")
+        end
+      end
+      if used == nil then
+        error("quota usage absent")
+      end
+      local reset_at = nil
+      if present(item.nextResetTime) then
+        local ms = item.nextResetTime
+        if not number(ms) or ms <= 0 or ms > 253402300799000 then
+          error("quota reset invalid")
+        end
+        reset_at = ms / 1000.0
+      end
       windows[#windows + 1] = {
         pool = "primary",
-        window = "five_hour",
+        window = window,
         models = models,
-        remaining_percent = 100.0 - item.percentage,
+        remaining_percent = 100.0 - used,
+        reset_at = reset_at,
         observed_at = ctx.now
       }
+    elseif kind ~= "TIME_LIMIT" then
+      error("quota limit type unknown")
     end
   end
   if #windows == 0 then
-    error("quota payload has no token limit")
+    error("quota payload has no inference limit")
   end
   return { version = 1, windows = windows }
 end
@@ -296,23 +297,86 @@ end
 ///
 /// `GET {origin}/api/oauth/usage` with the engine-injected Bearer token and
 /// the `anthropic-beta: oauth-2025-04-20` header the endpoint requires.
-/// Only kinds with a recorded contract are reported: `session` maps to the
-/// `primary` lane's `five_hour` window and `weekly_all` to
-/// `secondary`/`seven_day`. Model-scoped weekly kinds and every unknown
-/// kind are **ignored** — mapping them to an all-model pool would invent
-/// governing quota — and a payload with no known kind fails typed instead
-/// of producing fabricated windows. The live envelope remains unverified;
-/// any drift surfaces as the engine's typed categories, never invented
-/// facts.
+/// Only the `limits[]` envelope is read — the parallel top-level
+/// `five_hour`/`seven_day*` objects describe the same pools and are never
+/// unioned in. Each entry needs a numeric `percent` in `0..=100` and, when
+/// present, an RFC 3339 `resets_at`:
+///
+/// - `session` → `primary`/`five_hour` over every bound model;
+/// - `weekly_all` → `secondary`/`seven_day` over every bound model;
+/// - `weekly_scoped` → its own `model:<key>`/`seven_day` pool over exactly
+///   the bound models its `scope.model` names: an exact native `id` match, or
+///   a model whose name tokens contain every `display_name` token (live
+///   payloads carry `{"display_name": "Fable", "id": null}`). A scoped limit
+///   naming no bound model is not applicable to this account and is skipped.
+///
+/// `is_active` only marks the currently binding limit (observed `true` on the
+/// critical scoped entry, `false` on the others); every entry constrains its
+/// models regardless, so it never filters. An unknown `kind`, a non-null
+/// `scope.surface`, an unusable model scope, or a scope on a general kind
+/// fails the round typed instead of inventing or omitting a governing pool.
 const ANTHROPIC_USAGE: FirstPartyCollector = FirstPartyCollector {
     id: "anthropic_usage",
     source: "anthropic-usage",
     placement: AuthPlacement::BearerAuthorization,
     script: r#"
 collect = function(ctx)
+  local null = ctx.json.null
+  local function present(value)
+    return value ~= nil and value ~= null
+  end
   local models = {}
+  local model_tokens = {}
   for name, _ in pairs(ctx.models) do
     models[#models + 1] = name
+    local set = {}
+    for _, token in ipairs(ctx.text.tokens(name) or {}) do
+      set[token] = true
+    end
+    model_tokens[name] = set
+  end
+  local function scoped(scope)
+    if type(scope) ~= "table" or present(scope.surface) or type(scope.model) ~= "table" then
+      error("usage scope unknown")
+    end
+    local id = scope.model.id
+    local display = scope.model.display_name
+    local wanted = nil
+    if type(display) == "string" then
+      wanted = ctx.text.tokens(display)
+    elseif present(display) then
+      error("usage scope unknown")
+    end
+    if present(id) and type(id) ~= "string" then
+      error("usage scope unknown")
+    end
+    local key = nil
+    if type(id) == "string" and id ~= "" then
+      key = id
+    elseif wanted ~= nil and #wanted > 0 then
+      key = wanted[1]
+      for index = 2, #wanted do
+        key = key .. "-" .. wanted[index]
+      end
+    else
+      error("usage scope unknown")
+    end
+    local found = {}
+    for _, name in ipairs(models) do
+      local member = name == id
+      if not member and wanted ~= nil and #wanted > 0 then
+        member = true
+        for _, token in ipairs(wanted) do
+          if not model_tokens[name][token] then
+            member = false
+          end
+        end
+      end
+      if member then
+        found[#found + 1] = name
+      end
+    end
+    return found, key
   end
   local response = ctx.http.request({
     url = ctx.origin .. "/api/oauth/usage",
@@ -322,38 +386,64 @@ collect = function(ctx)
     error("usage endpoint status")
   end
   local payload = ctx.json.decode(response.body)
-  local limits = payload.limits
-  if limits == nil then
+  if type(payload) ~= "table" or type(payload.limits) ~= "table" then
     error("usage payload has no limits")
   end
   local windows = {}
-  for _, entry in ipairs(limits) do
-    local lane = nil
-    local window = nil
-    if entry.kind == "session" then
-      lane = "primary"
-      window = "five_hour"
-    elseif entry.kind == "weekly_all" then
-      lane = "secondary"
-      window = "seven_day"
+  for _, entry in ipairs(payload.limits) do
+    if type(entry) ~= "table" then
+      error("usage entry malformed")
     end
-    if lane ~= nil and entry.percent ~= nil then
-      local reset_at = nil
-      if entry.resets_at ~= nil then
-        reset_at = ctx.time.rfc3339(entry.resets_at)
+    local lane = nil
+    local window = "seven_day"
+    local bound = models
+    if entry.kind == "session" or entry.kind == "weekly_all" then
+      if present(entry.scope) then
+        error("usage scope unknown")
       end
+      if entry.kind == "session" then
+        lane = "primary"
+        window = "five_hour"
+      else
+        lane = "secondary"
+      end
+    elseif entry.kind == "weekly_scoped" then
+      local key = nil
+      bound, key = scoped(entry.scope)
+      lane = "model:" .. key
+    else
+      error("usage kind unknown")
+    end
+    local percent = entry.percent
+    if type(percent) ~= "number" or percent ~= percent or percent < 0 or percent > 100 then
+      error("usage percent invalid")
+    end
+    if present(entry.is_active) and type(entry.is_active) ~= "boolean" then
+      error("usage entry malformed")
+    end
+    local reset_at = nil
+    if present(entry.resets_at) then
+      if type(entry.resets_at) ~= "string" then
+        error("usage reset invalid")
+      end
+      reset_at = ctx.time.rfc3339(entry.resets_at)
+      if reset_at == nil then
+        error("usage reset invalid")
+      end
+    end
+    if #bound > 0 then
       windows[#windows + 1] = {
         pool = lane,
         window = window,
-        models = models,
-        remaining_percent = 100.0 - entry.percent,
+        models = bound,
+        remaining_percent = 100.0 - percent,
         reset_at = reset_at,
         observed_at = ctx.now
       }
     end
   end
   if #windows == 0 then
-    error("usage payload has no known usage kind")
+    error("usage payload has no applicable limit")
   end
   return { version = 1, windows = windows }
 end
@@ -478,13 +568,22 @@ fn plan_catalog(catalog: &ProviderCatalog) -> Result<Vec<Planned>> {
 
 /// Resolves the runnable script and placement for one planned unit.
 ///
-/// First-party collectors contribute their frozen bytes and placement. A
-/// custom identity runs the retained registry revision of its configured
-/// script file: the file's current bytes are installed only when they verify
-/// and compile, so a bad replacement never displaces the last valid
-/// revision, and a first-party identity with a script file is a typed
-/// conflict rather than a silent override.
-fn resolve_script(unit: &Planned) -> std::result::Result<(String, AuthPlacement), CollectorError> {
+/// First-party collectors contribute their frozen bytes and placement, and a
+/// first-party identity with a script file is a typed conflict rather than a
+/// silent override. A custom identity runs the retained revision of its
+/// configured script file under its complete source identity (script id plus
+/// canonical file path): the file is read through a bound checked before any
+/// allocation beyond it, its bytes are installed only when they verify and
+/// compile, and each accepted revision is also kept at
+/// `home/capacity/scripts/<sha256(identity)>.lua`. A missing, oversized, or
+/// invalid replacement — in this process or a later polling round — falls
+/// back to that last valid revision; with none, the round fails typed.
+/// Writing the durable copy is best effort: a failed write only shortens the
+/// retention to this process.
+fn resolve_script(
+    home: &Path,
+    unit: &Planned,
+) -> std::result::Result<(String, AuthPlacement), CollectorError> {
     if let Some(collector) = unit.collector {
         if unit.binding.script_file.is_some() || unit.binding.auth.is_some() {
             return Err(CollectorError::InvalidOutput("first_party_override"));
@@ -500,35 +599,67 @@ fn resolve_script(unit: &Planned) -> std::result::Result<(String, AuthPlacement)
         None => return Err(CollectorError::InvalidOutput("collector_auth_unbound")),
     };
     let limits = CollectorLimits::default();
+    let cap = limits.vm_memory_bytes.min(MAX_SCRIPT_BYTES);
+    let canonical = std::fs::canonicalize(&file).unwrap_or(file.clone());
+    let identity = format!("{}\n{}", unit.script, canonical.display());
+    let digest: String = Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let retained = home.join("capacity/scripts").join(format!("{digest}.lua"));
     let mut registry = custom_registry()
         .lock()
         .map_err(|_| CollectorError::Internal("registry"))?;
-    let mut installed = false;
-    if let Ok(text) = std::fs::read_to_string(&file) {
-        let script = CollectorScript::new(text);
-        if registry.install(&unit.script, script, &limits).is_ok() {
-            installed = true;
+    if let Some(text) = read_bounded(&file, cap) {
+        if registry
+            .install(&identity, CollectorScript::new(text.clone()), &limits)
+            .is_ok()
+            && crate::fs::private_dir(&home.join("capacity/scripts")).is_ok()
+        {
+            let _ = std::fs::write(&retained, text);
         }
     }
-    if !installed && registry.get(&unit.script).is_none() {
-        return Err(CollectorError::InvalidOutput(
-            "collector_script_unavailable",
-        ));
+    if registry.get(&identity).is_none() {
+        if let Some(text) = read_bounded(&retained, cap) {
+            let _ = registry.install(&identity, CollectorScript::new(text), &limits);
+        }
     }
     let script = registry
-        .get(&unit.script)
-        .expect("retained or freshly installed")
+        .get(&identity)
+        .ok_or(CollectorError::InvalidOutput(
+            "collector_script_unavailable",
+        ))?
         .source
         .clone();
     Ok((script, placement))
 }
 
+/// Largest accepted custom script, matching [`CollectorScript::verify`].
+const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+
+/// Reads a UTF-8 regular file of at most `cap` bytes, allocating no more
+/// than `cap + 1` bytes; returns `None` when absent, larger, or not UTF-8.
+fn read_bounded(path: &Path, cap: usize) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > cap {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Resolves one account's credential into an engine-held capability.
 ///
-/// Native and named harness logins are refused: they stay owned by their
-/// harness and never become exportable quota tokens. Explicit protected
-/// stores are read through `reader` at request time only; the value lands in
-/// the redacted [`AuthCapability`] and nowhere else.
+/// The account's own protected reference is read through `reader` at
+/// request time only (for [`QuotaCredentialReader`], native/named Claude
+/// logins resolve through their own harness store and Codex logins are
+/// refused); the value lands in the redacted [`AuthCapability`] and nowhere
+/// else. Callers must reduce any error to a fixed code: reader text may
+/// echo credential material.
 fn capability(
     account: &AccountId,
     record: &agent_run_domain::catalog::AccountRecord,
@@ -598,7 +729,7 @@ pub async fn collect_provider_quota(
             issues.push("backoff".to_owned());
         } else {
             let record: &AccountRecord = record.expect("enabled record");
-            match resolve_script(&unit) {
+            match resolve_script(home, &unit) {
                 Err(error) => issues.push(error.to_string()),
                 Ok((text, placement)) => {
                     match capability(&unit.account, record, &unit.binding, &placement, reader) {
@@ -638,14 +769,10 @@ pub async fn collect_provider_quota(
                                         now(),
                                     ) {
                                         Ok(_) => {
-                                            windows = snapshot
-                                                .models
-                                                .first()
-                                                .map(|model| model.pools.len())
-                                                .unwrap_or(0);
+                                            windows = window_count(&snapshot);
                                             backoff.record_success(&unit.account, source);
                                         }
-                                        Err(error) => issues.push(static_reason(&error)),
+                                        Err(_) => issues.push(STORE_FAILED.to_owned()),
                                     }
                                 }
                                 Err(CollectorError::RateLimited(horizon)) => {
@@ -668,266 +795,55 @@ pub async fn collect_provider_quota(
                                 }
                             }
                         }
-                        Err(error) => {
+                        Err(_) => {
                             backoff.record_failure(&unit.account, source, at);
-                            issues.push(static_reason(&error));
+                            issues.push(CREDENTIAL_UNAVAILABLE.to_owned());
                         }
                     }
                 }
             }
         }
-        let status = if issues.is_empty() && windows > 0 {
-            "collected"
-        } else if issues.is_empty() {
-            "no_data"
-        } else {
-            all_ok = false;
-            "failed"
-        };
+        let status = row_status(&issues, windows);
+        all_ok &= status != "failed";
         results.push(finish(entry, status, windows, issues));
     }
     Ok(json!({"ok": all_ok, "results": results}))
 }
 
 /// Stamps one unit's report row with its outcome facts.
-fn finish(mut entry: Value, status: &str, windows: usize, issues: Vec<String>) -> Value {
+pub(super) fn finish(mut entry: Value, status: &str, windows: usize, issues: Vec<String>) -> Value {
     entry["status"] = json!(status);
     entry["windows"] = json!(windows);
     entry["issues"] = json!(issues);
     entry
 }
 
-/// Reduces one domain error to a bounded static reason.
-///
-/// Only the reader's own fixed code families pass through verbatim; any other
-/// text — including a malicious or echoing credential store's error string —
-/// collapses into the generic `credential_unavailable` bucket so no
-/// credential material can reach a round report.
-fn static_reason(error: &Error) -> String {
-    let text = match error {
-        Error::Validation(reason) | Error::Runtime(reason) => reason,
-        _ => return "source_failed".to_owned(),
-    };
-    const SAFE_PREFIXES: &[&str] = &[
-        "credential",
-        "native login",
-        "codex quota uses",
-        "claude native quota",
-        "invalid ",
-        "unsupported ",
-        "glm requires",
-    ];
-    if text.len() <= 128 && SAFE_PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
-        return text.clone();
-    }
-    "credential_unavailable".to_owned()
+/// Counts the distinct physical `(pool, window)` observations persisted by
+/// one snapshot; a window shared by several models counts once.
+pub(super) fn window_count(snapshot: &agent_run_domain::catalog::NormalizedQuotaSnapshot) -> usize {
+    snapshot
+        .models
+        .iter()
+        .flat_map(|model| &model.pools)
+        .flat_map(|pool| {
+            pool.windows
+                .iter()
+                .map(move |window| (pool.key.as_str(), window.name.as_str()))
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
-/// Stable collector source identity for Codex app-server observations.
-const CODEX_SOURCE: &str = "codex-appserver";
-
-/// Maps one app-server `account/rateLimits/read` response into the validated
-/// version-1 collector shape and normalizes it for `account`.
-///
-/// Buckets become physical lanes keyed by their limit id; each present
-/// primary/secondary window contributes one entry over the provider's whole
-/// model set, and `resetsAt` stays numeric epoch seconds. Reusing
-/// [`normalize_collector_output`] means the same closed validation guards
-/// app-server facts as Lua facts. Unknown or malformed fields fail typed
-/// instead of being dropped silently, mirroring `normalize_codex`.
-fn codex_snapshot(
-    account: &AccountId,
-    runtime: &str,
-    models: &BTreeSet<String>,
-    response: &Value,
-    observed: f64,
-) -> Result<agent_run_domain::catalog::NormalizedQuotaSnapshot> {
-    let raw = response
-        .get("result")
-        .filter(|value| value.is_object())
-        .unwrap_or(response);
-    let buckets = raw
-        .get("rateLimitsByLimitId")
-        .and_then(Value::as_object)
-        .ok_or_else(|| crate::error::invalid("codex quota response has no bucket map"))?;
-    let mut windows = Vec::new();
-    for (limit_id, bucket) in buckets {
-        if limit_id.is_empty() || !bucket.is_object() {
-            continue;
-        }
-        for field in ["primary", "secondary"] {
-            let Some(value) = bucket.get(field).filter(|value| !value.is_null()) else {
-                continue;
-            };
-            let used = value
-                .get("usedPercent")
-                .and_then(Value::as_f64)
-                .filter(|used| (0.0..=100.0).contains(used))
-                .ok_or_else(|| crate::error::invalid("codex quota window is malformed"))?;
-            let minutes = value
-                .get("windowDurationMins")
-                .and_then(Value::as_f64)
-                .filter(|minutes| *minutes > 0.0)
-                .ok_or_else(|| crate::error::invalid("codex quota window is malformed"))?;
-            let reset_at = value
-                .get("resetsAt")
-                .and_then(Value::as_f64)
-                .filter(|reset| reset.is_finite() && *reset >= 0.0);
-            windows.push(json!({
-                "pool": limit_id,
-                "window": crate::capacity::sources::window_name(minutes),
-                "models": models,
-                "remaining_percent": 100.0 - used,
-                "reset_at": reset_at,
-                "observed_at": observed,
-            }));
-        }
+/// Classifies one unit outcome: any issue is `failed`, otherwise
+/// `collected` when windows were persisted and `no_data` when none were.
+pub(super) fn row_status(issues: &[String], windows: usize) -> &'static str {
+    if !issues.is_empty() {
+        "failed"
+    } else if windows > 0 {
+        "collected"
+    } else {
+        "no_data"
     }
-    if windows.is_empty() {
-        return Err(crate::error::invalid("codex quota response has no windows"));
-    }
-    let scope = CollectorScope {
-        runtime: runtime.to_owned(),
-        source: CODEX_SOURCE.to_owned(),
-        models: models.clone(),
-    };
-    normalize_collector_output(
-        account,
-        &scope,
-        &json!({"version": 1, "windows": windows}),
-        observed,
-        256,
-        256,
-    )
-}
-
-/// One app-server round for every CodexAppserver provider in a v2 catalog.
-///
-/// Each enabled binding's label selects its isolated probe home exactly as
-/// the v1 path does; the verified process cleanup contract of
-/// [`crate::capacity::sources::codex_probe`] is reused unchanged. Probing is
-/// network work and completes before any store transaction opens.
-async fn codex_appserver_round(
-    home: &Path,
-    config: &ProviderConfig,
-    catalog: &ProviderCatalog,
-    backoff: &mut AccountBackoff,
-    retention: usize,
-) -> Result<Vec<Value>> {
-    let mut results = Vec::new();
-    let claude = config
-        .harnesses
-        .get(&agent_run_domain::catalog::HarnessId::Codex)
-        .expect("validated config declares the codex harness");
-    // The probe environment reads only the shared environment declarations;
-    // a synthesized legacy view supplies exactly that plus the harness paths.
-    let legacy = crate::config::Config {
-        schema_version: 1,
-        core: config.core.clone(),
-        capacity: config.capacity.clone(),
-        delivery: config.delivery.clone(),
-        profiles: config.profiles.clone(),
-        skills: config.skills.clone(),
-        mcp: config.mcp.clone(),
-        environments: config.environments.clone(),
-        runtimes: BTreeMap::new(),
-    };
-    for provider in catalog.providers() {
-        if provider.limits_source != LimitsSource::CodexAppserver {
-            continue;
-        }
-        let models: BTreeSet<String> = provider
-            .models
-            .iter()
-            .map(|model| {
-                model
-                    .native_model
-                    .clone()
-                    .unwrap_or_else(|| model.id.clone())
-            })
-            .collect();
-        for bound in &provider.bindings {
-            let at = now();
-            let mut issues = Vec::new();
-            let mut windows = 0usize;
-            let record = catalog.account(&bound.account);
-            if record.is_none_or(|record| record.status != AccountStatus::Enabled) {
-                issues.push("account_disabled".to_owned());
-            } else if backoff.suppressed(&bound.account, CODEX_SOURCE, at) {
-                issues.push("backoff".to_owned());
-            } else {
-                let runtime = serde_json::from_value::<crate::config::Runtime>(json!({
-                    "enabled": true,
-                    "adapter": "codex",
-                    "binary": claude.binary,
-                    "home": claude.home,
-                    "models": models,
-                }))
-                .map_err(|_| crate::error::invalid("invalid synthesized codex runtime"))?;
-                let observed = now();
-                let probe = crate::capacity::sources::codex_probe(
-                    home,
-                    &legacy,
-                    &runtime,
-                    Some(bound.label.as_str()),
-                    "account/rateLimits/read",
-                )
-                .await;
-                let outcome = probe.and_then(|value| {
-                    codex_snapshot(
-                        &bound.account,
-                        provider.id.as_str(),
-                        &models,
-                        &value,
-                        observed,
-                    )
-                });
-                match outcome {
-                    Ok(snapshot) => {
-                        match agent_run_store::quota::record_quota_snapshot(
-                            home,
-                            provider.id.as_str(),
-                            &snapshot,
-                            retention,
-                            now(),
-                        ) {
-                            Ok(_) => {
-                                windows = snapshot
-                                    .models
-                                    .first()
-                                    .map(|model| model.pools.len())
-                                    .unwrap_or(0);
-                                backoff.record_success(&bound.account, CODEX_SOURCE);
-                            }
-                            Err(error) => issues.push(static_reason(&error)),
-                        }
-                    }
-                    Err(_) => {
-                        backoff.record_failure(&bound.account, CODEX_SOURCE, at);
-                        issues.push("probe_failed".to_owned());
-                    }
-                }
-            }
-            let status = if issues.is_empty() && windows > 0 {
-                "collected"
-            } else if issues.is_empty() {
-                "no_data"
-            } else {
-                "failed"
-            };
-            results.push(finish(
-                json!({
-                    "account": bound.account.as_str(),
-                    "source": CODEX_SOURCE,
-                    "runtime": provider.id.as_str(),
-                }),
-                status,
-                windows,
-                issues,
-            ));
-        }
-    }
-    Ok(results)
 }
 
 /// One full account-scoped polling round for a v2 provider configuration.
@@ -935,7 +851,10 @@ async fn codex_appserver_round(
 /// Resolves the catalog against the registered account store, runs the Lua
 /// collector units and the Codex app-server units, and persists the durable
 /// backoff ledger so suppression survives the process boundary between
-/// polling rounds. Report rows carry only static typed facts.
+/// polling rounds. `ok` is true only when no row of either source failed and
+/// the ledger persisted; a ledger write failure is reported as the fixed
+/// `backoff_persist_failed` code. Report rows carry only static typed facts.
+/// There is no legacy fallback: a failed source stays failed.
 pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<Value> {
     let store = agent_run_store::Store::open(home)
         .map_err(|_| Error::Runtime("account registry is unavailable".into()))?;
@@ -945,13 +864,8 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
         crate::capacity::lua::ReqwestQuotaHttp::new(limits.http_response_body_bytes)
             .map_err(|_| Error::Runtime("quota transport unavailable".into()))?,
     );
-    let reader = QuotaCredentialReader::new(
-        config
-            .harnesses
-            .get(&agent_run_domain::catalog::HarnessId::ClaudeCode)
-            .map(|harness| harness.home.clone())
-            .unwrap_or_else(|| PathBuf::from("/nonexistent")),
-    );
+    let reader = QuotaCredentialReader::from_host(home.to_path_buf())
+        .ok_or_else(|| Error::Runtime("HOME is unavailable".into()))?;
     let retention = config.capacity.sample_retention;
     let mut backoff = AccountBackoff::load(home);
     let mut report = collect_provider_quota(
@@ -964,12 +878,15 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
         &mut backoff,
     )
     .await?;
-    let codex = codex_appserver_round(home, config, &catalog, &mut backoff, retention).await?;
-    let at = now();
-    if let Err(error) = backoff.save(home, at) {
-        report["backoff_persist"] = json!(format!("runtime:{error}"));
+    let codex =
+        super::codex_quota::codex_appserver_round(home, config, &catalog, &mut backoff, retention)
+            .await?;
+    let mut ok = report["ok"].as_bool().unwrap_or(false)
+        && codex.iter().all(|row| row["status"] != "failed");
+    if backoff.save(home, now()).is_err() {
+        report["backoff_persist"] = json!(BACKOFF_PERSIST_FAILED);
+        ok = false;
     }
-    let ok = report["ok"].as_bool().unwrap_or(false);
     if let Some(rows) = report["results"].as_array_mut() {
         rows.extend(codex);
     }

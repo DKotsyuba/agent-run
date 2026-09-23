@@ -1022,14 +1022,39 @@ async fn omniroute(name: &str) -> Result<Slice> {
     let topology = sample_topology(name, "omniroute", &samples);
     Ok(slice_from_samples(name, name, samples, topology, 0.0))
 }
+/// Returns whether `home/config.toml` parses as TOML declaring
+/// `schema_version = 2`, reading at most one MiB; unreadable or other files
+/// return `false`.
+fn declares_schema_v2(home: &Path) -> bool {
+    std::fs::File::open(home.join("config.toml"))
+        .ok()
+        .and_then(|file| {
+            use std::io::Read;
+            let mut text = String::new();
+            file.take(1024 * 1024).read_to_string(&mut text).ok()?;
+            toml::from_str::<toml::Value>(&text).ok()
+        })
+        .and_then(|value| value.get("schema_version")?.as_integer())
+        == Some(2)
+}
+
+/// Runs one capacity collection round for `home` — the entry every polling
+/// round uses. A valid schema-2 home runs the account-scoped provider
+/// sources only; a home declaring schema 2 that fails to load returns that
+/// error; anything else runs the legacy runtime sources.
 pub async fn collect(home: &Path) -> Result<Value> {
     // A schema-v2 home runs the account-scoped provider sources exclusively:
     // the launchd polling path lands here every round, and its durable
     // backoff ledger under `capacity/backoff.json` survives the process
     // boundary between rounds.
-    if let Ok((provider_config, _)) = agent_run_config::provider_config::ProviderConfig::load(home)
-    {
-        return super::collectors::collect_providers(home, &provider_config).await;
+    // A home that declares schema 2 but fails to load reports that error;
+    // it never degrades silently to the legacy runtime sources.
+    match agent_run_config::provider_config::ProviderConfig::load(home) {
+        Ok((provider_config, _)) => {
+            return super::collectors::collect_providers(home, &provider_config).await;
+        }
+        Err(error) if declares_schema_v2(home) => return Err(error),
+        Err(_) => {}
     }
     let config = Config::load(home)?;
     let started = now();

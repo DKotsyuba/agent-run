@@ -728,17 +728,28 @@ impl HttpState {
         out
     }
 
-    /// Returns the bounded numeric `retry-after` seconds a throttled
-    /// response declared, or `None` when absent, unparseable, or over the
-    /// hard ceiling. Header names are already lowercased.
+    /// Returns the bounded `retry-after` seconds a throttled response
+    /// declared, or `None` when absent, unparseable, or already past; longer
+    /// horizons clamp to the 900 s ceiling. Both standard forms are
+    /// accepted: delay-seconds and an HTTP-date (IMF-fixdate, parsed as
+    /// RFC 2822), measured against the host clock and rounded up. Header
+    /// names are already lowercased.
     fn retry_after_seconds(response: &QuotaHttpResponse) -> Option<u64> {
         let raw = response
             .headers
             .iter()
             .find(|(name, _)| name == "retry-after")
-            .map(|(_, value)| value.trim())?;
-        let seconds: u64 = raw.parse().ok()?;
-        (seconds > 0 && seconds <= 900).then_some(seconds)
+            .map(|(_, value)| value.trim())
+            .filter(|value| value.len() <= 64)?;
+        let seconds = match raw.parse::<u64>() {
+            Ok(seconds) => seconds,
+            Err(_) => {
+                let at = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+                let delta = at.timestamp_millis() as f64 / 1000.0 - crate::domain::now();
+                (delta > 0.0).then(|| delta.ceil() as u64)?
+            }
+        };
+        (seconds > 0).then_some(seconds.min(900))
     }
 
     /// Classifies one completed response: throttled statuses become the
@@ -1150,6 +1161,11 @@ async fn invoke(
     json_table
         .set("encode", encode)
         .map_err(|_| CollectorError::Internal("context"))?;
+    // Decoded JSON `null` is this sentinel, not `nil`, so scripts can tell an
+    // explicit null from an absent field without a pattern library.
+    json_table
+        .set("null", LuaValue::NULL)
+        .map_err(|_| CollectorError::Internal("context"))?;
     ctx.set("json", json_table)
         .map_err(|_| CollectorError::Internal("context"))?;
 
@@ -1173,6 +1189,26 @@ async fn invoke(
         .set("rfc3339", rfc3339)
         .map_err(|_| CollectorError::Internal("context"))?;
     ctx.set("time", time_table)
+        .map_err(|_| CollectorError::Internal("context"))?;
+
+    // Bounded host text helper replacing the absent string library for the
+    // one need collectors have: case-insensitive model-name membership.
+    let text_table = lua
+        .create_table()
+        .map_err(|_| CollectorError::Internal("context"))?;
+    let tokens = lua
+        .create_function(|lua, (text,): (String,)| {
+            if text.len() > 128 {
+                return Ok(LuaValue::Nil);
+            }
+            let list: Vec<String> = text_tokens(&text);
+            lua.to_value(&list)
+        })
+        .map_err(|_| CollectorError::Internal("context"))?;
+    text_table
+        .set("tokens", tokens)
+        .map_err(|_| CollectorError::Internal("context"))?;
+    ctx.set("text", text_table)
         .map_err(|_| CollectorError::Internal("context"))?;
 
     let function = lua
@@ -1206,6 +1242,19 @@ async fn invoke(
     Ok(snapshot)
 }
 
+/// Splits `text` into ASCII-lowercased alphanumeric tokens, in order.
+///
+/// Every non-alphanumeric byte separates tokens and empty tokens are dropped,
+/// so `"claude-fable-5-1"` yields `claude`, `fable`, `5`, `1` and `"Fable"`
+/// yields `fable`. At most 16 tokens are returned; callers bound the input.
+fn text_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .take(16)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// Maps an interpreter failure to its typed category, discarding all text
 /// except the engine's own sentinels.
 fn map_lua_error(error: mlua::Error) -> CollectorError {
@@ -1220,18 +1269,19 @@ fn map_lua_error(error: mlua::Error) -> CollectorError {
         CollectorError::InstructionLimit
     } else if text.contains(WALL_SENTINEL) {
         CollectorError::Timeout
-    } else if let Some(horizon) = text
+    } else if let Some(digits) = text
         .split(HTTP_SENTINEL)
         .nth(1)
         .and_then(|rest| rest.strip_prefix("rate_limited:"))
-        .and_then(|digits| {
-            digits
-                .split(|c: char| c.is_whitespace() || c == ':' || c == '"')
-                .next()
-        })
-        .and_then(|digits| digits.parse::<u64>().ok())
     {
-        CollectorError::RateLimited((1..=900).contains(&horizon).then_some(horizon))
+        // A throttle without a usable horizon is still the typed rate-limit
+        // outcome, never a generic HTTP failure.
+        let horizon = digits
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .filter(|horizon| (1..=900).contains(horizon));
+        CollectorError::RateLimited(horizon)
     } else if let Some(category) = text
         .split(HTTP_SENTINEL)
         .nth(1)

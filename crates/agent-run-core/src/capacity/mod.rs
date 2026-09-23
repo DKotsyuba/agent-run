@@ -1,11 +1,13 @@
 //! Quota snapshots, exact physical-pool identities and pure read-only ranking.
 //! A failed collector never replaces good evidence with an invented zero.
 pub mod advice;
+pub mod codex_quota;
 pub mod collectors;
 pub mod lua;
 pub mod omniroute;
 pub mod provider_ranking;
 pub mod quota;
+pub mod quota_auth;
 pub mod ranking;
 pub mod sources;
 use crate::{config::Config, domain::now, error::invalid, state::Store, Result};
