@@ -383,6 +383,18 @@ tries to continue the same logical run on another account:
   by this run) through the atomic allocation, with bounded stale-revision
   recomputes (`no_eligible_account`, `selection_busy`); an unsealable history
   (for example a pending tool call) refuses with `continuation_unavailable`.
+- The switch also requires proof that this logical request's admitted task
+  reached native history (`task_proven` in the seal evidence). The Codex
+  runner records each attempt's own `turn/start` id and the SHA-256 of its
+  exact wire input (role preamble plus task) as a `native_turn_started`
+  event; at the cleanup boundary the sealed rollout must contain a user
+  `message` whose `internal_chat_message_metadata_passthrough.turn_id` is
+  that id with an `input_text` of that digest. A later automatic attempt
+  carries the proof of an earlier attempt of the same logical run; an
+  explicit-resume parent's turns never count and text is never matched.
+  An early rejection before the input was recorded (meta-only history)
+  refuses with `continuation_unavailable: the admitted task never reached
+  native history`; nothing is replayed.
 - The next attempt re-verifies the previous attempt's seal against the root
   its launch plan selects, resumes the same thread (`thread/resume`) and, as
   Codex app-server requires `input` on `turn/start`, sends one fixed internal

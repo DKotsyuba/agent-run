@@ -115,6 +115,55 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
     Ok(())
 }
 
+/// Reports whether the sealed Codex history shows the admitted turn itself:
+/// a `response_item` user `message` whose
+/// `internal_chat_message_metadata_passthrough.turn_id` is exactly `turn`
+/// (the id `turn/start` returned for this attempt) and one of whose
+/// `input_text` items hashes to `input_sha256` (the exact wire input, role
+/// preamble included).
+///
+/// Provenance is the turn id, never text equality, so an older turn with
+/// identical text (an explicit-resume parent, a repeated control text) can
+/// never stand in for this one. The file is re-read and must still match
+/// the seal; a changed or unreadable history is an error, not `false`.
+/// `false` means the turn never reached native history (for example a
+/// usage-limit rejection before the user input was recorded).
+pub fn admitted_turn_recorded(seal: &HistorySeal, turn: &str, input_sha256: &str) -> Result<bool> {
+    if seal.harness != HarnessId::Codex || turn.is_empty() {
+        return Ok(false);
+    }
+    let bytes = read(&seal.root, &seal.relative)?;
+    if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
+        return Err(unavailable("native history changed since it was sealed"));
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| unavailable("native history is not UTF-8"))?;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line)
+            .map_err(|_| unavailable("native history has a malformed record"))?;
+        let payload = &record["payload"];
+        if record["type"] != "response_item"
+            || payload["type"] != "message"
+            || payload["role"] != "user"
+            || payload["internal_chat_message_metadata_passthrough"]["turn_id"] != turn
+        {
+            continue;
+        }
+        let admitted = payload["content"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "input_text"
+                    && item["text"]
+                        .as_str()
+                        .is_some_and(|text| fs::sha256(text.as_bytes()) == input_sha256)
+            })
+        });
+        if admitted {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Reads `relative` under `root` through the anchored no-follow directory
 /// primitive, refusing escapes, links, non-regular files and more than the
 /// byte bound (the bound applies to the bytes actually read).
@@ -447,5 +496,45 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The admitted-turn proof is keyed by the attempt's own turn id and
+    /// input digest: the exact turn proves it, the same text under another
+    /// (older) turn or another digest does not, a meta-only history does
+    /// not, a changed file is an error, and an unfinished tool call cannot
+    /// even be sealed.
+    #[test]
+    fn admitted_turn_proof_is_bound_to_turn_id_and_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = "ROLE PREAMBLE\n\nfixture:task";
+        let digest = crate::fs::sha256(input.as_bytes());
+        let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n";
+        let user = |turn: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user",
+                    "content":[{"type":"input_text","text":input}],
+                    "internal_chat_message_metadata_passthrough":{"turn_id":turn}}})
+            )
+        };
+        let path = rollout(temp.path(), "s1", &format!("{meta}{}", user("old-turn")));
+        let sealed = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
+        assert!(!super::admitted_turn_recorded(&sealed, "new-turn", &digest).unwrap());
+        assert!(super::admitted_turn_recorded(&sealed, "old-turn", &digest).unwrap());
+        let other = crate::fs::sha256(b"another input");
+        assert!(!super::admitted_turn_recorded(&sealed, "old-turn", &other).unwrap());
+        fs::write(&path, meta).unwrap();
+        let meta_only = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
+        assert!(!super::admitted_turn_recorded(&meta_only, "new-turn", &digest).unwrap());
+        fs::write(&path, format!("{meta}{}", user("new-turn"))).unwrap();
+        assert!(
+            super::admitted_turn_recorded(&meta_only, "new-turn", &digest)
+                .unwrap_err()
+                .to_string()
+                .contains("changed since it was sealed")
+        );
+        let pending = "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"c1\"}}\n";
+        fs::write(&path, format!("{meta}{}{pending}", user("new-turn"))).unwrap();
+        assert!(super::seal(HarnessId::Codex, temp.path(), "s1").is_err());
     }
 }

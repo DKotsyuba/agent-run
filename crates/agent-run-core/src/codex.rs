@@ -566,7 +566,11 @@ pub async fn run(
         return Err(invalid("thread resume returned another thread"));
     }
     store.runtime_session(&record.id, &tid)?;
-    let mut turn_params = json!({"threadId":tid,"input":[{"type":"text","text":format!("{}\n\n{}",role.body,record.request.task)}]});
+    // The exact wire input (role preamble included) is what native history
+    // must later show under this turn's id.
+    let input = format!("{}\n\n{}", role.body, record.request.task);
+    let input_sha256 = crate::fs::sha256(input.as_bytes());
+    let mut turn_params = json!({"threadId":tid,"input":[{"type":"text","text":input}]});
     if let Some(effort) = &record.request.effort {
         turn_params["effort"] = json!(effort);
     }
@@ -580,6 +584,13 @@ pub async fn run(
         .ok_or_else(|| invalid("turn start did not return an id"))?
         .to_owned();
     session.turn_started(&turn_id)?;
+    // Attempt-bound provenance for continuation: this attempt's own turn id
+    // and the digest of the input it admitted (never the text itself).
+    store.event(
+        &record.id,
+        "native_turn_started",
+        &json!({"turn":turn_id,"input_sha256":input_sha256}),
+    )?;
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();

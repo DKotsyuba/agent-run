@@ -12,7 +12,7 @@ use crate::{
 };
 use agent_run_config::role_plan::ResolvedRolePlan;
 use agent_run_domain::catalog::HarnessId;
-use rusqlite::{params, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::{ffi::OsStr, path::Path, time::Duration};
@@ -846,13 +846,68 @@ fn history_evidence(
         return json!({"native_history_unavailable":"the attempt named no native storage"});
     };
     match crate::continuity::seal(identity.authority.harness, &root, &session) {
-        Ok(seal) => json!({"native_history":{
-            "seal": seal,
-            "provider": identity.authority.provider,
-            "assets_sha256": identity.authority.assets_sha256,
-            "attempt": attempt,
-        }}),
+        Ok(seal) => {
+            // Any failure to prove it (including changed history) is simply
+            // unproven: automatic continuation then fails closed.
+            let task_proven = task_proven(store, id, attempt, &seal).unwrap_or(false);
+            json!({"native_history":{
+                "seal": seal,
+                "provider": identity.authority.provider,
+                "assets_sha256": identity.authority.assets_sha256,
+                "attempt": attempt,
+                "task_proven": task_proven,
+            }})
+        }
         Err(error) => json!({"native_history_unavailable": error.to_string()}),
+    }
+}
+
+/// Whether THIS logical run's admitted task provably reached native history
+/// by the end of `attempt`: either this attempt's own recorded
+/// `native_turn_started` turn (its id and input digest) appears as a user
+/// message in the sealed history, or an earlier attempt of the same logical
+/// agent already proved it (a later automatic attempt only continues that
+/// proven conversation). Earlier attempts of a different agent (an
+/// explicit-resume parent) never count, and neither does matching text.
+fn task_proven(
+    store: &Store,
+    id: &AgentId,
+    attempt: &str,
+    seal: &crate::continuity::HistorySeal,
+) -> Result<bool> {
+    let prior: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT adapter_state_json FROM attempts WHERE agent_id=?1 \
+             AND number < (SELECT number FROM attempts WHERE id=?2 AND agent_id=?1) \
+             ORDER BY number DESC LIMIT 1",
+            rusqlite::params![id.as_str(), attempt],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if prior
+        .and_then(|state| serde_json::from_str::<serde_json::Value>(&state).ok())
+        .is_some_and(|state| state["native_history"]["task_proven"] == true)
+    {
+        return Ok(true);
+    }
+    let turn: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE agent_id=? AND attempt_id=? \
+             AND kind='native_turn_started' ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![id.as_str(), attempt],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(turn) = turn.and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+    else {
+        return Ok(false);
+    };
+    match (turn["turn"].as_str(), turn["input_sha256"].as_str()) {
+        (Some(turn), Some(digest)) => crate::continuity::admitted_turn_recorded(seal, turn, digest),
+        _ => Ok(false),
     }
 }
 /// The native history storage root a launch environment selects: `CODEX_HOME`

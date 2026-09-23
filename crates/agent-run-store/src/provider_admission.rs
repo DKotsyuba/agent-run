@@ -585,8 +585,9 @@ impl Store {
     /// Requires: the agent is a nonterminal provider run with no pending or
     /// claimed cancel; its latest attempt is the only owned one, has verified
     /// cleanup proof, a recorded authoritative `quota_exhausted` native
-    /// failure and a recorded native history seal (the continuation
-    /// evidence); the selection intent is automatic (a pinned run never
+    /// failure and a recorded native history seal whose `task_proven` shows
+    /// this logical request's admitted turn reached native history (the
+    /// continuation evidence); the selection intent is automatic (a pinned run never
     /// switches); `candidates` are for the agent's frozen provider and model
     /// at the current capacity revision. The chosen account must be in the
     /// frozen scope, enabled now, and not tried by any earlier attempt of the
@@ -685,6 +686,14 @@ impl Store {
             return Err(Error::Unsupported(
                 "continuation_unavailable: the previous attempt recorded no native history seal"
                     .into(),
+            ));
+        }
+        // The sealed history must also prove this logical request's admitted
+        // task reached the native session; a meta-only or early-rejected
+        // history would otherwise continue a conversation that never began.
+        if evidence["native_history"]["task_proven"] != true {
+            return Err(Error::Unsupported(
+                "continuation_unavailable: the admitted task never reached native history".into(),
             ));
         }
         candidates.validate()?;

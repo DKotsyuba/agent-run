@@ -1687,6 +1687,116 @@ fn count(home: &Path, sql: &str, id: &AgentId) -> i64 {
         .unwrap()
 }
 
+/// Reads the user-role inputs of a run's native rollout, in order.
+fn rollout_inputs(row: &agent_run::state::Record) -> Vec<String> {
+    let thread = row.runtime_session_id.clone().unwrap();
+    let rollout = fs::read_to_string(
+        std::path::Path::new(
+            row.identity.as_ref().unwrap()["runtime_home"]
+                .as_str()
+                .unwrap(),
+        )
+        .join(format!(
+            "sessions/2026/09/23/rollout-fixture-{thread}.jsonl"
+        )),
+    )
+    .unwrap();
+    rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["payload"]["role"] == "user")
+        .map(|record| {
+            record["payload"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// An early usage-limit rejection before the user input reached native
+/// history (a meta-only rollout) is sealable but proves no admitted task:
+/// the automatic switch refuses with the typed continuation blocker, B is
+/// never allocated, and the run keeps one user journal entry and one
+/// delivery. The original task is never replayed elsewhere.
+#[tokio::test]
+async fn early_quota_rejection_with_meta_only_history_never_switches() {
+    let (_temp, home) = codex_home(["exhausted early", "ok"]);
+    let id = codex_run(&home, "early-1", None).await;
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed, "{:?}", row.failure_text);
+    assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("admitted task never reached native history"),
+        "{:?}",
+        row.failure_text
+    );
+    assert_eq!(attempts(&home, &id).len(), 1);
+    assert!(rollout_inputs(&row).is_empty(), "meta-only history");
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+            &id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+}
+
+/// An explicit-resume child whose own turn never reached native history
+/// cannot switch accounts even though the inherited parent history holds a
+/// user message with the identical task text: provenance is the child's
+/// own turn id, never matching text.
+#[tokio::test]
+async fn inherited_identical_text_cannot_prove_an_explicit_child_task() {
+    let (_temp, home) = codex_home(["ok", "ok"]);
+    let parent = codex_run(&home, "parent-1", None).await;
+    assert_eq!(
+        Store::open(&home).unwrap().get(&parent).unwrap().status,
+        Status::Succeeded
+    );
+    fs::write(home.join("accounts/codex/a/auth.json"), "exhausted early").unwrap();
+    let service = Service::new(home.clone());
+    let child = service
+        .admit_provider_resume(
+            &Store::open(&home).unwrap().get(&parent).unwrap(),
+            "fixture:original-task".into(),
+            None,
+            Some("child-1".into()),
+            None,
+        )
+        .unwrap();
+    let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    run_to_end(&home, &child).await;
+    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    assert_eq!(row.status, Status::Failed, "{:?}", row.failure_text);
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("admitted task never reached native history"),
+        "{:?}",
+        row.failure_text
+    );
+    assert_eq!(attempts(&home, &child).len(), 1);
+    // The inherited history does contain the identical text.
+    assert!(rollout_inputs(&row)
+        .iter()
+        .any(|input| input.contains("fixture:original-task")));
+}
+
 /// Automatic in-flight switch: A's authoritative usage-limit failure closes
 /// A, allocates B on the same logical agent, continues the same native thread
 /// with one internal control turn (the original task is sent and journaled
@@ -1745,9 +1855,29 @@ async fn exhausted_account_switches_within_the_same_logical_run() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|record| record["payload"]["role"] == "user")
-        .map(|record| record["payload"]["content"].as_str().unwrap().to_owned())
+        .map(|record| {
+            record["payload"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
         .collect();
     assert_eq!(inputs.len(), 2, "{inputs:?}");
+    // A's own admitted turn is proven in native history; B carries it.
+    let proven = |number: u32| -> serde_json::Value {
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT adapter_state_json FROM attempts WHERE agent_id=? AND number=?",
+                rusqlite::params![id.as_str(), number],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&state).unwrap()["native_history"]["task_proven"]
+            .clone()
+    };
+    assert_eq!(proven(1), true);
+    assert_eq!(proven(2), true);
     assert!(inputs[0].contains("fixture:original-task"));
     assert!(!inputs[1].contains("fixture:original-task"));
     assert!(inputs[1].contains(agent_run::supervisor::CONTINUATION_CONTROL));

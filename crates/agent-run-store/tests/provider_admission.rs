@@ -455,7 +455,7 @@ fn cleaned_run(
         .unwrap();
     assert_eq!(admission.account_id.as_str(), "acct-a");
     let state = if seal {
-        json!({"native_history":{"seal":{"session":"s"}},"native_failure":{"class":"quota_exhausted"}}).to_string()
+        json!({"native_history":{"seal":{"session":"s"},"task_proven":true},"native_failure":{"class":"quota_exhausted"}}).to_string()
     } else {
         json!({"native_failure":{"class":"quota_exhausted"}}).to_string()
     };
@@ -497,6 +497,41 @@ fn ownership(store: &Store, id: &agent_run_domain::domain::AgentId) -> (i64, u64
         reserved,
         count("SELECT COUNT(*) FROM attempts WHERE agent_id=?"),
     )
+}
+
+/// A sealed history that does not prove the admitted task (meta-only or an
+/// early rejection) cannot allocate another attempt: the typed
+/// continuation refusal writes nothing.
+#[test]
+fn next_attempt_requires_the_admitted_task_proof() {
+    let home = home();
+    let (mut store, id) = cleaned_run(home.path(), "unproven-1", true);
+    let catalog = catalog(&store);
+    for proof in [json!(false), serde_json::Value::Null] {
+        let mut state = json!({"native_history":{"seal":{"session":"s"}},"native_failure":{"class":"quota_exhausted"}});
+        if !proof.is_null() {
+            state["native_history"]["task_proven"] = proof;
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET adapter_state_json=? WHERE agent_id=?",
+                rusqlite::params![state.to_string(), id.as_str()],
+            )
+            .unwrap();
+        let before = ownership(&store, &id);
+        let revision = store.quota_capacity_revision().unwrap();
+        let refused = store
+            .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("admitted task never reached native history"),
+            "{refused}"
+        );
+        assert_eq!(ownership(&store, &id), before);
+    }
 }
 
 /// After verified cleanup the next attempt goes to an untried account on the

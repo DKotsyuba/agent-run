@@ -226,9 +226,14 @@ fn native_history(session: &str, task: &str) {
 /// `thread/resume` (echoing the requested grant and keeping the resumed
 /// thread id) and `turn/start`. It keeps a Codex-shaped rollout in
 /// `$CODEX_HOME/sessions/.../rollout-fixture-<thread>.jsonl` with the turn
-/// input. A turn fails with the authoritative `usageLimitExceeded` code when
-/// the linked `$CODEX_HOME/auth.json` contains `exhausted`; otherwise it
-/// completes with an agent message naming the thread.
+/// input as the installed Codex records it: a user `message` whose
+/// `input_text` is the exact wire input, tagged with the turn id in
+/// `internal_chat_message_metadata_passthrough`. Turn ids are unique per
+/// process and turn, like real ones. A turn fails with the authoritative
+/// `usageLimitExceeded` code when the linked `$CODEX_HOME/auth.json`
+/// contains `exhausted`; with `early` as well, it is rejected before the
+/// user input is recorded (meta-only history). Otherwise it completes with
+/// an agent message naming the thread.
 fn app_server() {
     let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
     let exhausted = std::fs::read_to_string(home.join("auth.json"))
@@ -284,13 +289,21 @@ fn app_server() {
                     std::thread::sleep(Duration::from_millis(1500));
                 }
                 turns += 1;
-                let turn = format!("turn-{turns}");
+                let turn = format!("turn-{}-{turns}", std::process::id());
                 let input = params["input"][0]["text"].as_str().unwrap_or("").to_owned();
                 let rollout = rollout_path(&home, &thread);
-                append(
-                    &rollout,
-                    &json!({"type":"response_item","payload":{"type":"message","role":"user","content":input}}),
-                );
+                let early = exhausted
+                    && std::fs::read_to_string(home.join("auth.json"))
+                        .map(|text| text.contains("early"))
+                        .unwrap_or(false);
+                if !early {
+                    append(
+                        &rollout,
+                        &json!({"type":"response_item","payload":{"type":"message","role":"user",
+                            "content":[{"type":"input_text","text":input}],
+                            "internal_chat_message_metadata_passthrough":{"turn_id":turn}}}),
+                    );
+                }
                 emit(json!({"id":id,"result":{"turn":{"id":turn}}}));
                 // `hold` in the auth file pauses before the terminal frame
                 // until the test releases it (a deterministic barrier).
