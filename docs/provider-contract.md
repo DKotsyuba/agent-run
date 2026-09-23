@@ -383,9 +383,34 @@ tries to continue the same logical run on another account:
   one logical slot, and yields one final answer and delivery.
 - A blocked switch ends the run failed with `quota_exhausted` and
   `failover_blocked: <reason>`.
-- Exhaustion is not fed into the physical-quota latch: Codex's
-  `usageLimitExceeded` names no window, so it only excludes that account for
-  this run; Claude windows are not mapped to physical lanes yet.
+- Exhaustion feeds the durable latch only where the provider's own collector
+  mapping identifies the physical pool: a Claude Code provider using the
+  `anthropic_usage` collector latches `five_hour` as `primary`/`five_hour`
+  and `seven_day` as `secondary`/`seven_day` (source
+  `claude-rate-limit-event`). Codex's windowless `usageLimitExceeded`,
+  model-scoped weekly windows and overage only exclude the account for this
+  run. The ranker resolves lanes by model alias, so collector-keyed pools
+  like these are not yet consulted during selection.
+
+### One run deadline, handoff serialization and recovery
+
+- A provider run has one deadline: its admission time (`created_at`) plus
+  its stored `timeout_seconds`, re-read before every spawn. Each attempt runs
+  only for the remainder; on expiry the runner is dropped, the process group
+  cleaned, and the run ends `timed_out` once. An expired run allocates or
+  spawns no further attempt; a pending cancel wins over expiry.
+- The spawn claim refuses in the same statement while a cancel is pending or
+  claimed. A switched attempt re-checks at that boundary that its account is
+  still enabled and the current configuration still permits the frozen
+  execution (`account_revoked_at_handoff`, `current_policy_refused`) and
+  otherwise never spawns (never-spawned evidence).
+- Periodic reconciliation releases provider attempts still owned by a
+  terminal run only on proof: a recorded confirmed cleanup, never-spawned
+  evidence for a prepared attempt without a child, or a re-adopted recorded
+  leader (same token and birth) whose verified group it terminates with
+  confirmed evidence. A dead, reused, unknown or denied leader is never
+  signalled; unprovable cleanup stays owned with one typed
+  `attempt_cleanup_unresolved` event. Closed attempts keep their state.
 
 ### Attempt-bound journaling and native failure signals
 
