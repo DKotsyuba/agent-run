@@ -2451,3 +2451,58 @@ async fn follow_viewer_spans_attempts_and_survives_interrupt() {
         "{output:?}"
     );
 }
+
+/// An owned attempt of a terminal run whose recorded leader is gone (its
+/// descendants therefore unverifiable) is never signalled or released:
+/// reconciliation records one typed `attempt_cleanup_unresolved` blocker,
+/// keeps ownership, and a later pass adds no duplicate.
+#[tokio::test]
+async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "unresolved-parent").await;
+    // A real pid that has exited and been reaped: provably not our leader.
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = gone.id() as i32;
+    gone.wait().unwrap();
+    let store = Store::open(&home).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,selected_account_id,phase,process_identity,process_birth_time,ownership_active) \
+             VALUES('att_unproven',?,2,'running','{}',0,'acct-work','spawning','not-this-process',1.0,1)",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='lost',process_group_id=? WHERE id=?",
+            rusqlite::params![pid, id.as_str()],
+        )
+        .unwrap();
+    service.reconcile().unwrap();
+    service.reconcile().unwrap();
+    let store = Store::open(&home).unwrap();
+    let owned: i64 = store
+        .conn
+        .query_row(
+            "SELECT ownership_active FROM attempts WHERE id='att_unproven'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owned, 1, "unprovable cleanup is never released");
+    let reasons: Vec<String> = store
+        .conn
+        .prepare("SELECT json_extract(data_json,'$.reason') FROM events WHERE attempt_id='att_unproven' AND kind='attempt_cleanup_unresolved'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        reasons,
+        vec!["leader_gone_descendants_unverifiable".to_owned()]
+    );
+}
