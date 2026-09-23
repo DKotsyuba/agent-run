@@ -197,7 +197,6 @@ fn compare_tree(expected: &Value, home: &Path, workdir: &Path) {
     files(home, home, &mut actual_files);
     actual_files.remove(".agent-run-rust-snapshot.json");
     actual_files.remove(".agent-run-snapshots.json");
-    actual_files.remove(".agent-run-plugin-launch.json");
     actual_files.remove(".agent-run-snapshot.json");
     let expected_names = expected_files
         .keys()

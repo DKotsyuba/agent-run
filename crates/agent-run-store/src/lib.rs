@@ -1,4 +1,5 @@
 //! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
+pub mod accounts;
 /// Atomic durable admission, replay, and active-capacity reservation.
 pub mod admission;
 /// Durable delivery outbox rows, binding, expiry, and evidence verdicts.
@@ -12,11 +13,15 @@ pub mod lineage;
 pub mod migrations;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
+pub mod provider_admission;
+/// Account-bound quota observation persistence and the exhaustion latch.
+pub mod quota;
 /// Python-compatible normalization and repair of cumulative run usage rows.
 pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
 use agent_run_domain::{
+    catalog::{AccountId, PhysicalQuotaKey},
     domain::{self, now, AgentId, Outcome, StartRequest, Status},
     error::invalid,
     Error, Result,
@@ -32,7 +37,9 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-pub const VERSION: i64 = 16;
+/// The current schema; the canonical value lives with the sealed-release
+/// metadata so release, deployment and migration agree on it.
+pub const VERSION: i64 = agent_run_platform::release::STORE_SCHEMA_VERSION;
 pub const ACTIVE_SQL: &str = "('created','starting','running','cancelling')";
 /// How long an ordinary store connection waits out a competing writer before
 /// giving up with `SQLITE_BUSY`.
@@ -54,6 +61,12 @@ pub(crate) const MIGRATION_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Store {
     pub conn: Connection,
     pub home: PathBuf,
+    /// The attempt this handle writes for, once a supervisor binds it:
+    /// events, transcript messages and runtime-session records then carry
+    /// exactly this attempt id (checked to belong to the agent), also after
+    /// its ownership was released. Unbound handles keep the historical rule
+    /// (the agent's currently owned attempt, else NULL for logical records).
+    attempt: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -163,6 +176,12 @@ impl Record {
         })
     }
 }
+/// SQL for the attempt id of a record written for agent `?1` by a handle
+/// bound to attempt `?2`: exactly that attempt when bound (NULL if it is not
+/// the agent's), otherwise the agent's currently owned attempt, else NULL.
+const ATTEMPT_OF: &str =
+    "CASE WHEN ?2 IS NOT NULL THEN (SELECT id FROM attempts WHERE id=?2 AND agent_id=?1) \
+     ELSE (SELECT id FROM attempts WHERE agent_id=?1 AND ownership_active=1) END";
 pub(crate) fn tx_event(
     tx: &Transaction<'_>,
     id: &AgentId,
@@ -172,8 +191,10 @@ pub(crate) fn tx_event(
     data: &Value,
 ) -> Result<i64> {
     tx.execute(
-        "INSERT INTO events(agent_id,at,kind,from_status,to_status,data_json) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO events(agent_id,attempt_id,at,kind,from_status,to_status,data_json) \
+         VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?,?,?)",
         params![
+            id.as_str(),
             id.as_str(),
             now(),
             kind,
@@ -361,6 +382,7 @@ impl Store {
         Ok(Self {
             conn,
             home: home.to_path_buf(),
+            attempt: None,
         })
     }
     pub fn health(&self) -> Result<Value> {
@@ -399,10 +421,27 @@ impl Store {
             .optional()?
             .ok_or_else(|| Error::NotFound(id.to_string()))
     }
+    /// Binds every later event, message and runtime-session record written
+    /// through this handle to `attempt` (see [`Store`]'s `attempt` field).
+    pub fn bind_attempt(&mut self, attempt: &str) {
+        self.attempt = Some(attempt.to_owned());
+    }
+    /// The attempt this handle is bound to, if any.
+    pub fn bound_attempt(&self) -> Option<&str> {
+        self.attempt.as_deref()
+    }
     pub fn event(&self, id: &AgentId, kind: &str, data: &Value) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
-            params![id.as_str(), now(), kind, serde_json::to_string(data)?],
+            &format!(
+                "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?1,{ATTEMPT_OF},?3,?4,?5)"
+            ),
+            params![
+                id.as_str(),
+                self.attempt,
+                now(),
+                kind,
+                serde_json::to_string(data)?
+            ],
         )?;
         Ok(())
     }
@@ -781,7 +820,22 @@ impl Store {
             "UPDATE agents SET status='running',started_at=?,process_group_id=? WHERE id=?",
             params![now(), pgid, id.as_str()],
         )?;
-        tx.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES(?,?,1,'running','{}',?)",params![format!("{}:1",id),id.as_str(),now()])?;
+        let provider: bool = tx.query_row(
+            "SELECT COALESCE(json_extract(identity_json,'$.provider_identity_version'),0)=2 FROM agents WHERE id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        if provider {
+            let changed = tx.execute(
+                "UPDATE attempts SET state='running' WHERE agent_id=? AND ownership_active=1 AND finished_at IS NULL",
+                [id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(Error::Conflict);
+            }
+        } else {
+            tx.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES(?,?,1,'running','{}',?)",params![format!("{}:1",id),id.as_str(),now()])?;
+        }
         tx_event(
             &tx,
             id,
@@ -792,6 +846,89 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+    /// Returns the committed global revision of the entire quota snapshot.
+    ///
+    /// Admission reads this inside `BEGIN IMMEDIATE` and compares it with
+    /// the producer's candidate revision. The store never scores candidates.
+    pub fn quota_capacity_revision(&self) -> Result<i64> {
+        Self::quota_capacity_revision_in(&self.conn)
+    }
+    /// Reads the same singleton inside a producer or admission transaction.
+    pub fn quota_capacity_revision_in(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT revision FROM quota_capacity_revision WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+    /// Advances the global snapshot revision inside the caller's transaction.
+    ///
+    /// Collectors must write every relevant quota fact and call this once
+    /// before committing that same transaction, preserving snapshot atomicity.
+    pub fn advance_quota_capacity_revision(tx: &Transaction<'_>) -> Result<i64> {
+        let changed = tx.execute(
+            "UPDATE quota_capacity_revision SET revision=revision+1,updated_at=? \
+             WHERE id=1 AND revision<9223372036854775807",
+            [now()],
+        )?;
+        if changed != 1 {
+            return Err(invalid("quota capacity revision cannot advance"));
+        }
+        Self::quota_capacity_revision_in(tx)
+    }
+    /// Counts active reservations for each exact physical pool, including
+    /// shared aliases and attempts consuming multiple pools.
+    pub fn active_reservation_counts(
+        &self,
+        keys: &[PhysicalQuotaKey],
+    ) -> Result<BTreeMap<String, u64>> {
+        Self::active_reservation_counts_in(&self.conn, keys)
+    }
+    /// Counts physical reservations through `conn`, including the caller's
+    /// uncommitted writes when it is an active admission transaction.
+    pub fn active_reservation_counts_in(
+        conn: &Connection,
+        keys: &[PhysicalQuotaKey],
+    ) -> Result<BTreeMap<String, u64>> {
+        let mut counts = BTreeMap::new();
+        for key in keys {
+            let open: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM attempt_quota_keys k JOIN attempts a ON a.id=k.attempt_id \
+                 WHERE k.quota_key=? AND a.ownership_active=1",
+                [key.as_str()],
+                |row| row.get(0),
+            )?;
+            counts.insert(key.as_str().to_owned(), open as u64);
+        }
+        Ok(counts)
+    }
+    /// Counts owned orchestrated attempts per selected global account.
+    ///
+    /// Only attempts that carry a selected account and currently hold the
+    /// ownership flag are counted; released and legacy attempts stay
+    /// invisible, matching the schema's one-active-attempt partial index on
+    /// `ownership_active`. Accounts absent from `accounts` are not queried;
+    /// absent rows count as zero.
+    pub fn active_attempt_counts(&self, accounts: &[AccountId]) -> Result<BTreeMap<String, u64>> {
+        Self::active_attempt_counts_in(&self.conn, accounts)
+    }
+    /// Counts owned attempts through `conn`, including the caller's
+    /// uncommitted selections when it is an active admission transaction.
+    pub fn active_attempt_counts_in(
+        conn: &Connection,
+        accounts: &[AccountId],
+    ) -> Result<BTreeMap<String, u64>> {
+        let mut counts = BTreeMap::new();
+        for account in accounts {
+            let open: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM attempts WHERE selected_account_id=? AND ownership_active=1",
+                [account.as_str()],
+                |row| row.get(0),
+            )?;
+            counts.insert(account.as_str().to_owned(), open as u64);
+        }
+        Ok(counts)
     }
     /// Records a native runtime session and its durable session event atomically.
     ///
@@ -808,9 +945,12 @@ impl Store {
             params![session, id.as_str()],
         )?;
         tx.execute(
-            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
+            &format!(
+                "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?1,{ATTEMPT_OF},?3,?4,?5)"
+            ),
             params![
                 id.as_str(),
+                self.attempt,
                 now(),
                 "runtime_session",
                 json!({"id":session}).to_string()
@@ -835,8 +975,18 @@ impl Store {
         }
         let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
         self.conn.execute(
-            "INSERT INTO messages(agent_id,at,role,name,content,raw_ref) VALUES(?,?,?,?,?,?)",
-            params![id.as_str(), now(), role, name, content, raw_ref],
+            &format!(
+                "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) VALUES(?1,{ATTEMPT_OF},?3,?4,?5,?6,?7)"
+            ),
+            params![
+                id.as_str(),
+                self.attempt,
+                now(),
+                role,
+                name,
+                content,
+                raw_ref
+            ],
         )?;
         Ok(())
     }

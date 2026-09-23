@@ -566,7 +566,11 @@ pub async fn run(
         return Err(invalid("thread resume returned another thread"));
     }
     store.runtime_session(&record.id, &tid)?;
-    let mut turn_params = json!({"threadId":tid,"input":[{"type":"text","text":format!("{}\n\n{}",role.body,record.request.task)}]});
+    // The exact wire input (role preamble included) is what native history
+    // must later show under this turn's id.
+    let input = format!("{}\n\n{}", role.body, record.request.task);
+    let input_sha256 = crate::fs::sha256(input.as_bytes());
+    let mut turn_params = json!({"threadId":tid,"input":[{"type":"text","text":input}]});
     if let Some(effort) = &record.request.effort {
         turn_params["effort"] = json!(effort);
     }
@@ -580,6 +584,13 @@ pub async fn run(
         .ok_or_else(|| invalid("turn start did not return an id"))?
         .to_owned();
     session.turn_started(&turn_id)?;
+    // Attempt-bound provenance for continuation: this attempt's own turn id
+    // and the digest of the input it admitted (never the text itself).
+    store.event(
+        &record.id,
+        "native_turn_started",
+        &json!({"turn":turn_id,"input_sha256":input_sha256}),
+    )?;
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
@@ -617,6 +628,7 @@ pub async fn run(
                         .await;
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     return Ok(EngineResult {
+                        native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
                             exit_code: None,
@@ -661,6 +673,7 @@ pub async fn run(
             Event::Json(v) => v,
             Event::Eof => {
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome: Outcome::failure("engine_transport_eof"),
                     answer: None,
                     usage,
@@ -668,6 +681,7 @@ pub async fn run(
             }
             Event::Failure(e) => {
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome: Outcome::failure(e),
                     answer: None,
                     usage,
@@ -728,12 +742,17 @@ pub async fn run(
                 if text.len() + delta.len() > verify::MAX_ANSWER {
                     return Err(invalid("assistant stream exceeds bound"));
                 }
-                if !delta.trim().is_empty() && !text.trim().is_empty() {
+                // Every visible delta is journaled on arrival (the first one
+                // included) so a follower sees it immediately; whitespace-only
+                // deltas wait for the next visible text or the completion.
+                // `emitted` stays cumulative, so completion journals only the
+                // unseen tail.
+                text.push_str(delta);
+                if !text.trim().is_empty() {
                     journal(store, &record.id, "assistant", text, None, Some(&key))?;
                     emitted.entry(key.clone()).or_default().push_str(text);
                     text.clear();
                 }
-                text.push_str(delta);
             }
             "item/completed" => {
                 let item = &p["item"];
@@ -839,7 +858,10 @@ pub async fn run(
                     outcome.failure_kind = Some(kind.into());
                     final_answer = None;
                 }
+                let native_failure = (turn.get("status").and_then(Value::as_str) == Some("failed"))
+                    .then(|| crate::adapters::native_failure::codex_turn_error(&turn["error"]));
                 return Ok(EngineResult {
+                    native_failure,
                     outcome,
                     answer: final_answer,
                     usage,

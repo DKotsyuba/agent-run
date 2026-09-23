@@ -95,6 +95,57 @@ last valid cached revision. Existing sessions keep the immutable config they
 were prepared with. The config snapshot records the declared settings, so a
 change alters snapshot identity and forces regeneration on the next launch.
 
+In a `schema_version = 2` home, `agent-run capacity collect` polls
+account-scoped quota sources only: each registered account is observed once
+per round however many provider aliases bind it. `limits_source = "lua"`
+providers bind a collector (`glm_quota`, `anthropic_usage`, or a custom
+`script_file` with an explicit `auth` placement); `codex_appserver` providers
+are probed through the account's own reference (`native:codex` or
+`named:codex:<label>`), never a provider label; they must use the codex
+harness and a native connection. Native and named Claude
+accounts read only their own login store, with no fallback to the default
+login. Failures report fixed codes such as `credential_unavailable`, the
+round's `ok` is false when any source failed, and a v2 config that fails to
+load is an error rather than a switch to legacy sources. See
+`docs/quota-collectors.md` for the per-source window mapping.
+
+CodexBar is retired. Schema 2 rejects `capacity.codexbar_binary` and a
+`codexbar` limits source. A schema-1 file that still declares them keeps
+parsing so the one-time migration can read it, but a `codexbar` runtime is
+never invoked: each round reports it failed with
+`codexbar_retired_migration_required` and keeps its earlier samples.
+
+A labelled Claude login (`agent-run auth`/`login --account <label>`) is stored
+in `accounts/claude/<label>/claude-config` under the agent-run home, the same
+directory runs and quota collection read. A login made by an earlier release
+at `<runtime home>@<label>/claude-config` keeps working in place; if both
+directories exist the label is ambiguous and fails until one is removed.
+
 After manual edits, parse the TOML and run `agent-run doctor`. Doctor checks
 binaries and role assets; runtime start does not run language-toolchain
 readiness probes.
+
+## One-time paired migration to schema 2
+
+A schema-1 home moves to schema 2 together with its state database through
+`agent-run config migrate`; see the `migrations` topic for the mapping file,
+the refusals, snapshots, recovery and rollback.
+
+## New homes and native login
+
+`agent-run init` on a home without `config.toml` writes the explicitly empty
+schema-2 catalog `schema_version = 2` (no harness, provider or account;
+`models` lists nothing and nothing can start until they are declared). A
+schema-1 `config.toml` never initializes a new state database. `doctor`
+reports such a home as `provider_catalog_empty` (information), not as an
+invalid configuration; a configured schema-2 home is checked through its
+harness executables.
+
+In a schema-2 home, `agent-run auth <account> <provider>` and
+`agent-run login <provider> [--account <account>]` take a native-connection
+provider id and one of its bindings, by provider-local label or global
+account id (optional when the provider binds exactly one). The login runs the
+provider's harness executable against the bound account's own storage:
+`native:<harness>` is the harness's global login, `named:codex:<label>` is
+`accounts/codex/<label>`, `named:claude-code:<label>` the labelled Claude
+directory. `login` accepts Claude Code providers only.

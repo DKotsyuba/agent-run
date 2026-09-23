@@ -122,9 +122,13 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     };
     let config_path = report.home.join("config.toml");
     plaintext_secrets(&config_path, &mut report.findings);
-    let config = match Config::load(&report.home) {
-        Ok(config) => config,
-        Err(_) => {
+    let config = match (
+        agent_run_config::provider_config::ProviderConfig::load(&report.home),
+        Config::load(&report.home),
+    ) {
+        (Ok((v2, _)), _) => providers(&v2, &mut report.findings),
+        (_, Ok(config)) => config,
+        (Err(_), Err(_)) => {
             add(
                 &mut report.findings,
                 "config_invalid",
@@ -181,6 +185,37 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         dependencies.process_lister.as_ref(),
     );
     Ok(report)
+}
+
+/// Checks a valid schema-2 config: each harness executable, and an explicitly
+/// empty catalog reported as information (nothing can start yet), never as
+/// invalid configuration. Returns the shared controls for the remaining
+/// common checks.
+fn providers(
+    v2: &agent_run_config::provider_config::ProviderConfig,
+    findings: &mut Vec<Finding>,
+) -> Config {
+    for (id, harness) in &v2.harnesses {
+        if !executable(&harness.binary) {
+            add(
+                findings,
+                "harness_binary_missing",
+                "error",
+                &format!("harness:{}", id.as_str()),
+                harness.binary.display().to_string(),
+            );
+        }
+    }
+    if v2.providers.is_empty() {
+        add(
+            findings,
+            "provider_catalog_empty",
+            "info",
+            "config",
+            "no provider is configured; declare harnesses, providers and accounts before starting agents",
+        );
+    }
+    v2.shared()
 }
 
 /// Executes the provider-free detached-launch proof used by Python doctor.
@@ -1194,7 +1229,9 @@ mod tests {
             .collect();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].code, "state_migration_pending");
-        assert!(findings[0].detail.contains("v16"));
+        assert!(findings[0]
+            .detail
+            .contains(&format!("expected v{}", crate::state::VERSION)));
         assert!(!report.ok());
     }
 

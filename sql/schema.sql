@@ -52,6 +52,8 @@ CREATE TABLE agents (
   identity_json TEXT,
   supervisor_birth_time REAL,
   startup_owner_birth_time REAL,
+  selection_intent TEXT CHECK (selection_intent IN ('auto', 'pinned')),
+  requested_account_id TEXT,
   UNIQUE (orchestrator_session_id, request_id)
 );
 CREATE UNIQUE INDEX agents_parent_agent_id_unique
@@ -67,6 +69,13 @@ CREATE TABLE attempts (
   adapter_state_json TEXT NOT NULL,
   created_at REAL NOT NULL,
   finished_at REAL,
+  selected_account_id TEXT,
+  phase TEXT,
+  process_identity TEXT,
+  process_birth_time REAL,
+  cleanup_proof_json TEXT,
+  session_facts_json TEXT,
+  ownership_active INTEGER NOT NULL DEFAULT 0 CHECK (ownership_active IN (0, 1)),
   UNIQUE (agent_id, number)
 );
 
@@ -147,7 +156,14 @@ CREATE TABLE capacity_samples (
   observed_at REAL,
   valid_until REAL,
   payload_json TEXT NOT NULL
-);
+, account_id TEXT
+  REFERENCES provider_accounts(account_id), quota_key TEXT
+  CHECK (
+    (account_id IS NULL AND quota_key IS NULL)
+    OR (account_id IS NOT NULL AND quota_key IS NOT NULL
+      AND substr(quota_key, 1, length(account_id) + 2) = account_id || '::'
+      AND length(quota_key) > length(account_id) + 2)
+  ));
 
 CREATE TABLE context_receipts (
   orchestrator_session_id TEXT PRIMARY KEY REFERENCES orchestrator_sessions(id),
@@ -160,6 +176,68 @@ CREATE TABLE reconciliation_cursors (
   created_at REAL NOT NULL,
   agent_id TEXT NOT NULL
 );
+
+CREATE TABLE provider_accounts (
+  account_id TEXT PRIMARY KEY,
+  auth_family TEXT NOT NULL,
+  secret_ref TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE (auth_family, secret_ref)
+);
+
+CREATE TABLE quota_exhaustion (
+  account_id TEXT NOT NULL REFERENCES provider_accounts(account_id),
+  quota_key TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+  window_id TEXT NOT NULL CHECK (length(trim(window_id)) > 0),
+  observed_at REAL NOT NULL,
+  reset_at REAL,
+  collector_revision TEXT,
+  PRIMARY KEY (account_id, quota_key, source, window_id),
+  CHECK (
+    substr(quota_key, 1, length(account_id) + 2) = account_id || '::'
+    AND length(quota_key) > length(account_id) + 2
+  )
+);
+
+CREATE TABLE quota_capacity_revision (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  updated_at REAL NOT NULL
+);
+INSERT INTO quota_capacity_revision VALUES (1, 0, 0.0);
+
+CREATE TABLE attempt_quota_keys (
+  attempt_id TEXT NOT NULL REFERENCES attempts(id),
+  quota_key TEXT NOT NULL,
+  PRIMARY KEY (attempt_id, quota_key)
+);
+CREATE TRIGGER attempt_quota_keys_account_guard
+BEFORE INSERT ON attempt_quota_keys
+WHEN NOT EXISTS (
+  SELECT 1 FROM attempts
+  WHERE id = NEW.attempt_id AND selected_account_id IS NOT NULL
+    AND substr(NEW.quota_key, 1, length(selected_account_id) + 2) = selected_account_id || '::'
+    AND length(NEW.quota_key) > length(selected_account_id) + 2
+)
+BEGIN
+  SELECT RAISE(ABORT, 'quota key must belong to selected account');
+END;
+CREATE TRIGGER attempts_selected_account_immutable
+BEFORE UPDATE OF selected_account_id ON attempts
+WHEN OLD.selected_account_id IS NOT NULL
+  AND NEW.selected_account_id IS NOT OLD.selected_account_id
+BEGIN
+  SELECT RAISE(ABORT, 'selected account is immutable');
+END;
+CREATE TRIGGER attempt_quota_keys_immutable
+BEFORE UPDATE ON attempt_quota_keys
+WHEN NEW.attempt_id IS NOT OLD.attempt_id OR NEW.quota_key IS NOT OLD.quota_key
+BEGIN
+  SELECT RAISE(ABORT, 'attempt quota keys are immutable');
+END;
 
 CREATE TABLE workflow_runs (
   id TEXT PRIMARY KEY,
@@ -250,11 +328,18 @@ CREATE INDEX idx_agents_active
   WHERE status IN ('created', 'starting', 'running', 'cancelling');
 CREATE INDEX idx_events_agent_seq ON events(agent_id, seq);
 CREATE INDEX idx_messages_agent_seq ON messages(agent_id, seq);
+CREATE INDEX idx_attempts_selected_account
+  ON attempts(selected_account_id) WHERE selected_account_id IS NOT NULL;
+CREATE INDEX idx_attempt_quota_keys_key ON attempt_quota_keys(quota_key);
+CREATE UNIQUE INDEX idx_attempts_one_active
+  ON attempts(agent_id) WHERE ownership_active = 1;
 CREATE INDEX idx_commands_due ON commands(agent_id, state, id);
 CREATE INDEX idx_deliveries_due
   ON deliveries(state, next_attempt_at, lease_until, id);
 CREATE INDEX idx_capacity_lane_window_source_reset
   ON capacity_samples(lane, window, source, reset_at, observed_at);
+CREATE INDEX idx_capacity_samples_account_key
+  ON capacity_samples(account_id, quota_key) WHERE account_id IS NOT NULL;
 CREATE INDEX idx_workflow_runs_active
   ON workflow_runs(status, created_at, id)
   WHERE status IN ('created', 'running');
@@ -272,4 +357,4 @@ CREATE TABLE IF NOT EXISTS capacity_route_snapshots (
     CHECK (length(CAST(payload_json AS BLOB)) <= 65536)
 );
 
-PRAGMA user_version = 16;
+PRAGMA user_version = 17;

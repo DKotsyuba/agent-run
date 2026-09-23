@@ -95,17 +95,33 @@ external service manager such as systemd. Linux is not a qualified or published
 ## Use the CLI
 
 ```bash
-agent-run start --runtime codex --model gpt-5.6-sol --profile role-review \
+agent-run models                       # providers, explicit models, roles, standing
+agent-run start --provider codex --model gpt-6-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
 agent-run agents
 agent-run answer ag-...
 agent-run transcript ag-...
+agent-run transcript ag-... --follow --format text
 agent-run resume ag-... --task "Continue with the highest-priority finding."
 ```
 
-Output is line-delimited JSON. Other commands include `steer`, `cancel`,
-`models`, `limits`, `capacity order`, `delivery status`, and `doc`.
+Output is line-delimited JSON. `transcript --follow` streams a live view:
+model text, tool activity, and results as they arrive, exiting when the agent
+reaches a terminal state and its journal is drained; Ctrl-C exits only the
+viewer and never cancels the agent. `--format text|json` picks the rendering,
+defaulting to text on a terminal and JSON when output is piped. In text mode
+each journal fragment is sanitized and written to the pipe immediately as it
+arrives — there is no line buffering — with one newline per message or tool
+row; untrusted roles, names, and content are stripped of terminal escape
+sequences. The Codex runtime journals deltas and completion tails of one
+message under a shared item identity, so they render as one continuous row;
+the Claude runtime journals assistant fragments and the completion tail of one
+message under its native message id (or one producer-owned fallback per
+message boundary when the engine omits ids), so each message renders as one
+continuous row and distinct messages stay distinct. Other commands
+include `steer`, `cancel`, `models`, `limits`, `capacity order`,
+`delivery status`, and `doc`.
 
 ## Use the MCP server
 

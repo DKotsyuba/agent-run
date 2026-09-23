@@ -36,10 +36,36 @@ impl Harness {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let config=format!("schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary={}\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",toml::Value::String(env!("CARGO_BIN_EXE_agent-run-fixture").into()),toml::Value::String(home.join("runtime").to_string_lossy().into_owned()));
+        // One schema-2 provider on the fake engine behind a synthetic env account.
+        let binary = toml::Value::String(env!("CARGO_BIN_EXE_agent-run-fixture").into());
+        let config = format!(
+            "schema_version=2\n[harnesses.codex]\nbinary={binary}\nhome={codex}\n[harnesses.claude-code]\nbinary={binary}\nhome={claude}\n[providers.mock]\nharness='claude-code'\nconnection={{kind='custom',endpoint='https://gateway.example/api',protocol='messages'}}\nauth_family='anthropic'\nlimits_source='none'\n[[providers.mock.models]]\nid='fixture'\n[[providers.mock.bindings]]\nlabel='work'\naccount='acct-work'\n",
+            codex = toml::Value::String(home.join("codex").to_string_lossy().into_owned()),
+            claude = toml::Value::String(home.join("claude").to_string_lossy().into_owned()),
+        );
         std::fs::write(home.join("config.toml"), config).unwrap();
-        std::fs::create_dir(home.join("profiles")).unwrap();
-        std::fs::write(home.join("profiles/review.md"), "Review.\n").unwrap();
+        std::fs::create_dir_all(home.join("profiles")).unwrap();
+        std::fs::write(home.join("profiles/review.md"), "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview.\n").unwrap();
+        let registered = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                "accounts",
+                "register",
+                "--id",
+                "acct-work",
+                "--auth-family",
+                "anthropic",
+                "--reference",
+                "env:FAKE_TOKEN",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            registered.status.success(),
+            "{}",
+            String::from_utf8_lossy(&registered.stderr)
+        );
         Self {
             temp,
             home,
@@ -54,6 +80,7 @@ impl Harness {
                 .arg(&self.home)
                 .args(["api", "serve"])
                 .env("HOME", &self.home)
+                .env("FAKE_TOKEN", "synthetic-token")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(error)
@@ -79,7 +106,7 @@ impl Harness {
             .arg(&self.home)
             .args([
                 "start",
-                "--runtime",
+                "--provider",
                 "mock",
                 "--model",
                 "fixture",

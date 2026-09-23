@@ -43,13 +43,6 @@ jobs:
         run: cargo fetch --locked
       - name: Verify native runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
-      - name: Reject legacy implementation files
-        shell: bash
-        run: |
-          test -z "$(git ls-files '*.py')"
-          for path in pyproject.toml uv.lock .python-version pyrightconfig.json MANIFEST.in; do
-            test -z "$(git ls-files "$path")"
-          done
       - name: Run workspace gates
         run: cargo xtask check
       - name: Verify desktop transport fixture

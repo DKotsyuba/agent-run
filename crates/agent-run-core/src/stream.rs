@@ -119,6 +119,10 @@ pub fn plan_with_environment(
             "--input-format".into(),
             "stream-json".into(),
             "--verbose".into(),
+            // Partial streaming events carry the per-message identity the
+            // transcript producer journals; the official CLI requires this
+            // flag together with --print and stream-json above.
+            "--include-partial-messages".into(),
             "--model".into(),
             model,
             "--permission-mode".into(),
@@ -230,6 +234,10 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// instead reject any identifier other than their requested session. The
 /// function journals recognized events, services bounded control commands, and
 /// returns malformed stream data or persistence failures as domain errors.
+/// Assistant text deltas and the completion tail of one message are journaled
+/// under one durable `raw_ref`: the native message id from `message_start` or
+/// the full event, or one producer-owned bounded fallback per message boundary
+/// when the engine omits ids, so distinct messages never merge.
 pub async fn run(
     process: &mut Process,
     store: &mut Store,
@@ -243,9 +251,18 @@ pub async fn run(
     }
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
+    // The attempt's current authoritative native state (rate-limit events
+    // and assistant error controls, in protocol order).
+    let mut signals = crate::adapters::native_failure::ClaudeSignals::default();
     let mut emitted = String::new();
     let mut saw_delta = false;
     let mut saw_answer = false;
+    // Identity of the assistant message currently being streamed: the native
+    // message id from `message_start`, or one producer-owned bounded fallback
+    // when the engine omits ids. Every fragment and the completion tail of one
+    // message share it, so distinct messages never merge.
+    let mut message_id: Option<String> = None;
+    let mut fallback_messages: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -268,6 +285,7 @@ pub async fn run(
                 if command == "cancel" {
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     return Ok(EngineResult {
+                        native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
                             exit_code: None,
@@ -348,6 +366,7 @@ pub async fn run(
                 outcome.runtime_session_id = session;
                 outcome.failure_text = diagnostic;
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome,
                     answer: None,
                     usage: None,
@@ -359,6 +378,7 @@ pub async fn run(
                 outcome.exit_code = code;
                 outcome.failure_text = process.diagnostic_tail();
                 return Ok(EngineResult {
+                    native_failure: None,
                     outcome,
                     answer: None,
                     usage: None,
@@ -383,11 +403,29 @@ pub async fn run(
             store.runtime_session(&record.id, s)?;
             session = Some(s.into());
         }
+        // Only top-level protocol frames feed the native signal state.
+        signals.observe(&v);
         match v.get("type").and_then(Value::as_str) {
             Some("stream_event") => {
                 let event = &v["event"];
                 match event.get("type").and_then(Value::as_str) {
                     Some("message_start") => {
+                        // A real message boundary: adopt the native message id
+                        // as this message's durable identity, or mint one
+                        // bounded producer fallback when the engine omits it.
+                        // The fallback is per boundary, never per delta, and
+                        // never derived from text equality.
+                        message_id = Some(
+                            event
+                                .pointer("/message/id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.trim().is_empty())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| {
+                                    fallback_messages += 1;
+                                    format!("stream-message-{fallback_messages}")
+                                }),
+                        );
                         emitted.clear();
                         saw_delta = false;
                     }
@@ -408,7 +446,7 @@ pub async fn run(
                                 "assistant",
                                 &process.redact(text),
                                 None,
-                                None,
+                                message_id.as_deref(),
                             )?;
                         }
                     }
@@ -416,6 +454,11 @@ pub async fn run(
                 }
             }
             Some("assistant") => {
+                let native_id = v
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned);
                 if let Some(content) = v.pointer("/message/content").and_then(Value::as_array) {
                     let mut text = String::new();
                     for block in content {
@@ -439,6 +482,27 @@ pub async fn run(
                             _ => {}
                         }
                     }
+                    // The completion keeps the identity its fragments already
+                    // streamed under: a contradictory id in the full event must
+                    // not re-identify (and so duplicate) one message. Without
+                    // a prior boundary, the full event is itself the boundary:
+                    // its native id wins, and an id-less boundary mints one
+                    // bounded producer fallback so distinct messages stay
+                    // distinct.
+                    let identity = if saw_delta {
+                        message_id.clone().or(native_id)
+                    } else {
+                        Some(match native_id {
+                            Some(id) => id,
+                            None => match message_id.take() {
+                                Some(carried) => carried,
+                                None => {
+                                    fallback_messages += 1;
+                                    format!("stream-message-{fallback_messages}")
+                                }
+                            },
+                        })
+                    };
                     if saw_delta {
                         if let Some(tail) = text.strip_prefix(&emitted) {
                             journal(
@@ -447,7 +511,7 @@ pub async fn run(
                                 "assistant",
                                 &process.redact(tail),
                                 None,
-                                None,
+                                identity.as_deref(),
                             )?;
                         }
                     } else {
@@ -457,11 +521,14 @@ pub async fn run(
                             "assistant",
                             &process.redact(&text),
                             None,
-                            None,
+                            identity.as_deref(),
                         )?;
                     }
                     saw_delta = false;
                     emitted.clear();
+                    // The completed message's identity ends with it; the next
+                    // message_start establishes the next one.
+                    message_id = None;
                 }
             }
             Some("user") => {
@@ -524,7 +591,9 @@ pub async fn run(
                         "runtime did not confirm the resumed native session",
                     ));
                 }
+                let failed = outcome.status == Status::Failed;
                 final_result = Some(EngineResult {
+                    native_failure: signals.terminal().filter(|_| failed),
                     outcome,
                     answer: text.filter(|s| !s.is_empty()),
                     usage: Some(usage),

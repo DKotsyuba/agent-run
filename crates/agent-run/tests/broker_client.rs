@@ -7,7 +7,6 @@ use agent_run::{
     transport::{frame, socket},
     Error,
 };
-use agent_run_domain::types::StartRequest;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::{io::BufReader, net::UnixListener};
@@ -117,7 +116,7 @@ async fn client_start_serializes_request_and_rejects_malformed_results() {
             .unwrap();
             seen.push(request.clone());
             let result = if index == 0 {
-                json!({"agent_id":"ag-test","created":true})
+                json!({"agent_id":"ag-test","attempt_id":"at-test","created":true})
             } else {
                 json!({})
             };
@@ -132,27 +131,19 @@ async fn client_start_serializes_request_and_rejects_malformed_results() {
         seen
     });
     let client = socket::BrokerClient::new(endpoint(&home));
-    let request = StartRequest {
-        runtime: "codex".into(),
-        model: "model".into(),
-        profile: "review".into(),
-        task: "task".into(),
-        workdir,
-        write: false,
-        fast: false,
-        effort: None,
-        timeout_seconds: None,
-        read_roots: Vec::new(),
-        output_schema: None,
-        orchestrator: None,
-        request_id: None,
-        account: None,
-        required_constraints: Default::default(),
-    };
+    let request: agent_run_domain::ProviderStartRequest = serde_json::from_value(json!({
+        "provider": "codex-user", "model": "model", "profile": "review",
+        "task": "task", "workdir": workdir,
+    }))
+    .unwrap();
     let result = client.start(&request).await.unwrap();
     assert_eq!(
-        (result.agent_id.as_str(), result.created),
-        ("ag-test", true)
+        (
+            result.agent_id.as_str(),
+            result.created,
+            result.attempt_id.as_deref()
+        ),
+        ("ag-test", true, Some("at-test"))
     );
     let error = client.start(&request).await.unwrap_err();
     assert!(
@@ -160,6 +151,11 @@ async fn client_start_serializes_request_and_rejects_malformed_results() {
     );
     let seen = server.await.unwrap();
     assert_eq!(seen[0]["method"], "start");
+    // The strict provider shape the dispatcher accepts, never `runtime`.
+    assert_eq!(seen[0]["params"]["provider"], "codex-user");
+    assert!(seen[0]["params"].get("runtime").is_none());
+    serde_json::from_value::<agent_run_domain::ProviderStartRequest>(seen[0]["params"].clone())
+        .unwrap();
     assert_eq!(
         seen[0]["params"]["workdir"],
         home.path().to_string_lossy().as_ref()

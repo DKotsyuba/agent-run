@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.12.6"
+version = "0.13.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.98.1"
@@ -33,6 +33,7 @@ thiserror = "2.0"
 tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros", "process", "net", "io-util", "io-std", "signal", "time", "sync"] }
 toml = "0.8"
 uuid = { version = "1.16", features = ["v4"] }
+url = "2.5.8"
 rmcp = { version = "=1.8.0", default-features = false, features = ["server", "transport-io"] }
 
 [profile.release]

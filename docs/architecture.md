@@ -83,10 +83,11 @@ snapshot verify. See [continuations.md](continuations.md).
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 16. Numbered migrations live in `sql/migrations/`;
-write opens migrate transactionally after making a pre-version backup, while
-read-only opens report that migration is required. A binary refuses a database
-newer than its supported schema.
+current schema is version 17. Numbered migrations live in `sql/migrations/`
+and apply transactionally after a pre-version backup. The step to 17 is paired
+with the schema-2 config: ordinary commands and the broker refuse an older
+database with `migration_required` until `agent-run config migrate` runs. A
+binary refuses a database newer than its supported schema.
 
 Large payloads live under the run directory and are referenced by path, size,
 and SHA-256. A terminal success must be reproducible from stored state and

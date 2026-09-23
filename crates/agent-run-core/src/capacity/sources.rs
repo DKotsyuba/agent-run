@@ -24,44 +24,9 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, process::Command};
 const TTL: f64 = 900.0;
-/// Maximum seconds allowed for one Codexbar provider invocation.
-pub const CODEXBAR_TIMEOUT_SECONDS: u64 = 120;
-
-/// Extracts a nonblank email claim from a Codex auth document.
-///
-/// Malformed files, missing tokens, invalid base64url payloads, and absent or
-/// empty claims all return `None`; no parse detail or token content is exposed.
-pub fn account_email(path: &Path) -> Option<String> {
-    let payload: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    let token = payload.pointer("/tokens/id_token")?.as_str()?;
-    let encoded = token.split('.').nth(1)?;
-    let mut bytes = Vec::new();
-    let mut value = 0_u32;
-    let mut bits = 0_u8;
-    for byte in encoded.bytes() {
-        let digit = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        } as u32;
-        value = (value << 6) | digit;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push((value >> bits) as u8);
-            value &= (1 << bits) - 1;
-        }
-    }
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()?
-        .get("email")?
-        .as_str()
-        .filter(|email| !email.is_empty())
-        .map(str::to_owned)
-}
+/// Fixed issue for a schema-1 runtime still declaring the retired CodexBar
+/// source: nothing is invoked and the runtime must migrate to schema 2.
+pub const CODEXBAR_RETIRED: &str = "codexbar_retired_migration_required";
 const BODY_MAX: usize = 2 * 1024 * 1024;
 fn number(v: Option<&Value>) -> Option<f64> {
     v.and_then(Value::as_f64).filter(|v| v.is_finite())
@@ -76,7 +41,8 @@ fn timestamp(v: Option<&Value>) -> Option<f64> {
         .map(|d| d.timestamp_millis() as f64 / 1000.0)
         .filter(|v| *v >= 0.0)
 }
-fn window_name(minutes: f64) -> String {
+/// Maps one app-server window duration to its stable window name.
+pub fn window_name(minutes: f64) -> String {
     if minutes == 300.0 {
         "five_hour".into()
     } else if minutes == 10080.0 {
@@ -575,10 +541,6 @@ fn aggregate_topology(runtime: &str, samples: &[Sample]) -> Topology {
 /// the neutral per-identity grouping, so the result is canonically ordered and
 /// the input sample order never changes it. An empty `samples` yields an empty
 /// topology.
-///
-/// The `codexbar` source is deliberately not routed here: its account-scoped
-/// routing needs the configured account labels and auth-claim emails, so
-/// [`normalize_codexbar_accounts`] builds that topology directly.
 pub fn sample_topology(runtime: &str, source: &str, samples: &[Sample]) -> Topology {
     match source {
         "omniroute" => aggregate_topology(runtime, samples),
@@ -815,179 +777,6 @@ pub fn read_claude_stream(home: &Path, runtime: &str) -> Result<Slice> {
         observed,
     ))
 }
-pub fn normalize_codexbar(runtime: &str, raw: &Value) -> Result<Slice> {
-    normalize_codexbar_accounts(runtime, raw, &BTreeMap::new(), None)
-}
-/// Normalizes one Codexbar payload and maps each discovered email to its route account.
-///
-/// `accounts` maps configured labels to auth-file email claims; `default_email`
-/// remains the unlabelled target. Unknown provider accounts retain evidence but
-/// receive no route, so they cannot become launchable identities.
-pub fn normalize_codexbar_accounts(
-    runtime: &str,
-    raw: &Value,
-    accounts: &BTreeMap<String, String>,
-    default_email: Option<&str>,
-) -> Result<Slice> {
-    let value = if let Some(list) = raw.as_array() {
-        if accounts.is_empty() {
-            list.first().map(std::slice::from_ref).unwrap_or(&[])
-        } else {
-            list
-        }
-    } else {
-        std::slice::from_ref(raw)
-    };
-    let mut samples = Vec::new();
-    for entry in value {
-        let usage = entry
-            .get("usage")
-            .filter(|value| value.is_object())
-            .ok_or_else(|| invalid("codexbar_malformed_response"))?;
-        let email = usage
-            .pointer("/identity/accountEmail")
-            .or_else(|| usage.get("accountEmail"))
-            .and_then(Value::as_str)
-            .filter(|email| !email.is_empty());
-        let target = if accounts.is_empty() {
-            None
-        } else if email.is_none() {
-            Some("unknown".to_owned())
-        } else if email == default_email {
-            None
-        } else {
-            Some(
-                accounts
-                    .iter()
-                    .find_map(|(label, known)| {
-                        (Some(known.as_str()) == email).then(|| label.clone())
-                    })
-                    .unwrap_or_else(|| email.unwrap_or_default().to_owned()),
-            )
-        };
-        let observed = timestamp(usage.get("updatedAt"))
-            .ok_or_else(|| invalid("codexbar_invalid_observed_at"))?;
-        for lane in ["primary", "secondary", "tertiary"] {
-            let Some(value) = usage.get(lane).filter(|value| !value.is_null()) else {
-                continue;
-            };
-            let used = number(value.get("usedPercent"))
-                .filter(|percent| (0.0..=100.0).contains(percent))
-                .ok_or_else(|| invalid("codexbar_invalid_window"))?;
-            let minutes = number(value.get("windowMinutes"))
-                .filter(|minutes| *minutes > 0.0)
-                .ok_or_else(|| invalid("codexbar_invalid_window"))?;
-            let reset = timestamp(value.get("resetsAt"));
-            if value.get("resetsAt").is_some_and(|value| !value.is_null()) && reset.is_none() {
-                return Err(invalid("codexbar_invalid_reset"));
-            }
-            samples.push(sample(
-                runtime,
-                lane,
-                window_name(minutes),
-                target.clone(),
-                "codexbar",
-                100.0 - used,
-                reset,
-                observed,
-            ));
-        }
-    }
-    if samples.is_empty() {
-        return Err(invalid("codexbar_missing_data"));
-    }
-    let mut topology = Topology::default();
-    for (target, samples) in samples.iter().fold(
-        BTreeMap::<Option<String>, Vec<&Sample>>::new(),
-        |mut groups, sample| {
-            groups
-                .entry(sample.key.target.clone())
-                .or_default()
-                .push(sample);
-            groups
-        },
-    ) {
-        let keys = samples
-            .into_iter()
-            .map(|sample| sample.key.clone())
-            .collect();
-        let id = format!(
-            "{runtime}:codexbar:{}:all",
-            account_token(target.as_deref())
-        );
-        topology.pools.push(Pool {
-            pool_id: id.clone(),
-            keys,
-        });
-        if target
-            .as_ref()
-            .is_none_or(|target| accounts.contains_key(target))
-        {
-            topology.routes.push(Route {
-                route_id: id.clone(),
-                runtime: runtime.into(),
-                account: target,
-                quota_lane: "default".into(),
-                pool_ids: vec![id],
-                reset_credits: None,
-            });
-        }
-    }
-    topology.validate(runtime)?;
-    Ok(slice_from_samples(runtime, runtime, samples, topology, 0.0))
-}
-async fn codexbar(home: &Path, cfg: &Config, name: &str, rt: &Runtime) -> Result<Slice> {
-    let provider = codexbar_provider(rt.kind()?)?;
-    let mut args = vec![
-        "usage".into(),
-        "--provider".into(),
-        provider.into(),
-        "--json".into(),
-    ];
-    if !rt.accounts.is_empty() {
-        args.push("--all-accounts".into());
-    }
-    if rt.kind()? == Adapter::Claude {
-        args.extend(["--source".into(), "cli".into()]);
-    }
-    let bytes = capture(
-        &cfg.capacity.codexbar_binary,
-        &args,
-        CODEXBAR_TIMEOUT_SECONDS,
-        &host_environment(),
-    )
-    .await?;
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("codexbar_malformed_response"))?;
-    let accounts = rt
-        .accounts
-        .iter()
-        .filter_map(|label| {
-            account_email(
-                &home
-                    .join("accounts")
-                    .join(name)
-                    .join(label)
-                    .join("auth.json"),
-            )
-            .map(|email| (label.clone(), email))
-        })
-        .collect();
-    let default_email = match &rt.auth {
-        Some(Auth::FileLink { source, .. }) => account_email(source),
-        _ => None,
-    };
-    normalize_codexbar_accounts(name, &value, &accounts, default_email.as_deref())
-}
-
-/// Maps an adapter identity to the provider name understood by Codexbar.
-fn codexbar_provider(adapter: Adapter) -> Result<&'static str> {
-    match adapter {
-        Adapter::Codex => Ok("codex"),
-        Adapter::Claude => Ok("claude"),
-        Adapter::Glm => Ok("zai"),
-    }
-}
 /// Reads the local OmniRoute current-cache into one capacity slice.
 ///
 /// The route has one physical pool for the shared `opencode-go` capacity.
@@ -1021,7 +810,40 @@ async fn omniroute(name: &str) -> Result<Slice> {
     let topology = sample_topology(name, "omniroute", &samples);
     Ok(slice_from_samples(name, name, samples, topology, 0.0))
 }
+/// Returns whether `home/config.toml` parses as TOML declaring
+/// `schema_version = 2`, reading at most one MiB; unreadable or other files
+/// return `false`.
+fn declares_schema_v2(home: &Path) -> bool {
+    std::fs::File::open(home.join("config.toml"))
+        .ok()
+        .and_then(|file| {
+            use std::io::Read;
+            let mut text = String::new();
+            file.take(1024 * 1024).read_to_string(&mut text).ok()?;
+            toml::from_str::<toml::Value>(&text).ok()
+        })
+        .and_then(|value| value.get("schema_version")?.as_integer())
+        == Some(2)
+}
+
+/// Runs one capacity collection round for `home` — the entry every polling
+/// round uses. A valid schema-2 home runs the account-scoped provider
+/// sources only; a home declaring schema 2 that fails to load returns that
+/// error; anything else runs the legacy runtime sources.
 pub async fn collect(home: &Path) -> Result<Value> {
+    // A schema-v2 home runs the account-scoped provider sources exclusively:
+    // the launchd polling path lands here every round, and its durable
+    // backoff ledger under `capacity/backoff.json` survives the process
+    // boundary between rounds.
+    // A home that declares schema 2 but fails to load reports that error;
+    // it never degrades silently to the legacy runtime sources.
+    match agent_run_config::provider_config::ProviderConfig::load(home) {
+        Ok((provider_config, _)) => {
+            return super::collectors::collect_providers(home, &provider_config).await;
+        }
+        Err(error) if declares_schema_v2(home) => return Err(error),
+        Err(_) => {}
+    }
     let config = Config::load(home)?;
     let started = now();
     let mut results = Vec::new();
@@ -1082,7 +904,9 @@ pub async fn collect(home: &Path) -> Result<Value> {
             }
         } else {
             let result = match (source, rt.kind()?) {
-                ("codexbar", _) => codexbar(home, &config, name, rt).await,
+                // Retired: never invoked. The runtime reports a typed
+                // migration-required failure and previous samples stay intact.
+                ("codexbar", _) => Err(Error::Validation(CODEXBAR_RETIRED.into())),
                 ("omniroute", _) => omniroute(name).await,
                 ("native", Adapter::Claude) => match claude_native(name, rt).await {
                     Ok(slice) => Ok(slice),
@@ -1195,15 +1019,4 @@ pub async fn models(home: &Path) -> Result<Value> {
         result.insert(name.clone(),json!({"models":roster.into_values().collect::<Vec<_>>(),"capabilities":adapters::capabilities(kind),"available":available,"reason":reason,"accounts":accounts}));
     }
     Ok(Value::Object(result))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_glm_maps_to_the_zai_provider`.
-    #[test]
-    fn glm_maps_to_the_zai_provider() {
-        assert_eq!(codexbar_provider(Adapter::Glm).unwrap(), "zai");
-    }
 }

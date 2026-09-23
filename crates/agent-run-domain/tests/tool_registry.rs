@@ -17,8 +17,30 @@ fn registry_matches_python_golden_field_by_field() {
     assert_eq!(actual.len(), 11);
     assert_eq!(actual.len(), expected.len());
 
-    for (definition, (actual, expected)) in registry().iter().zip(actual.iter().zip(expected)) {
+    for (definition, (actual, mut expected)) in registry().iter().zip(actual.iter().zip(expected)) {
         assert_eq!(actual["name"], expected["name"]);
+        // The schema-2 catalog reads extend the baseline: their descriptions
+        // keep the Python text as a prefix, and they add only the exact
+        // optional nullable string filters pinned here.
+        let filters: &[&str] = match definition.name.as_str() {
+            "models" => &["model", "profile", "provider"],
+            "capacity_order" => &["model"],
+            _ => &[],
+        };
+        if !filters.is_empty() {
+            let base = expected["description"].as_str().unwrap();
+            assert!(actual["description"].as_str().unwrap().starts_with(base));
+            expected["description"] = actual["description"].clone();
+            for name in filters {
+                expected["inputSchema"]["properties"][name] =
+                    serde_json::json!({"type": ["string", "null"]});
+            }
+        }
+        // Schema-2 cutover: public start names a configured provider instead of
+        // a legacy runtime; nothing else in its input schema changes.
+        if definition.name == "start" {
+            rename_runtime_to_provider(&mut expected);
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }
@@ -99,4 +121,21 @@ fn registry_exposes_python_optional_argument_defaults() {
             .default,
         Some(ArgumentDefault::Integer(100))
     );
+}
+
+/// Applies the one deliberate start-schema change over the Python baseline:
+/// the required `runtime` property becomes the required `provider`.
+fn rename_runtime_to_provider(tool: &mut Value) {
+    let schema = &mut tool["inputSchema"];
+    let runtime = schema["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime")
+        .expect("baseline start declares runtime");
+    schema["properties"]["provider"] = runtime;
+    for name in schema["required"].as_array_mut().unwrap() {
+        if name == "runtime" {
+            *name = Value::from("provider");
+        }
+    }
 }

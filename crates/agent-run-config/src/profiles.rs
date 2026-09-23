@@ -1,7 +1,9 @@
+use crate::provider_config::ProviderConfig;
 use crate::{
     config::{self, Config, Runtime},
     policy::Constraint,
 };
+use agent_run_domain::ProviderStartRequest;
 use agent_run_domain::{
     domain::{self, StartRequest},
     error::invalid,
@@ -214,4 +216,33 @@ pub fn load(cfg: &Config, rt: &Runtime, request: &StartRequest) -> Result<Profil
         return Err(invalid("profile refers to unknown MCP server"));
     }
     Ok(p)
+}
+
+/// Loads one canonical v2 role through the existing safe profile path and
+/// parser, retaining caller constraints while rejecting legacy role defaults.
+pub fn load_provider(cfg: &ProviderConfig, request: &ProviderStartRequest) -> Result<Profile> {
+    if !config::name(&request.profile) || request.profile.contains('.') {
+        return Err(invalid("profile must be a configured name, not a path"));
+    }
+    let root = cfg.profiles_dir();
+    let path = profile_path(root, &request.profile)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| invalid("profile escapes configured directory"))?;
+    let raw = fs::Dir::open(root)?.read(relative, 1024 * 1024)?;
+    let profile = parse(
+        std::str::from_utf8(&raw).map_err(|_| invalid("profile must be UTF-8"))?,
+        &request.storage_projection(),
+    )?;
+    if !profile.canonical
+        || profile
+            .skills
+            .iter()
+            .chain(&profile.mcp)
+            .any(|name| !config::name(name))
+        || profile.mcp.iter().any(|name| !cfg.mcp.contains_key(name))
+    {
+        return Err(invalid("provider start requires a valid canonical role"));
+    }
+    Ok(profile)
 }

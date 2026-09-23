@@ -95,8 +95,10 @@ impl Store {
             .query_map(
                 (observed_at, orchestrator_session_id, limit as i64),
                 |row| {
-                    let warned: bool = row.get::<_, bool>(24)? || row.get::<_, bool>(38)?;
-                    let silence_seconds: f64 = row.get(39)?;
+                    // Named, not positional: later migrations append agents columns.
+                    let warned: bool =
+                        row.get::<_, bool>("warned")? || row.get::<_, bool>("activity_warned")?;
+                    let silence_seconds: f64 = row.get("activity_silence")?;
                     let mut object = row_object(row)?.as_object().cloned().expect("row object");
                     object.remove("activity_warned");
                     object.remove("activity_silence");

@@ -372,8 +372,29 @@ pub struct DispatchResult {
     pub locked_out: bool,
 }
 
+/// The held home-wide dispatcher lock; dropping it releases the lock.
+///
+/// Release is an explicit `flock(LOCK_UN)` on this guard's own open file
+/// description before the descriptor closes. Closing alone is not enough:
+/// a child forked while the lock was held (another thread spawning a
+/// process) inherits a descriptor to the same description and would keep
+/// the lock alive, spuriously locking out the next drain. The unlock only
+/// affects this guard's description, never an independent owner's lock.
+struct DispatcherLock(File);
+
+impl Drop for DispatcherLock {
+    /// Unlocks, then lets the descriptor close; unlock failure is ignored
+    /// because closing the last descriptor releases the lock anyway.
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// Opens the home-owned nonblocking dispatcher lock.
-fn dispatcher_lock(home: &Path) -> Result<Option<File>> {
+///
+/// Returns `None` when another live owner holds it, and the held guard
+/// otherwise; cross-process exclusion lasts exactly as long as the guard.
+fn dispatcher_lock(home: &Path) -> Result<Option<DispatcherLock>> {
     let locks = home.join("locks");
     std::fs::create_dir_all(&locks)?;
     let file = File::options()
@@ -381,7 +402,7 @@ fn dispatcher_lock(home: &Path) -> Result<Option<File>> {
         .append(true)
         .open(locks.join("delivery-dispatcher.lock"))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(DispatcherLock(file))),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -618,4 +639,49 @@ fn claude_registry() -> std::path::PathBuf {
                 .map(|home| std::path::PathBuf::from(home).join(".claude/sessions"))
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatcher_lock;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    /// A child that inherited the held dispatcher descriptor (blocked on its
+    /// stdin, so no timing is involved) must not keep the lock once the
+    /// parent's guard drops; while the guard is alive a second opener is
+    /// still excluded.
+    #[test]
+    fn dropped_guard_is_not_held_by_an_inherited_descriptor() {
+        let home = tempfile::tempdir().unwrap();
+        let guard = dispatcher_lock(home.path()).unwrap().expect("first owner");
+        assert!(
+            dispatcher_lock(home.path()).unwrap().is_none(),
+            "exclusion while held"
+        );
+        let fd = guard.0.as_raw_fd();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "read line"]).stdin(Stdio::piped());
+        // SAFETY: dup2 is async-signal-safe; fd 9 has no close-on-exec, so
+        // the child keeps the same open file description across exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 9) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(guard);
+        let next = dispatcher_lock(home.path()).unwrap();
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            next.is_some(),
+            "an inherited descriptor kept the dropped lock"
+        );
+    }
 }

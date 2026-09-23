@@ -8,7 +8,6 @@ use agent_run_platform::{
     fs::{self, Dir},
     snapshot_tree,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -77,18 +76,13 @@ pub fn apply_environment_overrides(
 }
 /// Launch-time paths derived while materializing one generated home.
 ///
-/// Claude-family launch paths are stored in an indexed file so verified resumes
-/// reuse their original order and plugin roots.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The durable proof is the Python-v1 runtime index; this value deliberately
+/// remains process-local because plugin launch paths are not snapshot metadata.
+#[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    /// Ordered paths passed to the native CLI as `--plugin-dir`.
     pub plugin_paths: Vec<PathBuf>,
-    /// Manifest names and the matching runtime-visible plugin roots.
     pub plugin_roots: BTreeMap<String, PathBuf>,
 }
-/// Indexed launch metadata for Claude-family runtimes.
-const PLUGIN_LAUNCH: &str = ".agent-run-plugin-launch.json";
 /// Builds one Python-v1 managed runtime home before its manifest/index freeze.
 pub struct Publisher {
     pub root: PathBuf,
@@ -162,19 +156,17 @@ impl Publisher {
         Ok((self.snapshot, digest))
     }
 }
-/// Verifies indexed runtime artifacts and returns any recorded plugin launch paths.
-///
-/// Older indexes have no plugin launch file and return an empty snapshot; resume
-/// callers must use `verify_for_resume` to recover those paths from stored grants.
 pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
     let dir = Dir::open(root)?;
     let raw = dir.read(Path::new(snapshot_tree::RUNTIME_SNAPSHOT_INDEX), 64 * 1024)?;
-    let document: Value = serde_json::from_slice(&raw)
-        .map_err(|_| Error::Integrity("runtime snapshot index is malformed".into()))?;
-    let revision = document
-        .get("materialize_revision")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    let revision = serde_json::from_slice::<Value>(&raw)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("materialize_revision")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .ok_or_else(|| Error::Integrity("runtime snapshot index is malformed".into()))?;
     let inspection = snapshot_tree::inspect_runtime_snapshots(root, &revision, expected)
         .map_err(|_| Error::Integrity("runtime snapshot index was modified".into()))?;
@@ -183,75 +175,7 @@ pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
             "generated runtime snapshot was modified".into(),
         ));
     }
-    let indexed = document["files"]
-        .as_array()
-        .is_some_and(|files| files.iter().any(|file| file["path"] == PLUGIN_LAUNCH));
-    match (indexed, dir.optional(Path::new(PLUGIN_LAUNCH), 64 * 1024)?) {
-        (true, Some(raw)) => serde_json::from_slice(&raw)
-            .map_err(|_| Error::Integrity("plugin launch metadata is malformed".into())),
-        (false, None) => Ok(Snapshot::default()),
-        _ => Err(Error::Integrity(
-            "plugin launch metadata is not indexed".into(),
-        )),
-    }
-}
-/// Verifies a resume home, reconstructing launch paths only for legacy indexes.
-///
-/// The runtime and profile must come from the recorded launch identity. A legacy
-/// plugin source that cannot be inspected fails closed instead of dropping flags.
-pub fn verify_for_resume(
-    root: &Path,
-    expected: &str,
-    runtime: &Runtime,
-    profile: &Profile,
-) -> Result<Snapshot> {
-    let snapshot = verify(root, expected)?;
-    if Dir::open(root)?
-        .optional(Path::new(PLUGIN_LAUNCH), 64 * 1024)?
-        .is_some()
-    {
-        return Ok(snapshot);
-    }
-    let kind = runtime.kind()?;
-    if !matches!(kind, Adapter::Claude | Adapter::Glm) {
-        return Ok(snapshot);
-    }
-    let mut legacy = Snapshot::default();
-    for source in &runtime.plugins {
-        let base = source
-            .file_name()
-            .ok_or_else(|| Error::Integrity("legacy plugin path is invalid".into()))?;
-        let path = if runtime
-            .plugin_snapshot_assets
-            .contains_key(&base.to_string_lossy().to_string())
-        {
-            root.join("declared-plugins").join(base)
-        } else {
-            source.clone()
-        };
-        let (name, _, _) = super::plugins::manifest(&path)
-            .map_err(|_| Error::Integrity("legacy plugin source is unavailable".into()))?;
-        if legacy.plugin_roots.insert(name, path.clone()).is_some() {
-            return Err(Error::Integrity(
-                "legacy plugin names are duplicated".into(),
-            ));
-        }
-        legacy.plugin_paths.push(path);
-    }
-    for skill in &profile.skills {
-        let owned = super::plugins::plugin_skill_dir(&runtime.plugins, skill)
-            .map_err(|_| Error::Integrity("legacy plugin skill source is unavailable".into()))?;
-        if owned.is_none() {
-            let path = root.join("plugins").join(skill);
-            if !path.is_dir() {
-                return Err(Error::Integrity(
-                    "legacy skill plugin is unavailable".into(),
-                ));
-            }
-            legacy.plugin_paths.push(path);
-        }
-    }
-    Ok(legacy)
+    Ok(Snapshot::default())
 }
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
@@ -271,6 +195,37 @@ pub fn shell_command(args: &[String]) -> String {
 }
 pub fn account_home(app_home: &Path, kind: Adapter, label: &str) -> PathBuf {
     app_home.join("accounts").join(kind.name()).join(label)
+}
+
+/// Returns the single `CLAUDE_CONFIG_DIR` of one labelled Claude login.
+///
+/// This is the one authority shared by `auth login`, run/provider
+/// materialization, and quota credential resolution. The canonical directory
+/// is `<app_home>/accounts/claude/<label>/claude-config`. Logins created by
+/// earlier releases live at `<runtime_home>@<label>/claude-config` (the
+/// runtime home's final component suffixed with `@<label>`) and stay usable in
+/// place without re-login or copying: when only that legacy directory exists
+/// it is returned. When neither exists the canonical directory is returned
+/// (it is not created here). When both exist and are not the same directory,
+/// ownership is ambiguous and a validation error is returned instead of
+/// silently choosing one; there is never a fallback to the default login.
+pub fn claude_account_config(app_home: &Path, runtime_home: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = account_home(app_home, Adapter::Claude, label).join("claude-config");
+    let name = runtime_home
+        .file_name()
+        .ok_or_else(|| invalid("Claude runtime home has no final path component"))?
+        .to_string_lossy()
+        .into_owned();
+    let legacy = runtime_home
+        .with_file_name(format!("{name}@{label}"))
+        .join("claude-config");
+    match (canonical.is_dir(), legacy.is_dir()) {
+        (true, true) if canonical.canonicalize().ok() != legacy.canonicalize().ok() => Err(
+            invalid("labelled Claude login exists in both account homes; remove one"),
+        ),
+        (false, true) => Ok(legacy),
+        _ => Ok(canonical),
+    }
 }
 pub fn environment(
     config: &Config,
@@ -331,8 +286,7 @@ pub fn environment_with_host(
         if let Some(a) = account {
             env.insert(
                 "CLAUDE_CONFIG_DIR".into(),
-                account_home(app_home, kind, a)
-                    .join("claude-config")
+                claude_account_config(app_home, &runtime.home, a)?
                     .to_string_lossy()
                     .into_owned(),
             );
@@ -490,6 +444,46 @@ pub fn materialize(
     home: &Path,
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
+    materialize_with_provider(config, runtime, request, profile, home, app_home, None)
+}
+
+/// Seals provider-specific native settings and nonsecret launch metadata into
+/// the same verified runtime index as skills, MCP, hooks, and permissions.
+// Each argument is an independent, already-validated input of the one seal.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_provider(
+    config: &Config,
+    runtime: &Runtime,
+    request: &StartRequest,
+    profile: &Profile,
+    home: &Path,
+    app_home: &Path,
+    provider: &agent_run_domain::ProviderDefinition,
+    native_model: &str,
+    config_sha256: &str,
+) -> Result<(Snapshot, String)> {
+    materialize_with_provider(
+        config,
+        runtime,
+        request,
+        profile,
+        home,
+        app_home,
+        Some((provider, native_model, config_sha256)),
+    )
+}
+
+/// Shared v1/v2 writer; only the optional provider branch adds new files or
+/// custom gateway settings, so historical materialization stays byte-stable.
+fn materialize_with_provider(
+    config: &Config,
+    runtime: &Runtime,
+    request: &StartRequest,
+    profile: &Profile,
+    home: &Path,
+    app_home: &Path,
+    provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
+) -> Result<(Snapshot, String)> {
     let kind = runtime.kind()?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     super::claude::validate_runtime(runtime, kind)?;
@@ -644,7 +638,15 @@ pub fn materialize(
             );
             doc.insert("projects".into(), toml::Value::Table(projects));
             super::plugins::codex_config(&mut doc, &hooks, home, &plugins)?;
-            let auth_target = if request.account.is_some() {
+            let custom = provider.is_some_and(|(provider, _, _)| {
+                matches!(
+                    provider.connection,
+                    agent_run_domain::ProviderConnection::Custom { .. }
+                )
+            });
+            let auth_target = if custom {
+                None
+            } else if provider.is_some() || request.account.is_some() {
                 Some("auth.json")
             } else if let Some(Auth::FileLink { target, .. }) = &runtime.auth {
                 Some(target.as_str())
@@ -652,28 +654,65 @@ pub fn materialize(
                 None
             };
             super::codex::render_permissions(&mut doc, runtime, home, auth_target)?;
+            if let Some((provider, _, _)) = provider {
+                if let agent_run_domain::ProviderConnection::Custom { endpoint, .. } =
+                    &provider.connection
+                {
+                    let mut gateway = toml::Table::new();
+                    gateway.insert(
+                        "name".into(),
+                        toml::Value::String("agent-run gateway".into()),
+                    );
+                    gateway.insert("base_url".into(), toml::Value::String(endpoint.clone()));
+                    gateway.insert(
+                        "env_key".into(),
+                        toml::Value::String("AGENT_RUN_PROVIDER_TOKEN".into()),
+                    );
+                    gateway.insert("wire_api".into(), toml::Value::String("responses".into()));
+                    doc.insert(
+                        "model_provider".into(),
+                        toml::Value::String("agent_run_gateway".into()),
+                    );
+                    let mut providers = toml::Table::new();
+                    providers.insert("agent_run_gateway".into(), toml::Value::Table(gateway));
+                    doc.insert("model_providers".into(), toml::Value::Table(providers));
+                    let mut shell = toml::Table::new();
+                    shell.insert("inherit".into(), toml::Value::String("core".into()));
+                    shell.insert(
+                        "exclude".into(),
+                        toml::Value::Array(vec![toml::Value::String(
+                            "AGENT_RUN_PROVIDER_TOKEN".into(),
+                        )]),
+                    );
+                    doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
+                }
+            }
             let text = toml::to_string_pretty(&doc)
                 .map_err(|_| invalid("native config could not be serialized"))?;
             let mut config_text = native_lines.join("\n");
             config_text.push_str("\n\n");
             config_text.push_str(&text);
             p.file("config.toml", config_text.as_bytes(), 0o600)?;
-            let (source, target) = if let Some(a) = request.account.as_deref() {
-                (
+            let source_target = if provider.is_some() {
+                None
+            } else if let Some(a) = request.account.as_deref() {
+                Some((
                     account_home(app_home, kind, a).join("auth.json"),
                     "auth.json".into(),
-                )
+                ))
             } else if let Some(Auth::FileLink { source, target }) = &runtime.auth {
-                (source.clone(), target.clone())
+                Some((source.clone(), target.clone()))
             } else {
                 let global = std::env::var_os("CODEX_HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
                         PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
                     });
-                (global.join("auth.json"), "auth.json".into())
+                Some((global.join("auth.json"), "auth.json".into()))
             };
-            p.link(&target, &source)?;
+            if let Some((source, target)) = source_target {
+                p.link(&target, &source)?;
+            }
         }
         Adapter::Claude | Adapter::Glm => {
             let mut settings = native;
@@ -736,8 +775,25 @@ pub fn materialize(
             0o600,
         )?;
     }
-    if matches!(kind, Adapter::Claude | Adapter::Glm) {
-        p.json(PLUGIN_LAUNCH, &serde_json::to_value(&p.snapshot)?)?;
+    if let Some((provider, native_model, config_sha256)) = provider {
+        p.json(
+            "provider-launch.json",
+            &json!({
+                "provider": provider.id,
+                "config_sha256": config_sha256,
+                "harness": provider.harness,
+                "model": request.model,
+                "native_model": native_model,
+                "connection": provider.connection,
+                "binary": runtime.binary,
+                "plugin_paths": p.snapshot.plugin_paths,
+                "workdir": request.workdir,
+                "profile": profile.name,
+                "restrictions": provider.models.iter()
+                    .find(|model| model.id == request.model)
+                    .map(|model| &model.restrictions),
+            }),
+        )?;
     }
     p.finish()
 }

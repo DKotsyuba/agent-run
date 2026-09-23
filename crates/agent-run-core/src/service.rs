@@ -14,10 +14,20 @@ use crate::{
     verify::{self, Proof},
     Error, Result,
 };
+use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
+use agent_run_domain::{
+    catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
+    ProviderStartRequest, Sha256Digest,
+};
+
+/// Most `selection_stale` recalculations after the initial selection in
+/// [`Service::admit_provider`]: four admission submissions in total.
+pub const PROVIDER_STALE_RETRIES: u32 = 3;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::str::FromStr;
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -35,6 +45,78 @@ pub struct LaunchIdentity {
     pub effective_policy: EffectivePolicy,
     pub runtime_home: Option<PathBuf>,
     pub snapshot_sha256: Option<String>,
+}
+
+/// Durable v2 admission authority; account credentials stay on the attempt.
+///
+/// The zero asset digest and absent runtime home mark preparation before the
+/// supervisor seals assets. No launch may use this pending identity as proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderLaunchIdentity {
+    /// Distinguishes new provider rows from historical runtime requests.
+    pub provider_identity_version: u32,
+    /// Exact hash of the strict provider request for replay.
+    pub replay_request_sha256: String,
+    /// Original explicit provider/model/account-label intent.
+    pub provider_request: ProviderStartRequest,
+    /// SHA-256 of exact config.toml bytes accepted at the request boundary.
+    pub provider_config_sha256: String,
+    /// Complete validated, credential-free launch configuration at admission.
+    pub provider_config: ProviderConfig,
+    /// Secret-free digest and ids of the operative normalized v2 config.
+    pub provider_config_snapshot: Value,
+    /// Frozen provider/model/role/scope; asset digest seals before spawning.
+    pub authority: ResolvedLaunchAuthority,
+    /// Per-lineage generated home once sealed.
+    pub runtime_home: Option<PathBuf>,
+    /// Runtime asset index digest once sealed.
+    pub snapshot_sha256: Option<String>,
+}
+
+impl ProviderLaunchIdentity {
+    /// Reads only an explicit v2 identity and verifies its raw provider
+    /// request matches the staged record projection and replay digest.
+    pub fn read(row: &Record) -> Result<Self> {
+        let identity: Self = serde_json::from_value(
+            row.identity
+                .clone()
+                .ok_or_else(|| invalid("provider launch identity is missing"))?,
+        )
+        .map_err(|_| invalid("provider launch identity is malformed"))?;
+        if identity.provider_identity_version != 2
+            || identity.provider_request.provider.as_str() != row.request.runtime
+            || identity.provider_request.model != row.request.model
+            || identity.provider_request.profile != row.request.profile
+            || identity.provider_request.task != row.request.task
+            || identity.provider_request.workdir != row.request.workdir
+            || identity.provider_request.effort != row.request.effort
+            || identity.provider_request.request_id != row.request.request_id
+            || identity.provider_request.orchestrator != row.request.orchestrator
+            || identity
+                .provider_request
+                .account
+                .as_ref()
+                .map(|label| label.as_str())
+                != row.request.account.as_deref()
+            || identity.authority.provider != identity.provider_request.provider
+            || identity.authority.model != identity.provider_request.model
+            || identity.authority.profile != identity.provider_request.profile
+            || identity.authority.workdir != identity.provider_request.workdir
+            || identity.provider_config.schema_version != 2
+            || identity.provider_config.snapshot()? != identity.provider_config_snapshot
+            || identity.replay_request_sha256
+                != agent_run_domain::canonical::sha256_hex(
+                    &serde_json::to_value(&identity.provider_request)?,
+                    true,
+                )
+        {
+            return Err(Error::Integrity(
+                "stored provider authority contradicts request".into(),
+            ));
+        }
+        Ok(identity)
+    }
 }
 impl LaunchIdentity {
     pub fn read(row: &Record) -> Result<Self> {
@@ -71,7 +153,15 @@ struct CachedConfig {
     /// Lowercase SHA-256 of the exact `config.toml` bytes.
     revision: String,
     /// Parsed and validated configuration for `revision`.
-    value: Config,
+    value: CachedConfigValue,
+}
+/// Exactly one validated schema for the currently active file revision.
+#[derive(Clone)]
+enum CachedConfigValue {
+    /// Historical consumer configuration.
+    Legacy(Config),
+    /// Provider-oriented schema v2 configuration.
+    Providers(ProviderConfig),
 }
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -145,9 +235,26 @@ impl Service {
             .write()
             .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?;
         let revision = cache.as_ref().map(|cached| cached.revision.as_str());
-        match Config::load_if_changed(&self.home, revision) {
-            Ok(None) => Ok(false),
-            Ok(Some((value, revision))) => {
+        let loaded = match ProviderConfig::load_if_changed(&self.home, revision) {
+            Ok(None) => return Ok(false),
+            Ok(Some((value, revision))) => Ok((CachedConfigValue::Providers(value), revision)),
+            Err(provider_error) => match Config::load_if_changed(&self.home, revision) {
+                Ok(None) => return Ok(false),
+                Ok(Some((value, revision))) => Ok((CachedConfigValue::Legacy(value), revision)),
+                Err(legacy_error) => Err(
+                    if matches!(
+                        cache.as_ref().map(|entry| &entry.value),
+                        Some(CachedConfigValue::Providers(_))
+                    ) {
+                        provider_error
+                    } else {
+                        legacy_error
+                    },
+                ),
+            },
+        };
+        match loaded {
+            Ok((value, revision)) => {
                 *cache = Some(CachedConfig { revision, value });
                 logging::config_reload(true, cache.as_ref().map(|c| c.revision.as_str()));
                 Ok(true)
@@ -166,8 +273,349 @@ impl Service {
             .read()
             .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
             .as_ref()
-            .map(|cached| cached.value.clone())
+            .and_then(|cached| match &cached.value {
+                CachedConfigValue::Legacy(value) => Some(value.clone()),
+                _ => None,
+            })
             .ok_or_else(|| Error::Runtime("configuration cache is empty".into()))
+    }
+
+    /// Loads schema v2 through the same last-valid exact-byte cache used by
+    /// historical starts; an invalid file never replaces the active value.
+    fn current_provider_config(&self) -> Result<(ProviderConfig, String)> {
+        self.refresh_config()?;
+        self.config
+            .read()
+            .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
+            .as_ref()
+            .and_then(|cached| match &cached.value {
+                CachedConfigValue::Providers(value) => {
+                    Some((value.clone(), cached.revision.clone()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| invalid("provider start requires schema_version 2"))
+    }
+
+    /// Admits a strict provider request, choosing its account mechanically
+    /// from persisted quota evidence; nothing is spawned.
+    ///
+    /// The orchestrator chooses provider, model, effort and profile; this
+    /// only picks the account. Order of work:
+    ///
+    /// 1. A repeated `request_id` with the identical request returns the
+    ///    original admission (`created=false`) before any config, account or
+    ///    quota read; a different request under that id is `Conflict`.
+    /// 2. The current valid v2 config and account registry resolve the
+    ///    launch authority once; that config revision is frozen into the row.
+    /// 3. Candidates come from
+    ///    [`crate::capacity::provider_ranking::provider_candidates`] outside
+    ///    every write transaction (the request's account label, if any, is a
+    ///    pin with no failover), then the store validates and commits.
+    /// 4. `selection_stale` recomputes from persisted facts and resubmits:
+    ///    one initial selection plus at most [`PROVIDER_STALE_RETRIES`]
+    ///    recalculations. If the last of those four submissions is also
+    ///    stale, this returns `selection_busy` and nothing was admitted.
+    ///    There is no sleep or polling; every other error returns as is.
+    ///
+    /// Test-only (feature `test-fixtures`): when the broker process runs with
+    /// `AGENT_RUN_FIXTURE_ALWAYS_STALE` set, the committed capacity revision
+    /// advances between every ranking and its submission, so a real broker
+    /// deterministically spends its stale-retry budget (`selection_busy`).
+    /// Absent in production builds.
+    pub fn admit_provider(&self, request: ProviderStartRequest) -> Result<Value> {
+        #[cfg(feature = "test-fixtures")]
+        if std::env::var_os("AGENT_RUN_FIXTURE_ALWAYS_STALE").is_some() {
+            let home = self.home.clone();
+            return self.admit_provider_ranked(request, &mut |_| {
+                let mut store = Store::open(&home)?;
+                let tx = store.conn.transaction()?;
+                Store::advance_quota_capacity_revision(&tx)?;
+                tx.commit()?;
+                Ok(())
+            });
+        }
+        self.admit_provider_ranked(request, &mut |_| Ok(()))
+    }
+
+    /// [`Self::admit_provider`] with a hook run after each candidate set is
+    /// computed and before its admission transaction, receiving the
+    /// zero-based submission number.
+    ///
+    /// Test-only seam (feature `test-fixtures`) for deterministic races (a
+    /// revision advance, an account disable) between the ranking read and
+    /// the store transaction. The hook cannot see or change candidates; its
+    /// error aborts the call unchanged.
+    #[cfg(feature = "test-fixtures")]
+    pub fn admit_provider_observed(
+        &self,
+        request: ProviderStartRequest,
+        before_admission: &mut dyn FnMut(u32) -> Result<()>,
+    ) -> Result<Value> {
+        self.admit_provider_ranked(request, before_admission)
+    }
+
+    /// Ranked admission shared by [`Self::admit_provider`] and its test seam;
+    /// `before_admission` runs between each ranking and its submission.
+    fn admit_provider_ranked(
+        &self,
+        request: ProviderStartRequest,
+        before_admission: &mut dyn FnMut(u32) -> Result<()>,
+    ) -> Result<Value> {
+        self.admit_provider_with(
+            request,
+            PROVIDER_STALE_RETRIES,
+            &mut |store, catalog, request, attempt| {
+                let pin = request.account.as_ref().map(|label| label.as_str());
+                let candidates = crate::capacity::provider_ranking::provider_candidates(
+                    store,
+                    catalog,
+                    &request.provider,
+                    &request.model,
+                    pin,
+                    &std::collections::BTreeSet::new(),
+                )?;
+                before_admission(attempt)?;
+                Ok(candidates)
+            },
+        )
+    }
+
+    /// Admits a strict provider request from trusted Rust quota candidates.
+    /// The split lets offline tests drive the real supervisor executable
+    /// without asking a test binary to respawn itself as `agent-run`.
+    /// No transport accepts candidates from caller JSON. A fixed set cannot
+    /// become fresh, so `selection_stale` returns without retry.
+    pub fn admit_provider_trusted(
+        &self,
+        request: ProviderStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        self.admit_provider_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+    }
+
+    /// Shared admission: replay first, authority once, then up to
+    /// `stale_retries + 1` submissions of freshly produced candidates.
+    ///
+    /// `produce` builds one candidate set from the committed store state for
+    /// the resolved catalog; it runs outside any write transaction and gets
+    /// the zero-based submission number. See [`Self::admit_provider`].
+    fn admit_provider_with(
+        &self,
+        mut request: ProviderStartRequest,
+        stale_retries: u32,
+        produce: &mut dyn FnMut(
+            &Store,
+            &agent_run_domain::catalog::ProviderCatalog,
+            &ProviderStartRequest,
+            u32,
+        ) -> Result<QuotaCandidateSet>,
+    ) -> Result<Value> {
+        request.validate()?;
+        if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
+            let store = Store::open(&self.home)?;
+            let row = store.get(&replay.agent_id)?;
+            return Ok(
+                json!({"agent_id":replay.agent_id,"attempt_id":replay.attempt_id,
+                "created":false,"agent":self.view(&store,&row)?}),
+            );
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let provider = catalog
+            .provider(&request.provider)
+            .ok_or_else(|| invalid("provider is not configured"))?;
+        let offering = provider
+            .models
+            .iter()
+            .find(|model| model.id == request.model)
+            .ok_or_else(|| invalid("model is not offered by provider"))?;
+        offering.permits_effort(request.effort.as_deref())?;
+        // Harness options run through the existing launch mechanisms: fast
+        // is the codex service tier, output_schema the claude answer schema.
+        if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
+            return Err(invalid("fast mode is supported only by the codex harness"));
+        }
+        if request.output_schema.is_some()
+            && provider.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+        {
+            return Err(invalid(
+                "output_schema is supported only by the claude-code harness",
+            ));
+        }
+        let pinned = request
+            .account
+            .as_ref()
+            .map(|label| {
+                provider
+                    .binding(label.as_str())
+                    .ok_or_else(|| invalid("account label is not bound to provider"))
+                    .map(|binding| binding.account.clone())
+            })
+            .transpose()?;
+        let mut profile = profiles::load_provider(&config, &request)?;
+        profile
+            .required_constraints
+            .extend(offering.restrictions.iter().copied());
+        let role = role_plan::resolve_role_plan(
+            &profile,
+            config.skills_dir(),
+            &config.mcp,
+            if request.account.is_some() {
+                "account"
+            } else {
+                "global"
+            },
+            request.account.as_ref().map(|label| label.as_str()),
+        )?;
+        let mut effective = request.storage_projection();
+        effective.write = profile.write;
+        effective.read_roots = profile.read_roots.clone();
+        effective.required_constraints = profile.required_constraints.clone();
+        effective.timeout_seconds = Some(
+            effective
+                .timeout_seconds
+                .unwrap_or(config.core.default_timeout_seconds),
+        );
+        let eligible_accounts = provider
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.contains(&request.model))
+            })
+            .filter(|binding| {
+                catalog
+                    .account(&binding.account)
+                    .is_some_and(|record| record.status == AccountStatus::Enabled)
+            })
+            .map(|binding| binding.account.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let authority = ResolvedLaunchAuthority {
+            provider: request.provider.clone(),
+            harness: provider.harness,
+            connection: provider.connection.clone(),
+            model: request.model.clone(),
+            effort: request.effort.clone(),
+            profile: profile.name,
+            workdir: request.workdir.clone(),
+            role_payload: role.to_payload(),
+            assets_sha256: Sha256Digest::from_str(&"0".repeat(64))?,
+            eligible_accounts,
+        };
+        let identity = ProviderLaunchIdentity {
+            provider_identity_version: 2,
+            replay_request_sha256: agent_run_domain::canonical::sha256_hex(
+                &serde_json::to_value(&request)?,
+                true,
+            ),
+            provider_request: request.clone(),
+            provider_config_sha256: revision,
+            provider_config: config.clone(),
+            provider_config_snapshot: config.snapshot()?,
+            authority: authority.clone(),
+            runtime_home: None,
+            snapshot_sha256: None,
+        };
+        let cap = config
+            .harnesses
+            .get(&provider.harness)
+            .ok_or_else(|| invalid("provider harness is not configured"))?
+            .max_active_agents;
+        let identity = serde_json::to_value(identity)?;
+        let mut submission = 0;
+        let admission = loop {
+            let candidates = produce(&Store::open(&self.home)?, &catalog, &request, submission)?;
+            match Store::open(&self.home)?.admit_provider(
+                &request,
+                &effective,
+                &catalog,
+                &authority,
+                &candidates,
+                &identity,
+                config.core.max_active_agents,
+                cap,
+                pinned.as_ref(),
+            ) {
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if stale_retries > 0 && submission == stale_retries =>
+                {
+                    return Err(QuotaAdmissionError::SelectionBusy { stale_retries }.into());
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < stale_retries =>
+                {
+                    submission += 1;
+                }
+                result => break result?,
+            }
+        };
+        let store = Store::open(&self.home)?;
+        let row = store.get(&admission.agent_id)?;
+        Ok(
+            json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
+            "created":admission.created,"agent":self.view(&store,&row)?}),
+        )
+    }
+
+    /// Admits through [`Self::admit_provider`] and hands a newly owned attempt
+    /// to the normal detached provider-aware supervisor; a replayed admission
+    /// (`created=false`) never launches another child or reserves again.
+    pub async fn start_provider(&self, request: ProviderStartRequest) -> Result<Value> {
+        let mut result = self.admit_provider(request)?;
+        self.hand_off_provider(&mut result).await?;
+        Ok(result)
+    }
+
+    /// Launches the supervisor for a newly created provider admission only;
+    /// a launch failure is recorded as a `supervisor_handoff_error` event.
+    ///
+    /// A definite pre-spawn failure (`Error::Io`: the OS refused the spawn,
+    /// or the child died before its PID proof and so owns nothing) certifies
+    /// the still-prepared attempt as never spawned, ends the run `failed`
+    /// with `supervisor_spawn_failed`, completes its terminal delivery once,
+    /// and refreshes `result["agent"]` so the caller returns the durable
+    /// terminal view. Any other launch failure is ambiguous: ownership is
+    /// retained for reconciliation. A replay (`created=false`) launches
+    /// nothing.
+    async fn hand_off_provider(&self, result: &mut Value) -> Result<()> {
+        if result["created"] == true {
+            let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
+            if let Err(error) = supervisor::launch(&self.home, &id).await {
+                let mut store = Store::open(&self.home)?;
+                store.event(
+                    &id,
+                    "supervisor_handoff_error",
+                    &json!({"kind":error.public().kind}),
+                )?;
+                if matches!(error, Error::Io(_)) && store.provider_never_spawned(&id)? {
+                    let mut outcome = Outcome::failure("supervisor_spawn_failed");
+                    outcome.failure_text = Some("the run supervisor could not be started".into());
+                    store.finish(&id, &outcome, None, None)?;
+                    crate::commands::complete_terminal(&mut store, &id)?;
+                    let row = store.get(&id)?;
+                    result["agent"] = self.view(&store, &row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Admits trusted quota candidates and hands a newly owned attempt to
+    /// the normal detached supervisor; replay never launches another child.
+    pub async fn start_provider_trusted(
+        &self,
+        request: ProviderStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        let mut result = self.admit_provider_trusted(request, candidates)?;
+        self.hand_off_provider(&mut result).await?;
+        Ok(result)
     }
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;
@@ -299,6 +747,9 @@ impl Service {
     /// The parent must be terminal with a native session and a sealed Rust launch
     /// identity. Snapshot continuations retain the parent's immutable revision;
     /// legacy revisions remain pending until their supervisor rematerializes them.
+    /// On a schema-2 home a schema-1 run refuses with
+    /// `legacy_continuation_unavailable` and writes nothing; a provider run
+    /// continues through [`Self::admit_provider_resume`].
     pub async fn resume(
         &self,
         id: &AgentId,
@@ -311,6 +762,24 @@ impl Service {
         if !parent.status.terminal() || parent.runtime_session_id.is_none() {
             return Err(invalid(
                 "resume requires a terminal run with a native session ID",
+            ));
+        }
+        // On a schema-2 home no continuation is remapped to a provider or
+        // replayed as a summary: the history stays readable and the refusal is
+        // typed. Explicit provider resume is a separate, later contract.
+        let provider_row = parent
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity["provider_identity_version"] == 2);
+        if provider_row {
+            let mut result =
+                self.admit_provider_resume(&parent, task, timeout, request_id, orchestrator)?;
+            self.hand_off_provider(&mut result).await?;
+            return Ok(result);
+        }
+        if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
+            return Err(Error::Unsupported(
+                "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
             ));
         }
         let mut identity = LaunchIdentity::read(&parent)?;
@@ -377,6 +846,236 @@ impl Service {
             Err(error) => Err(error),
         }
     }
+    /// Admits an explicit resume of a terminal provider run as a new logical
+    /// child, without launching it; [`Self::resume`] hands a created child
+    /// to the supervisor.
+    ///
+    /// The child keeps the parent's provider, harness, explicit model,
+    /// workdir, role grants, sealed assets, frozen configuration, runtime
+    /// home and native session; only the task text, timeout, orchestrator and
+    /// the per-attempt account lease change. A request-id replay is answered
+    /// before any configuration or quota read. The parent's selection intent
+    /// is kept: a pinned run never switches; an automatic run keeps its
+    /// previous account while that account is still a valid candidate and
+    /// switches only when it is not (disabled, exhausted or no longer bound).
+    /// Claude Code keeps session history per login, so it resumes only on the
+    /// parent's own account.
+    ///
+    /// Refuses with `continuation_unavailable` when the sealed assets or the
+    /// native history cannot be proved (see [`crate::continuity::prove`]),
+    /// and with a validation error when the current configuration no longer
+    /// offers the provider, harness, connection or model. Admission itself
+    /// proves the parent terminal, quiescent and cleaned up, and admits at
+    /// most one child per parent.
+    pub fn admit_provider_resume(
+        &self,
+        parent: &Record,
+        task: String,
+        timeout: Option<f64>,
+        request_id: Option<String>,
+        orchestrator: Option<OrchestratorRef>,
+    ) -> Result<Value> {
+        let frozen = ProviderLaunchIdentity::read(parent)?;
+        let mut request = frozen.provider_request.clone();
+        request.task = task;
+        request.request_id = request_id;
+        request.timeout_seconds = timeout.or(frozen.provider_request.timeout_seconds);
+        if orchestrator.is_some() {
+            request.orchestrator = orchestrator;
+        }
+        request.validate()?;
+        // Replay of the original resume intent precedes every mutable read.
+        if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
+            let store = Store::open(&self.home)?;
+            let row = store.get(&replay.agent_id)?;
+            if row.parent_agent_id.as_ref() != Some(&parent.id) {
+                return Err(Error::Conflict);
+            }
+            return Ok(
+                json!({"agent_id":replay.agent_id,"attempt_id":replay.attempt_id,
+                "created":false,"agent":self.view(&store,&row)?}),
+            );
+        }
+        // A parent that already has a child is refused for that reason (the
+        // child's own turns legitimately changed the parent's sealed history);
+        // the unique parent index remains the final authority.
+        let existing: Option<String> = Store::open(&self.home)?
+            .conn
+            .query_row(
+                "SELECT id FROM agents WHERE parent_agent_id=? LIMIT 1",
+                [parent.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(child) = existing {
+            return Err(invalid(format!(
+                "agent {} has already been resumed by {child}",
+                parent.id
+            )));
+        }
+        let session = parent
+            .runtime_session_id
+            .as_deref()
+            .ok_or_else(|| invalid("resume requires a native session ID"))?;
+        let runtime_home = frozen.runtime_home.clone().ok_or_else(|| {
+            Error::Unsupported("continuation_unavailable: parent has no sealed runtime home".into())
+        })?;
+        adapters::materialize::verify(&runtime_home, frozen.authority.assets_sha256.as_str())
+            .map_err(|_| {
+                Error::Unsupported(
+                    "continuation_unavailable: parent runtime assets no longer verify".into(),
+                )
+            })?;
+        let (prefer, intent, pinned_id, adapter_state): (String, String, Option<String>, String) =
+            Store::open(&self.home)?.conn.query_row(
+                "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id,t.adapter_state_json \
+                 FROM attempts t JOIN agents a ON a.id=t.agent_id \
+                 WHERE t.agent_id=? ORDER BY t.number DESC LIMIT 1",
+                [parent.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let prefer: agent_run_domain::catalog::AccountId = prefer.parse()?;
+        // The current configuration may only narrow the frozen authority.
+        let (current, _) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let now_catalog = current.resolve_catalog(accounts.clone())?;
+        let authority = &frozen.authority;
+        let offered = now_catalog
+            .provider(&authority.provider)
+            .filter(|definition| {
+                definition.harness == authority.harness
+                    && definition.connection == authority.connection
+                    && definition
+                        .models
+                        .iter()
+                        .any(|model| model.id == authority.model)
+            });
+        let Some(offered) = offered else {
+            return Err(invalid(
+                "provider, harness, connection or model changed since the parent ran; resume refused",
+            ));
+        };
+        // Current policy must still permit the frozen execution; it is never
+        // replaced by the current one. Checked before the history proof so a
+        // policy refusal is reported as such.
+        current_policy_permits(&current, &frozen, &request)?;
+        // Only the seal recorded at the parent's cleanup boundary is trusted.
+        // At admission only Codex's root is known (its run home); the
+        // handoff binds every harness to the launch plan's actual root.
+        let expected_root = (authority.harness == agent_run_domain::catalog::HarnessId::Codex)
+            .then_some(runtime_home.as_path());
+        verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+        let bound: std::collections::BTreeSet<_> = offered
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.contains(&authority.model))
+            })
+            .map(|binding| binding.account.clone())
+            .collect();
+        let mut child_authority = authority.clone();
+        child_authority.eligible_accounts.retain(|account| {
+            bound.contains(account)
+                && (authority.harness == agent_run_domain::catalog::HarnessId::Codex
+                    || *account == prefer)
+        });
+        let frozen_catalog = frozen.provider_config.resolve_catalog(accounts)?;
+        let hard: std::collections::BTreeSet<_> = frozen_catalog
+            .provider(&authority.provider)
+            .map(|definition| {
+                definition
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.account.clone())
+                    .filter(|account| !child_authority.eligible_accounts.contains(account))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pinned = match (intent.as_str(), pinned_id) {
+            ("pinned", Some(id)) => Some(id.parse::<agent_run_domain::catalog::AccountId>()?),
+            ("auto", None) => None,
+            _ => {
+                return Err(Error::Integrity(
+                    "parent selection intent is malformed".into(),
+                ))
+            }
+        };
+        let mut effective = parent.request.clone();
+        effective.task = request.task.clone();
+        effective.request_id = request.request_id.clone();
+        effective.timeout_seconds = request.timeout_seconds.or(parent.request.timeout_seconds);
+        effective.orchestrator = request.orchestrator.clone();
+        let identity = serde_json::to_value(ProviderLaunchIdentity {
+            provider_identity_version: 2,
+            replay_request_sha256: agent_run_domain::canonical::sha256_hex(
+                &serde_json::to_value(&request)?,
+                true,
+            ),
+            provider_request: request.clone(),
+            provider_config_sha256: frozen.provider_config_sha256.clone(),
+            provider_config: frozen.provider_config.clone(),
+            provider_config_snapshot: frozen.provider_config_snapshot.clone(),
+            authority: child_authority.clone(),
+            runtime_home: Some(runtime_home),
+            snapshot_sha256: frozen.snapshot_sha256.clone(),
+        })?;
+        let cap = current
+            .harnesses
+            .get(&authority.harness)
+            .ok_or_else(|| invalid("provider harness is not configured"))?
+            .max_active_agents;
+        let pin_label = request.account.as_ref().map(|label| label.as_str());
+        let mut submission = 0;
+        let admission = loop {
+            let store = Store::open(&self.home)?;
+            let candidates = crate::capacity::provider_ranking::provider_candidates(
+                &store,
+                &frozen_catalog,
+                &authority.provider,
+                &authority.model,
+                pin_label,
+                &hard,
+            )?;
+            match Store::open(&self.home)?.admit_provider_resume(
+                &request,
+                &effective,
+                &frozen_catalog,
+                &child_authority,
+                &candidates,
+                &identity,
+                current.core.max_active_agents,
+                cap,
+                pinned.as_ref(),
+                agent_run_store::provider_admission::ProviderResume {
+                    parent: &parent.id,
+                    prefer: &prefer,
+                },
+            ) {
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < PROVIDER_STALE_RETRIES =>
+                {
+                    submission += 1;
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
+                    return Err(QuotaAdmissionError::SelectionBusy {
+                        stale_retries: PROVIDER_STALE_RETRIES,
+                    }
+                    .into());
+                }
+                result => break result?,
+            }
+        };
+        let store = Store::open(&self.home)?;
+        let row = store.get(&admission.agent_id)?;
+        Ok(
+            json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
+            "created":admission.created,"agent":self.view(&store,&row)?}),
+        )
+    }
+
     /// Enqueues one durable cancellation and returns the agent's public view.
     ///
     /// The pending command is persisted exactly as [`Store::enqueue`] records
@@ -557,13 +1256,253 @@ impl Service {
         let mut store = Store::open(&self.home)?;
         Ok(reconcile::reconcile(&mut store, 100)?.len())
     }
-    pub async fn models(&self) -> Result<Value> {
-        crate::capacity::models(&self.home).await
+    /// Returns the active cached config revision after the request-boundary
+    /// digest check; an invalid edit keeps the last valid revision active.
+    fn active_config(&self) -> Result<CachedConfig> {
+        self.refresh_config()?;
+        self.config
+            .read()
+            .map_err(|_| Error::Runtime("configuration cache lock is poisoned".into()))?
+            .clone()
+            .ok_or_else(|| Error::Runtime("configuration cache is empty".into()))
+    }
+
+    /// Public `models` read.
+    ///
+    /// A schema-2 config returns the revisioned provider catalog of
+    /// [`crate::capacity::provider_catalog::models`] with exact `query`
+    /// filters. A schema-1 config keeps its historical runtime roster, which
+    /// probes each runtime; filters there are `Unsupported`.
+    pub async fn models(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
+        let active = self.active_config()?;
+        match &active.value {
+            CachedConfigValue::Providers(config) => crate::capacity::provider_catalog::models(
+                &self.home,
+                config,
+                &active.revision,
+                &query,
+            ),
+            CachedConfigValue::Legacy(_) if query.is_empty() => {
+                crate::capacity::models(&self.home).await
+            }
+            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
+                "models filters require schema_version 2".into(),
+            )),
+        }
     }
     pub fn limits(&self) -> Result<Value> {
         crate::capacity::limits(&self.home)
     }
-    pub fn capacity_order(&self) -> Result<Value> {
-        crate::capacity::order(&self.home)
+
+    /// Public `capacity_order` read: the provider-only order of
+    /// [`crate::capacity::provider_catalog::order`] for schema 2, or the
+    /// historical route order for schema 1 (where a model filter is
+    /// `Unsupported`).
+    pub fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
+        let active = self.active_config()?;
+        match &active.value {
+            CachedConfigValue::Providers(config) => crate::capacity::provider_catalog::order(
+                &self.home,
+                config,
+                &active.revision,
+                &query,
+            ),
+            CachedConfigValue::Legacy(_) if query.model.is_none() => {
+                crate::capacity::order(&self.home)
+            }
+            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
+                "capacity_order model filter requires schema_version 2".into(),
+            )),
+        }
     }
+}
+
+/// Refuses a provider resume when the current configuration no longer
+/// permits the parent's frozen execution: the provider no longer runs the
+/// frozen harness through the frozen connection, the offering's native model
+/// alias changed, its configured effort choices exclude the requested effort, a
+/// current hard model restriction is absent from the frozen role,
+/// the current canonical role no longer grants something the frozen role
+/// used (write, network, external read roots, a read root, a skill or MCP
+/// server) or requires a constraint the frozen role lacks, or the current
+/// harness policy rejects the frozen grants. Advice and ranking weights are
+/// not compared. The frozen authority is never replaced by the current one.
+pub(crate) fn current_policy_permits(
+    current: &ProviderConfig,
+    frozen: &ProviderLaunchIdentity,
+    request: &ProviderStartRequest,
+) -> Result<()> {
+    let authority = &frozen.authority;
+    let refuse = |what: &str| {
+        Err(invalid(format!(
+            "current policy no longer permits the parent's frozen execution ({what}); resume refused"
+        )))
+    };
+    let offering = |config: &ProviderConfig| {
+        config
+            .providers
+            .get(&authority.provider)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.id == authority.model)
+            })
+            .cloned()
+    };
+    let (Some(now), Some(then)) = (offering(current), offering(&frozen.provider_config)) else {
+        return refuse("model offering");
+    };
+    // The one offer identity guard shared by explicit resume, automatic
+    // allocation and the switch handoff: the current provider must still
+    // run the frozen harness through the frozen connection (endpoint,
+    // protocol, header style), never a different one under the same id.
+    if current
+        .providers
+        .get(&authority.provider)
+        .is_none_or(|settings| {
+            settings.harness != authority.harness || settings.connection != authority.connection
+        })
+    {
+        return refuse("harness or connection");
+    }
+    if now.native_model.as_deref().unwrap_or(&now.id)
+        != then.native_model.as_deref().unwrap_or(&then.id)
+    {
+        return refuse("native model alias");
+    }
+    if now.permits_effort(request.effort.as_deref()).is_err() {
+        return refuse("effort");
+    }
+    let role =
+        agent_run_config::role_plan::ResolvedRolePlan::from_payload(&authority.role_payload)?;
+    if !now
+        .restrictions
+        .iter()
+        .all(|restriction| role.required_constraints.contains(restriction))
+    {
+        return refuse("model restrictions");
+    }
+    let Ok(mut profile) = profiles::load_provider(current, request) else {
+        return refuse("canonical role");
+    };
+    profile
+        .required_constraints
+        .extend(now.restrictions.iter().copied());
+    let Ok(now_role) = role_plan::resolve_role_plan(
+        &profile,
+        current.skills_dir(),
+        &current.mcp,
+        if request.account.is_some() {
+            "account"
+        } else {
+            "global"
+        },
+        request.account.as_ref().map(|label| label.as_str()),
+    ) else {
+        return refuse("role assets");
+    };
+    let ids = |items: &[String]| {
+        items
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let frozen_skills = ids(&role
+        .skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<Vec<_>>());
+    let frozen_mcp = ids(&role
+        .mcp
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>());
+    let now_skills = ids(&now_role
+        .skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<Vec<_>>());
+    let now_mcp = ids(&now_role
+        .mcp
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>());
+    if (role.write && !now_role.write)
+        || (role.network && !now_role.network)
+        || (role.allow_external_read_roots && !now_role.allow_external_read_roots)
+        || !role
+            .read_roots
+            .iter()
+            .all(|root| now_role.read_roots.contains(root))
+        || !frozen_skills.is_subset(&now_skills)
+        || !frozen_mcp.is_subset(&now_mcp)
+        || !now_role
+            .required_constraints
+            .is_subset(&role.required_constraints)
+    {
+        return refuse("role grants");
+    }
+    let runtime = adapters::provider::runtime(current, authority.harness, &authority.model)?;
+    let frozen_profile = Profile {
+        name: role.role_name.clone(),
+        body: role.prompt.clone(),
+        write: role.write,
+        network: role.network,
+        revision: role.role_revision.clone(),
+        canonical: true,
+        allow_external_read_roots: role.allow_external_read_roots,
+        read_roots: role.read_roots.clone(),
+        skills: frozen_skills.into_iter().collect(),
+        mcp: frozen_mcp.into_iter().collect(),
+        required_constraints: role.required_constraints.clone(),
+    };
+    if policy::evaluate(authority.provider.as_str(), &runtime, &frozen_profile)
+        .admit()
+        .is_err()
+    {
+        return refuse("harness policy");
+    }
+    Ok(())
+}
+
+/// Verifies the native-history seal the supervisor recorded in the parent's
+/// last attempt (`adapter_state_json.native_history`) against the file it
+/// names. The seal must exist, be bound to the parent's session, harness and
+/// assets digest, name `expected_root` (when given) as its storage root, and
+/// the file must still have the exact sealed bytes. A missing seal fails closed: history is never
+/// adopted for the first time here.
+pub(crate) fn verify_recorded_history(
+    adapter_state: &str,
+    frozen: &ProviderLaunchIdentity,
+    expected_root: Option<&std::path::Path>,
+    session: &str,
+) -> Result<()> {
+    let unavailable =
+        |reason: &str| Error::Unsupported(format!("continuation_unavailable: {reason}"));
+    let state: Value = serde_json::from_str(adapter_state)
+        .map_err(|_| unavailable("parent attempt state is unreadable"))?;
+    let record = &state["native_history"];
+    if record.is_null() {
+        return Err(unavailable(
+            "the parent attempt recorded no native history seal",
+        ));
+    }
+    let seal: crate::continuity::HistorySeal = serde_json::from_value(record["seal"].clone())
+        .map_err(|_| unavailable("the parent's native history seal is malformed"))?;
+    if record["assets_sha256"] != frozen.authority.assets_sha256.as_str()
+        || record["provider"] != frozen.authority.provider.as_str()
+    {
+        return Err(unavailable(
+            "native history seal is bound to another authority",
+        ));
+    }
+    if expected_root
+        .is_some_and(|root| root.canonicalize().ok().as_deref() != Some(seal.root.as_path()))
+    {
+        return Err(unavailable(
+            "native history seal names another storage root",
+        ));
+    }
+    crate::continuity::verify(&seal, frozen.authority.harness, session)
 }

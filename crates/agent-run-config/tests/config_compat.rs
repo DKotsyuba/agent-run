@@ -150,12 +150,7 @@ fn config_to_value(cfg: &Config) -> Value {
             "warning_fraction": cfg.core.warning_fraction,
             "stalled_after_seconds": cfg.core.stalled_after_seconds,
         },
-        "capacity": {
-            "collect_interval_seconds": cfg.capacity.collect_interval_seconds,
-            "sample_retention": cfg.capacity.sample_retention,
-            "context_max_chars": cfg.capacity.context_max_chars,
-            "codexbar_binary": cfg.capacity.codexbar_binary,
-        },
+        "capacity": capacity_summary(&cfg.capacity),
         "delivery": {
             "retry_base_seconds": cfg.delivery.retry_base_seconds,
             "retry_cap_seconds": cfg.delivery.retry_cap_seconds,
@@ -178,6 +173,20 @@ fn environment_value(e: &agent_run_config::config::Environment) -> Value {
         "denied_commands": e.denied_commands,
         "rust": e.rust.as_ref().map(|r| json!({"rustup_home": r.rustup_home, "cargo_bin": r.cargo_bin})),
     })
+}
+
+/// Summarizes capacity settings; the retired `codexbar_binary` appears only
+/// when a legacy schema-1 file still declares it (it has no default).
+fn capacity_summary(capacity: &agent_run_config::config::Capacity) -> Value {
+    let mut value = json!({
+        "collect_interval_seconds": capacity.collect_interval_seconds,
+        "sample_retention": capacity.sample_retention,
+        "context_max_chars": capacity.context_max_chars,
+    });
+    if let Some(path) = &capacity.legacy_codexbar_binary {
+        value["codexbar_binary"] = json!(path);
+    }
+    value
 }
 
 /// Canonicalizes one expected string path when its target exists on this host.
@@ -346,7 +355,7 @@ fn expected_config_paths_are_portable_without_relaxing_other_strings() {
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_accounts_require_supported_adapter_and_legacy_default_is_declared`.
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_claude_accounts_accept_its_scoped_environment_auth`.
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_codex_workspace_root_and_mcp_approval_mode_are_strict`.
-/// Mirrors Python `tests/test_config.py::ConfigTests::test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute`.
+/// Mirrors Python `tests/test_config.py::ConfigTests::test_codexbar_binary_defaults_to_homebrew_and_must_be_absolute`, minus the retired default (legacy input only).
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_core_and_capacity_bounds_fail_during_load`.
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_delivery_queue_binary_is_optional_and_absolute`.
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_legacy_opencode_runtime_is_ignored`.

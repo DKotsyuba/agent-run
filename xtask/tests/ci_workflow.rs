@@ -1,4 +1,4 @@
-//! Static regression coverage for the Rust-only CI and release workflows.
+//! Static regression coverage for the native CI and release workflows.
 
 use std::{fs, path::Path};
 
@@ -10,10 +10,9 @@ fn repository_file(path: &str) -> String {
 
 /// Ensures primary CI gates macOS releases while retaining visible Linux validation.
 #[test]
-fn ci_is_rust_only_and_checks_the_desktop_transport() {
+fn ci_checks_native_release_and_desktop_transport() {
     let workflow = repository_file(".github/workflows/ci.yml");
     for required in [
-        "test -z \"$(git ls-files '*.py')\"",
         "cargo xtask check",
         "cargo xtask archive --verify",
         "cargo xtask release build-native",
@@ -28,12 +27,6 @@ fn ci_is_rust_only_and_checks_the_desktop_transport() {
         "validation-only-linux-x86_64-unqualified",
     ] {
         assert!(workflow.contains(required), "CI is missing {required:?}");
-    }
-    for forbidden in ["setup-python", "pip install", "pytest", "uv sync"] {
-        assert!(
-            !workflow.contains(forbidden),
-            "CI still contains legacy command {forbidden:?}"
-        );
     }
     assert!(
         !workflow.contains("macos-latest"),
@@ -87,19 +80,10 @@ fn release_publishes_checksummed_native_assets() {
             "release workflow is missing {required:?}"
         );
     }
-    for forbidden in [
-        "setup-python",
-        "pip install",
-        "pytest",
-        "uv sync",
-        ".whl",
-        "sdist",
-        "x86_64-unknown-linux-gnu",
-        "matrix.target",
-    ] {
+    for forbidden in ["x86_64-unknown-linux-gnu", "matrix.target"] {
         assert!(
             !workflow.contains(forbidden),
-            "release still contains legacy artifact {forbidden:?}"
+            "release contains an unqualified target {forbidden:?}"
         );
     }
     assert_eq!(

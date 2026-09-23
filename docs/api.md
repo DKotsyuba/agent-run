@@ -237,12 +237,14 @@ Notes for the loop:
 | -32700 | unparseable line, or line over 1 MiB |
 | -32600 | not a JSON-RPC 2.0 request; batch array; bad `id` |
 | -32601 | unknown method |
-| -32602 | invalid params (message carries the validation detail) |
-| -32000 | domain error; `error.data.code` holds the agent-run error class (e.g. `UnknownAgent`), plus context fields |
+| -32602 | invalid params (message carries the validation detail); a more specific class such as `PathEscapeError` is kept in `error.data.code` |
+| -32000 | domain error; `error.data.code` holds the agent-run error class (e.g. `AgentNotFound`, `selection_busy`, `no_eligible_account`, `quota_exhausted`), plus context fields |
 | -32603 | internal error (bounded message, details in server log) |
 
 Treat `-32602`/`-32000` as actionable (fix the request / the referenced
-id); `-32603` as a bug to report.
+id); `-32603` as a bug to report. The CLI (`error.type`) and MCP tool
+errors report the same class the broker returned; only an unknown class is
+rendered as `RuntimeError`.
 
 ## Versioning and compatibility
 
@@ -251,5 +253,6 @@ id); `-32603` as a bug to report.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 16. Older resident processes refuse a
-  newer database and must be restarted after an upgrade migrates it.
+- The current database schema is version 17, reached through the paired
+  `agent-run config migrate`. Older resident processes refuse a newer database
+  and must be restarted after an upgrade migrates it.

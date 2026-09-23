@@ -23,6 +23,10 @@ fn main() {
         ));
         return;
     }
+    if args.first().map(String::as_str) == Some("app-server") {
+        app_server();
+        return;
+    }
     if args.iter().any(|s| s == "--version") {
         println!("agent-run offline fixture 1.0");
         return;
@@ -142,7 +146,40 @@ fn main() {
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
     }
-    let failed = task == "fixture:error";
+    native_history(&session, &task);
+    // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
+    // same JSON merely quoted in assistant text (which must not count).
+    let quota_frame = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1790200000},"uuid":"fixture-uuid","session_id":session});
+    if task == "fixture:quota" || task.starts_with("fixture:quota-then-") {
+        emit(quota_frame.clone());
+    }
+    // A model-scoped weekly window (no exact physical pool mapping).
+    if task == "fixture:quota-opus" {
+        emit(
+            json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day_opus"},"uuid":"fixture-uuid-3","session_id":session}),
+        );
+    }
+    // A later protocol state supersedes the rejection: the window is allowed
+    // again, or the turn ends on an assistant error of another class.
+    if task == "fixture:quota-then-allowed" {
+        emit(
+            json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"uuid":"fixture-uuid-2","session_id":session}),
+        );
+    }
+    if task == "fixture:quota-then-auth" {
+        emit(
+            json!({"type":"assistant","session_id":session,"parent_tool_use_id":null,"error":"authentication_failed","message":{"content":[{"type":"text","text":"login required"}]}}),
+        );
+    }
+    if task == "fixture:quota-text" {
+        emit(
+            json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":quota_frame.to_string()}]}}),
+        );
+    }
+    let failed = task == "fixture:error"
+        || task == "fixture:quota"
+        || task == "fixture:quota-opus"
+        || task.starts_with("fixture:quota-then-");
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );
@@ -150,4 +187,195 @@ fn main() {
         io::stdout().flush().expect("fixture stdout");
         std::process::exit(3);
     }
+}
+
+/// Appends this turn to a Claude-shaped native transcript, as the real
+/// harness does before its result: `$CLAUDE_CONFIG_DIR/projects/
+/// -fixture-workdir/<session>.jsonl` with the user task, one completed tool
+/// call and the assistant text. Nothing is written without a config dir.
+fn native_history(session: &str, task: &str) {
+    let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&root).join("projects/-fixture-workdir");
+    std::fs::create_dir_all(&dir).expect("fixture history dir");
+    let path = dir.join(format!("{session}.jsonl"));
+    let turn = std::fs::read_to_string(&path)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    let tool = format!("toolu-fixture-{turn}");
+    let lines = [
+        json!({"sessionId":session,"type":"user","message":{"role":"user","content":[{"type":"text","text":task}]}}),
+        json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"tool_use","id":tool}]}}),
+        json!({"sessionId":session,"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":tool}]}}),
+        json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"text","text":"fixture final answer"}]}}),
+    ];
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("fixture history");
+    for line in lines {
+        writeln!(file, "{line}").expect("fixture history write");
+    }
+}
+
+/// A minimal Codex app-server (JSON lines over stdio) for provider tests.
+///
+/// Answers `initialize`, `model/list` (model `fixture`), `thread/start` or
+/// `thread/resume` (echoing the requested grant and keeping the resumed
+/// thread id) and `turn/start`. It keeps a Codex-shaped rollout in
+/// `$CODEX_HOME/sessions/.../rollout-fixture-<thread>.jsonl` with the turn
+/// input as the installed Codex records it: a user `message` whose
+/// `input_text` is the exact wire input, tagged with the turn id in
+/// `internal_chat_message_metadata_passthrough`. Turn ids are unique per
+/// process and turn, like real ones. A turn fails with the authoritative
+/// `usageLimitExceeded` code when the linked `$CODEX_HOME/auth.json`
+/// contains `exhausted`; with `early` as well, it is rejected before the
+/// user input is recorded (meta-only history), and with `rewrite` the whole
+/// rollout is replaced by a structurally valid meta-only file before that
+/// failure (earlier turns vanish). Otherwise it completes with an agent
+/// message naming the thread.
+fn app_server() {
+    let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
+    let exhausted = std::fs::read_to_string(home.join("auth.json"))
+        .map(|text| text.contains("exhausted"))
+        .unwrap_or(false);
+    let mut thread = String::new();
+    let mut turns = 0;
+    for line in io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (Some(id), Some(method)) = (request.get("id").cloned(), request["method"].as_str())
+        else {
+            continue;
+        };
+        let params = &request["params"];
+        match method {
+            "model/list" => emit(json!({"id":id,"result":{"data":[{"id":"fixture"}]}})),
+            "thread/start" | "thread/resume" => {
+                thread = params["threadId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("019a-fixture-{}", std::process::id()));
+                let rollout = rollout_path(&home, &thread);
+                if method == "thread/start" {
+                    std::fs::create_dir_all(rollout.parent().unwrap()).expect("rollout dir");
+                    append(
+                        &rollout,
+                        &json!({"type":"session_meta","payload":{"id":thread}}),
+                    );
+                }
+                let mut echo = json!({
+                    "model":params["model"],"cwd":params["cwd"],"approvalPolicy":params["approvalPolicy"],
+                    "sandbox":{"type":"readOnly","networkAccess":false},
+                    "runtimeWorkspaceRoots":params.get("runtimeWorkspaceRoots").cloned().unwrap_or_else(|| json!([params["cwd"]])),
+                    "thread":{"id":thread,"status":{"type":"idle"}},"threadId":thread,
+                });
+                if let Some(profile) = params["permissions"].as_str() {
+                    echo["activePermissionProfile"] = json!({"id":profile});
+                }
+                if let Some(reviewer) = params.get("approvalsReviewer") {
+                    echo["approvalsReviewer"] = reviewer.clone();
+                }
+                emit(json!({"id":id,"result":echo}));
+            }
+            "turn/start" => {
+                // `slow` in the auth file makes each turn take 1.5 s.
+                if std::fs::read_to_string(home.join("auth.json"))
+                    .map(|text| text.contains("slow"))
+                    .unwrap_or(false)
+                {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                turns += 1;
+                let turn = format!("turn-{}-{turns}", std::process::id());
+                let input = params["input"][0]["text"].as_str().unwrap_or("").to_owned();
+                let rollout = rollout_path(&home, &thread);
+                let early = exhausted
+                    && std::fs::read_to_string(home.join("auth.json"))
+                        .map(|text| text.contains("early"))
+                        .unwrap_or(false);
+                if !early {
+                    append(
+                        &rollout,
+                        &json!({"type":"response_item","payload":{"type":"message","role":"user",
+                            "content":[{"type":"input_text","text":input}],
+                            "internal_chat_message_metadata_passthrough":{"turn_id":turn}}}),
+                    );
+                }
+                emit(json!({"id":id,"result":{"turn":{"id":turn}}}));
+                // `hold` in the auth file pauses before the terminal frame
+                // until the test releases it (a deterministic barrier).
+                let hold = std::fs::read_to_string(home.join("auth.json"))
+                    .map(|text| text.contains("hold"))
+                    .unwrap_or(false);
+                if hold {
+                    std::fs::write(home.join("fixture-held"), "").expect("fixture hold marker");
+                    for _ in 0..400 {
+                        if home.join("fixture-release").exists() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                if exhausted {
+                    if std::fs::read_to_string(home.join("auth.json"))
+                        .map(|text| text.contains("rewrite"))
+                        .unwrap_or(false)
+                    {
+                        std::fs::write(
+                            &rollout,
+                            format!(
+                                "{}\n",
+                                json!({"type":"session_meta","payload":{"id":thread}})
+                            ),
+                        )
+                        .expect("rewrite rollout");
+                    }
+                    emit(
+                        json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"failed","items":[],"error":{"message":"usage limit reached","codexErrorInfo":"usageLimitExceeded"}}}}),
+                    );
+                } else {
+                    // Streamed as two deltas (leading whitespace and a
+                    // terminal escape included) before the completed item.
+                    let head = "fixture  \u{1b}[31mcodex ".to_owned();
+                    let tail = format!("answer on {thread}");
+                    let text = format!("{head}{tail}");
+                    for delta in [&head, &tail] {
+                        emit(
+                            json!({"method":"item/agentMessage/delta","params":{"threadId":thread,"turnId":turn,"itemId":format!("msg-{turns}"),"delta":delta}}),
+                        );
+                    }
+                    append(
+                        &rollout,
+                        &json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":text}}),
+                    );
+                    emit(
+                        json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"completed","items":[{"type":"agentMessage","id":format!("msg-{turns}"),"text":text}]}}}),
+                    );
+                }
+            }
+            _ => emit(json!({"id":id,"result":{}})),
+        }
+    }
+}
+
+/// The fixture rollout file of `thread` below `home`.
+fn rollout_path(home: &std::path::Path, thread: &str) -> std::path::PathBuf {
+    home.join(format!(
+        "sessions/2026/09/23/rollout-fixture-{thread}.jsonl"
+    ))
+}
+
+/// Appends one JSON line to a fixture rollout.
+fn append(path: &std::path::Path, value: &Value) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("fixture rollout");
+    writeln!(file, "{value}").expect("fixture rollout write");
 }

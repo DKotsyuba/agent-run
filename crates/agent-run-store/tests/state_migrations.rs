@@ -7,7 +7,7 @@
 //! replayed forward), so no Python process runs at test time.
 use agent_run_store::{migrations, Store, VERSION};
 use regex::Regex;
-use rusqlite::{params, Connection, DatabaseName};
+use rusqlite::{params, Connection, DatabaseName, TransactionBehavior};
 use std::path::Path;
 
 const V1_SCHEMA: &str = include_str!("fixtures/schema_v1.sql");
@@ -19,7 +19,7 @@ const V1_AGENTS: [&str; 3] = ["agt_alpha", "agt_beta", "agt_gamma"];
 fn build_fixture(path: &Path, version: i64) -> Connection {
     if version >= 2 {
         let fixture_name = if version == VERSION {
-            "current-v16.sqlite".to_owned()
+            format!("current-v{VERSION}.sqlite")
         } else {
             format!("historical-v{version}.sqlite")
         };
@@ -71,7 +71,7 @@ fn agent_count(conn: &Connection) -> i64 {
         .unwrap()
 }
 
-/// Every application table/index with insignificant whitespace and
+/// Every application table/index/trigger with insignificant whitespace and
 /// SQLite-added identifier quotes normalized away (mirrors Python's
 /// `_schema_objects` in `tests/test_state_migrations.py`).
 fn schema_objects(conn: &Connection) -> Vec<(String, String, String)> {
@@ -79,7 +79,7 @@ fn schema_objects(conn: &Connection) -> Vec<(String, String, String)> {
     let mut stmt = conn
         .prepare(
             "SELECT type, name, sql FROM sqlite_master \
-             WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'",
+             WHERE type IN ('table','index','trigger') AND name NOT LIKE 'sqlite_%'",
         )
         .unwrap();
     let mut rows: Vec<(String, String, String)> = stmt
@@ -129,6 +129,38 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
             "store migrated from v{version} drifted from a fresh schema"
         );
     }
+}
+
+/// The committed current-version binary fixture is a real current store,
+/// including its triggers and singleton quota revision, not a stale dev copy.
+#[test]
+fn current_binary_fixture_matches_fresh_schema() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let fixture = build_fixture(&db_path, VERSION);
+    assert_eq!(user_version(&fixture), VERSION);
+    assert_eq!(schema_objects(&fixture), fresh_schema_objects());
+    for required in [
+        "quota_capacity_revision",
+        "attempt_quota_keys",
+        "attempt_quota_keys_account_guard",
+        "attempts_selected_account_immutable",
+        "attempt_quota_keys_immutable",
+        "quota_exhaustion",
+        "idx_capacity_samples_account_key",
+    ] {
+        assert!(schema_objects(&fixture)
+            .iter()
+            .any(|(_, name, _)| name == required));
+    }
+    drop(fixture);
+    assert_eq!(
+        Store::open(home.path())
+            .unwrap()
+            .quota_capacity_revision()
+            .unwrap(),
+        0
+    );
 }
 
 // --- (b) existing rows survive migration ---
@@ -661,4 +693,364 @@ fn read_only_snapshot_refuses_a_pending_migration_without_mutation() {
     let error = agent_run_store::diagnostics::diagnostic_snapshot(&db_path, 1.0, 256).unwrap_err();
     assert!(error.to_string().contains("state migration required"));
     assert_eq!(user_version(&open_ro(&db_path)), 1);
+}
+
+// --- (e) schema v17 provider orchestration: additive columns, one owned
+// attempt across the orchestrated lifecycle, and legacy rows stay readable ---
+
+/// Seeds a v16 store with one agent, a legacy open attempt without a selected
+/// account, and a historical message whose attempt binding is NULL.
+fn seed_v16_legacy(conn: &Connection) {
+    conn.execute(
+        "INSERT INTO agents (id, runtime, model, profile, task, task_summary, workdir, \
+         request_json, status, created_at, timeout_seconds, config_revision) \
+         VALUES ('ag-20260825-010203-0123456789','codex','gpt-5.1','profile','task','summary','/tmp', \
+         '{\"runtime\":\"codex\",\"model\":\"gpt-5.1\",\"profile\":\"profile\",\"task\":\"task\",\
+         \"workdir\":\"/tmp\"}','running',1.0,10.0,'cfg')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at) \
+         VALUES ('att_legacy', 'ag-20260825-010203-0123456789', 1, 'running', '{}', 1.0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO messages (agent_id, attempt_id, at, role, content) \
+         VALUES ('ag-20260825-010203-0123456789', NULL, 1.0, 'user', 'historical message')",
+        [],
+    )
+    .unwrap();
+}
+
+/// Verifies v16 -> v17 keeps historical rows readable, leaves new columns
+/// NULL, still accepts current `running` attempt inserts that claim no
+/// ownership, and enforces one owned attempt per agent across the whole
+/// orchestrated lifecycle regardless of attempt state.
+#[test]
+fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let build = build_fixture(&db_path, 16);
+    seed_v16_legacy(&build);
+    drop(build);
+
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(store.health().unwrap()["schema_version"], VERSION);
+    let conn = open_ro(&db_path);
+
+    // Historical message with NULL attempt remains readable through the store.
+    let transcript = store
+        .transcript(&"ag-20260825-010203-0123456789".parse().unwrap(), 0, 10)
+        .unwrap();
+    let messages = transcript["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"], "historical message");
+
+    // New columns arrive NULL on legacy rows; ownership stays unclaimed.
+    let (selected, phase, intent, owned): (Option<String>, Option<String>, Option<String>, i64) =
+        conn.query_row(
+            "SELECT a.selected_account_id, a.phase, g.selection_intent, a.ownership_active \
+             FROM attempts a JOIN agents g ON g.id=a.agent_id WHERE a.id='att_legacy'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(selected, None);
+    assert_eq!(phase, None);
+    assert_eq!(intent, None);
+    assert_eq!(owned, 0);
+    let legacy_capacity: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT account_id,quota_key FROM capacity_samples LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy_capacity, (None, None));
+
+    // Registry and quota revision tables start empty and admit typed facts.
+    let account: agent_run_domain::AccountId = "acct-codex-native".parse().unwrap();
+    let key = agent_run_domain::PhysicalQuotaKey::new(&account, "gpt-5.1").unwrap();
+    let second_key = agent_run_domain::PhysicalQuotaKey::new(&account, "shared-tokens").unwrap();
+    assert_eq!(store.quota_capacity_revision().unwrap(), 0);
+    assert_eq!(
+        store
+            .active_attempt_counts(std::slice::from_ref(&account))
+            .unwrap()["acct-codex-native"],
+        0
+    );
+
+    let mut writable = Connection::open(&db_path).unwrap();
+    writable.pragma_update(None, "foreign_keys", true).unwrap();
+    writable
+        .execute(
+            "INSERT INTO provider_accounts VALUES ('acct-codex-native','openai',\
+             'keychain:codex','enabled',1.0,1.0)",
+            [],
+        )
+        .unwrap();
+    assert!(writable.execute(
+        "INSERT INTO provider_accounts VALUES ('acct-alias','openai','keychain:codex','enabled',1.0,1.0)",
+        [],
+    ).is_err());
+    writable.execute(
+        "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,account_id,quota_key) \
+         VALUES ('codex','tokens','5h','collector','null',?1,?2)",
+        params![account.as_str(), key.as_str()],
+    ).unwrap();
+    for (candidate_account, candidate_key) in [
+        (Some(account.as_str()), None),
+        (None, Some(key.as_str())),
+        (Some(account.as_str()), Some("acct-other::tokens")),
+        (Some("acct-missing"), Some("acct-missing::tokens")),
+    ] {
+        assert!(writable.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,account_id,quota_key) \
+             VALUES ('codex','tokens','5h','collector','null',?1,?2)",
+            params![candidate_account, candidate_key],
+        ).is_err());
+    }
+    writable.execute(
+        "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at,collector_revision) \
+         VALUES (?1,?2,'collector','5h',1.0,2.0,'revision-a')",
+        params![account.as_str(), key.as_str()],
+    ).unwrap();
+    assert!(writable.execute(
+        "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,collector_revision) \
+         VALUES (?1,?2,'collector','5h',3.0,'revision-b')",
+        params![account.as_str(), key.as_str()],
+    ).is_err());
+    for (candidate_account, candidate_key) in [
+        (account.as_str(), "acct-other::tokens"),
+        ("acct-missing", "acct-missing::tokens"),
+    ] {
+        assert!(writable
+            .execute(
+                "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at) \
+             VALUES (?1,?2,'collector','5h',1.0)",
+                params![candidate_account, candidate_key],
+            )
+            .is_err());
+    }
+    writable
+        .execute(
+            "DELETE FROM capacity_samples WHERE account_id=?1",
+            [account.as_str()],
+        )
+        .unwrap();
+    let latched: i64 = writable
+        .query_row(
+            "SELECT COUNT(*) FROM quota_exhaustion WHERE account_id=?1",
+            [account.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(latched, 1);
+    for (pool, expected) in [(&key, 1), (&second_key, 2)] {
+        let tx = writable.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,observed_at,payload_json) \
+             VALUES ('codex',?1,'5h','fixture',1.0,'null')",
+            [pool.as_str()],
+        )
+        .unwrap();
+        assert_eq!(
+            Store::advance_quota_capacity_revision(&tx).unwrap(),
+            expected
+        );
+        assert_eq!(Store::quota_capacity_revision_in(&tx).unwrap(), expected);
+        tx.commit().unwrap();
+        assert_eq!(store.quota_capacity_revision().unwrap(), expected);
+    }
+    // The second physical pool changed; the first pool's candidate revision
+    // is stale despite its own key remaining untouched.
+    assert_ne!(store.quota_capacity_revision().unwrap(), 1);
+
+    // Legacy-style inserts (no ownership claim) still work beside the index,
+    // even while another attempt holds ownership.
+    writable
+        .execute(
+            "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at) \
+             VALUES ('att_legacy2', 'ag-20260825-010203-0123456789', 2, 'running', '{}', 2.0)",
+            [],
+        )
+        .unwrap();
+    // One owned attempt across distinct lifecycle states: a claim in the
+    // prepared state already fences every later owned attempt.
+    let tx = writable
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    tx
+        .execute(
+            "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at, \
+             selected_account_id, ownership_active) VALUES ('att_orch','ag-20260825-010203-0123456789',3,'prepared',\
+             '{}',3.0,'acct-codex-native',1)",
+            [],
+        )
+        .unwrap();
+    for quota_key in [&key, &second_key] {
+        tx.execute(
+            "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
+            [quota_key.as_str()],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        Store::active_attempt_counts_in(&tx, std::slice::from_ref(&account)).unwrap()
+            [account.as_str()],
+        1
+    );
+    assert_eq!(
+        Store::active_reservation_counts_in(&tx, &[key.clone(), second_key.clone()]).unwrap()
+            [second_key.as_str()],
+        1
+    );
+    tx.commit().unwrap();
+    assert!(writable
+        .execute(
+            "UPDATE attempts SET selected_account_id='acct-other' WHERE id='att_orch'",
+            [],
+        )
+        .is_err());
+    assert!(writable
+        .execute(
+            "UPDATE attempts SET selected_account_id=NULL WHERE id='att_orch'",
+            [],
+        )
+        .is_err());
+    assert_eq!(
+        writable
+            .execute(
+                "UPDATE attempts SET selected_account_id='acct-codex-native' WHERE id='att_orch'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(writable.execute(
+        "UPDATE attempt_quota_keys SET quota_key='acct-other::gpt-5.1' WHERE attempt_id='att_orch' AND quota_key=?1",
+        [key.as_str()],
+    ).is_err());
+    assert!(writable.execute(
+        "UPDATE attempt_quota_keys SET attempt_id='att_legacy2' WHERE attempt_id='att_orch' AND quota_key=?1",
+        [key.as_str()],
+    ).is_err());
+    assert_eq!(writable.execute(
+        "UPDATE attempt_quota_keys SET quota_key=quota_key WHERE attempt_id='att_orch' AND quota_key=?1",
+        [key.as_str()],
+    ).unwrap(), 1);
+    assert_eq!(
+        writable
+            .execute(
+                "UPDATE attempts SET selected_account_id='acct-other' WHERE id='att_legacy2'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    assert!(writable
+        .execute(
+            "UPDATE attempts SET selected_account_id='acct-codex-native' WHERE id='att_legacy2'",
+            [],
+        )
+        .is_err());
+    let other: agent_run_domain::AccountId = "acct-other".parse().unwrap();
+    let foreign_key = agent_run_domain::PhysicalQuotaKey::new(&other, "gpt-5.1").unwrap();
+    assert!(writable
+        .execute(
+            "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
+            [foreign_key.as_str()],
+        )
+        .is_err());
+    assert_eq!(
+        store
+            .active_reservation_counts(&[key.clone(), second_key.clone()])
+            .unwrap()[key.as_str()],
+        1
+    );
+    assert_eq!(
+        store
+            .active_reservation_counts(std::slice::from_ref(&second_key))
+            .unwrap()[second_key.as_str()],
+        1
+    );
+    for (id, number, state) in [
+        ("att_orch_run", 4, "running"),
+        ("att_orch_switch", 5, "account_switch"),
+        ("att_orch_cleanup", 6, "cleanup_pending"),
+    ] {
+        let conflict = writable
+            .execute(
+                "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, \
+                 created_at, selected_account_id, ownership_active) \
+                 VALUES (?1,'ag-20260825-010203-0123456789',?2,?3,'{}',4.0,'acct-codex-native',1)",
+                params![id, number, state],
+            )
+            .unwrap_err();
+        // Fresh attempt numbers mean this uniqueness failure can only come
+        // from the ownership partial index, not the (agent_id, number) key.
+        assert!(
+            conflict
+                .to_string()
+                .contains("UNIQUE constraint failed: attempts.agent_id"),
+            "{state}: {conflict}"
+        );
+    }
+
+    // The index only enforces uniqueness: SQL permits release with NULL proof.
+    // The future session consumer must verify cleanup before this update.
+    let proof: Option<String> = writable
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE id='att_orch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(proof, None);
+    writable
+        .execute(
+            "UPDATE attempts SET ownership_active=0, state='finished', finished_at=4.0 \
+             WHERE id='att_orch'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .active_attempt_counts(std::slice::from_ref(&account))
+            .unwrap()["acct-codex-native"],
+        0
+    );
+    assert_eq!(
+        store
+            .active_reservation_counts(&[key.clone(), second_key.clone()])
+            .unwrap()[key.as_str()],
+        0
+    );
+    writable
+        .execute(
+            "INSERT INTO attempts (id, agent_id, number, state, adapter_state_json, created_at, \
+             selected_account_id, ownership_active) VALUES ('att_orch2','ag-20260825-010203-0123456789',7,\
+             'prepared','{}',5.0,'acct-codex-native',1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .active_attempt_counts(std::slice::from_ref(&account))
+            .unwrap()["acct-codex-native"],
+        1
+    );
+    writable
+        .execute(
+            "INSERT INTO attempt_quota_keys VALUES ('att_orch2', ?1)",
+            [key.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.active_reservation_counts(&[key, second_key]).unwrap()
+            ["acct-codex-native::shared-tokens"],
+        0
+    );
 }

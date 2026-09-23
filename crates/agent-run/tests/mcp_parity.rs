@@ -40,6 +40,9 @@ impl Harness {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // The captured Python session ran against an empty schema-1 home;
+        // `init` now seeds schema 2, so the legacy config is restored here.
+        std::fs::write(home.join("config.toml"), "schema_version = 1\n").unwrap();
         Self {
             temp,
             home,
@@ -145,6 +148,10 @@ const START_OPENING: &str = "Start one asynchronous durable agent. ";
 
 /// Inserts the intentional binding guidance into every captured `start` tool
 /// description found anywhere in `value`, leaving all other bytes untouched.
+///
+/// The schema-2 catalog reads (`models`, `capacity_order`) take their extended
+/// description and filter schema from the registry, whose exact extension over
+/// the Python baseline is pinned by the domain `tool_registry` test.
 fn extend_start_description(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -155,6 +162,26 @@ fn extend_start_description(value: &mut Value) {
                         &format!("{START_OPENING}{START_BINDING_GUIDANCE}"),
                         1,
                     );
+                }
+                // Schema-2 cutover: the start schema names a provider (pinned by the
+                // domain `tool_registry` test); take it from the registry.
+                if object.contains_key("inputSchema") {
+                    object.insert(
+                        "inputSchema".into(),
+                        agent_run_domain::tool("start")
+                            .unwrap()
+                            .input_schema
+                            .clone(),
+                    );
+                }
+            }
+            if let Some(name @ ("models" | "capacity_order")) =
+                object.get("name").and_then(Value::as_str)
+            {
+                if object.contains_key("inputSchema") {
+                    let tool = agent_run_domain::tool(name).unwrap();
+                    object.insert("description".into(), tool.description.clone().into());
+                    object.insert("inputSchema".into(), tool.input_schema.clone());
                 }
             }
             object.values_mut().for_each(extend_start_description);

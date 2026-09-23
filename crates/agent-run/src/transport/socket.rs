@@ -1,7 +1,7 @@
 //! Bounded LF-delimited JSON-RPC 2.0 over a private same-user Unix socket.
 use super::frame;
 use crate::{dispatch, service::Service, Error, Result};
-use agent_run_domain::types::StartRequest;
+use agent_run_domain::ProviderStartRequest;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
@@ -43,6 +43,8 @@ pub struct BrokerStartResult {
     pub agent_id: String,
     /// Whether this request admitted a new row rather than replaying one.
     pub created: bool,
+    /// The provider attempt the admission owns; absent from legacy brokers.
+    pub attempt_id: Option<String>,
 }
 
 /// The split broker stream retained by one [`BrokerClient`] session.
@@ -134,8 +136,10 @@ impl BrokerClient {
         unreachable!("the bounded broker retry loop always returns")
     }
 
-    /// Serializes a typed start request and rejects malformed broker acknowledgements.
-    pub async fn start(&self, request: &StartRequest) -> Result<BrokerStartResult> {
+    /// Serializes the strict schema-2 provider start request the broker
+    /// dispatcher accepts (never the retired `runtime` shape) and rejects
+    /// malformed broker acknowledgements.
+    pub async fn start(&self, request: &ProviderStartRequest) -> Result<BrokerStartResult> {
         let params = serde_json::to_value(request)?;
         let result = self.call("start", Some(params)).await?;
         let Some(object) = result.as_object() else {
@@ -153,9 +157,19 @@ impl BrokerClient {
                 "broker returned an invalid start result".into(),
             ));
         };
+        let attempt_id = match object.get("attempt_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(attempt)) => Some(attempt.clone()),
+            Some(_) => {
+                return Err(Error::Runtime(
+                    "broker returned an invalid start result".into(),
+                ))
+            }
+        };
         Ok(BrokerStartResult {
             agent_id: agent_id.into(),
             created,
+            attempt_id,
         })
     }
 
@@ -235,29 +249,7 @@ impl BrokerClient {
             let Some(object) = error.as_object() else {
                 return Err(ClientAttemptError::Transport);
             };
-            let message = object
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("broker request failed")
-                .to_owned();
-            if object.get("code").and_then(Value::as_i64) == Some(-32602) {
-                return Err(ClientAttemptError::Domain(Error::Validation(message)));
-            }
-            let (broker_error_code, broker_error_data) = object
-                .get("data")
-                .and_then(Value::as_object)
-                .map(|data| {
-                    (
-                        data.get("code").and_then(Value::as_str).map(str::to_owned),
-                        Some(Value::Object(data.clone())),
-                    )
-                })
-                .unwrap_or((None, None));
-            return Err(ClientAttemptError::Domain(Error::Broker {
-                message,
-                broker_error_code,
-                broker_error_data,
-            }));
+            return Err(ClientAttemptError::Domain(broker_error(object)));
         }
         value
             .get("result")
@@ -416,7 +408,13 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
             Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
             Err(e) => {
                 if e.rpc_code() == -32602 {
-                    err(id, -32602, &e.public().message, None)
+                    // Invalid-params responses stay bare for ordinary
+                    // validation; a more specific typed class (for example
+                    // `PathEscapeError`) keeps its code in `data`.
+                    let public = e.public();
+                    let data = (public.kind != "ValidationError")
+                        .then(|| json!({"code":public.kind,"message":public.message}));
+                    err(id, -32602, &public.message, data)
                 } else {
                     domain_err(id, &e)
                 }
@@ -563,7 +561,12 @@ pub async fn serve_at_with_options(
         return Err(crate::error::invalid("socket deadlines must be positive"));
     }
     agent_run_core::logging::configure(home, "api");
-    let _ = crate::config::Config::load(home)?;
+    // An older database is only ever upgraded by the paired config migration.
+    crate::migrate::require_current_store(home)?;
+    // Either a valid schema-2 provider config or a valid schema-1 config.
+    if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
+        let _ = crate::config::Config::load(home)?;
+    }
     let _ = crate::state::Store::open(home)?;
     let directory = std::fs::symlink_metadata(home)?;
     // SAFETY: geteuid is a read-only process identity query.
@@ -716,6 +719,48 @@ pub async fn client(home: &Path, method: &str, params: Value) -> Result<Value> {
     .await
 }
 
+/// Decodes one broker JSON-RPC error object, shared by every client.
+///
+/// A `-32602` response is a validation error unless its `data.code` names
+/// another allowlisted public class (for example `PathEscapeError`); every
+/// such typed error keeps the broker's `data.code` and bounded `data` as
+/// [`Error::Broker`], whose public rendering reports that code when it is
+/// allowlisted, so the CLI, MCP and socket clients show the same class. The
+/// message is bounded to 512 characters.
+fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
+    let message: String = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("broker request failed")
+        .chars()
+        .take(512)
+        .collect();
+    let typed = object
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .and_then(agent_run_domain::MachineCode::from_wire)
+        .is_some_and(|code| code != agent_run_domain::MachineCode::ValidationError);
+    if object.get("code").and_then(Value::as_i64) == Some(-32602) && !typed {
+        return Error::Validation(message);
+    }
+    let (broker_error_code, broker_error_data) = object
+        .get("data")
+        .and_then(Value::as_object)
+        .map(|data| {
+            (
+                data.get("code").and_then(Value::as_str).map(str::to_owned),
+                Some(Value::Object(data.clone())),
+            )
+        })
+        .unwrap_or((None, None));
+    Error::Broker {
+        message,
+        broker_error_code,
+        broker_error_data,
+    }
+}
+
 /// Calls the broker, bounding wait observations and retrying only timed-out observations.
 async fn client_with_wait_deadlines(
     home: &Path,
@@ -782,20 +827,10 @@ async fn client_with_wait_deadlines(
             return Err(crate::error::invalid("invalid broker response identity"));
         }
         if let Some(error) = value.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("broker request failed")
-                .chars()
-                .take(512)
-                .collect();
-            return Err(
-                if error.get("code").and_then(Value::as_i64) == Some(-32602) {
-                    Error::Validation(message)
-                } else {
-                    Error::Runtime(message)
-                },
-            );
+            return Err(error
+                .as_object()
+                .map(broker_error)
+                .unwrap_or_else(|| Error::Runtime("broker request failed".into())));
         }
         if is_wait && value["result"]["timed_out"] == true {
             continue;

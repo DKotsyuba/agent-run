@@ -6,7 +6,9 @@ use std::{
     os::unix::fs::{symlink, MetadataExt, PermissionsExt},
 };
 
-/// Mirrors `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`.
+/// Mirrors `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`,
+/// with the schema-2 bootstrap: a fresh home is seeded with the explicitly
+/// empty schema-2 catalog and empty default role and skill directories.
 #[test]
 fn python_init_bootstraps_a_private_minimal_home_idempotently() {
     let temp = tempfile::tempdir().expect("temporary parent");
@@ -15,8 +17,9 @@ fn python_init_bootstraps_a_private_minimal_home_idempotently() {
     assert_eq!(output["home"], home.display().to_string());
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
-        "schema_version = 1\n"
+        "schema_version = 2\n"
     );
+    assert!(home.join("profiles").is_dir() && home.join("skills").is_dir());
     assert_eq!(
         fs::metadata(&home).unwrap().permissions().mode() & 0o777,
         0o700
@@ -44,13 +47,30 @@ fn python_init_bootstraps_a_private_minimal_home_idempotently() {
 
 /// Mirrors `tests/test_cli.py::CliTests::test_init_bootstraps_private_minimal_home_without_credentials`.
 /// Mirrors `tests/test_doctor.py::DoctorTests::test_canary_handshake_ok_reports_a_completed_real_handshake`.
+/// A schema-1 config never initializes new state (only `config migrate`
+/// pairs it with the current schema); it is refused and left untouched.
 #[test]
 fn python_init_preserves_config_and_optional_integrations_are_not_mandatory() {
     let temp = tempfile::tempdir().expect("temporary parent");
+    let legacy = temp.path().join("legacy");
+    fs::create_dir_all(&legacy).unwrap();
+    let legacy_config = "schema_version = 1\n[core]\nmax_active_agents = 5\n";
+    fs::write(legacy.join("config.toml"), legacy_config).unwrap();
+    let refused = agent_run::init::initialize(&legacy).expect_err("schema 1 cannot seed state");
+    assert!(
+        refused.to_string().contains("schema_version 2"),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read_to_string(legacy.join("config.toml")).unwrap(),
+        legacy_config
+    );
+    assert!(!legacy.join("state.db").exists());
+
     let home = temp.path().join("configured");
     fs::create_dir_all(&home).unwrap();
     let config = home.join("config.toml");
-    let original = "schema_version = 1\n[core]\nmax_active_agents = 5\n";
+    let original = "schema_version = 2\n[core]\nmax_active_agents = 5\n";
     fs::write(&config, original).unwrap();
 
     agent_run::init::initialize(&home).expect("initialize preserves config");

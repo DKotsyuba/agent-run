@@ -1077,9 +1077,7 @@ fn tp_fresh_sample(key: Key, at: f64) -> Sample {
 fn collect_home(runtimes: &[(&str, &str, &str)]) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();
-    let mut text = String::from(
-        "schema_version=1\n[capacity]\ncodexbar_binary=\"/definitely/missing/codexbar\"\n",
-    );
+    let mut text = String::from("schema_version=1\n");
     for (name, adapter, source) in runtimes {
         text.push_str(&format!(
             "[runtimes.{name}]\nenabled=true\nadapter=\"{adapter}\"\nbinary={}\nhome={}\nmodels=[\"fixture\"]\nlimits_source=\"{source}\"\n",
@@ -1106,7 +1104,7 @@ fn result_for<'a>(report: &'a serde_json::Value, runtime: &str) -> &'a serde_jso
 #[tokio::test]
 async fn failed_empty_and_unsupported_outcomes_are_reported() {
     let home = collect_home(&[
-        // A provider the port does not implement fails with a fixed reason.
+        // The retired CodexBar source fails with a fixed migration reason.
         ("failed", "codex", "codexbar"),
         // The local Claude stream fallback finds no evidence at all.
         ("empty", "claude", "native"),
@@ -1142,8 +1140,11 @@ async fn collect_report_marks_only_degraded_rounds() {
     let report = sources::collect(degraded.path()).await.unwrap();
     assert_eq!(result_for(&report, "failed")["status"], "failed");
     assert_eq!(report["ok"], false);
-    // Fixed reason codes only: no provider output ever reaches the report.
-    assert_eq!(result_for(&report, "failed")["issues"][0], "source_failed");
+    // Fixed reason codes only: the retired source asks for migration.
+    assert_eq!(
+        result_for(&report, "failed")["issues"][0],
+        sources::CODEXBAR_RETIRED
+    );
 }
 
 /// Mirrors `tests/test_capacity_topology.py::CollectSliceTests::test_collect_slice_passes_none_through_for_unsupported_sources`.
@@ -1168,95 +1169,4 @@ async fn unsupported_source_yields_no_slice() {
         })
         .unwrap();
     assert_eq!(snapshots, 0);
-}
-
-/// Mirrors `tests/test_capacity_topology.py::SourceTopologyTests::test_codexbar_routes_only_configured_accounts`.
-///
-/// Rust groups codexbar pools per account rather than per sample identity, so
-/// one account's several windows are one reservoir with several keys instead
-/// of several pools. The routing contract this behavior is about is identical:
-/// only configured accounts become routes, and a discovered stranger keeps its
-/// pool and samples as evidence without ever becoming launchable.
-#[test]
-fn codexbar_routes_only_configured_accounts() {
-    let observed = "2026-09-15T12:00:00Z";
-    let entry = |email: &str, secondary: bool| {
-        let mut usage = serde_json::json!({
-            "updatedAt": observed,
-            "accountEmail": email,
-            "primary": {"usedPercent": 50, "windowMinutes": 300}
-        });
-        if secondary {
-            usage["secondary"] = serde_json::json!({"usedPercent": 50, "windowMinutes": 10080});
-        }
-        serde_json::json!({"usage": usage})
-    };
-    let raw = serde_json::json!([
-        entry("default@example.test", false),
-        entry("team1@example.test", true),
-        entry("team2@example.test", false),
-        entry("stranger@example.test", false),
-    ]);
-    let accounts: std::collections::BTreeMap<String, String> = [
-        ("team1".to_owned(), "team1@example.test".to_owned()),
-        ("team2".to_owned(), "team2@example.test".to_owned()),
-    ]
-    .into_iter()
-    .collect();
-    let slice = sources::normalize_codexbar_accounts(
-        "cortex-runtime",
-        &raw,
-        &accounts,
-        Some("default@example.test"),
-    )
-    .unwrap();
-
-    let routed: std::collections::BTreeSet<Option<&str>> = slice
-        .topology
-        .routes
-        .iter()
-        .map(|route| route.account.as_deref())
-        .collect();
-    assert_eq!(
-        routed,
-        [None, Some("team1"), Some("team2")].into_iter().collect()
-    );
-    // Primary and secondary windows never split one account into two routes.
-    let lanes: std::collections::BTreeSet<&str> = slice
-        .topology
-        .routes
-        .iter()
-        .map(|route| route.quota_lane.as_str())
-        .collect();
-    assert_eq!(lanes, ["default"].into_iter().collect());
-    assert_eq!(slice.topology.routes.len(), 3);
-    let team1 = slice
-        .topology
-        .routes
-        .iter()
-        .find(|route| route.account.as_deref() == Some("team1"))
-        .unwrap();
-    assert_eq!(team1.pool_ids.len(), 1);
-    assert_eq!(
-        slice
-            .topology
-            .pools
-            .iter()
-            .find(|pool| pool.pool_id == team1.pool_ids[0])
-            .unwrap()
-            .keys
-            .len(),
-        2
-    );
-    // The unknown email keeps its pool and samples but gets no route.
-    assert_eq!(slice.topology.pools.len(), 4);
-    assert!(!slice
-        .topology
-        .routes
-        .iter()
-        .any(|route| route.route_id.contains("stranger")));
-    assert!(slice
-        .samples
-        .iter()
-        .any(|sample| sample.key.target.as_deref() == Some("stranger@example.test")));
 }

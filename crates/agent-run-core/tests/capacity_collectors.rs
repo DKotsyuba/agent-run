@@ -2,41 +2,12 @@
 
 use agent_run_core::capacity::{
     omniroute, sources,
-    sources::{
-        account_email, capture, normalize_codex, normalize_codexbar_accounts, read_claude_stream,
-    },
+    sources::{capture, normalize_codex, read_claude_stream},
     Key,
 };
 use agent_run_domain::Error;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, process::Command};
-
-/// Converts a compact JSON Web Token fixture into the auth-file shape used by Codex.
-fn auth_file(email: Option<&str>) -> serde_json::Value {
-    let claims = email.map_or_else(|| "{}".into(), |email| format!(r#"{{"email":"{email}"}}"#));
-    let payload = base64url(claims.as_bytes());
-    json!({"tokens":{"id_token":format!("header.{payload}.signature")}})
-}
-
-/// Encodes only the URL-safe base64 alphabet needed by the email fixture.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0] as usize;
-        let b = chunk.get(1).copied().unwrap_or(0) as usize;
-        let c = chunk.get(2).copied().unwrap_or(0) as usize;
-        result.push(ALPHABET[a >> 2] as char);
-        result.push(ALPHABET[((a & 3) << 4) | (b >> 4)] as char);
-        if chunk.len() > 1 {
-            result.push(ALPHABET[((b & 15) << 2) | (c >> 6)] as char);
-        }
-        if chunk.len() > 2 {
-            result.push(ALPHABET[c & 63] as char);
-        }
-    }
-    result
-}
 
 const OBSERVED: f64 = 1_785_000_000.0;
 
@@ -74,109 +45,10 @@ fn empty_environment() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 
-/// Mirrors `tests/test_capacity_sources.py::test_declared_accounts_map_targets_and_add_all_accounts`.
-#[test]
-fn codexbar_maps_declared_accounts_without_exposing_auth_documents() {
-    let mut accounts = BTreeMap::new();
-    accounts.insert("personal".into(), "personal@example.test".into());
-    let slice = normalize_codexbar_accounts(
-        "codex",
-        &json!([
-            {"usage":{"accountEmail":"default@example.test","updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":3,"windowMinutes":300}}},
-            {"usage":{"identity":{"accountEmail":"personal@example.test"},"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":4,"windowMinutes":300}}},
-            {"usage":{"identity":{"accountEmail":"stranger@example.test"},"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":5,"windowMinutes":300}}}
-        ]),
-        &accounts,
-        Some("default@example.test"),
-    )
-    .expect("recorded codexbar response is valid");
-    let targets: Vec<_> = slice
-        .samples
-        .iter()
-        .map(|sample| sample.key.target.as_deref())
-        .collect();
-    assert_eq!(
-        targets,
-        vec![None, Some("personal"), Some("stranger@example.test")]
-    );
-    assert_eq!(slice.topology.routes.len(), 2);
-}
-
-/// Mirrors `tests/test_capacity_sources.py::test_spawn_failure_timeout_nonzero_exit_and_garbage_fail_the_round`.
-#[test]
-fn codexbar_empty_data_is_an_explicit_failure() {
-    let error = normalize_codexbar_accounts("codex", &json!([]), &BTreeMap::new(), None)
-        .expect_err("an empty success response is not capacity evidence");
-    assert_eq!(error.to_string(), "codexbar_missing_data");
-}
-
-/// Mirrors the Codexbar account-email helper's successful and collapsed-failure cases.
-// Mirrors `tests/test_capacity_sources.py::AccountEmailTests::test_decodes_email_and_collapses_failures`.
-#[test]
-fn codexbar_account_email_maps_only_valid_auth_claims() {
-    let temporary = tempfile::tempdir().expect("temporary root");
-    let path = temporary.path().join("auth.json");
-    std::fs::write(&path, serde_json::to_vec(&auth_file(Some("a @b"))).unwrap()).unwrap();
-    assert_eq!(account_email(&path).as_deref(), Some("a @b"));
-    let mut accounts = BTreeMap::new();
-    accounts.insert("personal".into(), "a @b".into());
-    let slice = normalize_codexbar_accounts(
-        "codex",
-        &json!({"usage":{"accountEmail":"a @b","updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":1,"windowMinutes":300}}}),
-        &accounts,
-        None,
-    )
-    .expect("valid account response");
-    assert_eq!(slice.samples[0].key.target.as_deref(), Some("personal"));
-    for contents in ["missing", "garbage"] {
-        std::fs::write(&path, contents).unwrap();
-        assert_eq!(account_email(&path), None);
-    }
-    std::fs::write(&path, serde_json::to_vec(&auth_file(None)).unwrap()).unwrap();
-    assert_eq!(account_email(&path), None);
-}
-
-/// Mirrors the honest Codexbar lane and window-name mapping rules.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_real_shape_maps_lanes_and_shelves_honestly`.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_unknown_window_minutes_names_itself`.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_absent_lanes_are_absent_but_present_windows_must_be_valid`.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_single_object_payload_still_maps_one_account_without_accounts`.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_empty_usage_object_is_an_invalid_observation`.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_first_account_only_and_ignored_sections`.
-#[test]
-fn codexbar_mapping_preserves_lanes_and_limits_account_scope() {
-    let payload = json!([
-        {"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":null,"secondary":{"usedPercent":46,"windowMinutes":10080,"resetsAt":"2026-09-03T16:26:47Z"},"tertiary":{"usedPercent":5.5,"windowMinutes":300,"resetsAt":null}}},
-        {"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":99,"windowMinutes":300}}}
-    ]);
-    let slice = normalize_codexbar_accounts("codex", &payload, &BTreeMap::new(), None).unwrap();
-    assert_eq!(slice.samples.len(), 2);
-    assert_eq!(slice.samples[0].key.lane, "secondary");
-    assert_eq!(slice.samples[0].key.window, "seven_day");
-    assert_eq!(slice.samples[0].remaining_percent, Some(54.0));
-    assert_eq!(slice.samples[1].key.window, "five_hour");
-    assert_eq!(slice.samples[0].reset_at, Some(1788452807.0));
-
-    let unknown = normalize_codexbar_accounts(
-        "codex",
-        &json!({"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":80,"windowMinutes":30}}}),
-        &BTreeMap::new(),
-        None,
-    )
-    .unwrap();
-    assert_eq!(unknown.samples[0].key.window, "min30");
-    let single = normalize_codexbar_accounts("codex", &json!({"usage":{"updatedAt":"2026-08-29T12:12:53Z","primary":{"usedPercent":20,"windowMinutes":300}}}), &BTreeMap::new(), None).unwrap();
-    assert_eq!(single.samples[0].remaining_percent, Some(80.0));
-    assert!(
-        normalize_codexbar_accounts("codex", &json!({"usage":{}}), &BTreeMap::new(), None).is_err()
-    );
-}
-
-/// Mirrors the source's failure-safe timeout and secret-safe failure contract.
-// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_codexbar_timeout_allows_two_minutes`.
+/// A failing bounded source process yields fixed text, never its output.
 // Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_failure_logs_and_exception_are_secret_safe`.
 #[tokio::test]
-async fn codexbar_capture_returns_fixed_secret_free_failures() {
+async fn capture_returns_fixed_secret_free_failures() {
     let error = sources::capture(
         Path::new("/bin/sh"),
         &["-c".into(), "printf provider-secret; exit 1".into()],
@@ -186,7 +58,6 @@ async fn codexbar_capture_returns_fixed_secret_free_failures() {
     .await
     .expect_err("nonzero source must fail");
     assert!(!error.to_string().contains("provider-secret"));
-    assert_eq!(sources::CODEXBAR_TIMEOUT_SECONDS, 120);
 }
 
 /// Mirrors native Claude's lane, target, remaining, and bounded validity mapping.
@@ -209,23 +80,6 @@ fn native_claude_mapping_is_bounded_and_provider_neutral() {
     assert_eq!(slice.samples[2].key.target.as_deref(), Some("fable"));
     assert_eq!(slice.samples[3].remaining_percent, Some(90.0));
     assert_eq!(slice.samples[0].valid_until, Some(1788279300.0));
-}
-
-/// Mirrors timestamp parsing's rejection of naive, garbage, numeric, and missing values.
-// Mirrors `tests/test_capacity_sources.py::TimestampTests::test_rejects_naive_and_garbage_stamps`.
-#[test]
-fn capacity_timestamps_require_rfc3339_timezone_information() {
-    for value in [
-        json!("2026-08-29T12:12:53"),
-        json!(""),
-        json!(12345),
-        Value::Null,
-        json!("not-a-stamp"),
-    ] {
-        let payload =
-            json!({"usage":{"updatedAt":value,"primary":{"usedPercent":1,"windowMinutes":300}}});
-        assert!(sources::normalize_codexbar("codex", &payload).is_err());
-    }
 }
 
 /// Writes the smallest config accepted by the capacity dispatcher.
@@ -257,6 +111,56 @@ async fn capacity_dispatch_keeps_unsupported_sources_distinct() {
     dispatcher_config(temporary.path(), "claude", "none", Path::new("/bin/true"));
     let unsupported = sources::collect(temporary.path()).await.unwrap();
     assert_eq!(unsupported["results"][0]["status"], "unsupported");
+}
+
+/// A schema-1 runtime still declaring the retired CodexBar source (and its
+/// legacy binary) parses, never invokes anything, reports the fixed
+/// migration-required failure, and keeps its previous samples.
+#[tokio::test]
+async fn retired_codexbar_source_requires_migration_and_keeps_samples() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let marker = root.join("invoked");
+    let binary = root.join("codexbar");
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    dispatcher_config(root, "claude", "codexbar", Path::new("/bin/true"));
+    let config = std::fs::read_to_string(root.join("config.toml")).unwrap();
+    std::fs::write(
+        root.join("config.toml"),
+        format!(
+            "{}[capacity]\ncodexbar_binary=\"{}\"\n",
+            config,
+            binary.display()
+        ),
+    )
+    .unwrap();
+    let prior = sources::normalize_claude(
+        "fixture",
+        &json!({"limits":[{"kind":"session","percent":25,"resets_at":"2099-01-01T00:00:00Z"}]}),
+        agent_run_core::domain::now(),
+    )
+    .unwrap();
+    agent_run_core::capacity::persist(root, &prior, 1000).unwrap();
+    let report = sources::collect(root).await.unwrap();
+    assert_eq!(report["ok"], false);
+    let row = &report["results"][0];
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["issues"][0], sources::CODEXBAR_RETIRED);
+    assert!(!marker.exists(), "the retired binary must never run");
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    let kept: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM capacity_samples WHERE runtime='fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1, "last-good samples survive the retired round");
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::test_current_cache_pool_average`.
@@ -296,7 +200,6 @@ async fn omniroute_pool_needs_no_adapter_calls() {
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::test_stale_cache_is_unknown`.
-/// Mirrors `tests/test_capacity_sources.py::CodexbarMappingTests::test_glm_maps_to_the_zai_provider`.
 #[test]
 fn omniroute_stale_cache_is_unknown_not_zero_capacity() {
     let samples = omniroute::samples(

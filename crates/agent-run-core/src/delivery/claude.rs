@@ -22,6 +22,19 @@ const MESSAGE_LIMIT: usize = 4096;
 /// interrupted write is
 /// classified as ambiguous because the inbox has no acknowledgement protocol.
 pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
+    send_after(registry, session, notice, async {}).await
+}
+
+/// [`send`] with `before_write` awaited after the connection is established
+/// and before any frame is written. Production passes an already-ready
+/// future; tests use it to order a peer close before the write, so an
+/// interrupted write is observed deterministically instead of racing.
+pub async fn send_after(
+    registry: &Path,
+    session: &str,
+    notice: &Notice,
+    before_write: impl std::future::Future<Output = ()>,
+) -> Evidence {
     if !bounded(session, SESSION_LIMIT) || notice.render().is_err() {
         return Evidence::new("uds_rejected", false, false);
     }
@@ -52,6 +65,7 @@ pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
             Ok(Err(_)) => return Evidence::new("uds_unavailable", false, false),
             Err(_) => return Evidence::new("uds_session_gone", false, false),
         };
+    before_write.await;
     let frames = format!(
         "{}\n{}\n",
         json!({"type":"auth","token":token}),

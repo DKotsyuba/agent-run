@@ -750,3 +750,99 @@ fn owned_supervisor_can_refine_its_group_after_startup_expiry() {
         .unwrap();
     assert_eq!(store.get(&id).unwrap().process_group_id, Some(456));
 }
+
+/// Inserts one terminal (`lost`) agent owning one attempt.
+fn lost_agent_with_attempt(
+    store: &Store,
+    agent: &str,
+    attempt: &str,
+    created: f64,
+    process: Option<(&str, f64)>,
+    group: Option<i32>,
+) {
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,process_group_id) \
+             VALUES(?1,'mock','fixture','review','t','t','/tmp','{}','lost',?2,1.0,'fixture',?1,?3)",
+            rusqlite::params![agent, created, group],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,process_identity,process_birth_time,ownership_active) \
+             VALUES(?1,?2,1,'lost','{}',?3,?4,?5,?6,1)",
+            rusqlite::params![
+                attempt,
+                agent,
+                created,
+                if process.is_some() { "spawning" } else { "prepared" },
+                process.map(|(token, _)| token),
+                process.map(|(_, birth)| birth)
+            ],
+        )
+        .unwrap();
+}
+
+/// With one attempt examined per pass, a permanently unprovable oldest
+/// attempt does not starve a newer releasable one: the cursor moves on, the
+/// newer attempt closes with never-spawned proof, and the oldest stays owned
+/// with exactly one typed unresolved event after the cursor wraps.
+#[test]
+fn orphaned_attempt_release_is_fair_under_a_limit_of_one() {
+    let home = common::Home::new();
+    let mut store = Store::open(&home.path).unwrap();
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = gone.id() as i32;
+    gone.wait().unwrap();
+    lost_agent_with_attempt(
+        &store,
+        "ag-20260923-000000-0000000001",
+        "att_old",
+        1.0,
+        Some(("not-ours", 1.0)),
+        Some(pid),
+    );
+    lost_agent_with_attempt(
+        &store,
+        "ag-20260923-000000-0000000002",
+        "att_new",
+        2.0,
+        None,
+        None,
+    );
+    let owned = |store: &Store, id: &str| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT ownership_active FROM attempts WHERE id=?",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    reconcile(&mut store, 1).unwrap();
+    assert_eq!((owned(&store, "att_old"), owned(&store, "att_new")), (1, 1));
+    reconcile(&mut store, 1).unwrap();
+    assert_eq!(
+        (owned(&store, "att_old"), owned(&store, "att_new")),
+        (1, 0),
+        "newer released"
+    );
+    reconcile(&mut store, 1).unwrap();
+    assert_eq!(
+        owned(&store, "att_old"),
+        1,
+        "unprovable cleanup is never released"
+    );
+    let unresolved: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE attempt_id='att_old' AND kind='attempt_cleanup_unresolved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unresolved, 1);
+}

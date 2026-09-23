@@ -2,18 +2,20 @@
 use crate::{
     capacity,
     config::{Adapter, Config},
-    domain::{AgentId, OrchestratorRef, StartRequest},
+    domain::{AgentId, OrchestratorRef},
     error::invalid,
     fs, hooks,
-    policy::Constraint,
     service::{Query, Service},
     state::Store,
     transport, Result,
 };
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use agent_run_domain::{
+    catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
+    CredentialRef,
+};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
     future::Future,
     io::Write,
     path::{Path, PathBuf},
@@ -28,6 +30,39 @@ pub type CliFuture<'a> = Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>
 
 /// Output callback used by [`CliDependencies`].
 pub type CliOutput = Arc<dyn Fn(&Value) -> Result<()> + Send + Sync>;
+
+/// Raw text chunk sink used by the transcript viewer's text format.
+///
+/// The sink writes exactly the bytes it is given and flushes; the transcript
+/// renderer owns every intentional newline, so streamed fragments reach the
+/// pipe as soon as they are rendered.
+pub type CliTextOutput = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+/// Output format of the `transcript` viewer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum TranscriptFormat {
+    /// Human-readable activity stream.
+    Text,
+    /// Line-delimited transcript pages (the historical machine format).
+    Json,
+}
+
+impl TranscriptFormat {
+    /// Resolves an explicit `--format` or the automatic default.
+    ///
+    /// An explicit choice always wins; otherwise text is used when standard
+    /// output is a terminal and JSON for any piped or captured consumer.
+    pub fn effective(format: Option<Self>) -> Self {
+        format.unwrap_or({
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                Self::Text
+            } else {
+                Self::Json
+            }
+        })
+    }
+}
 
 /// Structured doctor callback used by [`CliDependencies`].
 pub type DoctorRunner = Arc<dyn Fn(&Path) -> Result<crate::doctor::Report> + Send + Sync>;
@@ -46,12 +81,12 @@ pub trait CliService: Send + Sync {
     fn agent(&self, id: &AgentId) -> Result<Value>;
     /// Read one bounded transcript page.
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value>;
-    /// Return the configured model roster.
-    fn models<'a>(&'a self) -> CliFuture<'a>;
+    /// Return the configured model roster or schema-2 provider catalog.
+    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
     /// Return the configured capacity limits.
     fn limits(&self) -> Result<Value>;
-    /// Return the ordered capacity view.
-    fn capacity_order(&self) -> Result<Value>;
+    /// Return the ordered capacity view, optionally for one exact model.
+    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value>;
     /// Return one completion-delivery status view.
     fn delivery_status(&self, id: &AgentId) -> Result<Value>;
     /// Cancel one completion-delivery attempt.
@@ -85,14 +120,14 @@ impl CliService for Service {
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
     }
-    fn models<'a>(&'a self) -> CliFuture<'a> {
-        Box::pin(Service::models(self))
+    fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
+        Box::pin(Service::models(self, query))
     }
     fn limits(&self) -> Result<Value> {
         Service::limits(self)
     }
-    fn capacity_order(&self) -> Result<Value> {
-        Service::capacity_order(self)
+    fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
+        Service::capacity_order(self, query)
     }
     fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         Service::delivery_status(self, id)
@@ -122,6 +157,9 @@ pub struct CliDependencies {
     pub broker: Arc<dyn CliBroker>,
     /// JSON sink; production writes one newline-delimited value to stdout.
     pub output: CliOutput,
+    /// Raw text chunk sink used by the transcript viewer's human-readable
+    /// format.
+    pub text_output: CliTextOutput,
     /// Structured doctor report provider.
     pub doctor: DoctorRunner,
 }
@@ -133,6 +171,7 @@ impl CliDependencies {
             service: Arc::new(Service::new(home.clone())),
             broker: Arc::new(SocketBroker { home }),
             output: Arc::new(emit),
+            text_output: Arc::new(write_chunk),
             doctor: Arc::new(crate::doctor::run),
         }
     }
@@ -186,8 +225,22 @@ pub enum Command {
         follow: bool,
         #[arg(long, conflicts_with = "follow")]
         full: bool,
+        /// Output format; defaults to text on a terminal, JSON otherwise.
+        #[arg(long, value_enum)]
+        format: Option<TranscriptFormat>,
     },
-    Models,
+    /// Model roster, or the schema-2 provider catalog with exact filters.
+    Models {
+        /// Exact configured provider id.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Exact canonical role/profile name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exact provider-visible model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
     Limits,
     Doc {
         topic: Option<String>,
@@ -213,6 +266,16 @@ pub enum Command {
     Auth {
         label: String,
         runtime: String,
+    },
+    /// One-time schema-1 → schema-2 configuration migration and rollback.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Manage global account references without invoking native login.
+    Accounts {
+        #[command(subcommand)]
+        command: AccountCommand,
     },
     Context(Context),
     Hook {
@@ -251,6 +314,34 @@ pub enum Command {
         allow_mcp: Vec<String>,
     },
 }
+
+/// Administrative account registry operations; references name existing
+/// protected stores and never accept credential bytes as an argument.
+#[derive(Subcommand, Debug)]
+pub enum AccountCommand {
+    /// Register one global account and existing credential reference.
+    Register {
+        /// Opaque global account identity shared by provider aliases.
+        #[arg(long)]
+        id: AccountId,
+        /// Protocol credential family matching provider bindings.
+        #[arg(long)]
+        auth_family: AuthFamily,
+        /// Nonsecret native/named/env/file/Keychain storage reference.
+        ///
+        /// Taken as text and parsed by the handler, so a rejected value (for
+        /// example a pasted raw token) is never echoed in the parse error.
+        #[arg(long)]
+        reference: String,
+    },
+    /// List registered account metadata without full storage references.
+    List,
+    /// Disable future account selection while preserving history.
+    Disable {
+        /// Existing global account identity.
+        id: AccountId,
+    },
+}
 /// Optional orchestrator identity shared by public tool commands.
 #[derive(Args, Debug, Default)]
 pub struct SessionArgs {
@@ -282,8 +373,9 @@ impl SessionArgs {
 /// The resident-broker start command's shell request fields.
 #[derive(Args, Debug)]
 pub struct Start {
+    /// Configured provider id (schema 2); pair it with an explicit `--model`.
     #[arg(long)]
-    pub runtime: String,
+    pub provider: String,
     #[arg(long)]
     pub model: String,
     #[arg(long)]
@@ -301,7 +393,7 @@ pub struct Start {
     #[arg(
         long = "timeout",
         id = "timeout",
-        help = "Legacy metadata only; does not stop execution"
+        help = "Whole-run deadline in seconds, at most 2592000; defaults to core.default_timeout_seconds"
     )]
     pub timeout_seconds: Option<f64>,
     #[arg(long = "read-root", id = "read_root")]
@@ -410,13 +502,56 @@ pub enum Api {
     },
 }
 /// Capacity worker commands retained from the Python operator surface.
+/// Configuration migration commands (see `crate::migrate`).
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Plan (`--dry-run`) or apply (`--apply`) the paired migration (v1 config
+    /// and older state database → v2 config and current database) from an
+    /// explicit operator mapping file; apply snapshots config and state first.
+    #[command(group(ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
+    Migrate {
+        /// TOML mapping: `[harnesses.*]`, `[accounts.<id>]` and one
+        /// `[runtimes.<v1 name>]` each.
+        #[arg(long)]
+        mapping: PathBuf,
+        /// Print the plan and rendered config; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Snapshot, then migrate the database, register the declared accounts
+        /// and atomically publish the v2 config under the broker lock.
+        #[arg(long)]
+        apply: bool,
+        /// Acknowledge one dry-run manual_review marker (repeat for each).
+        #[arg(long = "ack")]
+        ack: Vec<String>,
+        /// The installed pre-migration sealed release directory (required
+        /// with `--apply`); its seal and schema are verified, and rollback
+        /// returns to it.
+        #[arg(long)]
+        from_release: Option<PathBuf>,
+    },
+    /// Restore the v1 config and original database from one verified
+    /// snapshot while nothing changed since the migration; also recovers an
+    /// interrupted migration or rollback of that snapshot.
+    Rollback {
+        /// The snapshot directory printed by `config migrate --apply`.
+        #[arg(long)]
+        snapshot: PathBuf,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Capacity {
     Collect {
         #[arg(long, required = true)]
         once: bool,
     },
-    Order,
+    /// Capacity order; schema 2 lists providers, optionally for one model.
+    Order {
+        /// Exact provider-visible model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
     Launchd {
         #[arg(long)]
         binary: PathBuf,
@@ -489,6 +624,17 @@ fn task_text(value: &str, max: usize) -> Result<String> {
     }
     Ok(text)
 }
+/// Writes one raw viewer text chunk to stdout and flushes immediately.
+///
+/// The chunk is written exactly as supplied: the transcript renderer owns
+/// every intentional newline, so a streamed fragment becomes visible on the
+/// pipe the moment it is rendered instead of at a line boundary.
+pub fn write_chunk(chunk: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(chunk.as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
 pub fn emit(value: &Value) -> Result<()> {
     let encoded = serde_json::to_vec(value)?;
     if encoded.len() + 1 > transport::socket::MAX_FRAME {
@@ -557,19 +703,51 @@ pub fn init(home: &Path) -> Result<Value> {
         let file=format!("profiles/{name}.md");let text=format!("+++\nrevision = \"rust-role-v1\"\nwrite = {write}\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\n{body}\n");
         if dir.optional(Path::new(&file),1024*1024)?.is_none(){dir.write(Path::new(&file),text.as_bytes(),0o600)?;}
     }
-    let _ = Config::load(home)?;
+    let _ = operator_config(home)?;
     let store = Store::initialize(home)?;
     let _ = store.health()?;
     Ok(json!({"home":home,"config":home.join("config.toml"),"state":home.join("state.db")}))
+}
+/// The operator view of either schema: a valid schema-2 config's shared
+/// controls with the config itself, or a schema-1 config.
+fn operator_config(
+    home: &Path,
+) -> Result<(
+    Config,
+    Option<agent_run_config::provider_config::ProviderConfig>,
+)> {
+    match agent_run_config::provider_config::ProviderConfig::load(home) {
+        Ok((v2, _)) => Ok((v2.shared(), Some(v2))),
+        Err(_) => Ok((Config::load(home)?, None)),
+    }
 }
 pub fn doc(topic: &str) -> Result<&'static str> {
     crate::dispatch::doc(topic)
 }
 pub async fn doctor(home: &Path) -> Result<Value> {
-    let cfg = Config::load(home)?;
+    let (cfg, v2) = operator_config(home)?;
     let store = Store::open(home)?;
     let mut checks = vec![json!({"name":"state","result":store.health()?})];
     drop(store);
+    // A schema-2 home reports its harness executables and each provider's
+    // bound accounts; an empty catalog simply has none.
+    if let Some(v2) = &v2 {
+        use std::os::unix::fs::PermissionsExt;
+        for (id, harness) in &v2.harnesses {
+            let executable = std::fs::metadata(&harness.binary)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            checks.push(json!({"name":format!("harness:{}", id.as_str()),"executable":executable}));
+        }
+        for (id, provider) in &v2.providers {
+            let accounts: Vec<&str> = provider
+                .bindings
+                .iter()
+                .map(|b| b.account.as_str())
+                .collect();
+            checks.push(json!({"name":id.as_str(),"harness":provider.harness.as_str(),"accounts":accounts,"limits_source":provider.limits_source}));
+        }
+    }
     for (name, runtime) in cfg.runtimes.iter().filter(|(_, r)| r.enabled) {
         use std::os::unix::fs::PermissionsExt;
         let executable = std::fs::metadata(&runtime.binary)
@@ -659,33 +837,24 @@ pub fn launchd(
         json!({"label":label,"interval_seconds":interval,"argv":argv,"plist":plist})
     })
 }
-/// Returns one Claude account's durable credential-state home.
-///
-/// Labelled Claude state lives beside the configured runtime home, with
-/// `@<label>` appended to its final component, so an account's credentials stay
-/// with the runtime they belong to instead of under the agent-run home.
-fn account_runtime_home(runtime_home: &Path, label: &str) -> PathBuf {
-    let name = runtime_home
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    runtime_home.with_file_name(format!("{name}@{label}"))
-}
-
 /// Builds one credential-isolated native login or post-login status command.
 ///
-/// Codex scopes labelled accounts below the agent-run home and Claude scopes
-/// them below the configured runtime home. `status` selects the provider's
+/// Codex scopes labelled accounts below the agent-run home; a labelled Claude
+/// login uses the directory chosen by
+/// [`crate::adapters::materialize::claude_account_config`], the same one runs
+/// and quota collection read, so an existing legacy login is refreshed in
+/// place and an ambiguous pair fails. `status` selects the provider's
 /// noninteractive verification invocation; both command forms retain no
 /// provider output in agent-run's JSON response.
 fn native_login_command(
     home: &Path,
-    runtime: &crate::config::Runtime,
+    binary: &Path,
+    runtime_home: &Path,
     kind: Adapter,
     account: Option<&str>,
     status: bool,
 ) -> Result<tokio::process::Command> {
-    let mut command = tokio::process::Command::new(&runtime.binary);
+    let mut command = tokio::process::Command::new(binary);
     // Only PATH and HOME are needed to locate the provider binary and run its
     // browser flow; every other inherited variable, including explicit
     // credential variables, is withheld from the interactive child.
@@ -717,7 +886,11 @@ fn native_login_command(
             }
             match account {
                 Some(label) => {
-                    let path = account_runtime_home(&runtime.home, label).join("claude-config");
+                    let path = crate::adapters::materialize::claude_account_config(
+                        home,
+                        runtime_home,
+                        label,
+                    )?;
                     fs::private_dir(&path)?;
                     command.env("CLAUDE_CONFIG_DIR", path);
                 }
@@ -754,18 +927,32 @@ async fn login(
     account: Option<&str>,
     claude_only: bool,
 ) -> Result<(i32, Value)> {
-    let cfg = Config::load(home)?;
-    let runtime = cfg.runtime(name)?;
-    let kind = runtime.kind()?;
+    let target = match agent_run_config::provider_config::ProviderConfig::load(home) {
+        Ok((cfg, _)) => provider_login_target(home, &cfg, name, account, claude_only)?,
+        Err(_) => {
+            let cfg = Config::load(home)?;
+            let runtime = cfg.runtime(name)?;
+            let kind = runtime.kind()?;
+            let account = runtime.selected_account(account)?;
+            LoginTarget {
+                binary: runtime.binary.clone(),
+                runtime_home: runtime.home.clone(),
+                kind,
+                label: account.clone(),
+                reply: json!({"account":account,"runtime":if kind == Adapter::Claude {"claude"} else {name},"status":"ok"}),
+            }
+        }
+    };
+    let kind = target.kind;
     if claude_only && kind != Adapter::Claude {
         return Err(invalid(format!(
             "login supports Claude only; use agent-run auth <label> {name}"
         )));
     }
-    let account = runtime.selected_account(account)?;
+    let (binary, runtime_home, account) = (&target.binary, &target.runtime_home, &target.label);
     let account_name = account.as_deref().unwrap_or("default");
     // Interactive native authentication owns its prompts and credential storage.
-    let status = native_login_command(home, runtime, kind, account.as_deref(), false)?
+    let status = native_login_command(home, binary, runtime_home, kind, account.as_deref(), false)?
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -776,7 +963,7 @@ async fn login(
         eprintln!("auth login failed for {account_name} {name} (exit {code})");
         return Ok((code, Value::Null));
     }
-    let status = native_login_command(home, runtime, kind, account.as_deref(), true)?
+    let status = native_login_command(home, binary, runtime_home, kind, account.as_deref(), true)?
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -787,10 +974,93 @@ async fn login(
         eprintln!("auth login status failed for {account_name} {name} (exit {code})");
         return Ok((code, Value::Null));
     }
-    Ok((
-        0,
-        json!({"account":account,"runtime":if kind == Adapter::Claude {"claude"} else {name},"status":"ok"}),
-    ))
+    Ok((0, target.reply))
+}
+
+/// One resolved native login: the harness executable and state root, the
+/// adapter family, the protected account label (`None` = the harness's
+/// native global login) and the success reply.
+struct LoginTarget {
+    binary: PathBuf,
+    runtime_home: PathBuf,
+    kind: Adapter,
+    label: Option<String>,
+    reply: Value,
+}
+
+/// Resolves a schema-2 login: `name` is a native-connection provider, the
+/// account is one of its bindings (by provider-local label or global account
+/// id; optional only when it has exactly one), and the credential storage is
+/// the registered account's own `native:<harness>` or
+/// `named:<harness>:<label>` reference on that provider's harness.
+fn provider_login_target(
+    home: &Path,
+    cfg: &agent_run_config::provider_config::ProviderConfig,
+    name: &str,
+    account: Option<&str>,
+    claude_only: bool,
+) -> Result<LoginTarget> {
+    use agent_run_domain::{
+        catalog::{HarnessId, ProviderConnection},
+        credential_ref::CredentialRef,
+    };
+    let provider = name
+        .parse()
+        .ok()
+        .and_then(|id| cfg.providers.get(&id))
+        .ok_or_else(|| invalid("unknown provider"))?;
+    if claude_only && provider.harness != HarnessId::ClaudeCode {
+        return Err(invalid(format!(
+            "login supports Claude only; use agent-run auth <label> {name}"
+        )));
+    }
+    if provider.connection != ProviderConnection::Native {
+        return Err(invalid(
+            "auth login is supported only for native-login providers",
+        ));
+    }
+    let binding = match account {
+        Some(wanted) => provider
+            .bindings
+            .iter()
+            .find(|binding| binding.label.as_str() == wanted || binding.account.as_str() == wanted),
+        None if provider.bindings.len() == 1 => provider.bindings.first(),
+        None => {
+            return Err(invalid(
+                "provider binds several accounts; name one with --account",
+            ))
+        }
+    }
+    .ok_or_else(|| invalid("account is not bound to this provider"))?;
+    let record = Store::open(home)?
+        .account(&binding.account)?
+        .ok_or_else(|| invalid("bound account is not registered"))?;
+    let label = match CredentialRef::from_secret(&record.secret_ref)? {
+        CredentialRef::Native(harness) if harness == provider.harness => None,
+        CredentialRef::Named { harness, label } if harness == provider.harness => {
+            Some(label.as_str().to_owned())
+        }
+        _ => {
+            return Err(invalid(
+                "account is not a native login of this provider's harness",
+            ))
+        }
+    };
+    let harness = cfg
+        .harnesses
+        .get(&provider.harness)
+        .ok_or_else(|| invalid("provider harness is not configured"))?;
+    let kind = match provider.harness {
+        HarnessId::Codex => Adapter::Codex,
+        HarnessId::ClaudeCode => Adapter::Claude,
+    };
+    Ok(LoginTarget {
+        binary: harness.binary.clone(),
+        runtime_home: harness.home.clone(),
+        kind,
+        label,
+        reply: json!({"account": binding.account, "provider": name, "status": "ok"}),
+    })
 }
 /// Executes one parsed command and returns its public process exit status.
 ///
@@ -800,6 +1070,15 @@ async fn login(
 /// socket broker.
 pub async fn run(cli: Cli) -> Result<i32> {
     let home = fs::home(cli.home.clone())?;
+    // An older state database must be migrated together with its config;
+    // no other command may open (and so auto-upgrade) it first.
+    // The permission hook helper never opens the database.
+    if !matches!(
+        cli.command,
+        Command::Config { .. } | Command::Doc { .. } | Command::PermissionRequest { .. }
+    ) {
+        crate::migrate::require_current_store(&home)?;
+    }
     if matches!(&cli.command, Command::Mcp) {
         transport::mcp::exec_desktop_frontend(&home)?;
     }
@@ -840,27 +1119,31 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             } else {
                 None
             };
-            let mut request = StartRequest {
-                runtime: a.runtime,
-                model: a.model,
-                profile: a.profile,
-                task,
-                workdir: absolute(&a.workdir.unwrap_or(std::env::current_dir()?))?,
-                write: a.write,
-                fast: a.fast,
-                effort: a.effort,
-                timeout_seconds: a.timeout_seconds,
-                read_roots: a
-                    .read_roots
-                    .iter()
-                    .map(|p| absolute(p))
-                    .collect::<Result<_>>()?,
-                output_schema: schema,
-                orchestrator: a.session.resolve()?,
-                request_id: a.request_id,
-                account: a.account,
-                required_constraints: BTreeSet::<Constraint>::new(),
-            };
+            // The strict provider request; the broker admits it (never this
+            // one-shot process) and chooses the account unless one is named.
+            let read_roots = a
+                .read_roots
+                .iter()
+                .map(|p| absolute(p))
+                .collect::<Result<Vec<_>>>()?;
+            let mut request: agent_run_domain::ProviderStartRequest =
+                serde_json::from_value(json!({
+                    "provider": a.provider,
+                    "model": a.model,
+                    "profile": a.profile,
+                    "task": task,
+                    "workdir": absolute(&a.workdir.unwrap_or(std::env::current_dir()?))?,
+                    "write": a.write,
+                    "fast": a.fast,
+                    "effort": a.effort,
+                    "timeout_seconds": a.timeout_seconds,
+                    "read_roots": read_roots,
+                    "output_schema": schema,
+                    "orchestrator": a.session.resolve()?,
+                    "request_id": a.request_id,
+                    "account": a.account,
+                }))
+                .map_err(|_| invalid("invalid provider start arguments"))?;
             request.validate()?;
             let result = dependencies
                 .broker
@@ -973,9 +1256,17 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             limit,
             follow,
             full,
-        } => loop {
-            let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
+            format,
+        } => {
+            // An explicit --format always wins; otherwise text is interactive
+            // and JSON keeps piped consumers on the historical machine shape.
+            let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
+            // Streaming state persists across pages and polls so journal
+            // fragments of one model message render continuously; the sink
+            // writes each rendered chunk immediately.
+            let mut renderer = crate::transcript::Renderer::default();
             if full {
+                let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
                 let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
                 let mut page_cursor = cursor;
                 let mut pages = 1usize;
@@ -994,37 +1285,81 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
                     pages += 1;
                 }
-                (dependencies.output)(
-                    &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
-                )?;
-                break;
-            }
-            (dependencies.output)(&page)?;
-            if let Some(seq) = page["messages"]
-                .as_array()
-                .and_then(|a| a.last())
-                .and_then(|v| v["seq"].as_i64())
-            {
-                cursor = seq;
-            }
-            if !follow {
-                break;
-            }
-            if page["complete"] == true
-                && dependencies.service.agent(&agent_id)?["status"]
-                    .as_str()
-                    .is_some_and(|status| {
-                        matches!(
-                            status,
-                            "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
-                        )
+                if text {
+                    renderer.page(&messages, &mut |line| (dependencies.text_output)(line))?;
+                    renderer.finish(&mut |line| (dependencies.text_output)(line))?;
+                } else {
+                    (dependencies.output)(
+                        &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
+                    )?;
+                }
+            } else {
+                // The interrupt listener is installed before the first page,
+                // so a Ctrl-C at any point ends only the viewer, gracefully.
+                let mut interrupt = follow
+                    .then(|| {
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                     })
-            {
-                break;
+                    .transpose()?;
+                loop {
+                    let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
+                    if text {
+                        renderer.page(
+                            page["messages"]
+                                .as_array()
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            &mut |line| (dependencies.text_output)(line),
+                        )?;
+                    } else {
+                        (dependencies.output)(&page)?;
+                    }
+                    if let Some(seq) = page["messages"]
+                        .as_array()
+                        .and_then(|a| a.last())
+                        .and_then(|v| v["seq"].as_i64())
+                    {
+                        cursor = seq;
+                    }
+                    if !follow {
+                        break;
+                    }
+                    if page["complete"] == true
+                        && dependencies.service.agent(&agent_id)?["status"]
+                            .as_str()
+                            .is_some_and(|status| {
+                                matches!(
+                                    status,
+                                    "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
+                                )
+                            })
+                    {
+                        break;
+                    }
+                    // Interrupting the viewer never cancels the supervised
+                    // agent; the resident supervisor keeps running it.
+                    if let Some(interrupt) = interrupt.as_mut() {
+                        tokio::select! {_=interrupt.recv()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
+                    }
+                }
+                // Flush the tail of the streamed item on any viewer exit.
+                renderer.finish(&mut |line| (dependencies.text_output)(line))?;
             }
-            tokio::select! {_=tokio::signal::ctrl_c()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
-        },
-        Command::Models => (dependencies.output)(&dependencies.service.models().await?)?,
+        }
+        Command::Models {
+            provider,
+            profile,
+            model,
+        } => (dependencies.output)(
+            &dependencies
+                .service
+                .models(agent_run_domain::ModelsQuery {
+                    provider,
+                    profile,
+                    model,
+                })
+                .await?,
+        )?,
         Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
@@ -1055,7 +1390,11 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             )?)?,
         },
         Command::Capacity { command } => match command {
-            Capacity::Order => (dependencies.output)(&dependencies.service.capacity_order()?)?,
+            Capacity::Order { model } => (dependencies.output)(
+                &dependencies
+                    .service
+                    .capacity_order(agent_run_domain::CapacityOrderQuery { model })?,
+            )?,
             Capacity::Launchd {
                 binary,
                 label,
@@ -1065,7 +1404,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 &home,
                 binary,
                 "capacity",
-                Config::load(&home)?.capacity.collect_interval_seconds,
+                operator_config(&home)?.0.capacity.collect_interval_seconds,
                 &label,
                 stdout_log,
                 stderr_log.unwrap_or_else(|| home.join("capacity-worker.err.log")),
@@ -1092,7 +1431,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 &home,
                 binary,
                 "delivery",
-                Config::load(&home)?.delivery.retry_base_seconds.ceil() as u64,
+                operator_config(&home)?.0.delivery.retry_base_seconds.ceil() as u64,
                 &label,
                 stdout_log,
                 stderr_log.unwrap_or_else(|| home.join("delivery-worker.err.log")),
@@ -1117,6 +1456,65 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             }
             return Ok(code);
         }
+        Command::Config { command } => match command {
+            ConfigCommand::Migrate {
+                mapping,
+                dry_run: _,
+                apply,
+                ack,
+                from_release,
+            } => (dependencies.output)(&crate::migrate::migrate(
+                &home,
+                &mapping,
+                apply,
+                &ack,
+                from_release.as_deref(),
+            )?)?,
+            ConfigCommand::Rollback { snapshot } => {
+                (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?
+            }
+        },
+        Command::Accounts { command } => match command {
+            AccountCommand::Register {
+                id,
+                auth_family,
+                reference,
+            } => {
+                let reference: SecretRef = reference.parse()?;
+                let source = CredentialRef::from_secret(&reference)?;
+                let record = AccountRecord {
+                    account_id: id.clone(),
+                    auth_family: auth_family.clone(),
+                    secret_ref: reference,
+                    status: AccountStatus::Enabled,
+                };
+                Store::open(&home)?.register_account(&record)?;
+                (dependencies.output)(&json!({
+                    "account_id": id, "auth_family": auth_family.as_str(),
+                    "status": "enabled", "source": source.kind()
+                }))?;
+            }
+            AccountCommand::List => {
+                let records = Store::open(&home)?.list_accounts()?;
+                let views: Vec<_> = records
+                    .iter()
+                    .map(|record| {
+                        json!({
+                            "account_id": record.account_id,
+                            "auth_family": record.auth_family.as_str(),
+                            "status": record.status.as_str(),
+                            "source": CredentialRef::from_secret(&record.secret_ref)
+                                .map(|reference| reference.kind()).unwrap_or("unknown"),
+                        })
+                    })
+                    .collect();
+                (dependencies.output)(&json!({"accounts":views}))?;
+            }
+            AccountCommand::Disable { id } => {
+                Store::open(&home)?.disable_account(&id)?;
+                (dependencies.output)(&json!({"account_id":id,"status":"disabled"}))?;
+            }
+        },
         // The supervisor is spawned by posix_spawn with three fixed bootstrap
         // descriptors; keep that signature from the launch work.
         Command::Supervisor {

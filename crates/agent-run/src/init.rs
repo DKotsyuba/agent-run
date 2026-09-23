@@ -7,10 +7,14 @@ use std::path::Path;
 
 /// Creates or validates the minimal private home without provisioning credentials.
 ///
-/// Existing valid files remain untouched.  A regular `config.toml` is seeded
-/// only when missing, then configuration and the SQLite schema are validated.
-/// Symlinked config files and non-directory homes are refused before state is
-/// initialized.
+/// Existing valid files remain untouched.  A missing `config.toml` is seeded
+/// as an explicitly empty schema-2 catalog (no harness, provider or account;
+/// nothing startable until the operator declares them) with empty default
+/// role and skill directories, then configuration
+/// and the SQLite schema are validated. A schema-1 config never seeds a new
+/// state database: that would pair it with the current schema, which only
+/// `config migrate` may do. Symlinked config files and non-directory homes
+/// are refused before state is initialized.
 pub fn initialize(home: &Path) -> Result<Value> {
     if let Ok(metadata) = std::fs::symlink_metadata(home) {
         if !metadata.is_dir() {
@@ -27,9 +31,22 @@ pub fn initialize(home: &Path) -> Result<Value> {
         .optional(Path::new("config.toml"), 1024 * 1024)?
         .is_none()
     {
-        dir.write(Path::new("config.toml"), b"schema_version = 1\n", 0o600)?;
+        dir.write(Path::new("config.toml"), b"schema_version = 2\n", 0o600)?;
+        // The seeded config uses the default role and skill catalogs; they
+        // start empty.
+        fs::private_dir(&home.join("profiles"))?;
+        fs::private_dir(&home.join("skills"))?;
     }
-    let _ = Config::load(home)?;
+    // A valid schema-2 provider config is accepted as is; a schema-1 config
+    // is validated only for an existing (already paired) state database.
+    if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
+        let _ = Config::load(home)?;
+        if !home.join("state.db").exists() {
+            return Err(invalid(
+                "a schema_version 1 config cannot initialize new state; write a schema_version 2 config",
+            ));
+        }
+    }
     let store = Store::initialize(home)?;
     drop(store);
     Ok(json!({"home": path(home), "config": path(&config), "state": path(&home.join("state.db"))}))

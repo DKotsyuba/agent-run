@@ -266,16 +266,25 @@ impl ServerHandler for Proxy {
             ));
         }
         let mut arguments = request.arguments.unwrap_or_default();
+        // Read tools accept exactly the arguments their shared registry
+        // schema declares (none for `limits`, exact filters for the others).
         if matches!(
             request.name.as_ref(),
             "capacity_order" | "models" | "limits"
-        ) && !arguments.is_empty()
-        {
-            let names: Vec<_> = arguments.keys().collect();
-            return Ok(tool_error(
-                "ValidationError",
-                python_unknown_arguments(names),
-            ));
+        ) {
+            let declared = dispatch::tool(request.name.as_ref())
+                .map(|tool| tool.arguments())
+                .unwrap_or_default();
+            let names: Vec<_> = arguments
+                .keys()
+                .filter(|name| !declared.iter().any(|argument| argument.name == *name))
+                .collect();
+            if !names.is_empty() {
+                return Ok(tool_error(
+                    "ValidationError",
+                    python_unknown_arguments(names),
+                ));
+            }
         }
         if matches!(request.name.as_ref(), "start" | "resume")
             && !arguments.contains_key("orchestrator")

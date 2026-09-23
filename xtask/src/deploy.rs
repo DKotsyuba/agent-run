@@ -620,7 +620,13 @@ mod tests {
         assert!(deploy_with_failure(&prefix, &home, &new, CutoverStage::Before).is_err());
         Connection::open(home.join("state.db"))
             .expect("state fixture")
-            .execute("PRAGMA user_version = 17", [])
+            .execute(
+                &format!(
+                    "PRAGMA user_version = {}",
+                    release::SUPPORTED_SCHEMA_VERSION + 1
+                ),
+                [],
+            )
             .expect("advance schema fixture");
         let error = recover(&prefix, &home, false).expect_err("newer schema must refuse recovery");
         assert!(

@@ -1,3 +1,4 @@
+use crate::catalog::QuotaAdmissionError;
 use serde::Serialize;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -5,6 +6,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Stable public machine codes carried by CLI, JSON-RPC, and MCP error envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MachineCode {
+    /// Candidate ordering was computed against an older committed snapshot.
+    SelectionStale,
+    /// The stale-retry budget was spent; nothing was admitted. Contention,
+    /// never provider exhaustion.
+    SelectionBusy,
+    /// No currently eligible account remains for the explicit provider/model.
+    NoEligibleAccount,
+    /// Every eligible account is authoritatively quota-exhausted until a
+    /// known reset; distinct from active-slot `CapacityExhausted`.
+    QuotaExhausted,
     /// The caller supplied an invalid public value.
     ValidationError,
     /// A derived path escaped its declared owned root.
@@ -35,6 +46,10 @@ impl MachineCode {
     /// Returns the exact Python-compatible public error type name.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SelectionStale => "selection_stale",
+            Self::SelectionBusy => "selection_busy",
+            Self::NoEligibleAccount => "no_eligible_account",
+            Self::QuotaExhausted => "quota_exhausted",
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
             Self::AgentNotFound => "AgentNotFound",
@@ -48,6 +63,35 @@ impl MachineCode {
             Self::IOError => "IOError",
             Self::StorageError => "StorageError",
         }
+    }
+
+    /// Every public machine code, in declaration order.
+    pub const ALL: [Self; 16] = [
+        Self::SelectionStale,
+        Self::SelectionBusy,
+        Self::NoEligibleAccount,
+        Self::QuotaExhausted,
+        Self::ValidationError,
+        Self::PathEscapeError,
+        Self::AgentNotFound,
+        Self::StateTransitionError,
+        Self::RequestConflict,
+        Self::CapacityExhausted,
+        Self::Unsupported,
+        Self::BrokerUnavailable,
+        Self::AnswerIntegrityError,
+        Self::RuntimeError,
+        Self::IOError,
+        Self::StorageError,
+    ];
+
+    /// Resolves an exact public spelling received from the broker.
+    ///
+    /// This is the allowlist for broker-carried codes: only a spelling that
+    /// [`Self::as_str`] produces is accepted, anything else returns `None`
+    /// and the caller keeps its generic category.
+    pub fn from_wire(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.as_str() == code)
     }
 }
 
@@ -65,6 +109,9 @@ pub struct ProtocolMapping {
 /// Expected domain failures; source-bearing variants never expose source diagnostics publicly.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A typed provider admission refusal with no partial durable admission.
+    #[error("{0}")]
+    QuotaAdmission(#[from] QuotaAdmissionError),
     /// A public input contract was violated.
     #[error("{0}")]
     Validation(String),
@@ -152,8 +199,25 @@ pub struct PublicError {
 }
 impl Error {
     /// Returns the stable machine code without formatting untrusted source diagnostics.
-    pub const fn machine_code(&self) -> MachineCode {
+    ///
+    /// A broker-returned error keeps the broker's own code when it is an
+    /// exact allowlisted spelling ([`MachineCode::from_wire`]), so the CLI and
+    /// MCP renderers report the same type as the socket; an absent or unknown
+    /// broker code stays `RuntimeError`.
+    pub fn machine_code(&self) -> MachineCode {
         match self {
+            Self::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }) => {
+                MachineCode::SelectionStale
+            }
+            Self::QuotaAdmission(QuotaAdmissionError::SelectionBusy { .. }) => {
+                MachineCode::SelectionBusy
+            }
+            Self::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. }) => {
+                MachineCode::NoEligibleAccount
+            }
+            Self::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { .. }) => {
+                MachineCode::QuotaExhausted
+            }
             Self::Validation(_) | Self::Json(_) => MachineCode::ValidationError,
             Self::PathEscape(_) => MachineCode::PathEscapeError,
             Self::NotFound(_) => MachineCode::AgentNotFound,
@@ -163,6 +227,10 @@ impl Error {
             Self::Unsupported(_) => MachineCode::Unsupported,
             Self::BrokerUnavailable => MachineCode::BrokerUnavailable,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
+            Self::Broker {
+                broker_error_code: Some(code),
+                ..
+            } => MachineCode::from_wire(code).unwrap_or(MachineCode::RuntimeError),
             Self::Runtime(_) | Self::Broker { .. } => MachineCode::RuntimeError,
             Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
@@ -171,7 +239,7 @@ impl Error {
     }
 
     /// Returns JSON-RPC, MCP, and CLI mappings shared by every public transport.
-    pub const fn protocol_mapping(&self) -> ProtocolMapping {
+    pub fn protocol_mapping(&self) -> ProtocolMapping {
         let code = self.machine_code();
         ProtocolMapping {
             json_rpc_code: if matches!(
@@ -195,6 +263,7 @@ impl Error {
             | Self::AnswerIntegrity(s)
             | Self::Integrity(s)
             | Self::Runtime(s) => s.clone(),
+            Self::QuotaAdmission(value) => value.to_string(),
             Self::Broker { message, .. } => message.clone(),
             Self::Bootstrap { message, .. } => message.clone(),
             // Parser/OS/database diagnostics can contain configured secret values.

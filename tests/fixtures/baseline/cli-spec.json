@@ -1651,9 +1651,25 @@
         "positional": false,
         "required": false,
         "type": null
+      },
+      {
+        "choices": [
+          "text",
+          "json"
+        ],
+        "default": null,
+        "dest": "format",
+        "help": "output format; text on a terminal, JSON otherwise",
+        "nargs": null,
+        "option_strings": [
+          "--format"
+        ],
+        "positional": false,
+        "required": false,
+        "type": null
       }
     ],
     "command": "transcript",
-    "help": "usage: agent-run transcript [-h] [--cursor CURSOR] [--limit LIMIT] [--follow |\n                            --full]\n                            agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help       show this help message and exit\n  --cursor CURSOR\n  --limit LIMIT\n  --follow\n  --full\n"
+    "help": "usage: agent-run transcript [-h] [--cursor CURSOR] [--limit LIMIT] [--follow |\n                            --full] [--format {text,json}]\n                            agent_id\n\npositional arguments:\n  agent_id\n\noptions:\n  -h, --help       show this help message and exit\n  --cursor CURSOR\n  --limit LIMIT\n  --follow\n  --full\n"
   }
 ]

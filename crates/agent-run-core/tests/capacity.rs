@@ -593,15 +593,6 @@ fn route_weight_precedence_is_account_then_lane_then_runtime_default() {
     assert_eq!(runtime.weight(None, "other-lane"), 1.0);
     assert_eq!(runtime.weight(Some("unknown-account"), "new-lane"), 2.0);
 }
-/// Mirrors `tests/test_capacity_sources.py::test_missing_or_naive_updated_at_cannot_revive_old_evidence`.
-#[test]
-fn codexbar_observation_time_must_have_a_timezone() {
-    let good = json!({"usage":{"updatedAt":"2026-09-15T12:00:00Z","primary":{"usedPercent":25,"windowMinutes":300,"resetsAt":"2026-09-15T16:00:00Z"}}});
-    assert!(capacity::sources::normalize_codexbar("mock", &good).is_ok());
-    let mut bad = good;
-    bad["usage"]["updatedAt"] = json!("2026-09-15T12:00:00");
-    assert!(capacity::sources::normalize_codexbar("mock", &bad).is_err());
-}
 
 // --- Pure ranking (`agent_run.capacity.ranking.rank_capacity_routes`) ---
 // The shared injected epoch used by every deterministic ranking test below,

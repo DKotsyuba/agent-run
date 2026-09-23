@@ -123,6 +123,10 @@ pub struct StartResult {
     pub agent_id: AgentId,
     /// Whether this call created rather than replayed admission.
     pub created: bool,
+    /// The provider attempt the admission (or its replay) owns; absent in
+    /// historical runtime start responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     /// Immediately committed status snapshot.
     pub agent: AgentView,
 }
@@ -227,4 +231,43 @@ pub struct AgentPage {
     pub revision: i64,
     /// UTC epoch seconds when the page was built.
     pub observed_at: f64,
+}
+
+/// Optional exact filters of the public `models` provider catalog.
+///
+/// Every filter is an exact configured identifier, never a fuzzy or
+/// semantic match: `provider` selects one configured provider, `model` keeps
+/// providers that explicitly offer that provider-visible model id, and
+/// `profile` keeps only model offerings the named canonical role can be
+/// admitted with (the same role load and policy check admission applies).
+/// An unknown value is a validation error; absent filters return everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsQuery {
+    /// Exact configured provider id.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Exact canonical role/profile name.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Exact provider-visible model id.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl ModelsQuery {
+    /// Returns whether no filter is set.
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.profile.is_none() && self.model.is_none()
+    }
+}
+
+/// Optional exact model filter of the public provider `capacity_order`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityOrderQuery {
+    /// Exact provider-visible model id; keeps only providers offering it and
+    /// ranks each by that model's own availability.
+    #[serde(default)]
+    pub model: Option<String>,
 }

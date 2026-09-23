@@ -6,8 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Records the store schema supported by binaries produced by this workspace.
-pub(crate) const SUPPORTED_SCHEMA_VERSION: u64 = 16;
+/// Records the store schema supported by binaries produced by this workspace:
+/// the store's own current schema, never a separately maintained number.
+pub(crate) const SUPPORTED_SCHEMA_VERSION: u64 =
+    agent_run_platform::release::STORE_SCHEMA_VERSION as u64;
 
 /// Returns a lowercase SHA-256 digest for arbitrary bytes.
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
@@ -83,47 +85,12 @@ pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, Str
 
 /// Validates a sealed release before it can become a `current` target.
 pub fn verify(release: &Path) -> Result<(), String> {
-    if fs::read_to_string(release.join("COMPLETE")).map_err(|error| error.to_string())?
-        != "complete\n"
-    {
-        return Err("release is incomplete".into());
-    }
-    let manifest =
-        fs::read_to_string(release.join("SHA256SUMS")).map_err(|error| error.to_string())?;
-    let mut seen = std::collections::BTreeSet::new();
-    for line in manifest.lines() {
-        let (hash, name) = line.split_once("  ").ok_or("invalid sealed manifest")?;
-        let relative = Path::new(name);
-        if hash.len() != 64
-            || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || relative.is_absolute()
-            || relative
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-            || !seen.insert(name)
-        {
-            return Err("unsafe or duplicate sealed manifest path".into());
-        }
-        if digest(&release.join(relative)).map_err(|error| error.to_string())? != hash {
-            return Err(format!("corrupt sealed release file: {name}"));
-        }
-    }
-    if !seen.contains("bin/agent-run") || !seen.contains("metadata.json") {
-        return Err("sealed manifest does not cover runtime entry points".into());
-    }
-    schema_version(release)?;
-    Ok(())
+    agent_run_platform::release::verify(release)
 }
 
 /// Reads the schema version recorded by a sealed release.
 pub(crate) fn schema_version(release: &Path) -> Result<u64, String> {
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &fs::read(release.join("metadata.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("invalid release metadata: {error}"))?;
-    metadata["schema_version"]
-        .as_u64()
-        .ok_or_else(|| "release metadata has no schema_version".into())
+    agent_run_platform::release::schema_version(release)
 }
 
 #[cfg(test)]
@@ -140,6 +107,11 @@ mod tests {
         fs::write(&binary, "native binary").expect("fixture binary");
         let release = build(temporary.path(), "0.12.0", &binary).expect("sealed release");
         verify(&release).expect("valid manifest");
+        assert_eq!(
+            super::schema_version(&release).expect("metadata schema"),
+            agent_run_platform::release::STORE_SCHEMA_VERSION as u64,
+            "release metadata records the store's current schema"
+        );
         fs::write(release.join("bin/agent-run"), "changed").expect("tamper fixture");
         assert!(verify(&release).is_err());
     }
