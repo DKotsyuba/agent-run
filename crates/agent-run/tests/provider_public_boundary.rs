@@ -28,6 +28,12 @@ impl Broker {
     /// Initializes the home through the CLI, writes the provider config,
     /// registers the account and starts `api serve`, waiting for its socket.
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// [`Self::start`] with extra environment for the broker process only
+    /// (test-fixtures seams such as `AGENT_RUN_FIXTURE_ALWAYS_STALE`).
+    fn start_with(environment: &[(&str, &str)]) -> Self {
         let base = std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into());
         let temp = tempfile::Builder::new()
             .prefix("ar-pb-")
@@ -68,6 +74,7 @@ impl Broker {
             .arg(&home)
             .args(["api", "serve"])
             .env("FAKE_TOKEN", "synthetic-token")
+            .envs(environment.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -265,4 +272,20 @@ async fn admission_codes_survive_every_public_transport() {
         .status
         .success());
     broker.assert_refused("no_eligible_account").await;
+}
+
+/// A real broker whose committed capacity revision moves between every
+/// ranking and submission (test-fixtures seam) spends its stale-retry
+/// budget; the contention verdict `selection_busy` keeps its exact class on
+/// the CLI, MCP and socket clients, and nothing is admitted.
+#[tokio::test]
+async fn selection_busy_survives_every_public_transport() {
+    let broker = Broker::start_with(&[("AGENT_RUN_FIXTURE_ALWAYS_STALE", "1")]);
+    broker.assert_refused("selection_busy").await;
+    let admitted: i64 = agent_run::state::Store::open(&broker.home)
+        .unwrap()
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(admitted, 0);
 }

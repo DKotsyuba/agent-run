@@ -317,7 +317,24 @@ impl Service {
     ///    recalculations. If the last of those four submissions is also
     ///    stale, this returns `selection_busy` and nothing was admitted.
     ///    There is no sleep or polling; every other error returns as is.
+    ///
+    /// Test-only (feature `test-fixtures`): when the broker process runs with
+    /// `AGENT_RUN_FIXTURE_ALWAYS_STALE` set, the committed capacity revision
+    /// advances between every ranking and its submission, so a real broker
+    /// deterministically spends its stale-retry budget (`selection_busy`).
+    /// Absent in production builds.
     pub fn admit_provider(&self, request: ProviderStartRequest) -> Result<Value> {
+        #[cfg(feature = "test-fixtures")]
+        if std::env::var_os("AGENT_RUN_FIXTURE_ALWAYS_STALE").is_some() {
+            let home = self.home.clone();
+            return self.admit_provider_ranked(request, &mut |_| {
+                let mut store = Store::open(&home)?;
+                let tx = store.conn.transaction()?;
+                Store::advance_quota_capacity_revision(&tx)?;
+                tx.commit()?;
+                Ok(())
+            });
+        }
         self.admit_provider_ranked(request, &mut |_| Ok(()))
     }
 
