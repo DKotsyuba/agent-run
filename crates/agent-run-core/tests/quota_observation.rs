@@ -492,3 +492,46 @@ fn malformed_rounds_and_noop_rounds_leave_history_and_revision_untouched() {
         .unwrap();
     assert!(payload.contains("glm-4.7"));
 }
+
+/// A native-signal latch (`Store::latch_native_exhaustion`) follows the same
+/// release rules as collector latches: an older positive collector sample
+/// never clears it, a newer authoritative positive observation of the same
+/// lane and window does.
+#[test]
+fn native_signal_latch_survives_stale_positive_and_releases_on_fresh() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let mut store = agent_run_store::Store::open(home.path()).unwrap();
+    store
+        .latch_native_exhaustion(
+            &account(),
+            "primary",
+            "five_hour",
+            "claude-rate-limit-event",
+            1600.0,
+            None,
+        )
+        .unwrap();
+    assert_eq!(latch_rows(home.path()), 1);
+    let positive = |observed: f64, at: f64| {
+        normalize_at(
+            &json!({"version":1,"windows":[{"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.6"],
+                "remaining_percent":80.0,"observed_at":observed}]}),
+            at,
+        )
+        .unwrap()
+    };
+    record_quota_snapshot(home.path(), "glm", &positive(1500.0, 1700.0), 100, 1700.0).unwrap();
+    assert_eq!(
+        latch_rows(home.path()),
+        1,
+        "an older positive sample never clears it"
+    );
+    record_quota_snapshot(home.path(), "glm", &positive(1650.0, 1700.0), 100, 1700.0).unwrap();
+    assert_eq!(
+        latch_rows(home.path()),
+        0,
+        "a newer positive observation releases it"
+    );
+}
