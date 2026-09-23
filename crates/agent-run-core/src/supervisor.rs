@@ -399,7 +399,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
     }
     row = store.get(id)?;
     let host: BTreeMap<String, String> = std::env::vars().collect();
-    let planned = adapters::provider::plan_selected(
+    let planned = adapters::provider::plan_selected_with(
         &config,
         &catalog,
         &identity.authority,
@@ -410,6 +410,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         &adapters::authorized_request::SystemCredentialReader,
         &identity.provider_request.task,
         None,
+        adapters::provider::LaunchOptions {
+            fast: identity.provider_request.fast,
+            output_schema: identity.provider_request.output_schema.as_ref(),
+        },
     )?;
     store.provider_spawning(id, &attempt_id)?;
     store.event(id, "phase", &json!({"phase":"spawning"}))?;

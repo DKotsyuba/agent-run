@@ -240,6 +240,34 @@ fn native_provider_keeps_login_and_model_alias() {
         .environment
         .contains_key("AGENT_RUN_PROVIDER_TOKEN"));
     assert!(run_fake(&plan.launch).contains("app-server"));
+    // The admitted fast option becomes the codex fast service tier.
+    let fast = agent_run_adapters::provider::plan_selected_with(
+        &config,
+        &catalog,
+        &authority,
+        &account,
+        &run_home,
+        root,
+        &BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]),
+        &FakeReader,
+        "task",
+        None,
+        agent_run_adapters::provider::LaunchOptions {
+            fast: true,
+            output_schema: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fast.launch.args,
+        [
+            "-c",
+            "service_tier=fast",
+            "-c",
+            "features.fast_mode=true",
+            "app-server"
+        ]
+    );
     agent_run_adapters::materialize::verify(&run_home, authority.assets_sha256.as_str()).unwrap();
     let other_auth = root.join("accounts/codex/other/auth.json");
     fs::create_dir_all(other_auth.parent().unwrap()).unwrap();
@@ -294,6 +322,28 @@ fn native_provider_keeps_login_and_model_alias() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "claude-sonnet");
+    // The admitted output_schema joins the claude system prompt.
+    let schema = serde_json::json!({"type": "object"});
+    let with_schema = agent_run_adapters::provider::plan_selected_with(
+        &config,
+        &catalog,
+        &authority,
+        &account,
+        &run_home,
+        root,
+        &BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]),
+        &FakeReader,
+        "task",
+        None,
+        agent_run_adapters::provider::LaunchOptions {
+            fast: false,
+            output_schema: schema.as_object(),
+        },
+    )
+    .unwrap();
+    assert!(with_schema.launch.args.iter().any(|arg| {
+        arg.contains("Return only JSON matching this schema: {\"type\":\"object\"}")
+    }));
     assert!(plan
         .launch
         .args

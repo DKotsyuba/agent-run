@@ -395,11 +395,6 @@ impl Service {
         ) -> Result<QuotaCandidateSet>,
     ) -> Result<Value> {
         request.validate()?;
-        if request.fast || request.output_schema.is_some() {
-            return Err(Error::Unsupported(
-                "provider fast mode and output schema await harness cutover".into(),
-            ));
-        }
         if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
             let store = Store::open(&self.home)?;
             let row = store.get(&replay.agent_id)?;
@@ -419,6 +414,18 @@ impl Service {
             .iter()
             .find(|model| model.id == request.model)
             .ok_or_else(|| invalid("model is not offered by provider"))?;
+        // Harness options run through the existing launch mechanisms: fast
+        // is the codex service tier, output_schema the claude answer schema.
+        if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
+            return Err(invalid("fast mode is supported only by the codex harness"));
+        }
+        if request.output_schema.is_some()
+            && provider.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+        {
+            return Err(invalid(
+                "output_schema is supported only by the claude-code harness",
+            ));
+        }
         let pinned = request
             .account
             .as_ref()

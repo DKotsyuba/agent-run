@@ -284,11 +284,20 @@ fn bind_native_codex(
     materialize::Publisher::new(home)?.link("auth.json", &source)
 }
 
-/// Builds one attempt from verified immutable assets and the selected account.
+/// Per-request harness options frozen with the admitted request.
 ///
-/// The caller supplies fresh task text and an optional exact native session
-/// id; neither can alter frozen model, grants, connection, binary, or assets.
-/// `reader` resolves custom credentials only into the child environment.
+/// `fast` asks the codex harness for its fast service tier; `output_schema`
+/// asks the claude-code harness to answer as JSON matching the schema.
+/// Admission rejects either on the other harness.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchOptions<'a> {
+    /// Codex fast service tier.
+    pub fast: bool,
+    /// Claude JSON answer schema.
+    pub output_schema: Option<&'a serde_json::Map<String, serde_json::Value>>,
+}
+
+/// [`plan_selected_with`] with no per-request harness options.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_selected(
     config: &ProviderConfig,
@@ -301,6 +310,41 @@ pub fn plan_selected(
     reader: &impl CredentialReader,
     task: &str,
     resume_session: Option<&str>,
+) -> Result<ProviderLaunchPlan> {
+    plan_selected_with(
+        config,
+        catalog,
+        authority,
+        account,
+        home,
+        app_home,
+        host,
+        reader,
+        task,
+        resume_session,
+        LaunchOptions::default(),
+    )
+}
+
+/// Builds one attempt from verified immutable assets and the selected account.
+///
+/// The caller supplies fresh task text, an optional exact native session id
+/// and the admitted request's [`LaunchOptions`]; none can alter frozen
+/// model, grants, connection, binary, or assets. `reader` resolves custom
+/// credentials only into the child environment.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_selected_with(
+    config: &ProviderConfig,
+    catalog: &ProviderCatalog,
+    authority: &ResolvedLaunchAuthority,
+    account: &AccountId,
+    home: &Path,
+    app_home: &Path,
+    host: &BTreeMap<String, String>,
+    reader: &impl CredentialReader,
+    task: &str,
+    resume_session: Option<&str>,
+    options: LaunchOptions<'_>,
 ) -> Result<ProviderLaunchPlan> {
     let role = role_from_authority(authority, &authority.assets_sha256)?;
     let sealed = sealed(home, authority)?;
@@ -425,7 +469,18 @@ pub fn plan_selected(
         );
     }
     let args = if sealed.harness == HarnessId::Codex {
-        vec!["app-server".into()]
+        // The same fast-tier overrides the historical codex launch uses.
+        let mut args: Vec<String> = Vec::new();
+        if options.fast {
+            args.extend([
+                "-c".into(),
+                "service_tier=fast".into(),
+                "-c".into(),
+                "features.fast_mode=true".into(),
+            ]);
+        }
+        args.push("app-server".into());
+        args
     } else {
         claude_args(
             &sealed,
@@ -433,6 +488,7 @@ pub fn plan_selected(
             home,
             authority.effort.as_deref(),
             resume_session,
+            options.output_schema,
         )?
     };
     Ok(ProviderLaunchPlan {
@@ -460,6 +516,7 @@ fn claude_args(
     home: &Path,
     effort: Option<&str>,
     resume_session: Option<&str>,
+    output_schema: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>> {
     let mut tools = vec!["Read", "Grep", "Glob"];
     if !role.skills.is_empty() {
@@ -530,7 +587,15 @@ fn claude_args(
     if let Some(effort) = effort {
         args.extend(["--effort".into(), effort.into()]);
     }
-    args.extend(["--append-system-prompt".into(), role.prompt.clone()]);
+    let mut prompt = role.prompt.clone();
+    if let Some(schema) = output_schema {
+        // The same schema instruction the historical Claude stream uses.
+        prompt.push_str(&format!(
+            "\n\nReturn only JSON matching this schema: {}",
+            serde_json::to_string(schema)?
+        ));
+    }
+    args.extend(["--append-system-prompt".into(), prompt]);
     if let Some(session) = resume_session {
         args.extend(["--resume".into(), session.into()]);
     } else {

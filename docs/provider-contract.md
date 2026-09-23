@@ -134,10 +134,11 @@ The public `start` tool (CLI `agent-run start`, broker socket, MCP) takes a
 resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
 `ValidationError`; there is no runtime alias. A repeated `request_id` returns
-the original admission (`created=false`). `fast` and `output_schema` remain
-in the schema but the provider launch path does not yet carry them, so a
-request setting either is refused with `Unsupported` before any row is
-written. On a schema-1 home `start` fails until the config is migrated.
+the original admission (`created=false`). `fast` is carried to the codex
+harness as its fast service tier and `output_schema` to the claude-code
+harness as the answer-schema instruction, through the same launch
+mechanisms as before; setting either on the other harness is a
+`ValidationError` before any row is written. On a schema-1 home `start` fails until the config is migrated.
 
 Resume on a schema-2 home is a typed refusal, never a remap or prompt
 replay: a schema-1 run returns `Unsupported`

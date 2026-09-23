@@ -701,3 +701,31 @@ async fn provider_concurrent_admissions_respect_replay_and_caps() {
         .all(|error| matches!(error, agent_run_domain::Error::Capacity)));
     assert_eq!(rows(&home), (2, 2));
 }
+
+/// Harness options follow the harness: fast on a claude-code provider is a
+/// validation error with no row, while an output_schema request is admitted
+/// and completes through the real supervisor.
+#[tokio::test]
+async fn provider_harness_options_are_validated_and_carried() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let mut fast = request_for(&home, "glm-user", "fast", None);
+    fast.fast = true;
+    let refused = service.admit_provider(fast).unwrap_err();
+    assert_eq!(refused.machine_code().as_str(), "ValidationError");
+    assert_eq!(rows(&home), (0, 0));
+    let mut schema = request_for(&home, "glm-user", "schema", None);
+    schema.output_schema = serde_json::json!({"type": "object"}).as_object().cloned();
+    let admitted = service.admit_provider(schema).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    assert!(tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+}
