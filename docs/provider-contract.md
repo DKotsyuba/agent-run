@@ -271,7 +271,11 @@ harness, reserve, consume reset credits, write samples or start agents.
   the model's restrictions admits on that harness — the same checks a start
   applies. Exact `provider`/`profile`/`model` filters; unknown values are
   validation errors.
-* Results carry `config_revision`, `capacity_revision`, `observed_at`, and
-  (`models`) `roles_sha256`. No account id, label or secret reference is
+* Results carry `config_revision`, `capacity_revision`, `ranked_at` (the
+  advice clock, not sample age), and (`models`) `roles_sha256`. Registry
+  status, samples, latches and the advertised capacity revision come from
+  one committed read transaction; config and roles are frozen inputs.
+  Reuse a result only while all three revisions match. Operator `limits`
+  keeps account-bound rows distinct by `account` and physical `pool`. No account id, label or secret reference is
   emitted. The orchestrator chooses provider, model, effort and profile;
   there is no automatic model choice or ability score.

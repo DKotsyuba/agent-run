@@ -273,3 +273,283 @@ async fn schema_one_filters_are_unsupported() {
         .unwrap();
     assert!(value.get("routes").is_some());
 }
+
+/// Inserts one account-bound sample on `lane` with explicit freshness.
+fn sample(root: &Path, provider: &str, account: &str, lane: &str, remaining: f64, valid: f64) {
+    let at = agent_run_core::domain::now();
+    agent_run_store::Store::open(root)
+        .unwrap()
+        .conn
+        .execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
+             VALUES(?1,?2,'5h',NULL,'collector',?3,?4,?5,?6,'null',?7,?8)",
+            rusqlite::params![
+                provider,
+                lane,
+                remaining,
+                at + 3600.0,
+                at - 10.0,
+                at + valid,
+                account,
+                format!("{account}::{lane}")
+            ],
+        )
+        .unwrap();
+}
+
+/// A home where provider `a` offers a high-capacity model restricted to
+/// roles without network (`web_tools_disabled`) plus a low-capacity open
+/// model, and provider `b` offers one mid-capacity open model.
+fn ranking_home() -> tempfile::TempDir {
+    let temp = home();
+    let root = temp.path();
+    fs::write(root.join("profiles/research.md"),
+        "+++\nrevision = \"n1\"\nwrite = false\nnetwork = true\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nResearch.\n").unwrap();
+    fs::write(
+        root.join("config.toml"),
+        format!(
+            r#"schema_version = 2
+[harnesses.codex]
+binary = "/bin/true"
+home = "{root}/codex"
+[harnesses.claude-code]
+binary = "/bin/true"
+home = "{root}/claude"
+[providers.a]
+harness = "claude-code"
+connection = {{ kind = "custom", endpoint = "https://a.example.com/api", protocol = "messages" }}
+auth_family = "anthropic"
+limits_source = "none"
+[[providers.a.models]]
+id = "a-locked"
+restrictions = ["web_tools_disabled"]
+[[providers.a.models]]
+id = "a-open"
+[[providers.a.bindings]]
+label = "main"
+account = "acct-a"
+[providers.b]
+harness = "claude-code"
+connection = {{ kind = "custom", endpoint = "https://b.example.com/api", protocol = "messages" }}
+auth_family = "anthropic"
+limits_source = "none"
+[[providers.b.models]]
+id = "b-open"
+[[providers.b.bindings]]
+label = "main"
+account = "acct-b"
+"#,
+            root = root.display()
+        ),
+    )
+    .unwrap();
+    let mut store = agent_run_store::Store::open(root).unwrap();
+    for (id, reference) in [
+        ("acct-a", "keychain:fake-a:ref"),
+        ("acct-b", "keychain:fake-b:ref"),
+    ] {
+        store
+            .register_account(&AccountRecord {
+                account_id: id.parse().unwrap(),
+                auth_family: "anthropic".parse().unwrap(),
+                secret_ref: reference.parse().unwrap(),
+                status: AccountStatus::Enabled,
+            })
+            .unwrap();
+    }
+    sample(root, "a", "acct-a", "a-locked", 90.0, 600.0);
+    sample(root, "a", "acct-a", "a-open", 10.0, 600.0);
+    sample(root, "b", "acct-b", "b-open", 60.0, 600.0);
+    temp
+}
+
+/// Returns `(provider, score, model ids)` in catalog order.
+fn standing(catalog: &Value) -> Vec<(String, f64, Vec<String>)> {
+    catalog["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|provider| {
+            (
+                provider["provider"].as_str().unwrap().to_owned(),
+                provider["score"].as_f64().unwrap(),
+                provider["models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|model| model["model"].as_str().unwrap().to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A profile filter ranks providers by the offerings it retains: an
+/// offering the role cannot use never lends its score or position.
+#[tokio::test]
+async fn profile_filter_ranks_only_retained_offerings() {
+    let temp = ranking_home();
+    let service = Service::new(temp.path().to_path_buf());
+    let all = standing(&service.models(ModelsQuery::default()).await.unwrap());
+    assert_eq!(all[0].0, "a", "a-locked has the most capacity: {all:?}");
+    let research = service
+        .models(ModelsQuery {
+            profile: Some("research".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let filtered = standing(&research);
+    assert_eq!(filtered[0].0, "b", "{filtered:?}");
+    assert_eq!(filtered[1].0, "a");
+    assert_eq!(filtered[1].2, ["a-open"]);
+    let a_open = research["providers"][1]["models"][0]["quota"]["best_priority"]
+        .as_f64()
+        .unwrap();
+    assert_eq!(filtered[1].1, a_open, "score comes from a-open alone");
+    assert!(filtered[0].1 > filtered[1].1);
+    assert!(filtered[1].1 < all[0].1);
+}
+
+/// Standing states its evidence: a current sample is `fresh`, an expired
+/// one `stale` with its age, a never-observed lane `missing`, and an
+/// active exhaustion fact reports its reset — never an account identity.
+#[tokio::test]
+async fn quota_standing_reports_freshness_and_exhaustion() {
+    let temp = ranking_home();
+    let root = temp.path();
+    // b-open's only sample expires; a-locked gets an active exhaustion latch.
+    agent_run_store::Store::open(root)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE capacity_samples SET valid_until=observed_at+1 WHERE lane='b-open'",
+            [],
+        )
+        .unwrap();
+    let reset = agent_run_core::domain::now() + 7200.0;
+    agent_run_store::Store::open(root)
+        .unwrap()
+        .conn
+        .execute(
+            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) \
+             VALUES('acct-a','acct-a::a-locked','collector','5h',?1,?2)",
+            rusqlite::params![reset - 7300.0, reset],
+        )
+        .unwrap();
+    let service = Service::new(root.to_path_buf());
+    let order = service
+        .capacity_order(CapacityOrderQuery::default())
+        .unwrap();
+    let quota = |provider: &str, model: &str| {
+        order["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["provider"] == provider)
+            .unwrap()["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["model"] == model)
+            .unwrap()["quota"]
+            .clone()
+    };
+    let locked = quota("a", "a-locked");
+    assert_eq!(locked["status"], "exhausted");
+    assert_eq!(locked["evidence"], "fresh");
+    assert_eq!(locked["exhausted_until"], reset);
+    let stale = quota("b", "b-open");
+    assert_eq!(stale["status"], "unknown");
+    assert_eq!(stale["evidence"], "stale");
+    assert!(stale["newest_observed_at"].as_f64().is_some());
+    assert_eq!(quota("a", "a-open")["evidence"], "fresh");
+    assert!(order["ranked_at"].as_f64().is_some());
+    let catalog = service.models(ModelsQuery::default()).await.unwrap();
+    let codexless = catalog.to_string();
+    assert!(!codexless.contains("acct-"));
+    let missing = home();
+    let missing_catalog = Service::new(missing.path().to_path_buf())
+        .models(ModelsQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_catalog["providers"][1]["models"][0]["quota"]["evidence"],
+        "missing"
+    );
+}
+
+/// Operator `limits` keeps two accounts sharing one provider lane apart.
+#[test]
+fn limits_keep_account_bound_rows_distinct() {
+    let temp = ranking_home();
+    let root = temp.path();
+    sample(root, "a", "acct-b", "a-open", 70.0, 600.0);
+    let limits = Service::new(root.to_path_buf()).limits().unwrap();
+    let pools: Vec<(String, String)> = limits["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["key"]["lane"] == "a-open")
+        .map(|item| {
+            (
+                item["account"].as_str().unwrap().to_owned(),
+                item["pool"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pools,
+        [
+            ("acct-a".to_owned(), "acct-a::a-open".to_owned()),
+            ("acct-b".to_owned(), "acct-b::a-open".to_owned())
+        ]
+    );
+    assert!(!limits.to_string().contains("keychain"));
+}
+
+/// Registry and quota changes committed between the former separate reads
+/// cannot mix: the whole result reflects the one read snapshot.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn registry_and_quota_come_from_one_committed_read() {
+    let temp = home();
+    let root = temp.path();
+    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
+    let before = footprint(root)[4];
+    let catalog = agent_run_core::capacity::provider_catalog::models_observed(
+        root,
+        &config,
+        &revision,
+        &ModelsQuery::default(),
+        &mut || {
+            let mut store = agent_run_store::Store::open(root).unwrap();
+            store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
+            let tx = store.conn.transaction().unwrap();
+            agent_run_store::Store::advance_quota_capacity_revision(&tx).unwrap();
+            tx.commit().unwrap();
+        },
+    )
+    .unwrap();
+    assert_eq!(catalog["capacity_revision"], before);
+    assert_eq!(catalog["providers"][0]["provider"], "glm");
+    assert_eq!(
+        catalog["providers"][0]["models"][0]["quota"]["status"],
+        "available"
+    );
+    let after = agent_run_core::capacity::provider_catalog::models(
+        root,
+        &config,
+        &revision,
+        &ModelsQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(after["capacity_revision"], before + 1);
+    let glm = after["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider"] == "glm")
+        .unwrap();
+    assert_eq!(glm["models"][0]["quota"]["status"], "no_eligible_account");
+}

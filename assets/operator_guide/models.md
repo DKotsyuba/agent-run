@@ -33,19 +33,30 @@ agent-run capacity order --model gpt-main
 The same filters are the `models` / `capacity_order` tool arguments over MCP
 and the broker socket (`{"provider":..,"profile":..,"model":..}`,
 `{"model":..}`). Each result carries `config_revision` (SHA-256 of the exact
-`config.toml` bytes) and `capacity_revision`; `models` also carries
-`roles_sha256` over the listed role grants.
+`config.toml` bytes), `capacity_revision` (the committed quota/registry
+snapshot it was read from) and `ranked_at` (the clock the standing was
+evaluated at — not a sample age); `models` also carries `roles_sha256` over
+the listed role grants. Registry status, samples and exhaustion facts all
+come from that one committed read. Reuse a result only while
+`config_revision`, `capacity_revision` and `roles_sha256` all match: role
+files can change without a config edit.
 
 `models` lists, per provider (in capacity order): `harness`, connection
 `kind`/`protocol`, `auth_family`, `limits_source`, `priority_multiplier`,
 `score`, provider `recommendations`, and every explicit offering with its
 `native_model`, default `params`, `allowed_params` (for example efforts),
 hard `restrictions`, model `recommendations`, the canonical `profiles`
-admission would accept for it, and cached `quota` (`status`,
-`best_priority`). `status` is `available`, `unknown` (configured but not yet
-observed — not a health claim), `priority_overflow`, `exhausted`, or
-`no_eligible_account`. No account id, label or credential reference appears;
-per-account facts stay in `limits` and `accounts list`.
+admission would accept for it, and cached `quota`: `status` (`available`,
+`unknown` = no current sample, `priority_overflow`, `exhausted`,
+`no_eligible_account`), `best_priority`, `evidence` (`fresh` = a current
+sample or an active exhaustion fact decided it, `stale` = samples exist but
+none is current, `missing` = never observed), `newest_observed_at` (the
+newest sample time on that lane, i.e. its age) and `exhausted_until` (the
+earliest known reset when exhausted). These are cached facts, not health
+claims. With a `profile` filter, providers are ranked over only the
+offerings that role can use. No account id, label or credential reference
+appears; per-account facts stay in `limits` (each account-bound row names
+its `account` and physical `pool`) and `accounts list`.
 
 Recommendations are plain configured prose. Editing them in `config.toml`
 changes the next `models` result (and its `config_revision`); no skill needs

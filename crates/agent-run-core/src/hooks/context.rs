@@ -122,7 +122,7 @@ fn provider_block(
     let providers = order["providers"]
         .as_array()
         .ok_or_else(|| invalid("provider order has invalid providers"))?;
-    let mut lines = vec!["Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; use models for roles and recommendations. unknown = configured but not yet observed.".to_owned()];
+    let mut lines = vec!["Provider capacity order (highest first; read-only). Pick provider, model, effort and profile yourself; use models for roles, recommendations and evidence. unknown = no current sample (missing or stale), not a health claim.".to_owned()];
     if providers.is_empty() {
         lines.push("No configured providers.".into());
     }
@@ -135,7 +135,7 @@ fn provider_block(
                 format!(
                     "{}:{}",
                     json_ascii(model["model"].as_str().unwrap_or_default()),
-                    model["status"].as_str().unwrap_or_default()
+                    model["quota"]["status"].as_str().unwrap_or_default()
                 )
             })
             .collect::<Vec<_>>()

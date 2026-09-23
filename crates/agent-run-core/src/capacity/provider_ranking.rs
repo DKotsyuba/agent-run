@@ -114,7 +114,14 @@ struct QuotaSnapshot {
 /// `scope` bounds the read, and ids absent from the registry simply carry no
 /// facts and a disabled status.
 fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<QuotaSnapshot> {
-    let tx = conn.unchecked_transaction()?;
+    // Join a caller's open read transaction (one snapshot for registry and
+    // quota reads together); otherwise open our own deferred one.
+    let _own = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let tx = conn;
     let mut enabled = BTreeMap::new();
     let mut facts: BTreeMap<AccountId, AccountFacts> = BTreeMap::new();
     for account in scope {
@@ -189,7 +196,7 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
                 .push(latch);
         }
     }
-    let revision = Store::quota_capacity_revision_in(&tx)?;
+    let revision = Store::quota_capacity_revision_in(tx)?;
     Ok(QuotaSnapshot {
         revision,
         enabled,
@@ -593,20 +600,23 @@ pub fn provider_order_at(
     hard_ineligible: &BTreeSet<AccountId>,
     at: f64,
 ) -> Result<ProviderCapacityOrder> {
-    provider_order_for_model_at(store, catalog, hard_ineligible, None, at)
+    provider_order_filtered_at(store, catalog, hard_ineligible, &|_, _| true, at)
 }
 
-/// [`provider_order_at`] restricted to one exact provider-visible `model`.
+/// [`provider_order_at`] over only the offerings `keep` retains.
 ///
-/// With `Some(model)` only providers explicitly offering that model appear,
-/// each carrying just that offering, so its score and rank come from that
-/// model's own lane under the same formula and ordering. `None` keeps every
-/// offering. An unoffered model yields an empty provider list.
-pub fn provider_order_for_model_at(
+/// `keep(provider, offering)` decides which offerings exist for this view
+/// (an exact model filter, a role's admissible offerings, ...). Scores,
+/// statuses and the provider order are computed from the retained
+/// offerings only, under the same formula and ordering, so a removed
+/// offering never lends its standing to its provider; providers with no
+/// retained offering are omitted. When the caller holds an open read
+/// transaction on `store`, the snapshot is read inside it.
+pub fn provider_order_filtered_at(
     store: &Store,
     catalog: &ProviderCatalog,
     hard_ineligible: &BTreeSet<AccountId>,
-    model: Option<&str>,
+    keep: &dyn Fn(&ProviderDefinition, &ProviderModel) -> bool,
     at: f64,
 ) -> Result<ProviderCapacityOrder> {
     if !at.is_finite() || at < 0.0 {
@@ -626,7 +636,7 @@ pub fn provider_order_for_model_at(
         for offering in definition
             .models
             .iter()
-            .filter(|offering| model.is_none_or(|model| offering.id == model))
+            .filter(|offering| keep(definition, offering))
         {
             let usable = current_eligible(
                 &snapshot,
@@ -661,11 +671,48 @@ pub fn provider_order_for_model_at(
             if let Some(priority) = best_priority {
                 available.push(priority);
             }
+            // Sample age and exhaustion horizon from the same snapshot,
+            // aggregated over accounts so no identity is exposed.
+            let newest_observed_at = ordering
+                .iter()
+                .flat_map(|(account, _, keys)| {
+                    let history = snapshot.facts.get(account).map(|facts| &facts.history);
+                    keys.iter()
+                        .filter_map(move |key| history.and_then(|history| history.get(key)))
+                        .flat_map(|windows| windows.values().flatten())
+                        .filter_map(|sample| sample.observed_at)
+                })
+                .fold(None, |newest: Option<f64>, at| {
+                    Some(newest.map_or(at, |n| n.max(at)))
+                });
+            let evidence = if best_priority.is_some() || status_rank == 3 {
+                "fresh"
+            } else if newest_observed_at.is_some() {
+                "stale"
+            } else {
+                "missing"
+            };
+            let exhausted_until = (status_rank == 3)
+                .then(|| {
+                    ordering
+                        .iter()
+                        .filter_map(|(_, verdict, _)| match verdict {
+                            LaneVerdict::Exhausted { reset_at } => *reset_at,
+                            _ => None,
+                        })
+                        .fold(None, |min: Option<f64>, at| {
+                            Some(min.map_or(at, |m| m.min(at)))
+                        })
+                })
+                .flatten();
             models.push(ProviderModelOrder {
                 model: offering.id.clone(),
                 native_model: offering.native_model.clone(),
                 status: status.to_owned(),
                 best_priority,
+                evidence: evidence.to_owned(),
+                newest_observed_at,
+                exhausted_until,
             });
         }
         if models.is_empty() {
@@ -751,4 +798,14 @@ pub struct ProviderModelOrder {
     /// The best known account priority (`score * multiplier`) for this
     /// model; `None` when no account has known usable capacity.
     pub best_priority: Option<f64>,
+    /// Evidence behind `status`: `fresh` (a current sample or an active
+    /// exhaustion fact decided it), `stale` (samples exist but none is
+    /// current), or `missing` (never observed for any eligible account).
+    pub evidence: String,
+    /// Newest sample observation time (Unix seconds) on this model's lane
+    /// across eligible accounts, fresh or not; `None` when never observed.
+    pub newest_observed_at: Option<f64>,
+    /// When `status` is `exhausted`: the earliest known reset among the
+    /// exhausted accounts; `None` when unknown or not exhausted.
+    pub exhausted_until: Option<f64>,
 }

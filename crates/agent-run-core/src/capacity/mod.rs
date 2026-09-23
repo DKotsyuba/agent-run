@@ -521,11 +521,20 @@ pub fn limits(home: &Path) -> Result<Value> {
     let store = Store::open(home)?;
     let at = now();
     // Select the latest per identity BEFORE applying a diagnostic result bound.
-    let mut q=store.conn.prepare("SELECT * FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY runtime,lane,window,target,source ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY runtime,lane,window,target,source LIMIT 1000")?;
+    let mut q=store.conn.prepare("SELECT * FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY runtime,lane,window,target,source,account_id,quota_key ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY runtime,lane,window,target,source,account_id,quota_key LIMIT 1000")?;
+    // Account-bound (schema-2) rows keep their account and physical pool so
+    // two accounts sharing one provider lane never collapse into one item;
+    // legacy rows (no account identity) render exactly as before.
     let rows = q
-        .query_map([], row_sample)?
+        .query_map([], |row| {
+            Ok((
+                row_sample(row)?,
+                row.get::<_, Option<String>>("account_id")?,
+                row.get::<_, Option<String>>("quota_key")?,
+            ))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let items:Vec<_>=rows.iter().map(|s|json!({"key":s.key,"known":s.fresh(at),"remaining_percent":if s.fresh(at){s.remaining_percent}else{None},"reset_at":s.reset_at,"observed_at":s.observed_at,"valid_until":s.valid_until})).collect();
+    let items:Vec<_>=rows.iter().map(|(s,account,pool)|{let mut item=json!({"key":s.key,"known":s.fresh(at),"remaining_percent":if s.fresh(at){s.remaining_percent}else{None},"reset_at":s.reset_at,"observed_at":s.observed_at,"valid_until":s.valid_until});if let (Some(account),Some(pool))=(account,pool){item["account"]=json!(account);item["pool"]=json!(pool);}item}).collect();
     Ok(json!({"observed_at":at,"items":items}))
 }
 /// Build the enabled-runtime capacity order from one persisted snapshot.

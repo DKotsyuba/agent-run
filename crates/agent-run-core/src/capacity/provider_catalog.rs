@@ -112,24 +112,54 @@ fn check_model(catalog: &ProviderCatalog, model: Option<&str>) -> Result<()> {
 
 /// The public provider catalog (`models`) for one config revision.
 ///
-/// `revision` is the exact-byte SHA-256 of the cached `config`. The result
-/// carries `config_revision`, the committed `capacity_revision` of its one
-/// quota read, a `roles_sha256` digest of the listed role grants, the
-/// canonical `profiles`, and `providers` in provider capacity order, each with
-/// harness, connection kind, recommendations, and every offered model's
-/// native alias, default `params`, `allowed_params`, hard `restrictions`,
-/// recommendations, admissible `profiles`, and cached `quota` standing
-/// (`available`/`unknown`/`priority_overflow`/`exhausted`/
-/// `no_eligible_account`). `unknown` means configured but not observed; it
-/// is not a live-health claim. Filters are exact (see [`ModelsQuery`]);
-/// unknown provider/profile/model values are validation errors.
+/// `revision` is the exact-byte SHA-256 of the cached, immutable `config`;
+/// role files are read once and digested into `roles_sha256`. Every mutable
+/// fact — registry status, samples, exhaustion latches, and the advertised
+/// `capacity_revision` — comes from ONE committed read transaction, so a
+/// registry or quota change between reads can never be mixed into one
+/// result. `ranked_at` is the advice clock the standing was evaluated at,
+/// not a sample age; each offering's `quota` carries `status`,
+/// `best_priority`, `evidence` (`fresh`/`stale`/`missing`),
+/// `newest_observed_at` (sample age), and `exhausted_until`. Providers are
+/// ranked over exactly the offerings the filters retain (see
+/// [`provider_ranking::provider_order_filtered_at`]), so a removed offering
+/// never lends its score. Filters are exact (see [`ModelsQuery`]); unknown
+/// provider/profile/model values are validation errors.
 pub fn models(
     home: &Path,
     config: &ProviderConfig,
     revision: &str,
     query: &ModelsQuery,
 ) -> Result<Value> {
+    models_between(home, config, revision, query, &mut || {})
+}
+
+/// [`models`] with a hook between the registry read and the quota read of
+/// its one transaction (feature `test-fixtures`): a test seam proving a
+/// concurrent registry or quota commit there cannot mix into the result.
+#[cfg(feature = "test-fixtures")]
+pub fn models_observed(
+    home: &Path,
+    config: &ProviderConfig,
+    revision: &str,
+    query: &ModelsQuery,
+    between_reads: &mut dyn FnMut(),
+) -> Result<Value> {
+    models_between(home, config, revision, query, between_reads)
+}
+
+/// Shared body of [`models`]; `between_reads` runs after the registry read
+/// and before the quota read, inside the same read transaction.
+fn models_between(
+    home: &Path,
+    config: &ProviderConfig,
+    revision: &str,
+    query: &ModelsQuery,
+    between_reads: &mut dyn FnMut(),
+) -> Result<Value> {
     let store = Store::open(home)?;
+    // One committed read: registry, samples, latches and revision together.
+    let _read = store.conn.unchecked_transaction()?;
     let catalog = resolve(config, &store)?;
     if let Some(provider) = &query.provider {
         if catalog.provider(&provider.parse()?).is_none() {
@@ -137,13 +167,6 @@ pub fn models(
         }
     }
     check_model(&catalog, query.model.as_deref())?;
-    let order = provider_ranking::provider_order_for_model_at(
-        &store,
-        &catalog,
-        &BTreeSet::new(),
-        query.model.as_deref(),
-        crate::domain::now(),
-    )?;
     let any = catalog
         .providers()
         .iter()
@@ -183,15 +206,30 @@ pub fn models(
             Err(_) => profiles_out.push(json!({"name": name, "canonical": false})),
         }
     }
-    let mut providers = Vec::new();
-    for entry in &order.providers {
-        if query
+    between_reads();
+    let keep = |definition: &ProviderDefinition, offering: &ProviderModel| {
+        query
             .provider
             .as_deref()
-            .is_some_and(|wanted| wanted != entry.provider.as_str())
-        {
-            continue;
-        }
+            .is_none_or(|wanted| wanted == definition.id.as_str())
+            && query
+                .model
+                .as_deref()
+                .is_none_or(|wanted| wanted == offering.id)
+            && (query.profile.is_none()
+                || roles
+                    .iter()
+                    .all(|role| admissible(config, definition, offering, role)))
+    };
+    let order = provider_ranking::provider_order_filtered_at(
+        &store,
+        &catalog,
+        &BTreeSet::new(),
+        &keep,
+        crate::domain::now(),
+    )?;
+    let mut providers = Vec::new();
+    for entry in &order.providers {
         let definition = catalog
             .provider(&entry.provider)
             .ok_or_else(|| invalid("provider order names an unknown provider"))?;
@@ -207,9 +245,6 @@ pub fn models(
                 .filter(|role| admissible(config, definition, offering, role))
                 .map(|role| role.name.as_str())
                 .collect();
-            if query.profile.is_some() && admissible.is_empty() {
-                continue;
-            }
             models.push(json!({
                 "model": offering.id,
                 "native_model": offering.native_model,
@@ -218,11 +253,8 @@ pub fn models(
                 "restrictions": offering.restrictions,
                 "recommendations": offering.recommendations,
                 "profiles": admissible,
-                "quota": {"status": standing.status, "best_priority": standing.best_priority},
+                "quota": quota(standing),
             }));
-        }
-        if models.is_empty() {
-            continue;
         }
         providers.push(json!({
             "provider": definition.id,
@@ -240,19 +272,31 @@ pub fn models(
         "schema_version": 2,
         "config_revision": revision,
         "capacity_revision": order.capacity_revision,
-        "observed_at": order.observed_at,
+        "ranked_at": order.observed_at,
         "roles_sha256": agent_run_domain::canonical::sha256_hex(&json!(profiles_out), true),
         "profiles": profiles_out,
         "providers": providers,
     }))
 }
 
+/// Renders one offering's cached standing without any account identity.
+fn quota(standing: &provider_ranking::ProviderModelOrder) -> Value {
+    json!({
+        "status": standing.status,
+        "best_priority": standing.best_priority,
+        "evidence": standing.evidence,
+        "newest_observed_at": standing.newest_observed_at,
+        "exhausted_until": standing.exhausted_until,
+    })
+}
+
 /// The public provider-only capacity order for one config revision.
 ///
 /// Providers, never provider/account pairs, in descending score with each
-/// offered model's own status and best priority; with `query.model` only
-/// providers offering that model appear, ranked by that model. Carries the
-/// `config_revision` and committed `capacity_revision` of its one read.
+/// offered model's own standing (as in [`models`]); with `query.model` only
+/// providers offering that model appear, ranked by that model. Registry and
+/// quota facts and the advertised `capacity_revision` come from one
+/// committed read; `ranked_at` is the advice clock.
 pub fn order(
     home: &Path,
     config: &ProviderConfig,
@@ -260,20 +304,42 @@ pub fn order(
     query: &CapacityOrderQuery,
 ) -> Result<Value> {
     let store = Store::open(home)?;
+    let _read = store.conn.unchecked_transaction()?;
     let catalog = resolve(config, &store)?;
     check_model(&catalog, query.model.as_deref())?;
-    let order = provider_ranking::provider_order_for_model_at(
+    let order = provider_ranking::provider_order_filtered_at(
         &store,
         &catalog,
         &BTreeSet::new(),
-        query.model.as_deref(),
+        &|_, offering| {
+            query
+                .model
+                .as_deref()
+                .is_none_or(|wanted| wanted == offering.id)
+        },
         crate::domain::now(),
     )?;
+    let providers: Vec<Value> = order
+        .providers
+        .iter()
+        .map(|entry| {
+            json!({
+                "provider": entry.provider,
+                "priority_multiplier": entry.priority_multiplier,
+                "score": entry.score,
+                "models": entry.models.iter().map(|standing| json!({
+                    "model": standing.model,
+                    "native_model": standing.native_model,
+                    "quota": quota(standing),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     Ok(json!({
         "schema_version": 2,
         "config_revision": revision,
         "capacity_revision": order.capacity_revision,
-        "observed_at": order.observed_at,
-        "providers": order.providers,
+        "ranked_at": order.observed_at,
+        "providers": providers,
     }))
 }
