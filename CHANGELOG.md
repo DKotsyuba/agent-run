@@ -4,6 +4,23 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-23
+
+- feat!: schema-2 provider configuration; public `start` takes an explicit
+  provider and model, resolves accounts from the registry, and ranks them from
+  account-scoped quota observations. A schema-1 home must run the one-time
+  paired `config migrate` (state schema 16 to 17) before any other command
+- feat: explicit provider resume continues the recorded native session as a
+  new logical child; an authoritative quota exhaustion switches a Codex run to
+  another account within the same logical run (Claude Code and custom
+  gateways refuse cross-account continuation)
+- feat: one enforced overall run deadline, handoff checks serialized with
+  cancellation, and proof-gated recovery of orphaned provider attempts
+- fix: quota pools are matched to models through recorded per-window
+  membership rather than pool names
+- 0.13.0 publishes a native artifact only for macOS Apple silicon; Linux
+  x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.12.5] - 2026-09-22
 
 - fix(mcp): replace Desktop-launched MCP with the supplied signed Node frontend,
