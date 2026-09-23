@@ -676,7 +676,6 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
         let order = service
             .capacity_order(CapacityOrderQuery {
                 model: Some(model.into()),
-                ..Default::default()
             })
             .unwrap();
         order["providers"][0]["models"][0]["quota"]["status"]
