@@ -552,3 +552,86 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
     )
     .is_err());
 }
+
+/// Provider (schema-2) Claude-shaped routes, native and custom gateway,
+/// seal the harness plugin set with the frozen assets: an explicit native
+/// resume plans exactly the first launch's ordered `--plugin-dir` paths,
+/// and a modified sealed launch record is refused before any plan.
+#[test]
+fn provider_claude_routes_resume_with_sealed_plugin_directories() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let mut config = config(root, &fake_engine(root));
+    let plugin = root.join("external-plugin");
+    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        r#"{"name":"external","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    config
+        .harnesses
+        .get_mut(&agent_run_domain::HarnessId::ClaudeCode)
+        .unwrap()
+        .plugins = vec![plugin.clone()];
+    let catalog = catalog(&config);
+    let role = role(root, false);
+    let host = BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]);
+    let dirs = |plan: &agent_run_adapters::provider::ProviderLaunchPlan| -> Vec<String> {
+        plan.launch
+            .args
+            .windows(2)
+            .filter(|pair| pair[0] == "--plugin-dir")
+            .map(|pair| pair[1].clone())
+            .collect()
+    };
+    for (provider, model, account) in [
+        ("glm-any", "glm", "acct-glm"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let provider: ProviderId = provider.parse().unwrap();
+        let account = account.parse().unwrap();
+        let run_home = root.join(format!("{provider}-run"));
+        let (_, digest) = materialize_selected(
+            &config, &catalog, &provider, model, &account, &role, root, &run_home, root,
+        )
+        .unwrap();
+        let authority = make_authority(
+            &catalog,
+            &provider,
+            model,
+            &role,
+            root,
+            digest,
+            account.as_str(),
+        );
+        let plan = |session: Option<&str>| {
+            plan_selected(
+                &config,
+                &catalog,
+                &authority,
+                &account,
+                &run_home,
+                root,
+                &host,
+                &FakeReader,
+                "task",
+                session,
+            )
+        };
+        let first = plan(None).unwrap();
+        let resumed = plan(Some("saved")).unwrap();
+        assert_eq!(
+            dirs(&first),
+            [plugin.to_string_lossy().into_owned()],
+            "{provider}"
+        );
+        assert_eq!(dirs(&resumed), dirs(&first), "{provider}");
+        let sealed = run_home.join("provider-launch.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sealed).unwrap()).unwrap();
+        record["plugin_paths"] = serde_json::json!([]);
+        fs::write(&sealed, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(plan(Some("saved")).is_err(), "{provider}: tampered seal");
+    }
+}

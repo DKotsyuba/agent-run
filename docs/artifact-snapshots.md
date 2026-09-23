@@ -66,7 +66,21 @@ adapter-known flat config files, declared credential-link paths and targets,
 and the materialization revision; resume requires its stored SHA-256, revision,
 and every referenced artifact to match. `inspect_config_snapshot()` likewise reads the attempt's
 configuration metadata as a no-follow regular file, checks its recorded hash,
-and requires canonical version-one JSON before reuse. Persisted revisions,
+and requires canonical version-one JSON before reuse.
+
+For legacy (schema-1) Claude and GLM homes, the index also hashes
+`.agent-run-plugin-launch.json`, which records the ordered `--plugin-dir`
+paths and plugin-name roots used by the first launch. A continuation reads
+these values only after index verification; a modified file, or one present
+without being indexed, is refused. Older verified homes without this file
+reconstruct the paths from their stored launch runtime and profile (never
+current configuration); unavailable legacy plugin sources fail the
+continuation with an integrity error rather than silently dropping plugin
+flags. Provider (schema-2) homes seal the same ordered plugin paths in their
+indexed `provider-launch.json`, which every attempt, initial or resumed,
+launches from.
+
+Persisted revisions,
 snapshot manifests, and replay fingerprints hash one shared serialization
 (`agent-run-domain::canonical`): sorted keys, `,`/`:` separators, and
 CPython-compatible string escaping and float rendering, with `ensure_ascii`
