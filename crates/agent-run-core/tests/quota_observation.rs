@@ -12,8 +12,9 @@ fn account() -> AccountId {
     AccountId::from_str("acct-main").unwrap()
 }
 
-/// Registers the fixture account so persisted facts satisfy the registry FK.
-fn registered(home: &std::path::Path) {
+/// Registers the fixture account so persisted facts satisfy the registry FK,
+/// returning the capacity revision that registration committed.
+fn registered(home: &std::path::Path) -> i64 {
     let mut store = agent_run_store::Store::open(home).unwrap();
     store
         .register_account(&AccountRecord {
@@ -23,6 +24,7 @@ fn registered(home: &std::path::Path) {
             status: AccountStatus::Enabled,
         })
         .unwrap();
+    store.quota_capacity_revision().unwrap()
 }
 
 /// One configured GLM-like scope with two explicit models and a stable
@@ -167,7 +169,7 @@ fn latest(home: &Path) -> (Option<f64>, Option<f64>, f64) {
 fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
-    registered(home.path());
+    let base = registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -175,7 +177,7 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     }))
     .unwrap();
     let r1 = record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1500.0).unwrap();
-    assert_eq!(r1, 1);
+    assert_eq!(r1, base + 1);
     assert_eq!(
         latch_rows(home.path()),
         1,
@@ -414,7 +416,7 @@ fn exhaustion_latch_survives_a_collector_source_change() {
 fn shared_pool_windows_persist_once_with_full_membership() {
     let home = tempdir().unwrap();
     agent_run_store::Store::initialize(home.path()).unwrap();
-    registered(home.path());
+    let base = registered(home.path());
     let shared = normalize(&json!({
         "version": 1,
         "windows": [
@@ -426,7 +428,7 @@ fn shared_pool_windows_persist_once_with_full_membership() {
     }))
     .unwrap();
     let revision = record_quota_snapshot(home.path(), "glm", &shared, 100, 1500.0).unwrap();
-    assert_eq!(revision, 1);
+    assert_eq!(revision, base + 1);
     let store = agent_run_store::Store::open(home.path()).unwrap();
     let rows: i64 = store
         .conn

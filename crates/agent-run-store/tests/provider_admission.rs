@@ -183,13 +183,15 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
         .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
+    // Registration advanced the committed revision; candidates carry it.
+    let revision = store.quota_capacity_revision().unwrap();
     let admitted = store
         .admit_provider(
             &request,
             &effective,
             &catalog,
             &authority,
-            &candidates(0, &ordered),
+            &candidates(revision, &ordered),
             &frozen_identity,
             2,
             None,
@@ -198,7 +200,7 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
         .unwrap();
     assert!(admitted.created);
     assert_eq!(admitted.account_id.as_str(), "acct-a");
-    assert_eq!(store.quota_capacity_revision().unwrap(), 1);
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision + 1);
     let facts: (String, String, i64) = store.conn.query_row(
         "SELECT a.selection_intent,k.quota_key,t.ownership_active FROM agents a \
          JOIN attempts t ON t.agent_id=a.id JOIN attempt_quota_keys k ON k.attempt_id=t.id WHERE a.id=?",
@@ -223,7 +225,7 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
     alias_request.provider = "glm-alias".parse().unwrap();
     let mut alias_authority = authority.clone();
     alias_authority.provider = alias_request.provider.clone();
-    let mut alias_candidates = candidates(1, &[("acct-a", 0)]);
+    let mut alias_candidates = candidates(revision + 1, &[("acct-a", 0)]);
     alias_candidates.provider = alias_request.provider.clone();
     let alias = store
         .admit_provider(
@@ -239,7 +241,7 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
         )
         .unwrap();
     assert_eq!(alias.account_id.as_str(), "acct-a");
-    assert_eq!(store.quota_capacity_revision().unwrap(), 2);
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision + 2);
     assert_eq!(
         store
             .active_reservation_counts(&[
@@ -255,7 +257,7 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
             &effective,
             &catalog,
             &authority,
-            &candidates(0, &ordered),
+            &candidates(revision, &ordered),
             &frozen_identity,
             1,
             None,
@@ -265,13 +267,14 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
     assert!(!replay.created);
     assert_eq!(replay.attempt_id, admitted.attempt_id);
     let next = provider_request(home.path(), "req-two");
+    let current = store.quota_capacity_revision().unwrap();
     let cap = store
         .admit_provider(
             &next,
             &next.storage_projection(),
             &catalog,
             &authority,
-            &candidates(2, &[("acct-b", 0)]),
+            &candidates(current, &[("acct-b", 0)]),
             &identity(&next, &authority),
             1,
             None,
@@ -290,6 +293,7 @@ fn filters_invalid_candidates_before_rank_tie_break() {
     let catalog = catalog(&store);
     let request = provider_request(home.path(), "filtered");
     let authority = authority(&catalog, home.path());
+    let revision = store.quota_capacity_revision().unwrap();
     let admitted = store
         .admit_provider(
             &request,
@@ -297,7 +301,7 @@ fn filters_invalid_candidates_before_rank_tie_break() {
             &catalog,
             &authority,
             &candidates(
-                0,
+                revision,
                 &[
                     ("acct-disabled", 0),
                     ("acct-ineligible", 0),
@@ -323,13 +327,14 @@ fn harness_cap_covers_provider_aliases() {
     let catalog = catalog(&store);
     let first = provider_request(home.path(), "first");
     let first_authority = authority(&catalog, home.path());
+    let revision = store.quota_capacity_revision().unwrap();
     store
         .admit_provider(
             &first,
             &first.storage_projection(),
             &catalog,
             &first_authority,
-            &candidates(0, &[("acct-a", 0)]),
+            &candidates(revision, &[("acct-a", 0)]),
             &identity(&first, &first_authority),
             2,
             Some(1),
@@ -340,7 +345,7 @@ fn harness_cap_covers_provider_aliases() {
     alias.provider = "glm-alias".parse().unwrap();
     let mut alias_authority = first_authority;
     alias_authority.provider = alias.provider.clone();
-    let mut alias_candidates = candidates(1, &[("acct-a", 0)]);
+    let mut alias_candidates = candidates(revision + 1, &[("acct-a", 0)]);
     alias_candidates.provider = alias.provider.clone();
     let refusal = store
         .admit_provider(
@@ -356,7 +361,7 @@ fn harness_cap_covers_provider_aliases() {
         )
         .unwrap_err();
     assert!(matches!(refusal, Error::Capacity));
-    assert_eq!(store.quota_capacity_revision().unwrap(), 1);
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision + 1);
 }
 
 /// Two independent store connections cannot both commit against one global
@@ -376,13 +381,14 @@ fn concurrent_provider_admissions_share_one_committed_revision() {
         workers.push(std::thread::spawn(move || {
             let mut store = Store::open(&path).unwrap();
             let request = provider_request(&path, suffix);
+            let revision = store.quota_capacity_revision().unwrap();
             barrier.wait();
             store.admit_provider(
                 &request,
                 &request.storage_projection(),
                 &catalog,
                 &authority,
-                &candidates(0, &[("acct-a", 0)]),
+                &candidates(revision, &[("acct-a", 0)]),
                 &identity(&request, &authority),
                 2,
                 None,

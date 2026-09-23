@@ -97,3 +97,24 @@ fn registry_keeps_global_identity_and_reference_metadata() {
         .is_err());
     assert_eq!(store.list_accounts().unwrap().len(), 5);
 }
+
+/// Every registry mutation advances the quota capacity revision in its own
+/// transaction, so advice computed before a registration or disable is stale.
+#[test]
+fn registry_mutations_advance_the_capacity_revision() {
+    let home = tempfile::tempdir().unwrap();
+    let mut store = Store::initialize(home.path()).unwrap();
+    let before = store.quota_capacity_revision().unwrap();
+    store
+        .register_account(&record("acct-rev", "anthropic", "env:FAKE_REV_TOKEN"))
+        .unwrap();
+    let registered = store.quota_capacity_revision().unwrap();
+    assert!(registered > before);
+    store.disable_account(&"acct-rev".parse().unwrap()).unwrap();
+    let disabled = store.quota_capacity_revision().unwrap();
+    assert!(disabled > registered);
+    assert!(store
+        .disable_account(&"acct-missing".parse().unwrap())
+        .is_err());
+    assert_eq!(store.quota_capacity_revision().unwrap(), disabled);
+}

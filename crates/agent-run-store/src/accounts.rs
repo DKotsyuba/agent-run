@@ -26,7 +26,10 @@ impl Store {
     /// reference. Neither credentials nor provider-local labels are stored.
     ///
     /// Duplicate ids or canonical auth-family/reference identities fail
-    /// without changing previous rows.
+    /// without changing previous rows. A successful registration advances
+    /// the quota capacity revision in the same transaction, so advice
+    /// computed before it (`models`, `capacity_order`, candidate sets) is
+    /// visibly stale.
     pub fn register_account(&mut self, record: &AccountRecord) -> Result<()> {
         if !CredentialRef::from_secret(&record.secret_ref)?.matches_family(&record.auth_family) {
             return Err(invalid("native credential family does not match account"));
@@ -46,7 +49,10 @@ impl Store {
             ],
         );
         match result {
-            Ok(_) => tx.commit()?,
+            Ok(_) => {
+                Store::advance_quota_capacity_revision(&tx)?;
+                tx.commit()?
+            }
             Err(error)
                 if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) =>
             {
@@ -86,14 +92,23 @@ impl Store {
 
     /// Disables future selection for an existing account without deleting
     /// its reference, reservations, attempts, or historical messages.
+    ///
+    /// The status change and a quota capacity revision advance commit in one
+    /// transaction, so availability can never change under an unchanged
+    /// advertised revision. An unknown id changes nothing.
     pub fn disable_account(&mut self, id: &AccountId) -> Result<()> {
-        let changed = self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE provider_accounts SET status='disabled',updated_at=? WHERE account_id=?",
             params![agent_run_domain::domain::now(), id.as_str()],
         )?;
         if changed == 0 {
             return Err(invalid("account is not registered"));
         }
+        Store::advance_quota_capacity_revision(&tx)?;
+        tx.commit()?;
         Ok(())
     }
 }

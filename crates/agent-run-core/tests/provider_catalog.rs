@@ -529,10 +529,9 @@ fn registry_and_quota_come_from_one_committed_read() {
         &ModelsQuery::default(),
         &mut || {
             let mut store = agent_run_store::Store::open(root).unwrap();
+            // Disabling advances the capacity revision in its own
+            // transaction; no separate collector round is needed.
             store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
-            let tx = store.conn.transaction().unwrap();
-            agent_run_store::Store::advance_quota_capacity_revision(&tx).unwrap();
-            tx.commit().unwrap();
         },
     )
     .unwrap();

@@ -158,6 +158,15 @@ fn request(home: &Path) -> ProviderStartRequest {
     .unwrap()
 }
 
+/// Returns the committed quota capacity revision; account registration in
+/// the fixture home has already advanced it.
+fn committed(home: &Path) -> i64 {
+    Store::open(home)
+        .unwrap()
+        .quota_capacity_revision()
+        .unwrap()
+}
+
 /// Supplies the fixed trusted candidate; user request JSON has no candidate
 /// field and the store rechecks this revision under BEGIN IMMEDIATE.
 fn candidates(revision: i64) -> QuotaCandidateSet {
@@ -187,7 +196,7 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     let service = Service::new(home.clone());
     let request = request(&home);
     let admitted = service
-        .admit_provider_trusted(request.clone(), candidates(0))
+        .admit_provider_trusted(request.clone(), candidates(committed(&home)))
         .unwrap();
     assert_eq!(admitted["created"], true);
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
@@ -256,7 +265,7 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
         .unwrap();
     assert_eq!(deliveries, 1);
     let replay = service
-        .admit_provider_trusted(request, candidates(0))
+        .admit_provider_trusted(request, candidates(committed(&home)))
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
@@ -271,7 +280,7 @@ async fn provider_auto_start_uses_trusted_candidate_and_completes() {
     let mut request = request(&home);
     request.account = None;
     request.request_id = Some("provider-auto".into());
-    let mut selected = candidates(0);
+    let mut selected = candidates(committed(&home));
     selected.intent = SelectionIntent::Auto;
     let admitted = service.admit_provider_trusted(request, selected).unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
@@ -300,7 +309,7 @@ async fn provider_cancel_before_spawn_releases_only_its_attempt() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(0))
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     Store::open(&home)
@@ -332,7 +341,7 @@ async fn provider_supervisor_refuses_tampered_role_authority() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(0))
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let store = Store::open(&home).unwrap();
@@ -372,7 +381,7 @@ async fn provider_supervisor_refuses_tampered_config_snapshot() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(0))
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let store = Store::open(&home).unwrap();
@@ -422,7 +431,7 @@ async fn provider_spawn_error_closes_owned_attempt_without_process() {
     .unwrap();
     let service = Service::new(home.clone());
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(0))
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let mut child = supervisor(&home, &id);
@@ -455,7 +464,7 @@ async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
     fs::write(home.join("fixture-supervisor-spawn-error"), "").unwrap();
     let service = Service::new(home.clone());
     let result = service
-        .start_provider_trusted(request(&home), candidates(0))
+        .start_provider_trusted(request(&home), candidates(committed(&home)))
         .await
         .unwrap();
     assert_eq!(result["created"], true);
@@ -872,7 +881,7 @@ async fn provider_resume_continues_the_proven_native_session() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(0))
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
@@ -1046,7 +1055,7 @@ async fn provider_resume_honors_new_model_restrictions() {
     let provider = original.provider.to_string();
     let model = original.model.clone();
     let admitted = service
-        .admit_provider_trusted(original, candidates(0))
+        .admit_provider_trusted(original, candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
@@ -1098,7 +1107,7 @@ async fn concurrent_provider_resumes_admit_one_child() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
     let admitted = service
-        .admit_provider_trusted(request(&home), candidates(0))
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;

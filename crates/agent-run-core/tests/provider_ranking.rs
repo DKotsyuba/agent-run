@@ -220,7 +220,10 @@ fn known_scores_weight_and_order_before_unknown() {
             ("acct-c".into(), 2, 100.0, false),
         ]
     );
-    assert_eq!(set.capacity_revision, 0);
+    assert_eq!(
+        set.capacity_revision,
+        store.quota_capacity_revision().unwrap()
+    );
     assert_eq!(set.intent, SelectionIntent::Auto);
     let key = PhysicalQuotaKey::new(&"acct-a".parse().unwrap(), "fixture").unwrap();
     assert_eq!(set.candidates[0].physical_keys, vec![key]);
@@ -479,7 +482,7 @@ fn equal_priorities_share_rank_and_output_is_row_order_independent() {
     .unwrap();
     let after = candidates(&busy, &busy_catalog, "fixture");
     assert_eq!(summary(&after), summary(&before));
-    assert_eq!(after.capacity_revision, 1);
+    assert_eq!(after.capacity_revision, before.capacity_revision + 1);
 }
 
 /// Pinning resolves one provider-local label to one global account without
@@ -672,7 +675,10 @@ fn producing_candidates_is_read_only_and_revision_consistent() {
         )
         .unwrap();
     assert_eq!(admitted.account_id.as_str(), "acct-a");
-    assert_eq!(store.quota_capacity_revision().unwrap(), 1);
+    assert_eq!(
+        store.quota_capacity_revision().unwrap(),
+        set.capacity_revision + 1
+    );
     let second = provider_request(home.path(), "ranked-two");
     let stale = store
         .admit_provider(
@@ -695,7 +701,7 @@ fn producing_candidates_is_read_only_and_revision_consistent() {
         "{stale:?}"
     );
     let refreshed = candidates(&store, &catalog, "fixture");
-    assert_eq!(refreshed.capacity_revision, 1);
+    assert_eq!(refreshed.capacity_revision, set.capacity_revision + 1);
 }
 
 /// Invalid input, overflow, malformed, future, and conflicting alias

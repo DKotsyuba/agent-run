@@ -857,6 +857,8 @@ async fn collector_output_persists_through_the_quota_store_path() {
             status: agent_run_domain::catalog::AccountStatus::Enabled,
         })
         .unwrap();
+    // Registration itself advanced the committed capacity revision.
+    let base = store.quota_capacity_revision().unwrap();
     let script = CollectorScript::new(
         r#"
 collect = function(ctx)
@@ -886,5 +888,5 @@ end
         1500.0,
     )
     .unwrap();
-    assert_eq!(revision, 1);
+    assert_eq!(revision, base + 1);
 }

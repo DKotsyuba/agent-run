@@ -802,9 +802,12 @@ pub fn provider_order_filtered_at(
             continue;
         }
         let best = available.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        // The multiplier is any positive finite value, so the product itself
+        // can overflow; it saturates at the largest finite score so the
+        // order and its JSON stay representable.
         let score = best
             .is_finite()
-            .then(|| best * definition.priority_multiplier.get());
+            .then(|| (best * definition.priority_multiplier.get()).min(f64::MAX));
         providers.push(ProviderOrderEntry {
             provider: definition.id.clone(),
             priority_multiplier: definition.priority_multiplier.get(),
