@@ -26,7 +26,13 @@ unregistered/incompatible account references refuse rather than silently
 change selection. Old auth declarations or differing stable harness settings
 produce manual-review markers without copying secret values.
 
-This is the independent planning boundary. Public `--apply`, legacy launch
-cutover, backup publication, and adapter/session dispatch wait for the
-remaining real consumers. Schema v17 and historical sealed blobs remain
-untouched by this API.
+The public `agent-run config migrate --mapping <file> --dry-run` uses this
+planner and reports the current database schema without changing the home.
+`--apply` requires the verified installed release, explicit acknowledgement
+of every `manual_review` marker, a stopped broker, and no active agents. It
+seals the original config and database before migrating the staged copy to
+schema 17, then publishes the v2 pair under a journal. Ordinary commands
+refuse an older or interrupted home. `agent-run config rollback --snapshot
+<dir>` restores the verified v1 pair only if no later writes have changed it.
+The exact commands, refusal rules, and recovery sequence are in the embedded
+[`migrations` operator guide](../assets/operator_guide/migrations.md).
