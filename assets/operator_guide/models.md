@@ -43,7 +43,10 @@ files can change without a config edit.
 
 `models` lists, per provider (in capacity order): `harness`, connection
 `kind`/`protocol`, `auth_family`, `limits_source`, `priority_multiplier`,
-`score`, provider `recommendations`, and every explicit offering with its
+`score` (best available priority times the multiplier, saturating at the
+largest finite double, or `null` when nothing is available; equal scores
+order by status, then provider id), provider `recommendations`, and every
+explicit offering with its
 `native_model`, default `params`, `allowed_params` (for example efforts; a
 chosen `effort` outside the list is refused at start and resume),
 hard `restrictions`, model `recommendations`, the canonical `profiles`

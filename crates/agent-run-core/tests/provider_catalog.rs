@@ -557,3 +557,75 @@ fn registry_and_quota_come_from_one_committed_read() {
         .unwrap();
     assert_eq!(glm["models"][0]["quota"]["status"], "no_eligible_account");
 }
+
+/// A provider score is the best priority times an unrestricted positive
+/// finite multiplier; when that product overflows it saturates at
+/// `f64::MAX`, so the public order stays finite JSON (never `null`, NaN or
+/// infinity). Saturated providers tie and fall back to the deterministic
+/// status/provider-id order; a saturated score still outranks a finite one.
+#[tokio::test]
+async fn overflowing_provider_scores_saturate_in_the_public_order() {
+    let temp = ranking_home();
+    let root = temp.path();
+    let path = root.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    let huge = config.replace(
+        "limits_source = \"none\"\n",
+        "limits_source = \"none\"\npriority_multiplier = 1.7976931348623157e308\n",
+    );
+    assert_ne!(huge, config);
+    fs::write(&path, &huge).unwrap();
+    let service = Service::new(root.to_path_buf());
+    let scores = |order: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+        order["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["provider"].as_str().unwrap().to_owned(),
+                    entry["score"].clone(),
+                )
+            })
+            .collect()
+    };
+    let order = service
+        .capacity_order(CapacityOrderQuery::default())
+        .unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&order.to_string()).unwrap();
+    assert_eq!(
+        scores(&wire),
+        vec![
+            ("a".to_owned(), serde_json::json!(f64::MAX)),
+            ("b".to_owned(), serde_json::json!(f64::MAX))
+        ],
+        "{wire}"
+    );
+    assert_eq!(
+        scores(
+            &service
+                .capacity_order(CapacityOrderQuery::default())
+                .unwrap()
+        ),
+        scores(&wire),
+        "deterministic"
+    );
+    // Only `b` overflows: its saturated score outranks `a`'s finite one.
+    let mixed = config.replacen(
+        "[providers.b]\nharness = \"claude-code\"",
+        "[providers.b]\npriority_multiplier = 1.7976931348623157e308\nharness = \"claude-code\"",
+        1,
+    );
+    assert_ne!(mixed, config);
+    fs::write(&path, &mixed).unwrap();
+    let order = service
+        .capacity_order(CapacityOrderQuery::default())
+        .unwrap();
+    let listed = scores(&order);
+    assert_eq!(
+        listed[0],
+        ("b".to_owned(), serde_json::json!(f64::MAX)),
+        "{order}"
+    );
+    assert!(listed[1].1.as_f64().is_some_and(f64::is_finite), "{order}");
+}
