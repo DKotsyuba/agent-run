@@ -1371,10 +1371,7 @@ async fn custom_scripts_bind_to_their_full_source_identity() {
     // polling round left behind.
     let file_c = root.path().join("c.lua");
     std::fs::write(&file_c, "collect = ").unwrap();
-    let identity = format!(
-        "team_quota\n{}",
-        std::fs::canonicalize(&file_c).unwrap().display()
-    );
+    let identity = format!("team_quota\n{}", file_c.display());
     let digest: String = Sha256::digest(identity.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1398,4 +1395,37 @@ async fn custom_scripts_bind_to_their_full_source_identity() {
         report["results"][0]["issues"][0],
         "quota_collector_output_invalid_collector_script_unavailable"
     );
+}
+
+/// A configured symlink keeps its retained script when its target disappears,
+/// then accepts a valid replacement at the same configured path.
+#[tokio::test]
+async fn custom_script_symlink_retains_identity_across_missing_target() {
+    let root = tempdir().unwrap();
+    let real = root.path().join("real.lua");
+    let alias = root.path().join("alias.lua");
+    std::fs::write(&real, custom_script(44)).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let home = tempdir().unwrap();
+    custom_round(home.path(), "acct-alias", &alias).await;
+    assert_eq!(stored(home.path(), "acct-alias")[0].2, Some(44.0));
+    std::fs::remove_file(&real).unwrap();
+    let missing = custom_round(home.path(), "acct-alias", &alias).await;
+    assert_eq!(missing["results"][0]["status"], "collected", "{missing}");
+    assert_eq!(stored(home.path(), "acct-alias")[0].2, Some(44.0));
+    std::fs::write(&real, custom_script(55)).unwrap();
+    let replacement = custom_round(home.path(), "acct-alias", &alias).await;
+    assert_eq!(
+        replacement["results"][0]["status"], "collected",
+        "{replacement}"
+    );
+    let latest: Option<f64> = Connection::open(home.path().join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT remaining_percent FROM capacity_samples WHERE account_id='acct-alias' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(latest, Some(55.0));
 }

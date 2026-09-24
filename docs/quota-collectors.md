@@ -133,8 +133,9 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   identity surfaces as the typed `collector_unknown` round failure, and a
   first-party identity cannot be overridden by a script file. Custom
   scripts install through the retained-script registry under their
-  complete source identity — script id plus canonical script file — so two
-  configurations reusing one id never share code. The file is read through
+  complete source identity — script id plus the configured absolute path — so
+  two configurations reusing one id never share code. The path spelling stays
+  stable while a symlink target is missing or replaced. The file is read through
   a 256 KiB bound (never allocating past it); a replacement is installed
   only when it verifies and compiles, and each accepted revision is also
   kept at `capacity/scripts/<sha256(identity)>.lua`, so a missing,
