@@ -10,6 +10,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - fix(supervisor): record bounded cleanup failures and route supervisor errors to their component log without persisting task text or credentials
 - fix(delivery): use schema-2 retry policy after migration so a claimed notice reaches a durable result instead of repeating a validation failure
 - fix(transcript): redact launch credentials across Claude and Codex text fragments, tool output, native event diagnostics, and sealed answers before persistence
+- fix(transcript): preserve nonsecret streamed text, flush pending Codex fragments on terminal turns, and redact failures before truncation
 - fix(config): apply offered model effort defaults to the frozen launch while preserving caller replay intent; reject unsupported model parameter keys
 - fix(auth): refuse provider login selectors that ambiguously name one account label and another account id
 - fix(doctor): detect schema-2 provider bindings that cannot resolve against the registered accounts without mutating state

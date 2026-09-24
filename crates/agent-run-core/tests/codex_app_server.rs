@@ -319,6 +319,46 @@ async fn first_codex_delta_is_journaled_on_arrival() {
     process.reap().await;
 }
 
+/// A terminal turn flushes withheld safe text even without item/completed.
+#[tokio::test]
+async fn terminal_turn_keeps_redactor_tail_without_item_completion() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    request.validate().unwrap();
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let record = store.get(&id).unwrap();
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut plan = lone_delta_plan();
+    plan.environment
+        .insert("SERVICE_TOKEN".into(), "synthetic-secret".into());
+    let mut process = Process::spawn(&plan).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    let transcript = store.transcript(&id, 0, 10).unwrap();
+    assert!(transcript["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| { message["role"] == "assistant" && message["content"] == "Hello" }));
+    drop(process.input.take());
+    process.reap().await;
+}
+
 // Mirrors `tests/test_codex_app_server.py::StartSessionTests::test_refuses_when_effective_params_drift`
 #[test]
 fn python_test_codex_app_server_start_refuses_effective_drift() {
@@ -457,4 +497,48 @@ async fn codex_turn_errors_cross_the_runner_boundary_typed() {
         drop(process.input.take());
         process.reap().await;
     }
+}
+
+/// Failure diagnostics redact the complete known token before bounding the
+/// exported text, even when the token crosses the character limit.
+#[tokio::test]
+async fn codex_failure_redacts_before_truncating() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    request.validate().unwrap();
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let record = store.get(&id).unwrap();
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut plan = fake_plan();
+    plan.environment
+        .insert("AGENT_RUN_PROVIDER_TOKEN".into(), "synthetic-secret".into());
+    let message = format!("{}synthetic-secret", "x".repeat(505));
+    let replacement = format!(
+        r#""status":"failed","error":{{"message":"{message}","codexErrorInfo":"other"}},"items":[]"#
+    );
+    let script = plan.args[1].replace(r#""status":"completed","items":[]"#, &replacement);
+    assert_ne!(script, plan.args[1]);
+    plan.args[1] = script;
+    let mut process = Process::spawn(&plan).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .unwrap();
+    let failure = result.outcome.failure_text.unwrap();
+    assert!(!failure.contains("synthet"));
+    assert!(failure.chars().count() <= 512);
+    drop(process.input.take());
+    process.reap().await;
 }

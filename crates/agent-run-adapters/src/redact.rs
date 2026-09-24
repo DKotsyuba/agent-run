@@ -95,7 +95,8 @@ pub struct StreamingRedactor {
 
 impl StreamingRedactor {
     /// Adds the next UTF-8 fragment and returns only text safe to persist now.
-    /// A possible secret prefix remains buffered until more input or `finish`.
+    /// A possible secret prefix remains buffered until more input or `finish`;
+    /// fragment text is never parsed as a complete JSON document.
     pub fn feed(&mut self, fragment: &str) -> String {
         if self.redactor.literals.is_empty() {
             return self.redactor.redact(fragment);
@@ -133,12 +134,12 @@ impl StreamingRedactor {
             }
         }
         self.pending = raw[cursor..].to_owned();
-        self.redactor.redact(&safe)
+        redact_literals(&safe, &self.redactor.literals)
     }
 
-    /// Resolves and redacts the last buffered suffix at message completion.
+    /// Resolves the last buffered suffix without normalizing unrelated text.
     pub fn finish(&mut self) -> String {
-        self.redactor.redact(&std::mem::take(&mut self.pending))
+        redact_literals(&std::mem::take(&mut self.pending), &self.redactor.literals)
     }
 }
 

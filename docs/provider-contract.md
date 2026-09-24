@@ -257,7 +257,10 @@ can be journaled while the engine is running. Both Claude-family and Codex
 producers withhold a bounded possible launch-secret suffix between text
 fragments, redact it before persistence, and flush it at the message boundary.
 Complete tool output, native event diagnostics, failure text, and answer proofs
-are sanitized before storage; unhandled native event text is omitted.
+are sanitized before storage; unhandled native event text is omitted. Fragment
+redaction preserves nonsecret whitespace, Codex flushes pending text when a
+turn ends without an item completion, and failure text is redacted before its
+published length limit is applied.
 
 ## C4 Attempts and ownership (schema v17)
 

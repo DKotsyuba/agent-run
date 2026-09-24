@@ -65,3 +65,15 @@ fn parsed_event_redaction_covers_escaped_values_and_keys() {
     assert!(!safe.contains("a\\\"b"));
     assert!(safe.contains("<redacted>"));
 }
+
+/// Buffer boundaries cannot parse and reserialize ordinary message fragments.
+#[test]
+fn streaming_redaction_preserves_nonsecret_whitespace() {
+    let redactor = Redactor::from_environment(&BTreeMap::from([(
+        "API_TOKEN".into(),
+        "abcdefghijklmnop".into(),
+    )]));
+    let input = " 1 xxxxxxxxxxxxxxx";
+    let mut stream = redactor.stream();
+    assert_eq!(format!("{}{}", stream.feed(input), stream.finish()), input);
+}

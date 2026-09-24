@@ -53,6 +53,28 @@ fn journal_assistant_fragment(
     Ok(())
 }
 
+/// Flushes every uncompleted assistant item's raw tail and withheld secret
+/// prefix before a turn, cancellation, or transport failure becomes terminal.
+fn flush_pending_assistant(
+    process: &Process,
+    store: &Store,
+    id: &AgentId,
+    streamed: &BTreeMap<String, String>,
+    completed: &BTreeMap<String, String>,
+    redactors: &mut BTreeMap<String, StreamingRedactor>,
+) -> Result<()> {
+    for (key, text) in streamed {
+        if !completed.contains_key(key) && (!text.trim().is_empty() || redactors.contains_key(key))
+        {
+            journal_assistant_fragment(process, store, id, redactors, key, text, true)?;
+        }
+    }
+    for key in redactors.keys().cloned().collect::<Vec<_>>() {
+        journal_assistant_fragment(process, store, id, redactors, &key, "", true)?;
+    }
+    Ok(())
+}
+
 /// Removes arbitrary text fields from unhandled native events; those fields
 /// have no transcript contract and may split a secret across notifications.
 fn omit_native_text(value: &mut Value) {
@@ -576,6 +598,8 @@ pub async fn models(process: &mut Process) -> Result<Vec<Value>> {
 /// unconsumed app-server notifications as durable events. It returns a
 /// terminal engine outcome, or fails closed on malformed protocol data,
 /// grant drift, unavailable models, and nonterminal completion statuses.
+/// Pending safe text is flushed on every terminal path; failure diagnostics
+/// are redacted before their exported length is bounded.
 pub async fn run(
     process: &mut Process,
     store: &mut Store,
@@ -703,6 +727,14 @@ pub async fn run(
                         )
                         .await;
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
+                    flush_pending_assistant(
+                        process,
+                        store,
+                        &record.id,
+                        &streamed,
+                        &completed,
+                        &mut redactors,
+                    )?;
                     return Ok(EngineResult {
                         native_failure: None,
                         outcome: Outcome {
@@ -748,20 +780,36 @@ pub async fn run(
         let v = match event {
             Event::Json(v) => v,
             Event::Eof => {
+                flush_pending_assistant(
+                    process,
+                    store,
+                    &record.id,
+                    &streamed,
+                    &completed,
+                    &mut redactors,
+                )?;
                 return Ok(EngineResult {
                     native_failure: None,
                     outcome: Outcome::failure("engine_transport_eof"),
                     answer: None,
                     usage,
-                })
+                });
             }
             Event::Failure(e) => {
+                flush_pending_assistant(
+                    process,
+                    store,
+                    &record.id,
+                    &streamed,
+                    &completed,
+                    &mut redactors,
+                )?;
                 return Ok(EngineResult {
                     native_failure: None,
                     outcome: Outcome::failure(e),
                     answer: None,
                     usage,
-                })
+                });
             }
         };
         if v.get("method").is_some() && v.get("id").is_some() {
@@ -939,19 +987,14 @@ pub async fn run(
                         }
                     }
                 }
-                for (key, text) in &streamed {
-                    if !text.trim().is_empty() && !completed.contains_key(key) {
-                        journal_assistant_fragment(
-                            process,
-                            store,
-                            &record.id,
-                            &mut redactors,
-                            key,
-                            text,
-                            true,
-                        )?;
-                    }
-                }
+                flush_pending_assistant(
+                    process,
+                    store,
+                    &record.id,
+                    &streamed,
+                    &completed,
+                    &mut redactors,
+                )?;
                 let mut outcome = match turn.get("status").and_then(Value::as_str) {
                     Some("completed") => Outcome::success(Some(tid.clone())),
                     Some("interrupted") => {
@@ -972,7 +1015,7 @@ pub async fn run(
                 outcome.failure_text = turn
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .map(|s| process.redact(&s.chars().take(512).collect::<String>()));
+                    .map(|s| process.redact(s).chars().take(512).collect());
                 if let Some(kind) = final_answer.as_deref().and_then(verify::error_only) {
                     outcome.status = Status::Failed;
                     outcome.failure_kind = Some(kind.into());
