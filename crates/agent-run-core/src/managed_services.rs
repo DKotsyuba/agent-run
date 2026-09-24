@@ -192,10 +192,11 @@ impl Manager {
     }
 
     /// Ends leases only after logical completion and resolution of all attempt ownership.
+    /// Records actual release time so delayed cleanup cannot consume the service's idle grace.
     fn release_finished(&self) -> Result<()> {
         let store = Store::open(&self.home)?;
         let at = now();
-        store.conn.execute("UPDATE managed_service_leases SET released_at=COALESCE((SELECT finished_at FROM agents WHERE id=managed_service_leases.agent_id),?1) WHERE released_at IS NULL AND EXISTS(SELECT 1 FROM agents a WHERE a.id=managed_service_leases.agent_id AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')) AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=managed_service_leases.agent_id AND t.ownership_active=1)", [at])?;
+        store.conn.execute("UPDATE managed_service_leases SET released_at=?1 WHERE released_at IS NULL AND EXISTS(SELECT 1 FROM agents a WHERE a.id=managed_service_leases.agent_id AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')) AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=managed_service_leases.agent_id AND t.ownership_active=1)", [at])?;
         store.conn.execute("UPDATE managed_service_generations SET idle_since=COALESCE((SELECT MAX(released_at) FROM managed_service_leases WHERE generation_id=managed_service_generations.id),?1) WHERE state!='stopped' AND idle_since IS NULL AND NOT EXISTS(SELECT 1 FROM managed_service_leases l WHERE l.generation_id=managed_service_generations.id AND l.released_at IS NULL)", [at])?;
         Ok(())
     }
@@ -719,5 +720,79 @@ pub async fn wait_for_gate(home: &Path, id: &AgentId) -> Result<()> {
         }
         drop(store);
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An old logical finish cannot consume the idle grace while process ownership remains unresolved.
+    #[test]
+    fn idle_grace_starts_when_final_ownership_is_released() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        let old = now() - 7200.0;
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,finished_at,timeout_seconds,config_revision) VALUES ('agent','fixture','fixture','review','fixture','fixture','/tmp','{}','lost',?1,?1,60,'fixture')", [old]).unwrap();
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES ('attempt','agent',1,'lost','{}',?,1)", [old]).unwrap();
+        store.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,created_at) VALUES ('generation','fixture',?,'{}','ready','{}',?)",params!["a".repeat(64),old]).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO managed_service_leases VALUES ('generation','agent',?,NULL)",
+                [old],
+            )
+            .unwrap();
+        let manager = Manager::new(home.path(), std::env::current_exe().unwrap()).unwrap();
+        manager.release_finished().unwrap();
+        let held: bool = store
+            .conn
+            .query_row(
+                "SELECT released_at IS NULL FROM managed_service_leases",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(held);
+        store
+            .conn
+            .execute("UPDATE attempts SET ownership_active=0", [])
+            .unwrap();
+        let before_release = now();
+        manager.release_finished().unwrap();
+        let released: f64 = store
+            .conn
+            .query_row(
+                "SELECT released_at FROM managed_service_leases",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let idle: f64 = store
+            .conn
+            .query_row(
+                "SELECT idle_since FROM managed_service_generations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            released >= before_release,
+            "idle grace was backdated to logical completion"
+        );
+        assert_eq!(idle, released);
+        manager.release_finished().unwrap();
+        let unchanged: f64 = store
+            .conn
+            .query_row(
+                "SELECT idle_since FROM managed_service_generations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged, idle,
+            "later maintenance must not postpone idle expiry"
+        );
     }
 }

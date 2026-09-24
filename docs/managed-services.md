@@ -72,9 +72,11 @@ See [process identity](process-identity.md) for platform limits.
 The broker warms every configured service before a new harness starts.
 Concurrent agents share one generation. Pending or active agents retain leases;
 unresolved process ownership retains them even after an agent is marked lost.
-The inactivity clock starts when the **last active agent finishes**, not at its
-launch. A new agent resets it; a long-running agent cannot lose its services
-because thirty minutes elapsed. Expiry sends TERM, then bounded KILL to verified
+The inactivity clock starts when the **last active agent finishes** and its
+process ownership is resolved, using the actual final lease-release time.
+Delayed cleanup cannot consume the idle grace. A new agent resets the clock;
+a running agent cannot lose its services because thirty minutes elapsed.
+Expiry sends TERM, then bounded KILL to verified
 owned processes. Service health failures block new launches; changing a service
 configuration must not restart it underneath active agents.
 
