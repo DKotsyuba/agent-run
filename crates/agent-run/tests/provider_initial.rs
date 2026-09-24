@@ -835,6 +835,93 @@ async fn provider_effort_and_timeout_are_bounded_before_admission() {
     high.effort = Some("high".into());
     service.admit_provider(high).unwrap();
     assert_eq!(rows(&home).0, 2);
+
+    edit_config(&home, |config| {
+        config["providers"]["glm-user"]["models"][0]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "params".into(),
+                toml::from_str::<toml::Value>("effort = \"medium\"").unwrap(),
+            );
+    });
+    let defaulted = service
+        .admit_provider(request_for(&home, "glm-user", "effort-default", None))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(defaulted["agent_id"].clone()).unwrap();
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let frozen = agent_run::service::ProviderLaunchIdentity::read(&row).unwrap();
+    assert_eq!(frozen.provider_request.effort, None);
+    assert_eq!(row.request.effort.as_deref(), Some("medium"));
+    assert_eq!(frozen.authority.effort.as_deref(), Some("medium"));
+    let mut old_row = row.clone();
+    old_row.request.effort = None;
+    old_row.identity.as_mut().unwrap()["authority"]["effort"] = serde_json::Value::Null;
+    assert!(agent_run::service::ProviderLaunchIdentity::read(&old_row).is_ok());
+    let mut tampered = row;
+    tampered.request.effort = Some("high".into());
+    tampered.identity.as_mut().unwrap()["authority"]["effort"] = serde_json::json!("high");
+    assert!(agent_run::service::ProviderLaunchIdentity::read(&tampered).is_err());
+}
+
+/// A resume checks the frozen effective effort, even when the original caller
+/// omitted it and the current model default has since changed.
+#[tokio::test]
+async fn provider_resume_checks_frozen_default_effort() {
+    let (_temp, home) = home();
+    edit_config(&home, |config| {
+        let offering = config["providers"]["glm-user"]["models"][0]
+            .as_table_mut()
+            .unwrap();
+        offering.insert(
+            "allowed_params".into(),
+            toml::from_str::<toml::Value>("effort = [\"medium\", \"high\"]").unwrap(),
+        );
+        offering.insert(
+            "params".into(),
+            toml::from_str::<toml::Value>("effort = \"medium\"").unwrap(),
+        );
+    });
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider(request_for(&home, "glm-user", "default-parent", None))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(parent.request.effort.as_deref(), Some("medium"));
+    let session = parent.runtime_session_id.as_deref().unwrap();
+    let runtime_home = std::path::PathBuf::from(
+        parent.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    transcript(
+        &runtime_home,
+        session,
+        &format!("{{\"sessionId\":\"{session}\"}}\n"),
+    );
+    edit_config(&home, |config| {
+        let offering = config["providers"]["glm-user"]["models"][0]
+            .as_table_mut()
+            .unwrap();
+        offering.insert(
+            "allowed_params".into(),
+            toml::from_str::<toml::Value>("effort = [\"high\"]").unwrap(),
+        );
+        offering.insert(
+            "params".into(),
+            toml::from_str::<toml::Value>("effort = \"high\"").unwrap(),
+        );
+    });
+    let refused = service.admit_provider_resume(
+        &parent,
+        "fixture:answer".into(),
+        None,
+        Some("default-effort-revoked".into()),
+        None,
+    );
+    assert!(refused.is_err(), "resume ignored frozen effective effort");
 }
 
 /// Runs one admitted provider agent to its terminal state through the real

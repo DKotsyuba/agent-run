@@ -77,6 +77,7 @@ recommendations = ["native subscription; strongest for long refactors"]
 id = "gpt-main"
 native_model = "gpt-native"
 allowed_params = { effort = ["medium", "high"] }
+params = { effort = "medium" }
 recommendations = ["broad coding"]
 [[providers.codex.models]]
 id = "gpt-review"
@@ -85,6 +86,9 @@ restrictions = ["web_tools_disabled"]
 label = "personal"
 account = "acct-codex"
 ```
+
+`params.effort` is the effective default when a start omits effort. Other
+parameter keys are rejected until a launch adapter can execute them.
 
 A schema-1 file keeps its historical runtime roster and route order; the
 filters are `Unsupported` there.

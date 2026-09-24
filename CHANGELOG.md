@@ -10,6 +10,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - fix(supervisor): record bounded cleanup failures and route supervisor errors to their component log without persisting task text or credentials
 - fix(delivery): use schema-2 retry policy after migration so a claimed notice reaches a durable result instead of repeating a validation failure
 - fix(transcript): redact launch credentials across Claude and Codex text fragments, tool output, native event diagnostics, and sealed answers before persistence
+- fix(config): apply offered model effort defaults to the frozen launch while preserving caller replay intent; reject unsupported model parameter keys
 - 0.13.2 publishes a native artifact only for macOS Apple silicon; Linux x86-64 remains a non-blocking validation lane with no published artifact
 
 ## [0.13.1] - 2026-09-23

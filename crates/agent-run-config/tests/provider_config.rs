@@ -29,7 +29,7 @@ recommendations = ["native subscription"]
 [[providers.codex.models]]
 id = "gpt"
 native_model = "gpt-native"
-params = {{ reasoning = "medium" }}
+params = {{ effort = "medium" }}
 allowed_params = {{ effort = ["medium", "high"] }}
 recommendations = ["coding"]
 restrictions = ["web_tools_disabled"]
@@ -142,6 +142,7 @@ fn v2_rejects_invalid_provider_contracts() {
             "allowed_params = { effort = [\"medium\", \"high\"] }",
             "allowed_params = { reasoning = [\"high\"] }",
         ),
+        valid.replace("params = { effort = \"medium\" }", "params = { reasoning = \"medium\" }"),
     ] {
         let parsed = ProviderConfig::parse(&invalid, home.path());
         assert!(

@@ -33,6 +33,7 @@ recommendations = ["Use for coding work."]
 id = "gpt"
 native_model = "gpt"
 allowed_params = { effort = ["medium", "high"] }
+params = { effort = "medium" } # applied when start omits effort
 restrictions = ["web_tools_disabled"]
 
 [[providers.codex.bindings]]
