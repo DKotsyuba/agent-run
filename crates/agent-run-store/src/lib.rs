@@ -11,6 +11,7 @@ pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
 pub mod lineage;
 pub mod migrations;
+pub mod process_ownership;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
 pub mod provider_admission;

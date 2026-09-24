@@ -296,6 +296,7 @@ pub fn plan_v1(
         profiles: old.profiles.clone(),
         skills: old.skills.clone(),
         mcp: old.mcp.clone(),
+        services: BTreeMap::new(),
         environments: old.environments.clone(),
         harnesses,
         providers,

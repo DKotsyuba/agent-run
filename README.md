@@ -58,9 +58,9 @@ Build from source with the pinned Rust toolchain (also usable before publication
 
 ```bash
 release_root="$(mktemp -d)"
-cargo xtask release build-native --output "$release_root" --version 0.13.3
-"$release_root/releases/0.13.3/bin/agent-run-deploy" install \
-  --release "$release_root/releases/0.13.3" --version 0.13.3 \
+cargo xtask release build-native --output "$release_root" --version 0.14.0
+"$release_root/releases/0.14.0/bin/agent-run-deploy" install \
+  --release "$release_root/releases/0.14.0" --version 0.14.0 \
   --prefix "$HOME/.agent-run/standalone" --home "$HOME/.agent-run" --bin-dir "$HOME/.local/bin"
 ```
 

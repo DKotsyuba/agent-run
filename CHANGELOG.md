@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- build: prepare 0.14.0 and schema 18 for broker-owned service generations,
+  agent leases, startup gates and captured process identities
+- feat(install): install or update a sealed release with curl/wget, preserving
+  configuration and data and refusing active or incompatible installations
+- feat(capacity)!: run externally configured quota executables with private JSON
+  input and normalized JSON output; remove the embedded Lua runtime
+- fix(supervisor): observe the primary harness PID independently of inherited
+  pipes and terminate captured descendants on exit
+- fix(mcp): bound test fixture lifetimes and stop the Rust frontend when its
+  desktop transport parent disappears
+
 ## [0.13.3] - 2026-09-24
 
 - fix(reconcile): restrict orphaned-attempt diagnostic lookup to its indexed agent history so a large transcript cannot hold the SQLite writer and block broker commands

@@ -117,7 +117,10 @@ fn checksums(remote: &Path, asset: &str) {
 #[test]
 fn install_update_and_noop_preserve_data() {
     let fixture = Fixture::new();
-    fixture.database(17, "succeeded");
+    fixture.database(
+        agent_run_platform::release::STORE_SCHEMA_VERSION as u64,
+        "succeeded",
+    );
     let config = fs::read(fixture.home.join("config.toml")).unwrap();
     fixture.install().unwrap();
     fixture.install().unwrap();
@@ -176,10 +179,19 @@ fn preflight_refusals_never_switch() {
                 file.lock_exclusive().unwrap();
                 broker = Some(file);
             }
-            "agent" => fixture.database(17, "running"),
-            "schema" => fixture.database(16, "succeeded"),
+            "agent" => fixture.database(
+                agent_run_platform::release::STORE_SCHEMA_VERSION as u64,
+                "running",
+            ),
+            "schema" => fixture.database(
+                (agent_run_platform::release::STORE_SCHEMA_VERSION - 1) as u64,
+                "succeeded",
+            ),
             "writer" => {
-                fixture.database(17, "succeeded");
+                fixture.database(
+                    agent_run_platform::release::STORE_SCHEMA_VERSION as u64,
+                    "succeeded",
+                );
                 let writer = Connection::open(fixture.home.join("state.db")).unwrap();
                 writer.execute_batch("BEGIN IMMEDIATE").unwrap();
                 connection = Some(writer);

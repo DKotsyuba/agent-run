@@ -148,6 +148,11 @@ fn current_binary_fixture_matches_fresh_schema() {
         "attempt_quota_keys_immutable",
         "quota_exhaustion",
         "idx_capacity_samples_account_key",
+        "managed_service_generations",
+        "managed_service_leases",
+        "agent_service_gates",
+        "process_ownership",
+        "process_members",
     ] {
         assert!(schema_objects(&fixture)
             .iter()

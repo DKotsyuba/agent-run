@@ -21,8 +21,8 @@ fn schema_initialization_and_reopen() {
     let h = common::Home::new();
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
-    assert_eq!(a["schema_version"], 17);
-    assert_eq!(a["tables"], 20);
+    assert_eq!(a["schema_version"], agent_run_store::VERSION);
+    assert_eq!(a["tables"], 25);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     assert_eq!(
@@ -360,7 +360,7 @@ fn backup_is_openable_and_never_overwrites_an_existing_file() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        17
+        agent_run_store::VERSION
     );
     assert_eq!(
         db.query_row(
@@ -391,20 +391,21 @@ fn backup_is_openable_and_never_overwrites_an_existing_file() {
 fn newer_database_version_is_refused_without_upgrade() {
     let h = common::Home::new();
     let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
-    db.pragma_update(None, "user_version", 18).unwrap();
+    db.pragma_update(None, "user_version", agent_run_store::VERSION + 1)
+        .unwrap();
     drop(db);
     assert!(Store::open(&h.path).is_err());
     let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
     assert_eq!(
-        db.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        18
+        agent_run_store::VERSION + 1
     );
 }
 #[test]
+/// Replays reconciliation, provider and service migrations over a reconstructed schema-15 store.
 fn legacy_database_version_is_migrated_on_open() {
-    // Schema 15 is two migrations (016 reconciliation cursors, 017 provider
-    // orchestration) behind current: drop what both add and stamp the store
+    // Schema 15 is three migrations behind current: drop their additions and stamp the store
     // back to v15, then confirm `Store::open` upgrades it transparently
     // instead of refusing it (see crates/agent-run-store/src/migrations.rs,
     // ported from src/agent_run/state/migrations.py).
@@ -412,7 +413,9 @@ fn legacy_database_version_is_migrated_on_open() {
     {
         let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
         db.execute_batch(
-            "DROP TRIGGER attempt_quota_keys_account_guard; \
+            "DROP TABLE process_members; DROP TABLE process_ownership; \
+             DROP TABLE managed_service_leases; DROP TABLE agent_service_gates; DROP TABLE managed_service_generations; \
+             DROP TRIGGER attempt_quota_keys_account_guard; \
              DROP TRIGGER attempts_selected_account_immutable; \
              DROP TRIGGER attempt_quota_keys_immutable; \
              DROP INDEX idx_attempts_one_active; DROP INDEX idx_attempts_selected_account; \
@@ -436,7 +439,10 @@ fn legacy_database_version_is_migrated_on_open() {
         .unwrap();
     }
     let store = Store::open(&h.path).unwrap();
-    assert_eq!(store.health().unwrap()["schema_version"], 17);
+    assert_eq!(
+        store.health().unwrap()["schema_version"],
+        agent_run_store::VERSION
+    );
 }
 #[tokio::test]
 async fn start_replay_is_independent_of_later_configuration_edits() {
@@ -667,6 +673,6 @@ fn concurrent_first_initializers_share_one_atomic_schema() {
         .into_iter()
         .map(|handle| handle.join().expect("initializer thread"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![17; callers]);
+    assert_eq!(versions, vec![agent_run_store::VERSION; callers]);
     Store::open(&home).expect("the shared schema is usable afterwards");
 }

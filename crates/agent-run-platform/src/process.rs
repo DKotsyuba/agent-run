@@ -485,14 +485,26 @@ pub struct Cleanup {
     /// Original process-group identifier, when safe to report.
     pub process_group_id: Option<i32>,
 }
+/// Serializable captured identities used to recover ownership after a supervisor or broker restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipSnapshot {
+    /// Original leader identity, retained even after that PID disappears or is reused.
+    pub leader: Identity,
+    /// All observed members, including the leader; distinct start tokens survive PID reuse.
+    pub members: Vec<Identity>,
+    /// Whether observation began from a verified live root; does not assert a complete historical tree.
+    pub descendants_observed: bool,
+}
+
 /// PID-reuse-aware ownership evidence for one child process group.
 pub struct OwnedProcess {
     /// Captured identity of the group leader, when readable at spawn time.
     pub leader: Option<Identity>,
     /// Expected process-group identifier, equal to the spawned leader PID.
     pub pid: i32,
-    /// Captured leader and observed descendants indexed by PID.
-    known: BTreeMap<i32, Identity>,
+    /// Captured leader and descendants indexed by PID and immutable start token.
+    known: BTreeMap<(i32, String), Identity>,
     /// Whether tracking began from a live verified leader or a later live snapshot.
     ///
     /// False means no descendant set was ever verified, so cleanup reports the
@@ -510,7 +522,11 @@ impl OwnedProcess {
     /// so descendant cleanup stays unknown unless a later live snapshot succeeds.
     pub fn capture(pid: i32) -> Self {
         let leader = inspect(pid).ok();
-        let known = leader.clone().into_iter().map(|p| (p.pid, p)).collect();
+        let known = leader
+            .clone()
+            .into_iter()
+            .map(|p| ((p.pid, p.token.clone()), p))
+            .collect();
         let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
         Self {
             leader,
@@ -527,11 +543,54 @@ impl OwnedProcess {
     pub fn adopt(leader: Identity) -> Self {
         let pid = leader.pid;
         Self {
-            known: BTreeMap::from([(pid, leader.clone())]),
+            known: BTreeMap::from([((pid, leader.token.clone()), leader.clone())]),
             leader: Some(leader),
             pid,
             descendants_observed: false,
         }
+    }
+    /// Exports captured identities without probing or changing the tree; absent root evidence returns None.
+    pub fn snapshot(&self) -> Option<OwnershipSnapshot> {
+        Some(OwnershipSnapshot {
+            leader: self.leader.clone()?,
+            members: self.known.values().cloned().collect(),
+            descendants_observed: self.descendants_observed,
+        })
+    }
+    /// Restores previously recorded evidence; every future signal still requires a fresh kernel identity check.
+    /// Rejects malformed identities, duplicate members or a missing/mismatched original root.
+    pub fn restore(snapshot: OwnershipSnapshot) -> Result<Self> {
+        let mut known = BTreeMap::new();
+        for member in snapshot.members {
+            if member.pid <= 1
+                || member.ppid < 0
+                || member.group < 0
+                || member.token.is_empty()
+                || member.token.len() > 256
+                || !member.birth.is_finite()
+                || member.birth < 0.0
+                || known
+                    .insert((member.pid, member.token.clone()), member)
+                    .is_some()
+            {
+                return Err(Error::Integrity("invalid captured process identity".into()));
+            }
+        }
+        let leader = snapshot.leader;
+        if known
+            .get(&(leader.pid, leader.token.clone()))
+            .is_none_or(|root| root.birth != leader.birth || root.group != leader.group)
+        {
+            return Err(Error::Integrity(
+                "captured process root is missing or inconsistent".into(),
+            ));
+        }
+        Ok(Self {
+            pid: leader.pid,
+            leader: Some(leader),
+            known,
+            descendants_observed: snapshot.descendants_observed,
+        })
     }
     /// Record descendants visible from a complete native process snapshot.
     ///
@@ -561,13 +620,17 @@ impl OwnedProcess {
         loop {
             let mut changed = false;
             for p in &all {
-                let child = self.known.get(&p.ppid).is_some_and(|parent| {
-                    observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
-                        == ProcessState::Alive
-                });
+                let child = self
+                    .known
+                    .range((p.ppid, String::new())..)
+                    .take_while(|((pid, _), _)| *pid == p.ppid)
+                    .any(|(_, parent)| {
+                        observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
+                            == ProcessState::Alive
+                    });
                 let in_group = leader_owned && p.group == self.pid;
-                if (child || in_group) && !self.known.contains_key(&p.pid) {
-                    self.known.insert(p.pid, p.clone());
+                if (child || in_group) && !self.known.contains_key(&(p.pid, p.token.clone())) {
+                    self.known.insert((p.pid, p.token.clone()), p.clone());
                     changed = true;
                 }
             }
@@ -617,11 +680,13 @@ impl OwnedProcess {
     pub fn signal_descendants(&mut self, sig: i32) -> bool {
         self.refresh();
         let mut signalled = false;
-        for process in self
-            .known
-            .values()
-            .filter(|process| process.pid != self.pid)
-        {
+        for process in self.known.values().filter(|process| {
+            self.leader
+                .as_ref()
+                .map_or(process.pid != self.pid, |leader| {
+                    process.pid != leader.pid || process.token != leader.token
+                })
+        }) {
             if Self::descendant_state(process) != ProcessState::Alive {
                 continue;
             }
@@ -636,11 +701,13 @@ impl OwnedProcess {
     fn descendants_gone(&self) -> Option<bool> {
         self.descendants_observed.then(|| {
             let mut unknown = false;
-            for process in self
-                .known
-                .values()
-                .filter(|process| process.pid != self.pid)
-            {
+            for process in self.known.values().filter(|process| {
+                self.leader
+                    .as_ref()
+                    .map_or(process.pid != self.pid, |leader| {
+                        process.pid != leader.pid || process.token != leader.token
+                    })
+            }) {
                 match Self::descendant_state(process) {
                     ProcessState::Dead | ProcessState::Reused => {}
                     ProcessState::Alive => return false,
@@ -937,7 +1004,10 @@ mod tests {
         let mut owned = OwnedProcess::capture(leader.id() as i32);
         let helper_identity = inspect(helper.id() as i32).expect("inspect helper");
         assert_ne!(helper_identity.group, owned.pid);
-        owned.known.insert(helper_identity.pid, helper_identity);
+        owned.known.insert(
+            (helper_identity.pid, helper_identity.token.clone()),
+            helper_identity,
+        );
         leader.wait().expect("reap leader");
 
         let cleanup = owned
@@ -1001,17 +1071,24 @@ mod tests {
             })
             .expect("fixture helper PID");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while !owned.known.contains_key(&helper_pid) && std::time::Instant::now() < deadline {
+        while !owned.known.values().any(|member| member.pid == helper_pid)
+            && std::time::Instant::now() < deadline
+        {
             owned.refresh();
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let helper_identity = owned
             .known
-            .get(&helper_pid)
+            .values()
+            .find(|member| member.pid == helper_pid)
             .expect("captured child identity");
         assert_ne!(helper_identity.group, owned.pid);
         leader.wait().expect("reap leader");
         drop(output);
+
+        // Recovery restores captured evidence even though the original parent is now gone.
+        let saved = serde_json::to_vec(&owned.snapshot().expect("captured root")).unwrap();
+        let mut owned = OwnedProcess::restore(serde_json::from_slice(&saved).unwrap()).unwrap();
 
         let cleanup = owned
             .cleanup(std::time::Duration::from_millis(50))
@@ -1050,7 +1127,9 @@ mod tests {
         let mut owned = OwnedProcess::capture(leader.id() as i32);
         let identity = inspect(helper.id() as i32).expect("inspect helper");
         assert_ne!(identity.group, owned.pid);
-        owned.known.insert(identity.pid, identity);
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
         leader.wait().expect("reap leader");
 
         let cleanup = owned
@@ -1088,7 +1167,9 @@ mod tests {
             OwnedProcess::descendant_state(&identity),
             ProcessState::Reused
         );
-        owned.known.insert(identity.pid, identity.clone());
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity.clone());
         assert!(!owned.signal_descendants(libc::SIGTERM));
         assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
 
@@ -1098,7 +1179,9 @@ mod tests {
             OwnedProcess::descendant_state(&identity),
             ProcessState::Reused
         );
-        owned.known.insert(identity.pid, identity.clone());
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity.clone());
         assert!(!owned.signal_descendants(libc::SIGTERM));
         assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
 
@@ -1107,7 +1190,9 @@ mod tests {
             OwnedProcess::descendant_state(&identity),
             ProcessState::Unknown
         );
-        owned.known.insert(identity.pid, identity);
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
         assert!(!owned.signal_descendants(libc::SIGKILL));
         assert_eq!(owned.descendants_gone(), Some(false));
         assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
@@ -1135,7 +1220,9 @@ mod tests {
             .expect("spawn leader");
         let mut owned = OwnedProcess::capture(leader.id() as i32);
         let identity = inspect(helper.id() as i32).expect("inspect helper");
-        owned.known.insert(identity.pid, identity);
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
         owned.leader = None;
         assert_eq!(owned.group_observation(), GroupObservation::Unknown);
 
