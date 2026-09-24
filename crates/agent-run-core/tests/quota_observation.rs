@@ -615,4 +615,35 @@ fn partial_unknown_keeps_all_exhausted_window_members() {
         json!(["glm-4.6", "glm-4.7"])
     );
     assert_eq!(latch_rows(home.path()), 1);
+    let definitions = serde_json::from_value(json!([{
+        "id":"fixture-provider","harness":"codex","connection":{"kind":"native"},
+        "auth_family":"openai","limits_source":"codex_appserver",
+        "models":[{"id":"fixture-b","native_model":"glm-4.6"}],
+        "bindings":[{"label":"main","account":"acct-main"}]
+    }]))
+    .unwrap();
+    let catalog = agent_run_domain::catalog::ProviderCatalog::new(
+        store.list_accounts().unwrap(),
+        definitions,
+    )
+    .unwrap();
+    let blocked = agent_run_core::capacity::provider_ranking::provider_candidates_at(
+        &store,
+        &catalog,
+        &"fixture-provider".parse().unwrap(),
+        "fixture-b",
+        None,
+        &BTreeSet::new(),
+        1600.0,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            blocked,
+            agent_run_domain::Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::QuotaExhausted { .. }
+            )
+        ),
+        "{blocked:?}"
+    );
 }
