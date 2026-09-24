@@ -55,7 +55,9 @@ struct StartupOwner {
 ///
 /// The return value contains only rows that durably became `lost`.  `limit`
 /// must be between one and 1000.  `Unknown`, `Denied`, `Alive`, and incomplete
-/// ownership evidence leave rows untouched.
+/// ownership evidence leave rows untouched. A verified-dead READY supervisor
+/// can be lost before an engine group exists; its attempt cleanup remains
+/// separately proof-gated.
 pub fn reconcile(store: &mut Store, limit: usize) -> Result<Vec<AgentId>> {
     reconcile_with(store, limit, process::observe)
 }
@@ -133,7 +135,9 @@ pub fn reconcile_reaped_supervisor(
 ///
 /// `observe` receives the PID plus its immutable token/birth evidence and must
 /// return a platform observation.  Production calls [`reconcile`]; callers
-/// should not use this hook to treat missing evidence as death.
+/// should not use this hook to treat missing evidence as death. A starting run
+/// with a READY supervisor but no engine group can become lost when that exact
+/// supervisor is dead; its attempt ownership is settled separately on proof.
 pub fn reconcile_with<F>(store: &mut Store, limit: usize, observe: F) -> Result<Vec<AgentId>>
 where
     F: Fn(Option<i32>, Option<&str>, Option<f64>) -> ProcessState,
@@ -165,13 +169,13 @@ where
         return Ok(changed);
     }
     for row in fair_rows(store, "active_supervisors", active_sql(), remaining)? {
-        let (Some(pid), Some(pgid), Some(identity)) = (
-            row.supervisor_pid,
-            row.process_group_id,
-            row.supervisor_identity.as_deref(),
-        ) else {
+        let (Some(pid), Some(identity)) = (row.supervisor_pid, row.supervisor_identity.as_deref())
+        else {
             continue;
         };
+        if row.process_group_id.is_none() && row.status != Status::Starting {
+            continue;
+        }
         let state = observe(Some(pid), Some(identity), row.supervisor_birth_time);
         let failure_kind = match state {
             ProcessState::Dead => "supervisor_dead",
@@ -186,7 +190,7 @@ where
             &row,
             failure_kind,
             "periodic detached supervisor reconciliation",
-            json!({"verdict": state_name(state), "supervisor_pid": pid, "process_group_id": pgid}),
+            json!({"verdict": state_name(state), "supervisor_pid": pid, "process_group_id": row.process_group_id}),
             now(),
         )? {
             changed.push(row.id);
@@ -216,6 +220,14 @@ struct OwnedAttempt {
     /// The run's recorded process group (the attempt leader's pid).
     group: Option<i32>,
 }
+
+/// Probe only the indexed owning agent's history for a recorded unresolved outcome.
+///
+/// The attempt and reason guards still enforce deduplication, while the agent
+/// key prevents a write transaction from scanning unrelated transcript events.
+const UNRESOLVED_EVENT_EXISTS_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND attempt_id=? AND kind='attempt_cleanup_unresolved' \
+     AND json_extract(data_json,'$.reason')=?)";
 
 /// Releases provider attempts that a terminal logical run still owns (for
 /// example a switched attempt whose supervisor died), only on proof:
@@ -365,9 +377,8 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
             }
             Err(reason) => {
                 let recorded: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE attempt_id=? AND kind='attempt_cleanup_unresolved' \
-                     AND json_extract(data_json,'$.reason')=?)",
-                    params![attempt.id, reason],
+                    UNRESOLVED_EVENT_EXISTS_SQL,
+                    params![attempt.agent, attempt.id, reason],
                     |row| row.get(0),
                 )?;
                 if !recorded {
@@ -631,4 +642,38 @@ fn same_ownership(expected: &Candidate, current: &Candidate) -> bool {
         && current.supervisor_identity.is_none()
         && expected.startup_owner == current.startup_owner
         && expected.startup_birth_time == current.startup_birth_time
+}
+
+/// Checks that orphaned-attempt diagnostics use bounded indexed history reads.
+#[cfg(test)]
+mod tests {
+    use super::UNRESOLVED_EVENT_EXISTS_SQL;
+
+    /// The deduplication probe must use one agent's event index instead of
+    /// scanning the entire durable transcript while holding a write lease.
+    #[test]
+    fn unresolved_cleanup_probe_uses_agent_index() {
+        let home = tempfile::tempdir().unwrap();
+        let store = agent_run_store::Store::initialize(home.path()).unwrap();
+        let mut statement = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {UNRESOLVED_EVENT_EXISTS_SQL}"))
+            .unwrap();
+        let plan = statement
+            .query_map(rusqlite::params!["agent", "attempt", "reason"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH events USING INDEX idx_events_agent_seq")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN events")),
+            "{plan:?}"
+        );
+    }
 }

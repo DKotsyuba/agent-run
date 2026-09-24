@@ -91,6 +91,89 @@ fn broker_crash_reconciles_only_a_dead_start_owner() {
     assert_eq!(row.failure_kind.as_deref(), Some("unowned_starting"));
 }
 
+/// A supervisor that died after READY but before the spawn claim has no
+/// process group; its prepared attempt still has exact never-spawned evidence.
+#[test]
+fn dead_pre_spawn_supervisor_releases_prepared_attempt() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    store.conn.execute(
+        "UPDATE agents SET status='starting',supervisor_pid=4246,supervisor_identity='linux:fixture:6',supervisor_birth_time=6.0,heartbeat_at=? WHERE id=?",
+        rusqlite::params![agent_run_core::domain::now(), id.as_str()],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES('att_prepared',?,1,'prepared','{}',?,'prepared',1)",
+        rusqlite::params![id.as_str(), agent_run_core::domain::now()],
+    ).unwrap();
+
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Unknown)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Starting);
+    let changed = reconcile_with(&mut store, 10, |pid, _, _| {
+        assert_eq!(pid, Some(4246));
+        ProcessState::Dead
+    })
+    .unwrap();
+
+    assert_eq!(changed, vec![id.clone()]);
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Lost);
+    assert_eq!(row.failure_kind.as_deref(), Some("supervisor_dead"));
+    let (owned, proof): (i64, String) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json FROM attempts WHERE id='att_prepared'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(owned, 0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&proof).unwrap()["never_spawned"],
+        true
+    );
+}
+
+/// A missing group does not prove that an attempt already claiming spawn left
+/// no child; reconciliation records loss but retains its ownership reservation.
+#[test]
+fn dead_supervisor_without_group_keeps_uncertain_spawn_owned() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    store.conn.execute(
+        "UPDATE agents SET status='starting',supervisor_pid=4247,supervisor_identity='linux:fixture:7',supervisor_birth_time=7.0,heartbeat_at=? WHERE id=?",
+        rusqlite::params![agent_run_core::domain::now(), id.as_str()],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES('att_spawning',?,1,'spawning','{}',?,'spawning',1)",
+        rusqlite::params![id.as_str(), agent_run_core::domain::now()],
+    ).unwrap();
+
+    let changed = reconcile_with(&mut store, 10, |pid, _, _| {
+        assert_eq!(pid, Some(4247));
+        ProcessState::Dead
+    })
+    .unwrap();
+
+    assert_eq!(changed, vec![id.clone()]);
+    assert_eq!(store.get(&id).unwrap().status, Status::Lost);
+    let (owned, proof): (i64, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json FROM attempts WHERE id='att_spawning'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(owned, 1);
+    assert!(proof.is_none());
+}
+
 /// Mirrors `test_reused_supervisor_is_lost_with_identity_mismatch`.
 /// Mirrors Python `tests/test_supervisor.py::SupervisorTests::test_reused_group_id_never_receives_native_cancel_or_signal`.
 #[test]
