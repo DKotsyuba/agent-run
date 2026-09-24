@@ -33,6 +33,7 @@ dependencies = [
  "agent-run-domain",
  "agent-run-platform",
  "chrono",
+ "libc",
  "regex",
  "reqwest",
  "serde",

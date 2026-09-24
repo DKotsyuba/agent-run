@@ -614,7 +614,7 @@ impl OwnedProcess {
     /// Signal each still-live captured descendant after a fresh exact identity check.
     /// A vanished, reused, unreadable or incomplete identity is never signalled.
     /// Failed signals do not skip later descendants; evidence remains unconfirmed if they live.
-    fn signal_descendants(&mut self, sig: i32) -> bool {
+    pub fn signal_descendants(&mut self, sig: i32) -> bool {
         self.refresh();
         let mut signalled = false;
         for process in self

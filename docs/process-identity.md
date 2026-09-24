@@ -19,6 +19,15 @@ only when the stored startup owner or supervisor is observed as dead or reused.
 
 ## Signalling and cleanup
 
+The shared harness transport observes the primary child PID independently of
+stdout EOF, during startup RPC as well as streaming. On primary exit it sends
+TERM immediately to captured live descendants. Already-written output drains
+for at most 200ms; a descendant holding an inherited descriptor cannot keep the
+run waiting indefinitely. This deadline survives cancellation of a read by
+supervisor maintenance. The supervisor then performs bounded escalation and
+records the final cleanup proof. Normal protocol completion still follows the
+same supervisor cleanup path even if the primary PID has not exited yet.
+
 Group signals require the recorded group leader to be `alive` with its original
 identity and group. Captured descendants are also checked individually by PID,
 kernel token and birth time, including after the leader exits. Reused, unknown,

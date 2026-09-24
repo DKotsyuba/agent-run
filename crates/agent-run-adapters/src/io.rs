@@ -1,3 +1,5 @@
+//! Bounded engine streams with independent observation of the primary harness PID.
+
 use crate::{
     redact::{DiagnosticTail, Redactor, StreamingRedactor},
     LaunchPlan,
@@ -51,6 +53,10 @@ pub struct Process {
     pub stderr_bytes: Arc<AtomicU64>,
     redactor: Redactor,
     diagnostic_tail: Arc<Mutex<DiagnosticTail>>,
+    /// Fixed drain deadline after primary-child exit; survives cancellation of `next`/RPC waits.
+    exit_drain_deadline: Option<tokio::time::Instant>,
+    /// Last descendant snapshot, shared by startup RPC and streaming reads.
+    observed_at: tokio::time::Instant,
 }
 impl Process {
     /// Spawns the planned engine with isolated environment and line-framed pipes.
@@ -133,6 +139,8 @@ impl Process {
             stderr_bytes,
             redactor,
             diagnostic_tail,
+            exit_drain_deadline: None,
+            observed_at: tokio::time::Instant::now(),
         })
     }
 
@@ -200,12 +208,56 @@ impl Process {
         input.flush().await?;
         Ok(())
     }
-    /// Returns the next retained notification or waits for a bounded reader event.
+    /// Returns a retained notification or observes stdout and the primary PID together.
     pub async fn next(&mut self) -> Event {
         if let Some(e) = self.backlog.pop_front() {
             e
         } else {
-            self.events.recv().await.unwrap_or(Event::Eof)
+            self.receive().await
+        }
+    }
+    /// Begins descendant termination on observed primary exit, then drains already-written output.
+    ///
+    /// A 200ms absolute deadline prevents inherited pipes from keeping the run alive.
+    /// The supervisor still owns escalation and final cleanup proof; cancelling this
+    /// receive future neither resets the deadline nor loses process observations.
+    async fn receive(&mut self) -> Event {
+        loop {
+            let now = tokio::time::Instant::now();
+            if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+                self.owner.refresh();
+                self.observed_at = now;
+            }
+            if self.exit_drain_deadline.is_none() {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.owner.signal_descendants(libc::SIGTERM);
+                        self.input.take();
+                        self.exit_drain_deadline = Some(now + Duration::from_millis(200));
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Event::Failure("engine_process_observation_failed"),
+                }
+            }
+            if let Some(deadline) = self.exit_drain_deadline {
+                if tokio::time::Instant::now() >= deadline {
+                    return Event::Eof;
+                }
+                return tokio::select! {
+                    biased;
+                    event = self.events.recv() => event.unwrap_or(Event::Eof),
+                    _ = tokio::time::sleep_until(deadline) => Event::Eof,
+                };
+            }
+            tokio::select! {
+                biased;
+                exit = self.child.wait() => {
+                    if exit.is_err() { return Event::Failure("engine_process_observation_failed"); }
+                    // The next iteration records a single fixed deadline and TERM sweep.
+                }
+                event = self.events.recv() => return event.unwrap_or(Event::Eof),
+                _ = tokio::time::sleep_until(self.observed_at + Duration::from_millis(200)) => {},
+            }
         }
     }
     /// Sends one request, correlates its response, and retains interleaved notifications.
@@ -235,10 +287,9 @@ impl Process {
             };
         }
         loop {
-            let event = tokio::time::timeout_at(deadline, self.events.recv())
+            let event = tokio::time::timeout_at(deadline, self.receive())
                 .await
-                .map_err(|_| Error::Runtime("app-server RPC timed out".into()))?
-                .unwrap_or(Event::Eof);
+                .map_err(|_| Error::Runtime("app-server RPC timed out".into()))?;
             match event {
                 Event::Json(v)
                     if v.get("id").and_then(Value::as_u64) == Some(id)
