@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-09-24
+
+- fix(reconcile): restrict orphaned-attempt diagnostic lookup to its indexed agent history so a large transcript cannot hold the SQLite writer and block broker commands
+- fix(reconcile): mark a verified-dead supervisor lost even if it exited before recording an engine group; release only a prepared attempt with never-spawned proof and retain uncertain spawning ownership
+- 0.13.3 publishes a native artifact only for macOS Apple silicon; Linux x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.13.2] - 2026-09-24
 
 - fix(supervisor): settle verified descendant cleanup after the process group exits instead of losing runs when short-lived helpers finish moments later

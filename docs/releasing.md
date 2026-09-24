@@ -26,7 +26,7 @@ node --test scripts/check-desktop-transport.cjs
 
 Run the release gates on macOS arm64. The non-blocking Linux validation lane
 runs the workspace and sealed-build checks independently, but its result does
-not gate or add an artifact to the 0.13.2 release.
+not gate or add an artifact to the 0.13.3 release.
 
 For adapter or supervisor changes, also run a candidate through a supported
 real engine in an isolated home. Verify the answer proof, transcript, process
@@ -37,10 +37,10 @@ smoke.
 
 ```bash
 release_root="$(mktemp -d)"
-cargo xtask release build-native --output "$release_root" --version 0.13.2
-cargo xtask release verify --release "$release_root/releases/0.13.2"
+cargo xtask release build-native --output "$release_root" --version 0.13.3
+cargo xtask release verify --release "$release_root/releases/0.13.3"
 cargo xtask archive --revision HEAD \
-  --output "$release_root/agent-run-0.13.2-source.tar" --verify
+  --output "$release_root/agent-run-0.13.3-source.tar" --verify
 ```
 
 `build-native` seals the current host binary. The sealed directory contains the
@@ -56,8 +56,8 @@ one host's binary.
 3. Create and push an annotated tag from that accepted commit:
 
    ```bash
-   git tag -a v0.13.2 -m "agent-run 0.13.2"
-   git push origin v0.13.2
+   git tag -a v0.13.3 -m "agent-run 0.13.3"
+   git push origin v0.13.3
    ```
 
 After CI accepts the commit, the tagged `Release` workflow runs the macOS
