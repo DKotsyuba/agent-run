@@ -676,10 +676,10 @@ fn same_ownership(expected: &Candidate, current: &Candidate) -> bool {
 mod tests {
     use super::UNRESOLVED_EVENT_EXISTS_SQL;
 
-    /// The deduplication probe must use one agent's event index instead of
+    /// The deduplication probe must use one agent's or attempt's event index instead of
     /// scanning the entire durable transcript while holding a write lease.
     #[test]
-    fn unresolved_cleanup_probe_uses_agent_index() {
+    fn unresolved_cleanup_probe_uses_owner_index() {
         let home = tempfile::tempdir().unwrap();
         let store = agent_run_store::Store::initialize(home.path()).unwrap();
         let mut statement = store
@@ -694,8 +694,10 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert!(
-            plan.iter()
-                .any(|step| step.contains("SEARCH events USING INDEX idx_events_agent_seq")),
+            plan.iter().any(
+                |step| step.contains("SEARCH events USING INDEX idx_events_agent_seq")
+                    || step.contains("SEARCH events USING INDEX idx_events_attempt")
+            ),
             "{plan:?}"
         );
         assert!(
