@@ -77,3 +77,11 @@ fn streaming_redaction_preserves_nonsecret_whitespace() {
     let mut stream = redactor.stream();
     assert_eq!(format!("{}{}", stream.feed(input), stream.finish()), input);
 }
+
+/// Native logins without environment secrets still keep text bytes intact.
+#[test]
+fn streaming_redaction_without_literals_preserves_text() {
+    let mut stream = Redactor::default().stream();
+    assert_eq!(stream.feed(" 1 "), " 1 ");
+    assert_eq!(stream.finish(), "");
+}

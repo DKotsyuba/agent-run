@@ -99,7 +99,7 @@ impl StreamingRedactor {
     /// fragment text is never parsed as a complete JSON document.
     pub fn feed(&mut self, fragment: &str) -> String {
         if self.redactor.literals.is_empty() {
-            return self.redactor.redact(fragment);
+            return fragment.to_owned();
         }
         let mut raw = std::mem::take(&mut self.pending);
         raw.push_str(fragment);
