@@ -627,12 +627,10 @@ async fn descendant_process_is_reaped_before_finish() {
     assert_eq!(cleanup["descendants_gone"], json!(true));
 }
 
-/// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_escaped_descendant_is_reported_and_cleaned_by_fixture_owner`.
-///
-/// Group cleanup must not signal an escaped descendant individually, and its
-/// unconfirmed cleanup evidence must remain separate from the runtime result.
+/// A captured descendant which leaves the original group is individually
+/// terminated by the supervisor before successful cleanup is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn escaped_descendant_is_not_signalled_and_does_not_change_runtime_outcome() {
+async fn escaped_descendant_is_terminated_before_confirmed_cleanup() {
     let (_tmp, home) = home();
     let row = run_task(&home, "fixture:escaped-descendant").await;
     assert_eq!(row.status, Status::Succeeded);
@@ -643,21 +641,21 @@ async fn escaped_descendant_is_not_signalled_and_does_not_change_runtime_outcome
         .expect("process_cleanup event recorded");
     assert_eq!(cleanup["scope"], json!("verified_descendants"));
     assert_eq!(cleanup["group_gone"], json!(true));
-    assert_eq!(cleanup["descendants_gone"], json!(false));
-    assert_eq!(cleanup["confirmed"], json!(false));
+    assert_eq!(cleanup["descendants_gone"], json!(true));
+    assert_eq!(cleanup["confirmed"], json!(true));
     let escaped: i32 = std::fs::read_to_string(home.join("escaped.pid"))
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    // The supervisor sent only its verified group signal; the escaped child
-    // remains alive until this test-owned fixture cleanup.
-    // SAFETY: `escaped` is a positive PID this test's own fixture spawned and
-    // recorded, so signal 0 addresses one process and never a group or wildcard.
-    assert_eq!(unsafe { libc::kill(escaped, 0) }, 0);
-    // SAFETY: same single owned PID, proven alive by the probe above; this test
-    // owns the escaped child and is responsible for reaping it.
-    assert_eq!(unsafe { libc::kill(escaped, libc::SIGKILL) }, 0);
+    // Inspection only: the test must not kill a stale PID after supervisor cleanup.
+    match agent_run_platform::process::inspect(escaped) {
+        Ok(identity) => assert!(identity.zombie, "escaped helper is still running"),
+        Err(error) => assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT) | Some(libc::ESRCH)
+        )),
+    }
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_cancel_queued_before_launch_cannot_orphan_the_engine`.

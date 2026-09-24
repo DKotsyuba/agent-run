@@ -493,7 +493,7 @@ pub struct OwnedProcess {
     pub pid: i32,
     /// Captured leader and observed descendants indexed by PID.
     known: BTreeMap<i32, Identity>,
-    /// Whether a complete native snapshot was taken while the leader was alive.
+    /// Whether tracking began from a live verified leader or a later live snapshot.
     ///
     /// False means no descendant set was ever verified, so cleanup reports the
     /// descendant scope as unknown rather than clean.
@@ -502,15 +502,12 @@ pub struct OwnedProcess {
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
     ///
-    /// A live leader read here is itself the first verified descendant snapshot:
-    /// a process observed at the moment it is spawned cannot have descendants
-    /// yet, so its empty set is proven rather than assumed, and even a child
-    /// exiting before the caller's first periodic refresh leaves verified
-    /// evidence behind. That proof costs only the leader's own inspection; a
-    /// full process-table scan here would delay the caller's stream readers and
-    /// is not needed for an empty set. A leader that is already gone, a zombie,
-    /// or unreadable records no snapshot, and cleanup then reports the
-    /// descendant scope as unknown rather than clean.
+    /// A live identity establishes the root from which periodic snapshots expand.
+    /// The child may already have forked: this observation does not prove an empty
+    /// historical tree. Cleanup confirms only the original group and identities
+    /// actually captured, never unobserved descendants which escaped beforehand.
+    /// An already absent, zombie or unreadable leader cannot establish this root,
+    /// so descendant cleanup stays unknown unless a later live snapshot succeeds.
     pub fn capture(pid: i32) -> Self {
         let leader = inspect(pid).ok();
         let known = leader.clone().into_iter().map(|p| (p.pid, p)).collect();
@@ -719,19 +716,8 @@ impl OwnedProcess {
     pub fn cleanup_blocking(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
         self.refresh();
-        let observation_deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(250);
-        while self.group_observation() == GroupObservation::Unknown
-            && std::time::Instant::now() < observation_deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
         if !self.gone() && self.signal(libc::SIGTERM).unwrap_or(false) {
             signals.push("SIGTERM".into());
-        }
-        let until = std::time::Instant::now() + grace;
-        while std::time::Instant::now() < until && !self.settled() {
-            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         if self.signal_descendants(libc::SIGTERM)
             && !signals.iter().any(|signal| signal == "SIGTERM")
@@ -772,19 +758,8 @@ impl OwnedProcess {
     pub async fn cleanup(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
         self.refresh();
-        let observation_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-        while self.group_observation() == GroupObservation::Unknown
-            && tokio::time::Instant::now() < observation_deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
         if !self.gone() && self.signal(libc::SIGTERM).unwrap_or(false) {
             signals.push("SIGTERM".into());
-        }
-        let until = tokio::time::Instant::now() + grace;
-        while tokio::time::Instant::now() < until && !self.settled() {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         if self.signal_descendants(libc::SIGTERM)
             && !signals.iter().any(|signal| signal == "SIGTERM")
@@ -945,9 +920,9 @@ mod tests {
         assert!(cleanup.signals.is_empty());
     }
 
-    /// A captured helper that exits during grace needs no individual signal.
+    /// A surviving captured helper receives TERM immediately, without passive exit grace.
     #[tokio::test]
-    async fn cleanup_waits_for_captured_descendant_after_group_exit() {
+    async fn cleanup_signals_captured_descendant_after_group_exit() {
         use std::os::unix::process::CommandExt;
 
         let mut helper = std::process::Command::new("/bin/sleep")
@@ -972,11 +947,13 @@ mod tests {
         helper.wait().expect("reap helper");
         assert!(cleanup.confirmed);
         assert_eq!(cleanup.descendants_gone, Some(true));
-        assert!(cleanup.signals.is_empty());
+        assert_eq!(cleanup.signals, ["SIGTERM"]);
     }
 
     /// Spawn a helper in its own group while this test process is the owned leader.
+    /// The leader deliberately exits first; the outer regression owns helper cleanup.
     #[test]
+    #[allow(clippy::zombie_processes)]
     fn detached_helper_fixture() {
         use std::io::Write;
         use std::os::unix::process::CommandExt;

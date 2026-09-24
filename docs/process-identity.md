@@ -19,21 +19,25 @@ only when the stored startup owner or supervisor is observed as dead or reused.
 
 ## Signalling and cleanup
 
-Signals are allowed only while the recorded supervisor identity is `alive` and
-the supervisor is still the leader of its recorded process group. Reused,
-unknown, denied, and missing identity never authorize a signal.
+Group signals require the recorded group leader to be `alive` with its original
+identity and group. Captured descendants are also checked individually by PID,
+kernel token and birth time, including after the leader exits. Reused, unknown,
+denied and missing identities never authorize a signal.
 
 Before group termination, agent-run captures every readable member by PID and
 birth identity. Cleanup evidence records the signals attempted, scope,
 `group_gone`, nullable `descendants_gone`, and `confirmed`. Confirmation
 requires both the original group and every readable captured descendant to be
-gone. Escaped descendants are not signalled individually, and group
-disappearance alone does not claim wider tree cleanup.
+gone. Captured descendants which left the original group receive individual
+signals. This is evidence about observed identities, not proof of a complete
+historical process tree: a process may detach before any snapshot sees it.
 
-After the original group exits, cleanup waits up to two seconds for captured
-descendants to exit and for transient observation failures to clear. These
-retries only inspect process identities; they never authorize another signal.
-If the complete proof still cannot be established, a provider attempt keeps
+Cleanup sends TERM to the verified group and captured live descendants immediately.
+After a short caller-selected grace it sends KILL to remaining verified identities.
+Bounded observation retries then allow exit and transient inspection states to
+settle. Captured identities currently live in the supervisor's memory; recovery
+after its loss cannot reconstruct an escaped child from an already-dead leader.
+If the required proof cannot be established, a provider attempt keeps
 its ownership and records a bounded cleanup diagnostic for investigation.
 
 macOS uses native process APIs and a start-time-only sysctl fallback when
