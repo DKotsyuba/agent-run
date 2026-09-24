@@ -264,11 +264,13 @@ pub fn retain_exhausted(
 /// `home` is the agent-run home whose store receives the write; `runtime`
 /// names the engine scope that observed the facts; the global account must
 /// be registered and is persisted explicitly in `account_id`/`quota_key`
-/// (with `target` kept as a legacy view mirror). One row is written per
+/// (with `target` kept as a legacy view mirror). At most one row is written per
 /// physical window with its full model membership in `payload_json`,
 /// however many configured models share the pool. The durable exhaustion
 /// latch is upserted for retained exhausted windows and cleared for released
-/// ones. Every mutating round — samples written, latch upserted, or latch
+/// ones. An unsettled latch's last membership is kept when a new disjoint
+/// nonzero observation would otherwise replace its only governing sample.
+/// Every mutating round — samples written, latch upserted, or latch
 /// cleared — advances `quota_capacity_revision` exactly once inside the same
 /// immediate transaction; a round that changes nothing leaves the revision
 /// and history untouched. `at` is the host clock the latch evaluates resets
@@ -312,7 +314,7 @@ pub fn record_quota_snapshot(
     let mut snapshot = snapshot.clone();
     retain_exhausted(&exhausted, &membership, &mut snapshot, &account, at)?;
 
-    // One physical window is persisted exactly once with its full model
+    // One physical window is selected at most once with its full model
     // membership, however many configured models share the pool.
     let mut physical: BTreeMap<(&str, &str, &str), &QuotaWindow> = BTreeMap::new();
     for model in &snapshot.models {
@@ -371,7 +373,25 @@ pub fn record_quota_snapshot(
         }
     }
     let mut mutations = 0usize;
-    for (identity @ (lane, _source, _name), window) in &physical {
+    for (identity @ (lane, source, name), window) in &physical {
+        let old_key = (lane.to_string(), source.to_string(), name.to_string());
+        // A disjoint nonzero report cannot settle this latch. Persisting it
+        // as the newest row would erase the only membership that keeps the
+        // exhausted model blocked; retain the older row instead.
+        if window.remaining_percent != Some(0.0)
+            && !released.contains(&old_key)
+            && membership
+                .get(&old_key)
+                .and_then(Option::as_ref)
+                .is_some_and(|old| {
+                    !old.is_empty()
+                        && pool_models.get(identity).is_some_and(|current| {
+                            old.iter().all(|model| !current.contains(model.as_str()))
+                        })
+                })
+        {
+            continue;
+        }
         window.validate()?;
         let quota_key = format!("{}::{}", account.as_str(), lane);
         let models = pool_models

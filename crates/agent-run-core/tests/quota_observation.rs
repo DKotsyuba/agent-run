@@ -647,3 +647,88 @@ fn partial_unknown_keeps_all_exhausted_window_members() {
         "{blocked:?}"
     );
 }
+
+/// A disjoint unknown observation cannot replace the only sample carrying
+/// an unsettled latch's model membership or make that model admissible.
+#[test]
+fn disjoint_unknown_keeps_exhausted_model_blocked() {
+    use agent_run_core::capacity::provider_ranking::provider_candidates_at;
+    use agent_run_domain::catalog::{ProviderCatalog, QuotaAdmissionError};
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let exhausted = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"reset_at":2500.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1500.0).unwrap();
+    let disjoint = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.6"],"observed_at":1600.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &disjoint, 100, 1600.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let members: String = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE quota_key='acct-main::primary' \
+         AND source='glm-native' AND window='five_hour' ORDER BY observed_at DESC,id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&members).unwrap()["models"],
+        json!(["glm-4.7"])
+    );
+    assert_eq!(latch_rows(home.path()), 1);
+    let definitions = serde_json::from_value(json!([{
+        "id":"fixture-provider","harness":"codex","connection":{"kind":"native"},
+        "auth_family":"openai","limits_source":"codex_appserver",
+        "models":[{"id":"fixture-a","native_model":"glm-4.7"},
+                  {"id":"fixture-b","native_model":"glm-4.6"}],
+        "bindings":[{"label":"main","account":"acct-main"}]
+    }]))
+    .unwrap();
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), definitions).unwrap();
+    let candidate = |model| {
+        provider_candidates_at(
+            &store,
+            &catalog,
+            &"fixture-provider".parse().unwrap(),
+            model,
+            None,
+            &BTreeSet::new(),
+            1600.0,
+        )
+    };
+    assert!(matches!(
+        candidate("fixture-a"),
+        Err(agent_run_domain::Error::QuotaAdmission(
+            QuotaAdmissionError::QuotaExhausted { .. }
+        ))
+    ));
+    let other = candidate("fixture-b").unwrap();
+    assert!(!other.candidates[0].quota_known);
+    assert!(other.candidates[0].physical_keys.is_empty());
+
+    let recovered = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":80.0,"reset_at":3000.0,"observed_at":1700.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &recovered, 100, 1700.0).unwrap();
+    assert_eq!(latch_rows(home.path()), 0);
+    let available = provider_candidates_at(
+        &store,
+        &catalog,
+        &"fixture-provider".parse().unwrap(),
+        "fixture-a",
+        None,
+        &BTreeSet::new(),
+        1700.0,
+    )
+    .unwrap();
+    assert!(available.candidates[0].quota_known);
+}
