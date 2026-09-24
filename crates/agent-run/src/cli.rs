@@ -1077,49 +1077,6 @@ fn provider_login_target(
     })
 }
 
-#[cfg(test)]
-mod login_selection_tests {
-    //! Credential selection must not depend on the order of provider bindings.
-
-    use super::provider_login_target;
-    use agent_run_config::provider_config::ProviderConfig;
-    use agent_run_domain::catalog::{AccountRecord, AccountStatus};
-    use agent_run_store::Store;
-
-    /// A provider label that is another binding's global ID is ambiguous;
-    /// unambiguous labels and IDs still select their registered account.
-    #[test]
-    fn login_rejects_cross_namespace_account_collision() {
-        let home = tempfile::tempdir().unwrap();
-        Store::initialize(home.path()).unwrap();
-        let config = format!(
-            "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{0}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{0}/claude\"\n[providers.codex]\nharness = \"codex\"\nconnection = {{ kind = \"native\" }}\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex.models]]\nid = \"gpt\"\n[[providers.codex.bindings]]\nlabel = \"acct-b\"\naccount = \"acct-a\"\n[[providers.codex.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n",
-            home.path().display()
-        );
-        let config = ProviderConfig::parse(&config, home.path()).unwrap();
-        let mut store = Store::open(home.path()).unwrap();
-        for (id, reference) in [("acct-a", "native:codex"), ("acct-b", "named:codex:b")] {
-            store
-                .register_account(&AccountRecord {
-                    account_id: id.parse().unwrap(),
-                    auth_family: "openai".parse().unwrap(),
-                    secret_ref: reference.parse().unwrap(),
-                    status: AccountStatus::Enabled,
-                })
-                .unwrap();
-        }
-        let error = provider_login_target(home.path(), &config, "codex", Some("acct-b"), false)
-            .err()
-            .expect("ambiguous selector is refused");
-        assert!(error.to_string().contains("ambiguous"), "{error}");
-        let by_label =
-            provider_login_target(home.path(), &config, "codex", Some("b"), false).unwrap();
-        assert_eq!(by_label.reply["account"], "acct-b");
-        let by_id =
-            provider_login_target(home.path(), &config, "codex", Some("acct-a"), false).unwrap();
-        assert_eq!(by_id.reply["account"], "acct-a");
-    }
-}
 /// Executes one parsed command and returns its public process exit status.
 ///
 /// Success writes JSON (except the stdio server), while expected failures
@@ -1614,4 +1571,48 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod login_selection_tests {
+    //! Credential selection must not depend on the order of provider bindings.
+
+    use super::provider_login_target;
+    use agent_run_config::provider_config::ProviderConfig;
+    use agent_run_domain::catalog::{AccountRecord, AccountStatus};
+    use agent_run_store::Store;
+
+    /// A provider label that is another binding's global ID is ambiguous;
+    /// unambiguous labels and IDs still select their registered account.
+    #[test]
+    fn login_rejects_cross_namespace_account_collision() {
+        let home = tempfile::tempdir().unwrap();
+        Store::initialize(home.path()).unwrap();
+        let config = format!(
+            "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{0}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{0}/claude\"\n[providers.codex]\nharness = \"codex\"\nconnection = {{ kind = \"native\" }}\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex.models]]\nid = \"gpt\"\n[[providers.codex.bindings]]\nlabel = \"acct-b\"\naccount = \"acct-a\"\n[[providers.codex.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n",
+            home.path().display()
+        );
+        let config = ProviderConfig::parse(&config, home.path()).unwrap();
+        let mut store = Store::open(home.path()).unwrap();
+        for (id, reference) in [("acct-a", "native:codex"), ("acct-b", "named:codex:b")] {
+            store
+                .register_account(&AccountRecord {
+                    account_id: id.parse().unwrap(),
+                    auth_family: "openai".parse().unwrap(),
+                    secret_ref: reference.parse().unwrap(),
+                    status: AccountStatus::Enabled,
+                })
+                .unwrap();
+        }
+        let error = provider_login_target(home.path(), &config, "codex", Some("acct-b"), false)
+            .err()
+            .expect("ambiguous selector is refused");
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        let by_label =
+            provider_login_target(home.path(), &config, "codex", Some("b"), false).unwrap();
+        assert_eq!(by_label.reply["account"], "acct-b");
+        let by_id =
+            provider_login_target(home.path(), &config, "codex", Some("acct-a"), false).unwrap();
+        assert_eq!(by_id.reply["account"], "acct-a");
+    }
 }
