@@ -77,6 +77,8 @@ pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
 ///
 /// `fds` are the inherited ready, identity and error descriptors.  The first
 /// heartbeat makes the complete ownership record eligible for later recovery.
+/// Execution errors are logged by fixed public class without persisting task
+/// text or credentials, including errors whose owned process prevents finish.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     crate::logging::configure(home, "supervisor");
     let [ready_fd, identity_fd, error_fd] = fds;
@@ -110,6 +112,16 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     match execute(home, id, &mut store).await {
         Ok(()) => Ok(()),
         Err(error) => {
+            if let Some(logger) = crate::logging::configured() {
+                logger.log(
+                    crate::logging::Level::Error,
+                    &format!(
+                        "supervisor execution failed agent_id={} class={}",
+                        id,
+                        error.public().kind
+                    ),
+                );
+            }
             let row = store.get(id)?;
             if !row.status.terminal() {
                 if row
@@ -587,6 +599,23 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let exit = process.reap().await;
         #[cfg(feature = "test-fixtures")]
         let cleanup = injected_cleanup_error(home, &attempt_id, store, cleanup)?;
+        match &cleanup {
+            Ok(proof) if !proof.confirmed => {
+                store.event(
+                    id,
+                    "process_cleanup_unverified",
+                    &serde_json::to_value(proof)?,
+                )?;
+            }
+            Err(error) => {
+                store.event(
+                    id,
+                    "process_cleanup_unavailable",
+                    &json!({"class":error.public().kind}),
+                )?;
+            }
+            _ => {}
+        }
         let cleanup = cleanup?;
         store.provider_cleanup(id, &attempt_id, &cleanup)?;
         store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;

@@ -4,6 +4,10 @@ Public semantics of the physical quota observation layer and the embedded
 Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
 `agent_run_store::quota`).
 
+A fresh schema-2 home with no providers returns a successful empty
+`capacity collect --once` result (`{"ok":true,"results":[]}`); it does not
+require either harness or a credential before a provider is configured.
+
 ## Observation layer (`capacity::quota`, `agent_run_store::quota`)
 
 * Collectors report **version-1 output**: `{ "version": 1, "windows": [ {
@@ -46,7 +50,11 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   window across collector source identities, so a script revision neither
   forks the pool nor strands the latch. Carried facts keep their original
   observation times; only the survival horizon extends (to the reset, or one
-  900 s TTL past the round).
+  900 s TTL past the round). If disjoint models report fresh zero for the same
+  physical window, its one shared latch keeps the later known reset; an
+  unknown reset remains unknown. This can conservatively block a newly
+  exhausted model until the older restriction expires, never release an older
+  model early.
 * Freshness, unknown data, and collection failure are distinct states; a
   failed collector never replaces good evidence, and read-only advice never
   fetches network or reserves.
@@ -68,7 +76,11 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   inside `pcall` still collapses within bounded ticks and the invocation
   returns a typed `Timeout`/`InstructionLimit` on its own. Native host work
   (such as bounded JSON conversion) cannot be preempted by a Lua hook; the
-  wall limit is cooperative, not a hard real-time deadline. No collector may
+  wall limit is cooperative, not a hard real-time deadline. Lua-to-Rust output
+  and `ctx.json.encode` first traverse tables with depth at most 64, at most
+  262,144 expanded values (including sparse array holes), bounded bytes, and
+  deadline checks; shared references count on every use and
+  cycles are rejected before serde conversion. No collector may
   use Lua pattern matching or coroutines. Registry compilation validates the
   same resource limits and rejects source larger than the VM memory bound.
 * `collect(ctx)` receives the nonsecret host-bound account identity, explicit
@@ -90,7 +102,8 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   set the configured credential header, `authorization`, `host`, `cookie`,
   `connection`, or `proxy-authorization`.
 * Response bodies and header values are scrubbed of the credential value
-  (plus any extra markers) before anything is exposed to Lua, so an
+  (plus any extra markers), and response header names containing credential
+  material are omitted before anything is exposed to Lua, so an
   endpoint echoing the injected secret cannot make it script-observable.
   Requests carrying injected credentials derive to a redacted `Debug`, as
   does the capability itself. Errors crossing the boundary are static typed
@@ -132,8 +145,9 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   identity surfaces as the typed `collector_unknown` round failure, and a
   first-party identity cannot be overridden by a script file. Custom
   scripts install through the retained-script registry under their
-  complete source identity — script id plus canonical script file — so two
-  configurations reusing one id never share code. The file is read through
+  complete source identity — script id plus the configured absolute path — so
+  two configurations reusing one id never share code. The path spelling stays
+  stable while a symlink target is missing or replaced. The file is read through
   a 256 KiB bound (never allocating past it); a replacement is installed
   only when it verifies and compiles, and each accepted revision is also
   kept at `capacity/scripts/<sha256(identity)>.lua`, so a missing,
@@ -266,12 +280,19 @@ id — the names each collector unit is built with) that window governs, in
 `payload_json.models`, per window rather than per pool, so a narrower window
 never inherits every model of its pool. Account selection, the `models` and
 `capacity_order` views and admission reservations consume that membership:
-a window governs a model only when its newest row names that model's lane;
-an older row's membership never authorizes a model the newest one dropped.
+a window governs a model only when its newest row names that model's lane.
+While an exhaustion latch remains active, a partial unknown, positive, or
+disjoint zero observation cannot shrink that window's recorded membership;
+the prior governed lanes remain until reset or fresh evidence covers them
+all. Other physical windows keep
+their own membership.
 Only rows with no recorded membership (written before membership was
 recorded) fall back to a pool id equal to the lane. All governing windows of
 all governing pools enter one model's score and exhaustion gates, and one
 pool is reserved once however many models or provider aliases it governs.
+Ranking merges sample history by account, physical key, source, and window;
+renaming a provider alias cannot turn one physical window into two competing
+forecasts. A different physical key remains a separate quota constraint.
 
 Membership is per window end to end: the normalizer gives each model only
 the windows whose output names it, and a normalized snapshot may therefore
@@ -279,7 +300,8 @@ show different subsets of one pool's windows under different models (one
 physical window repeated under several models must still carry the same
 fact). An exhaustion latch is carried through an incomplete round only into
 the models its window governed; it is never copied into another model that
-merely shares the pool.
+merely shares the pool. When a partial round carries the window into only a
+subset of those models, persistence retains the complete previous membership.
 
 Retention never deletes, for any latched physical window, that window's
 newest row in the ranker's `(observed_at, id)` order, so the latch keeps

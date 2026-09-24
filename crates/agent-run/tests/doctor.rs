@@ -196,6 +196,40 @@ fn python_doctor_validates_canonical_roles_from_shared_catalogs() {
     assert!(!codes.contains("mixed_role_assets"), "{codes:?}");
 }
 
+/// A schema-2 provider bound to an absent account is unusable even when its
+/// harness binary exists, so doctor must report it before an attempted start.
+#[test]
+fn schema_two_doctor_reports_unregistered_provider_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{0}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{0}/claude\"\n[providers.codex]\nharness = \"codex\"\nconnection = {{ kind = \"native\" }}\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex.models]]\nid = \"gpt\"\n[[providers.codex.bindings]]\nlabel = \"work\"\naccount = \"acct-missing\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    let mut store = agent_run::state::Store::initialize(home).unwrap();
+    let report = doctor::run(home).unwrap();
+    assert!(report.findings.iter().any(|finding| {
+        finding.code == "provider_bindings_invalid" && finding.severity == "error"
+    }));
+    store
+        .register_account(&agent_run_domain::catalog::AccountRecord {
+            account_id: "acct-missing".parse().unwrap(),
+            auth_family: "openai".parse().unwrap(),
+            secret_ref: "native:codex".parse().unwrap(),
+            status: agent_run_domain::catalog::AccountStatus::Enabled,
+        })
+        .unwrap();
+    let report = doctor::run(home).unwrap();
+    assert!(!report
+        .findings
+        .iter()
+        .any(|finding| finding.code == "provider_bindings_invalid"));
+}
+
 /// Mirrors `test_doctor.py::test_canary_handshake_ok_reports_a_completed_real_handshake`.
 #[test]
 fn python_doctor_cli_canary_proves_the_production_ready_handshake() {

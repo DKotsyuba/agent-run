@@ -29,7 +29,7 @@ recommendations = ["native subscription"]
 [[providers.codex.models]]
 id = "gpt"
 native_model = "gpt-native"
-params = {{ reasoning = "medium" }}
+params = {{ effort = "medium" }}
 allowed_params = {{ effort = ["medium", "high"] }}
 recommendations = ["coding"]
 restrictions = ["web_tools_disabled"]
@@ -113,6 +113,32 @@ fn v2_resolves_named_providers_without_secret_snapshot_values() {
     assert!(!snapshot.contains("keychain:fake"));
 }
 
+/// New configuration rejects unimplemented parameter keys, while an older
+/// frozen catalog carrying one remains readable for its existing run.
+#[test]
+fn old_frozen_model_parameters_remain_resolvable() {
+    let home = tempfile::tempdir().unwrap();
+    let valid = document(home.path());
+    assert!(ProviderConfig::parse(
+        &valid.replace(
+            "params = { effort = \"medium\" }",
+            "params = { reasoning = \"medium\" }"
+        ),
+        home.path(),
+    )
+    .is_err());
+    let mut frozen = ProviderConfig::parse(&valid, home.path()).unwrap();
+    let offering = &mut frozen
+        .providers
+        .get_mut(&"codex".parse().unwrap())
+        .unwrap()
+        .models[0];
+    offering.params.remove("effort");
+    offering.params.insert("reasoning".into(), "medium".into());
+    assert!(frozen.snapshot().is_ok());
+    assert!(frozen.resolve_catalog(accounts()).is_ok());
+}
+
 /// Structural, protocol, model, and account failures never yield a resolved catalog.
 #[test]
 fn v2_rejects_invalid_provider_contracts() {
@@ -142,6 +168,7 @@ fn v2_rejects_invalid_provider_contracts() {
             "allowed_params = { effort = [\"medium\", \"high\"] }",
             "allowed_params = { reasoning = [\"high\"] }",
         ),
+        valid.replace("params = { effort = \"medium\" }", "params = { reasoning = \"medium\" }"),
     ] {
         let parsed = ProviderConfig::parse(&invalid, home.path());
         assert!(

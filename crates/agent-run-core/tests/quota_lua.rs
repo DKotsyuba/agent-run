@@ -404,6 +404,7 @@ async fn echoed_credentials_are_scrubbed_before_lua_can_read_them() {
         200,
         &[
             ("x-echo-auth", SECRET),
+            (&format!("x-{SECRET}"), "reflected"),
             ("content-type", "application/json"),
         ],
         &echo,
@@ -414,6 +415,7 @@ collect = function(ctx)
   local r = ctx.http.request({{url = "https://api.test/quota"}})
   local body = ctx.json.decode(r.body)
   local leaked = (body.echo == "{SECRET}") or (r.headers["x-echo-auth"] == "{SECRET}")
+    or (r.headers["x-{SECRET}"] ~= nil)
   local v = body.remaining_percent
   if leaked then v = 55.0 end
   return {{ version = 1, windows = {{ {{ pool = "primary", window = "five_hour",
@@ -825,6 +827,38 @@ end
     };
     let snapshot = run(&script, limits, FakeHttp::new(vec![])).await.unwrap();
     assert_eq!(snapshot.models.len(), 1);
+}
+
+/// Deep but tiny Lua values must be stopped before Rust recursively expands
+/// them, both at collector output and inside the catchable JSON helper.
+#[tokio::test]
+async fn host_json_conversion_rejects_deep_values_before_expansion() {
+    let output = r#"collect = function(ctx)
+        local v = 'x'
+        for i = 1, 70 do v = {v} end
+        return {version = 1, windows = v}
+    end"#;
+    let error = run(output, fast(), FakeHttp::new(vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CollectorError::InvalidOutput("quota_output_overflow")
+    );
+
+    let encode = r#"collect = function(ctx)
+        local v = 'x'
+        for i = 1, 70 do v = {v} end
+        local ok = pcall(function() return ctx.json.encode(v) end)
+        if ok then error('deep JSON accepted') end
+        return {version = 1, windows = {{pool = 'primary', window = 'five_hour',
+            models = {'glm-4.7'}, remaining_percent = 1, observed_at = 1000}}}
+    end"#;
+    let snapshot = run(encode, fast(), FakeHttp::new(vec![])).await.unwrap();
+    assert_eq!(
+        snapshot.models[0].pools[0].windows[0].remaining_percent,
+        Some(1.0)
+    );
 }
 
 /// Encodes `text` as a quoted Lua string literal with escapes.

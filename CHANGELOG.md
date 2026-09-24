@@ -4,6 +4,20 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-09-24
+
+- fix(supervisor): settle verified descendant cleanup after the process group exits instead of losing runs when short-lived helpers finish moments later
+- fix(supervisor): record bounded cleanup failures and route supervisor errors to their component log without persisting task text or credentials
+- fix(delivery): use schema-2 retry policy after migration so a claimed notice reaches a durable result instead of repeating a validation failure
+- fix(transcript): redact launch credentials across Claude and Codex text fragments, tool output, native event diagnostics, and sealed answers before persistence
+- fix(transcript): preserve nonsecret streamed text, flush pending Codex fragments on terminal turns, and redact failures before truncation
+- fix(config): apply offered model effort defaults to the frozen launch while preserving caller replay intent; reject unsupported model parameter keys
+- fix(auth): refuse provider login selectors that ambiguously name one account label and another account id
+- fix(doctor): detect schema-2 provider bindings that cannot resolve against the registered accounts without mutating state
+- fix(capacity): treat a valid empty schema-2 provider catalog as a successful empty collection round
+- docs: align provider cutover and continuation guidance with the implemented Codex A→B proof and Claude-family refusal
+- 0.13.2 publishes a native artifact only for macOS Apple silicon; Linux x86-64 remains a non-blocking validation lane with no published artifact
+
 ## [0.13.1] - 2026-09-23
 
 - fix(claude): schema-2 Claude Code and custom gateway launches use the
@@ -27,8 +41,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   activity as the run proceeds
 - feat: explicit provider resume continues the recorded native session as a
   new logical child; an authoritative quota exhaustion switches a Codex run to
-  another account within the same logical run (Claude Code and custom
-  gateways refuse cross-account continuation)
+  another account within the same logical run. Claude-family routes refuse
+  cross-account continuation; a custom Codex gateway follows the Codex
+  harness contract when its frozen connection and native history verify
 - feat: one enforced overall run deadline, handoff checks serialized with
   cancellation, and proof-gated recovery of orphaned provider attempts
 - fix: quota pools are matched to models through recorded per-window

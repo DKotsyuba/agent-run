@@ -76,7 +76,9 @@ pub struct ProviderLaunchIdentity {
 
 impl ProviderLaunchIdentity {
     /// Reads only an explicit v2 identity and verifies its raw provider
-    /// request matches the staged record projection and replay digest.
+    /// request against the staged projection and replay digest. An omitted
+    /// effort may resolve to the frozen model default in newer admissions;
+    /// older rows whose effective effort stayed absent remain readable.
     pub fn read(row: &Record) -> Result<Self> {
         let identity: Self = serde_json::from_value(
             row.identity
@@ -84,13 +86,28 @@ impl ProviderLaunchIdentity {
                 .ok_or_else(|| invalid("provider launch identity is missing"))?,
         )
         .map_err(|_| invalid("provider launch identity is malformed"))?;
+        let configured_default = identity
+            .provider_config
+            .providers
+            .get(&identity.provider_request.provider)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.id == identity.provider_request.model)
+            })
+            .and_then(|model| model.params.get("effort"));
+        let effort_matches = identity.authority.effort == row.request.effort
+            && (identity.provider_request.effort == row.request.effort
+                || (identity.provider_request.effort.is_none()
+                    && configured_default == row.request.effort.as_ref()));
         if identity.provider_identity_version != 2
             || identity.provider_request.provider.as_str() != row.request.runtime
             || identity.provider_request.model != row.request.model
             || identity.provider_request.profile != row.request.profile
             || identity.provider_request.task != row.request.task
             || identity.provider_request.workdir != row.request.workdir
-            || identity.provider_request.effort != row.request.effort
+            || !effort_matches
             || identity.provider_request.request_id != row.request.request_id
             || identity.provider_request.orchestrator != row.request.orchestrator
             || identity
@@ -431,7 +448,11 @@ impl Service {
             .iter()
             .find(|model| model.id == request.model)
             .ok_or_else(|| invalid("model is not offered by provider"))?;
-        offering.permits_effort(request.effort.as_deref())?;
+        let effective_effort = request
+            .effort
+            .clone()
+            .or_else(|| offering.params.get("effort").cloned());
+        offering.permits_effort(effective_effort.as_deref())?;
         // Harness options run through the existing launch mechanisms: fast
         // is the codex service tier, output_schema the claude answer schema.
         if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
@@ -470,6 +491,7 @@ impl Service {
             request.account.as_ref().map(|label| label.as_str()),
         )?;
         let mut effective = request.storage_projection();
+        effective.effort = effective_effort.clone();
         effective.write = profile.write;
         effective.read_roots = profile.read_roots.clone();
         effective.required_constraints = profile.required_constraints.clone();
@@ -501,7 +523,7 @@ impl Service {
             harness: provider.harness,
             connection: provider.connection.clone(),
             model: request.model.clone(),
-            effort: request.effort.clone(),
+            effort: effective_effort,
             profile: profile.name,
             workdir: request.workdir.clone(),
             role_payload: role.to_payload(),
@@ -1320,7 +1342,7 @@ impl Service {
 /// Refuses a provider resume when the current configuration no longer
 /// permits the parent's frozen execution: the provider no longer runs the
 /// frozen harness through the frozen connection, the offering's native model
-/// alias changed, its configured effort choices exclude the requested effort, a
+/// alias changed, its configured effort choices exclude the frozen effective effort, a
 /// current hard model restriction is absent from the frozen role,
 /// the current canonical role no longer grants something the frozen role
 /// used (write, network, external read roots, a read root, a skill or MCP
@@ -1371,7 +1393,7 @@ pub(crate) fn current_policy_permits(
     {
         return refuse("native model alias");
     }
-    if now.permits_effort(request.effort.as_deref()).is_err() {
+    if now.permits_effort(authority.effort.as_deref()).is_err() {
         return refuse("effort");
     }
     let role =

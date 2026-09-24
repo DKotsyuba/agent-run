@@ -27,6 +27,11 @@ values. Native and named forms preserve the harness's own protected login and
 refresh lifecycle. File, environment, and Keychain values are read only when
 an authorized custom request is prepared.
 
+`agent-run auth` accepts a provider-local label or a global account id for a
+native-login provider. If the same spelling names the label of one binding
+and the global id of another, login refuses it as ambiguous before touching
+either protected credential store; use an unambiguous label or id.
+
 The quota-side Rust boundary is `Store::list_accounts()` or
 `Store::account(id)`, followed by
 `ProviderConfig::resolve_catalog(account_records)` and

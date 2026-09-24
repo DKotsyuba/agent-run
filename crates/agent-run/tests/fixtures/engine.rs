@@ -13,6 +13,7 @@ fn argument(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
+/// Runs one offline native-protocol scenario selected only by fixture task text.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // A detached helper mode used only by `fixture:descendant`: sleep past the
@@ -149,7 +150,7 @@ fn main() {
     native_history(&session, &task);
     // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
     // same JSON merely quoted in assistant text (which must not count).
-    let quota_frame = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1790200000},"uuid":"fixture-uuid","session_id":session});
+    let quota_frame = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":agent_run::domain::now() + 3600.0},"uuid":"fixture-uuid","session_id":session});
     if task == "fixture:quota" || task.starts_with("fixture:quota-then-") {
         emit(quota_frame.clone());
     }

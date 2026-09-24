@@ -338,10 +338,11 @@ pub struct ProviderModel {
     /// The harness-native model to invoke when it differs from `id`.
     #[serde(default)]
     pub native_model: Option<String>,
-    /// Textual request parameters such as effort choices and defaults.
+    /// Textual request defaults; the public config loader admits only `effort`.
     #[serde(default)]
     pub params: BTreeMap<String, String>,
-    /// Explicit accepted values for each orchestrator-selected parameter.
+    /// Explicit accepted values for selected parameters; the public loader
+    /// currently admits only `effort`.
     #[serde(default)]
     pub allowed_params: BTreeMap<String, Vec<String>>,
     /// Plain-text advisory recommendations; advisory only, never scoring.
@@ -353,8 +354,8 @@ pub struct ProviderModel {
 }
 
 impl ProviderModel {
-    /// Validates nonblank ids, textual parameter keys, and unique prose-free
-    /// invariants; recommendations may be empty.
+    /// Validates nonblank ids, textual parameter shape, and unique prose-free
+    /// invariants; older frozen catalogs may retain non-executable keys.
     pub fn validate(&self) -> Result<()> {
         external_model_id(&self.id)?;
         if let Some(native) = &self.native_model {

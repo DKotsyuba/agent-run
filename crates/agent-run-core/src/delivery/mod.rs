@@ -9,6 +9,7 @@ use crate::{
     state::Store,
     Result,
 };
+use agent_run_config::provider_config::ProviderConfig;
 use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -511,9 +512,13 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     }))
 }
 
-/// Persists one owned result and its immutable queue evidence in the same transaction.
+/// Persists one owned result and its immutable queue evidence in the same
+/// transaction, using the delivery policy from either supported config schema.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
-    let config = Config::load(home)?;
+    let delivery = match ProviderConfig::load(home) {
+        Ok((config, _)) => config.delivery,
+        Err(_) => Config::load(home)?.delivery,
+    };
     let mut store = Store::open(home)?;
     let tx = store
         .conn
@@ -529,8 +534,7 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     }
     let accepted = evidence.accepted();
     let ambiguous = evidence.ambiguous();
-    let exhausted =
-        config.delivery.max_attempts > 0 && claim.attempt >= config.delivery.max_attempts;
+    let exhausted = delivery.max_attempts > 0 && claim.attempt >= delivery.max_attempts;
     let failed = !accepted && (exhausted || evidence.classifier == "unsupported_transport");
     let state = if accepted {
         "delivered"
@@ -541,9 +545,9 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     };
     let next_attempt = if state == "retry_wait" {
         Some(
-            time + (config.delivery.retry_base_seconds
+            time + (delivery.retry_base_seconds
                 * 2f64.powi((claim.attempt.saturating_sub(1)).min(20) as i32))
-            .min(config.delivery.retry_cap_seconds),
+            .min(delivery.retry_cap_seconds),
         )
     } else {
         None

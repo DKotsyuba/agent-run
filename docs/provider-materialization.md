@@ -32,8 +32,11 @@ Native Codex uses the existing login and app-server invocation. Its selected
 `auth.json` link is bound per attempt outside the immutable asset manifest,
 so the same lineage home can retain history while the session consumer
 switches an account after verified cleanup. Native Claude keeps its native
-login/config directory. A fixture can prove the link and launch boundaries;
-real A→B native continuity remains unproven.
+login/config directory. Fixtures prove the link and launch boundaries; a
+disposable real two-login Codex A→B run also kept its native thread and
+recalled the parent turn. Claude-family cross-account continuation remains
+unverified and is refused. A real three-account rewrite and bound completion
+delivery were not qualified by that two-login run.
 
 Custom Codex writes only the supported Responses
 `model_provider = "agent_run_gateway"` settings and an `env_key` name into
@@ -47,11 +50,12 @@ or the durable role document. Both routes keep configured roots, MCP, hooks,
 native-setting guards, and model restrictions under the sealed role/assets
 checks.
 
-The current v1 consumer path remains intact until session dispatch switches
-to these APIs. Its compatibility-only removal points are
+Public `start` and `resume` use the provider path. Historical v1 rows retain
+their separate compatibility reader; they do not create a public runtime
+alias. Its compatibility-only removal points are
 `config::Adapter::Glm`, `adapters::glm::cli_model`,
 `materialize`'s old `Adapter::Glm` branch, the `fable`/GLM model mapping in
 `core::stream::plan_with_environment`, GLM-specific environment handling in
 `adapters::auth`, and the matching `core::supervisor` dispatch. The
-capacity source's legacy GLM mapping remains quota-side work. No public
-permanent GLM launch alias is promised by the v2 path.
+capacity source's legacy GLM mapping remains historical quota-side code. No
+public permanent GLM launch alias is promised by the v2 path.

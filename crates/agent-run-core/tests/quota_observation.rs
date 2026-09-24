@@ -579,3 +579,245 @@ fn same_window_name_from_two_sources_keeps_separate_membership() {
     assert_eq!(members("s1"), json!(["glm-4.7"]));
     assert_eq!(members("s2"), json!(["glm-4.6"]));
 }
+
+/// A partial unknown round cannot narrow the model set of a carried physical
+/// exhaustion latch; unrelated pool and source rows keep their own members.
+#[test]
+fn partial_unknown_keeps_all_exhausted_window_members() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let first = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.6"],
+         "remaining_percent":0.0,"reset_at":2500.0,"observed_at":1000.0},
+        {"pool":"secondary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":40.0,"reset_at":2500.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &first, 100, 1500.0).unwrap();
+    let partial = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],"observed_at":1600.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &partial, 100, 1600.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let members: String = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE quota_key='acct-main::primary' \
+         AND source='glm-native' AND window='five_hour' ORDER BY observed_at DESC,id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&members).unwrap()["models"],
+        json!(["glm-4.6", "glm-4.7"])
+    );
+    assert_eq!(latch_rows(home.path()), 1);
+    let definitions = serde_json::from_value(json!([{
+        "id":"fixture-provider","harness":"codex","connection":{"kind":"native"},
+        "auth_family":"openai","limits_source":"codex_appserver",
+        "models":[{"id":"fixture-b","native_model":"glm-4.6"}],
+        "bindings":[{"label":"main","account":"acct-main"}]
+    }]))
+    .unwrap();
+    let catalog = agent_run_domain::catalog::ProviderCatalog::new(
+        store.list_accounts().unwrap(),
+        definitions,
+    )
+    .unwrap();
+    let blocked = agent_run_core::capacity::provider_ranking::provider_candidates_at(
+        &store,
+        &catalog,
+        &"fixture-provider".parse().unwrap(),
+        "fixture-b",
+        None,
+        &BTreeSet::new(),
+        1600.0,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            blocked,
+            agent_run_domain::Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::QuotaExhausted { .. }
+            )
+        ),
+        "{blocked:?}"
+    );
+}
+
+/// A disjoint unknown observation cannot replace the only sample carrying
+/// an unsettled latch's model membership or make that model admissible.
+#[test]
+fn disjoint_unknown_keeps_exhausted_model_blocked() {
+    use agent_run_core::capacity::provider_ranking::provider_candidates_at;
+    use agent_run_domain::catalog::{ProviderCatalog, QuotaAdmissionError};
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let exhausted = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"reset_at":2500.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &exhausted, 100, 1500.0).unwrap();
+    let disjoint = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.6"],"observed_at":1600.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &disjoint, 100, 1600.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let members: String = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE quota_key='acct-main::primary' \
+         AND source='glm-native' AND window='five_hour' ORDER BY observed_at DESC,id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&members).unwrap()["models"],
+        json!(["glm-4.7"])
+    );
+    assert_eq!(latch_rows(home.path()), 1);
+    let definitions = serde_json::from_value(json!([{
+        "id":"fixture-provider","harness":"codex","connection":{"kind":"native"},
+        "auth_family":"openai","limits_source":"codex_appserver",
+        "models":[{"id":"fixture-a","native_model":"glm-4.7"},
+                  {"id":"fixture-b","native_model":"glm-4.6"}],
+        "bindings":[{"label":"main","account":"acct-main"}]
+    }]))
+    .unwrap();
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), definitions).unwrap();
+    let candidate = |model| {
+        provider_candidates_at(
+            &store,
+            &catalog,
+            &"fixture-provider".parse().unwrap(),
+            model,
+            None,
+            &BTreeSet::new(),
+            1600.0,
+        )
+    };
+    assert!(matches!(
+        candidate("fixture-a"),
+        Err(agent_run_domain::Error::QuotaAdmission(
+            QuotaAdmissionError::QuotaExhausted { .. }
+        ))
+    ));
+    let other = candidate("fixture-b").unwrap();
+    assert!(!other.candidates[0].quota_known);
+    assert!(other.candidates[0].physical_keys.is_empty());
+
+    let recovered = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":80.0,"reset_at":3000.0,"observed_at":1700.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &recovered, 100, 1700.0).unwrap();
+    assert_eq!(latch_rows(home.path()), 0);
+    let available = provider_candidates_at(
+        &store,
+        &catalog,
+        &"fixture-provider".parse().unwrap(),
+        "fixture-a",
+        None,
+        &BTreeSet::new(),
+        1700.0,
+    )
+    .unwrap();
+    assert!(available.candidates[0].quota_known);
+}
+
+/// A disjoint zero may widen one physical latch to both models, but its
+/// earlier reset must not shorten the older exhausted model's horizon.
+#[test]
+fn disjoint_zero_keeps_later_latch_reset_until_expiry() {
+    use agent_run_core::capacity::provider_ranking::provider_candidates_at;
+    use agent_run_domain::catalog::{ProviderCatalog, QuotaAdmissionError};
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let first = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"reset_at":2000.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &first, 100, 1100.0).unwrap();
+    let second = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.6"],
+         "remaining_percent":0.0,"reset_at":1500.0,"observed_at":1200.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &second, 100, 1200.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let reset: Option<f64> = store.conn.query_row(
+        "SELECT reset_at FROM quota_exhaustion WHERE account_id='acct-main' AND quota_key='acct-main::primary' AND source='glm-native' AND window_id='five_hour'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(reset, Some(2000.0));
+    let definitions = serde_json::from_value(json!([{
+        "id":"fixture-provider","harness":"codex","connection":{"kind":"native"},
+        "auth_family":"openai","limits_source":"codex_appserver",
+        "models":[{"id":"fixture-a","native_model":"glm-4.7"},
+                  {"id":"fixture-b","native_model":"glm-4.6"}],
+        "bindings":[{"label":"main","account":"acct-main"}]
+    }]))
+    .unwrap();
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), definitions).unwrap();
+    for model in ["fixture-a", "fixture-b"] {
+        let blocked = provider_candidates_at(
+            &store,
+            &catalog,
+            &"fixture-provider".parse().unwrap(),
+            model,
+            None,
+            &BTreeSet::new(),
+            1600.0,
+        );
+        assert!(
+            matches!(
+                blocked,
+                Err(agent_run_domain::Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaExhausted { .. }
+                ))
+            ),
+            "{model}"
+        );
+    }
+    let empty = normalize(&json!({"version":1,"windows":[]})).unwrap();
+    record_quota_snapshot(home.path(), "glm", &empty, 100, 2100.0).unwrap();
+    assert_eq!(latch_rows(home.path()), 0);
+    let available = provider_candidates_at(
+        &store,
+        &catalog,
+        &"fixture-provider".parse().unwrap(),
+        "fixture-a",
+        None,
+        &BTreeSet::new(),
+        2100.0,
+    )
+    .unwrap();
+    assert!(!available.candidates[0].quota_known);
+
+    let unknown_home = tempdir().unwrap();
+    agent_run_store::Store::initialize(unknown_home.path()).unwrap();
+    registered(unknown_home.path());
+    let no_reset = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(unknown_home.path(), "glm", &no_reset, 100, 1100.0).unwrap();
+    record_quota_snapshot(unknown_home.path(), "glm", &second, 100, 1200.0).unwrap();
+    let unknown_store = agent_run_store::Store::open(unknown_home.path()).unwrap();
+    let unknown_reset: Option<f64> = unknown_store.conn.query_row(
+        "SELECT reset_at FROM quota_exhaustion WHERE account_id='acct-main' AND quota_key='acct-main::primary' AND source='glm-native' AND window_id='five_hour'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(unknown_reset, None);
+}

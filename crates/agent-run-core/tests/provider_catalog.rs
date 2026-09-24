@@ -31,7 +31,7 @@ recommendations = ["{recommendation}"]
 [[providers.codex.models]]
 id = "gpt-main"
 native_model = "gpt-native"
-params = {{ reasoning = "medium" }}
+params = {{ effort = "medium" }}
 allowed_params = {{ effort = ["medium", "high"] }}
 recommendations = ["broad coding"]
 [[providers.codex.models]]
@@ -146,7 +146,7 @@ async fn catalog_is_revisioned_ordered_and_account_free() {
     let main = &codex["models"][0];
     assert_eq!(main["native_model"], "gpt-native");
     assert_eq!(main["allowed_params"]["effort"], json!(["medium", "high"]));
-    assert_eq!(main["params"]["reasoning"], "medium");
+    assert_eq!(main["params"]["effort"], "medium");
     assert_eq!(main["quota"]["status"], "unknown");
     assert_eq!(main["profiles"], json!(["code", "review"]));
     assert_eq!(

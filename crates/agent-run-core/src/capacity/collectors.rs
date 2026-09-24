@@ -137,7 +137,7 @@ impl AccountBackoff {
 /// Process-wide retained-script registry for configured custom collectors.
 ///
 /// Entries are keyed by the complete source identity (script id plus the
-/// canonical script file), so two configurations reusing one custom id never
+/// configured absolute script path), so two configurations reusing one custom id never
 /// share code. A revision is installed only when it verifies and compiles; a
 /// rejected replacement never displaces the retained valid revision. The
 /// durable copy under `capacity/scripts/` carries that guarantee across the
@@ -565,7 +565,7 @@ fn plan_catalog(catalog: &ProviderCatalog) -> Result<Vec<Planned>> {
 /// first-party identity with a script file is a typed conflict rather than a
 /// silent override. A custom identity runs the retained revision of its
 /// configured script file under its complete source identity (script id plus
-/// canonical file path): the file is read through a bound checked before any
+/// configured absolute path): the file is read through a bound checked before any
 /// allocation beyond it, its bytes are installed only when they verify and
 /// compile, and each accepted revision is also kept at
 /// `home/capacity/scripts/<sha256(identity)>.lua`. A missing, oversized, or
@@ -593,8 +593,7 @@ fn resolve_script(
     };
     let limits = CollectorLimits::default();
     let cap = limits.vm_memory_bytes.min(MAX_SCRIPT_BYTES);
-    let canonical = std::fs::canonicalize(&file).unwrap_or(file.clone());
-    let identity = format!("{}\n{}", unit.script, canonical.display());
+    let identity = format!("{}\n{}", unit.script, file.display());
     let digest: String = Sha256::digest(identity.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -842,11 +841,15 @@ pub(super) fn row_status(issues: &[String], windows: usize) -> &'static str {
 /// polling rounds. `ok` is true only when no row of either source failed and
 /// the ledger persisted; a ledger write failure is reported as the fixed
 /// `backoff_persist_failed` code. Report rows carry only static typed facts.
-/// There is no legacy fallback: a failed source stays failed.
+/// There is no legacy fallback: a failed source stays failed. An explicitly
+/// empty provider catalog succeeds without requiring either harness.
 pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<Value> {
     let store = agent_run_store::Store::open(home)
         .map_err(|_| Error::Runtime("account registry is unavailable".into()))?;
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
+    if catalog.providers().is_empty() {
+        return Ok(json!({"ok":true,"results":[]}));
+    }
     let limits = CollectorLimits::default();
     let client = Arc::new(
         crate::capacity::lua::ReqwestQuotaHttp::new(limits.http_response_body_bytes)

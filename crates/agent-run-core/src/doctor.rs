@@ -122,15 +122,12 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     };
     let config_path = report.home.join("config.toml");
     plaintext_secrets(&config_path, &mut report.findings);
-    let (config, provider_starts_configured) = match (
+    let (config, provider_config) = match (
         agent_run_config::provider_config::ProviderConfig::load(&report.home),
         Config::load(&report.home),
     ) {
-        (Ok((v2, _)), _) => {
-            let configured = !v2.providers.is_empty();
-            (providers(&v2, &mut report.findings), configured)
-        }
-        (_, Ok(config)) => (config, false),
+        (Ok((v2, _)), _) => (providers(&v2, &mut report.findings), Some(v2)),
+        (_, Ok(config)) => (config, None),
         (Err(_), Err(_)) => {
             add(
                 &mut report.findings,
@@ -145,7 +142,9 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     configuration(
         &config,
         &report.home,
-        provider_starts_configured,
+        provider_config
+            .as_ref()
+            .is_some_and(|config| !config.providers.is_empty()),
         &mut report.findings,
     );
     let snapshot = match state::diagnostics::diagnostic_snapshot(
@@ -175,6 +174,9 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
             return Ok(report);
         }
     };
+    if let Some(config) = &provider_config {
+        provider_bindings(config, &report.home, &mut report.findings);
+    }
     capacity(
         &config,
         &snapshot.capacity,
@@ -193,6 +195,39 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         dependencies.process_lister.as_ref(),
     );
     Ok(report)
+}
+
+/// Checks every configured provider binding against a WAL-aware, read-only
+/// account snapshot without exposing credential references in findings.
+fn provider_bindings(
+    config: &agent_run_config::provider_config::ProviderConfig,
+    home: &Path,
+    findings: &mut Vec<Finding>,
+) {
+    if config.providers.is_empty() {
+        return;
+    }
+    let ids = config
+        .providers
+        .values()
+        .flat_map(|provider| {
+            provider
+                .bindings
+                .iter()
+                .map(|binding| binding.account.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let valid = state::diagnostics::provider_accounts_snapshot(&home.join("state.db"), &ids)
+        .and_then(|accounts| config.resolve_catalog(accounts).map(drop));
+    if valid.is_err() {
+        add(
+            findings,
+            "provider_bindings_invalid",
+            "error",
+            "providers",
+            "provider bindings do not match the account registry",
+        );
+    }
 }
 
 /// Checks a valid schema-2 config: each harness executable, and an explicitly

@@ -21,7 +21,7 @@ use mlua::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
     pin::Pin,
@@ -46,6 +46,142 @@ pub const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Default and hard maximum output windows per invocation.
 pub const DEFAULT_OUTPUT_WINDOWS: usize = 256;
+
+/// Maximum nested Lua table depth converted by a Rust host operation.
+const MAX_CONVERSION_DEPTH: usize = 64;
+/// Maximum expanded Lua values converted by one Rust host operation.
+const MAX_CONVERSION_NODES: usize = 262_144;
+
+/// Static failure categories for a bounded Lua-to-Rust conversion preflight.
+enum ConversionFailure {
+    /// Expanded depth, node count, or approximate bytes exceeded its bound.
+    Overflow,
+    /// A cyclic table or unreadable table entry cannot be converted.
+    Malformed,
+    /// The invocation's wall deadline passed during synchronous traversal.
+    Timeout,
+}
+
+/// Counts expanded graph work before `mlua` recursively copies a Lua value.
+struct ConversionGuard {
+    /// Maximum aggregate scalar bytes and per-node overhead permitted.
+    bytes_limit: usize,
+    /// Aggregate bytes counted along every expanded edge, including repeats.
+    bytes: usize,
+    /// Number of expanded values visited, including shared subtrees again.
+    nodes: usize,
+    /// Tables currently on the traversal path, used to reject cycles.
+    active: BTreeSet<usize>,
+    /// Whole-invocation deadline also enforced inside this native work.
+    deadline: Instant,
+}
+
+impl ConversionGuard {
+    /// Visits one value and every table edge with bounded work and memory;
+    /// repeated references count repeatedly because conversion expands them.
+    fn visit(
+        &mut self,
+        value: &LuaValue,
+        depth: usize,
+    ) -> std::result::Result<(), ConversionFailure> {
+        if Instant::now() >= self.deadline {
+            return Err(ConversionFailure::Timeout);
+        }
+        self.nodes += 1;
+        self.bytes = self.bytes.saturating_add(16);
+        if depth > MAX_CONVERSION_DEPTH
+            || self.nodes > MAX_CONVERSION_NODES
+            || self.bytes > self.bytes_limit
+        {
+            return Err(ConversionFailure::Overflow);
+        }
+        match value {
+            LuaValue::String(text) => {
+                self.bytes = self.bytes.saturating_add(text.as_bytes().len());
+                if self.bytes > self.bytes_limit {
+                    return Err(ConversionFailure::Overflow);
+                }
+            }
+            LuaValue::Table(table) => {
+                // mlua serializes a table with a nonzero Lua array length by
+                // iterating every index, including holes absent from pairs.
+                let array_len = table.raw_len();
+                if array_len > MAX_CONVERSION_NODES {
+                    return Err(ConversionFailure::Overflow);
+                }
+                let mut present_array = 0usize;
+                let pointer = table.to_pointer() as usize;
+                if !self.active.insert(pointer) {
+                    return Err(ConversionFailure::Malformed);
+                }
+                for pair in table.pairs::<LuaValue, LuaValue>() {
+                    let (key, value) = pair.map_err(|_| ConversionFailure::Malformed)?;
+                    if matches!(&key, LuaValue::Integer(index) if *index > 0 && (*index as u64) <= array_len as u64)
+                    {
+                        present_array += 1;
+                    }
+                    self.visit(&key, depth + 1)?;
+                    self.visit(&value, depth + 1)?;
+                }
+                let holes = array_len.saturating_sub(present_array);
+                self.nodes = self.nodes.saturating_add(holes);
+                self.bytes = self.bytes.saturating_add(holes.saturating_mul(4));
+                if self.nodes > MAX_CONVERSION_NODES || self.bytes > self.bytes_limit {
+                    return Err(ConversionFailure::Overflow);
+                }
+                self.active.remove(&pointer);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Rejects cyclic, oversized, or overdue Lua graphs before serde expands them.
+fn check_lua_conversion(
+    value: &LuaValue,
+    bytes_limit: usize,
+    deadline: Instant,
+) -> std::result::Result<(), ConversionFailure> {
+    ConversionGuard {
+        bytes_limit,
+        bytes: 0,
+        nodes: 0,
+        active: BTreeSet::new(),
+        deadline,
+    }
+    .visit(value, 0)
+}
+
+/// Bounded host-conversion regressions using tiny in-memory Lua graphs.
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    /// A tiny shared DAG counts expanded work and a cycle remains malformed.
+    #[test]
+    fn repeated_reference_and_cycle_are_bounded() {
+        let lua = Lua::new();
+        let mut value = LuaValue::String(lua.create_string("x").unwrap());
+        for _ in 0..12 {
+            let table = lua.create_table().unwrap();
+            table.set(1, value.clone()).unwrap();
+            table.set(2, value).unwrap();
+            value = LuaValue::Table(table);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(matches!(
+            check_lua_conversion(&value, 4096, deadline),
+            Err(ConversionFailure::Overflow)
+        ));
+        let cycle = lua.create_table().unwrap();
+        cycle.set("self", cycle.clone()).unwrap();
+        assert!(matches!(
+            check_lua_conversion(&LuaValue::Table(cycle), 4096, deadline),
+            Err(ConversionFailure::Malformed)
+        ));
+    }
+}
 
 /// Hard ceiling every override is validated against; nothing can be raised past it.
 struct HardLimits;
@@ -728,6 +864,18 @@ impl HttpState {
         out
     }
 
+    /// Keeps response header names out of Lua when they contain credential
+    /// material; HTTP transports lowercase names, so compare ASCII folded
+    /// spellings while leaving ordinary names untouched.
+    fn safe_header_name(&self, name: &str) -> bool {
+        let folded = name.to_ascii_lowercase();
+        !self
+            .secrets
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .any(|secret| folded.contains(&secret.to_ascii_lowercase()))
+    }
+
     /// Returns the bounded `retry-after` seconds a throttled response
     /// declared, or `None` when absent, unparseable, or already past; longer
     /// horizons clamp to the 900 s ceiling. Both standard forms are
@@ -1061,6 +1209,9 @@ async fn invoke(
                         mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
                     })?;
                     for (name, value) in &response.headers {
+                        if !state.safe_header_name(name) {
+                            continue;
+                        }
                         header_table
                             .set(
                                 name.clone(),
@@ -1147,13 +1298,31 @@ async fn invoke(
                 .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))
         })
         .map_err(|_| CollectorError::Internal("context"))?;
+    let encode_latch = deadline_exceeded.clone();
     let encode = lua
         .create_function(move |lua, value: LuaValue| {
+            match check_lua_conversion(&value, json_bound, deadline) {
+                Ok(()) => {}
+                Err(ConversionFailure::Overflow) => {
+                    return Err(mlua::Error::RuntimeError("quota_json_overflow".into()));
+                }
+                Err(ConversionFailure::Malformed) => {
+                    return Err(mlua::Error::RuntimeError("quota_json_malformed".into()));
+                }
+                Err(ConversionFailure::Timeout) => {
+                    encode_latch.store(true, Ordering::SeqCst);
+                    return Err(mlua::Error::RuntimeError(WALL_SENTINEL.into()));
+                }
+            }
             let value: Value = lua
                 .from_value(value)
                 .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))?;
             let text = serde_json::to_string(&value)
                 .map_err(|_| mlua::Error::RuntimeError("quota_json_malformed".into()))?;
+            if Instant::now() >= deadline {
+                encode_latch.store(true, Ordering::SeqCst);
+                return Err(mlua::Error::RuntimeError(WALL_SENTINEL.into()));
+            }
             if text.len() > json_bound {
                 return Err(mlua::Error::RuntimeError("quota_json_overflow".into()));
             }
@@ -1229,9 +1398,20 @@ async fn invoke(
         .call_async::<LuaValue>(ctx)
         .await
         .map_err(map_lua_error)?;
+    match check_lua_conversion(&output, limits.vm_memory_bytes, deadline) {
+        Ok(()) => {}
+        Err(ConversionFailure::Overflow) => {
+            return Err(CollectorError::InvalidOutput("quota_output_overflow"));
+        }
+        Err(ConversionFailure::Malformed) => return Err(CollectorError::MalformedOutput),
+        Err(ConversionFailure::Timeout) => return Err(CollectorError::Timeout),
+    }
     let json = lua
         .from_value::<Value>(output)
         .map_err(|_| CollectorError::MalformedOutput)?;
+    if Instant::now() >= deadline {
+        return Err(CollectorError::Timeout);
+    }
     let snapshot = normalize_collector_output(
         account,
         scope,

@@ -148,7 +148,12 @@ The public `start` tool (CLI `agent-run start`, broker socket, MCP) takes a
 `write`, `read_roots`, `timeout_seconds`, `request_id`, `orchestrator` and
 `required_constraints`. When the offering configures
 `allowed_params.effort`, a chosen `effort` outside that list is a
-`ValidationError`. It is served by `Service::start_provider` inside the
+`ValidationError`. `params.effort` supplies the effective value when the caller
+omits it; the original omission stays in replay identity while the resolved
+value is frozen for execution and current-policy checks. New configuration
+rejects other model parameter keys because no launch adapter can apply them;
+older frozen snapshots remain readable for already-admitted runs. The request is
+served by `Service::start_provider` inside the
 resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
 `ValidationError`; there is no runtime alias. A repeated `request_id` returns
@@ -249,7 +254,14 @@ never-spawned result. Replays return the first admission before consulting
 changed configuration or quota state. This first path does not switch accounts
 automatically; historical version-one rows retain their existing read path.
 Claude Messages launches request partial stream events so live assistant text
-can be journaled while the engine is running.
+can be journaled while the engine is running. Both Claude-family and Codex
+producers withhold a bounded possible launch-secret suffix between text
+fragments, redact it before persistence, and flush it at the message boundary.
+Complete tool output, native event diagnostics, failure text, and answer proofs
+are sanitized before storage; unhandled native event text is omitted. Fragment
+redaction preserves nonsecret whitespace, Codex flushes pending text when a
+turn ends without an item completion, and failure text is redacted before its
+published length limit is applied.
 
 ## C4 Attempts and ownership (schema v17)
 

@@ -10,7 +10,7 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::str::FromStr;
 
 /// Decodes one trusted registry row into validated public identity types.
-fn account_record(
+pub(crate) fn account_record(
     (id, family, reference, status): (String, String, String, String),
 ) -> Result<AccountRecord> {
     Ok(AccountRecord {

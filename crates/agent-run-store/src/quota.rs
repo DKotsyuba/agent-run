@@ -264,11 +264,15 @@ pub fn retain_exhausted(
 /// `home` is the agent-run home whose store receives the write; `runtime`
 /// names the engine scope that observed the facts; the global account must
 /// be registered and is persisted explicitly in `account_id`/`quota_key`
-/// (with `target` kept as a legacy view mirror). One row is written per
+/// (with `target` kept as a legacy view mirror). At most one row is written per
 /// physical window with its full model membership in `payload_json`,
 /// however many configured models share the pool. The durable exhaustion
 /// latch is upserted for retained exhausted windows and cleared for released
-/// ones. Every mutating round — samples written, latch upserted, or latch
+/// ones. An unsettled latch's last membership is kept when a new disjoint
+/// nonzero observation would otherwise replace its only governing sample.
+/// Repeated zeros for an unsettled window keep the later reset, or an unknown
+/// reset if either report lacks one, across all governed models.
+/// Every mutating round — samples written, latch upserted, or latch
 /// cleared — advances `quota_capacity_revision` exactly once inside the same
 /// immediate transaction; a round that changes nothing leaves the revision
 /// and history untouched. `at` is the host clock the latch evaluates resets
@@ -312,7 +316,7 @@ pub fn record_quota_snapshot(
     let mut snapshot = snapshot.clone();
     retain_exhausted(&exhausted, &membership, &mut snapshot, &account, at)?;
 
-    // One physical window is persisted exactly once with its full model
+    // One physical window is selected at most once with its full model
     // membership, however many configured models share the pool.
     let mut physical: BTreeMap<(&str, &str, &str), &QuotaWindow> = BTreeMap::new();
     for model in &snapshot.models {
@@ -333,8 +337,9 @@ pub fn record_quota_snapshot(
     }
     // Membership is recorded per physical window, and only for the models
     // whose own view of that window is exactly the persisted fact: a narrower
-    // window never inherits every model of its pool, and a carried exhaustion
-    // never extends to a model that reported the window as unknown. It is
+    // window never inherits every model of its pool. An unsettled carried
+    // exhaustion also retains its previous members when this round omits
+    // some governed models. It is
     // keyed by the full physical identity (lane, source, window): the same
     // window name from another source (a carried latch after a source
     // switch) is a different fact with its own members.
@@ -353,8 +358,42 @@ pub fn record_quota_snapshot(
             }
         }
     }
+    for ((lane, source, name), governed) in &membership {
+        let identity = (lane.as_str(), source.as_str(), name.as_str());
+        if released.contains(&(lane.clone(), source.clone(), name.clone()))
+            || !physical
+                .get(&identity)
+                .is_some_and(|window| window.remaining_percent == Some(0.0))
+        {
+            continue;
+        }
+        if let Some(governed) = governed {
+            pool_models
+                .entry(identity)
+                .or_default()
+                .extend(governed.iter().map(String::as_str));
+        }
+    }
     let mut mutations = 0usize;
-    for (identity @ (lane, _source, _name), window) in &physical {
+    for (identity @ (lane, source, name), window) in &physical {
+        let old_key = (lane.to_string(), source.to_string(), name.to_string());
+        // A disjoint nonzero report cannot settle this latch. Persisting it
+        // as the newest row would erase the only membership that keeps the
+        // exhausted model blocked; retain the older row instead.
+        if window.remaining_percent != Some(0.0)
+            && !released.contains(&old_key)
+            && membership
+                .get(&old_key)
+                .and_then(Option::as_ref)
+                .is_some_and(|old| {
+                    !old.is_empty()
+                        && pool_models.get(identity).is_some_and(|current| {
+                            old.iter().all(|model| !current.contains(model.as_str()))
+                        })
+                })
+        {
+            continue;
+        }
         window.validate()?;
         let quota_key = format!("{}::{}", account.as_str(), lane);
         let models = pool_models
@@ -393,7 +432,8 @@ pub fn record_quota_snapshot(
     }
 
     // Durable latch maintenance: every currently exhausted physical window
-    // upserts its fact, and sample retention never erases the latch.
+    // upserts its fact, and sample retention never erases the latch. A
+    // conflicting zero cannot shorten a shared window's reset horizon.
     for ((lane, source, name), window) in &physical {
         if window.remaining_percent != Some(0.0)
             || window.reset_at.is_some_and(|reset| reset <= at)
@@ -408,7 +448,7 @@ pub fn record_quota_snapshot(
             "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at,collector_revision) \
              VALUES(?,?,?,?,?,?,NULL) \
              ON CONFLICT(account_id,quota_key,source,window_id) DO UPDATE SET \
-             observed_at=excluded.observed_at,reset_at=excluded.reset_at",
+             observed_at=excluded.observed_at,reset_at=MAX(quota_exhaustion.reset_at,excluded.reset_at)",
             params![
                 account.as_str(),
                 quota_key,

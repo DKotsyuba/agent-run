@@ -51,20 +51,95 @@ impl Redactor {
 
     /// Sanitizes text before it enters a transcript or bounded diagnostic tail.
     pub fn redact(&self, text: &str) -> String {
-        let mut safe = text.to_owned();
-        for literal in &self.literals {
-            safe = safe.replace(literal, "<redacted>");
-        }
-        let Ok(mut value) = serde_json::from_str::<Value>(safe.trim()) else {
-            return safe;
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            return redact_literals(text, &self.literals);
         };
-        redact_value(&mut value);
-        serde_json::to_string(&value).unwrap_or(safe)
+        serde_json::to_string(&self.redact_value(&value))
+            .unwrap_or_else(|_| redact_literals(text, &self.literals))
+    }
+
+    /// Sanitizes a parsed native event without losing literal matching to
+    /// JSON string escaping or leaking a secret used as an object key.
+    pub fn redact_value(&self, value: &Value) -> Value {
+        let mut safe = value.clone();
+        redact_value(&mut safe, &self.literals);
+        safe
+    }
+
+    /// Starts one message-local redactor that withholds possible secret prefixes
+    /// until a later fragment proves whether they complete a launch secret.
+    pub fn stream(&self) -> StreamingRedactor {
+        StreamingRedactor {
+            redactor: self.clone(),
+            pending: String::new(),
+        }
     }
 
     /// Returns the longest literal-secret byte length used to preserve tail overlap.
     fn overlap_bytes(&self) -> usize {
         self.literals.iter().map(String::len).max().unwrap_or(0)
+    }
+}
+
+/// Redacts launch secrets across adjacent text fragments before persistence.
+///
+/// The caller owns one instance per native message and must call [`Self::finish`]
+/// at its terminal boundary. At most one maximum-secret-length suffix is held
+/// in memory; earlier text is returned promptly and can be journaled.
+pub struct StreamingRedactor {
+    /// Launch-specific literal and JSON-field redaction policy.
+    redactor: Redactor,
+    /// Raw suffix that might still become a complete secret.
+    pending: String,
+}
+
+impl StreamingRedactor {
+    /// Adds the next UTF-8 fragment and returns only text safe to persist now.
+    /// A possible secret prefix remains buffered until more input or `finish`;
+    /// fragment text is never parsed as a complete JSON document.
+    pub fn feed(&mut self, fragment: &str) -> String {
+        if self.redactor.literals.is_empty() {
+            return fragment.to_owned();
+        }
+        let mut raw = std::mem::take(&mut self.pending);
+        raw.push_str(fragment);
+        let keep = self.redactor.overlap_bytes().saturating_sub(1);
+        let mut ready = raw.len().saturating_sub(keep);
+        while !raw.is_char_boundary(ready) {
+            ready -= 1;
+        }
+        let mut cursor = 0;
+        let mut safe = String::new();
+        while cursor < ready {
+            let next = self
+                .redactor
+                .literals
+                .iter()
+                .filter_map(|literal| {
+                    raw[cursor..]
+                        .find(literal)
+                        .map(|offset| (cursor + offset, literal))
+                })
+                .filter(|(start, _)| *start < ready)
+                .min_by(|(left, a), (right, b)| {
+                    left.cmp(right).then_with(|| b.len().cmp(&a.len()))
+                });
+            if let Some((start, literal)) = next {
+                safe.push_str(&raw[cursor..start]);
+                safe.push_str("<redacted>");
+                cursor = start + literal.len();
+            } else {
+                safe.push_str(&raw[cursor..ready]);
+                cursor = ready;
+            }
+        }
+        self.pending = raw[cursor..].to_owned();
+        redact_literals(&safe, &self.redactor.literals)
+    }
+
+    /// Resolves the last buffered suffix without normalizing unrelated text.
+    pub fn finish(&mut self) -> String {
+        redact_literals(&std::mem::take(&mut self.pending), &self.redactor.literals)
     }
 }
 
@@ -110,19 +185,31 @@ impl DiagnosticTail {
     }
 }
 
-/// Recursively removes string values whose object keys look credential-shaped.
-fn redact_value(value: &mut Value) {
+/// Replaces complete literal secrets in an ordinary UTF-8 text fragment.
+fn redact_literals(text: &str, literals: &[String]) -> String {
+    literals.iter().fold(text.to_owned(), |safe, literal| {
+        safe.replace(literal, "<redacted>")
+    })
+}
+
+/// Recursively removes launch secrets and string values under credential-shaped keys.
+fn redact_value(value: &mut Value, literals: &[String]) {
     match value {
         Value::Object(object) => {
-            for (name, value) in object {
-                if value.is_string() && is_secret_name(name) {
-                    *value = Value::String("<redacted>".into());
+            let original = std::mem::take(object);
+            for (name, mut nested) in original {
+                if nested.is_string() && is_secret_name(&name) {
+                    nested = Value::String("<redacted>".into());
                 } else {
-                    redact_value(value);
+                    redact_value(&mut nested, literals);
                 }
+                object.insert(redact_literals(&name, literals), nested);
             }
         }
-        Value::Array(values) => values.iter_mut().for_each(redact_value),
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| redact_value(value, literals)),
+        Value::String(text) => *text = redact_literals(text, literals),
         _ => {}
     }
 }

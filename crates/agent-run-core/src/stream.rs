@@ -1,7 +1,7 @@
 use crate::{commands, journal};
 use crate::{
     config::{Adapter, Config, Runtime},
-    domain::{Outcome, Status},
+    domain::{AgentId, Outcome, Status},
     error::invalid,
     profiles::Profile,
     state::{Record, Store},
@@ -10,10 +10,26 @@ use crate::{
 use agent_run_adapters::{
     io::{Event, Process},
     materialize::Snapshot,
+    redact::StreamingRedactor,
     EngineResult, LaunchPlan,
 };
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
+
+/// Flushes the unresolved suffix of one assistant message only after applying
+/// its launch-secret policy across all streamed fragment boundaries.
+fn flush_assistant(
+    store: &Store,
+    id: &AgentId,
+    redactor: &mut StreamingRedactor,
+    message_id: Option<&str>,
+) -> Result<()> {
+    let text = redactor.finish();
+    if !text.is_empty() {
+        journal(store, id, "assistant", &text, None, message_id)?;
+    }
+    Ok(())
+}
 
 /// Resolves the adapter environment and builds one isolated stream-JSON launch plan.
 ///
@@ -255,6 +271,7 @@ pub async fn run(
     // and assistant error controls, in protocol order).
     let mut signals = crate::adapters::native_failure::ClaudeSignals::default();
     let mut emitted = String::new();
+    let mut assistant_redactor = process.stream_redactor();
     let mut saw_delta = false;
     let mut saw_answer = false;
     // Identity of the assistant message currently being streamed: the native
@@ -331,6 +348,12 @@ pub async fn run(
         let v = match event {
             Event::Json(v) => v,
             Event::Eof => {
+                flush_assistant(
+                    store,
+                    &record.id,
+                    &mut assistant_redactor,
+                    message_id.as_deref(),
+                )?;
                 let code = process.reap().await;
                 if let Some(mut result) = final_result {
                     result.outcome.exit_code = code;
@@ -373,6 +396,12 @@ pub async fn run(
                 });
             }
             Event::Failure(e) => {
+                flush_assistant(
+                    store,
+                    &record.id,
+                    &mut assistant_redactor,
+                    message_id.as_deref(),
+                )?;
                 let code = process.reap().await;
                 let mut outcome = Outcome::failure(e);
                 outcome.exit_code = code;
@@ -410,6 +439,13 @@ pub async fn run(
                 let event = &v["event"];
                 match event.get("type").and_then(Value::as_str) {
                     Some("message_start") => {
+                        flush_assistant(
+                            store,
+                            &record.id,
+                            &mut assistant_redactor,
+                            message_id.as_deref(),
+                        )?;
+                        assistant_redactor = process.stream_redactor();
                         // A real message boundary: adopt the native message id
                         // as this message's durable identity, or mint one
                         // bounded producer fallback when the engine omits it.
@@ -440,14 +476,17 @@ pub async fn run(
                             saw_delta = true;
                             saw_answer = true;
                             emitted.push_str(text);
-                            journal(
-                                store,
-                                &record.id,
-                                "assistant",
-                                &process.redact(text),
-                                None,
-                                message_id.as_deref(),
-                            )?;
+                            let safe = assistant_redactor.feed(text);
+                            if !safe.is_empty() {
+                                journal(
+                                    store,
+                                    &record.id,
+                                    "assistant",
+                                    &safe,
+                                    None,
+                                    message_id.as_deref(),
+                                )?;
+                            }
                         }
                     }
                     _ => {}
@@ -505,15 +544,24 @@ pub async fn run(
                     };
                     if saw_delta {
                         if let Some(tail) = text.strip_prefix(&emitted) {
-                            journal(
-                                store,
-                                &record.id,
-                                "assistant",
-                                &process.redact(tail),
-                                None,
-                                identity.as_deref(),
-                            )?;
+                            let safe = assistant_redactor.feed(tail);
+                            if !safe.is_empty() {
+                                journal(
+                                    store,
+                                    &record.id,
+                                    "assistant",
+                                    &safe,
+                                    None,
+                                    identity.as_deref(),
+                                )?;
+                            }
                         }
+                        flush_assistant(
+                            store,
+                            &record.id,
+                            &mut assistant_redactor,
+                            identity.as_deref(),
+                        )?;
                     } else {
                         journal(
                             store,
@@ -526,6 +574,7 @@ pub async fn run(
                     }
                     saw_delta = false;
                     emitted.clear();
+                    assistant_redactor = process.stream_redactor();
                     // The completed message's identity ends with it; the next
                     // message_start establishes the next one.
                     message_id = None;
@@ -573,7 +622,7 @@ pub async fn run(
                 };
                 outcome.runtime_session_id = session.clone();
                 if outcome.status == Status::Failed {
-                    outcome.failure_text = text.clone();
+                    outcome.failure_text = text.as_deref().map(|value| process.redact(value));
                 }
                 if let Some(k) = text.as_deref().and_then(verify::error_only) {
                     outcome.status = Status::Failed;
@@ -595,7 +644,9 @@ pub async fn run(
                 final_result = Some(EngineResult {
                     native_failure: signals.terminal().filter(|_| failed),
                     outcome,
-                    answer: text.filter(|s| !s.is_empty()),
+                    answer: text
+                        .filter(|s| !s.is_empty())
+                        .map(|value| process.redact(&value)),
                     usage: Some(usage),
                 });
                 // The one-shot stream must close after its result; EOF plus exit status remains required.

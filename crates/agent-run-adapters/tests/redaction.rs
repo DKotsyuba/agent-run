@@ -36,3 +36,52 @@ fn diagnostic_tail_is_bounded_and_redacted() {
     assert!(text.len() <= 4096);
     assert!(!text.contains("tail-secret"));
 }
+
+/// A launch secret split at any stream boundary never reaches durable output.
+#[test]
+fn streaming_redaction_holds_partial_secrets_until_they_are_resolved() {
+    let redactor = Redactor::from_environment(&BTreeMap::from([(
+        "SERVICE_TOKEN".into(),
+        "synthetic-secret".into(),
+    )]));
+    let secret = "synthetic-secret";
+    for split in 1..secret.len() {
+        let mut stream = redactor.stream();
+        let first = stream.feed(&format!("before {}", &secret[..split]));
+        let second = stream.feed(&format!("{} after", &secret[split..]));
+        let visible = format!("{first}{second}{}", stream.finish());
+        assert_eq!(visible, "before <redacted> after", "split={split}");
+        assert!(!first.contains(&secret[..split]), "split={split}");
+    }
+}
+
+/// Parsed native events hide secrets even when JSON escaping changed their bytes.
+#[test]
+fn parsed_event_redaction_covers_escaped_values_and_keys() {
+    let redactor =
+        Redactor::from_environment(&BTreeMap::from([("SERVICE_TOKEN".into(), "a\"b".into())]));
+    let event = serde_json::json!({"a\"b":"a\"b","message":"a\"b"});
+    let safe = redactor.redact_value(&event).to_string();
+    assert!(!safe.contains("a\\\"b"));
+    assert!(safe.contains("<redacted>"));
+}
+
+/// Buffer boundaries cannot parse and reserialize ordinary message fragments.
+#[test]
+fn streaming_redaction_preserves_nonsecret_whitespace() {
+    let redactor = Redactor::from_environment(&BTreeMap::from([(
+        "API_TOKEN".into(),
+        "abcdefghijklmnop".into(),
+    )]));
+    let input = " 1 xxxxxxxxxxxxxxx";
+    let mut stream = redactor.stream();
+    assert_eq!(format!("{}{}", stream.feed(input), stream.finish()), input);
+}
+
+/// Native logins without environment secrets still keep text bytes intact.
+#[test]
+fn streaming_redaction_without_literals_preserves_text() {
+    let mut stream = Redactor::default().stream();
+    assert_eq!(stream.feed(" 1 "), " 1 ");
+    assert_eq!(stream.finish(), "");
+}
