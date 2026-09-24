@@ -21,10 +21,12 @@ only when the stored startup owner or supervisor is observed as dead or reused.
 
 The shared harness transport observes the primary child PID independently of
 stdout EOF, during startup RPC as well as streaming. On primary exit it sends
-TERM immediately to captured live descendants. Already-written output drains
-for at most 200ms; a descendant holding an inherited descriptor cannot keep the
-run waiting indefinitely. This deadline survives cancellation of a read by
-supervisor maintenance. The supervisor then performs bounded escalation and
+TERM immediately to captured live descendants. Queued output drains without
+counting downstream processing time as silence; each idle read after exit is
+limited to 200ms. Cancellation of a read does not reset its idle deadline.
+Captured writers still alive after two seconds receive KILL even if they keep
+producing output. The overall run deadline also bounds unobserved writers.
+The supervisor then completes bounded escalation and
 records the final cleanup proof. Normal protocol completion still follows the
 same supervisor cleanup path even if the primary PID has not exited yet.
 

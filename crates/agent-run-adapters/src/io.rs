@@ -59,8 +59,12 @@ pub struct Process {
     pub stderr_bytes: Arc<AtomicU64>,
     redactor: Redactor,
     diagnostic_tail: Arc<Mutex<DiagnosticTail>>,
-    /// Fixed drain deadline after primary-child exit; survives cancellation of `next`/RPC waits.
+    /// True once waitpid proves the primary exited, independent of stdout ownership.
+    primary_exited: bool,
+    /// Deadline of the current idle read after exit; survives cancellation, not consumer processing time.
     exit_drain_deadline: Option<tokio::time::Instant>,
+    /// One fixed escalation deadline for captured descendants still writing after primary exit.
+    exit_kill_deadline: Option<tokio::time::Instant>,
     /// Last descendant snapshot, shared by startup RPC and streaming reads.
     observed_at: tokio::time::Instant,
     /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
@@ -150,6 +154,8 @@ impl Process {
             redactor,
             diagnostic_tail,
             exit_drain_deadline: None,
+            primary_exited: false,
+            exit_kill_deadline: None,
             observed_at: tokio::time::Instant::now(),
             ownership_observer: None,
             ownership_revision: None,
@@ -251,17 +257,41 @@ impl Process {
     }
     /// Returns a retained notification or observes stdout and the primary PID together.
     pub async fn next(&mut self) -> Event {
-        if let Some(e) = self.backlog.pop_front() {
-            e
+        if !self.backlog.is_empty() {
+            if self.observe_primary_exit().is_err() {
+                return Event::Failure("engine_process_observation_failed");
+            }
+            if self.checkpoint_ownership().is_err() {
+                return Event::Failure("engine_process_ownership_failed");
+            }
+            self.backlog.pop_front().expect("checked backlog")
         } else {
             self.receive().await
         }
     }
+    /// Starts TERM on primary exit and escalates captured survivors after two seconds, even during output traffic.
+    fn observe_primary_exit(&mut self) -> Result<()> {
+        if !self.primary_exited && self.child.try_wait()?.is_some() {
+            self.primary_exited = true;
+            self.owner.signal_descendants(libc::SIGTERM);
+            self.input.take();
+            self.exit_kill_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+        }
+        if self
+            .exit_kill_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.owner.signal_descendants(libc::SIGKILL);
+            self.exit_kill_deadline = None;
+        }
+        Ok(())
+    }
     /// Begins descendant termination on observed primary exit, then drains already-written output.
     ///
-    /// A 200ms absolute deadline prevents inherited pipes from keeping the run alive.
-    /// The supervisor still owns escalation and final cleanup proof; cancelling this
-    /// receive future neither resets the deadline nor loses process observations.
+    /// Each idle wait after exit has a 200ms deadline, preserved across cancellation.
+    /// Receiving a frame ends that wait, so slow downstream processing cannot discard
+    /// queued output. A separate fixed deadline escalates captured writers; the run's
+    /// overall deadline also bounds any unobserved writers. The supervisor owns final proof.
     async fn receive(&mut self) -> Event {
         loop {
             let now = tokio::time::Instant::now();
@@ -269,35 +299,31 @@ impl Process {
                 self.owner.refresh();
                 self.observed_at = now;
             }
-            if self.exit_drain_deadline.is_none() {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => {
-                        self.owner.signal_descendants(libc::SIGTERM);
-                        self.input.take();
-                        self.exit_drain_deadline = Some(now + Duration::from_millis(200));
-                    }
-                    Ok(None) => {}
-                    Err(_) => return Event::Failure("engine_process_observation_failed"),
-                }
+            if self.observe_primary_exit().is_err() {
+                return Event::Failure("engine_process_observation_failed");
             }
             if self.checkpoint_ownership().is_err() {
                 return Event::Failure("engine_process_ownership_failed");
             }
-            if let Some(deadline) = self.exit_drain_deadline {
-                if tokio::time::Instant::now() >= deadline {
-                    return Event::Eof;
-                }
-                return tokio::select! {
+            if self.primary_exited {
+                let deadline = *self.exit_drain_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + Duration::from_millis(200)
+                });
+                let event = tokio::select! {
                     biased;
                     event = self.events.recv() => event.unwrap_or(Event::Eof),
                     _ = tokio::time::sleep_until(deadline) => Event::Eof,
                 };
+                if !matches!(event, Event::Eof) {
+                    self.exit_drain_deadline = None;
+                }
+                return event;
             }
             tokio::select! {
                 biased;
                 exit = self.child.wait() => {
                     if exit.is_err() { return Event::Failure("engine_process_observation_failed"); }
-                    // The next iteration records a single fixed deadline and TERM sweep.
+                    // The next iteration records exit and sends the first TERM sweep.
                 }
                 event = self.events.recv() => return event.unwrap_or(Event::Eof),
                 _ = tokio::time::sleep_until(self.observed_at + Duration::from_millis(200)) => {},
