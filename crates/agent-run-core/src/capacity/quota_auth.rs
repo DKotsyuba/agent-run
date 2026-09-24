@@ -4,7 +4,7 @@
 //! references go through the shared [`SystemCredentialReader`] unchanged, and
 //! the Claude harness's own OAuth store is read for native/named Claude logins
 //! through exactly the account-home convention the harness adapters launch
-//! with. Tokens never reach Lua, configuration, diagnostics, or the store; the
+//! with. Tokens reach only the selected executable over private stdin, never configuration, diagnostics, or the store; the
 //! custom-gateway reader keeps refusing native logins for gateway headers.
 
 use crate::adapters::materialize::claude_account_config;

@@ -84,7 +84,7 @@ pub struct ProviderSettings {
     pub priority_multiplier: PositiveFinite,
     /// Explicit collector selection for capacity observations.
     pub limits_source: LimitsSource,
-    /// Explicit first-party collector binding; required for the Lua source.
+    /// External command binding; required for the exec source.
     #[serde(default)]
     pub collector: Option<CollectorBinding>,
 }
@@ -317,6 +317,12 @@ impl ProviderConfig {
             }
         }
         for (id, provider) in &self.providers {
+            if matches!(
+                provider.limits_source,
+                LimitsSource::Lua | LimitsSource::CodexAppserver
+            ) {
+                return Err(invalid("built-in quota collectors are retired; configure limits_source = exec and collector.command"));
+            }
             if !self.harnesses.contains_key(&provider.harness) {
                 return Err(invalid("provider names an undeclared harness"));
             }

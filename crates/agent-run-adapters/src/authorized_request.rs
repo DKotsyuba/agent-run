@@ -1,7 +1,7 @@
 //! Origin-bound HTTP authorization for explicit custom provider accounts.
 //!
-//! The Rust quota consumer can send requests through this capability; Lua
-//! receives only sanitized response facts and never a credential string.
+//! Inference gateways use this capability; external quota commands receive their
+//! selected account context separately over a private stdin pipe.
 
 use agent_run_domain::{
     catalog::{
@@ -21,7 +21,8 @@ use std::str::FromStr;
 use url::Url;
 
 /// Resolves one credential only inside Rust at request time. Implementations
-/// must not log, persist, or serialize the returned bytes.
+/// must not log or persist the returned bytes; authorized child input may carry
+/// them over a private pipe.
 pub trait CredentialReader {
     /// Returns live credential bytes for an explicit env/file/Keychain
     /// reference, or a safe error when unavailable; native logins stay owned

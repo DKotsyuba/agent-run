@@ -1311,7 +1311,7 @@ mod tests {
         std::fs::write(
             home.path().join("config.toml"),
             format!(
-                "schema_version = 2\n[harnesses.codex]\nbinary = '/bin/true'\nhome = '{0}/codex'\n[harnesses.claude-code]\nbinary = '/bin/true'\nhome = '{0}/claude'\n[providers.codex]\nharness = 'codex'\nconnection = {{ kind = 'native' }}\nauth_family = 'openai'\nlimits_source = 'codex_appserver'\n[[providers.codex.models]]\nid = 'gpt'\n[[providers.codex.bindings]]\nlabel = 'global'\naccount = 'acct'\n",
+                "schema_version = 2\n[harnesses.codex]\nbinary = '/bin/true'\nhome = '{0}/codex'\n[harnesses.claude-code]\nbinary = '/bin/true'\nhome = '{0}/claude'\n[providers.codex]\nharness = 'codex'\nconnection = {{ kind = 'native' }}\nauth_family = 'openai'\nlimits_source = 'none'\n[[providers.codex.models]]\nid = 'gpt'\n[[providers.codex.bindings]]\nlabel = 'global'\naccount = 'acct'\n",
                 home.path().display()
             ),
         )

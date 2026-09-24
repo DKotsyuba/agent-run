@@ -663,9 +663,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 store.latch_native_exhaustion(
                     &account,
                     identity.authority.provider.as_str(),
-                    lane,
-                    window,
-                    "claude-rate-limit-event",
+                    &lane,
+                    &window,
+                    "native-quota-exhaustion",
                     &governed_lanes(&identity, &account),
                     domain::now(),
                     reset,
@@ -982,7 +982,7 @@ fn history_root(
 fn latch_mapping(
     identity: &ProviderLaunchIdentity,
     failure: &adapters::native_failure::NativeFailure,
-) -> Option<(&'static str, &'static str)> {
+) -> Option<(String, String)> {
     let adapters::native_failure::NativeFailure::QuotaExhausted {
         window: Some(window),
         ..
@@ -994,20 +994,18 @@ fn latch_mapping(
         .provider_config
         .providers
         .get(&identity.authority.provider)?;
-    if identity.authority.harness != HarnessId::ClaudeCode
-        || provider.limits_source != agent_run_domain::LimitsSource::Lua
-        || provider.collector.as_ref()?.script != "anthropic_usage"
-    {
+    if provider.limits_source != agent_run_domain::LimitsSource::Exec {
         return None;
     }
-    match window.as_str() {
-        "five_hour" => Some(("primary", "five_hour")),
-        "seven_day" => Some(("secondary", "seven_day")),
-        _ => None,
-    }
+    let pool = provider
+        .collector
+        .as_ref()?
+        .exhaustion_windows
+        .get(window)?;
+    Some((pool.clone(), window.clone()))
 }
 
-/// The model lanes (native alias, else id) a general `anthropic_usage` pool
+/// The model lanes (native alias, else id) an explicitly configured native exhaustion pool
 /// of `account` governs for this provider: every provider model the
 /// account's bindings admit, exactly as that collector builds its unit.
 fn governed_lanes(

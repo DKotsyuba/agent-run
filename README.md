@@ -41,27 +41,24 @@ The home defaults to `~/.agent-run`; override it with `AGENT_RUN_HOME` or
 
 ## Configure
 
-Configuration lives in `<home>/config.toml`. Unknown agent-run keys and
-reserved native control fields fail closed. Runtime aliases are `codex`,
-`claude`, and `glm`.
+Configuration lives in `<home>/config.toml`. Schema 2 declares native harnesses,
+named providers, explicit models and account bindings. See
+[provider configuration](docs/provider-config-v2.md) for a complete example.
+Each provider selects its external quota executable:
 
 ```toml
-schema_version = 1
-
-[runtimes.codex]
-enabled = true
-adapter = "codex"
-binary = "/absolute/path/to/codex"
-home = "/absolute/path/to/agent-run-home/runtimes/codex"
-models = ["gpt-5.6-sol"]
-limits_source = "codex_appserver"
+# Inside an existing provider declaration:
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/glm.sh"], source = "glm-quota" }
 ```
 
-Per-runtime configuration supports declared auth sources, skills, MCP servers,
-hooks, plugins, native engine settings, and capacity sources. Credential values
-do not belong in this file. The resident broker hashes the file every minute
-and reloads valid changes; new requests also check immediately. Invalid changes
-leave the last valid configuration active.
+The same contract accepts Python scripts or native programs: private JSON on
+stdin, normalized quota JSON on stdout. The native archive includes external
+scripts under `collectors/`; those examples require Bash/jq, plus curl for HTTP.
+See [quota collectors](docs/quota-collectors.md) for credentials, dependencies,
+the output contract and migration from retired Lua/app-server settings.
+Credentials stay in protected account stores. The broker checks configuration
+every minute and on requests; invalid revisions keep the last valid settings.
 
 Initialize and inspect the installation:
 

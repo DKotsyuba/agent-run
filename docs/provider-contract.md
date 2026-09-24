@@ -19,16 +19,12 @@ them from `agent_run_domain::catalog` rather than redefining business types.
   settings, allowed parameter values, plain-text recommendations, and typed
   preserved restrictions. There is no model intelligence, classification, or
   scoring in the catalog.
-* V2 capacity source kinds are `codex_appserver`, `lua`, and `none`.
-  `codex_appserver` is accepted only on the codex harness with a native
-  connection whose bound accounts are native or named Codex logins; any
-  other combination is refused at catalog resolution because the app-server
-  probe could never observe it. A
-  `lua` source must additionally bind an explicit `CollectorBinding`: a
-  first-party collector script identity plus one to eight exact HTTPS (or
-  fixture loopback HTTP) origins. Neither a script identity nor a
-  credential identity is ever inferred from a provider's name; an unknown
-  script identity is a typed collection failure, not a guess.
+* Current capacity sources are `exec` and `none`. An exec source names an
+  absolute executable and literal arguments through `CollectorBinding`.
+  The command receives versioned private JSON on stdin and returns the common
+  observation envelope on stdout. Provider endpoints and response formats live
+  in external files. Old source spellings deserialize only for frozen historical
+  runs; fresh configurations must migrate.
 * A registered account (`AccountRecord`) has an immutable global opaque
   `AccountId`, an auth family, a secret *reference*, and a status. A provider
   binding (`ProviderBinding`) carries a validated `AccountLabel`, an optional
@@ -430,14 +426,12 @@ tries to continue the same logical run on another account:
   one logical slot, and yields one final answer and delivery.
 - A blocked switch ends the run failed with `quota_exhausted` and
   `failover_blocked: <reason>`.
-- Exhaustion feeds the durable latch only where the provider's own collector
-  mapping identifies the physical pool: a Claude Code provider using the
-  `anthropic_usage` collector latches `five_hour` as `primary`/`five_hour`
-  and `seven_day` as `secondary`/`seven_day` (source
-  `claude-rate-limit-event`). Codex's windowless `usageLimitExceeded`,
-  model-scoped weekly windows and overage only exclude the account for this
-  run. The ranker resolves lanes by model alias, so collector-keyed pools
-  like these are not yet consulted during selection.
+- Exhaustion feeds the durable latch only when `collector.exhaustion_windows`
+  explicitly identifies the physical pool for that native window. The mapping
+  governs the account's eligible model lanes and is journaled under
+  `native-quota-exhaustion`. Windowless or unmapped failures exclude the account
+  for that run without inventing a shared pool. Ranking consumes the stored
+  per-window model membership.
 
 ### One run deadline, handoff serialization and recovery
 

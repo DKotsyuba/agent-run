@@ -150,7 +150,7 @@ async fn retired_codexbar_source_requires_migration_and_keeps_samples() {
     assert_eq!(report["ok"], false);
     let row = &report["results"][0];
     assert_eq!(row["status"], "failed");
-    assert_eq!(row["issues"][0], sources::CODEXBAR_RETIRED);
+    assert_eq!(row["issues"][0], sources::COLLECTOR_RETIRED);
     assert!(!marker.exists(), "the retired binary must never run");
     let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
     let kept: i64 = conn

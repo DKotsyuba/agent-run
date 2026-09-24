@@ -1,9 +1,8 @@
 # Provider configuration v2
 
 Schema v2 declares two native harnesses and any number of named providers.
-New capacity source kinds are `codex_appserver`, `lua`, and `none`; older
-v1 source names are migration input only. Lua collection configuration is
-owned by the quota integration.
+Capacity sources are `exec` and `none`. Every collector is an external
+executable explicitly selected by its provider; no collector code is embedded.
 Provider ids are operator-chosen; names such as `codex-plus` and `glm` carry
 no built-in subscription or model-intelligence meaning. The orchestrator
 selects a configured model id. Profiles, skills, and MCP definitions remain
@@ -26,7 +25,8 @@ home = "/var/lib/agent-run/claude"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
 recommendations = ["Use for coding work."]
 
 [[providers.codex.models]]
@@ -44,7 +44,8 @@ account = "acct-personal"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
 priority_multiplier = 5.0
 
 [[providers.codex-plus.models]]
@@ -60,7 +61,8 @@ models = ["gpt"]
 harness = "claude-code"
 connection = { kind = "custom", endpoint = "https://gateway.example/api/anthropic", protocol = "messages" }
 auth_family = "anthropic"
-limits_source = "lua"
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/glm.sh"], source = "glm-quota" }
 
 [[providers.glm.models]]
 id = "glm-5.3"
@@ -103,3 +105,11 @@ The [provider materialization contract](provider-materialization.md) names
 the sealed adapter APIs that consume this configuration.
 The [one-time migration plan](provider-migration.md) requires explicit
 runtime, model, account, and harness mappings before any later apply step.
+
+## External quota execution
+
+For current configurations, use `limits_source = "exec"` and a collector with
+an absolute `command` and optional literal `args`, or `limits_source = "none"`.
+The former `lua` and `codex_appserver` choices are retired. See
+[the executable contract](quota-collectors.md) for stdin/stdout, credentials,
+script installation, source identity and replacement behavior.

@@ -24,7 +24,7 @@ upgrade it unpaired); the broker refuses to start the same way.
 Write one mapping file. It names the two harnesses, declares every global
 account by nonsecret reference (no credential value is read), and maps each v1
 runtime to its provider id, harness, connection, auth family, v2 limits source
-(and collector for `lua`), an explicit native model for every historical
+(and executable collector for `exec`), an explicit native model for every historical
 model, the account for requests that omitted an account (`global_account`), an
 account for every v1 label, and optional recommendation prose:
 
@@ -46,7 +46,8 @@ provider = "codex"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
 global_account = "acct-codex-native"
 labelled_accounts = { personal2 = "acct-codex-personal2" }
 [runtimes.codex.native_models]

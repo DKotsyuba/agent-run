@@ -1,151 +1,68 @@
 # config
 
-`config.toml` declares runtime binaries/models, one profile directory, one skill
-catalog, and shared MCP definitions. It contains references, never credential
-values.
+Schema 2 separates native harnesses, named providers and global accounts.
+Configuration contains nonsecret references, never token values. Register each
+account before using its id in a provider binding.
 
 ```toml
-schema_version = 1
-
-[profiles]
-directory = "/absolute/path/to/profiles"
-
-[skills]
-directory = "/absolute/path/to/skills"
-
-[mcp.codegraph]
-transport = "stdio"
-command = "/absolute/path/to/codegraph"
-args = ["mcp"]
-approval_mode = "auto"
-
-[runtimes.codex]
-enabled = true
-adapter = "codex"
+schema_version = 2
+[harnesses.codex]
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
-workspace_roots = ["/absolute/path/to/projects", "/absolute/path/to/worktrees"]
-workspace_network = true
-models = ["gpt-6-astra"]
-accounts = ["personal2"]
-limits_source = "codex_appserver"
+[harnesses.claude-code]
+binary = "/absolute/path/to/claude"
+home = "/absolute/path/to/agent-run/claude"
 
-[runtimes.codex.native_settings]
+[providers.codex]
+harness = "codex"
+connection = { kind = "native" }
+auth_family = "openai"
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
+[[providers.codex.models]]
+id = "gpt-6-sol"
+[[providers.codex.bindings]]
+label = "main"
+account = "acct-codex-native"
+```
+
+Quota collection executes the configured command and literal arguments.
+Python, Bash and native programs share one JSON stdin/stdout contract. Stdin
+contains account identity, explicit model scope, time and protected authentication
+context. Stdout must be a single version-1 quota document. Never put credentials
+in arguments or script logs. Example scripts remain external files under
+`collectors/` in the native archive and require Bash/jq, plus curl for HTTP.
+
+The collector's `timeout_seconds` defaults to 30 (1–300 allowed). `env_from`
+grants additional environment variable names. Missing commands, nonzero exit,
+timeout, oversized output and invalid quota facts fail without replacing the
+last good observations. `limits_source = "none"` disables collection. Former
+`lua` and `codex_appserver` sources require migration; there is no built-in
+fallback. Account aliases share observations and failure backoff.
+
+Canonical Markdown profiles select skills, MCP servers, permissions and required
+constraints. Shared `[mcp.<name>]` declarations contain a transport, command,
+arguments and optional environment names; profiles select their ids. Harnesses
+own native settings, hooks, plugins and workspace roots. Provider models carry
+explicit native aliases, effort settings, recommendations and restrictions.
+
+Tune an existing harness without overriding managed permissions:
+
+```toml
+[harnesses.codex.native_settings]
 model_context_window = 500000
 model_auto_compact_token_limit = 400000
 ```
 
-Revisioned Markdown profiles own write/network grants, external read-root
-policy, skills, MCP selection, and required constraints. `agent-run init`
-creates the valid profile identifiers `role-review`, `role-architect`, and
-`role-code`. Model policy is separate from general profile validity:
-`gpt-6-astra` accepts only the exact read-only profile IDs `review` and
-`architect`. A generally valid ID such as `role-review` is rejected for that
-model. Compatibility profiles and runtime `skills`/`mcp` lists remain readable,
-but canonical and compatibility asset declarations cannot be mixed.
-Qwen is no longer a runtime: a Qwen adapter identifier is rejected with a
-deprecation error, and the runtime must be removed from `config.toml`.
+Managed controls such as provider routing, credentials, sandbox and MCP selection
+cannot be overridden through native settings. Workspace roots and network grants
+remain explicit; read-only roles do not inherit write access. A write role under
+one authorized root receives the configured root set. `workspace_network = true`
+requires workspace roots and retains the harness's normal approval policy.
 
-`workspace_roots` affects write-capable Codex profiles only. Their workdir must
-be inside at least one configured tree; read-only profiles do not inherit write
-access. A write role admitted under one root receives write access to every
-configured root. The legacy singular `workspace_root = "..."` declaration is still
-accepted and normalizes to one root; declaring both forms is rejected.
-`workspace_network = true` explicitly enables shell network in that Projects
-profile and keeps `curl` behind Codex's normal approval reviewer; it defaults
-to false and requires at least one configured workspace root.
-MCP `approval_mode = "approve"` is appropriate only for a locally trusted server
-whose own runtime enforces downstream permissions.
-
-Omitting an account uses native global auth. An explicit label selects separate
-credential state. Compatibility-only `default_account`, environment, and Rust
-declarations remain readable but do not provision tools or redirect unlabelled
-starts; remove them from new configurations.
-
-`runtimes.<name>.native_settings` retunes a runtime's own generated preference
-file (Codex `config.toml` or Claude/GLM `settings.json`)
-from this common config, without rebuilding the broker. The
-table attaches to a runtime you have already declared with its mandatory
-fields; for example, under an existing claude block:
-
-```toml
-[runtimes.claude.native_settings]
-spinnerTipsEnabled = false
-```
-
-Values may be strings, booleans, integers, finite floats, arrays, or nested
-tables; keys are plain identifiers without dots. Codex defaults to a
-1,000,000-token context window and 780,000-token total compaction limit; a
-declared key overrides its default, and omitted keys keep it. Reserved control
-roots are rejected with a validation error instead of being applied: model and
-reasoning-effort selection, provider and auth routing, credentials and
-environment (including `shell_environment_policy`, `notify`, `apiKeyHelper`,
-and the AWS/GCP credential helpers), sandbox, permissions, approvals, hooks and
-hook-disablement, and MCP and plugin enablement. Those
-stay owned by agent-run or the runtime's security model. An
-unknown-but-unreserved key (Codex `model_verbosity`, for instance) is accepted
-as a plain tuning value; that is a convenience, not a safety claim about every
-upstream key. Never place secret values in `native_settings`: auth and
-credential sources are never resolved through it, but the table is persisted
-verbatim in the config snapshot. Edit the TOML, parse it, and run
-`agent-run doctor`: the broker compares the file's SHA-256 every 60 seconds and
-loads a changed valid revision without restarting. New starts and continuations
-also check immediately; malformed changes are rejected instead of replacing the
-last valid cached revision. Existing sessions keep the immutable config they
-were prepared with. The config snapshot records the declared settings, so a
-change alters snapshot identity and forces regeneration on the next launch.
-
-In a `schema_version = 2` home, `agent-run capacity collect` polls
-account-scoped quota sources only: each registered account is observed once
-per round however many provider aliases bind it. `limits_source = "lua"`
-providers bind a collector (`glm_quota`, `anthropic_usage`, or a custom
-`script_file` with an explicit `auth` placement); `codex_appserver` providers
-are probed through the account's own reference (`native:codex` or
-`named:codex:<label>`), never a provider label; they must use the codex
-harness and a native connection. Native and named Claude
-accounts read only their own login store, with no fallback to the default
-login. Failures report fixed codes such as `credential_unavailable`, the
-round's `ok` is false when any source failed, and a v2 config that fails to
-load is an error rather than a switch to legacy sources. See
-`docs/quota-collectors.md` for the per-source window mapping.
-
-CodexBar is retired. Schema 2 rejects `capacity.codexbar_binary` and a
-`codexbar` limits source. A schema-1 file that still declares them keeps
-parsing so the one-time migration can read it, but a `codexbar` runtime is
-never invoked: each round reports it failed with
-`codexbar_retired_migration_required` and keeps its earlier samples.
-
-A labelled Claude login (`agent-run auth`/`login --account <label>`) is stored
-in `accounts/claude/<label>/claude-config` under the agent-run home, the same
-directory runs and quota collection read. A login made by an earlier release
-at `<runtime home>@<label>/claude-config` keeps working in place; if both
-directories exist the label is ambiguous and fails until one is removed.
-
-After manual edits, parse the TOML and run `agent-run doctor`. Doctor checks
-binaries and role assets; runtime start does not run language-toolchain
-readiness probes.
-
-## One-time paired migration to schema 2
-
-A schema-1 home moves to schema 2 together with its state database through
-`agent-run config migrate`; see the `migrations` topic for the mapping file,
-the refusals, snapshots, recovery and rollback.
-
-## New homes and native login
-
-`agent-run init` on a home without `config.toml` writes the explicitly empty
-schema-2 catalog `schema_version = 2` (no harness, provider or account;
-`models` lists nothing and nothing can start until they are declared). A
-schema-1 `config.toml` never initializes a new state database. `doctor`
-reports such a home as `provider_catalog_empty` (information), not as an
-invalid configuration; a configured schema-2 home is checked through its
-harness executables.
-
-In a schema-2 home, `agent-run auth <account> <provider>` and
-`agent-run login <provider> [--account <account>]` take a native-connection
-provider id and one of its bindings, by provider-local label or global
-account id (optional when the provider binds exactly one). The login runs the
-provider's harness executable against the bound account's own storage:
-`native:<harness>` is the harness's global login, `named:codex:<label>` is
-`accounts/codex/<label>`, `named:claude-code:<label>` the labelled Claude
-directory. `login` accepts Claude Code providers only.
+The broker checks configuration every 60 seconds and at request boundaries.
+Invalid revisions retain the last valid configuration. Existing runs keep their
+frozen settings; new runs receive the validated revision. Script edits are read
+on each collection and do not require a binary rebuild. Use `agent-run doctor`
+to inspect configuration and freshness, and `agent-run capacity collect --once`
+to execute one collection round.

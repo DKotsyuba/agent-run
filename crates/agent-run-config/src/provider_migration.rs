@@ -39,9 +39,9 @@ pub struct RuntimeMapping {
     pub connection: ProviderConnection,
     /// Exact credential family of all mapped accounts.
     pub auth_family: AuthFamily,
-    /// New v2 source: codex_appserver, lua, or none.
+    /// New v2 source: exec or none.
     pub limits_source: LimitsSource,
-    /// Explicit first-party collector binding for a Lua source; supplied by
+    /// Explicit external command binding for an exec source; supplied by
     /// the mapping caller because a script identity is never inferred from a
     /// runtime name.
     #[serde(default)]

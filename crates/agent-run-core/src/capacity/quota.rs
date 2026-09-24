@@ -1,6 +1,6 @@
 //! Version-1 collector output normalization into host-bound quota snapshots.
 //!
-//! The collector engine (see [`super::lua`]) produces raw JSON facts; this
+//! The collector engine (see [`super::executable`]) produces raw JSON facts; this
 //! module binds them to one global account and validates them through
 //! [`NormalizedQuotaSnapshot::validate`] before any persistence or scoring.
 //! Freshness, unknown data, and collection failure stay distinct: a malformed

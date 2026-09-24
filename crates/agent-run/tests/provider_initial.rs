@@ -2711,13 +2711,13 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
         let (_temp, home) = home();
         edit_config(&home, |config| {
             let provider = config["providers"]["glm-user"].as_table_mut().unwrap();
-            provider.insert("limits_source".into(), "lua".into());
+            provider.insert("limits_source".into(), "exec".into());
             let mut collector = toml::map::Map::new();
-            collector.insert("script".into(), "anthropic_usage".into());
-            collector.insert(
-                "origins".into(),
-                toml::Value::Array(vec!["https://gateway.example".into()]),
-            );
+            collector.insert("command".into(), "/bin/true".into());
+            let mut windows = toml::map::Map::new();
+            windows.insert("five_hour".into(), "primary".into());
+            windows.insert("seven_day".into(), "secondary".into());
+            collector.insert("exhaustion_windows".into(), toml::Value::Table(windows));
             provider.insert("collector".into(), toml::Value::Table(collector));
         });
         let service = Service::new(home.clone());
@@ -2747,7 +2747,7 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
                 vec![(
                     "acct-work::primary".to_owned(),
                     "five_hour".to_owned(),
-                    "claude-rate-limit-event".to_owned()
+                    "native-quota-exhaustion".to_owned()
                 )],
                 "{task}"
             );
@@ -3219,18 +3219,44 @@ async fn codex_source_buckets_govern_bound_models() {
     let at = agent_run::domain::now();
     let models: std::collections::BTreeSet<String> = ["fixture".to_owned()].into();
     for (account, used) in [("acct-cx-a", 100.0), ("acct-cx-b", 20.0)] {
+        use std::io::Write;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
+        let mut parser = std::process::Command::new("jq")
+            .args(["-e", "-L"])
+            .arg(&root)
+            .args(["--argjson", "ctx"])
+            .arg(serde_json::json!({"models":{"fixture":{}},"now":at}).to_string())
+            .arg("-f")
+            .arg(root.join("codex.jq"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let response = serde_json::json!({"rateLimitsByLimitId":{"codex":{
             "primary":{"usedPercent":used,"windowDurationMins":300,"resetsAt":at + 3600.0}
         }}});
-        let (snapshot, skipped) = agent_run::capacity::codex_quota::codex_snapshot(
+        parser
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(response.to_string().as_bytes())
+            .unwrap();
+        let output = parser.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let scope = agent_run::capacity::quota::CollectorScope {
+            runtime: "codex-user".into(),
+            source: "codex-appserver".into(),
+            models: models.clone(),
+        };
+        let snapshot = agent_run::capacity::quota::normalize_collector_output(
             &account.parse().unwrap(),
-            "codex-user",
-            &models,
-            &response,
+            &scope,
+            &serde_json::from_slice(&output.stdout).unwrap(),
             at,
+            256,
+            256,
         )
         .unwrap();
-        assert_eq!(skipped, 0);
         agent_run::state::quota::record_quota_snapshot(&home, "codex-user", &snapshot, 100, at)
             .unwrap();
     }

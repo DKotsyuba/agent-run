@@ -188,7 +188,7 @@ provider = "codex"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "none"
 global_account = "acct-codex-native"
 labelled_accounts = {{ personal2 = "acct-codex-personal2" }}
 [runtimes.codex.native_models]

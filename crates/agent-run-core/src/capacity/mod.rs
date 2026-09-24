@@ -1,9 +1,8 @@
 //! Quota snapshots, exact physical-pool identities and pure read-only ranking.
 //! A failed collector never replaces good evidence with an invented zero.
 pub mod advice;
-pub mod codex_quota;
 pub mod collectors;
-pub mod lua;
+pub mod executable;
 pub mod omniroute;
 pub mod provider_catalog;
 pub mod provider_ranking;

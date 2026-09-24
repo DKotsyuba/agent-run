@@ -72,8 +72,9 @@ Native process identity and signalling are described in
   and stores the native thread identity for continuation.
 - **Claude** and **GLM** use their supported native CLI protocols and retain the
   corresponding session identity when continuation is available.
-- Engine binaries and authentication remain external. agent-run never embeds
-  provider credentials or invokes an engine outside its adapter and supervisor.
+- Engine binaries and authentication remain external. Agent tasks execute through
+  adapters and the supervisor. Quota metadata comes from separately configured,
+  bounded executables; the shipped Codex collector starts no model turn.
 
 `resume` admits a new durable row linked to the latest terminal run and reuses
 the native conversation only after its immutable authority and generated-home

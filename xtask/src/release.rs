@@ -44,7 +44,7 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Creates a sealed release from an already-built native binary.
 ///
-/// The resulting `releases/<version>` contains only the binary, metadata,
+/// The resulting `releases/<version>` contains the binary, external collectors, metadata,
 /// SHA256SUMS and COMPLETE marker. Existing complete releases are verified and
 /// reused; incomplete candidates are rejected to retain forensic evidence.
 pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, String> {
@@ -61,6 +61,16 @@ pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, Str
     }
     fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
     fs::copy(binary, release.join("bin/agent-run")).map_err(|error| error.to_string())?;
+    // Collector code remains ordinary files: never compile it into the executable.
+    let collectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/collectors");
+    fs::create_dir(release.join("collectors")).map_err(|error| error.to_string())?;
+    for relative in files(&collectors).map_err(|error| error.to_string())? {
+        let destination = release.join("collectors").join(&relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::copy(collectors.join(&relative), destination).map_err(|error| error.to_string())?;
+    }
     let metadata = format!(
         "{{\"version\":{version:?},\"format\":1,\"schema_version\":{SUPPORTED_SCHEMA_VERSION}}}\n"
     );
@@ -107,6 +117,8 @@ mod tests {
         fs::write(&binary, "native binary").expect("fixture binary");
         let release = build(temporary.path(), "0.12.0", &binary).expect("sealed release");
         verify(&release).expect("valid manifest");
+        assert!(release.join("collectors/codex.sh").is_file());
+        assert!(release.join("collectors/glm.jq").is_file());
         assert_eq!(
             super::schema_version(&release).expect("metadata schema"),
             agent_run_platform::release::STORE_SCHEMA_VERSION as u64,
