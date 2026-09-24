@@ -90,7 +90,8 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   set the configured credential header, `authorization`, `host`, `cookie`,
   `connection`, or `proxy-authorization`.
 * Response bodies and header values are scrubbed of the credential value
-  (plus any extra markers) before anything is exposed to Lua, so an
+  (plus any extra markers), and response header names containing credential
+  material are omitted before anything is exposed to Lua, so an
   endpoint echoing the injected secret cannot make it script-observable.
   Requests carrying injected credentials derive to a redacted `Debug`, as
   does the capability itself. Errors crossing the boundary are static typed

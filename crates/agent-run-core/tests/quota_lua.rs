@@ -404,6 +404,7 @@ async fn echoed_credentials_are_scrubbed_before_lua_can_read_them() {
         200,
         &[
             ("x-echo-auth", SECRET),
+            (&format!("x-{SECRET}"), "reflected"),
             ("content-type", "application/json"),
         ],
         &echo,
@@ -414,6 +415,7 @@ collect = function(ctx)
   local r = ctx.http.request({{url = "https://api.test/quota"}})
   local body = ctx.json.decode(r.body)
   local leaked = (body.echo == "{SECRET}") or (r.headers["x-echo-auth"] == "{SECRET}")
+    or (r.headers["x-{SECRET}"] ~= nil)
   local v = body.remaining_percent
   if leaked then v = 55.0 end
   return {{ version = 1, windows = {{ {{ pool = "primary", window = "five_hour",

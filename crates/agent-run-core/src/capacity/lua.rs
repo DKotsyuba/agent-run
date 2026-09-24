@@ -728,6 +728,18 @@ impl HttpState {
         out
     }
 
+    /// Keeps response header names out of Lua when they contain credential
+    /// material; HTTP transports lowercase names, so compare ASCII folded
+    /// spellings while leaving ordinary names untouched.
+    fn safe_header_name(&self, name: &str) -> bool {
+        let folded = name.to_ascii_lowercase();
+        !self
+            .secrets
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .any(|secret| folded.contains(&secret.to_ascii_lowercase()))
+    }
+
     /// Returns the bounded `retry-after` seconds a throttled response
     /// declared, or `None` when absent, unparseable, or already past; longer
     /// horizons clamp to the 900 s ceiling. Both standard forms are
@@ -1061,6 +1073,9 @@ async fn invoke(
                         mlua::Error::RuntimeError(format!("{HTTP_SENTINEL}transport"))
                     })?;
                     for (name, value) in &response.headers {
+                        if !state.safe_header_name(name) {
+                            continue;
+                        }
                         header_table
                             .set(
                                 name.clone(),
