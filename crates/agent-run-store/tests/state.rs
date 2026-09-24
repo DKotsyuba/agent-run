@@ -403,41 +403,12 @@ fn newer_database_version_is_refused_without_upgrade() {
     );
 }
 #[test]
-/// Replays reconciliation, provider and service migrations over a reconstructed schema-15 store.
+/// Opens a real historical schema-15 fixture and upgrades it through every current migration.
 fn legacy_database_version_is_migrated_on_open() {
-    // Schema 15 is three migrations behind current: drop their additions and stamp the store
-    // back to v15, then confirm `Store::open` upgrades it transparently
-    // instead of refusing it (see crates/agent-run-store/src/migrations.rs,
-    // ported from src/agent_run/state/migrations.py).
     let h = common::Home::new();
-    {
-        let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
-        db.execute_batch(
-            "DROP TABLE process_members; DROP TABLE process_ownership; \
-             DROP TABLE managed_service_probes; DROP TABLE managed_service_leases; DROP TABLE agent_service_gates; DROP TABLE managed_service_generations; \
-             DROP TRIGGER attempt_quota_keys_account_guard; \
-             DROP TRIGGER attempts_selected_account_immutable; \
-             DROP TRIGGER attempt_quota_keys_immutable; \
-             DROP INDEX idx_attempts_one_active; DROP INDEX idx_attempts_selected_account; \
-             DROP INDEX idx_attempt_quota_keys_key; DROP TABLE attempt_quota_keys; \
-             DROP INDEX idx_capacity_samples_account_key; \
-             ALTER TABLE capacity_samples DROP COLUMN quota_key; \
-             ALTER TABLE capacity_samples DROP COLUMN account_id; \
-             ALTER TABLE attempts DROP COLUMN selected_account_id; \
-             ALTER TABLE attempts DROP COLUMN phase; \
-             ALTER TABLE attempts DROP COLUMN process_identity; \
-             ALTER TABLE attempts DROP COLUMN process_birth_time; \
-             ALTER TABLE attempts DROP COLUMN cleanup_proof_json; \
-             ALTER TABLE attempts DROP COLUMN session_facts_json; \
-             ALTER TABLE attempts DROP COLUMN ownership_active; \
-             ALTER TABLE agents DROP COLUMN selection_intent; \
-             ALTER TABLE agents DROP COLUMN requested_account_id; \
-             DROP TABLE quota_exhaustion; DROP TABLE provider_accounts; DROP TABLE quota_capacity_revision; \
-             DROP INDEX idx_agents_request_id; DROP TABLE reconciliation_cursors; \
-             PRAGMA user_version=15;",
-        )
-        .unwrap();
-    }
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/baseline/db/historical-v15.sqlite");
+    std::fs::copy(fixture, h.path.join("state.db")).unwrap();
     let store = Store::open(&h.path).unwrap();
     assert_eq!(
         store.health().unwrap()["schema_version"],
