@@ -44,8 +44,13 @@ historical process tree: a process may detach before any snapshot sees it.
 Cleanup sends TERM to the verified group and captured live descendants immediately.
 After a short caller-selected grace it sends KILL to remaining verified identities.
 Bounded observation retries then allow exit and transient inspection states to
-settle. Captured identities currently live in the supervisor's memory; recovery
-after its loss cannot reconstruct an escaped child from an already-dead leader.
+settle. Current provider supervisors checkpoint newly captured identities in
+SQLite during startup RPC, streaming and final cleanup. Recovery restores these
+snapshots even when the original leader has exited; every signal still requires
+a fresh identity check. Old attempts without snapshots retain the conservative
+leader-only recovery path. No migration reconstructs an escaped child that was
+never captured, and observations not yet checkpointed when a supervisor crashes
+cannot be recovered from an already-dead leader.
 If the required proof cannot be established, a provider attempt keeps
 its ownership and records a bounded cleanup diagnostic for investigation.
 

@@ -235,8 +235,10 @@ const UNRESOLVED_EVENT_EXISTS_SQL: &str =
 /// * a recorded confirmed cleanup proof is simply honoured;
 /// * a `prepared` attempt that never recorded a child closes with exact
 ///   never-spawned evidence;
+/// * a persisted ownership snapshot restores individually verified members
+///   even after the leader exits, and releases only on confirmed cleanup;
 /// * a recorded leader that still observes as the same process (token and
-///   birth) is re-adopted and its verified group terminated; ownership is
+///   birth) is re-adopted when no snapshot exists and its verified group terminated; ownership is
 ///   released only when the cleanup evidence is confirmed.
 ///
 /// A dead, reused, unknown or denied leader is never signalled. When
@@ -310,6 +312,7 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
     }
     let rows: Vec<OwnedAttempt> = rows.into_iter().map(|(attempt, _)| attempt).collect();
     for attempt in rows {
+        let saved_processes = store.remembered_processes("attempt", &attempt.id)?;
         let confirmed = attempt
             .proof
             .as_deref()
@@ -319,6 +322,30 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
             _ if confirmed && attempt.phase.as_deref() == Some("cleanup_complete") => Ok(None),
             (None, _, _) if attempt.phase.as_deref() == Some("prepared") => {
                 Ok(Some(json!({"never_spawned":true,"reconciled":true})))
+            }
+            (Some(token), Some(birth), Some(pid)) if saved_processes.is_some() => {
+                let mut owned = saved_processes.expect("checked persisted ownership");
+                let matches_attempt = owned.leader.as_ref().is_some_and(|root| {
+                    root.pid == pid
+                        && root.group == pid
+                        && root.token == *token
+                        && root.birth == birth
+                });
+                if !matches_attempt {
+                    Err("stored_process_identity_mismatch")
+                } else {
+                    // The original root may be gone: captured detached children
+                    // still receive their own fresh PID/token/birth checks.
+                    match owned.cleanup_blocking(ORPHAN_GRACE) {
+                        Ok(cleanup) if cleanup.confirmed => {
+                            let mut proof = serde_json::to_value(&cleanup)?;
+                            proof["reconciled"] = json!(true);
+                            Ok(Some(proof))
+                        }
+                        Ok(_) => Err("cleanup_unconfirmed"),
+                        Err(_) => continue,
+                    }
+                }
             }
             (Some(token), Some(birth), Some(pid)) if pid > 1 => {
                 match process::observe(Some(pid), Some(token), Some(birth)) {

@@ -44,6 +44,15 @@ async fn spawn(tail: &str) -> (Fixture, process::Identity) {
 #[tokio::test]
 async fn leader_exit_closes_stream_without_waiting_for_descendant_eof() {
     let (mut fixture, child) = spawn("printf '%s\\n' '{\"result\":\"done\"}'; exit 0").await;
+    let captures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = captures.clone();
+    fixture
+        .0
+        .observe_ownership(move |snapshot| {
+            recorded.lock().unwrap().push(snapshot.members.len());
+            Ok(())
+        })
+        .unwrap();
     fixture.0.text("finish\n").await.unwrap();
     let Event::Json(value) = fixture.0.next().await else {
         panic!("final result lost");
@@ -55,6 +64,11 @@ async fn leader_exit_closes_stream_without_waiting_for_descendant_eof() {
         "leader exit must end the stream promptly: {ended:?}"
     );
     assert_eq!(fixture.0.reap().await, Some(0));
+    assert_eq!(
+        *captures.lock().unwrap(),
+        vec![2],
+        "unchanged observations must not rewrite durable snapshots"
+    );
     assert_eq!(
         process::observe(Some(child.pid), Some(&child.token), Some(child.birth)),
         ProcessState::Dead

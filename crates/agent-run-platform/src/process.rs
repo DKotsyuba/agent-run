@@ -557,6 +557,10 @@ impl OwnedProcess {
             descendants_observed: self.descendants_observed,
         })
     }
+    /// Returns the append-only capture revision without cloning identities, for change-only persistence.
+    pub fn capture_revision(&self) -> (usize, bool) {
+        (self.known.len(), self.descendants_observed)
+    }
     /// Restores previously recorded evidence; every future signal still requires a fresh kernel identity check.
     /// Rejects malformed identities, duplicate members or a missing/mismatched original root.
     pub fn restore(snapshot: OwnershipSnapshot) -> Result<Self> {

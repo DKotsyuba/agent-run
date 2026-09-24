@@ -236,6 +236,16 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(selected, "acct-work");
     assert_eq!(active, 0);
     assert!(cleanup.is_some() && process.is_some());
+    let captured = store
+        .remembered_processes("attempt", &attempt)
+        .unwrap()
+        .expect("provider supervisor checkpoints ownership");
+    let captured = captured.snapshot().unwrap();
+    assert!(captured.descendants_observed);
+    assert_eq!(Some(&captured.leader.token), process.as_ref());
+    assert!(!serde_json::to_string(&captured)
+        .unwrap()
+        .contains("synthetic-token"));
     let attached: i64 = store
         .conn
         .query_row(

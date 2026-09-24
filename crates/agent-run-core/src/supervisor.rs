@@ -365,6 +365,8 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
 
 /// Runs one admitted v2 attempt through the existing detached supervisor,
 /// process-identity fence, transcript, cleanup verifier, and terminal outbox.
+/// Checkpoints observed root/descendant identities on change, including final
+/// cleanup, so recovery retains captured members after this supervisor exits.
 async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     if store.cancel_pending(id)? {
         if !store.provider_never_spawned(id)? {
@@ -545,6 +547,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 .as_ref()
                 .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
             store.provider_process(id, &attempt_id, leader)?;
+            let ownership_home = home.to_owned();
+            let ownership_attempt = attempt_id.clone();
+            process.observe_ownership(move |snapshot| {
+                Store::open(&ownership_home)?.remember_processes(
+                    "attempt",
+                    &ownership_attempt,
+                    snapshot,
+                )
+            })?;
             if switched {
                 // The logical run is already running; its start time (and
                 // so any deadline) is kept. No user entry is journaled.
@@ -596,7 +607,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
         };
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
+        let checkpoint = process.checkpoint_ownership();
         let exit = process.reap().await;
+        checkpoint?;
         #[cfg(feature = "test-fixtures")]
         let cleanup = injected_cleanup_error(home, &attempt_id, store, cleanup)?;
         match &cleanup {

@@ -5,7 +5,10 @@ use crate::{
     LaunchPlan,
 };
 use agent_run_domain::{Error, Result};
-use agent_run_platform::{frame, process::OwnedProcess};
+use agent_run_platform::{
+    frame,
+    process::{OwnedProcess, OwnershipSnapshot},
+};
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
@@ -24,6 +27,9 @@ use tokio::{
 };
 /// Maximum UTF-8 JSON-RPC line retained from an engine before failing closed.
 pub const ENGINE_FRAME: usize = 8 * 1024 * 1024;
+
+/// Synchronous durable checkpoint installed by the supervisor; receives identity metadata only.
+type OwnershipObserver = Box<dyn FnMut(&OwnershipSnapshot) -> Result<()> + Send>;
 
 /// One bounded result from the engine stdout reader.
 #[derive(Debug)]
@@ -57,6 +63,10 @@ pub struct Process {
     exit_drain_deadline: Option<tokio::time::Instant>,
     /// Last descendant snapshot, shared by startup RPC and streaming reads.
     observed_at: tokio::time::Instant,
+    /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
+    ownership_observer: Option<OwnershipObserver>,
+    /// Last successfully persisted append-only capture revision.
+    ownership_revision: Option<(usize, bool)>,
 }
 impl Process {
     /// Spawns the planned engine with isolated environment and line-framed pipes.
@@ -141,7 +151,38 @@ impl Process {
             diagnostic_tail,
             exit_drain_deadline: None,
             observed_at: tokio::time::Instant::now(),
+            ownership_observer: None,
+            ownership_revision: None,
         })
+    }
+
+    /// Attaches the supervisor's durable ownership writer and immediately checkpoints the current root.
+    /// Errors propagate so the supervisor cleans up instead of running without required evidence.
+    pub fn observe_ownership(
+        &mut self,
+        observer: impl FnMut(&OwnershipSnapshot) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.ownership_observer = Some(Box::new(observer));
+        self.ownership_revision = None;
+        self.checkpoint_ownership()
+    }
+
+    /// Persists newly captured members once; successful unchanged captures never touch the database.
+    pub fn checkpoint_ownership(&mut self) -> Result<()> {
+        let Some(observer) = self.ownership_observer.as_mut() else {
+            return Ok(());
+        };
+        let revision = self.owner.capture_revision();
+        if self.ownership_revision == Some(revision) {
+            return Ok(());
+        }
+        let snapshot = self
+            .owner
+            .snapshot()
+            .ok_or_else(|| Error::Integrity("process root identity is unavailable".into()))?;
+        observer(&snapshot)?;
+        self.ownership_revision = Some(revision);
+        Ok(())
     }
 
     /// Redacts launch secrets from text before core code persists it.
@@ -238,6 +279,9 @@ impl Process {
                     Ok(None) => {}
                     Err(_) => return Event::Failure("engine_process_observation_failed"),
                 }
+            }
+            if self.checkpoint_ownership().is_err() {
+                return Event::Failure("engine_process_ownership_failed");
             }
             if let Some(deadline) = self.exit_drain_deadline {
                 if tokio::time::Instant::now() >= deadline {
