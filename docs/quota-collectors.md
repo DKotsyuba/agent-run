@@ -266,8 +266,11 @@ id — the names each collector unit is built with) that window governs, in
 `payload_json.models`, per window rather than per pool, so a narrower window
 never inherits every model of its pool. Account selection, the `models` and
 `capacity_order` views and admission reservations consume that membership:
-a window governs a model only when its newest row names that model's lane;
-an older row's membership never authorizes a model the newest one dropped.
+a window governs a model only when its newest row names that model's lane.
+While an exhaustion latch remains active, a partial unknown observation cannot
+shrink that window's recorded membership; the prior governed lanes remain
+until reset or fresh evidence covers them all. Other physical windows keep
+their own membership.
 Only rows with no recorded membership (written before membership was
 recorded) fall back to a pool id equal to the lane. All governing windows of
 all governing pools enter one model's score and exhaustion gates, and one
@@ -279,7 +282,8 @@ show different subsets of one pool's windows under different models (one
 physical window repeated under several models must still carry the same
 fact). An exhaustion latch is carried through an incomplete round only into
 the models its window governed; it is never copied into another model that
-merely shares the pool.
+merely shares the pool. When a partial round carries the window into only a
+subset of those models, persistence retains the complete previous membership.
 
 Retention never deletes, for any latched physical window, that window's
 newest row in the ranker's `(observed_at, id)` order, so the latch keeps

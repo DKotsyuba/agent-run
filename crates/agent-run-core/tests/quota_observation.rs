@@ -579,3 +579,40 @@ fn same_window_name_from_two_sources_keeps_separate_membership() {
     assert_eq!(members("s1"), json!(["glm-4.7"]));
     assert_eq!(members("s2"), json!(["glm-4.6"]));
 }
+
+/// A partial unknown round cannot narrow the model set of a carried physical
+/// exhaustion latch; unrelated pool and source rows keep their own members.
+#[test]
+fn partial_unknown_keeps_all_exhausted_window_members() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let first = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.6"],
+         "remaining_percent":0.0,"reset_at":2500.0,"observed_at":1000.0},
+        {"pool":"secondary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":40.0,"reset_at":2500.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &first, 100, 1500.0).unwrap();
+    let partial = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],"observed_at":1600.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &partial, 100, 1600.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let members: String = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM capacity_samples WHERE quota_key='acct-main::primary' \
+         AND source='glm-native' AND window='five_hour' ORDER BY observed_at DESC,id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&members).unwrap()["models"],
+        json!(["glm-4.6", "glm-4.7"])
+    );
+    assert_eq!(latch_rows(home.path()), 1);
+}

@@ -333,8 +333,9 @@ pub fn record_quota_snapshot(
     }
     // Membership is recorded per physical window, and only for the models
     // whose own view of that window is exactly the persisted fact: a narrower
-    // window never inherits every model of its pool, and a carried exhaustion
-    // never extends to a model that reported the window as unknown. It is
+    // window never inherits every model of its pool. An unsettled carried
+    // exhaustion also retains its previous members when this round omits
+    // some governed models. It is
     // keyed by the full physical identity (lane, source, window): the same
     // window name from another source (a carried latch after a source
     // switch) is a different fact with its own members.
@@ -351,6 +352,22 @@ pub fn record_quota_snapshot(
                         .insert(model.model.as_str());
                 }
             }
+        }
+    }
+    for ((lane, source, name), governed) in &membership {
+        let identity = (lane.as_str(), source.as_str(), name.as_str());
+        if released.contains(&(lane.clone(), source.clone(), name.clone()))
+            || !physical
+                .get(&identity)
+                .is_some_and(|window| window.remaining_percent == Some(0.0))
+        {
+            continue;
+        }
+        if let Some(governed) = governed {
+            pool_models
+                .entry(identity)
+                .or_default()
+                .extend(governed.iter().map(String::as_str));
         }
     }
     let mut mutations = 0usize;
