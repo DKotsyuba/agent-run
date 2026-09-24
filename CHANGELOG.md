@@ -12,6 +12,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - fix(transcript): redact launch credentials across Claude and Codex text fragments, tool output, native event diagnostics, and sealed answers before persistence
 - fix(config): apply offered model effort defaults to the frozen launch while preserving caller replay intent; reject unsupported model parameter keys
 - fix(auth): refuse provider login selectors that ambiguously name one account label and another account id
+- fix(doctor): detect schema-2 provider bindings that cannot resolve against the registered accounts without mutating state
 - 0.13.2 publishes a native artifact only for macOS Apple silicon; Linux x86-64 remains a non-blocking validation lane with no published artifact
 
 ## [0.13.1] - 2026-09-23

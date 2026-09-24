@@ -120,6 +120,7 @@ and never launches work. Missing or stale evidence becomes unknown rather than
 an invented zero.
 
 `agent-run doctor` checks configuration, binaries, role assets, state,
+schema-2 provider bindings against a read-only account-registry snapshot,
 supervisor identity, MCP processes, delivery, and capacity freshness. Its
 provider-free canary exercises the production detach, identity, and READY path.
 

@@ -1,11 +1,15 @@
 //! Bounded read-only diagnostics and model-visible active context snapshots.
 
-use crate::{Store, ACTIVE_SQL, VERSION};
-use agent_run_domain::{error::invalid, Result};
-use rusqlite::{types::ValueRef, Connection, OpenFlags, Row};
+use crate::{accounts::account_record, Store, ACTIVE_SQL, VERSION};
+use agent_run_domain::{
+    catalog::{AccountId, AccountRecord},
+    error::invalid,
+    Result,
+};
+use rusqlite::{types::ValueRef, Connection, OpenFlags, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 /// A doctor-safe point-in-time view of active agents and newest capacity samples per identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +75,37 @@ pub fn diagnostic_snapshot(
     let mut capacity_stmt = conn.prepare("SELECT id,runtime,lane,window,target,source,observed_at,valid_until FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY runtime,lane,window,target,source ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY observed_at DESC,id DESC LIMIT ?")?;
     let capacity = capacity_stmt.query_map([limit as i64], |row| Ok(json!({ "id": row.get::<_, i64>(0)?, "runtime": row.get::<_, String>(1)?, "lane": row.get::<_, String>(2)?, "window": row.get::<_, String>(3)?, "target": row.get::<_, Option<String>>(4)?, "source": row.get::<_, String>(5)?, "observed_at": row.get::<_, Option<f64>>(6)?, "valid_until": row.get::<_, Option<f64>>(7)? })))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(DiagnosticSnapshot { agents, capacity })
+}
+
+/// Reads only configured account identities from the current WAL-aware store
+/// without migration or SQL writes, so doctor sees newly registered accounts.
+pub fn provider_accounts_snapshot(
+    path: &Path,
+    ids: &BTreeSet<AccountId>,
+) -> Result<Vec<AccountRecord>> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.pragma_update(None, "query_only", true)?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != VERSION {
+        return Err(invalid(
+            "state migration required before provider diagnosis",
+        ));
+    }
+    let mut statement = conn.prepare(
+        "SELECT account_id,auth_family,secret_ref,status FROM provider_accounts WHERE account_id=?",
+    )?;
+    let mut accounts = Vec::with_capacity(ids.len());
+    for id in ids {
+        let row = statement
+            .query_row([id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?;
+        if let Some(row) = row {
+            accounts.push(account_record(row)?);
+        }
+    }
+    Ok(accounts)
 }
 
 impl Store {
