@@ -1,5 +1,5 @@
 use crate::{
-    redact::{DiagnosticTail, Redactor},
+    redact::{DiagnosticTail, Redactor, StreamingRedactor},
     LaunchPlan,
 };
 use agent_run_domain::{Error, Result};
@@ -139,6 +139,16 @@ impl Process {
     /// Redacts launch secrets from text before core code persists it.
     pub fn redact(&self, text: &str) -> String {
         self.redactor.redact(text)
+    }
+
+    /// Sanitizes one parsed engine event before durable storage.
+    pub fn redact_value(&self, value: &Value) -> Value {
+        self.redactor.redact_value(value)
+    }
+
+    /// Creates one message-local redactor for streamed stdout fragments.
+    pub fn stream_redactor(&self) -> StreamingRedactor {
+        self.redactor.stream()
     }
 
     /// Returns the redacted bounded stderr evidence retained for a failed launch.

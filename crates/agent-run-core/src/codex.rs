@@ -10,6 +10,7 @@ use crate::{
 use agent_run_adapters::{
     codex::session::{failure_kind as structured_failure_kind, Session},
     io::{Event, Process},
+    redact::StreamingRedactor,
     EngineResult, LaunchPlan,
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,80 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
+/// Journals one assistant fragment after message-local literal redaction.
+/// `complete` flushes any possible secret prefix before the item is retired.
+fn journal_assistant_fragment(
+    process: &Process,
+    store: &Store,
+    id: &AgentId,
+    redactors: &mut BTreeMap<String, StreamingRedactor>,
+    key: &str,
+    text: &str,
+    complete: bool,
+) -> Result<()> {
+    if complete && !redactors.contains_key(key) {
+        let safe = process.redact(text);
+        if !safe.is_empty() {
+            journal(store, id, "assistant", &safe, None, Some(key))?;
+        }
+        return Ok(());
+    }
+    let redactor = redactors
+        .entry(key.to_owned())
+        .or_insert_with(|| process.stream_redactor());
+    let mut safe = redactor.feed(text);
+    if complete {
+        safe.push_str(&redactor.finish());
+        redactors.remove(key);
+    }
+    if !safe.is_empty() {
+        journal(store, id, "assistant", &safe, None, Some(key))?;
+    }
+    Ok(())
+}
+
+/// Removes arbitrary text fields from unhandled native events; those fields
+/// have no transcript contract and may split a secret across notifications.
+fn omit_native_text(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (name, nested) in object {
+                if matches!(
+                    name.as_str(),
+                    "text"
+                        | "delta"
+                        | "content"
+                        | "aggregatedOutput"
+                        | "output"
+                        | "stdout"
+                        | "stderr"
+                        | "raw"
+                ) && nested.is_string()
+                {
+                    *nested = Value::String("<omitted>".into());
+                } else {
+                    omit_native_text(nested);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(omit_native_text),
+        _ => {}
+    }
+}
+
+/// Persists only a sanitized diagnostic view of one unhandled native event.
+fn record_native_event(
+    process: &Process,
+    store: &Store,
+    id: &AgentId,
+    method: &str,
+    value: &Value,
+) -> Result<()> {
+    let mut safe = process.redact_value(value);
+    omit_native_text(&mut safe);
+    store.event(id, &process.redact(method), &safe)
+}
 
 /// Returns the per-run isolated home for a global or labelled Codex account.
 ///
@@ -593,6 +668,7 @@ pub async fn run(
     )?;
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
+    let mut redactors: BTreeMap<String, StreamingRedactor> = BTreeMap::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
     let mut usage = None;
@@ -697,7 +773,13 @@ pub async fn run(
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         else {
-            store.event(&record.id, "malformed_event", &json!({"raw": v}))?;
+            record_native_event(
+                process,
+                store,
+                &record.id,
+                "malformed_event",
+                &json!({"raw": v}),
+            )?;
             continue;
         };
         let p = v.get("params").unwrap_or(&Value::Null);
@@ -705,7 +787,7 @@ pub async fn run(
             .and_then(Value::as_str)
             .is_some_and(|id| id != tid)
         {
-            store.event(&record.id, method, p)?;
+            record_native_event(process, store, &record.id, method, p)?;
             continue;
         }
         let event_turn = p
@@ -713,18 +795,18 @@ pub async fn run(
             .or_else(|| p.pointer("/turn/id"))
             .and_then(Value::as_str);
         if event_turn.is_some_and(|id| id != turn_id) {
-            store.event(&record.id, method, p)?;
+            record_native_event(process, store, &record.id, method, p)?;
             continue;
         }
         if record.resume_of_runtime_session_id.is_some()
             && method.starts_with("item/")
             && event_turn.is_none()
         {
-            store.event(&record.id, method, p)?;
+            record_native_event(process, store, &record.id, method, p)?;
             continue;
         }
         if session.notification(&v)?.is_none() {
-            store.event(&record.id, method, p)?;
+            record_native_event(process, store, &record.id, method, p)?;
             continue;
         }
         match method {
@@ -749,7 +831,15 @@ pub async fn run(
                 // unseen tail.
                 text.push_str(delta);
                 if !text.trim().is_empty() {
-                    journal(store, &record.id, "assistant", text, None, Some(&key))?;
+                    journal_assistant_fragment(
+                        process,
+                        store,
+                        &record.id,
+                        &mut redactors,
+                        &key,
+                        text,
+                        false,
+                    )?;
                     emitted.entry(key.clone()).or_default().push_str(text);
                     text.clear();
                 }
@@ -763,7 +853,13 @@ pub async fn run(
                         .and_then(Value::as_f64)
                         .is_some_and(|at| at < 0.0)
                     {
-                        store.event(&record.id, "malformed_message", &json!({"raw": item}))?;
+                        record_native_event(
+                            process,
+                            store,
+                            &record.id,
+                            "malformed_message",
+                            &json!({"raw": item}),
+                        )?;
                         continue;
                     }
                     let text = item.get("text").and_then(Value::as_str).unwrap_or("");
@@ -774,7 +870,15 @@ pub async fn run(
                         } else {
                             ""
                         });
-                        journal(store, &record.id, "assistant", tail, None, Some(key))?;
+                        journal_assistant_fragment(
+                            process,
+                            store,
+                            &record.id,
+                            &mut redactors,
+                            key,
+                            tail,
+                            true,
+                        )?;
                         completed.insert(key.into(), text.into());
                     }
                     streamed.remove(key);
@@ -787,12 +891,12 @@ pub async fn run(
                         store,
                         &record.id,
                         "tool_result",
-                        text,
+                        &process.redact(text),
                         Some("command"),
                         Some(key),
                     )?;
                 } else {
-                    store.event(&record.id, method, p)?;
+                    record_native_event(process, store, &record.id, method, p)?;
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -818,7 +922,15 @@ pub async fn run(
                                     let tail = text
                                         .strip_prefix(prefix)
                                         .unwrap_or(if prefix.is_empty() { text } else { "" });
-                                    journal(store, &record.id, "assistant", tail, None, Some(key))?;
+                                    journal_assistant_fragment(
+                                        process,
+                                        store,
+                                        &record.id,
+                                        &mut redactors,
+                                        key,
+                                        tail,
+                                        true,
+                                    )?;
                                     streamed.remove(key);
                                     emitted.remove(key);
                                 }
@@ -829,7 +941,15 @@ pub async fn run(
                 }
                 for (key, text) in &streamed {
                     if !text.trim().is_empty() && !completed.contains_key(key) {
-                        journal(store, &record.id, "assistant", text, None, Some(key))?;
+                        journal_assistant_fragment(
+                            process,
+                            store,
+                            &record.id,
+                            &mut redactors,
+                            key,
+                            text,
+                            true,
+                        )?;
                     }
                 }
                 let mut outcome = match turn.get("status").and_then(Value::as_str) {
@@ -844,7 +964,7 @@ pub async fn run(
                             .unwrap_or_else(|| "runtime_failed".into()),
                     ),
                     _ => {
-                        store.event(&record.id, method, p)?;
+                        record_native_event(process, store, &record.id, method, p)?;
                         return Err(invalid("nonterminal turn/completed status"));
                     }
                 };
@@ -852,7 +972,7 @@ pub async fn run(
                 outcome.failure_text = turn
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .map(|s| s.chars().take(512).collect());
+                    .map(|s| process.redact(&s.chars().take(512).collect::<String>()));
                 if let Some(kind) = final_answer.as_deref().and_then(verify::error_only) {
                     outcome.status = Status::Failed;
                     outcome.failure_kind = Some(kind.into());
@@ -863,11 +983,11 @@ pub async fn run(
                 return Ok(EngineResult {
                     native_failure,
                     outcome,
-                    answer: final_answer,
+                    answer: final_answer.map(|text| process.redact(&text)),
                     usage,
                 });
             }
-            _ => store.event(&record.id, method, p)?,
+            _ => record_native_event(process, store, &record.id, method, p)?,
         }
     }
 }
