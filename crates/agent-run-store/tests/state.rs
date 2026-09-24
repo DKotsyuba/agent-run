@@ -22,7 +22,7 @@ fn schema_initialization_and_reopen() {
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 25);
+    assert_eq!(a["tables"], 26);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     assert_eq!(
@@ -414,7 +414,7 @@ fn legacy_database_version_is_migrated_on_open() {
         let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
         db.execute_batch(
             "DROP TABLE process_members; DROP TABLE process_ownership; \
-             DROP TABLE managed_service_leases; DROP TABLE agent_service_gates; DROP TABLE managed_service_generations; \
+             DROP TABLE managed_service_probes; DROP TABLE managed_service_leases; DROP TABLE agent_service_gates; DROP TABLE managed_service_generations; \
              DROP TRIGGER attempt_quota_keys_account_guard; \
              DROP TRIGGER attempts_selected_account_immutable; \
              DROP TRIGGER attempt_quota_keys_immutable; \

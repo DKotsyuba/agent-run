@@ -5,9 +5,9 @@ use agent_run_domain::{domain::now, error::invalid, Error, Result};
 use agent_run_platform::process::{Identity, OwnedProcess, OwnershipSnapshot};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
-/// Validates the two ownership namespaces; caller identifiers are always bound SQL parameters.
+/// Validates attempt, service and temporary readiness-probe ownership; identifiers are SQL parameters.
 fn validate_owner(kind: &str, id: &str) -> Result<()> {
-    if !matches!(kind, "attempt" | "service") || id.is_empty() || id.len() > 256 {
+    if !matches!(kind, "attempt" | "service" | "probe") || id.is_empty() || id.len() > 256 {
         return Err(invalid("invalid process ownership key"));
     }
     Ok(())
@@ -16,7 +16,7 @@ fn validate_owner(kind: &str, id: &str) -> Result<()> {
 impl Store {
     /// Adds captured members atomically without changing an existing root or stealing another owner's PID/token.
     ///
-    /// `kind` is attempt or service, `id` names an existing durable owner, and
+    /// `kind` is attempt, service or probe, `id` names an existing durable owner, and
     /// `snapshot` comes from its OwnedProcess. Repeated observations are no-ops.
     /// Environment, command arguments and credentials are never accepted here.
     pub fn remember_processes(
@@ -37,7 +37,8 @@ impl Store {
         let exists: bool = tx.query_row(
             match kind {
                 "attempt" => "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?)",
-                _ => "SELECT EXISTS(SELECT 1 FROM managed_service_generations WHERE id=?)",
+                "service" => "SELECT EXISTS(SELECT 1 FROM managed_service_generations WHERE id=?)",
+                _ => "SELECT EXISTS(SELECT 1 FROM managed_service_probes WHERE id=?)",
             },
             [id],
             |row| row.get(0),

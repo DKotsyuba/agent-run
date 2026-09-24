@@ -168,14 +168,19 @@ fn install_update_and_noop_preserve_data() {
 #[test]
 fn preflight_refusals_never_switch() {
     for reason in [
-        "broker", "agent", "writer", "schema", "config", "launcher", "corrupt",
+        "broker", "services", "agent", "writer", "schema", "config", "launcher", "corrupt",
     ] {
         let fixture = Fixture::new();
         let mut connection = None;
         let mut broker = None;
         match reason {
-            "broker" => {
-                let file = fs::File::create(fixture.home.join(".api.sock.lock")).unwrap();
+            "broker" | "services" => {
+                let file = fs::File::create(fixture.home.join(if reason == "broker" {
+                    ".api.sock.lock"
+                } else {
+                    ".services.lock"
+                }))
+                .unwrap();
                 file.lock_exclusive().unwrap();
                 broker = Some(file);
             }

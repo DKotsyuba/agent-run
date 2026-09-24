@@ -2,9 +2,11 @@
 
 Broker services are independent foreground processes shared by agents. They are
 not harness children and do not receive provider account credentials. Service
-configuration, schema-18 ownership storage and snapshot restoration are available;
-broker warmup, idle monitoring and MCP bindings are still being integrated in
-this unreleased version. A declaration alone does not yet start a service.
+configuration, schema-18 ownership storage, snapshot restoration and the resident
+broker lifecycle are implemented. The broker starts declared services only when
+an agent needs admission; it does not start them merely because the API opens.
+MCP clients must already be configured to connect to the declared backend;
+per-run MCP credential bindings are a separate capability.
 
 ## Configuration contract
 
@@ -39,6 +41,11 @@ Startup timeout is 1–300 seconds; one readiness probe is 1–30 seconds; healt
 interval is 1–60 seconds; TERM grace is 0–30 seconds. Idle timeout is 1–86400
 seconds and defaults to 1800. Unknown fields and invalid bounds fail validation.
 Readiness is an application check, distinct from proof of process ownership.
+The probe receives `AGENT_RUN_SERVICE_PID`, `AGENT_RUN_SERVICE_ID` and
+`AGENT_RUN_SERVICE_GENERATION` in its environment. It should check the actual
+application endpoint, associating it with the expected process when unrelated
+servers could share the address. Probe output is discarded; only bounded static
+failure codes enter durable state.
 
 ## Durable ownership
 
@@ -49,6 +56,11 @@ token, so reuse does not overwrite an older captured member. Ownership records
 retain the original leader and whether capture began from a verified root.
 Attempt and service ownership cannot both claim the same PID/token.
 
+Readiness probes have separate transient ownership records tied to their service
+generation. A pipe gates exec until that identity is committed. Broker restart
+cleans interrupted probes before starting more work; confirmed probe records
+are removed so health checks do not accumulate history indefinitely.
+
 Restoration never treats a database row as permission to kill a current PID:
 every signal still checks the kernel token and birth time. Missing historical
 snapshots remain unknown; migration does not invent a historical process tree.
@@ -57,7 +69,7 @@ See [process identity](process-identity.md) for platform limits.
 
 ## Broker lifecycle contract
 
-The integration must warm every configured service before a new harness starts.
+The broker warms every configured service before a new harness starts.
 Concurrent agents share one generation. Pending or active agents retain leases;
 unresolved process ownership retains them even after an agent is marked lost.
 The inactivity clock starts when the **last active agent finishes**, not at its
@@ -65,6 +77,21 @@ launch. A new agent resets it; a long-running agent cannot lose its services
 because thirty minutes elapsed. Expiry sends TERM, then bounded KILL to verified
 owned processes. Service health failures block new launches; changing a service
 configuration must not restart it underneath active agents.
+
+Admission creates a durable pending gate in the same transaction as the agent.
+The supervisor waits for that gate with its original timeout and cancellation
+rules; disconnecting the submitting CLI does not abandon warmup. Spawn admission
+rechecks ready gates and leases atomically. A revision conflict with active
+leases rejects the new gate. Unready services cannot start model execution.
+
+An internal native bootstrap records its exact identity and process snapshot
+before exec. It verifies its originating broker and cannot exec after its
+generation was retired. Broker restart restores only recorded generations,
+checks their identities again and never adopts a daemon merely because a socket
+responds. Services can survive a broker restart; the replacement broker resumes
+health and idle monitoring from SQLite. A broker which stays down cannot enforce
+idle expiry until it returns. Foreground service exit marks the generation
+unhealthy and cleans captured children. Uncertain ownership remains unresolved.
 
 Harness cleanup owns every observed harness descendant, including an accidental
 daemon. Only a process launched independently as a broker service belongs to

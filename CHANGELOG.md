@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(services): warm configured foreground backends before harness launch,
+  share durable generations across agents, monitor readiness, and stop after
+  thirty minutes without active agents; recover owned services and interrupted
+  readiness probes after broker restart
+- fix(supervisor): checkpoint captured descendants and use fresh identity
+  checks to recover their cleanup even after the original harness leader exits
 - build: prepare 0.14.0 and schema 18 for broker-owned service generations,
   agent leases, startup gates and captured process identities
 - feat(install): install or update a sealed release with curl/wget, preserving

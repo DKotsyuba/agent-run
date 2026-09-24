@@ -431,9 +431,10 @@
         "run_stats": 2,
         "workflow_deliveries": 0,
         "workflow_runs": 0,
-        "workflow_steps": 0
+        "workflow_steps": 0,
+        "managed_service_probes": 0
       },
-      "sha256": "6b154c1d1283be35719394b280e11f657d233e2456f0cff620fbe02620782b3b",
+      "sha256": "a8dee81a5ec5b1c6921d51ce3f1a0281cb9440bd54dd0243a78feba23cca3611",
       "user_version": 18
     }
   ],

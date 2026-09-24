@@ -380,6 +380,7 @@ CREATE TABLE agent_service_gates (
     state TEXT NOT NULL CHECK(state IN ('pending','ready','failed')),
     failure_kind TEXT CHECK(failure_kind IS NULL OR length(failure_kind) <= 64)
 );
+CREATE INDEX idx_agent_service_gates_pending ON agent_service_gates(agent_id) WHERE state='pending';
 CREATE TABLE managed_service_leases (
     generation_id TEXT NOT NULL REFERENCES managed_service_generations(id),
     agent_id TEXT NOT NULL REFERENCES agents(id),
@@ -390,8 +391,14 @@ CREATE TABLE managed_service_leases (
 CREATE INDEX idx_managed_service_lease_active
     ON managed_service_leases(generation_id, agent_id) WHERE released_at IS NULL;
 
+CREATE TABLE managed_service_probes (
+    id TEXT PRIMARY KEY,
+    generation_id TEXT NOT NULL REFERENCES managed_service_generations(id),
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE process_ownership (
-    owner_kind TEXT NOT NULL CHECK(owner_kind IN ('attempt','service')),
+    owner_kind TEXT NOT NULL CHECK(owner_kind IN ('attempt','service','probe')),
     owner_id TEXT NOT NULL,
     leader_json TEXT NOT NULL CHECK(json_valid(leader_json)),
     descendants_observed INTEGER NOT NULL CHECK(descendants_observed IN (0,1)),

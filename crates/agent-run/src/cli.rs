@@ -296,6 +296,12 @@ pub enum Command {
     DenyCommand {
         name: String,
     },
+    /// Commits a broker-authorized service identity before replacing this process with its foreground command.
+    #[command(name = "_service-exec", hide = true)]
+    ServiceExec {
+        /// Durable generation authorized by this process's parent broker.
+        generation: String,
+    },
     /// Runs the doctor bootstrap canary using its three inherited descriptors.
     #[command(name = "_doctor_canary", hide = true)]
     DoctorCanary {
@@ -1102,6 +1108,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Mcp => "mcp",
         Command::Api { .. } => "api",
         Command::Supervisor { .. } => "supervisor",
+        Command::ServiceExec { .. } => "services",
         _ => "cli",
     };
     agent_run_core::logging::configure(&home, component);
@@ -1538,6 +1545,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             identity_fd,
             error_fd,
         } => crate::supervisor::run(&home, &agent_id, [ready_fd, identity_fd, error_fd]).await?,
+        Command::ServiceExec { generation } => {
+            agent_run_core::managed_services::bootstrap(&home, &generation)?
+        }
         Command::DenyCommand { name: _ } => {
             eprintln!("agent-run: command denied by the configured developer environment");
             return Ok(126);

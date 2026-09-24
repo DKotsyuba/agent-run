@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod hooks;
 pub mod lifecycle;
 pub mod logging;
+pub mod managed_services;
 pub mod service;
 pub mod stream;
 pub mod supervisor;

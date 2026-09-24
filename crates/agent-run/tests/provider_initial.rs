@@ -85,6 +85,485 @@ fn home() -> (tempfile::TempDir, std::path::PathBuf) {
     home_with("", &[])
 }
 
+/// Failure guard for all process owners created by a managed-service test; service fixtures also have finite TTLs.
+struct ServiceProcesses(std::path::PathBuf);
+impl Drop for ServiceProcesses {
+    /// Reads exact recorded identities and terminates only this disposable home's captured processes.
+    fn drop(&mut self) {
+        let Ok(store) = Store::open(&self.0) else {
+            return;
+        };
+        let owners: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT owner_kind,owner_id FROM process_ownership")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (kind, id) in owners {
+            if let Ok(Some(mut owned)) = store.remembered_processes(&kind, &id) {
+                let _ = owned.cleanup_blocking(Duration::from_millis(100));
+                // SAFETY: reaps only this exact recorded child when it still belongs
+                // to the test process; WNOHANG cannot block and ECHILD is harmless.
+                unsafe {
+                    libc::waitpid(owned.pid, std::ptr::null_mut(), libc::WNOHANG);
+                }
+            }
+        }
+    }
+}
+
+/// Two agents share one warm generation, retain it while active, and start idle expiry only after both finish.
+#[tokio::test]
+async fn managed_services_share_warmup_and_expire_after_last_agent() {
+    use agent_run_core::managed_services::Manager;
+    let (_temp, home) = home_with(
+        r#"
+[services.shared]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+idle_timeout_seconds=1
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/usr/bin/true"}
+"#,
+        &[],
+    );
+    let _cleanup = ServiceProcesses(home.clone());
+    let service = Service::new(home.clone());
+    let mut ids = Vec::new();
+    for index in 0..2 {
+        let mut request = request(&home);
+        request.request_id = Some(format!("shared-service-{index}"));
+        let admitted = service
+            .admit_provider_trusted(request, candidates(committed(&home)))
+            .unwrap();
+        assert_eq!(admitted["created"], true);
+        ids.push(serde_json::from_value::<AgentId>(admitted["agent_id"].clone()).unwrap());
+    }
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        manager.tick().await.unwrap();
+        let ready: i64 = Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_service_gates WHERE state='ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if ready == 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "services did not warm before the fixture deadline: {ready} ready gates"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = Store::open(&home).unwrap();
+    let generation: String = store
+        .conn
+        .query_row("SELECT id FROM managed_service_generations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let root = store
+        .remembered_processes("service", &generation)
+        .unwrap()
+        .unwrap()
+        .leader
+        .unwrap();
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM managed_service_generations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(store);
+    drop(manager);
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    manager.tick().await.unwrap();
+    let restored = Store::open(&home)
+        .unwrap()
+        .remembered_processes("service", &generation)
+        .unwrap()
+        .unwrap()
+        .leader
+        .unwrap();
+    assert_eq!(
+        restored.token, root.token,
+        "manager restart must retain the exact service generation"
+    );
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        config.replace("args=[\"20\"]", "args=[\"21\"]"),
+    )
+    .unwrap();
+    let mut changed = request(&home);
+    changed.request_id = Some("changed-service-revision".into());
+    let admitted = service
+        .admit_provider_trusted(changed, candidates(committed(&home)))
+        .unwrap();
+    let changed_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    manager.tick().await.unwrap();
+    let mut blocked = supervisor(&home, &changed_id);
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), blocked.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&changed_id).unwrap().status,
+        Status::Failed
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    manager.tick().await.unwrap();
+    assert_eq!(
+        agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
+        agent_run::process::ProcessState::Alive
+    );
+    let mut supervisors = ids
+        .iter()
+        .map(|id| supervisor(&home, id))
+        .collect::<Vec<_>>();
+    for child in &mut supervisors {
+        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    for id in &ids {
+        assert_eq!(
+            Store::open(&home).unwrap().get(id).unwrap().status,
+            Status::Succeeded
+        );
+    }
+    manager.tick().await.unwrap();
+    let store = Store::open(&home).unwrap();
+    let (state, idle): (String, Option<f64>) = store
+        .conn
+        .query_row(
+            "SELECT state,idle_since FROM managed_service_generations WHERE id=?",
+            [&generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "ready");
+    assert!(idle.is_some());
+    drop(store);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    manager.tick().await.unwrap();
+    assert!(matches!(
+        agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
+        agent_run::process::ProcessState::Dead | agent_run::process::ProcessState::Reused
+    ));
+    let state: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT state FROM managed_service_generations WHERE id=?",
+            [&generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "stopped");
+}
+
+/// An unready backend blocks the actual harness, then releases only never-spawned attempt ownership.
+#[tokio::test]
+async fn managed_services_readiness_failure_never_starts_harness() {
+    use agent_run_core::managed_services::Manager;
+    let (_temp, home) = home_with(
+        r#"
+[services.unready]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+startup_timeout_seconds=1
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/usr/bin/false",timeout_seconds=1}
+"#,
+        &[],
+    );
+    let _cleanup = ServiceProcesses(home.clone());
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        manager.tick().await.unwrap();
+        if let Some(exit) = child.try_wait().unwrap() {
+            assert!(!exit.success());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "readiness failure did not reach the supervisor"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Failed);
+    let (process, active): (Option<String>, bool) = store
+        .conn
+        .query_row(
+            "SELECT process_identity,ownership_active FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(process.is_none());
+    assert!(!active);
+    drop(store);
+    manager.tick().await.unwrap();
+}
+
+/// Starts a real disposable broker with the fixture credential and no inherited interactive streams.
+fn resident_broker(home: &Path) -> tokio::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(home)
+        .args(["api", "serve"])
+        .env("FAKE_TOKEN", "synthetic-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+/// Waits for the actual listener while ensuring a failed child cannot leave the test waiting indefinitely.
+async fn broker_ready(home: &Path, child: &mut tokio::process::Child) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::net::UnixStream::connect(home.join("api.sock"))
+        .await
+        .is_err()
+    {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "broker exited during startup"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "broker did not bind"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Real socket admission keeps service warmup in the resident broker after the submitting connection closes.
+#[tokio::test]
+async fn managed_services_run_through_the_resident_socket_broker() {
+    use agent_run::transport::socket;
+    let (_temp, home) = home_with(
+        r#"
+[services.api]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+idle_timeout_seconds=1
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/usr/bin/true"}
+"#,
+        &[],
+    );
+    let _cleanup = ServiceProcesses(home.clone());
+    let mut broker = resident_broker(&home);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.timeout_seconds = Some(10.0);
+    let submitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(submitted["agent_id"].clone()).unwrap();
+    loop {
+        let row = Store::open(&home).unwrap().get(&id).unwrap();
+        if row.status.terminal() {
+            assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_kind);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resident broker did not complete the fixture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let answer = socket::client(&home, "answer", serde_json::json!({"agent_id":id}))
+        .await
+        .unwrap();
+    assert_eq!(answer["content"], "fixture final answer\n");
+    loop {
+        let stopped: bool = Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM managed_service_generations WHERE state='stopped')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if stopped {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resident broker did not stop its idle service"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM managed_service_probes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    broker.kill().await.unwrap();
+}
+
+/// SIGKILL during a running probe leaves durable ownership for the replacement broker to clean.
+#[tokio::test]
+async fn managed_services_recover_interrupted_probe_after_broker_crash() {
+    use agent_run::{
+        process::{self, ProcessState},
+        transport::socket,
+    };
+    let (_temp, home) = home_with(
+        r#"
+[services.crash]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+startup_timeout_seconds=5
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /bin/sleep 10"],timeout_seconds=2}
+"#,
+        &[],
+    );
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        config.replace(
+            "cwd=\"/tmp\"",
+            &format!(
+                "cwd={}",
+                toml::Value::String(home.to_string_lossy().into_owned())
+            ),
+        ),
+    )
+    .unwrap();
+    let _cleanup = ServiceProcesses(home.clone());
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.timeout_seconds = Some(8.0);
+    let submitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(submitted["agent_id"].clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(14);
+    while !home.join("probe-started").exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "probe never executed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let encoded: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT leader_json FROM process_ownership WHERE owner_kind='probe' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let probe: process::Identity = serde_json::from_str(&encoded).unwrap();
+    broker.kill().await.unwrap();
+    assert_eq!(
+        process::observe(Some(probe.pid), Some(&probe.token), Some(probe.birth)),
+        ProcessState::Alive,
+        "fixture must exercise recovery rather than natural exit"
+    );
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let recovery = tokio::time::Instant::now() + Duration::from_secs(3);
+    while process::observe(Some(probe.pid), Some(&probe.token), Some(probe.birth))
+        == ProcessState::Alive
+    {
+        assert!(
+            tokio::time::Instant::now() < recovery,
+            "replacement broker did not clean the interrupted probe"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    loop {
+        let store = Store::open(&home).unwrap();
+        let active: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_service_generations WHERE state!='stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if active == 0 && store.get(&id).unwrap().status.terminal() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "crash fixture did not settle"
+        );
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = Store::open(&home).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_service_generations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "broker restart must not duplicate the service"
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM managed_service_probes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    broker.kill().await.unwrap();
+}
+
 /// [`home`] plus `extra` TOML appended to the config (more bindings,
 /// providers, or core caps) and more enabled fake-token accounts.
 fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -2951,12 +3430,11 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
     );
 }
 
-/// An unobservable cleanup of the exhausted attempt A ends the supervisor
-/// without success, switch or release: the run stays unproven until
-/// reconciliation marks it lost, and A stays owned with a typed
-/// `attempt_cleanup_unresolved` blocker; no attempt B exists.
+/// A failed supervisor cannot release unproven cleanup or switch accounts.
+/// Recovery may release it only after freshly verifying the durable member
+/// snapshot; the logical run remains lost and no second attempt is created.
 #[tokio::test]
-async fn cleanup_error_never_switches_or_releases() {
+async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
     let (_temp, home) = codex_home(["exhausted", "ok"]);
     fs::write(home.join("fixture-cleanup-error-1"), "").unwrap();
     let id = codex_admit(&home, "cleanup-error", None);
@@ -2969,6 +3447,12 @@ async fn cleanup_error_never_switches_or_releases() {
         !exit.success(),
         "the supervisor reports the unproven cleanup"
     );
+    let before = attempts(&home, &id);
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].3, 1,
+        "the failed supervisor must retain ownership"
+    );
     let service = Service::new(home.clone());
     service.reconcile().unwrap();
     service.reconcile().unwrap();
@@ -2978,7 +3462,22 @@ async fn cleanup_error_never_switches_or_releases() {
     assert!(supervisor_log.contains("class=RuntimeError"));
     let attempts = attempts(&home, &id);
     assert_eq!(attempts.len(), 1, "{attempts:?}");
-    assert_eq!(attempts[0].3, 1, "unproven cleanup keeps ownership");
+    assert_eq!(
+        attempts[0].3, 0,
+        "freshly verified recovery releases ownership"
+    );
+    let proof: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let proof: serde_json::Value = serde_json::from_str(&proof).unwrap();
+    assert_eq!(proof["confirmed"], true);
+    assert_eq!(proof["reconciled"], true);
     assert_eq!(
         count(
             &home,
@@ -2991,7 +3490,7 @@ async fn cleanup_error_never_switches_or_releases() {
     assert_eq!(
         count(
             &home,
-            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='attempt_cleanup_unresolved'",
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='attempt_cleanup_reconciled'",
             &id
         ),
         1

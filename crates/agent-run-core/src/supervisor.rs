@@ -505,6 +505,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 return commands::complete_terminal(store, id);
             }
         }
+        if !config.services.is_empty() {
+            store.event(id, "phase", &json!({"phase":"warming_services"}))?;
+        }
+        let service_gate = crate::managed_services::wait_for_gate(home, id).await;
         // The run's one overall deadline (admission time + its timeout) is
         // re-read from durable state before every spawn; an expired run never
         // spawns another attempt.
@@ -515,6 +519,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             }
             return timed_out_before_spawn(id, store);
         }
+        service_gate?;
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
         if !store.provider_spawning(id, &attempt_id)? {

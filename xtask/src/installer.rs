@@ -212,6 +212,10 @@ pub fn install(
             &home.join(".api.sock.lock"),
             "stop the resident broker before updating; no processes were stopped",
         )?;
+        let _services = lock(
+            &home.join(".services.lock"),
+            "stop the resident broker before updating its managed services",
+        )?;
         let database = home.join("state.db");
         let _writer = if database.exists() {
             let connection =
