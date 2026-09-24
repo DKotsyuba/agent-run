@@ -48,6 +48,33 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
 /// SHA256SUMS and COMPLETE marker. Existing complete releases are verified and
 /// reused; incomplete candidates are rejected to retain forensic evidence.
 pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, String> {
+    build_inner(output, version, binary, None)
+}
+
+/// Seals a native release with the standalone deployment helper required by install.sh.
+pub fn build_with_installer(
+    output: &Path,
+    version: &str,
+    binary: &Path,
+    installer: &Path,
+) -> Result<PathBuf, String> {
+    if !installer.is_file() {
+        return Err("native release requires a built deployment helper".into());
+    }
+    let release = build_inner(output, version, binary, Some(installer))?;
+    if !release.join("bin/agent-run-deploy").is_file() {
+        return Err("existing release predates install.sh; choose a new version".into());
+    }
+    Ok(release)
+}
+
+/// Writes a release once, optionally including the native installation entry point.
+fn build_inner(
+    output: &Path,
+    version: &str,
+    binary: &Path,
+    installer: Option<&Path>,
+) -> Result<PathBuf, String> {
     if version.trim().is_empty() || version.contains('/') {
         return Err("version must be a nonblank path component".into());
     }
@@ -61,6 +88,10 @@ pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, Str
     }
     fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
     fs::copy(binary, release.join("bin/agent-run")).map_err(|error| error.to_string())?;
+    if let Some(installer) = installer {
+        fs::copy(installer, release.join("bin/agent-run-deploy"))
+            .map_err(|error| error.to_string())?;
+    }
     // Collector code remains ordinary files: never compile it into the executable.
     let collectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/collectors");
     fs::create_dir(release.join("collectors")).map_err(|error| error.to_string())?;

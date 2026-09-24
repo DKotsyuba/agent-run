@@ -41,11 +41,14 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cargo xtask archive --revision HEAD --output "dist/agent-run-$version-source.tar" --verify
+          cp install.sh dist/install.sh
       - name: Upload source archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: source
-          path: dist/agent-run-*-source.tar
+          path: |
+            dist/agent-run-*-source.tar
+            dist/install.sh
           if-no-files-found: error
           retention-days: 7
 
@@ -105,7 +108,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum agent-run-*.tar.gz agent-run-*-source.tar > SHA256SUMS
+          sha256sum agent-run-*.tar.gz agent-run-*-source.tar install.sh > SHA256SUMS
           sha256sum --check SHA256SUMS
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -120,5 +123,5 @@ jobs:
           test -z "$(gh release view "$GITHUB_REF_NAME" 2>/dev/null || true)"
           gh release create "$GITHUB_REF_NAME" \
             dist/agent-run-*.tar.gz \
-            dist/agent-run-*-source.tar dist/SHA256SUMS \
+            dist/agent-run-*-source.tar dist/SHA256SUMS dist/install.sh \
             --generate-notes --title "$GITHUB_REF_NAME" --verify-tag

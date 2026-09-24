@@ -10,31 +10,63 @@ external dependencies and must be installed and authenticated separately.
 
 ## Release targets
 
-Version 0.12.3 publishes a native artifact only for macOS Apple silicon
+Native releases are published only for macOS Apple silicon
 (`aarch64-apple-darwin`), the qualified release platform. Linux x86-64 remains
 an unqualified, non-blocking validation target; its release and qualification
 are deferred. Keychain and launchd integration remain macOS-only.
 
 ## Install
 
-Download `SHA256SUMS` and
-`agent-run-0.12.3-aarch64-apple-darwin.tar.gz` from the GitHub Release.
-
-Verify the checksum, then place the binary on `PATH`:
+Use the same command for a fresh installation or an update:
 
 ```bash
-grep "agent-run-0.12.3-aarch64-apple-darwin.tar.gz" SHA256SUMS | shasum -a 256 -c -
-tar -xzf agent-run-0.12.3-aarch64-apple-darwin.tar.gz
-install -m 0755 bin/agent-run ~/.local/bin/agent-run
-agent-run init
+curl -fsSL https://github.com/DKotsyuba/agent-run/releases/latest/download/install.sh | sh
 ```
 
-Build from source with the pinned Rust toolchain:
+Or use wget:
 
 ```bash
-cargo build --locked --release --package agent-run --bin agent-run
-install -m 0755 target/release/agent-run ~/.local/bin/agent-run
+wget -qO- https://github.com/DKotsyuba/agent-run/releases/latest/download/install.sh | sh -s -- --downloader wget
 ```
+
+**Availability:** the installer ships with the next release after 0.13.3.
+Releases through 0.13.3 do not contain its script/helper. Until that release is
+published, build from source below; the commands above require the new assets.
+
+The installer verifies the download and release manifest, retains immutable
+versions under `~/.agent-run/standalone/releases`, and places a launcher in
+`~/.local/bin`. Add that directory to `PATH`. No Cargo, Python or sudo is needed.
+Repeat the command to select the latest compatible version. Existing config,
+accounts and database are preserved; updates include a state/config backup.
+
+Stop the broker and other agent-run services before updating. Active agents,
+incompatible configuration or a schema migration requirement block the update.
+Services are not stopped or restarted automatically. Afterward, restart your
+configured services and run `agent-run doctor`.
+
+To pin a version or choose directories, download `install.sh` and run:
+
+```bash
+sh install.sh --version X.Y.Z --home "$HOME/.agent-run" \
+  --prefix "$HOME/.agent-run/standalone" --bin-dir "$HOME/.local/bin"
+```
+
+For a fresh install, run `agent-run init`, then configure engine CLIs and
+accounts. The installer does not install engines or sign in to providers.
+
+Build from source with the pinned Rust toolchain (also usable before publication):
+
+```bash
+release_root="$(mktemp -d)"
+cargo xtask release build-native --output "$release_root" --version 0.13.3
+"$release_root/releases/0.13.3/bin/agent-run-deploy" install \
+  --release "$release_root/releases/0.13.3" --version 0.13.3 \
+  --prefix "$HOME/.agent-run/standalone" --home "$HOME/.agent-run" --bin-dir "$HOME/.local/bin"
+```
+
+Use a new version for changed source: the installer never overwrites an
+existing version with different bytes. The temporary build directory may be
+removed after installation; the selected release is copied into the prefix.
 
 The home defaults to `~/.agent-run`; override it with `AGENT_RUN_HOME` or
 `--home`.

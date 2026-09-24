@@ -43,8 +43,9 @@ cargo xtask archive --revision HEAD \
   --output "$release_root/agent-run-0.13.3-source.tar" --verify
 ```
 
-`build-native` seals the current host binary. The sealed directory contains the
-native binary, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
+`build-native` seals the current host binaries. The sealed directory contains the
+runtime, `bin/agent-run-deploy` (the native xtask deployment entry point), external
+quota scripts, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
 interpreter, virtual environment, or package installation. Cross-platform
 release archives are built on their matching hosted runners, not by relabelling
 one host's binary.
@@ -63,12 +64,32 @@ one host's binary.
 After CI accepts the commit, the tagged `Release` workflow runs the macOS
 workspace checks and builds and verifies the sealed macOS artifact. The macOS
 gate job additionally runs Desktop transport and source-archive gates once. The workflow then generates one `SHA256SUMS`, attests
-the listed macOS and source artifacts, and publishes a GitHub Release only after
+the listed macOS and source artifacts plus `install.sh`, and publishes a GitHub Release only after
 every required job succeeds. A failed run leaves no public partial release.
 Tags are immutable; corrections ship as a new patch version.
 
 ## Install or update a sealed runtime
 
+The primary public entry point is the [one-line installer](../README.md#install).
+It uses curl or wget, verifies the archive checksum, rejects unsafe tar members,
+and runs the sealed native helper. It is available in releases after 0.13.3.
+`install.sh --version X.Y.Z` pins a published release; omitting the version uses
+the latest stable GitHub Release. macOS Apple silicon is the only accepted host.
+
+The standalone helper takes `install --release DIR --version X.Y.Z --prefix DIR
+--home DIR --bin-dir DIR`. It serializes installation, holds the broker startup
+lock and a SQLite writer reservation, validates current provider configuration,
+requires an identical store schema, and checks active work before cutover.
+Explicit config/schema migrations remain separate operations. No services are
+stopped automatically; an occupied installation fails without killing processes.
+It copies into the permanent releases directory before calling the journalled
+deployer, then creates a managed launcher with the selected default home.
+An explicit `AGENT_RUN_HOME` or CLI `--home` still overrides that default.
+Foreign launchers, conflicting bytes at an existing version and pending
+deployment recovery are refused. An identical selected release is a no-op.
+
+For offline operator recovery, the same helper exposes the existing `release`
+commands below without Cargo (replace `cargo xtask` with its absolute path).
 Use explicit paths for every deployment operation:
 
 ```bash
@@ -85,8 +106,10 @@ cargo xtask release rollback --prefix "$prefix" --home "$home"
 `--release` is required for install and update; roll-forward and rollback use
 the retained deployment journal and therefore accept only `--prefix` and
 `--home`. The deployer verifies the manifest before switching `current`, checks
-schema compatibility, reserves the SQLite writer, backs up state, and records a
+schema compatibility, backs up state, and records a
 private deployment journal.
+The raw xtask recovery/deploy commands require operator-established quiescence;
+the extra broker and SQLite locks belong to the standalone `install` wrapper.
 
 Service control and post-switch API/MCP validation remain explicit operator
 steps:
