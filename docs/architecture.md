@@ -105,6 +105,12 @@ but cannot contact native host tools. Without both capabilities, the Rust MCP
 runs directly. Claude uses its configured local UDS transport. Unbound callers
 retrieve completion through `wait`, `answer`, or `list_agents`.
 
+The frontend passes its PID to its Rust MCP child through a private environment
+marker. The child observes its own parent relationship every 250 milliseconds
+and exits if that relationship ends, even when inherited stdin stays open.
+This also covers frontend SIGKILL, which cannot run JavaScript cleanup handlers.
+The resident broker and its admitted detached jobs have independent ownership.
+
 Delivery attempts are leased, bounded, and retried with backoff. Persisted
 diagnostics contain safe classifications and redacted tails, never task or
 answer text, session IDs, argument or environment values, or credentials.

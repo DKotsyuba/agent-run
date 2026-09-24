@@ -360,14 +360,42 @@ pub async fn serve_with(
     orchestrator: Option<OrchestratorRef>,
     broker: Arc<dyn CliBroker>,
 ) -> Result<()> {
-    serve_io(
+    let parent = std::env::var_os("AGENT_RUN_MCP_PARENT_PID")
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse::<i32>().ok())
+                .filter(|pid| *pid > 1)
+                .ok_or_else(|| crate::error::invalid("invalid MCP parent identity"))
+        })
+        .transpose()?;
+    let serving = serve_io(
         home,
         orchestrator,
         broker,
         BoundedStdin::new(),
         BoundedStdout::new(),
-    )
-    .await
+    );
+    match parent {
+        None => serving.await,
+        Some(parent) => tokio::select! {
+            result = serving => result,
+            _ = parent_ended(parent) => Ok(()),
+        },
+    }
+}
+
+/// Waits for the frontend parent relationship to end, without probing or signalling another PID.
+/// The expected PID is supplied before spawn, so death before Rust starts is detected too.
+async fn parent_ended(expected: i32) {
+    loop {
+        // SAFETY: getppid reads this process's current kernel parent relationship.
+        if unsafe { libc::getppid() } != expected {
+            return;
+        }
+        // ponytail: parent exit is observed within 250 ms; use a kernel watch only if tighter latency is needed.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// Run MCP over caller-owned streams while retaining the same broker and protocol implementation.
