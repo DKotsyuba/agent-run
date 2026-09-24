@@ -3,20 +3,45 @@
 state.db's schema version is tracked in SQLite's own `PRAGMA user_version`.
 Each schema change beyond the initial schema is a numbered SQL delta file
 under `sql/migrations/` (`NNN_slug.sql`), applied in order, each in its own
-`BEGIN IMMEDIATE` transaction. The current schema is version 17.
+`BEGIN IMMEDIATE` transaction. The current schema is version 18.
 
 ## Older stores refuse ordinary commands
 
 While a home's database is older than the running binary's schema, every
 command except `config` and `doc` refuses with `migration_required` instead
-of opening it, and the broker refuses to start: the 16 → 17 step belongs to
+of opening it, and the broker refuses to start: schema upgrades belong to
 the paired config migration below. `agent-run doctor` reports the condition
 as `state_migration_pending`. A newer store than the binary supports is
 refused clearly rather than opened partially; see `releases`.
 
-## Paired migration to schema 2
+## Upgrading an existing schema-2 home
 
-This release pairs the schema-2 config with state database schema 17. While
+Use the new candidate binary with an explicit complete target configuration:
+
+```sh
+/absolute/path/to/new/agent-run --home <home> config migrate \
+  --target-config /absolute/path/to/config-v2.toml --dry-run
+/absolute/path/to/new/agent-run --home <home> config migrate \
+  --target-config /absolute/path/to/config-v2.toml --apply \
+  --from-release <prefix>/releases/<installed-version>
+```
+
+This upgrades the database and configuration as one recoverable pair. Existing
+accounts, references and history are preserved; account registration is not
+part of this path. The target must use current settings, including configured
+external quota executables instead of retired Lua bindings. agent-run never
+chooses a vendor collector automatically. The target is checked against the
+read-only account registry and again against the staged database.
+
+`--mapping` and `--target-config` are mutually exclusive. Rollback uses the
+printed snapshot exactly as below. Historical snapshot filenames and v1/v2
+digest key names mean before/after even for an already-v2 source. File hashes
+stream in fixed-size chunks, and SQLite sorts canonical row text with disk
+spill; migration does not build a whole-database string in Rust memory.
+
+## Paired migration from schema 1 to schema 2
+
+This release pairs the schema-2 config with state database schema 18. While
 the home still has an older database, every command except `config` and
 `doc` refuses with `migration_required` instead of opening it (opening would
 upgrade it unpaired); the broker refuses to start the same way.
@@ -92,7 +117,8 @@ if any other process holds the database open, they refuse ("in use") before
 writing anything, and a writer arriving while the lease is held is refused
 with `SQLITE_BUSY` until it is released, so no committed write is replaced.
 Nothing is killed; stop such processes and rerun. Recovery only rolls back
-to the v1 pair; there is no roll-forward.
+to the original pair; there is no roll-forward. The service-manager lock also
+excludes brokers using a custom socket.
 
 `--from-release` names the installed release directory — a sealed release
 as built by `xtask release` — not a bare executable. Its `COMPLETE`,
@@ -107,7 +133,7 @@ config, the mapping, an online SQLite backup, and `manifest.json` recording
 the old release (path, version, schema, binary and `SHA256SUMS` digests), this
 binary (digest and schema), the config, mapping and backup digests, the
 source schema and a logical digest of every row — writes `COMPLETE` last and
-makes the snapshot read-only. The numbered migration (to schema 17) and the
+makes the snapshot read-only. The numbered migrations (to the current schema) and the
 declared accounts are applied to a staged copy of the snapshot database. Only
 then does it write `migrations/in-progress.json`, the journal recording the
 source and target row digests and both config digests, and publish: the live

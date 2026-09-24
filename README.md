@@ -41,6 +41,8 @@ accounts and database are preserved; updates include a state/config backup.
 
 Stop the broker and other agent-run services before updating. Active agents,
 incompatible configuration or a schema migration requirement block the update.
+For an existing 0.13.x schema-2 home, first use the new candidate's
+[paired configuration/database migration](docs/provider-migration.md#existing-schema-2-homes).
 Services are not stopped or restarted automatically. Afterward, restart your
 configured services and run `agent-run doctor`.
 

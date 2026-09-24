@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(migration): upgrade existing schema-2 homes with an explicit target
+  configuration while preserving account references and history; reuse paired
+  rollback and stream database verification without whole-database allocations
 - feat(services): warm configured foreground backends before harness launch,
   share durable generations across agents, monitor readiness, and stop after
   thirty minutes without active agents; recover owned services and interrupted

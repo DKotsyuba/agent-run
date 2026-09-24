@@ -511,15 +511,18 @@ pub enum Api {
 /// Configuration migration commands (see `crate::migrate`).
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Plan (`--dry-run`) or apply (`--apply`) the paired migration (v1 config
-    /// and older state database → v2 config and current database) from an
-    /// explicit operator mapping file; apply snapshots config and state first.
+    /// Plan or apply a paired configuration/database migration. Use a v1 mapping
+    /// or an explicit replacement v2 configuration; apply snapshots both sides first.
     #[command(group(ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
+    #[command(group(ArgGroup::new("migration_input").required(true).args(["mapping", "target_config"])))]
     Migrate {
         /// TOML mapping: `[harnesses.*]`, `[accounts.<id>]` and one
         /// `[runtimes.<v1 name>]` each.
         #[arg(long)]
-        mapping: PathBuf,
+        mapping: Option<PathBuf>,
+        /// Complete target v2 configuration for an already-v2 home; existing accounts are preserved.
+        #[arg(long)]
+        target_config: Option<PathBuf>,
         /// Print the plan and rendered config; write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -536,7 +539,7 @@ pub enum ConfigCommand {
         #[arg(long)]
         from_release: Option<PathBuf>,
     },
-    /// Restore the v1 config and original database from one verified
+    /// Restore the original config and database from one verified
     /// snapshot while nothing changed since the migration; also recovers an
     /// interrupted migration or rollback of that snapshot.
     Rollback {
@@ -1481,17 +1484,31 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
         Command::Config { command } => match command {
             ConfigCommand::Migrate {
                 mapping,
+                target_config,
                 dry_run: _,
                 apply,
                 ack,
                 from_release,
-            } => (dependencies.output)(&crate::migrate::migrate(
-                &home,
-                &mapping,
-                apply,
-                &ack,
-                from_release.as_deref(),
-            )?)?,
+            } => {
+                let result = match (mapping.as_deref(), target_config.as_deref()) {
+                    (Some(mapping), None) => crate::migrate::migrate(
+                        &home,
+                        mapping,
+                        apply,
+                        &ack,
+                        from_release.as_deref(),
+                    )?,
+                    (None, Some(target)) if ack.is_empty() => {
+                        crate::migrate::migrate_v2(&home, target, apply, from_release.as_deref())?
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "choose one migration input; --ack applies only to a legacy mapping",
+                        ))
+                    }
+                };
+                (dependencies.output)(&result)?;
+            }
             ConfigCommand::Rollback { snapshot } => {
                 (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?
             }

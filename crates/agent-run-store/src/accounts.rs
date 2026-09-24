@@ -21,6 +21,18 @@ pub(crate) fn account_record(
     })
 }
 
+/// Reads account references in stable id order through an existing connection, without opening or migrating a store.
+/// This also supports read-only planning against schema 17 before a schema upgrade.
+pub fn list_at(connection: &rusqlite::Connection) -> Result<Vec<AccountRecord>> {
+    let mut statement=connection.prepare("SELECT account_id,auth_family,secret_ref,status FROM provider_accounts ORDER BY account_id")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(account_record).collect()
+}
+
 impl Store {
     /// Registers one global account with an existing, typed credential
     /// reference. Neither credentials nor provider-local labels are stored.
@@ -79,15 +91,7 @@ impl Store {
     /// Lists all registered accounts in global-id order, including disabled
     /// records whose past attempt history remains readable.
     pub fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT account_id,auth_family,secret_ref,status FROM provider_accounts ORDER BY account_id")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(account_record).collect()
+        list_at(&self.conn)
     }
 
     /// Disables future selection for an existing account without deleting
