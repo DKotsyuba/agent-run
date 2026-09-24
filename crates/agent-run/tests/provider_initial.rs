@@ -564,6 +564,195 @@ readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /b
     broker.kill().await.unwrap();
 }
 
+/// Opt-in qualification of the installed CodeGraph bundle using a synthetic project, private HOME and bounded daemons.
+#[tokio::test]
+#[ignore = "requires AGENT_RUN_CODEGRAPH_BUNDLE pointing to the installed CodeGraph 1.6.0 platform bundle"]
+async fn managed_services_real_codegraph_qualification() {
+    use agent_run_config::{
+        provider_config::ProviderConfig,
+        services::{ManagedService, ReadinessProbe},
+    };
+    use agent_run_core::managed_services::Manager;
+    let bundle = std::path::PathBuf::from(
+        std::env::var_os("AGENT_RUN_CODEGRAPH_BUNDLE").expect("qualification bundle"),
+    );
+    let launcher = bundle.join("bin/codegraph");
+    let node = bundle.join("node");
+    let probe = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/services/codegraph-probe.cjs")
+        .canonicalize()
+        .unwrap();
+    let (_temp, home) = home();
+    let _cleanup = ServiceProcesses(home.clone());
+    let project = home.join("sample");
+    let private_home = home.join("codegraph-home");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&private_home).unwrap();
+    fs::write(
+        project.join("sample.js"),
+        "/** Adds two numbers. */\nexport function add(a, b) { return a + b; }\n",
+    )
+    .unwrap();
+    let initialized = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new(&launcher)
+            .args(["init", "--yes"])
+            .arg(&project)
+            .env("HOME", &private_home)
+            .env("DO_NOT_TRACK", "1")
+            .env("CODEGRAPH_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let mut config = ProviderConfig::load(&home).unwrap().0;
+    config.services.insert(
+        "codegraph".into(),
+        ManagedService {
+            command: "/usr/bin/env".into(),
+            args: vec![
+                format!("HOME={}", private_home.display()),
+                "DO_NOT_TRACK=1".into(),
+                "CODEGRAPH_NO_UPDATE_CHECK=1".into(),
+                "CODEGRAPH_DAEMON_INTERNAL=1".into(),
+                "CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS=15000".into(),
+                "CODEGRAPH_DAEMON_MAX_IDLE_MS=20000".into(),
+                launcher.to_string_lossy().into_owned(),
+                "serve".into(),
+                "--mcp".into(),
+                "--path".into(),
+                project.to_string_lossy().into_owned(),
+                "--no-watch".into(),
+            ],
+            cwd: project.clone(),
+            env_from: vec![],
+            readiness: ReadinessProbe {
+                command: node.clone(),
+                args: vec![
+                    probe.to_string_lossy().into_owned(),
+                    project.to_string_lossy().into_owned(),
+                    "1.6.0".into(),
+                ],
+                timeout_seconds: 5,
+            },
+            startup_timeout_seconds: 30,
+            idle_timeout_seconds: 2,
+            monitor_interval_seconds: 1,
+            stop_grace_seconds: 2,
+        },
+    );
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let service = Service::new(home.clone());
+    let mut request = request(&home);
+    request.timeout_seconds = Some(40.0);
+    let accepted = service
+        .admit_provider_trusted(request, candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(accepted["agent_id"].clone()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    let root = loop {
+        manager.tick().await.unwrap();
+        let store = Store::open(&home).unwrap();
+        let (state, root): (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT state,process_identity_json FROM managed_service_generations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if state == "ready" {
+            break serde_json::from_str::<agent_run::process::Identity>(&root.unwrap()).unwrap();
+        }
+        assert!(
+            !matches!(state.as_str(), "unhealthy" | "unknown"),
+            "real CodeGraph failed readiness: {state}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "real CodeGraph did not warm"
+        );
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    manager.tick().await.unwrap();
+    let mut wrong = Command::new(&node)
+        .arg(&probe)
+        .arg(&project)
+        .arg("1.6.0")
+        .env("AGENT_RUN_SERVICE_PID", (root.pid + 1).to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(6), wrong.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success(),
+        "probe must reject another PID"
+    );
+    for _ in 0..2 {
+        let mut client = Command::new(&node)
+            .arg(&probe)
+            .arg(&project)
+            .arg("1.6.0")
+            .env("AGENT_RUN_SERVICE_PID", root.pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(6), client.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    let mut child = supervisor(&home, &id);
+    assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+    manager.tick().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    manager.tick().await.unwrap();
+    assert!(matches!(
+        agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
+        agent_run::process::ProcessState::Dead | agent_run::process::ProcessState::Reused
+    ));
+    assert_eq!(
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_service_generations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
 /// [`home`] plus `extra` TOML appended to the config (more bindings,
 /// providers, or core caps) and more enabled fake-token accounts.
 fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {

@@ -98,3 +98,37 @@ daemon. Only a process launched independently as a broker service belongs to
 the shared service lifecycle. Declaring a service does not turn a single-client
 stdio MCP server into a multi-client server: its agents still need a supported
 client or network transport to reach the shared backend.
+
+## CodeGraph 1.6.0 example
+
+The native archive includes `services/codegraph-probe.cjs` as an external
+integration example. It checks the daemon's socket hello against the PID supplied
+by agent-run and completes a real `codegraph_status` MCP call. It never starts a
+daemon and rejects another PID or version. This example is qualified against
+CodeGraph **1.6.0** and uses its private `CODEGRAPH_DAEMON_INTERNAL` entry point;
+re-qualify the command and probe before changing that version.
+
+Initialize the intended project with CodeGraph first. Point to its installed
+platform bundle, whose launcher execs its bundled Node in the foreground:
+
+```toml
+[services.codegraph]
+command = "/usr/bin/env"
+args = ["CODEGRAPH_DAEMON_INTERNAL=1", "DO_NOT_TRACK=1", "CODEGRAPH_NO_UPDATE_CHECK=1",
+        "/absolute/path/to/codegraph-bundle/bin/codegraph", "serve", "--mcp",
+        "--path", "/absolute/path/to/project"]
+cwd = "/absolute/path/to/project"
+idle_timeout_seconds = 1800
+monitor_interval_seconds = 5
+readiness = { command = "/absolute/path/to/codegraph-bundle/node", args = ["/absolute/path/to/agent-run/current/services/codegraph-probe.cjs", "/absolute/path/to/project", "1.6.0"], timeout_seconds = 5 }
+```
+
+Keep the normal per-agent CodeGraph MCP client configured with `serve --mcp
+--path /absolute/path/to/project`; do not set `CODEGRAPH_DAEMON_INTERNAL` for
+those clients. They connect to the prewarmed backend. The readiness traffic also
+keeps CodeGraph's own idle watchdog active while agent-run retains the service.
+CodeGraph's own watchdog remains a backstop when the broker is down.
+
+`agent-run doctor` reports cold services as expected information, stale health
+as a warning, and unhealthy or mismatched process ownership as an error. It
+reads state without launching probes or starting services.

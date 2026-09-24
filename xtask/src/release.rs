@@ -92,15 +92,19 @@ fn build_inner(
         fs::copy(installer, release.join("bin/agent-run-deploy"))
             .map_err(|error| error.to_string())?;
     }
-    // Collector code remains ordinary files: never compile it into the executable.
-    let collectors = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/collectors");
-    fs::create_dir(release.join("collectors")).map_err(|error| error.to_string())?;
-    for relative in files(&collectors).map_err(|error| error.to_string())? {
-        let destination = release.join("collectors").join(&relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    // External integration scripts remain ordinary files, never embedded executable logic.
+    for directory in ["collectors", "services"] {
+        let scripts = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts")
+            .join(directory);
+        fs::create_dir(release.join(directory)).map_err(|error| error.to_string())?;
+        for relative in files(&scripts).map_err(|error| error.to_string())? {
+            let destination = release.join(directory).join(&relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::copy(scripts.join(&relative), destination).map_err(|error| error.to_string())?;
         }
-        fs::copy(collectors.join(&relative), destination).map_err(|error| error.to_string())?;
     }
     let metadata = format!(
         "{{\"version\":{version:?},\"format\":1,\"schema_version\":{SUPPORTED_SCHEMA_VERSION}}}\n"
@@ -150,6 +154,7 @@ mod tests {
         verify(&release).expect("valid manifest");
         assert!(release.join("collectors/codex.sh").is_file());
         assert!(release.join("collectors/glm.jq").is_file());
+        assert!(release.join("services/codegraph-probe.cjs").is_file());
         assert_eq!(
             super::schema_version(&release).expect("metadata schema"),
             agent_run_platform::release::STORE_SCHEMA_VERSION as u64,

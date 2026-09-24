@@ -27,6 +27,25 @@ profiles select servers with `mcp = ["name"]` in their front matter. Runtime
 and compatibility selection cannot be mixed. A server selected nowhere is
 inert, and an unknown selected name fails closed at config load.
 
+## Shared background backends
+
+Schema 2 also accepts `[services.<id>]` with an absolute foreground `command`,
+literal `args`, absolute `cwd`, explicit `env_from` and a bounded `readiness`
+command. These are broker-owned backends, separate from per-agent MCP clients.
+The broker warms all configured services before a harness starts, retains their
+leases while agents are active, and stops them after `idle_timeout_seconds`
+(default 1800) counted from the last agent's completion. Native MCP clients
+still need their normal configuration to connect to the shared backend; a
+service declaration does not add tools to a role or multiplex stdio sessions.
+
+Probe commands receive `AGENT_RUN_SERVICE_PID`, `AGENT_RUN_SERVICE_ID` and
+`AGENT_RUN_SERVICE_GENERATION`. Their zero exit must mean the intended backend
+is ready; output is discarded. Process ownership is separately checked by
+native PID/start-token evidence. `doctor` reports service health without starting
+backends. The native archive includes an external `services/codegraph-probe.cjs`
+example qualified for CodeGraph 1.6.0, using that version's private daemon entry.
+Keep CodeGraph's ordinary `serve --mcp --path <project>` client in the agent role.
+
 ## Codex workspace and destructive guard
 
 `runtimes.codex.workspace_roots` optionally gives write-capable Codex roles

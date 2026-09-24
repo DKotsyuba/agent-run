@@ -94,6 +94,12 @@ the output contract and migration from retired Lua/app-server settings.
 Credentials stay in protected account stores. The broker checks configuration
 every minute and on requests; invalid revisions keep the last valid settings.
 
+Declare shared background backends under `services.<id>`. The broker warms them
+before harness launch, retains them while agents are active, and stops them
+after thirty minutes of inactivity. Native MCP clients connect to their usual
+backend; their tool permissions remain defined by the role. See
+[managed services](docs/managed-services.md), including the CodeGraph example.
+
 Initialize and inspect the installation:
 
 ```bash
