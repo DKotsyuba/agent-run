@@ -18,7 +18,7 @@ Unix socket API ───┘                              └─> detached super
 | `agent-run` | CLI, MCP proxy, Unix-socket daemon, launchd helper |
 | `agent-run-domain` | public requests, responses, tools, errors, states |
 | `agent-run-config` | strict config, profiles, role plans, snapshots |
-| `agent-run-store` | SQLite schema 16, migrations, events, projections |
+| `agent-run-store` | SQLite schema 19, migrations, events, projections |
 | `agent-run-adapters` | Codex, Claude, and GLM preparation and protocols |
 | `agent-run-core` | service, supervisor, lifecycle, delivery, capacity, doctor |
 | `agent-run-platform` | native launch, process identity, safe files, snapshots |
@@ -84,7 +84,7 @@ snapshot verify. See [continuations.md](continuations.md).
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 17. Numbered migrations live in `sql/migrations/`
+current schema is version 19. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A
@@ -93,6 +93,11 @@ binary refuses a database newer than its supported schema.
 Large payloads live under the run directory and are referenced by path, size,
 and SHA-256. A terminal success must be reproducible from stored state and
 sealed files.
+
+Completed database history expires after fourteen days through the resident
+broker's bounded maintenance loop; active work and retained lineage are protected.
+Idle compaction returns unused SQLite pages to disk. See
+[history-retention.md](history-retention.md) for retention and space-reclamation rules.
 
 ## Completion delivery
 

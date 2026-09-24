@@ -3,7 +3,7 @@
 state.db's schema version is tracked in SQLite's own `PRAGMA user_version`.
 Each schema change beyond the initial schema is a numbered SQL delta file
 under `sql/migrations/` (`NNN_slug.sql`), applied in order, each in its own
-`BEGIN IMMEDIATE` transaction. The current schema is version 18.
+`BEGIN IMMEDIATE` transaction. The current schema is version 19.
 
 ## Older stores refuse ordinary commands
 
@@ -41,7 +41,7 @@ spill; migration does not build a whole-database string in Rust memory.
 
 ## Paired migration from schema 1 to schema 2
 
-This release pairs the schema-2 config with state database schema 18. While
+This release pairs the schema-2 config with state database schema 19. While
 the home still has an older database, every command except `config` and
 `doc` refuses with `migration_required` instead of opening it (opening would
 upgrade it unpaired); the broker refuses to start the same way.

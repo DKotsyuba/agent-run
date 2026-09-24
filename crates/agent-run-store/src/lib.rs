@@ -17,6 +17,8 @@ pub mod projections;
 pub mod provider_admission;
 /// Account-bound quota observation persistence and the exhaustion latch.
 pub mod quota;
+/// Bounded fourteen-day history expiry and SQLite space reclamation.
+pub mod retention;
 /// Python-compatible normalization and repair of cumulative run usage rows.
 pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
@@ -270,6 +272,7 @@ impl Store {
     /// enables WAL strictly: an already-WAL database skips conversion, while a
     /// competing delete-to-WAL conversion is retried briefly and other modes
     /// or SQLite errors are reported to the caller.
+    /// New stores enable incremental page reclamation before the first transaction.
     fn connect(home: &Path, create: bool) -> Result<Self> {
         let path = home.join("state.db");
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -310,6 +313,7 @@ impl Store {
                         "unversioned nonempty database is not safe to initialize",
                     ));
                 }
+                conn.pragma_update(None, "auto_vacuum", 2)?;
                 conn.execute_batch("BEGIN IMMEDIATE")?;
                 if let Err(e) = conn.execute_batch(include_str!("../../../sql/schema.sql")) {
                     let _ = conn.execute_batch("ROLLBACK");

@@ -124,6 +124,13 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
         let migrated = open_ro(&db_path);
         assert_eq!(user_version(&migrated), VERSION, "version {version}");
         assert_eq!(
+            migrated
+                .pragma_query_value(None, "auto_vacuum", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "incremental reclamation must be prepared from v{version}"
+        );
+        assert_eq!(
             schema_objects(&migrated),
             fresh,
             "store migrated from v{version} drifted from a fresh schema"
@@ -139,6 +146,12 @@ fn current_binary_fixture_matches_fresh_schema() {
     let db_path = home.path().join("state.db");
     let fixture = build_fixture(&db_path, VERSION);
     assert_eq!(user_version(&fixture), VERSION);
+    assert_eq!(
+        fixture
+            .pragma_query_value(None, "auto_vacuum", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
     assert_eq!(schema_objects(&fixture), fresh_schema_objects());
     for required in [
         "quota_capacity_revision",
@@ -166,6 +179,35 @@ fn current_binary_fixture_matches_fresh_schema() {
             .unwrap(),
         0
     );
+}
+
+/// Physical preparation may survive a failed schema step; rows/version/backup stay recoverable.
+#[test]
+fn retention_migration_retries_after_physical_preparation() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 18);
+    let before = agent_count(&conn);
+    assert!(migrations::apply_one(
+        &conn,
+        &path,
+        19,
+        "CREATE TABLE partial_retention(id); INVALID SQL;"
+    )
+    .is_err());
+    assert_eq!(user_version(&conn), 18);
+    assert_eq!(agent_count(&conn), before);
+    assert!(migrations::backup_path(&path, 19).is_file());
+    assert_eq!(
+        conn.pragma_query_value(None, "auto_vacuum", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = open_ro(&path);
+    assert_eq!(agent_count(&conn), before);
+    assert_eq!(schema_objects(&conn), fresh_schema_objects());
 }
 
 // --- (b) existing rows survive migration ---

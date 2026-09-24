@@ -110,6 +110,10 @@ const PENDING_FILES: &[(i64, &str)] = &[
         18,
         include_str!("../../../sql/migrations/018_managed_services.sql"),
     ),
+    (
+        19,
+        include_str!("../../../sql/migrations/019_history_retention_indexes.sql"),
+    ),
 ];
 
 /// Every migration file, ordered by the version it produces.
@@ -245,6 +249,10 @@ fn foreign_key_violation_count(conn: &Connection) -> Result<usize> {
 /// open transaction). The migration is rolled back if execution or the
 /// explicit foreign-key audit fails, and both connection settings are
 /// restored before returning or raising an error.
+/// Before schema 19, an existing backup also protects the one-time VACUUM
+/// enabling incremental reclamation. This physical preparation runs outside
+/// the schema transaction and may remain enabled after a later SQL failure;
+/// rows and the version stay unchanged, so retry is safe without rebuilding again.
 pub fn apply_one(conn: &Connection, path: &Path, target: i64, sql: &str) -> Result<()> {
     let backup = snapshot(conn, path, target)?;
     let foreign_keys: i64 = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
@@ -253,6 +261,18 @@ pub fn apply_one(conn: &Connection, path: &Path, target: i64, sql: &str) -> Resu
     conn.pragma_update(None, "foreign_keys", false)?;
     conn.pragma_update(None, "legacy_alter_table", true)?;
     let outcome: Result<()> = (|| {
+        if target == 19 {
+            let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+            conn.pragma_update(None, "auto_vacuum", 2)?;
+            if mode == 0 {
+                // Only the explicit offline migration pays for a full rebuild.
+                conn.execute_batch("VACUUM")?;
+            }
+            let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+            if mode != 2 {
+                return Err(invalid("incremental vacuum preparation failed"));
+            }
+        }
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let applied: Result<()> = (|| {
             conn.execute_batch(sql)?;

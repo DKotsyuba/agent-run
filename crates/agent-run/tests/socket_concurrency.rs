@@ -38,6 +38,52 @@ async fn python_second_owner_refuses_a_live_listener() {
     let _ = task.await;
 }
 
+/// The real broker starts retention automatically without delaying its ping transport.
+#[tokio::test]
+async fn broker_expires_old_history_on_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    cli::init(temp.path()).unwrap();
+    let store = agent_run::state::Store::open(temp.path()).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+        VALUES ('fixture','shared','fixture','fixture','{}',0)",
+            [],
+        )
+        .unwrap();
+    let path = temp.path().join("broker.sock");
+    let task = tokio::spawn({
+        let home = temp.path().to_owned();
+        let path = path.clone();
+        async move { socket::serve_at(&home, &path).await }
+    });
+    wait_for_socket(&path).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
+            .unwrap();
+        if count == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "broker did not expire history"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ping = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}}),
+    )
+    .await;
+    assert_eq!(ping["result"]["ok"], true);
+    task.abort();
+    let _ = task.await;
+}
+
 /// Reclaims an unlistened socket only after the kernel reports ECONNREFUSED.
 #[tokio::test]
 async fn python_stale_socket_reclaim_requires_econnrefused() {

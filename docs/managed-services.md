@@ -2,7 +2,7 @@
 
 Broker services are independent foreground processes shared by agents. They are
 not harness children and do not receive provider account credentials. Service
-configuration, schema-18 ownership storage, snapshot restoration and the resident
+configuration, schema-19 ownership storage, snapshot restoration and the resident
 broker lifecycle are implemented. The broker starts declared services only when
 an agent needs admission; it does not start them merely because the API opens.
 MCP clients must already be configured to connect to the declared backend;

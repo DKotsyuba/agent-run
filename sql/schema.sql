@@ -1,3 +1,5 @@
+PRAGMA auto_vacuum = INCREMENTAL;
+
 CREATE TABLE orchestrator_sessions (
   id TEXT PRIMARY KEY,
   transport TEXT NOT NULL,
@@ -416,4 +418,8 @@ CREATE TABLE process_members (
 );
 CREATE INDEX idx_process_members_owner ON process_members(owner_kind, owner_id);
 
-PRAGMA user_version = 18;
+CREATE INDEX idx_events_attempt ON events(attempt_id) WHERE attempt_id IS NOT NULL;
+CREATE INDEX idx_messages_attempt ON messages(attempt_id) WHERE attempt_id IS NOT NULL;
+CREATE INDEX idx_deliveries_terminal_event ON deliveries(terminal_event_seq) WHERE terminal_event_seq IS NOT NULL;
+
+PRAGMA user_version = 19;

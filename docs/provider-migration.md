@@ -2,7 +2,7 @@
 
 ## Existing schema-2 homes
 
-When upgrading from 0.13.x to schema 18, prepare a complete replacement
+When upgrading from 0.13.x to schema 19, prepare a complete replacement
 configuration using external quota commands as described in
 [quota collectors](quota-collectors.md). Run the **new candidate binary** while
 the old broker and other agent-run writers are stopped:
