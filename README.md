@@ -29,9 +29,8 @@ Or use wget:
 wget -qO- https://github.com/DKotsyuba/agent-run/releases/latest/download/install.sh | sh -s -- --downloader wget
 ```
 
-**Availability:** the installer ships with the next release after 0.13.3.
-Releases through 0.13.3 do not contain its script/helper. Until that release is
-published, build from source below; the commands above require the new assets.
+**Availability:** the installer is included starting with 0.14.0.
+Releases through 0.13.3 do not contain its script/helper.
 
 The installer verifies the download and release manifest, retains immutable
 versions under `~/.agent-run/standalone/releases`, and places a launcher in

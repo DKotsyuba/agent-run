@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-24
+
+- fix(store): expire completed database history after fourteen days while
+  retaining active work and recovery dependencies; reclaim free pages in
+  bounded incremental-vacuum batches, prepared by the schema-19 migration
 - feat(migration): upgrade existing schema-2 homes with an explicit target
   configuration while preserving account references and history; reuse paired
   rollback and stream database verification without whole-database allocations
@@ -13,8 +18,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   readiness probes after broker restart
 - fix(supervisor): checkpoint captured descendants and use fresh identity
   checks to recover their cleanup even after the original harness leader exits
-- build: prepare 0.14.0 and schema 18 for broker-owned service generations,
-  agent leases, startup gates and captured process identities
+- build: schema 19 stores broker-owned service generations, agent leases,
+  startup gates and captured process identities, with indexed history cleanup
 - feat(install): install or update a sealed release with curl/wget, preserving
   configuration and data and refusing active or incompatible installations
 - feat(capacity)!: run externally configured quota executables with private JSON
