@@ -50,7 +50,11 @@ require either harness or a credential before a provider is configured.
   window across collector source identities, so a script revision neither
   forks the pool nor strands the latch. Carried facts keep their original
   observation times; only the survival horizon extends (to the reset, or one
-  900 s TTL past the round).
+  900 s TTL past the round). If disjoint models report fresh zero for the same
+  physical window, its one shared latch keeps the later known reset; an
+  unknown reset remains unknown. This can conservatively block a newly
+  exhausted model until the older restriction expires, never release an older
+  model early.
 * Freshness, unknown data, and collection failure are distinct states; a
   failed collector never replaces good evidence, and read-only advice never
   fetches network or reserves.
@@ -277,9 +281,10 @@ id — the names each collector unit is built with) that window governs, in
 never inherits every model of its pool. Account selection, the `models` and
 `capacity_order` views and admission reservations consume that membership:
 a window governs a model only when its newest row names that model's lane.
-While an exhaustion latch remains active, a partial unknown observation cannot
-shrink that window's recorded membership; the prior governed lanes remain
-until reset or fresh evidence covers them all. Other physical windows keep
+While an exhaustion latch remains active, a partial unknown, positive, or
+disjoint zero observation cannot shrink that window's recorded membership;
+the prior governed lanes remain until reset or fresh evidence covers them
+all. Other physical windows keep
 their own membership.
 Only rows with no recorded membership (written before membership was
 recorded) fall back to a pool id equal to the lane. All governing windows of
