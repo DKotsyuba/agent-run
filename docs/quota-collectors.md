@@ -275,6 +275,9 @@ Only rows with no recorded membership (written before membership was
 recorded) fall back to a pool id equal to the lane. All governing windows of
 all governing pools enter one model's score and exhaustion gates, and one
 pool is reserved once however many models or provider aliases it governs.
+Ranking merges sample history by account, physical key, source, and window;
+renaming a provider alias cannot turn one physical window into two competing
+forecasts. A different physical key remains a separate quota constraint.
 
 Membership is per window end to end: the normalizer gives each model only
 the windows whose output names it, and a normalized snapshot may therefore

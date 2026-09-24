@@ -45,8 +45,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// One account's committed quota facts inside one consistent snapshot.
 #[derive(Debug, Clone, Default)]
 struct AccountFacts {
-    /// Newest-first sample history per window identity, per physical key.
-    /// Only rows carrying an explicit account/quota key identity appear.
+    /// Newest-first sample history per physical key, source, and window.
+    /// Collector runtime aliases do not split one physical history.
     history: BTreeMap<PhysicalQuotaKey, BTreeMap<Key, Vec<Sample>>>,
     /// Durable exhaustion latches per physical key: each entry is one latched
     /// window's source, name and reset instant, with `None` meaning "until a
@@ -170,7 +170,9 @@ struct QuotaSnapshot {
 /// selected, so historical runtime/target evidence cannot become current
 /// account quota. The transaction never writes; dropping it is a no-op.
 /// `scope` bounds the read, and ids absent from the registry simply carry no
-/// facts and a disabled status.
+/// facts and a disabled status. History is grouped by physical key, source,
+/// and window, with merged alias rows ordered newest first by observation
+/// time and row id.
 fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<QuotaSnapshot> {
     // Join a caller's open read transaction (one snapshot for registry and
     // quota reads together); otherwise open our own deferred one.
@@ -198,7 +200,7 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
         let mut statement = tx.prepare(
             "SELECT quota_key,runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,id \
              FROM capacity_samples WHERE account_id=? \
-             ORDER BY quota_key,runtime,lane,window,target,source,observed_at DESC,id DESC",
+             ORDER BY quota_key,source,window,observed_at DESC,id DESC",
         )?;
         let rows = statement.query_map([account.as_str()], |row| {
             Ok((
@@ -220,11 +222,16 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
             ))
         })?;
         for row in rows {
-            let (text, (payload, id), sample) = row?;
+            let (text, (payload, id), mut sample) = row?;
             let lane = text.strip_prefix(&prefix).ok_or_else(|| {
                 invalid("capacity sample quota key does not belong to its account")
             })?;
             let key = PhysicalQuotaKey::new(account, lane)?;
+            // `runtime`, `lane`, and `target` are legacy collector labels;
+            // physical identity is the validated quota key plus source/window.
+            sample.key.runtime = account.as_str().to_owned();
+            sample.key.lane = lane.to_owned();
+            sample.key.target = None;
             let account_facts = facts
                 .get_mut(account)
                 .expect("scope accounts are pre-seeded");

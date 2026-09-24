@@ -301,6 +301,65 @@ fn labels_and_aliases_deduplicate_to_one_physical_candidate() {
     assert_eq!(summary(&pinned), vec![("acct-b".into(), 0, 1.0, false)]);
 }
 
+/// A renamed collector alias must keep one physical window history, so an
+/// expired old row cannot poison the newer fresh observation. The same-alias
+/// control verifies that only the stored runtime label changed.
+#[test]
+fn renamed_alias_keeps_fresh_physical_window_known() {
+    for renamed in [false, true] {
+        let home = home(&[
+            ("acct-a", "FAKE_A"),
+            ("acct-b", "FAKE_B"),
+            ("acct-c", "FAKE_C"),
+        ]);
+        let store = Store::open(home.path()).unwrap();
+        let catalog = catalog(&store);
+        for (runtime, observed, valid, remaining) in [
+            (if renamed { "a-old" } else { "b-new" }, 800.0, 900.0, 70.0),
+            ("b-new", 950.0, 1100.0, 80.0),
+        ] {
+            store.conn.execute(
+                "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
+                 VALUES(?1,'fixture','5h',NULL,'collector',?2,1200,?3,?4,'{\"models\":[\"fixture\"]}','acct-a','acct-a::fixture')",
+                rusqlite::params![runtime, remaining, observed, valid],
+            ).unwrap();
+        }
+        let set = provider_candidates_at(
+            &store,
+            &catalog,
+            &"glm-user".parse().unwrap(),
+            "fixture",
+            Some("alpha"),
+            &none_ineligible(),
+            AT,
+        )
+        .unwrap();
+        assert_eq!(
+            summary(&set),
+            vec![("acct-a".into(), 0, 3.0, true)],
+            "renamed={renamed}"
+        );
+        if renamed {
+            store.conn.execute(
+                "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
+                 VALUES('b-new','secondary','5h',NULL,'collector',70,1200,800,900,'{\"models\":[\"fixture\"]}','acct-a','acct-a::secondary')",
+                [],
+            ).unwrap();
+            let distinct = provider_candidates_at(
+                &store,
+                &catalog,
+                &"glm-user".parse().unwrap(),
+                "fixture",
+                Some("alpha"),
+                &none_ineligible(),
+                AT,
+            )
+            .unwrap();
+            assert_eq!(summary(&distinct), vec![("acct-a".into(), 0, 3.0, false)]);
+        }
+    }
+}
+
 /// A model-specific exhausted lane excludes only that model; unrelated
 /// unknown windows never mask exhaustion, and durable latches survive stale
 /// samples and failed sources.
