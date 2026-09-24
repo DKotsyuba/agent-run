@@ -5,8 +5,9 @@ account_records, home)` is a deterministic dry run. It performs no write,
 backup, credential read, CLI launch, or database migration. Its output is a
 validated proposed `ProviderConfig`, a map from raw v1 runtime names to
 recorded provider/harness evidence for `decode_legacy_request`, and stable
-nonsecret `manual_review` markers. A future coordinated publication path
-must back up before applying any plan and must resolve every review marker.
+nonsecret `manual_review` markers. The implemented `config migrate --apply`
+path backs up the paired config/state before publication and requires every
+review marker to be acknowledged.
 
 Each v1 runtime requires an explicit `RuntimeMapping`: new provider id,
 Codex or Claude Code harness, native/custom connection, auth family, v2

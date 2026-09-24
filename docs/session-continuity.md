@@ -1,16 +1,16 @@
 # Native session continuity across an account change
 
-Status: implemented. Explicit resume and automatic in-flight Codex A→B
-account switching are in place and proven live with two real native Codex
-logins; Claude-family continuation stays on the parent's account. This document records the exact conditions under which a
-native Codex or Claude-family session keeps its session ID, history, and
-grants across an account change, the product/API seam a real switch needs,
-and how the repeatable fixture boundary proves everything that can be proved
-without a second real account.
+Status: schema-2 explicit resume and automatic in-flight Codex A→B account
+switching are implemented. A disposable run with two real native Codex logins
+kept one thread and recalled the parent turn. Claude-family continuation stays
+on the parent's account; cross-account Claude continuation is refused. The
+historical schema-1 conditions below explain retained rows, while the current
+provider path and its proof are described in the final section. Schema-1 rows
+do not silently resume through a schema-2 provider.
 
-## Conditions for a native session to survive continuation
+## Historical schema-1 continuation conditions
 
-These are the durable, checkable conditions enforced by the resume path
+These are the durable, checkable conditions of the legacy resume path
 (`agent-run-core` `service::resume` and `stream::plan`):
 
 1. **Terminal parent with a recorded native session.** Resume requires a
@@ -59,16 +59,14 @@ These are the durable, checkable conditions enforced by the resume path
   and quota collection fail instead of choosing one. Its account-scoped
   config state and native session discovery need a separate continuity proof.
 
-The current product guard requires the parent's labelled account to remain
-declared; it does not prove that native switching is impossible. A real A→B
-continuation must demonstrate the same native session ID and history with
-unchanged grants while authentication changes, through an explicit verified
-handoff at the session boundary. For Codex, that may reuse the sealed lineage
-home with a newly bound account credential, provided snapshot and process
-evidence remain valid. For Claude, the account config location needs a
-verified session-access path. Both remain unproven. A new conversation,
-summary, foreign session ID, changed grants, unproved live process, or
-ambiguous submitted turn cannot count as continuity.
+The historical guard requires the parent's labelled account to remain
+declared. In schema 2, Codex A→B rebinds the credential only after verified
+cleanup and continues the same native thread in the sealed lineage home; this
+was observed with two real logins. A real three-account chain has fixture
+coverage but no live qualification. Claude's account-scoped config location
+still lacks a verified cross-account session-access path, so that switch is
+refused. A new conversation, summary, foreign session ID, changed grants,
+unproved live process, or ambiguous submitted turn cannot count as continuity.
 
 ## Repeatable fixture boundary and existing evidence
 

@@ -96,9 +96,9 @@ The quota/session handoff is `ProviderConfig::load_if_changed(home, revision)`
 for exact-byte SHA reload, `ProviderConfig::resolve_catalog(account_records)`
 for registry-checked provider bindings, and `ProviderConfig::snapshot()`
 for a secret-free digest and stable ids. A failed reload returns an error;
-the caller retains its last valid cached value. The current v1 `Config`
-continues serving existing launch consumers during staged integration. V1 is
-historical/migration input, not a promise of permanent public v1 launches.
+the caller retains its last valid cached value. Public starts use schema 2;
+the v1 `Config` remains only for historical rows, migration inputs, and shared
+operator controls. It is not a public runtime launch alias.
 The [provider materialization contract](provider-materialization.md) names
 the sealed adapter APIs that consume this configuration.
 The [one-time migration plan](provider-migration.md) requires explicit
