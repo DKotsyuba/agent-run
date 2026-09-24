@@ -829,6 +829,38 @@ end
     assert_eq!(snapshot.models.len(), 1);
 }
 
+/// Deep but tiny Lua values must be stopped before Rust recursively expands
+/// them, both at collector output and inside the catchable JSON helper.
+#[tokio::test]
+async fn host_json_conversion_rejects_deep_values_before_expansion() {
+    let output = r#"collect = function(ctx)
+        local v = 'x'
+        for i = 1, 70 do v = {v} end
+        return {version = 1, windows = v}
+    end"#;
+    let error = run(output, fast(), FakeHttp::new(vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CollectorError::InvalidOutput("quota_output_overflow")
+    );
+
+    let encode = r#"collect = function(ctx)
+        local v = 'x'
+        for i = 1, 70 do v = {v} end
+        local ok = pcall(function() return ctx.json.encode(v) end)
+        if ok then error('deep JSON accepted') end
+        return {version = 1, windows = {{pool = 'primary', window = 'five_hour',
+            models = {'glm-4.7'}, remaining_percent = 1, observed_at = 1000}}}
+    end"#;
+    let snapshot = run(encode, fast(), FakeHttp::new(vec![])).await.unwrap();
+    assert_eq!(
+        snapshot.models[0].pools[0].windows[0].remaining_percent,
+        Some(1.0)
+    );
+}
+
 /// Encodes `text` as a quoted Lua string literal with escapes.
 fn string_literal(text: &str) -> String {
     let mut out = String::from("\"");

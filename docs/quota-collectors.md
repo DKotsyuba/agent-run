@@ -68,7 +68,11 @@ Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
   inside `pcall` still collapses within bounded ticks and the invocation
   returns a typed `Timeout`/`InstructionLimit` on its own. Native host work
   (such as bounded JSON conversion) cannot be preempted by a Lua hook; the
-  wall limit is cooperative, not a hard real-time deadline. No collector may
+  wall limit is cooperative, not a hard real-time deadline. Lua-to-Rust output
+  and `ctx.json.encode` first traverse tables with depth at most 64, at most
+  262,144 expanded values (including sparse array holes), bounded bytes, and
+  deadline checks; shared references count on every use and
+  cycles are rejected before serde conversion. No collector may
   use Lua pattern matching or coroutines. Registry compilation validates the
   same resource limits and rejects source larger than the VM memory bound.
 * `collect(ctx)` receives the nonsecret host-bound account identity, explicit
