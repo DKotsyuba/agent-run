@@ -71,7 +71,8 @@ model or account constants:
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
 recommendations = ["native subscription; strongest for long refactors"]
 [[providers.codex.models]]
 id = "gpt-main"

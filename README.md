@@ -10,58 +10,94 @@ external dependencies and must be installed and authenticated separately.
 
 ## Release targets
 
-Version 0.12.3 publishes a native artifact only for macOS Apple silicon
+Native releases are published only for macOS Apple silicon
 (`aarch64-apple-darwin`), the qualified release platform. Linux x86-64 remains
 an unqualified, non-blocking validation target; its release and qualification
 are deferred. Keychain and launchd integration remain macOS-only.
 
 ## Install
 
-Download `SHA256SUMS` and
-`agent-run-0.12.3-aarch64-apple-darwin.tar.gz` from the GitHub Release.
-
-Verify the checksum, then place the binary on `PATH`:
+Use the same command for a fresh installation or an update:
 
 ```bash
-grep "agent-run-0.12.3-aarch64-apple-darwin.tar.gz" SHA256SUMS | shasum -a 256 -c -
-tar -xzf agent-run-0.12.3-aarch64-apple-darwin.tar.gz
-install -m 0755 bin/agent-run ~/.local/bin/agent-run
-agent-run init
+curl -fsSL https://github.com/DKotsyuba/agent-run/releases/latest/download/install.sh | sh
 ```
 
-Build from source with the pinned Rust toolchain:
+Or use wget:
 
 ```bash
-cargo build --locked --release --package agent-run --bin agent-run
-install -m 0755 target/release/agent-run ~/.local/bin/agent-run
+wget -qO- https://github.com/DKotsyuba/agent-run/releases/latest/download/install.sh | sh -s -- --downloader wget
 ```
+
+**Availability:** the installer is included starting with 0.14.0.
+Releases through 0.13.3 do not contain its script/helper.
+
+The installer verifies the download and release manifest, retains immutable
+versions under `~/.agent-run/standalone/releases`, and places a launcher in
+`~/.local/bin`. Add that directory to `PATH`. No Cargo, Python or sudo is needed.
+Repeat the command to select the latest compatible version. Existing config,
+accounts and database are preserved; updates include a state/config backup.
+
+Stop the broker and other agent-run services before updating. Active agents,
+incompatible configuration or a schema migration requirement block the update.
+For an existing 0.13.x schema-2 home, first use the new candidate's
+[paired configuration/database migration](docs/provider-migration.md#existing-schema-2-homes).
+Services are not stopped or restarted automatically. Afterward, restart your
+configured services and run `agent-run doctor`.
+
+To pin a version or choose directories, download `install.sh` and run:
+
+```bash
+sh install.sh --version X.Y.Z --home "$HOME/.agent-run" \
+  --prefix "$HOME/.agent-run/standalone" --bin-dir "$HOME/.local/bin"
+```
+
+For a fresh install, run `agent-run init`, then configure engine CLIs and
+accounts. The installer does not install engines or sign in to providers.
+
+Build from source with the pinned Rust toolchain (also usable before publication):
+
+```bash
+release_root="$(mktemp -d)"
+cargo xtask release build-native --output "$release_root" --version 0.14.0
+"$release_root/releases/0.14.0/bin/agent-run-deploy" install \
+  --release "$release_root/releases/0.14.0" --version 0.14.0 \
+  --prefix "$HOME/.agent-run/standalone" --home "$HOME/.agent-run" --bin-dir "$HOME/.local/bin"
+```
+
+Use a new version for changed source: the installer never overwrites an
+existing version with different bytes. The temporary build directory may be
+removed after installation; the selected release is copied into the prefix.
 
 The home defaults to `~/.agent-run`; override it with `AGENT_RUN_HOME` or
 `--home`.
 
 ## Configure
 
-Configuration lives in `<home>/config.toml`. Unknown agent-run keys and
-reserved native control fields fail closed. Runtime aliases are `codex`,
-`claude`, and `glm`.
+Configuration lives in `<home>/config.toml`. Schema 2 declares native harnesses,
+named providers, explicit models and account bindings. See
+[provider configuration](docs/provider-config-v2.md) for a complete example.
+Each provider selects its external quota executable:
 
 ```toml
-schema_version = 1
-
-[runtimes.codex]
-enabled = true
-adapter = "codex"
-binary = "/absolute/path/to/codex"
-home = "/absolute/path/to/agent-run-home/runtimes/codex"
-models = ["gpt-5.6-sol"]
-limits_source = "codex_appserver"
+# Inside an existing provider declaration:
+limits_source = "exec"
+collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/glm.sh"], source = "glm-quota" }
 ```
 
-Per-runtime configuration supports declared auth sources, skills, MCP servers,
-hooks, plugins, native engine settings, and capacity sources. Credential values
-do not belong in this file. The resident broker hashes the file every minute
-and reloads valid changes; new requests also check immediately. Invalid changes
-leave the last valid configuration active.
+The same contract accepts Python scripts or native programs: private JSON on
+stdin, normalized quota JSON on stdout. The native archive includes external
+scripts under `collectors/`; those examples require Bash/jq, plus curl for HTTP.
+See [quota collectors](docs/quota-collectors.md) for credentials, dependencies,
+the output contract and migration from retired Lua/app-server settings.
+Credentials stay in protected account stores. The broker checks configuration
+every minute and on requests; invalid revisions keep the last valid settings.
+
+Declare shared background backends under `services.<id>`. The broker warms them
+before harness launch, retains them while agents are active, and stops them
+after thirty minutes of inactivity. Native MCP clients connect to their usual
+backend; their tool permissions remain defined by the role. See
+[managed services](docs/managed-services.md), including the CodeGraph example.
 
 Initialize and inspect the installation:
 

@@ -10,6 +10,7 @@ agent-run-config = { path = "../agent-run-config" }
 agent-run-domain = { path = "../agent-run-domain" }
 agent-run-platform = { path = "../agent-run-platform" }
 chrono.workspace = true
+libc.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

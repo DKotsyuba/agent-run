@@ -85,6 +85,674 @@ fn home() -> (tempfile::TempDir, std::path::PathBuf) {
     home_with("", &[])
 }
 
+/// Failure guard for all process owners created by a managed-service test; service fixtures also have finite TTLs.
+struct ServiceProcesses(std::path::PathBuf);
+impl Drop for ServiceProcesses {
+    /// Reads exact recorded identities and terminates only this disposable home's captured processes.
+    fn drop(&mut self) {
+        let Ok(store) = Store::open(&self.0) else {
+            return;
+        };
+        let owners: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT owner_kind,owner_id FROM process_ownership")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (kind, id) in owners {
+            if let Ok(Some(mut owned)) = store.remembered_processes(&kind, &id) {
+                let _ = owned.cleanup_blocking(Duration::from_millis(100));
+                // SAFETY: reaps only this exact recorded child when it still belongs
+                // to the test process; WNOHANG cannot block and ECHILD is harmless.
+                unsafe {
+                    libc::waitpid(owned.pid, std::ptr::null_mut(), libc::WNOHANG);
+                }
+            }
+        }
+    }
+}
+
+/// Two agents share one warm generation, retain it while active, and start idle expiry only after both finish.
+#[tokio::test]
+async fn managed_services_share_warmup_and_expire_after_last_agent() {
+    use agent_run_core::managed_services::Manager;
+    let (_temp, home) = home_with(
+        r#"
+[services.shared]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+idle_timeout_seconds=1
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/usr/bin/true"}
+"#,
+        &[],
+    );
+    let _cleanup = ServiceProcesses(home.clone());
+    let service = Service::new(home.clone());
+    let mut ids = Vec::new();
+    for index in 0..2 {
+        let mut request = request(&home);
+        request.request_id = Some(format!("shared-service-{index}"));
+        let admitted = service
+            .admit_provider_trusted(request, candidates(committed(&home)))
+            .unwrap();
+        assert_eq!(admitted["created"], true);
+        ids.push(serde_json::from_value::<AgentId>(admitted["agent_id"].clone()).unwrap());
+    }
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        manager.tick().await.unwrap();
+        let ready: i64 = Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_service_gates WHERE state='ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if ready == 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "services did not warm before the fixture deadline: {ready} ready gates"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = Store::open(&home).unwrap();
+    let generation: String = store
+        .conn
+        .query_row("SELECT id FROM managed_service_generations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let root = store
+        .remembered_processes("service", &generation)
+        .unwrap()
+        .unwrap()
+        .leader
+        .unwrap();
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM managed_service_generations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(store);
+    drop(manager);
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    manager.tick().await.unwrap();
+    let restored = Store::open(&home)
+        .unwrap()
+        .remembered_processes("service", &generation)
+        .unwrap()
+        .unwrap()
+        .leader
+        .unwrap();
+    assert_eq!(
+        restored.token, root.token,
+        "manager restart must retain the exact service generation"
+    );
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        config.replace("args=[\"20\"]", "args=[\"21\"]"),
+    )
+    .unwrap();
+    let mut changed = request(&home);
+    changed.request_id = Some("changed-service-revision".into());
+    let admitted = service
+        .admit_provider_trusted(changed, candidates(committed(&home)))
+        .unwrap();
+    let changed_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    manager.tick().await.unwrap();
+    let mut blocked = supervisor(&home, &changed_id);
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), blocked.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&changed_id).unwrap().status,
+        Status::Failed
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    manager.tick().await.unwrap();
+    assert_eq!(
+        agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
+        agent_run::process::ProcessState::Alive
+    );
+    let mut supervisors = ids
+        .iter()
+        .map(|id| supervisor(&home, id))
+        .collect::<Vec<_>>();
+    for child in &mut supervisors {
+        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    for id in &ids {
+        assert_eq!(
+            Store::open(&home).unwrap().get(id).unwrap().status,
+            Status::Succeeded
+        );
+    }
+    manager.tick().await.unwrap();
+    let store = Store::open(&home).unwrap();
+    let (state, idle): (String, Option<f64>) = store
+        .conn
+        .query_row(
+            "SELECT state,idle_since FROM managed_service_generations WHERE id=?",
+            [&generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "ready");
+    assert!(idle.is_some());
+    drop(store);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    manager.tick().await.unwrap();
+    assert!(matches!(
+        agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
+        agent_run::process::ProcessState::Dead | agent_run::process::ProcessState::Reused
+    ));
+    let state: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT state FROM managed_service_generations WHERE id=?",
+            [&generation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "stopped");
+}
+
+/// An unready backend blocks the actual harness, then releases only never-spawned attempt ownership.
+#[tokio::test]
+async fn managed_services_readiness_failure_never_starts_harness() {
+    use agent_run_core::managed_services::Manager;
+    let (_temp, home) = home_with(
+        r#"
+[services.unready]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+startup_timeout_seconds=1
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/usr/bin/false",timeout_seconds=1}
+"#,
+        &[],
+    );
+    let _cleanup = ServiceProcesses(home.clone());
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        manager.tick().await.unwrap();
+        if let Some(exit) = child.try_wait().unwrap() {
+            assert!(!exit.success());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "readiness failure did not reach the supervisor"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Failed);
+    let (process, active): (Option<String>, bool) = store
+        .conn
+        .query_row(
+            "SELECT process_identity,ownership_active FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(process.is_none());
+    assert!(!active);
+    drop(store);
+    manager.tick().await.unwrap();
+}
+
+/// Starts a real disposable broker with the fixture credential and no inherited interactive streams.
+fn resident_broker(home: &Path) -> tokio::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(home)
+        .args(["api", "serve"])
+        .env("FAKE_TOKEN", "synthetic-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+/// Waits for the actual listener while ensuring a failed child cannot leave the test waiting indefinitely.
+async fn broker_ready(home: &Path, child: &mut tokio::process::Child) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    while tokio::net::UnixStream::connect(home.join("api.sock"))
+        .await
+        .is_err()
+    {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "broker exited during startup"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "broker did not bind"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Real socket admission keeps service warmup in the resident broker after the submitting connection closes.
+#[tokio::test]
+async fn managed_services_run_through_the_resident_socket_broker() {
+    use agent_run::transport::socket;
+    let (_temp, home) = home_with(
+        r#"
+[services.api]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+idle_timeout_seconds=1
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/usr/bin/true"}
+"#,
+        &[],
+    );
+    let _cleanup = ServiceProcesses(home.clone());
+    let mut broker = resident_broker(&home);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.timeout_seconds = Some(10.0);
+    let submitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(submitted["agent_id"].clone()).unwrap();
+    loop {
+        let row = Store::open(&home).unwrap().get(&id).unwrap();
+        if row.status.terminal() {
+            assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_kind);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resident broker did not complete the fixture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let answer = socket::client(&home, "answer", serde_json::json!({"agent_id":id}))
+        .await
+        .unwrap();
+    assert_eq!(answer["content"], "fixture final answer\n");
+    loop {
+        let stopped: bool = Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM managed_service_generations WHERE state='stopped')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if stopped {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resident broker did not stop its idle service"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM managed_service_probes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    broker.kill().await.unwrap();
+}
+
+/// SIGKILL during a running probe leaves durable ownership for the replacement broker to clean.
+#[tokio::test]
+async fn managed_services_recover_interrupted_probe_after_broker_crash() {
+    use agent_run::{
+        process::{self, ProcessState},
+        transport::socket,
+    };
+    let (_temp, home) = home_with(
+        r#"
+[services.crash]
+command="/bin/sleep"
+args=["20"]
+cwd="/tmp"
+startup_timeout_seconds=5
+monitor_interval_seconds=1
+stop_grace_seconds=0
+readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /bin/sleep 10"],timeout_seconds=2}
+"#,
+        &[],
+    );
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        config.replace(
+            "cwd=\"/tmp\"",
+            &format!(
+                "cwd={}",
+                toml::Value::String(home.to_string_lossy().into_owned())
+            ),
+        ),
+    )
+    .unwrap();
+    let _cleanup = ServiceProcesses(home.clone());
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.timeout_seconds = Some(8.0);
+    let submitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(submitted["agent_id"].clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(14);
+    while !home.join("probe-started").exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "probe never executed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let encoded: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT leader_json FROM process_ownership WHERE owner_kind='probe' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let probe: process::Identity = serde_json::from_str(&encoded).unwrap();
+    broker.kill().await.unwrap();
+    assert_eq!(
+        process::observe(Some(probe.pid), Some(&probe.token), Some(probe.birth)),
+        ProcessState::Alive,
+        "fixture must exercise recovery rather than natural exit"
+    );
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let recovery = tokio::time::Instant::now() + Duration::from_secs(3);
+    while process::observe(Some(probe.pid), Some(&probe.token), Some(probe.birth))
+        == ProcessState::Alive
+    {
+        assert!(
+            tokio::time::Instant::now() < recovery,
+            "replacement broker did not clean the interrupted probe"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    loop {
+        let store = Store::open(&home).unwrap();
+        let active: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_service_generations WHERE state!='stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if active == 0 && store.get(&id).unwrap().status.terminal() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "crash fixture did not settle"
+        );
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = Store::open(&home).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_service_generations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "broker restart must not duplicate the service"
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM managed_service_probes", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    broker.kill().await.unwrap();
+}
+
+/// Opt-in qualification of the installed CodeGraph bundle using a synthetic project, private HOME and bounded daemons.
+#[tokio::test]
+#[ignore = "requires AGENT_RUN_CODEGRAPH_BUNDLE pointing to the installed CodeGraph 1.6.0 platform bundle"]
+async fn managed_services_real_codegraph_qualification() {
+    use agent_run_config::{
+        provider_config::ProviderConfig,
+        services::{ManagedService, ReadinessProbe},
+    };
+    use agent_run_core::managed_services::Manager;
+    let bundle = std::path::PathBuf::from(
+        std::env::var_os("AGENT_RUN_CODEGRAPH_BUNDLE").expect("qualification bundle"),
+    );
+    let launcher = bundle.join("bin/codegraph");
+    let node = bundle.join("node");
+    let probe = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/services/codegraph-probe.cjs")
+        .canonicalize()
+        .unwrap();
+    let (_temp, home) = home();
+    let _cleanup = ServiceProcesses(home.clone());
+    let project = home.join("sample");
+    let private_home = home.join("codegraph-home");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&private_home).unwrap();
+    fs::write(
+        project.join("sample.js"),
+        "/** Adds two numbers. */\nexport function add(a, b) { return a + b; }\n",
+    )
+    .unwrap();
+    let initialized = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new(&launcher)
+            .args(["init", "--yes"])
+            .arg(&project)
+            .env("HOME", &private_home)
+            .env("DO_NOT_TRACK", "1")
+            .env("CODEGRAPH_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let mut config = ProviderConfig::load(&home).unwrap().0;
+    config.services.insert(
+        "codegraph".into(),
+        ManagedService {
+            command: "/usr/bin/env".into(),
+            args: vec![
+                format!("HOME={}", private_home.display()),
+                "DO_NOT_TRACK=1".into(),
+                "CODEGRAPH_NO_UPDATE_CHECK=1".into(),
+                "CODEGRAPH_DAEMON_INTERNAL=1".into(),
+                "CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS=15000".into(),
+                "CODEGRAPH_DAEMON_MAX_IDLE_MS=20000".into(),
+                launcher.to_string_lossy().into_owned(),
+                "serve".into(),
+                "--mcp".into(),
+                "--path".into(),
+                project.to_string_lossy().into_owned(),
+                "--no-watch".into(),
+            ],
+            cwd: project.clone(),
+            env_from: vec![],
+            readiness: ReadinessProbe {
+                command: node.clone(),
+                args: vec![
+                    probe.to_string_lossy().into_owned(),
+                    project.to_string_lossy().into_owned(),
+                    "1.6.0".into(),
+                ],
+                timeout_seconds: 5,
+            },
+            startup_timeout_seconds: 30,
+            idle_timeout_seconds: 2,
+            monitor_interval_seconds: 1,
+            stop_grace_seconds: 2,
+        },
+    );
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let service = Service::new(home.clone());
+    let mut request = request(&home);
+    request.timeout_seconds = Some(40.0);
+    let accepted = service
+        .admit_provider_trusted(request, candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(accepted["agent_id"].clone()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    let root = loop {
+        manager.tick().await.unwrap();
+        let store = Store::open(&home).unwrap();
+        let (state, root): (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT state,process_identity_json FROM managed_service_generations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if state == "ready" {
+            break serde_json::from_str::<agent_run::process::Identity>(&root.unwrap()).unwrap();
+        }
+        assert!(
+            !matches!(state.as_str(), "unhealthy" | "unknown"),
+            "real CodeGraph failed readiness: {state}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "real CodeGraph did not warm"
+        );
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    manager.tick().await.unwrap();
+    let mut wrong = Command::new(&node)
+        .arg(&probe)
+        .arg(&project)
+        .arg("1.6.0")
+        .env("AGENT_RUN_SERVICE_PID", (root.pid + 1).to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(6), wrong.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success(),
+        "probe must reject another PID"
+    );
+    for _ in 0..2 {
+        let mut client = Command::new(&node)
+            .arg(&probe)
+            .arg(&project)
+            .arg("1.6.0")
+            .env("AGENT_RUN_SERVICE_PID", root.pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(6), client.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    let mut child = supervisor(&home, &id);
+    assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+    manager.tick().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    manager.tick().await.unwrap();
+    assert!(matches!(
+        agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
+        agent_run::process::ProcessState::Dead | agent_run::process::ProcessState::Reused
+    ));
+    assert_eq!(
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_service_generations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
 /// [`home`] plus `extra` TOML appended to the config (more bindings,
 /// providers, or core caps) and more enabled fake-token accounts.
 fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -236,6 +904,16 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(selected, "acct-work");
     assert_eq!(active, 0);
     assert!(cleanup.is_some() && process.is_some());
+    let captured = store
+        .remembered_processes("attempt", &attempt)
+        .unwrap()
+        .expect("provider supervisor checkpoints ownership");
+    let captured = captured.snapshot().unwrap();
+    assert!(captured.descendants_observed);
+    assert_eq!(Some(&captured.leader.token), process.as_ref());
+    assert!(!serde_json::to_string(&captured)
+        .unwrap()
+        .contains("synthetic-token"));
     let attached: i64 = store
         .conn
         .query_row(
@@ -2711,13 +3389,13 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
         let (_temp, home) = home();
         edit_config(&home, |config| {
             let provider = config["providers"]["glm-user"].as_table_mut().unwrap();
-            provider.insert("limits_source".into(), "lua".into());
+            provider.insert("limits_source".into(), "exec".into());
             let mut collector = toml::map::Map::new();
-            collector.insert("script".into(), "anthropic_usage".into());
-            collector.insert(
-                "origins".into(),
-                toml::Value::Array(vec!["https://gateway.example".into()]),
-            );
+            collector.insert("command".into(), "/bin/true".into());
+            let mut windows = toml::map::Map::new();
+            windows.insert("five_hour".into(), "primary".into());
+            windows.insert("seven_day".into(), "secondary".into());
+            collector.insert("exhaustion_windows".into(), toml::Value::Table(windows));
             provider.insert("collector".into(), toml::Value::Table(collector));
         });
         let service = Service::new(home.clone());
@@ -2747,7 +3425,7 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
                 vec![(
                     "acct-work::primary".to_owned(),
                     "five_hour".to_owned(),
-                    "claude-rate-limit-event".to_owned()
+                    "native-quota-exhaustion".to_owned()
                 )],
                 "{task}"
             );
@@ -2941,12 +3619,11 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
     );
 }
 
-/// An unobservable cleanup of the exhausted attempt A ends the supervisor
-/// without success, switch or release: the run stays unproven until
-/// reconciliation marks it lost, and A stays owned with a typed
-/// `attempt_cleanup_unresolved` blocker; no attempt B exists.
+/// A failed supervisor cannot release unproven cleanup or switch accounts.
+/// Recovery may release it only after freshly verifying the durable member
+/// snapshot; the logical run remains lost and no second attempt is created.
 #[tokio::test]
-async fn cleanup_error_never_switches_or_releases() {
+async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
     let (_temp, home) = codex_home(["exhausted", "ok"]);
     fs::write(home.join("fixture-cleanup-error-1"), "").unwrap();
     let id = codex_admit(&home, "cleanup-error", None);
@@ -2959,6 +3636,12 @@ async fn cleanup_error_never_switches_or_releases() {
         !exit.success(),
         "the supervisor reports the unproven cleanup"
     );
+    let before = attempts(&home, &id);
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].3, 1,
+        "the failed supervisor must retain ownership"
+    );
     let service = Service::new(home.clone());
     service.reconcile().unwrap();
     service.reconcile().unwrap();
@@ -2968,7 +3651,22 @@ async fn cleanup_error_never_switches_or_releases() {
     assert!(supervisor_log.contains("class=RuntimeError"));
     let attempts = attempts(&home, &id);
     assert_eq!(attempts.len(), 1, "{attempts:?}");
-    assert_eq!(attempts[0].3, 1, "unproven cleanup keeps ownership");
+    assert_eq!(
+        attempts[0].3, 0,
+        "freshly verified recovery releases ownership"
+    );
+    let proof: String = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let proof: serde_json::Value = serde_json::from_str(&proof).unwrap();
+    assert_eq!(proof["confirmed"], true);
+    assert_eq!(proof["reconciled"], true);
     assert_eq!(
         count(
             &home,
@@ -2981,7 +3679,7 @@ async fn cleanup_error_never_switches_or_releases() {
     assert_eq!(
         count(
             &home,
-            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='attempt_cleanup_unresolved'",
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='attempt_cleanup_reconciled'",
             &id
         ),
         1
@@ -3219,18 +3917,44 @@ async fn codex_source_buckets_govern_bound_models() {
     let at = agent_run::domain::now();
     let models: std::collections::BTreeSet<String> = ["fixture".to_owned()].into();
     for (account, used) in [("acct-cx-a", 100.0), ("acct-cx-b", 20.0)] {
+        use std::io::Write;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
+        let mut parser = std::process::Command::new("jq")
+            .args(["-e", "-L"])
+            .arg(&root)
+            .args(["--argjson", "ctx"])
+            .arg(serde_json::json!({"models":{"fixture":{}},"now":at}).to_string())
+            .arg("-f")
+            .arg(root.join("codex.jq"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let response = serde_json::json!({"rateLimitsByLimitId":{"codex":{
             "primary":{"usedPercent":used,"windowDurationMins":300,"resetsAt":at + 3600.0}
         }}});
-        let (snapshot, skipped) = agent_run::capacity::codex_quota::codex_snapshot(
+        parser
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(response.to_string().as_bytes())
+            .unwrap();
+        let output = parser.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let scope = agent_run::capacity::quota::CollectorScope {
+            runtime: "codex-user".into(),
+            source: "codex-appserver".into(),
+            models: models.clone(),
+        };
+        let snapshot = agent_run::capacity::quota::normalize_collector_output(
             &account.parse().unwrap(),
-            "codex-user",
-            &models,
-            &response,
+            &scope,
+            &serde_json::from_slice(&output.stdout).unwrap(),
             at,
+            256,
+            256,
         )
         .unwrap();
-        assert_eq!(skipped, 0);
         agent_run::state::quota::record_quota_snapshot(&home, "codex-user", &snapshot, 100, at)
             .unwrap();
     }

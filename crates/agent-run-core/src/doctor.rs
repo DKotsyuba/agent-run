@@ -176,6 +176,12 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     };
     if let Some(config) = &provider_config {
         provider_bindings(config, &report.home, &mut report.findings);
+        managed_services(
+            config,
+            &report.home,
+            report.checked_at,
+            &mut report.findings,
+        );
     }
     capacity(
         &config,
@@ -195,6 +201,106 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         dependencies.process_lister.as_ref(),
     );
     Ok(report)
+}
+
+/// Reports cold/warm/unhealthy service state from a read-only connection and fresh PID evidence.
+/// Never launches a probe, starts a daemon, or emits command arguments, environment values or credentials.
+fn managed_services(
+    config: &agent_run_config::provider_config::ProviderConfig,
+    home: &Path,
+    at: f64,
+    findings: &mut Vec<Finding>,
+) {
+    let inspect = (|| -> Result<()> {
+        let connection = rusqlite::Connection::open_with_flags(
+            home.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut query=connection.prepare("SELECT g.service_id,g.state,g.process_identity_json,g.checked_at,p.leader_json FROM managed_service_generations g LEFT JOIN process_ownership p ON p.owner_kind='service' AND p.owner_id=g.id WHERE g.state!='stopped' ORDER BY g.service_id LIMIT 256")?;
+        let mut rows = query.query([])?;
+        let mut seen = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let state: String = row.get(1)?;
+            let identity: Option<String> = row.get(2)?;
+            let checked: Option<f64> = row.get(3)?;
+            let captured: Option<String> = row.get(4)?;
+            let component = if config.services.contains_key(&name) {
+                format!("service:{name}")
+            } else {
+                "services".into()
+            };
+            seen.insert(name.clone());
+            let root =
+                identity.and_then(|value| serde_json::from_str::<process::Identity>(&value).ok());
+            let captured =
+                captured.and_then(|value| serde_json::from_str::<process::Identity>(&value).ok());
+            let alive = root.as_ref().is_some_and(|root| {
+                captured.as_ref().is_some_and(|saved| {
+                    saved.pid == root.pid
+                        && saved.token == root.token
+                        && saved.birth == root.birth
+                        && saved.group == root.group
+                }) && process::observe(Some(root.pid), Some(&root.token), Some(root.birth))
+                    == ProcessState::Alive
+            });
+            if matches!(state.as_str(), "unhealthy" | "unknown") || (state == "ready" && !alive) {
+                add(
+                    findings,
+                    "managed_service_unavailable",
+                    "error",
+                    &component,
+                    "service health or process ownership is unresolved",
+                );
+            } else if state == "ready"
+                && checked.is_none_or(|checked| {
+                    at - checked
+                        > config.services.get(&name).map_or(15.0, |service| {
+                            service.monitor_interval_seconds as f64 * 3.0
+                        })
+                })
+            {
+                add(
+                    findings,
+                    "managed_service_health_stale",
+                    "warning",
+                    &component,
+                    "broker health observation is stale",
+                );
+            } else {
+                add(
+                    findings,
+                    "managed_service_state",
+                    "info",
+                    &component,
+                    if state == "ready" {
+                        "service is warm and its process identity is alive"
+                    } else {
+                        "service is starting or stopping"
+                    },
+                );
+            }
+        }
+        for name in config.services.keys().filter(|name| !seen.contains(*name)) {
+            add(
+                findings,
+                "managed_service_cold",
+                "info",
+                &format!("service:{name}"),
+                "service starts before the next agent; a cold service is expected while idle",
+            );
+        }
+        Ok(())
+    })();
+    if inspect.is_err() {
+        add(
+            findings,
+            "managed_service_state_invalid",
+            "error",
+            "services",
+            "service state could not be read",
+        );
+    }
 }
 
 /// Checks every configured provider binding against a WAL-aware, read-only
@@ -1260,6 +1366,57 @@ mod tests {
     use serde_json::json;
     use std::cell::Cell;
 
+    /// Cold services are normal, missing ownership is an error, and diagnostics never expose commands or write state.
+    #[test]
+    fn service_diagnostics_are_read_only_and_secret_safe() {
+        let home = tempfile::tempdir().unwrap();
+        state::Store::initialize(home.path()).unwrap();
+        let config = agent_run_config::provider_config::ProviderConfig::parse(
+            r#"schema_version=2
+[services.hot]
+command="/bin/sleep"
+args=["sensitive-argument"]
+cwd="/tmp"
+env_from=["PRIVATE_SERVICE_TOKEN"]
+readiness={command="/bin/true"}
+"#,
+            home.path(),
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        managed_services(&config, home.path(), 100.0, &mut findings);
+        assert_eq!(findings[0].code, "managed_service_cold");
+        assert_eq!(findings[0].severity, "info");
+        let mut store = state::Store::open(home.path()).unwrap();
+        let owner = process::OwnedProcess::capture(std::process::id() as i32);
+        let root = owner.leader.as_ref().unwrap();
+        store.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,process_identity_json,created_at,checked_at) VALUES ('fixture','hot',?1,?2,'ready',?3,?3,1,100)",rusqlite::params![config.services["hot"].revision().unwrap(),serde_json::to_string(&config.services["hot"]).unwrap(),serde_json::to_string(root).unwrap()]).unwrap();
+        findings.clear();
+        managed_services(&config, home.path(), 100.0, &mut findings);
+        assert_eq!(findings[0].code, "managed_service_unavailable");
+        store
+            .remember_processes("service", "fixture", &owner.snapshot().unwrap())
+            .unwrap();
+        let revision: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        findings.clear();
+        managed_services(&config, home.path(), 100.0, &mut findings);
+        assert_eq!(findings[0].severity, "info");
+        let after: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(revision, after);
+        let printed = serde_json::to_string(&findings).unwrap();
+        assert!(!printed.contains("sensitive-argument"));
+        assert!(!printed.contains("PRIVATE_SERVICE_TOKEN"));
+        findings.clear();
+        managed_services(&config, home.path(), 200.0, &mut findings);
+        assert_eq!(findings[0].code, "managed_service_health_stale");
+    }
+
     /// A declared auth variable guaranteed absent, standing in for Python's
     /// `mock.patch.dict(os.environ, {}, clear=True)`: Rust tests share one
     /// process environment, so a name that is never set is the deterministic
@@ -1311,7 +1468,7 @@ mod tests {
         std::fs::write(
             home.path().join("config.toml"),
             format!(
-                "schema_version = 2\n[harnesses.codex]\nbinary = '/bin/true'\nhome = '{0}/codex'\n[harnesses.claude-code]\nbinary = '/bin/true'\nhome = '{0}/claude'\n[providers.codex]\nharness = 'codex'\nconnection = {{ kind = 'native' }}\nauth_family = 'openai'\nlimits_source = 'codex_appserver'\n[[providers.codex.models]]\nid = 'gpt'\n[[providers.codex.bindings]]\nlabel = 'global'\naccount = 'acct'\n",
+                "schema_version = 2\n[harnesses.codex]\nbinary = '/bin/true'\nhome = '{0}/codex'\n[harnesses.claude-code]\nbinary = '/bin/true'\nhome = '{0}/claude'\n[providers.codex]\nharness = 'codex'\nconnection = {{ kind = 'native' }}\nauth_family = 'openai'\nlimits_source = 'none'\n[[providers.codex.models]]\nid = 'gpt'\n[[providers.codex.bindings]]\nlabel = 'global'\naccount = 'acct'\n",
                 home.path().display()
             ),
         )

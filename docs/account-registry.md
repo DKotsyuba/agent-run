@@ -32,7 +32,7 @@ native-login provider. If the same spelling names the label of one binding
 and the global id of another, login refuses it as ambiguous before touching
 either protected credential store; use an unambiguous label or id.
 
-The quota-side Rust boundary is `Store::list_accounts()` or
+The custom inference authorization boundary is `Store::list_accounts()` or
 `Store::account(id)`, followed by
 `ProviderConfig::resolve_catalog(account_records)` and
 `AuthorizedRequest::new(catalog, provider, model, account)`. Construction
@@ -42,8 +42,9 @@ scheme/host/port, constructs authorization inside Rust, and disables HTTP
 redirects. `CredentialReader` is injectable for synthetic tests;
 `SystemCredentialReader` uses the existing host environment, file, or
 platform Keychain. Native providers cannot mint an exportable HTTP token.
-The quota consumer must keep prepared request headers out of Lua, logs,
-snapshots, and response bodies.
+Prepared request headers stay out of logs, snapshots and response bodies.
+External quota executables receive account-bound credentials through private
+stdin; see the [collector protocol](quota-collectors.md).
 
 Custom gateway `auth_header = "bearer"` is the default; the explicit
 `x_api_key` form is available for compatible Messages gateways. This

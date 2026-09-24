@@ -13,7 +13,7 @@ use std::{
 };
 
 /// The state database schema supported by binaries built from this workspace.
-pub const STORE_SCHEMA_VERSION: i64 = 17;
+pub const STORE_SCHEMA_VERSION: i64 = 19;
 
 /// Lowercase SHA-256 of one release file.
 fn digest(path: &Path) -> Result<String, String> {

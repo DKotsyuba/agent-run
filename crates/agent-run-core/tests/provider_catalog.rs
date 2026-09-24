@@ -26,7 +26,7 @@ home = "{root}/claude"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "none"
 recommendations = ["{recommendation}"]
 [[providers.codex.models]]
 id = "gpt-main"
@@ -44,8 +44,8 @@ account = "acct-codex"
 harness = "claude-code"
 connection = {{ kind = "custom", endpoint = "https://api.example.com/api", protocol = "messages" }}
 auth_family = "anthropic"
-limits_source = "lua"
-collector = {{ script = "glm_quota", origins = ["https://api.example.com"] }}
+limits_source = "exec"
+collector = {{ command = "/bin/true" }}
 [[providers.glm.models]]
 id = "glm-5.3"
 [[providers.glm.bindings]]

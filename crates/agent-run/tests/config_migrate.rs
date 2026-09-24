@@ -130,6 +130,48 @@ impl Home {
         Self { _temp: temp, root }
     }
 
+    /// Builds an already-v2/schema-17 home with one existing reference and a retired external Lua binding.
+    fn v2() -> Self {
+        let home = Self::new();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/baseline/db/current-v17.sqlite"),
+            home.root.join("state.db"),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+        conn.execute_batch("UPDATE agents SET status='succeeded'; INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at) VALUES ('acct-existing','anthropic','env:EXISTING_KEY','enabled',0,0);").unwrap();
+        drop(conn);
+        let original = format!(
+            r#"# Preserve this original v2 configuration byte-for-byte on rollback.
+schema_version=2
+[harnesses.codex]
+binary="/bin/true"
+home="{0}/codex"
+[harnesses.claude-code]
+binary="/bin/true"
+home="{0}/claude"
+[providers.tenant]
+harness="claude-code"
+connection={{kind="native"}}
+auth_family="anthropic"
+limits_source="lua"
+collector={{script="/retired/quota.lua"}}
+[[providers.tenant.models]]
+id="fixture"
+[[providers.tenant.bindings]]
+label="existing"
+account="acct-existing"
+"#,
+            home.root.display()
+        );
+        let target=original.replace("limits_source=\"lua\"","limits_source=\"exec\"").replace("collector={script=\"/retired/quota.lua\"}","collector={command=\"/bin/bash\",args=[\"/external/quota.sh\"],source=\"configured-quota\"}");
+        fs::write(home.root.join("config.toml"), original).unwrap();
+        fs::write(home.root.join("target.toml"), target).unwrap();
+        seal(&home.root.join("old-release"), 17);
+        home
+    }
+
     /// Path text of a file inside the home.
     fn path(&self, name: &str) -> String {
         self.root.join(name).to_string_lossy().into_owned()
@@ -163,6 +205,134 @@ impl Home {
     }
 }
 
+/// An explicit v2 replacement upgrades state without re-registering accounts and rolls back the complete original pair.
+#[test]
+fn v2_target_config_migration_preserves_accounts_and_history() {
+    let home = Home::v2();
+    let before_config = fs::read(home.root.join("config.toml")).unwrap();
+    let before_db = sha(&home.root.join("state.db"));
+    let before_history = history(&home.root);
+    let target = home.path("target.toml");
+    let old = home.path("old-release");
+    let (ok, plan) = run(
+        &home.root,
+        &["config", "migrate", "--target-config", &target, "--dry-run"],
+        false,
+    );
+    assert!(ok, "{plan}");
+    assert_eq!(plan["plan"]["source_config_schema"], 2);
+    assert_eq!(sha(&home.root.join("state.db")), before_db);
+    assert_eq!(
+        fs::read(home.root.join("config.toml")).unwrap(),
+        before_config
+    );
+    assert!(!home.root.join("migrations").exists());
+    let (ok, result) = run(
+        &home.root,
+        &[
+            "config",
+            "migrate",
+            "--target-config",
+            &target,
+            "--apply",
+            "--from-release",
+            &old,
+        ],
+        false,
+    );
+    assert!(ok, "{result}");
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
+    assert_eq!(
+        fs::read(home.root.join("config.toml")).unwrap(),
+        fs::read(&target).unwrap()
+    );
+    assert_eq!(history(&home.root), before_history);
+    let accounts = agent_run::state::Store::open(&home.root)
+        .unwrap()
+        .list_accounts()
+        .unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].account_id.as_str(), "acct-existing");
+    assert_eq!(accounts[0].secret_ref.as_str(), "env:EXISTING_KEY");
+    let snapshot = result["snapshot"].as_str().unwrap();
+    let (ok, result) = run(
+        &home.root,
+        &["config", "rollback", "--snapshot", snapshot],
+        false,
+    );
+    assert!(ok, "{result}");
+    assert_eq!(version(&home.root), 17);
+    assert_eq!(
+        fs::read(home.root.join("config.toml")).unwrap(),
+        before_config
+    );
+    assert_eq!(history(&home.root), before_history);
+}
+
+/// Missing account references and a live service-manager lock refuse before changing the source pair.
+#[test]
+fn v2_migration_refuses_invalid_target_and_live_manager() {
+    let home = Home::v2();
+    let source = sha(&home.root.join("state.db"));
+    let config = sha(&home.root.join("config.toml"));
+    let target = home.path("target.toml");
+    let original = fs::read_to_string(&target).unwrap();
+    fs::write(&target, original.replace("acct-existing", "acct-missing")).unwrap();
+    let (ok, _) = run(
+        &home.root,
+        &["config", "migrate", "--target-config", &target, "--dry-run"],
+        false,
+    );
+    assert!(!ok);
+    fs::write(&target, original).unwrap();
+    let lock = fs::File::create(home.root.join(".services.lock")).unwrap();
+    lock.lock_exclusive().unwrap();
+    let (ok, result) = run(
+        &home.root,
+        &[
+            "config",
+            "migrate",
+            "--target-config",
+            &target,
+            "--apply",
+            "--from-release",
+            &home.path("old-release"),
+        ],
+        false,
+    );
+    assert!(!ok, "{result}");
+    assert_eq!(sha(&home.root.join("state.db")), source);
+    assert_eq!(sha(&home.root.join("config.toml")), config);
+    assert!(!home.root.join("migrations").exists());
+}
+
+/// The shared publication journal restores a v2 source pair after a failure following the database switch.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn v2_migration_publish_failure_restores_original_pair() {
+    let home = Home::v2();
+    let config = fs::read(home.root.join("config.toml")).unwrap();
+    let rows = history(&home.root);
+    let (ok, _) = run(
+        &home.root,
+        &[
+            "config",
+            "migrate",
+            "--target-config",
+            &home.path("target.toml"),
+            "--apply",
+            "--from-release",
+            &home.path("old-release"),
+        ],
+        true,
+    );
+    assert!(!ok);
+    assert_eq!(version(&home.root), 17);
+    assert_eq!(fs::read(home.root.join("config.toml")).unwrap(), config);
+    assert_eq!(history(&home.root), rows);
+    assert!(!home.root.join("migrations/in-progress.json").exists());
+}
+
 /// The explicit mapping; `luna = false` leaves a historical model unmapped.
 fn mapping(home: &Path, luna: bool) -> String {
     let luna = if luna {
@@ -188,7 +358,7 @@ provider = "codex"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "none"
 global_account = "acct-codex-native"
 labelled_accounts = {{ personal2 = "acct-codex-personal2" }}
 [runtimes.codex.native_models]
@@ -324,7 +494,7 @@ fn planning_and_refusals_never_touch_the_old_pair() {
     );
 }
 
-/// config1+DB16 → config2+DB17 with registered accounts; rollback restores
+/// config1+DB16 → config2+current DB with registered accounts; rollback restores
 /// config1+DB16 exactly (all rows) and binds the recorded old binary; a
 /// post-migration non-agent write makes rollback refuse.
 #[test]
@@ -334,7 +504,7 @@ fn apply_and_rollback_move_the_whole_pair() {
     let rows = history(&home.root);
     let (ok, applied) = home.apply("mapping.toml", false);
     assert!(ok, "{applied}");
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     assert!(fs::read_to_string(home.root.join("config.toml"))
         .unwrap()
         .contains("schema_version = 2"));
@@ -344,7 +514,10 @@ fn apply_and_rollback_move_the_whole_pair() {
     assert_eq!(manifest["source_schema_version"], 16);
     assert_eq!(manifest["old_release"]["version"], "0.12.4");
     assert_eq!(manifest["old_release"]["schema_version"], 16);
-    assert_eq!(manifest["target_binary"]["schema_version"], 17);
+    assert_eq!(
+        manifest["target_binary"]["schema_version"],
+        agent_run::state::VERSION
+    );
     assert_ne!(
         manifest["old_release"]["binary_sha256"],
         manifest["target_binary"]["sha256"]
@@ -388,7 +561,7 @@ fn apply_and_rollback_move_the_whole_pair() {
         "{changed}"
     );
     fs::write(&old, &original).unwrap();
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
 
     // A post-migration write that creates no agent still blocks rollback.
     let (ok, _) = run(
@@ -406,7 +579,7 @@ fn apply_and_rollback_move_the_whole_pair() {
         !ok && refused.to_string().contains("state changed"),
         "{refused}"
     );
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     assert!(fs::read_to_string(home.root.join("config.toml"))
         .unwrap()
         .contains("schema_version = 2"));
@@ -444,7 +617,7 @@ fn old_config_does_not_bypass_rollback_divergence() {
     );
     assert!(!ok, "rollback discarded a later database write: {result}");
     assert_eq!(sha(&home.root.join("state.db")), before);
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     assert_eq!(fs::read(home.root.join("config.toml")).unwrap(), old_config);
 }
 
@@ -501,7 +674,7 @@ fn snapshots_are_exclusive_and_immutable() {
         successes, 1,
         "exactly one concurrent apply may switch the pair"
     );
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     assert_eq!(
         sha(&first.join("state.db")),
         first_state,
@@ -537,7 +710,7 @@ fn late_publish_failure_restores_the_original_pair() {
     assert!(entries[0].join("COMPLETE").is_file());
     let (ok, retry) = home.apply("mapping.toml", false);
     assert!(ok, "{retry}");
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
 }
 
 /// A resumed-looking pair (old config restored by hand) with an active agent
@@ -569,7 +742,7 @@ fn resumed_rollback_refuses_active_agents() {
         "{refused}"
     );
     assert_eq!(sha(&home.root.join("state.db")), before);
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
 }
 
 /// A bounded, owned `config migrate --apply` child held at one publication
@@ -657,7 +830,11 @@ fn interrupted_apply_is_gated_and_recovered_from_evidence() {
         assert!(!paused.child.wait().unwrap().success(), "{step}: killed");
         let journal = home.root.join("migrations/in-progress.json");
         assert!(journal.is_file(), "{step}: journal survives the kill");
-        assert_eq!(version(&home.root), 17, "{step}: database was published");
+        assert_eq!(
+            version(&home.root),
+            agent_run::state::VERSION as u32,
+            "{step}: database was published"
+        );
         assert_eq!(
             fs::read(home.root.join("config.toml")).unwrap() == config_v1,
             step == "after_db",
@@ -704,7 +881,7 @@ fn interrupted_apply_is_gated_and_recovered_from_evidence() {
         assert_eq!(history(&home.root), rows);
         let (ok, retry) = home.apply("mapping.toml", false);
         assert!(ok, "{step}: retry {retry}");
-        assert_eq!(version(&home.root), 17);
+        assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     }
 }
 
@@ -799,7 +976,7 @@ fn writers_during_publication_are_refused_not_overwritten() {
             assert!(refused_busy(write_with(&handle)), "{journal}: idle handle");
         }
         assert!(paused.finish(), "{journal}: apply completes");
-        assert_eq!(version(&home.root), 17);
+        assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
         assert_eq!(markers(&home.root), 0, "{journal}: nothing was committed");
 
         let snapshot = fs::read_dir(home.root.join("migrations"))
@@ -863,7 +1040,7 @@ fn a_preopened_wal_handle_refuses_the_lease() {
         false,
     );
     assert!(!ok && refused.to_string().contains("in use"), "{refused}");
-    assert_eq!(version(&home.root), 17);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     assert!(!home.root.join("migrations/in-progress.json").exists());
     drop(holder);
     let (ok, rolled) = run(

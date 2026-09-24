@@ -96,7 +96,8 @@ home = "{root}/claude-runtime"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "exec"
+collector = {{ command = "/bin/bash", args = ["{collector}"], source = "codex-appserver" }}
 [[providers.codex-main.models]]
 id = "gpt-6-sol"
 [[providers.codex-main.models]]
@@ -112,7 +113,8 @@ models = ["gpt-6-sol"]
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "exec"
+collector = {{ command = "/bin/bash", args = ["{collector}"], source = "codex-appserver" }}
 [[providers.codex-alt.models]]
 id = "gpt-6-sol"
 [[providers.codex-alt.bindings]]
@@ -120,6 +122,9 @@ label = "work-b"
 account = "acct-work"
 "#,
             binary = binary.display(),
+            collector = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/collectors/codex.sh")
+                .display(),
             root = root.path().display(),
         ),
     )
@@ -164,11 +169,6 @@ account = "acct-work"
     let general = lane(&native_rows, "codex");
     assert_eq!(general.2, 75.0);
     assert!(general.3.contains("gpt-6-sol") && !general.3.contains("spark"));
-    let native_row = rows
-        .iter()
-        .find(|row| row["account"] == "acct-native")
-        .unwrap();
-    assert_eq!(native_row["unmapped_lanes"], 1);
     // Work account binds only gpt-6-sol across both aliases, so the Spark
     // exhaustion never touches it.
     let work_rows = stored(&home, "acct-work");
@@ -186,7 +186,7 @@ account = "acct-work"
         .as_array()
         .unwrap()
         .iter()
-        .all(|row| row["status"] == "failed" && row["issues"][0] == "probe_failed"));
+        .all(|row| row["status"] == "failed" && row["issues"][0] == "collector_exit_failed"));
     assert_eq!(stored(&home, "acct-native").len(), 2);
     // The durable ledger now suppresses the next round across processes.
     assert!(home.join("capacity/backoff.json").is_file());

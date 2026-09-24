@@ -2,9 +2,16 @@
 use std::{env, path::PathBuf, process::Command};
 use xtask::{archive, deploy, release};
 
-/// Runs the Rust workspace's formatter plus locked linter and test gates.
+/// Dispatches standalone installation, release tooling, or the locked workspace gates.
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("install") {
+        if let Err(error) = xtask::installer::command(&arguments[1..]) {
+            eprintln!("installation stopped: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if arguments.first().map(String::as_str) == Some("release") {
         release_command(&arguments[1..]);
         return;
@@ -86,7 +93,7 @@ fn archive_command(arguments: &[String]) {
     }
 }
 
-/// Builds the native binary for an installed Cargo target and returns its path.
+/// Builds the runtime and deployment helper for an installed target, returning the runtime path.
 ///
 /// This is intentionally offline and locked: target support is the set installed
 /// in the invoking toolchain, dependency resolution cannot modify `Cargo.lock`,
@@ -100,6 +107,8 @@ fn native_binary(target: Option<&str>) -> Result<PathBuf, String> {
         "--release",
         "-p",
         "agent-run",
+        "-p",
+        "xtask",
     ]);
     if let Some(target) = target {
         command.args(["--target", target]);
@@ -149,10 +158,11 @@ fn release_command(arguments: &[String]) {
         .map(|path| println!("{}", path.display())),
         Some("build-native") => native_binary(text("--target").as_deref())
             .and_then(|binary| {
-                release::build(
+                release::build_with_installer(
                     &value("--output").ok_or("--output is required")?,
                     &text("--version").ok_or("--version is required")?,
                     &binary,
+                    &binary.with_file_name("xtask"),
                 )
             })
             .map(|path| println!("{}", path.display())),

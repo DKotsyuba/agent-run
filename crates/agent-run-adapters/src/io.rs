@@ -1,9 +1,14 @@
+//! Bounded engine streams with independent observation of the primary harness PID.
+
 use crate::{
     redact::{DiagnosticTail, Redactor, StreamingRedactor},
     LaunchPlan,
 };
 use agent_run_domain::{Error, Result};
-use agent_run_platform::{frame, process::OwnedProcess};
+use agent_run_platform::{
+    frame,
+    process::{OwnedProcess, OwnershipSnapshot},
+};
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
@@ -22,6 +27,9 @@ use tokio::{
 };
 /// Maximum UTF-8 JSON-RPC line retained from an engine before failing closed.
 pub const ENGINE_FRAME: usize = 8 * 1024 * 1024;
+
+/// Synchronous durable checkpoint installed by the supervisor; receives identity metadata only.
+type OwnershipObserver = Box<dyn FnMut(&OwnershipSnapshot) -> Result<()> + Send>;
 
 /// One bounded result from the engine stdout reader.
 #[derive(Debug)]
@@ -51,6 +59,18 @@ pub struct Process {
     pub stderr_bytes: Arc<AtomicU64>,
     redactor: Redactor,
     diagnostic_tail: Arc<Mutex<DiagnosticTail>>,
+    /// True once waitpid proves the primary exited, independent of stdout ownership.
+    primary_exited: bool,
+    /// Deadline of the current idle read after exit; survives cancellation, not consumer processing time.
+    exit_drain_deadline: Option<tokio::time::Instant>,
+    /// One fixed escalation deadline for captured descendants still writing after primary exit.
+    exit_kill_deadline: Option<tokio::time::Instant>,
+    /// Last descendant snapshot, shared by startup RPC and streaming reads.
+    observed_at: tokio::time::Instant,
+    /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
+    ownership_observer: Option<OwnershipObserver>,
+    /// Last successfully persisted append-only capture revision.
+    ownership_revision: Option<(usize, bool)>,
 }
 impl Process {
     /// Spawns the planned engine with isolated environment and line-framed pipes.
@@ -133,7 +153,42 @@ impl Process {
             stderr_bytes,
             redactor,
             diagnostic_tail,
+            exit_drain_deadline: None,
+            primary_exited: false,
+            exit_kill_deadline: None,
+            observed_at: tokio::time::Instant::now(),
+            ownership_observer: None,
+            ownership_revision: None,
         })
+    }
+
+    /// Attaches the supervisor's durable ownership writer and immediately checkpoints the current root.
+    /// Errors propagate so the supervisor cleans up instead of running without required evidence.
+    pub fn observe_ownership(
+        &mut self,
+        observer: impl FnMut(&OwnershipSnapshot) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.ownership_observer = Some(Box::new(observer));
+        self.ownership_revision = None;
+        self.checkpoint_ownership()
+    }
+
+    /// Persists newly captured members once; successful unchanged captures never touch the database.
+    pub fn checkpoint_ownership(&mut self) -> Result<()> {
+        let Some(observer) = self.ownership_observer.as_mut() else {
+            return Ok(());
+        };
+        let revision = self.owner.capture_revision();
+        if self.ownership_revision == Some(revision) {
+            return Ok(());
+        }
+        let snapshot = self
+            .owner
+            .snapshot()
+            .ok_or_else(|| Error::Integrity("process root identity is unavailable".into()))?;
+        observer(&snapshot)?;
+        self.ownership_revision = Some(revision);
+        Ok(())
     }
 
     /// Redacts launch secrets from text before core code persists it.
@@ -200,12 +255,79 @@ impl Process {
         input.flush().await?;
         Ok(())
     }
-    /// Returns the next retained notification or waits for a bounded reader event.
+    /// Returns a retained notification or observes stdout and the primary PID together.
     pub async fn next(&mut self) -> Event {
-        if let Some(e) = self.backlog.pop_front() {
-            e
+        if !self.backlog.is_empty() {
+            if self.observe_primary_exit().is_err() {
+                return Event::Failure("engine_process_observation_failed");
+            }
+            if self.checkpoint_ownership().is_err() {
+                return Event::Failure("engine_process_ownership_failed");
+            }
+            self.backlog.pop_front().expect("checked backlog")
         } else {
-            self.events.recv().await.unwrap_or(Event::Eof)
+            self.receive().await
+        }
+    }
+    /// Starts TERM on primary exit and escalates captured survivors after two seconds, even during output traffic.
+    fn observe_primary_exit(&mut self) -> Result<()> {
+        if !self.primary_exited && self.child.try_wait()?.is_some() {
+            self.primary_exited = true;
+            self.owner.signal_descendants(libc::SIGTERM);
+            self.input.take();
+            self.exit_kill_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+        }
+        if self
+            .exit_kill_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.owner.signal_descendants(libc::SIGKILL);
+            self.exit_kill_deadline = None;
+        }
+        Ok(())
+    }
+    /// Begins descendant termination on observed primary exit, then drains already-written output.
+    ///
+    /// Each idle wait after exit has a 200ms deadline, preserved across cancellation.
+    /// Receiving a frame ends that wait, so slow downstream processing cannot discard
+    /// queued output. A separate fixed deadline escalates captured writers; the run's
+    /// overall deadline also bounds any unobserved writers. The supervisor owns final proof.
+    async fn receive(&mut self) -> Event {
+        loop {
+            let now = tokio::time::Instant::now();
+            if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+                self.owner.refresh();
+                self.observed_at = now;
+            }
+            if self.observe_primary_exit().is_err() {
+                return Event::Failure("engine_process_observation_failed");
+            }
+            if self.checkpoint_ownership().is_err() {
+                return Event::Failure("engine_process_ownership_failed");
+            }
+            if self.primary_exited {
+                let deadline = *self.exit_drain_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + Duration::from_millis(200)
+                });
+                let event = tokio::select! {
+                    biased;
+                    event = self.events.recv() => event.unwrap_or(Event::Eof),
+                    _ = tokio::time::sleep_until(deadline) => Event::Eof,
+                };
+                if !matches!(event, Event::Eof) {
+                    self.exit_drain_deadline = None;
+                }
+                return event;
+            }
+            tokio::select! {
+                biased;
+                exit = self.child.wait() => {
+                    if exit.is_err() { return Event::Failure("engine_process_observation_failed"); }
+                    // The next iteration records exit and sends the first TERM sweep.
+                }
+                event = self.events.recv() => return event.unwrap_or(Event::Eof),
+                _ = tokio::time::sleep_until(self.observed_at + Duration::from_millis(200)) => {},
+            }
         }
     }
     /// Sends one request, correlates its response, and retains interleaved notifications.
@@ -235,10 +357,9 @@ impl Process {
             };
         }
         loop {
-            let event = tokio::time::timeout_at(deadline, self.events.recv())
+            let event = tokio::time::timeout_at(deadline, self.receive())
                 .await
-                .map_err(|_| Error::Runtime("app-server RPC timed out".into()))?
-                .unwrap_or(Event::Eof);
+                .map_err(|_| Error::Runtime("app-server RPC timed out".into()))?;
             match event {
                 Event::Json(v)
                     if v.get("id").and_then(Value::as_u64) == Some(id)

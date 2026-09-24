@@ -6,4 +6,5 @@
 //! `--test deploy_recovery`).
 pub mod archive;
 pub mod deploy;
+pub mod installer;
 pub mod release;

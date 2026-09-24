@@ -1106,14 +1106,14 @@ async fn failed_empty_and_unsupported_outcomes_are_reported() {
     let home = collect_home(&[
         // The retired CodexBar source fails with a fixed migration reason.
         ("failed", "codex", "codexbar"),
-        // The local Claude stream fallback finds no evidence at all.
+        // The old native Claude collector requires external configuration.
         ("empty", "claude", "native"),
         ("unsupported", "claude", "none"),
     ]);
     let report = sources::collect(home.path()).await.unwrap();
     for (runtime, status) in [
         ("failed", "failed"),
-        ("empty", "no_data"),
+        ("empty", "failed"),
         ("unsupported", "unsupported"),
     ] {
         let result = result_for(&report, runtime);
@@ -1143,7 +1143,7 @@ async fn collect_report_marks_only_degraded_rounds() {
     // Fixed reason codes only: the retired source asks for migration.
     assert_eq!(
         result_for(&report, "failed")["issues"][0],
-        sources::CODEXBAR_RETIRED
+        sources::COLLECTOR_RETIRED
     );
 }
 

@@ -84,7 +84,7 @@ pub struct ProviderSettings {
     pub priority_multiplier: PositiveFinite,
     /// Explicit collector selection for capacity observations.
     pub limits_source: LimitsSource,
-    /// Explicit first-party collector binding; required for the Lua source.
+    /// External command binding; required for the exec source.
     #[serde(default)]
     pub collector: Option<CollectorBinding>,
 }
@@ -121,6 +121,10 @@ pub struct ProviderConfig {
     /// Role-accessible MCP definitions.
     #[serde(default)]
     pub mcp: BTreeMap<String, Mcp>,
+    /// Foreground background services owned by the broker rather than any harness.
+    /// Empty is omitted so historical frozen configurations keep their original digest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, crate::services::ManagedService>,
     /// Named nonsecret environment defaults.
     #[serde(default)]
     pub environments: BTreeMap<String, Environment>,
@@ -201,6 +205,15 @@ impl ProviderConfig {
     /// A file with neither harnesses nor providers is the explicitly empty
     /// catalog a fresh `init` writes: valid, with nothing to start or collect.
     pub fn validate(&mut self, home: &Path) -> Result<()> {
+        if self.services.len() > 32 {
+            return Err(invalid("at most 32 managed services may be configured"));
+        }
+        for (id, service) in &self.services {
+            if !crate::services::valid_id(id) {
+                return Err(invalid("invalid managed service id"));
+            }
+            service.validate()?;
+        }
         let empty = self.harnesses.is_empty() && self.providers.is_empty();
         if self.schema_version != 2
             || (!empty
@@ -317,6 +330,12 @@ impl ProviderConfig {
             }
         }
         for (id, provider) in &self.providers {
+            if matches!(
+                provider.limits_source,
+                LimitsSource::Lua | LimitsSource::CodexAppserver
+            ) {
+                return Err(invalid("built-in quota collectors are retired; configure limits_source = exec and collector.command"));
+            }
             if !self.harnesses.contains_key(&provider.harness) {
                 return Err(invalid("provider names an undeclared harness"));
             }

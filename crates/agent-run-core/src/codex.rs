@@ -705,7 +705,6 @@ pub async fn run(
             _ = tick.tick() => None,
         };
         let Some(event) = event else {
-            process.owner.refresh();
             let started = tokio::time::Instant::now();
             for _ in 0..commands::COMMAND_PAGE_LIMIT {
                 if started.elapsed() >= Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS) {

@@ -1,5 +1,5 @@
-//! The one-time paired migration: schema-1 config + older state database →
-//! schema-2 config + current state database, and its paired rollback.
+//! Paired migration from a legacy mapping or an explicit replacement v2 config
+//! to the current state database, with byte-exact paired rollback.
 //!
 //! * Planning (`--dry-run`), every refusal and every invalid input never open
 //!   the state database for writing: no numbered migration, no account
@@ -37,7 +37,8 @@
 //! arrives later is refused `SQLITE_BUSY` until the lease is released, so no
 //! committed write is ever replaced.
 //!
-//! Limit: recovery only rolls back to the v1 pair; there is no roll-forward.
+//! Historical snapshot filenames and v1/v2 digest keys mean before/after for
+//! both input schemas. Recovery restores the original pair; there is no roll-forward.
 
 use crate::{config::Config, fs, state::Store, Result};
 use agent_run_config::{
@@ -47,8 +48,9 @@ use agent_run_config::{
 use agent_run_domain::error::invalid;
 use agent_run_platform::release;
 use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{functions::FunctionFlags, Connection, OpenFlags};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     io::{Read, Write},
@@ -114,9 +116,9 @@ pub fn require_current_store(home: &Path) -> Result<()> {
     }
 }
 
-/// Takes the broker startup lock exclusively, refusing while a broker holds
-/// it. Holding the returned file keeps any broker from starting.
-fn exclusive(home: &Path) -> Result<std::fs::File> {
+/// Holds both broker and service-manager startup locks, including custom-socket brokers.
+/// Returned files retain exclusion throughout publication and rollback.
+fn exclusive(home: &Path) -> Result<(std::fs::File, std::fs::File)> {
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -126,7 +128,30 @@ fn exclusive(home: &Path) -> Result<std::fs::File> {
         .open(home.join(".api.sock.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|_| invalid("stop the resident broker before a config migration"))?;
-    Ok(lock)
+    let services = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(home.join(".services.lock"))?;
+    services.try_lock_exclusive().map_err(|_| {
+        invalid("stop the resident broker and its service manager before migration")
+    })?;
+    Ok((lock, services))
+}
+
+/// Reads one operator-supplied configuration or mapping with the same one-MiB bound as runtime configuration.
+fn input_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(invalid("migration configuration exceeds one MiB"));
+    }
+    Ok(bytes)
 }
 
 /// Opens a state database strictly read-only. Without live WAL frames the
@@ -158,34 +183,75 @@ fn active_agents(conn: &Connection) -> Result<i64> {
     )?)
 }
 
-/// A logical digest of every row of every table, independent of page layout
-/// and WAL state; any post-migration write changes it.
+/// Hashes a file in fixed-size chunks, including multi-gigabyte database backups.
+fn file_digest(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut bytes = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut bytes)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&bytes[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Quotes a schema-provided identifier, including embedded double quotes.
+fn identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A logical digest of every row, byte-compatible with historical paired snapshots.
+/// SQLite performs the binary row-text sort with temporary-file spill; Rust
+/// holds only one row and the digest state, never the whole database in RAM.
 fn content_digest(conn: &Connection) -> Result<String> {
+    conn.pragma_update(None, "temp_store", "FILE")?;
+    conn.create_scalar_function(
+        "_agent_run_migration_row",
+        -1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let mut line = String::new();
+            for index in 0..context.len() {
+                line.push_str(&format!(
+                    "{:?}\u{1f}",
+                    context.get::<rusqlite::types::Value>(index)?
+                ));
+            }
+            Ok(line)
+        },
+    )?;
     let mut tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     tables.sort();
-    let mut text = String::new();
+    let mut hash = Sha256::new();
     for table in tables {
-        let mut statement = conn.prepare(&format!("SELECT * FROM \"{table}\""))?;
-        let columns = statement.column_count();
-        let mut rows: Vec<String> = Vec::new();
+        let columns = conn
+            .prepare(&format!("SELECT * FROM {}", identifier(&table)))?
+            .column_names()
+            .into_iter()
+            .map(identifier)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement=conn.prepare(&format!("SELECT _agent_run_migration_row({columns}) AS payload FROM {} ORDER BY payload COLLATE BINARY",identifier(&table)))?;
+        hash.update(table.as_bytes());
+        hash.update(b"\x1e");
         let mut query = statement.query([])?;
+        let mut first = true;
         while let Some(row) = query.next()? {
-            let mut line = String::new();
-            for index in 0..columns {
-                line.push_str(&format!(
-                    "{:?}\u{1f}",
-                    row.get::<_, rusqlite::types::Value>(index)?
-                ));
+            if !first {
+                hash.update(b"\x1e");
             }
-            rows.push(line);
+            first = false;
+            hash.update(row.get::<_, String>(0)?.as_bytes());
         }
-        rows.sort();
-        text.push_str(&format!("{table}\u{1e}{}\u{1d}", rows.join("\u{1e}")));
+        hash.update(b"\x1d");
     }
-    Ok(fs::sha256(text.as_bytes()))
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Takes the exclusive lease on the live database: a read-write connection in
@@ -226,8 +292,8 @@ fn old_release(dir: &Path) -> Result<Value> {
         "version": metadata["version"],
         "schema_version": release::schema_version(dir).map_err(invalid)?,
         "binary": dir.join("bin/agent-run"),
-        "binary_sha256": fs::sha256(&std::fs::read(dir.join("bin/agent-run"))?),
-        "sha256sums_sha256": fs::sha256(&std::fs::read(dir.join("SHA256SUMS"))?),
+        "binary_sha256": file_digest(&dir.join("bin/agent-run"))?,
+        "sha256sums_sha256": file_digest(&dir.join("SHA256SUMS"))?,
     }))
 }
 
@@ -359,10 +425,87 @@ pub fn migrate(
     acks: &[String],
     from_release: Option<&Path>,
 ) -> Result<Value> {
-    let config_bytes = std::fs::read(home.join("config.toml"))?;
-    let mapping_bytes = std::fs::read(mapping_path)?;
-    let (rendered, legacy_runtime_map, review, mapping) =
-        plan(home, &config_bytes, &mapping_bytes)?;
+    migrate_input(
+        home,
+        mapping_path,
+        apply,
+        acks,
+        from_release,
+        MigrationInput::LegacyMapping,
+    )
+}
+
+/// Upgrades an already-v2 home using an explicit validated replacement config, preserving every account reference.
+/// Dry run is read-only; apply and rollback reuse the same journalled paired executor as legacy migration.
+pub fn migrate_v2(
+    home: &Path,
+    target_config: &Path,
+    apply: bool,
+    from_release: Option<&Path>,
+) -> Result<Value> {
+    migrate_input(
+        home,
+        target_config,
+        apply,
+        &[],
+        from_release,
+        MigrationInput::ProviderConfig,
+    )
+}
+
+/// Selects how the operator describes the target, without changing publication or recovery semantics.
+enum MigrationInput {
+    /// Explicit legacy runtime-to-provider and account mapping.
+    LegacyMapping,
+    /// Complete v2 configuration, with no account registration or credential mutation.
+    ProviderConfig,
+}
+
+/// Plans one bounded input, then performs the shared backup/stage/journal/publish sequence.
+fn migrate_input(
+    home: &Path,
+    input_path: &Path,
+    apply: bool,
+    acks: &[String],
+    from_release: Option<&Path>,
+    input: MigrationInput,
+) -> Result<Value> {
+    let config_bytes = input_bytes(&home.join("config.toml"))?;
+    let mapping_bytes = input_bytes(input_path)?;
+    let (rendered, legacy_runtime_map, review, accounts, source_config_schema) = match input {
+        MigrationInput::LegacyMapping => {
+            let (rendered, map, review, mapping) = plan(home, &config_bytes, &mapping_bytes)?;
+            (rendered, map, review, mapping.account_records(), 1)
+        }
+        MigrationInput::ProviderConfig => {
+            let source: toml::Value = toml::from_str(
+                std::str::from_utf8(&config_bytes).map_err(|_| invalid("config must be UTF-8"))?,
+            )
+            .map_err(|_| invalid("source configuration is not valid TOML"))?;
+            if source
+                .get("schema_version")
+                .and_then(toml::Value::as_integer)
+                != Some(2)
+            {
+                return Err(invalid(
+                    "--target-config requires an already-v2 home; use --mapping for schema 1",
+                ));
+            }
+            if stored_version(home)?.is_none_or(|version| version < 17) {
+                return Err(invalid(
+                    "a v2 home requires the existing schema-17 account registry",
+                ));
+            }
+            let rendered = std::str::from_utf8(&mapping_bytes)
+                .map_err(|_| invalid("target config must be UTF-8"))?
+                .to_owned();
+            let target = ProviderConfig::parse(&rendered, home)?;
+            target.resolve_catalog(agent_run_store::accounts::list_at(&read_only_at(
+                &db_path(home),
+            )?)?)?;
+            (rendered, json!({}), Vec::new(), Vec::new(), 2)
+        }
+    };
     let source_version = stored_version(home)?;
     let summary = json!({
         "config_toml": rendered,
@@ -371,6 +514,7 @@ pub fn migrate(
         "manual_review": review,
         "state_schema_version": source_version,
         "target_schema_version": agent_run_store::VERSION,
+        "source_config_schema": source_config_schema,
     });
     if !apply {
         return Ok(json!({"applied": false, "plan": summary}));
@@ -401,7 +545,7 @@ pub fn migrate(
     let target_exe = std::env::current_exe()?;
     let target = json!({
         "path": target_exe,
-        "sha256": fs::sha256(&std::fs::read(&target_exe)?),
+        "sha256": file_digest(&target_exe)?,
         "schema_version": agent_run_store::VERSION,
     });
     if old["binary_sha256"] == target["sha256"] {
@@ -425,7 +569,16 @@ pub fn migrate(
     let root = home.join("migrations");
     fs::private_dir(&root)?;
     let at = crate::domain::now();
-    let name = format!("{}-{}-v1-to-v2", at as u64, uuid::Uuid::new_v4().simple());
+    let name = format!(
+        "{}-{}-{}",
+        at as u64,
+        uuid::Uuid::new_v4().simple(),
+        if source_config_schema == 1 {
+            "v1-to-v2"
+        } else {
+            "v2-state-upgrade"
+        }
+    );
     let dir = root.join(&name);
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     write_new(&dir.join("config.v1.toml"), &config_bytes)?;
@@ -449,10 +602,11 @@ pub fn migrate(
         "v2_config_sha256": fs::sha256(rendered.as_bytes()),
         "source_schema_version": source_version,
         "target_schema_version": agent_run_store::VERSION,
-        "state_backup_sha256": fs::sha256(&std::fs::read(dir.join("state.db"))?),
+        "state_backup_sha256": file_digest(&dir.join("state.db"))?,
         "state_content_sha256": source_digest,
         "legacy_runtime_map": legacy_runtime_map,
         "manual_review": review,
+        "source_config_schema": source_config_schema,
     });
     write_new(&dir.join("manifest.json"), &fs::canonical_json(&manifest)?)?;
     write_new(&dir.join("COMPLETE"), b"")?;
@@ -468,9 +622,10 @@ pub fn migrate(
             std::fs::Permissions::from_mode(0o600),
         )?;
         let mut store = Store::open(&stage)?;
-        for record in mapping.account_records() {
+        for record in accounts {
             store.register_account(&record)?;
         }
+        ProviderConfig::parse(&rendered, home)?.resolve_catalog(store.list_accounts()?)?;
         drop(store);
         checkpoint("staged")?;
         content_digest(&read_only_at(&stage.join("state.db"))?)
@@ -580,7 +735,7 @@ fn publish(
     Ok(record)
 }
 
-/// Returns the pair to the snapshot's v1 config and source database, touching
+/// Returns the pair to the snapshot's original config and source database, touching
 /// each side only while it provably is this operation's own state: the
 /// config only when it equals the recorded v2 bytes (v1 is left alone, any
 /// other content is a third-party edit and is kept), the database only when
@@ -613,7 +768,7 @@ fn recover(home: &Path, live: &mut Connection, snapshot: &Path, journal: &Value)
 }
 
 /// `config rollback --snapshot DIR`: returns the home to the snapshot's
-/// verified v1 config and schema-`source` database, and recovers an
+/// verified original config and schema-`source` database, and recovers an
 /// interrupted apply or rollback of that snapshot.
 ///
 /// Refuses unless the snapshot is complete and matches its manifest, the
@@ -633,8 +788,7 @@ pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
     let expect = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
     let v1 = std::fs::read(dir.join("config.v1.toml"))?;
     if fs::sha256(&v1) != expect(&manifest, "v1_config_sha256")
-        || fs::sha256(&std::fs::read(dir.join("state.db"))?)
-            != expect(&manifest, "state_backup_sha256")
+        || file_digest(&dir.join("state.db"))? != expect(&manifest, "state_backup_sha256")
     {
         return Err(invalid("migration snapshot does not match its manifest"));
     }
@@ -715,4 +869,48 @@ pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
         "state_schema_version": manifest["source_schema_version"],
         "run_release": old,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Preserve historical snapshot digests while removing whole-database allocations.
+    use super::*;
+
+    /// SQLite's binary sort must produce the exact old Rust Debug row framing for every value type.
+    #[test]
+    fn streamed_content_digest_matches_historical_format() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE entries(a,b); CREATE TABLE empty_table(value); INSERT INTO entries VALUES (NULL, X'00ff'), (2,'quotes\"'), (10,'строка'), (-2.5, 'line'||char(10)||'break'), (2,'quotes\"'), (0,'nul'||char(0)||'tail');").unwrap();
+        let mut legacy = String::new();
+        for table in ["empty_table", "entries"] {
+            let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = statement.column_count();
+            let mut query = statement.query([]).unwrap();
+            let mut rows = Vec::new();
+            while let Some(row) = query.next().unwrap() {
+                rows.push(
+                    (0..columns)
+                        .map(|index| {
+                            format!(
+                                "{:?}\u{1f}",
+                                row.get::<_, rusqlite::types::Value>(index).unwrap()
+                            )
+                        })
+                        .collect::<String>(),
+                );
+            }
+            rows.sort();
+            legacy.push_str(&format!("{table}\u{1e}{}\u{1d}", rows.join("\u{1e}")));
+        }
+        assert_eq!(
+            content_digest(&conn).unwrap(),
+            fs::sha256(legacy.as_bytes())
+        );
+        conn.execute("INSERT INTO entries VALUES ('later', 3)", [])
+            .unwrap();
+        assert_ne!(
+            content_digest(&conn).unwrap(),
+            fs::sha256(legacy.as_bytes())
+        );
+    }
 }

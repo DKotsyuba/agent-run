@@ -456,82 +456,94 @@ pub use crate::provider_connection::{
     CredentialHeader, LimitsSource, ProviderConnection, ProviderProtocol,
 };
 
-/// Explicit binding of a Lua limits source to one collector.
+/// An external quota executable and its nonsecret launch configuration.
 ///
-/// `script` names a first-party collector identity the capacity side resolves
-/// through its own registry, or a caller-chosen identity for a configured
-/// custom script; it is never inferred from a provider name. `origins` are
-/// the exact credential-bearing origins the collector may request: HTTPS in
-/// production, plain HTTP only for explicit loopback fixtures, and never
-/// userinfo, fragments, queries, or paths. A custom `script_file` supplies
-/// the Lua bytes for a non-first-party identity; `auth` selects the
-/// credential placement for such a custom script (first-party collectors
-/// fix their own placement and reject overrides).
+/// Rust executes command and args directly, writes one versioned context to stdin,
+/// and accepts only the normalized quota JSON from stdout. Secrets belong to the
+/// protected account registry, never arguments or this definition. Historical Lua
+/// fields survive only inside frozen run records; fresh configuration rejects them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CollectorBinding {
-    /// Collector script identity, e.g. `glm_quota` or a custom name.
-    pub script: String,
-    /// Exact requestable origins; never empty and never a credential.
-    pub origins: Vec<String>,
-    /// Absolute path of a custom Lua collector script; never a credential.
-    #[serde(default)]
-    pub script_file: Option<std::path::PathBuf>,
-    /// Credential placement for a custom script; raw by default.
-    #[serde(default)]
-    pub auth: Option<CredentialPlacement>,
+    /// Absolute executable path; its interpreter may be selected explicitly.
+    #[serde(default, skip_serializing_if = "collector_command_empty")]
+    pub command: std::path::PathBuf,
+    /// Literal arguments, with no shell expansion or interpolation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Stable observation source; an empty value derives it from command and args.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Whole execution deadline in seconds, including stdin/stdout, from 1 to 300.
+    #[serde(
+        default = "collector_timeout",
+        skip_serializing_if = "collector_default_timeout"
+    )]
+    pub timeout_seconds: u64,
+    /// Additional host environment variable names explicitly granted to the script.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_from: Vec<String>,
+    /// Native exhaustion window names mapped to physical pools by the operator.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exhaustion_windows: BTreeMap<String, String>,
+    /// Retained old fields for frozen history only; never executable configuration.
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy: BTreeMap<String, serde_json::Value>,
 }
 
-/// Where a custom collector's credential is placed on allowed requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialPlacement {
-    /// `Authorization: <token>` exactly as stored.
-    RawAuthorization,
-    /// `Authorization: Bearer <token>`.
-    BearerAuthorization,
+/// Default execution deadline for an external quota command, in seconds.
+fn collector_timeout() -> u64 {
+    30
+}
+
+/// Omits the default when reserializing old frozen Lua configuration.
+fn collector_default_timeout(value: &u64) -> bool {
+    *value == collector_timeout()
+}
+
+/// Omits the absent command from historical frozen configuration.
+fn collector_command_empty(value: &std::path::Path) -> bool {
+    value.as_os_str().is_empty()
 }
 
 impl CollectorBinding {
-    /// Validates the script identifier grammar and every origin spelling
-    /// against the same URL reading custom endpoints use.
+    /// Rejects unknown fields, relative paths, invalid bounds and unsafe argument
+    /// shapes before any execution. File existence is checked when collecting.
     pub fn validate(&self) -> Result<()> {
-        nonblank("collector script", &self.script)?;
-        if self.script.len() > 64
-            || !self
-                .script
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        if !self.legacy.is_empty() {
+            return Err(invalid(
+                "unknown collector field; configure command and args for exec",
+            ));
+        }
+        if !self.command.is_absolute() || self.command.as_os_str().len() > 4096 {
+            return Err(invalid("collector command must be an absolute path"));
+        }
+        if !(1..=300).contains(&self.timeout_seconds)
+            || self.args.len() > 64
+            || self
+                .args
+                .iter()
+                .any(|arg| arg.len() > 4096 || arg.contains('\0'))
         {
-            return Err(invalid("invalid collector script identity"));
+            return Err(invalid("invalid collector arguments or timeout"));
         }
-        if self.origins.is_empty() || self.origins.len() > 8 {
-            return Err(invalid("collector needs one to eight origins"));
+        if self.source.len() > 128 || self.source.chars().any(char::is_control) {
+            return Err(invalid("invalid collector source"));
         }
-        if let Some(file) = &self.script_file {
-            if !file.is_absolute()
-                || file.components().count() > 32
-                || file.as_os_str().len().saturating_add(self.script.len()) > 512
-                || self.auth.is_none()
-            {
-                return Err(invalid(
-                    "custom collector scripts need an absolute bounded path and an explicit auth placement",
-                ));
-            }
+        if self.env_from.len() > 32
+            || self.env_from.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 128
+                    || name.as_bytes()[0].is_ascii_digit()
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+        {
+            return Err(invalid("invalid collector environment name"));
         }
-        for origin in &self.origins {
-            let url = url::Url::parse(origin).map_err(|_| invalid("invalid collector origin"))?;
-            if url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.fragment().is_some()
-                || url.query().is_some()
-                || !(url.path() == "/" || url.path().is_empty())
-                || !(url.scheme() == "https"
-                    || (url.scheme() == "http"
-                        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
-            {
-                return Err(invalid("invalid collector origin"));
+        for (window, pool) in &self.exhaustion_windows {
+            nonblank("collector exhaustion window", window)?;
+            nonblank("collector exhaustion pool", pool)?;
+            if window.len() > 128 || pool.len() > 128 {
+                return Err(invalid("collector exhaustion mapping is too long"));
             }
         }
         Ok(())
@@ -558,9 +570,7 @@ pub struct ProviderDefinition {
     pub priority_multiplier: PositiveFinite,
     /// Explicit collector family for quota observations.
     pub limits_source: LimitsSource,
-    /// Explicit first-party collector binding; required exactly for the Lua
-    /// source so a script or credential identity is configuration, never an
-    /// inference from the provider name.
+    /// External executable configuration, required for the exec source.
     #[serde(default)]
     pub collector: Option<CollectorBinding>,
     /// Explicit model offerings; duplicates are rejected.
@@ -579,13 +589,15 @@ impl ProviderDefinition {
             return Err(invalid("provider must offer at least one model"));
         }
         match (&self.limits_source, &self.collector) {
-            (LimitsSource::Lua, Some(binding)) => binding.validate()?,
-            (LimitsSource::Lua, None) => {
-                return Err(invalid("lua limits source requires a collector binding"));
+            (LimitsSource::Exec, Some(binding)) => binding.validate()?,
+            // Older frozen run records remain readable without activating a collector.
+            (LimitsSource::Lua, Some(_)) => {}
+            (LimitsSource::Exec, None) | (LimitsSource::Lua, None) => {
+                return Err(invalid("limits source requires a collector binding"));
             }
             (_, None) => {}
             (_, Some(_)) => {
-                return Err(invalid("collector binding requires the lua limits source"));
+                return Err(invalid("collector binding requires the exec limits source"));
             }
         }
         for advice in &self.recommendations {

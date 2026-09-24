@@ -465,7 +465,7 @@ fn proc_list_all_pids() -> std::io::Result<Vec<i32>> {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 /// Process-group and descendant cleanup evidence for one owned runtime.
 pub struct Cleanup {
-    /// Signals successfully delivered to the verified process group.
+    /// Signal names successfully delivered to the verified group or captured descendants.
     pub signals: Vec<String>,
     /// Scope of the descendant evidence.
     ///
@@ -475,26 +475,37 @@ pub struct Cleanup {
     pub scope: String,
     /// Whether native group observation proved the original group absent.
     pub group_gone: bool,
-    /// Whether every descendant identity captured while the leader was alive is
-    /// gone, or `None` when that could not be established.
+    /// Whether every captured descendant identity is gone. `Some(false)`
+    /// includes live or unreadable identities; `None` means no verified snapshot.
     ///
-    /// `None` means unknown — no snapshot was ever verified, or some captured
-    /// identity was unreadable at cleanup. It never means "clean".
+    /// Neither `Some(false)` nor `None` confirms cleanup.
     pub descendants_gone: Option<bool>,
     /// Whether both group and descendant observations confirm cleanup.
     pub confirmed: bool,
     /// Original process-group identifier, when safe to report.
     pub process_group_id: Option<i32>,
 }
+/// Serializable captured identities used to recover ownership after a supervisor or broker restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipSnapshot {
+    /// Original leader identity, retained even after that PID disappears or is reused.
+    pub leader: Identity,
+    /// All observed members, including the leader; distinct start tokens survive PID reuse.
+    pub members: Vec<Identity>,
+    /// Whether observation began from a verified live root; does not assert a complete historical tree.
+    pub descendants_observed: bool,
+}
+
 /// PID-reuse-aware ownership evidence for one child process group.
 pub struct OwnedProcess {
     /// Captured identity of the group leader, when readable at spawn time.
     pub leader: Option<Identity>,
     /// Expected process-group identifier, equal to the spawned leader PID.
     pub pid: i32,
-    /// Captured leader and observed descendants indexed by PID.
-    known: BTreeMap<i32, Identity>,
-    /// Whether a complete native snapshot was taken while the leader was alive.
+    /// Captured leader and descendants indexed by PID and immutable start token.
+    known: BTreeMap<(i32, String), Identity>,
+    /// Whether tracking began from a live verified leader or a later live snapshot.
     ///
     /// False means no descendant set was ever verified, so cleanup reports the
     /// descendant scope as unknown rather than clean.
@@ -503,18 +514,19 @@ pub struct OwnedProcess {
 impl OwnedProcess {
     /// Capture the spawned leader identity without assuming failure is death.
     ///
-    /// A live leader read here is itself the first verified descendant snapshot:
-    /// a process observed at the moment it is spawned cannot have descendants
-    /// yet, so its empty set is proven rather than assumed, and even a child
-    /// exiting before the caller's first periodic refresh leaves verified
-    /// evidence behind. That proof costs only the leader's own inspection; a
-    /// full process-table scan here would delay the caller's stream readers and
-    /// is not needed for an empty set. A leader that is already gone, a zombie,
-    /// or unreadable records no snapshot, and cleanup then reports the
-    /// descendant scope as unknown rather than clean.
+    /// A live identity establishes the root from which periodic snapshots expand.
+    /// The child may already have forked: this observation does not prove an empty
+    /// historical tree. Cleanup confirms only the original group and identities
+    /// actually captured, never unobserved descendants which escaped beforehand.
+    /// An already absent, zombie or unreadable leader cannot establish this root,
+    /// so descendant cleanup stays unknown unless a later live snapshot succeeds.
     pub fn capture(pid: i32) -> Self {
         let leader = inspect(pid).ok();
-        let known = leader.clone().into_iter().map(|p| (p.pid, p)).collect();
+        let known = leader
+            .clone()
+            .into_iter()
+            .map(|p| ((p.pid, p.token.clone()), p))
+            .collect();
         let descendants_observed = leader.as_ref().is_some_and(|p| !p.zombie);
         Self {
             leader,
@@ -531,11 +543,58 @@ impl OwnedProcess {
     pub fn adopt(leader: Identity) -> Self {
         let pid = leader.pid;
         Self {
-            known: BTreeMap::from([(pid, leader.clone())]),
+            known: BTreeMap::from([((pid, leader.token.clone()), leader.clone())]),
             leader: Some(leader),
             pid,
             descendants_observed: false,
         }
+    }
+    /// Exports captured identities without probing or changing the tree; absent root evidence returns None.
+    pub fn snapshot(&self) -> Option<OwnershipSnapshot> {
+        Some(OwnershipSnapshot {
+            leader: self.leader.clone()?,
+            members: self.known.values().cloned().collect(),
+            descendants_observed: self.descendants_observed,
+        })
+    }
+    /// Returns the append-only capture revision without cloning identities, for change-only persistence.
+    pub fn capture_revision(&self) -> (usize, bool) {
+        (self.known.len(), self.descendants_observed)
+    }
+    /// Restores previously recorded evidence; every future signal still requires a fresh kernel identity check.
+    /// Rejects malformed identities, duplicate members or a missing/mismatched original root.
+    pub fn restore(snapshot: OwnershipSnapshot) -> Result<Self> {
+        let mut known = BTreeMap::new();
+        for member in snapshot.members {
+            if member.pid <= 1
+                || member.ppid < 0
+                || member.group < 0
+                || member.token.is_empty()
+                || member.token.len() > 256
+                || !member.birth.is_finite()
+                || member.birth < 0.0
+                || known
+                    .insert((member.pid, member.token.clone()), member)
+                    .is_some()
+            {
+                return Err(Error::Integrity("invalid captured process identity".into()));
+            }
+        }
+        let leader = snapshot.leader;
+        if known
+            .get(&(leader.pid, leader.token.clone()))
+            .is_none_or(|root| root.birth != leader.birth || root.group != leader.group)
+        {
+            return Err(Error::Integrity(
+                "captured process root is missing or inconsistent".into(),
+            ));
+        }
+        Ok(Self {
+            pid: leader.pid,
+            leader: Some(leader),
+            known,
+            descendants_observed: snapshot.descendants_observed,
+        })
     }
     /// Record descendants visible from a complete native process snapshot.
     ///
@@ -565,13 +624,17 @@ impl OwnedProcess {
         loop {
             let mut changed = false;
             for p in &all {
-                let child = self.known.get(&p.ppid).is_some_and(|parent| {
-                    observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
-                        == ProcessState::Alive
-                });
+                let child = self
+                    .known
+                    .range((p.ppid, String::new())..)
+                    .take_while(|((pid, _), _)| *pid == p.ppid)
+                    .any(|(_, parent)| {
+                        observe(Some(parent.pid), Some(&parent.token), Some(parent.birth))
+                            == ProcessState::Alive
+                    });
                 let in_group = leader_owned && p.group == self.pid;
-                if (child || in_group) && !self.known.contains_key(&p.pid) {
-                    self.known.insert(p.pid, p.clone());
+                if (child || in_group) && !self.known.contains_key(&(p.pid, p.token.clone())) {
+                    self.known.insert((p.pid, p.token.clone()), p.clone());
                     changed = true;
                 }
             }
@@ -598,6 +661,73 @@ impl OwnedProcess {
             }
         }
         Ok(signalled)
+    }
+    /// Observe a captured descendant by its exact PID, native token and birth time.
+    /// Missing evidence stays unknown; a matching zombie is dead, not signallable.
+    fn descendant_state(process: &Identity) -> ProcessState {
+        if process.pid <= 1 || process.token.is_empty() || !process.birth.is_finite() {
+            return ProcessState::Unknown;
+        }
+        match inspect(process.pid) {
+            Ok(actual) if actual.pid != process.pid => ProcessState::Unknown,
+            Ok(actual) if actual.token != process.token || actual.birth != process.birth => {
+                ProcessState::Reused
+            }
+            Ok(actual) if actual.zombie => ProcessState::Dead,
+            Ok(_) => ProcessState::Alive,
+            Err(error) => verdict(Err(error), Some(&process.token), Some(process.birth)),
+        }
+    }
+    /// Signal each still-live captured descendant after a fresh exact identity check.
+    /// A vanished, reused, unreadable or incomplete identity is never signalled.
+    /// Failed signals do not skip later descendants; evidence remains unconfirmed if they live.
+    pub fn signal_descendants(&mut self, sig: i32) -> bool {
+        self.refresh();
+        let mut signalled = false;
+        for process in self.known.values().filter(|process| {
+            self.leader
+                .as_ref()
+                .map_or(process.pid != self.pid, |leader| {
+                    process.pid != leader.pid || process.token != leader.token
+                })
+        }) {
+            if Self::descendant_state(process) != ProcessState::Alive {
+                continue;
+            }
+            // SAFETY: the positive PID was just inspected against its captured token and birth.
+            if unsafe { libc::kill(process.pid, sig) } == 0 {
+                signalled = true;
+            }
+        }
+        signalled
+    }
+    /// Report whether all captured descendants are gone, or unknown without a verified snapshot.
+    fn descendants_gone(&self) -> Option<bool> {
+        self.descendants_observed.then(|| {
+            let mut unknown = false;
+            for process in self.known.values().filter(|process| {
+                self.leader
+                    .as_ref()
+                    .map_or(process.pid != self.pid, |leader| {
+                        process.pid != leader.pid || process.token != leader.token
+                    })
+            }) {
+                match Self::descendant_state(process) {
+                    ProcessState::Dead | ProcessState::Reused => {}
+                    ProcessState::Alive => return false,
+                    ProcessState::Unknown | ProcessState::Denied | ProcessState::NotStarted => {
+                        unknown = true;
+                    }
+                }
+            }
+            !unknown
+        })
+    }
+    /// Refresh parentage and check whether group and descendant evidence can settle.
+    /// An absent descendant snapshot cannot confirm cleanup but needs no extra wait.
+    fn settled(&mut self) -> bool {
+        self.refresh();
+        self.gone() && self.descendants_gone() != Some(false)
     }
     /// Return whether the leader and its original group are both proven absent.
     pub fn gone(&self) -> bool {
@@ -651,38 +781,35 @@ impl OwnedProcess {
             },
         }
     }
-    /// Blocking twin of [`Self::cleanup`] for synchronous recovery paths: the
-    /// same verified-group signalling and bounded evidence settling, sleeping
-    /// the thread. Observation retries never authorize a new signal.
+    /// Blocking twin of [`Self::cleanup`] for synchronous recovery paths.
+    /// Group signals keep their leader guard; each surviving captured descendant
+    /// is independently verified before TERM and, after a bounded wait, KILL.
     pub fn cleanup_blocking(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
         self.refresh();
-        let observation_deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(250);
-        while self.group_observation() == GroupObservation::Unknown
-            && std::time::Instant::now() < observation_deadline
+        if !self.gone() && self.signal(libc::SIGTERM).unwrap_or(false) {
+            signals.push("SIGTERM".into());
+        }
+        if self.signal_descendants(libc::SIGTERM)
+            && !signals.iter().any(|signal| signal == "SIGTERM")
         {
+            signals.push("SIGTERM".into());
+        }
+        let until = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < until && !self.settled() {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        if self.group_observation() == GroupObservation::Unknown {
-            return Err(Error::Runtime(
-                "process cleanup observation unavailable".into(),
-            ));
+        if !self.gone() && self.signal(libc::SIGKILL).unwrap_or(false) {
+            signals.push("SIGKILL".into());
         }
-        for (signal, name, wait) in [
-            (libc::SIGTERM, "SIGTERM", grace),
-            (libc::SIGKILL, "SIGKILL", std::time::Duration::from_secs(2)),
-        ] {
-            if self.gone() {
-                break;
-            }
-            if self.signal(signal).unwrap_or(false) {
-                signals.push(name.into());
-            }
-            let until = std::time::Instant::now() + wait;
-            while std::time::Instant::now() < until && !self.gone() {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
+        if self.signal_descendants(libc::SIGKILL)
+            && !signals.iter().any(|signal| signal == "SIGKILL")
+        {
+            signals.push("SIGKILL".into());
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < until && !self.settled() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -697,40 +824,34 @@ impl OwnedProcess {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
-    /// Terminate the verified group and await full group/descendant evidence for
-    /// at most two further seconds. Observation retries never authorize signals.
+    /// Terminate the verified group and separately signal captured live descendants.
+    /// TERM and KILL use fresh identity checks, bounded waits, and final evidence settling.
     pub async fn cleanup(&mut self, grace: std::time::Duration) -> Result<Cleanup> {
         let mut signals = Vec::new();
         self.refresh();
-        let observation_deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(250);
-        while self.group_observation() == GroupObservation::Unknown
-            && tokio::time::Instant::now() < observation_deadline
+        if !self.gone() && self.signal(libc::SIGTERM).unwrap_or(false) {
+            signals.push("SIGTERM".into());
+        }
+        if self.signal_descendants(libc::SIGTERM)
+            && !signals.iter().any(|signal| signal == "SIGTERM")
         {
+            signals.push("SIGTERM".into());
+        }
+        let until = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < until && !self.settled() {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        if self.group_observation() == GroupObservation::Unknown {
-            return Err(Error::Runtime(
-                "process cleanup observation unavailable".into(),
-            ));
+        if !self.gone() && self.signal(libc::SIGKILL).unwrap_or(false) {
+            signals.push("SIGKILL".into());
         }
-        if !self.gone() {
-            if self.signal(libc::SIGTERM).unwrap_or(false) {
-                signals.push("SIGTERM".into());
-            }
-            let until = tokio::time::Instant::now() + grace;
-            while tokio::time::Instant::now() < until && !self.gone() {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
+        if self.signal_descendants(libc::SIGKILL)
+            && !signals.iter().any(|signal| signal == "SIGKILL")
+        {
+            signals.push("SIGKILL".into());
         }
-        if !self.gone() {
-            if self.signal(libc::SIGKILL).unwrap_or(false) {
-                signals.push("SIGKILL".into());
-            }
-            let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while tokio::time::Instant::now() < until && !self.gone() {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < until && !self.settled() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         let settle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -745,7 +866,8 @@ impl OwnedProcess {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
-    /// Final group and descendant observation after `signals` were sent.
+    /// Final group and exact descendant observation after `signals` were sent.
+    /// An unknown group returns an error instead of confirmed cleanup evidence.
     fn evidence(&self, signals: Vec<String>) -> Result<Cleanup> {
         let group = self.group_observation();
         if group == GroupObservation::Unknown {
@@ -754,23 +876,7 @@ impl OwnedProcess {
             ));
         }
         let group_gone = group == GroupObservation::Gone;
-        let descendants_gone = self.descendants_observed.then(|| {
-            let mut unknown = false;
-            for process in self
-                .known
-                .values()
-                .filter(|process| process.pid != self.pid)
-            {
-                match observe(Some(process.pid), Some(&process.token), Some(process.birth)) {
-                    ProcessState::Dead | ProcessState::Reused => {}
-                    ProcessState::Alive => return false,
-                    ProcessState::Unknown | ProcessState::Denied | ProcessState::NotStarted => {
-                        unknown = true;
-                    }
-                }
-            }
-            !unknown
-        });
+        let descendants_gone = self.descendants_gone();
         Ok(Cleanup {
             signals,
             // Mirrors Python's `Termination.scope` (src/agent_run/lifecycle.py:196-204):
@@ -885,10 +991,9 @@ mod tests {
         assert!(cleanup.signals.is_empty());
     }
 
-    /// A captured helper outside the leader's group can outlive that group
-    /// briefly; cleanup must wait for its exact identity before confirming.
+    /// A surviving captured helper receives TERM immediately, without passive exit grace.
     #[tokio::test]
-    async fn cleanup_waits_for_captured_descendant_after_group_exit() {
+    async fn cleanup_signals_captured_descendant_after_group_exit() {
         use std::os::unix::process::CommandExt;
 
         let mut helper = std::process::Command::new("/bin/sleep")
@@ -903,16 +1008,240 @@ mod tests {
         let mut owned = OwnedProcess::capture(leader.id() as i32);
         let helper_identity = inspect(helper.id() as i32).expect("inspect helper");
         assert_ne!(helper_identity.group, owned.pid);
-        owned.known.insert(helper_identity.pid, helper_identity);
+        owned.known.insert(
+            (helper_identity.pid, helper_identity.token.clone()),
+            helper_identity,
+        );
         leader.wait().expect("reap leader");
 
         let cleanup = owned
-            .cleanup(std::time::Duration::from_millis(50))
+            .cleanup(std::time::Duration::from_millis(750))
             .await
             .expect("cleanup observation available");
         helper.wait().expect("reap helper");
         assert!(cleanup.confirmed);
         assert_eq!(cleanup.descendants_gone, Some(true));
-        assert!(cleanup.signals.is_empty());
+        assert_eq!(cleanup.signals, ["SIGTERM"]);
+    }
+
+    /// Spawn a helper in its own group while this test process is the owned leader.
+    /// The leader deliberately exits first; the outer regression owns helper cleanup.
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn detached_helper_fixture() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+
+        if std::env::var_os("AGENT_RUN_DETACHED_HELPER_FIXTURE").is_none() {
+            return;
+        }
+        let helper = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .process_group(0)
+            .spawn()
+            .expect("spawn detached helper");
+        println!("DETACHED_HELPER_PID={}", helper.id());
+        std::io::stdout().flush().expect("flush helper PID");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    /// Cleanup captures a real child by verified parentage, then signals it
+    /// after the leader exits even though the child changed process groups.
+    #[tokio::test]
+    async fn cleanup_terminates_captured_helper_outside_original_group() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut leader = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg("--exact")
+            .arg("process::tests::detached_helper_fixture")
+            .arg("--nocapture")
+            .env("AGENT_RUN_DETACHED_HELPER_FIXTURE", "1")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let mut output = std::io::BufReader::new(leader.stdout.take().expect("fixture output"));
+        let helper_pid = (&mut output)
+            .lines()
+            .find_map(|line| {
+                line.ok()?
+                    .split("DETACHED_HELPER_PID=")
+                    .nth(1)?
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            })
+            .expect("fixture helper PID");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !owned.known.values().any(|member| member.pid == helper_pid)
+            && std::time::Instant::now() < deadline
+        {
+            owned.refresh();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let helper_identity = owned
+            .known
+            .values()
+            .find(|member| member.pid == helper_pid)
+            .expect("captured child identity");
+        assert_ne!(helper_identity.group, owned.pid);
+        leader.wait().expect("reap leader");
+        drop(output);
+
+        // Recovery restores captured evidence even though the original parent is now gone.
+        let saved = serde_json::to_vec(&owned.snapshot().expect("captured root")).unwrap();
+        let mut owned = OwnedProcess::restore(serde_json::from_slice(&saved).unwrap()).unwrap();
+
+        let cleanup = owned
+            .cleanup(std::time::Duration::from_millis(50))
+            .await
+            .expect("cleanup observation available");
+        assert!(cleanup.group_gone);
+        assert_eq!(cleanup.descendants_gone, Some(true));
+        assert!(cleanup.confirmed);
+        assert_eq!(cleanup.signals, ["SIGTERM"]);
+    }
+
+    /// Blocking cleanup escalates to KILL for an exact detached identity that
+    /// ignores TERM, and confirms its exit independently of the original group.
+    #[test]
+    fn blocking_cleanup_kills_detached_helper_after_grace() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo ready; exec /bin/sleep 30")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn TERM-resistant helper");
+        let mut ready = String::new();
+        std::io::BufReader::new(helper.stdout.take().expect("helper output"))
+            .read_line(&mut ready)
+            .expect("read helper readiness");
+        assert_eq!(ready.trim(), "ready");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let identity = inspect(helper.id() as i32).expect("inspect helper");
+        assert_ne!(identity.group, owned.pid);
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
+        leader.wait().expect("reap leader");
+
+        let cleanup = owned
+            .cleanup_blocking(std::time::Duration::from_millis(50))
+            .expect("cleanup observation available");
+        if !cleanup.confirmed {
+            helper.kill().expect("stop surviving helper");
+        }
+        helper.wait().expect("reap helper");
+        assert!(cleanup.confirmed);
+        assert_eq!(cleanup.signals, ["SIGTERM", "SIGKILL"]);
+    }
+
+    /// Reused or incomplete descendant identities never authorize a PID signal;
+    /// an incomplete live identity also cannot become positive cleanup evidence.
+    #[test]
+    fn reused_or_unknown_descendant_identity_is_not_signalled() {
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn unrelated helper");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn owned leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let mut identity = inspect(helper.id() as i32).expect("inspect helper");
+        let captured = identity.clone();
+        identity.token.push_str(":reused");
+        assert_eq!(
+            OwnedProcess::descendant_state(&identity),
+            ProcessState::Reused
+        );
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity.clone());
+        assert!(!owned.signal_descendants(libc::SIGTERM));
+        assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
+
+        identity = captured;
+        identity.birth += 1.0;
+        assert_eq!(
+            OwnedProcess::descendant_state(&identity),
+            ProcessState::Reused
+        );
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity.clone());
+        assert!(!owned.signal_descendants(libc::SIGTERM));
+        assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
+
+        identity.token.clear();
+        assert_eq!(
+            OwnedProcess::descendant_state(&identity),
+            ProcessState::Unknown
+        );
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
+        assert!(!owned.signal_descendants(libc::SIGKILL));
+        assert_eq!(owned.descendants_gone(), Some(false));
+        assert!(!inspect(helper.id() as i32).expect("helper survives").zombie);
+        helper.kill().expect("stop helper");
+        helper.wait().expect("reap helper");
+        leader.kill().expect("stop leader");
+        leader.wait().expect("reap leader");
+    }
+
+    /// An unverified group does not block safe individual cleanup, but the
+    /// final outcome cannot claim confirmed ownership teardown.
+    #[tokio::test]
+    async fn unknown_group_still_cleans_verified_descendant_without_confirmation() {
+        use std::os::unix::process::CommandExt;
+
+        let mut helper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn helper");
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn leader");
+        let mut owned = OwnedProcess::capture(leader.id() as i32);
+        let identity = inspect(helper.id() as i32).expect("inspect helper");
+        owned
+            .known
+            .insert((identity.pid, identity.token.clone()), identity);
+        owned.leader = None;
+        assert_eq!(owned.group_observation(), GroupObservation::Unknown);
+
+        let result = owned.cleanup(std::time::Duration::from_millis(50)).await;
+        let helper_exited = helper.try_wait().expect("observe helper").is_some();
+        if !helper_exited {
+            helper.kill().expect("stop surviving helper");
+        }
+        helper.wait().expect("reap helper");
+        leader.kill().expect("stop unverified leader");
+        leader.wait().expect("reap leader");
+        assert!(
+            helper_exited,
+            "captured helper should receive an individual signal"
+        );
+        assert!(result.is_err(), "unknown group cannot confirm cleanup");
     }
 }

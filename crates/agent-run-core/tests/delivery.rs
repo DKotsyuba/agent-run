@@ -391,6 +391,21 @@ async fn write_frame(stream: &mut tokio::net::UnixStream, value: &Value) {
     stream.write_all(&frame(value)).await.unwrap();
 }
 
+/// Owns the test frontend's entire private process group, including panic paths.
+struct HostProcesses {
+    /// Captured leader and descendants; absence means explicit cleanup completed.
+    owner: Option<agent_run_platform::process::OwnedProcess>,
+}
+
+impl Drop for HostProcesses {
+    /// Async test cancellation cannot await, so enforce bounded synchronous teardown.
+    fn drop(&mut self) {
+        if let Some(owner) = &mut self.owner {
+            let _ = owner.cleanup_blocking(Duration::from_millis(250));
+        }
+    }
+}
+
 /// Runs the embedded signed-Node frontend against a private fake Desktop MCP pipe.
 async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     use tokio::io::AsyncWriteExt;
@@ -455,24 +470,29 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     .map(PathBuf::from)
     .find(|path| path.is_file())
     .expect("Node is required for relay host tests");
-    let mut host = tokio::process::Command::new(&node)
-        .args([
-            "-e",
-            include_str!("../../../assets/desktop-transport.cjs"),
-            "--",
-        ])
+    let mut command = tokio::process::Command::new(&node);
+    command
+        .arg("-e")
+        .arg(format!("setTimeout(() => process.exit(1), 45000).unref();\n{}", include_str!("../../../assets/desktop-transport.cjs")))
+        .arg("--")
         .arg(&node)
         .arg(root.path())
         .arg(include_str!("../../../assets/completion_notice.json"))
-        .args(["-e", "setInterval(() => {}, 1000)"])
+        .args(["-e", "const parent=process.ppid; setInterval(() => { if(process.ppid===1 || process.ppid!==parent) process.exit(0); },250); setTimeout(() => process.exit(0),30000)"])
         .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe_path)
         .env("CODEX_MCP_NODE_PATH", &node)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+    let mut host = command.spawn().unwrap();
+    let mut processes = HostProcesses {
+        owner: Some(agent_run_platform::process::OwnedProcess::capture(
+            host.id().unwrap() as i32,
+        )),
+    };
     let endpoint = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(path) = std::fs::read_dir(root.path())
@@ -509,7 +529,22 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     client.write_all(&frame(&request)).await.unwrap();
     let response = read_frame(&mut client).await;
     let called = host_peer.await.unwrap();
-    let _ = host.kill().await;
+    let cleanup = processes
+        .owner
+        .as_mut()
+        .unwrap()
+        .cleanup(Duration::from_millis(250))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), host.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cleanup.confirmed,
+        "relay fixture left an owned process alive"
+    );
+    processes.owner.take();
     (response, called)
 }
 

@@ -145,7 +145,7 @@ fn live_writers(connection: &Connection) -> Result<i64, String> {
 /// (see [`live_writers`]). `force` skips only this safety gate; it neither
 /// terminates workers nor loads services, so an operator must establish
 /// quiescence before using it.
-fn quiescent(home: &Path, force: bool) -> Result<(), String> {
+pub(crate) fn quiescent(home: &Path, force: bool) -> Result<(), String> {
     let state = home.join("state.db");
     if !state.exists() || force {
         return Ok(());

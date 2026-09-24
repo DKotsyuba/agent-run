@@ -296,6 +296,12 @@ pub enum Command {
     DenyCommand {
         name: String,
     },
+    /// Commits a broker-authorized service identity before replacing this process with its foreground command.
+    #[command(name = "_service-exec", hide = true)]
+    ServiceExec {
+        /// Durable generation authorized by this process's parent broker.
+        generation: String,
+    },
     /// Runs the doctor bootstrap canary using its three inherited descriptors.
     #[command(name = "_doctor_canary", hide = true)]
     DoctorCanary {
@@ -505,15 +511,18 @@ pub enum Api {
 /// Configuration migration commands (see `crate::migrate`).
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
-    /// Plan (`--dry-run`) or apply (`--apply`) the paired migration (v1 config
-    /// and older state database → v2 config and current database) from an
-    /// explicit operator mapping file; apply snapshots config and state first.
+    /// Plan or apply a paired configuration/database migration. Use a v1 mapping
+    /// or an explicit replacement v2 configuration; apply snapshots both sides first.
     #[command(group(ArgGroup::new("mode").required(true).args(["dry_run", "apply"])))]
+    #[command(group(ArgGroup::new("migration_input").required(true).args(["mapping", "target_config"])))]
     Migrate {
         /// TOML mapping: `[harnesses.*]`, `[accounts.<id>]` and one
         /// `[runtimes.<v1 name>]` each.
         #[arg(long)]
-        mapping: PathBuf,
+        mapping: Option<PathBuf>,
+        /// Complete target v2 configuration for an already-v2 home; existing accounts are preserved.
+        #[arg(long)]
+        target_config: Option<PathBuf>,
         /// Print the plan and rendered config; write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -530,7 +539,7 @@ pub enum ConfigCommand {
         #[arg(long)]
         from_release: Option<PathBuf>,
     },
-    /// Restore the v1 config and original database from one verified
+    /// Restore the original config and database from one verified
     /// snapshot while nothing changed since the migration; also recovers an
     /// interrupted migration or rollback of that snapshot.
     Rollback {
@@ -1102,6 +1111,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::Mcp => "mcp",
         Command::Api { .. } => "api",
         Command::Supervisor { .. } => "supervisor",
+        Command::ServiceExec { .. } => "services",
         _ => "cli",
     };
     agent_run_core::logging::configure(&home, component);
@@ -1474,17 +1484,31 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
         Command::Config { command } => match command {
             ConfigCommand::Migrate {
                 mapping,
+                target_config,
                 dry_run: _,
                 apply,
                 ack,
                 from_release,
-            } => (dependencies.output)(&crate::migrate::migrate(
-                &home,
-                &mapping,
-                apply,
-                &ack,
-                from_release.as_deref(),
-            )?)?,
+            } => {
+                let result = match (mapping.as_deref(), target_config.as_deref()) {
+                    (Some(mapping), None) => crate::migrate::migrate(
+                        &home,
+                        mapping,
+                        apply,
+                        &ack,
+                        from_release.as_deref(),
+                    )?,
+                    (None, Some(target)) if ack.is_empty() => {
+                        crate::migrate::migrate_v2(&home, target, apply, from_release.as_deref())?
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "choose one migration input; --ack applies only to a legacy mapping",
+                        ))
+                    }
+                };
+                (dependencies.output)(&result)?;
+            }
             ConfigCommand::Rollback { snapshot } => {
                 (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?
             }
@@ -1538,6 +1562,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             identity_fd,
             error_fd,
         } => crate::supervisor::run(&home, &agent_id, [ready_fd, identity_fd, error_fd]).await?,
+        Command::ServiceExec { generation } => {
+            agent_run_core::managed_services::bootstrap(&home, &generation)?
+        }
         Command::DenyCommand { name: _ } => {
             eprintln!("agent-run: command denied by the configured developer environment");
             return Ok(126);

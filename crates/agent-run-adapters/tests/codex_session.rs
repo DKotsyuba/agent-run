@@ -666,7 +666,9 @@ async fn python_test_codex_app_server_closed_error_does_not_wait_unboundedly() {
 // Protects Process::reap from a descendant that keeps inherited stdout open.
 #[tokio::test]
 async fn process_reap_does_not_wait_for_inherited_pipe_descriptors() {
-    let mut process = Process::spawn(&transport_plan("tail -f /dev/null & exit 0")).unwrap();
+    // Keep the pipe open longer than the assertion's three-second deadline,
+    // but expire even if the test process is forcibly terminated before cleanup.
+    let mut process = Process::spawn(&transport_plan("sleep 10 & exit 0")).unwrap();
     let reap = tokio::time::timeout(Duration::from_secs(3), process.reap()).await;
     if reap.is_err() {
         process

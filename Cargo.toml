@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.13.3"
+version = "0.14.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.98.1"
@@ -24,7 +24,7 @@ fs2 = "0.4"
 libc = "0.2"
 regex = "1.11"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "functions", "hooks"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

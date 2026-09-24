@@ -365,6 +365,8 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
 
 /// Runs one admitted v2 attempt through the existing detached supervisor,
 /// process-identity fence, transcript, cleanup verifier, and terminal outbox.
+/// Checkpoints observed root/descendant identities on change, including final
+/// cleanup, so recovery retains captured members after this supervisor exits.
 async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     if store.cancel_pending(id)? {
         if !store.provider_never_spawned(id)? {
@@ -503,6 +505,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 return commands::complete_terminal(store, id);
             }
         }
+        if !config.services.is_empty() {
+            store.event(id, "phase", &json!({"phase":"warming_services"}))?;
+        }
+        let service_gate = crate::managed_services::wait_for_gate(home, id).await;
         // The run's one overall deadline (admission time + its timeout) is
         // re-read from durable state before every spawn; an expired run never
         // spawns another attempt.
@@ -513,6 +519,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             }
             return timed_out_before_spawn(id, store);
         }
+        service_gate?;
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
         if !store.provider_spawning(id, &attempt_id)? {
@@ -545,6 +552,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 .as_ref()
                 .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
             store.provider_process(id, &attempt_id, leader)?;
+            let ownership_home = home.to_owned();
+            let ownership_attempt = attempt_id.clone();
+            process.observe_ownership(move |snapshot| {
+                Store::open(&ownership_home)?.remember_processes(
+                    "attempt",
+                    &ownership_attempt,
+                    snapshot,
+                )
+            })?;
             if switched {
                 // The logical run is already running; its start time (and
                 // so any deadline) is kept. No user entry is journaled.
@@ -596,7 +612,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
         };
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
+        let checkpoint = process.checkpoint_ownership();
         let exit = process.reap().await;
+        checkpoint?;
         #[cfg(feature = "test-fixtures")]
         let cleanup = injected_cleanup_error(home, &attempt_id, store, cleanup)?;
         match &cleanup {
@@ -663,9 +681,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 store.latch_native_exhaustion(
                     &account,
                     identity.authority.provider.as_str(),
-                    lane,
-                    window,
-                    "claude-rate-limit-event",
+                    &lane,
+                    &window,
+                    "native-quota-exhaustion",
                     &governed_lanes(&identity, &account),
                     domain::now(),
                     reset,
@@ -982,7 +1000,7 @@ fn history_root(
 fn latch_mapping(
     identity: &ProviderLaunchIdentity,
     failure: &adapters::native_failure::NativeFailure,
-) -> Option<(&'static str, &'static str)> {
+) -> Option<(String, String)> {
     let adapters::native_failure::NativeFailure::QuotaExhausted {
         window: Some(window),
         ..
@@ -994,20 +1012,18 @@ fn latch_mapping(
         .provider_config
         .providers
         .get(&identity.authority.provider)?;
-    if identity.authority.harness != HarnessId::ClaudeCode
-        || provider.limits_source != agent_run_domain::LimitsSource::Lua
-        || provider.collector.as_ref()?.script != "anthropic_usage"
-    {
+    if provider.limits_source != agent_run_domain::LimitsSource::Exec {
         return None;
     }
-    match window.as_str() {
-        "five_hour" => Some(("primary", "five_hour")),
-        "seven_day" => Some(("secondary", "seven_day")),
-        _ => None,
-    }
+    let pool = provider
+        .collector
+        .as_ref()?
+        .exhaustion_windows
+        .get(window)?;
+    Some((pool.clone(), window.clone()))
 }
 
-/// The model lanes (native alias, else id) a general `anthropic_usage` pool
+/// The model lanes (native alias, else id) an explicitly configured native exhaustion pool
 /// of `account` governs for this provider: every provider model the
 /// account's bindings admit, exactly as that collector builds its unit.
 fn governed_lanes(

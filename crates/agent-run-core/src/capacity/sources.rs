@@ -24,9 +24,8 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, process::Command};
 const TTL: f64 = 900.0;
-/// Fixed issue for a schema-1 runtime still declaring the retired CodexBar
-/// source: nothing is invoked and the runtime must migrate to schema 2.
-pub const CODEXBAR_RETIRED: &str = "codexbar_retired_migration_required";
+/// Fixed issue for any schema-1 collector: nothing runs until explicit exec configuration.
+pub const COLLECTOR_RETIRED: &str = "external_collector_configuration_required";
 const BODY_MAX: usize = 2 * 1024 * 1024;
 fn number(v: Option<&Value>) -> Option<f64> {
     v.and_then(Value::as_f64).filter(|v| v.is_finite())
@@ -270,8 +269,7 @@ pub async fn codex_probe(
     account: Option<&str>,
     method: &str,
 ) -> Result<Value> {
-    if rt.kind()? != Adapter::Codex || !["model/list", "account/rateLimits/read"].contains(&method)
-    {
+    if rt.kind()? != Adapter::Codex || method != "model/list" {
         return Err(invalid("invalid metadata probe"));
     }
     let probes = app_home.join("probes");
@@ -621,51 +619,13 @@ pub fn claude_oauth_token(rt: &Runtime) -> Option<String> {
         _ => None,
     }
 }
-/// Collects one native Claude usage round through the provider's OAuth endpoint.
-///
-/// `runtime` names the configured engine and `rt` supplies the declared auth
-/// bridge. Returns a validated slice of the reported limits. Without a
-/// declared, exported, non-empty OAuth token this fails immediately with the
-/// fixed reason `claude_token_missing` and performs **no** network request and
-/// no scoped credential read; an unreachable endpoint, a non-success status,
-/// or an oversized body yields `claude_usage_unreachable`, and unparsable or
-/// out-of-contract content yields `claude_malformed_response`. No reason ever
-/// carries provider output. Performs a bounded HTTPS request only when a token
-/// is present.
-pub async fn claude_native(runtime: &str, rt: &Runtime) -> Result<Slice> {
-    let token = claude_oauth_token(rt).ok_or_else(|| invalid("claude_token_missing"))?;
-    let observed = now();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .connect_timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-        .map_err(|_| invalid("claude_usage_unreachable"))?;
-    let mut response = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .bearer_auth(token)
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .send()
-        .await
-        .map_err(|_| invalid("claude_usage_unreachable"))?;
-    if !response.status().is_success() {
-        return Err(invalid("claude_usage_unreachable"));
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| invalid("claude_usage_unreachable"))?
-    {
-        if bytes.len() + chunk.len() > BODY_MAX {
-            return Err(invalid("claude_malformed_response"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("claude_malformed_response"))?;
-    normalize_claude(runtime, &value, observed)
+/// Compatibility refusal for the retired native quota entry point.
+/// No runtime metadata or ambient credential can authorize a request here;
+/// configure an external executable through schema 2 instead.
+pub async fn claude_native(_runtime: &str, _rt: &Runtime) -> Result<Slice> {
+    Err(invalid(
+        "native quota collector retired; configure an external exec collector",
+    ))
 }
 /// Reads the newest bounded Claude runtime stream as a credential-free fallback.
 ///
@@ -782,176 +742,34 @@ pub fn read_claude_stream(home: &Path, runtime: &str) -> Result<Slice> {
 /// The route has one physical pool for the shared `opencode-go` capacity.
 /// Docker failures and malformed cache values propagate fixed unavailable
 /// reasons, while a healthy empty cache remains a no-data outcome.
-async fn omniroute(name: &str) -> Result<Slice> {
-    let args = vec![
-        "exec".into(),
-        "omniroute".into(),
-        "node".into(),
-        "-e".into(),
-        super::omniroute::script(),
-    ];
-    let environment = host_environment();
-    let attempt = || capture(super::omniroute::docker(), &args, 10, &environment);
-    let values = match super::omniroute::read(attempt()).await {
-        Ok(values) => values,
-        Err(Error::Runtime(reason)) if reason == "omniroute_unavailable" => {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            super::omniroute::read(attempt()).await?
-        }
-        Err(error) => return Err(error),
-    };
-    let samples = values
-        .into_iter()
-        .map(|mut sample| {
-            sample.key.runtime = name.into();
-            sample
-        })
-        .collect::<Vec<_>>();
-    let topology = sample_topology(name, "omniroute", &samples);
-    Ok(slice_from_samples(name, name, samples, topology, 0.0))
-}
-/// Returns whether `home/config.toml` parses as TOML declaring
-/// `schema_version = 2`, reading at most one MiB; unreadable or other files
-/// return `false`.
-fn declares_schema_v2(home: &Path) -> bool {
-    std::fs::File::open(home.join("config.toml"))
-        .ok()
-        .and_then(|file| {
-            use std::io::Read;
-            let mut text = String::new();
-            file.take(1024 * 1024).read_to_string(&mut text).ok()?;
-            toml::from_str::<toml::Value>(&text).ok()
-        })
-        .and_then(|value| value.get("schema_version")?.as_integer())
-        == Some(2)
-}
-
-/// Runs one capacity collection round for `home` — the entry every polling
-/// round uses. A valid schema-2 home runs the account-scoped provider
-/// sources only; a home declaring schema 2 that fails to load returns that
-/// error; anything else runs the legacy runtime sources.
+/// Runs only explicitly configured external quota executables; legacy configurations must migrate.
 pub async fn collect(home: &Path) -> Result<Value> {
-    // A schema-v2 home runs the account-scoped provider sources exclusively:
-    // the launchd polling path lands here every round, and its durable
-    // backoff ledger under `capacity/backoff.json` survives the process
-    // boundary between rounds.
-    // A home that declares schema 2 but fails to load reports that error;
-    // it never degrades silently to the legacy runtime sources.
     match agent_run_config::provider_config::ProviderConfig::load(home) {
-        Ok((provider_config, _)) => {
-            return super::collectors::collect_providers(home, &provider_config).await;
-        }
-        Err(error) if declares_schema_v2(home) => return Err(error),
-        Err(_) => {}
-    }
-    let config = Config::load(home)?;
-    let started = now();
-    let mut results = Vec::new();
-    let mut all_ok = true;
-    for (name, rt) in config.runtimes.iter().filter(|(_, r)| r.enabled) {
-        let source = rt.limits_source.as_deref().unwrap_or("native");
-        let mut count = 0;
-        let mut issues: Vec<String> = Vec::new();
-        let mut no_data = false;
-        if source == "none" {
-            results.push(json!({"runtime":name,"status":"unsupported","sample_count":0,"error":null,"issues":[]}));
-            continue;
-        }
-        if (source == "codex_appserver" || source == "native") && rt.kind()? == Adapter::Codex {
-            let mut scopes = vec![None];
-            scopes.extend(rt.accounts.iter().map(|s| Some(s.as_str())));
-            let mut seen = BTreeSet::new();
-            for account in scopes {
-                let observed = now();
-                // Python classifies a scope whose home is absent as
-                // `home_missing` and reserves `probe_failed` for a home that
-                // exists but could not be probed; the two are distinct
-                // operator signals, so the scope's own home decides.
-                let scope_home = match account {
-                    None => rt.home.clone(),
-                    Some(label) => materialize::account_home(home, Adapter::Codex, label),
-                };
-                let response =
-                    codex_probe(home, &config, rt, account, "account/rateLimits/read").await;
-                match response.and_then(|v| normalize_codex(name, account, &v, observed)) {
-                    Ok((slice, backend)) => {
-                        if let Some(id) = backend {
-                            if !seen.insert(id) {
-                                continue;
-                            }
-                        }
-                        if slice.samples.is_empty() {
-                            issues.push("scope_empty".into());
-                            continue;
-                        }
-                        if slice.topology.routes.is_empty() {
-                            issues.push("incomplete_bucket".into());
-                        }
-                        match super::persist(home, &slice, config.capacity.sample_retention) {
-                            Ok(n) => count += n,
-                            Err(_) => issues.push("persist_failed".into()),
-                        }
-                    }
-                    Err(_) => issues.push(
-                        if scope_home.is_dir() {
-                            "probe_failed"
-                        } else {
-                            "home_missing"
-                        }
-                        .into(),
-                    ),
-                }
-            }
-        } else {
-            let result = match (source, rt.kind()?) {
-                // Retired: never invoked. The runtime reports a typed
-                // migration-required failure and previous samples stay intact.
-                ("codexbar", _) => Err(Error::Validation(CODEXBAR_RETIRED.into())),
-                ("omniroute", _) => omniroute(name).await,
-                ("native", Adapter::Claude) => match claude_native(name, rt).await {
-                    Ok(slice) => Ok(slice),
-                    Err(Error::Validation(reason)) if reason == "claude_token_missing" => {
-                        read_claude_stream(home, name)
-                    }
-                    Err(error) => Err(error),
-                },
-                _ => Err(Error::Unsupported(
-                    "selected quota source has not been ported".into(),
-                )),
+        Ok((config, _)) => super::collectors::collect_providers(home, &config).await,
+        Err(error) => {
+            // Old homes remain inspectable, but no legacy provider collector may run.
+            let Ok(config) = Config::load(home) else {
+                return Err(error);
             };
-            match result {
-                Ok(slice) if slice.samples.is_empty() => no_data = true,
-                Ok(slice) => match super::persist(home, &slice, config.capacity.sample_retention) {
-                    Ok(n) => count = n,
-                    Err(_) => issues.push("persist_failed".into()),
-                },
-                Err(Error::Unsupported(_)) => issues.push("source_not_ported".into()),
-                Err(Error::Validation(reason)) => issues.push(reason),
-                Err(Error::Runtime(reason)) => issues.push(reason),
-                Err(_) => issues.push("source_failed".into()),
-            }
+            let results: Vec<_> = config
+                .runtimes
+                .iter()
+                .filter(|(_, runtime)| runtime.enabled)
+                .map(|(name, runtime)| {
+                    let disabled = runtime.limits_source.as_deref() == Some("none");
+                    let issues: Vec<&str> = if disabled {
+                        vec![]
+                    } else {
+                        vec![COLLECTOR_RETIRED]
+                    };
+                    json!({"runtime":name,"status":if disabled {"unsupported"} else {"failed"},
+                        "sample_count":0,"error":issues.first(),"issues":issues})
+                })
+                .collect();
+            super::prune(home, config.capacity.sample_retention)?;
+            Ok(json!({"ok":results.iter().all(|row|row["status"]!="failed"),"results":results}))
         }
-        let status = if issues.is_empty() && count > 0 {
-            "collected"
-        } else if count > 0 {
-            "partial"
-        } else if no_data && issues.is_empty() {
-            "no_data"
-        } else {
-            "failed"
-        };
-        if status != "collected" {
-            all_ok = false;
-        }
-        results.push(json!({"runtime":name,"status":status,"sample_count":count,"error":issues.first(),"issues":issues}));
     }
-    // Retention is global and per round, not per commit: Python's
-    // `collect_once` prunes after every round, so a round in which every
-    // runtime failed still enforces the bound on already-stored history.
-    super::prune(home, config.capacity.sample_retention)?;
-    Ok(
-        json!({"started_at":started,"finished_at":now(),"ok":all_ok,"results":results,"over_interval":now()-started>config.capacity.collect_interval_seconds as f64}),
-    )
 }
 pub async fn models(home: &Path) -> Result<Value> {
     let cfg = Config::load(home)?;

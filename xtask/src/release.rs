@@ -44,10 +44,37 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Creates a sealed release from an already-built native binary.
 ///
-/// The resulting `releases/<version>` contains only the binary, metadata,
+/// The resulting `releases/<version>` contains the binary, external collectors, metadata,
 /// SHA256SUMS and COMPLETE marker. Existing complete releases are verified and
 /// reused; incomplete candidates are rejected to retain forensic evidence.
 pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, String> {
+    build_inner(output, version, binary, None)
+}
+
+/// Seals a native release with the standalone deployment helper required by install.sh.
+pub fn build_with_installer(
+    output: &Path,
+    version: &str,
+    binary: &Path,
+    installer: &Path,
+) -> Result<PathBuf, String> {
+    if !installer.is_file() {
+        return Err("native release requires a built deployment helper".into());
+    }
+    let release = build_inner(output, version, binary, Some(installer))?;
+    if !release.join("bin/agent-run-deploy").is_file() {
+        return Err("existing release predates install.sh; choose a new version".into());
+    }
+    Ok(release)
+}
+
+/// Writes a release once, optionally including the native installation entry point.
+fn build_inner(
+    output: &Path,
+    version: &str,
+    binary: &Path,
+    installer: Option<&Path>,
+) -> Result<PathBuf, String> {
     if version.trim().is_empty() || version.contains('/') {
         return Err("version must be a nonblank path component".into());
     }
@@ -61,6 +88,24 @@ pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, Str
     }
     fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
     fs::copy(binary, release.join("bin/agent-run")).map_err(|error| error.to_string())?;
+    if let Some(installer) = installer {
+        fs::copy(installer, release.join("bin/agent-run-deploy"))
+            .map_err(|error| error.to_string())?;
+    }
+    // External integration scripts remain ordinary files, never embedded executable logic.
+    for directory in ["collectors", "services"] {
+        let scripts = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts")
+            .join(directory);
+        fs::create_dir(release.join(directory)).map_err(|error| error.to_string())?;
+        for relative in files(&scripts).map_err(|error| error.to_string())? {
+            let destination = release.join(directory).join(&relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::copy(scripts.join(&relative), destination).map_err(|error| error.to_string())?;
+        }
+    }
     let metadata = format!(
         "{{\"version\":{version:?},\"format\":1,\"schema_version\":{SUPPORTED_SCHEMA_VERSION}}}\n"
     );
@@ -107,6 +152,9 @@ mod tests {
         fs::write(&binary, "native binary").expect("fixture binary");
         let release = build(temporary.path(), "0.12.0", &binary).expect("sealed release");
         verify(&release).expect("valid manifest");
+        assert!(release.join("collectors/codex.sh").is_file());
+        assert!(release.join("collectors/glm.jq").is_file());
+        assert!(release.join("services/codegraph-probe.cjs").is_file());
         assert_eq!(
             super::schema_version(&release).expect("metadata schema"),
             agent_run_platform::release::STORE_SCHEMA_VERSION as u64,

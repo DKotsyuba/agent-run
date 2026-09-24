@@ -90,11 +90,15 @@ impl Store {
     /// created. Returns `false`, changing nothing, when a cancel is pending or
     /// claimed: the claim and the cancel check are one statement, so an
     /// accepted cancel can never race past this boundary.
+    /// Configured service gates and leased generations must still be ready in
+    /// the same statement; a readiness race returns Conflict without spawning.
     pub fn provider_spawning(&self, id: &AgentId, attempt: &str) -> Result<bool> {
         let changed = self.conn.execute(
             "UPDATE attempts SET phase='spawning',state='starting' \
              WHERE id=?1 AND agent_id=?2 AND ownership_active=1 AND phase='prepared' \
-             AND NOT EXISTS (SELECT 1 FROM commands WHERE agent_id=?2 AND kind='cancel' AND state IN ('pending','claimed'))",
+             AND NOT EXISTS (SELECT 1 FROM commands WHERE agent_id=?2 AND kind='cancel' AND state IN ('pending','claimed')) \
+             AND NOT EXISTS (SELECT 1 FROM agent_service_gates WHERE agent_id=?2 AND state!='ready') \
+             AND NOT EXISTS (SELECT 1 FROM managed_service_leases l JOIN managed_service_generations g ON g.id=l.generation_id WHERE l.agent_id=?2 AND l.released_at IS NULL AND g.state!='ready')",
             params![attempt, id.as_str()],
         )?;
         if changed == 1 {
@@ -465,6 +469,16 @@ impl Store {
              VALUES(?,?,1,'prepared','{}',?,?,'prepared',1)",
             params![attempt_id, id.as_str(), at, candidate.account.as_str()],
         )?;
+        if identity
+            .pointer("/provider_config/services")
+            .and_then(Value::as_object)
+            .is_some_and(|services| !services.is_empty())
+        {
+            tx.execute(
+                "INSERT INTO agent_service_gates(agent_id,state) VALUES (?,'pending')",
+                [id.as_str()],
+            )?;
+        }
         for key in &candidate.physical_keys {
             tx.execute(
                 "INSERT INTO attempt_quota_keys(attempt_id,quota_key) VALUES(?,?)",

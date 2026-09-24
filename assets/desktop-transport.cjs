@@ -289,6 +289,8 @@ function startChild() {
   childStarted = true;
   const env = { ...process.env };
   delete env.CODEX_APP_TOOLS_PIPE_PATH; delete env.CODEX_MCP_NODE_PATH;
+  // The Rust child observes this parent relationship even if SIGKILL skips cleanup.
+  env.AGENT_RUN_MCP_PARENT_PID = String(process.pid);
   child = spawn(executable, mcpArgs, { env, stdio: "inherit" });
   child.once("error", () => { cleanup(); process.exit(1); });
   child.once("exit", (code, signal) => {

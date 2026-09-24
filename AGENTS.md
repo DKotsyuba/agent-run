@@ -8,7 +8,9 @@ evidence, process ownership, and secret safety are product requirements.
 - Use the pinned Rust toolchain and the committed `Cargo.lock`. Prefer the
   standard library and existing workspace dependencies.
 - Keep modules focused. Add tests for every behavior change.
-- Engine processes are created only through adapters and the supervisor.
+- Agent-task harnesses are created only through adapters and the supervisor.
+  Configured quota commands use the bounded external collector runner; shipped
+  collectors query metadata without starting model turns.
 - Preserve unrelated work and never weaken lifecycle assertions to hide flakes.
 - Release workflows publish only the qualified macOS Apple-silicon artifact.
   Linux x86-64 remains visible as non-blocking validation; its release and

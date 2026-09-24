@@ -549,6 +549,8 @@ pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
 }
 
 /// Serves one selected socket with explicit bounded connection and deadline options.
+/// Owns reconciliation, service supervision and bounded history-retention workers;
+/// shutdown cancels their schedules while in-flight SQLite work uses progress deadlines.
 pub async fn serve_at_with_options(
     home: &Path,
     socket_path: &Path,
@@ -639,8 +641,54 @@ pub async fn serve_at_with_options(
     };
     let service = Service::new(home.to_owned());
     let _ = service.reconcile()?;
+    let mut services =
+        agent_run_core::managed_services::Manager::new(home, std::env::current_exe()?)?;
+    // JoinSet aborts maintenance on every exit path, including cancellation of
+    // serve_at itself; dropping a bare JoinHandle would detach these loops.
+    let mut workers = JoinSet::new();
+    let history_home = home.to_owned();
+    workers.spawn(async move {
+        loop {
+            let home = history_home.clone();
+            // SQLite work runs outside the async executor. One job at a time;
+            // short SQL deadlines also bound it if the broker task is aborted.
+            let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+                let mut store = crate::state::Store::open(&home)?;
+                store.conn.busy_timeout(Duration::from_millis(100))?;
+                let deleted = store.prune_history(crate::domain::now())?;
+                if deleted == 0 && store.vacuum_history()? {
+                    return Ok(1); // More free pages may remain; continue after the short pause.
+                }
+                Ok(deleted)
+            })
+            .await;
+            let delay = match result {
+                Ok(Ok(0)) => 3600,
+                Ok(Ok(_)) => 1,
+                Ok(Err(error)) => {
+                    eprintln!("history maintenance: {}", error.public().kind);
+                    60
+                }
+                Err(_) => {
+                    eprintln!("history maintenance: worker failed");
+                    60
+                }
+            };
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+    });
+    workers.spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(error) = services.tick().await {
+                eprintln!("service maintenance: {}", error.public().kind);
+            }
+        }
+    });
     let maintenance = service.clone();
-    let worker = tokio::spawn(async move {
+    workers.spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut config_tick = tokio::time::interval_at(
@@ -693,7 +741,8 @@ pub async fn serve_at_with_options(
             }
         }
     }
-    worker.abort();
+    workers.abort_all();
+    while workers.join_next().await.is_some() {}
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !handlers.is_empty() && tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

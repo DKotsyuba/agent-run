@@ -6,7 +6,7 @@ use agent_run_config::{
     provider_migration::{plan_v1, RuntimeMapping},
 };
 use agent_run_domain::catalog::{
-    decode_legacy_request, AccountRecord, AccountStatus, CollectorBinding, HarnessId, LimitsSource,
+    decode_legacy_request, AccountRecord, AccountStatus, HarnessId, LimitsSource,
     ProviderConnection, ProviderProtocol,
 };
 use serde_json::json;
@@ -72,7 +72,7 @@ fn mappings() -> BTreeMap<String, RuntimeMapping> {
                 harness: HarnessId::Codex,
                 connection: ProviderConnection::Native,
                 auth_family: "openai".parse().unwrap(),
-                limits_source: LimitsSource::CodexAppserver,
+                limits_source: LimitsSource::None,
                 collector: None,
                 recommendations: vec![],
                 model_recommendations: BTreeMap::new(),
@@ -94,13 +94,13 @@ fn mappings() -> BTreeMap<String, RuntimeMapping> {
                     allow_loopback_http: false,
                 },
                 auth_family: "anthropic".parse().unwrap(),
-                limits_source: LimitsSource::Lua,
-                collector: Some(CollectorBinding {
-                    script: "glm_quota".into(),
-                    origins: vec!["https://gateway.example".into()],
-                    script_file: None,
-                    auth: None,
-                }),
+                limits_source: LimitsSource::Exec,
+                collector: Some(
+                    serde_json::from_value(
+                        serde_json::json!({"command":"/bin/sh","args":["/collectors/glm.sh"]}),
+                    )
+                    .unwrap(),
+                ),
                 recommendations: vec![],
                 model_recommendations: BTreeMap::new(),
                 native_models: BTreeMap::from([("glm-5.3".into(), "glm-5.3[1m]".into())]),

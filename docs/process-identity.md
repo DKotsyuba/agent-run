@@ -19,21 +19,41 @@ only when the stored startup owner or supervisor is observed as dead or reused.
 
 ## Signalling and cleanup
 
-Signals are allowed only while the recorded supervisor identity is `alive` and
-the supervisor is still the leader of its recorded process group. Reused,
-unknown, denied, and missing identity never authorize a signal.
+The shared harness transport observes the primary child PID independently of
+stdout EOF, during startup RPC as well as streaming. On primary exit it sends
+TERM immediately to captured live descendants. Queued output drains without
+counting downstream processing time as silence; each idle read after exit is
+limited to 200ms. Cancellation of a read does not reset its idle deadline.
+Captured writers still alive after two seconds receive KILL even if they keep
+producing output. The overall run deadline also bounds unobserved writers.
+The supervisor then completes bounded escalation and
+records the final cleanup proof. Normal protocol completion still follows the
+same supervisor cleanup path even if the primary PID has not exited yet.
+
+Group signals require the recorded group leader to be `alive` with its original
+identity and group. Captured descendants are also checked individually by PID,
+kernel token and birth time, including after the leader exits. Reused, unknown,
+denied and missing identities never authorize a signal.
 
 Before group termination, agent-run captures every readable member by PID and
 birth identity. Cleanup evidence records the signals attempted, scope,
 `group_gone`, nullable `descendants_gone`, and `confirmed`. Confirmation
 requires both the original group and every readable captured descendant to be
-gone. Escaped descendants are not signalled individually, and group
-disappearance alone does not claim wider tree cleanup.
+gone. Captured descendants which left the original group receive individual
+signals. This is evidence about observed identities, not proof of a complete
+historical process tree: a process may detach before any snapshot sees it.
 
-After the original group exits, cleanup waits up to two seconds for captured
-descendants to exit and for transient observation failures to clear. These
-retries only inspect process identities; they never authorize another signal.
-If the complete proof still cannot be established, a provider attempt keeps
+Cleanup sends TERM to the verified group and captured live descendants immediately.
+After a short caller-selected grace it sends KILL to remaining verified identities.
+Bounded observation retries then allow exit and transient inspection states to
+settle. Current provider supervisors checkpoint newly captured identities in
+SQLite during startup RPC, streaming and final cleanup. Recovery restores these
+snapshots even when the original leader has exited; every signal still requires
+a fresh identity check. Old attempts without snapshots retain the conservative
+leader-only recovery path. No migration reconstructs an escaped child that was
+never captured, and observations not yet checkpointed when a supervisor crashes
+cannot be recovered from an already-dead leader.
+If the required proof cannot be established, a provider attempt keeps
 its ownership and records a bounded cleanup diagnostic for investigation.
 
 macOS uses native process APIs and a start-time-only sysctl fallback when

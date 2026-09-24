@@ -87,10 +87,12 @@ pub enum ProviderProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitsSource {
-    /// Codex app-server capacity telemetry.
+    /// Historical frozen configuration only; new configuration must use `exec`.
     CodexAppserver,
-    /// Quota collection delegated to the Lua source.
+    /// Historical frozen configuration only; no Lua interpreter is shipped.
     Lua,
+    /// An operator-configured executable returning the versioned quota document.
+    Exec,
     /// No known capacity source.
     None,
 }

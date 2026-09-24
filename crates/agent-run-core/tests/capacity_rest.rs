@@ -473,5 +473,5 @@ async fn native_claude_capacity_never_reaches_outside_declared_oauth() {
     let error = claude_native("claude", &undeclared)
         .await
         .expect_err("native capacity without OAuth is a source failure");
-    assert_eq!(error.to_string(), "claude_token_missing");
+    assert!(error.to_string().contains("retired"));
 }

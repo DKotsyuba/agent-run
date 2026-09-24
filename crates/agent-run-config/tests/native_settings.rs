@@ -157,8 +157,10 @@ fn documented_full_config_example_loads() {
         .expect("operator guide must keep a TOML example");
     let home = common::Home::new();
     std::fs::write(home.path.join("config.toml"), block).unwrap();
-    let cfg = Config::load(&home.path).unwrap();
-    assert!(cfg.runtimes.contains_key("codex"));
+    let (cfg, _) = agent_run_config::provider_config::ProviderConfig::load(&home.path).unwrap();
+    assert!(cfg
+        .harnesses
+        .contains_key(&agent_run_domain::catalog::HarnessId::Codex));
 }
 
 /// Build a fixed runtime and role so canonical snapshot bytes are reproducible.

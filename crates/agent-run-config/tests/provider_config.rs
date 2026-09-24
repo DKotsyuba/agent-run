@@ -24,7 +24,7 @@ home = "{home}/claude"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "none"
 recommendations = ["native subscription"]
 [[providers.codex.models]]
 id = "gpt"
@@ -40,7 +40,7 @@ account = "acct-native"
 harness = "codex"
 connection = {{ kind = "native" }}
 auth_family = "openai"
-limits_source = "codex_appserver"
+limits_source = "none"
 priority_multiplier = 5.0
 [[providers.codex-plus.models]]
 id = "gpt"
@@ -53,8 +53,8 @@ models = ["gpt"]
 harness = "claude-code"
 connection = {{ kind = "custom", endpoint = "https://api.example.com/messages", protocol = "messages" }}
 auth_family = "anthropic"
-limits_source = "lua"
-collector = {{ script = "glm_quota", origins = ["https://api.example.com"] }}
+limits_source = "exec"
+collector = {{ command = "/bin/bash", args = ["/collectors/glm.sh"] }}
 [[providers.glm.models]]
 id = "glm-5.3"
 native_model = "glm-5.3[1m]"
@@ -182,9 +182,14 @@ fn v2_rejects_invalid_provider_contracts() {
     let config = ProviderConfig::parse(&valid, home.path()).unwrap();
     assert!(config.resolve_catalog(vec![]).is_err());
     for retired in ["native", "codexbar", "omniroute", "provider"] {
-        assert!(
-            ProviderConfig::parse(&valid.replace("codex_appserver", retired), home.path()).is_err()
-        );
+        assert!(ProviderConfig::parse(
+            &valid.replace(
+                "limits_source = \"none\"",
+                &format!("limits_source = \"{retired}\"")
+            ),
+            home.path()
+        )
+        .is_err());
     }
     // The retired CodexBar binary is schema-1 migration input only.
     let with_codexbar = format!("{valid}\n[capacity]\ncodexbar_binary = \"/bin/true\"\n");
@@ -220,4 +225,27 @@ fn v2_reload_preserves_last_valid_revision() {
             .len(),
         3
     );
+}
+
+/// Old frozen collector bytes round-trip unchanged; live configs refuse the retired execution mode.
+#[test]
+fn frozen_collectors_keep_their_digest_without_reactivating_lua() {
+    let raw = serde_json::json!({"script":"anthropic_usage","origins":["https://api.anthropic.com"],"script_file":null,"auth":null});
+    let frozen: agent_run_domain::catalog::CollectorBinding =
+        serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&frozen).unwrap(), raw);
+    assert!(frozen.validate().is_err());
+    let root = tempfile::tempdir().unwrap();
+    let configured = document(root.path());
+    for retired in ["lua", "codex_appserver"] {
+        let error = ProviderConfig::parse(
+            &configured.replace(
+                "limits_source = \"exec\"",
+                &format!("limits_source = \"{retired}\""),
+            ),
+            root.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("retired"), "{error}");
+    }
 }
