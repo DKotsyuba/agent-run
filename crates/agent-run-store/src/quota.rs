@@ -270,6 +270,8 @@ pub fn retain_exhausted(
 /// latch is upserted for retained exhausted windows and cleared for released
 /// ones. An unsettled latch's last membership is kept when a new disjoint
 /// nonzero observation would otherwise replace its only governing sample.
+/// Repeated zeros for an unsettled window keep the later reset, or an unknown
+/// reset if either report lacks one, across all governed models.
 /// Every mutating round — samples written, latch upserted, or latch
 /// cleared — advances `quota_capacity_revision` exactly once inside the same
 /// immediate transaction; a round that changes nothing leaves the revision
@@ -430,7 +432,8 @@ pub fn record_quota_snapshot(
     }
 
     // Durable latch maintenance: every currently exhausted physical window
-    // upserts its fact, and sample retention never erases the latch.
+    // upserts its fact, and sample retention never erases the latch. A
+    // conflicting zero cannot shorten a shared window's reset horizon.
     for ((lane, source, name), window) in &physical {
         if window.remaining_percent != Some(0.0)
             || window.reset_at.is_some_and(|reset| reset <= at)
@@ -445,7 +448,7 @@ pub fn record_quota_snapshot(
             "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at,collector_revision) \
              VALUES(?,?,?,?,?,?,NULL) \
              ON CONFLICT(account_id,quota_key,source,window_id) DO UPDATE SET \
-             observed_at=excluded.observed_at,reset_at=excluded.reset_at",
+             observed_at=excluded.observed_at,reset_at=MAX(quota_exhaustion.reset_at,excluded.reset_at)",
             params![
                 account.as_str(),
                 quota_key,

@@ -732,3 +732,92 @@ fn disjoint_unknown_keeps_exhausted_model_blocked() {
     .unwrap();
     assert!(available.candidates[0].quota_known);
 }
+
+/// A disjoint zero may widen one physical latch to both models, but its
+/// earlier reset must not shorten the older exhausted model's horizon.
+#[test]
+fn disjoint_zero_keeps_later_latch_reset_until_expiry() {
+    use agent_run_core::capacity::provider_ranking::provider_candidates_at;
+    use agent_run_domain::catalog::{ProviderCatalog, QuotaAdmissionError};
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    registered(home.path());
+    let first = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"reset_at":2000.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &first, 100, 1100.0).unwrap();
+    let second = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.6"],
+         "remaining_percent":0.0,"reset_at":1500.0,"observed_at":1200.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(home.path(), "glm", &second, 100, 1200.0).unwrap();
+    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let reset: Option<f64> = store.conn.query_row(
+        "SELECT reset_at FROM quota_exhaustion WHERE account_id='acct-main' AND quota_key='acct-main::primary' AND source='glm-native' AND window_id='five_hour'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(reset, Some(2000.0));
+    let definitions = serde_json::from_value(json!([{
+        "id":"fixture-provider","harness":"codex","connection":{"kind":"native"},
+        "auth_family":"openai","limits_source":"codex_appserver",
+        "models":[{"id":"fixture-a","native_model":"glm-4.7"},
+                  {"id":"fixture-b","native_model":"glm-4.6"}],
+        "bindings":[{"label":"main","account":"acct-main"}]
+    }]))
+    .unwrap();
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), definitions).unwrap();
+    for model in ["fixture-a", "fixture-b"] {
+        let blocked = provider_candidates_at(
+            &store,
+            &catalog,
+            &"fixture-provider".parse().unwrap(),
+            model,
+            None,
+            &BTreeSet::new(),
+            1600.0,
+        );
+        assert!(
+            matches!(
+                blocked,
+                Err(agent_run_domain::Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaExhausted { .. }
+                ))
+            ),
+            "{model}"
+        );
+    }
+    let empty = normalize(&json!({"version":1,"windows":[]})).unwrap();
+    record_quota_snapshot(home.path(), "glm", &empty, 100, 2100.0).unwrap();
+    assert_eq!(latch_rows(home.path()), 0);
+    let available = provider_candidates_at(
+        &store,
+        &catalog,
+        &"fixture-provider".parse().unwrap(),
+        "fixture-a",
+        None,
+        &BTreeSet::new(),
+        2100.0,
+    )
+    .unwrap();
+    assert!(!available.candidates[0].quota_known);
+
+    let unknown_home = tempdir().unwrap();
+    agent_run_store::Store::initialize(unknown_home.path()).unwrap();
+    registered(unknown_home.path());
+    let no_reset = normalize(&json!({"version":1,"windows":[
+        {"pool":"primary","window":"five_hour","models":["glm-4.7"],
+         "remaining_percent":0.0,"observed_at":1000.0}
+    ]}))
+    .unwrap();
+    record_quota_snapshot(unknown_home.path(), "glm", &no_reset, 100, 1100.0).unwrap();
+    record_quota_snapshot(unknown_home.path(), "glm", &second, 100, 1200.0).unwrap();
+    let unknown_store = agent_run_store::Store::open(unknown_home.path()).unwrap();
+    let unknown_reset: Option<f64> = unknown_store.conn.query_row(
+        "SELECT reset_at FROM quota_exhaustion WHERE account_id='acct-main' AND quota_key='acct-main::primary' AND source='glm-native' AND window_id='five_hour'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(unknown_reset, None);
+}
