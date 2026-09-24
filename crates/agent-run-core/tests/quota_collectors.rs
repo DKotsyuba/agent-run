@@ -3,7 +3,7 @@
 
 use agent_run_adapters::authorized_request::{CredentialReader, SystemCredentialReader};
 use agent_run_core::capacity::collectors::{
-    collect_provider_quota, first_party, planned_pairs, AccountBackoff,
+    collect_provider_quota, collect_providers, first_party, planned_pairs, AccountBackoff,
 };
 use agent_run_core::capacity::lua::{
     CollectorLimits, QuotaHttpClient, QuotaHttpError, QuotaHttpRequest, QuotaHttpResponse,
@@ -24,6 +24,21 @@ use std::{
     time::Duration,
 };
 use tempfile::tempdir;
+
+/// A valid fresh schema-2 home without providers has a successful empty
+/// collection round and needs no harness-specific credential state.
+#[tokio::test]
+async fn empty_provider_catalog_collects_without_claude_harness() {
+    let home = tempdir().unwrap();
+    agent_run_store::Store::initialize(home.path()).unwrap();
+    let config = agent_run_config::provider_config::ProviderConfig::parse(
+        "schema_version = 2\n",
+        home.path(),
+    )
+    .unwrap();
+    let report = collect_providers(home.path(), &config).await.unwrap();
+    assert_eq!(report, serde_json::json!({"ok":true,"results":[]}));
+}
 
 /// The validated default ranking multiplier.
 fn one() -> PositiveFinite {

@@ -841,11 +841,15 @@ pub(super) fn row_status(issues: &[String], windows: usize) -> &'static str {
 /// polling rounds. `ok` is true only when no row of either source failed and
 /// the ledger persisted; a ledger write failure is reported as the fixed
 /// `backoff_persist_failed` code. Report rows carry only static typed facts.
-/// There is no legacy fallback: a failed source stays failed.
+/// There is no legacy fallback: a failed source stays failed. An explicitly
+/// empty provider catalog succeeds without requiring either harness.
 pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<Value> {
     let store = agent_run_store::Store::open(home)
         .map_err(|_| Error::Runtime("account registry is unavailable".into()))?;
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
+    if catalog.providers().is_empty() {
+        return Ok(json!({"ok":true,"results":[]}));
+    }
     let limits = CollectorLimits::default();
     let client = Arc::new(
         crate::capacity::lua::ReqwestQuotaHttp::new(limits.http_response_body_bytes)

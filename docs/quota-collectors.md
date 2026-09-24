@@ -4,6 +4,10 @@ Public semantics of the physical quota observation layer and the embedded
 Lua collector engine (`agent_run_core::capacity::{quota,lua,collectors}`,
 `agent_run_store::quota`).
 
+A fresh schema-2 home with no providers returns a successful empty
+`capacity collect --once` result (`{"ok":true,"results":[]}`); it does not
+require either harness or a credential before a provider is configured.
+
 ## Observation layer (`capacity::quota`, `agent_run_store::quota`)
 
 * Collectors report **version-1 output**: `{ "version": 1, "windows": [ {
