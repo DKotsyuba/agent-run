@@ -8,6 +8,6 @@ token=$(printf '%s' "$context" | jq -er 'select(.version == 1) | .auth.token | s
 case "$token" in *$'\n'*|*$'\r'*) exit 1 ;; esac
 metadata=$(printf '%s' "$context" | jq -ec '{models,now}')
 printf 'Authorization: Bearer %s\nanthropic-beta: oauth-2025-04-20\n' "$token" |
-  curl --fail --silent --show-error --connect-timeout 10 --max-time 25 --header @- \
+  curl -q --fail --silent --show-error --connect-timeout 10 --max-time 25 --max-filesize 2097152 --header @- \
     "${1:-https://api.anthropic.com/api/oauth/usage}" |
   jq -e -L "$directory" --argjson ctx "$metadata" -f "$directory/claude.jq"

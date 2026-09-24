@@ -458,3 +458,37 @@ fn supplied_http_scripts_reject_control_bytes_before_network() {
         }
     }
 }
+
+/// An unrelated user curl configuration must not trace collector authorization into a file.
+#[test]
+fn supplied_http_scripts_ignore_global_curl_configuration() {
+    use std::io::Write;
+    let root = tempfile::tempdir().unwrap();
+    let trace = root.path().join("credentials.log");
+    fs::write(
+        root.path().join(".curlrc"),
+        format!("trace-ascii = {:?}\n", trace.to_str().unwrap()),
+    )
+    .unwrap();
+    let (url, server) =
+        endpoint(r#"{"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":25}]}}"#);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors/glm.sh");
+    let mut child = std::process::Command::new("/bin/bash")
+        .arg(script)
+        .arg(url)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(json!({"version":1,"auth":{"token":"private-fixture-token"},"models":{"sonnet":{}},"now":1000}).to_string().as_bytes()).unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert!(server.join().unwrap().contains("private-fixture-token"));
+    assert!(
+        !trace.exists(),
+        "curl inherited a credential-leaking trace configuration"
+    );
+}
