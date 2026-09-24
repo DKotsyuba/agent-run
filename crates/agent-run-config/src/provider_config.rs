@@ -320,6 +320,15 @@ impl ProviderConfig {
             if !self.harnesses.contains_key(&provider.harness) {
                 return Err(invalid("provider names an undeclared harness"));
             }
+            if provider.models.iter().any(|model| {
+                model
+                    .params
+                    .keys()
+                    .chain(model.allowed_params.keys())
+                    .any(|key| key != "effort")
+            }) {
+                return Err(invalid("unsupported model parameter"));
+            }
             self.definition(id, provider).validate()?;
         }
         Ok(())

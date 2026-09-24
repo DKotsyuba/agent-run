@@ -150,8 +150,9 @@ The public `start` tool (CLI `agent-run start`, broker socket, MCP) takes a
 `allowed_params.effort`, a chosen `effort` outside that list is a
 `ValidationError`. `params.effort` supplies the effective value when the caller
 omits it; the original omission stays in replay identity while the resolved
-value is frozen for execution and current-policy checks. Other model parameter
-keys are rejected because no launch adapter can apply them. The request is
+value is frozen for execution and current-policy checks. New configuration
+rejects other model parameter keys because no launch adapter can apply them;
+older frozen snapshots remain readable for already-admitted runs. The request is
 served by `Service::start_provider` inside the
 resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
