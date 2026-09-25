@@ -21,16 +21,19 @@ impl Store {
     /// large histories make progress over multiple calls. Accounts, quota
     /// exhaustion latches, live services and files on disk are never removed.
     /// Every batch commits atomically or rolls back on error; no await is allowed.
+    /// Callback setup/cleanup errors propagate; cleanup is attempted even if the batch fails.
     pub fn prune_history(&mut self, at: f64) -> Result<usize> {
         if !at.is_finite() || at < HISTORY_SECONDS {
             return Err(invalid("history retention requires a finite Unix time"));
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         self.conn
-            .progress_handler(1_000, Some(move || Instant::now() >= deadline));
+            .progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
         let result = self.prune_history_batch(at);
-        self.conn.progress_handler(0, None::<fn() -> bool>);
-        result
+        let cleanup = self.conn.progress_handler(0, None::<fn() -> bool>);
+        let deleted = result?;
+        cleanup?;
+        Ok(deleted)
     }
 
     /// Runs one short transaction under the caller's progress/lock deadlines.
@@ -199,6 +202,7 @@ impl Store {
     /// later on contention/interruption. This is cooperative, not a hard I/O deadline.
     /// Schema 19 prepares incremental mode during offline migration. This method
     /// never replaces the database file or changes schema/auto-vacuum mode.
+    /// Callback setup/cleanup errors propagate; cleanup is attempted even if vacuum fails.
     pub fn vacuum_history(&self) -> Result<bool> {
         let active: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE status IN ('created','starting','running','cancelling'))
@@ -227,7 +231,7 @@ impl Store {
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         self.conn
-            .progress_handler(1_000, Some(move || Instant::now() >= deadline));
+            .progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
         let vacuum = (|| -> rusqlite::Result<()> {
             let mut statement = self.conn.prepare("PRAGMA incremental_vacuum(1024)")?;
             let mut rows = statement.query([])?;
@@ -235,8 +239,9 @@ impl Store {
             while rows.next()?.is_some() {}
             Ok(())
         })();
-        self.conn.progress_handler(0, None::<fn() -> bool>);
+        let cleanup = self.conn.progress_handler(0, None::<fn() -> bool>);
         vacuum?;
+        cleanup?;
         // A busy reader may defer truncation; a later idle pass checkpoints again.
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         let after: i64 = self
