@@ -100,9 +100,12 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
         "start" | "resume" => Some(json!({"agent_id": value["agent_id"]})),
         _ => None,
     };
-    let result = match value {
-        Value::String(text) => CallToolResult::success(vec![Content::text(text.clone())]),
-        _ => match render(tool, value) {
+    let result = match (tool, value) {
+        ("delegation_guide", Value::String(text)) => {
+            CallToolResult::success(vec![Content::text(text.clone())])
+        }
+        ("delegation_guide", _) => error_result("RuntimeError", "delegation guide must be text"),
+        (_, Value::Object(_)) => match render(tool, value) {
             Ok(text) => CallToolResult::success(vec![Content::text(text)]),
             // A projection/template defect is a typed compact failure, never
             // JSON, a silent blank, or a success page hiding the failure.
@@ -111,6 +114,7 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
                 &format!("tool result presentation failed: {error}"),
             ),
         },
+        _ => error_result("RuntimeError", "tool result must be an object"),
     };
     // The one deliberate structured mirror, kept even on a presentation
     // failure: machine identity for the PostToolUse binding hook, never the
@@ -208,7 +212,10 @@ fn start_context(value: &Value) -> Value {
     fields["agent_id"] = value["agent_id"].clone();
     fields["created"] = value["created"].clone();
     fields["attempt_id"] = json!(value["attempt_id"].as_str().unwrap_or_default());
-    fields["parent_agent_id"] = json!(value["parent_agent_id"].as_str().unwrap_or_default());
+    fields["parent_agent_id"] = json!(value["agent"]["parent_agent_id"]
+        .as_str()
+        .or_else(|| value["parent_agent_id"].as_str())
+        .unwrap_or_default());
     fields
 }
 
@@ -549,6 +556,30 @@ mod tests {
         assert_eq!(payload.agent_id.as_deref(), Some("ag-2026-1"));
     }
 
+    /// Resume reads lineage from the real nested agent view; other tools
+    /// cannot bypass their templates by returning a preformatted scalar.
+    #[test]
+    fn resume_lineage_and_non_guide_result_shapes_are_preserved() {
+        let mut agent = agent_view();
+        agent["parent_agent_id"] = json!("ag-parent");
+        let page = text(
+            "resume",
+            &json!({"agent_id": "ag-child", "created": true, "agent": agent}),
+        );
+        assert!(page.contains("Parent: ag-parent"), "{page}");
+        for (name, value) in [
+            ("models", json!("unvalidated text")),
+            ("delegation_guide", json!({})),
+        ] {
+            let result = success_result(name, &value);
+            assert_eq!(result.is_error, Some(true), "{name}");
+            assert!(serde_json::to_value(result.content).unwrap()[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("RuntimeError"));
+        }
+    }
+
     /// Cancel and steer report acceptance without claiming a terminal state.
     #[test]
     fn cancel_and_steer_report_pending_acceptance() {
@@ -564,6 +595,11 @@ mod tests {
         assert!(steer.contains("agent-run steer accepted"), "{steer}");
         assert!(steer.contains("steer #7 (queued)"), "{steer}");
         assert!(steer.contains("applies to the active run"), "{steer}");
+        let mut terminal = agent_view();
+        terminal["status"] = json!("cancelled");
+        let finished = text("cancel", &terminal);
+        assert!(finished.contains("already terminal"));
+        assert!(!finished.contains("watch list_agents"));
     }
 
     /// list_agents keeps the exact total, page size, and continuation.

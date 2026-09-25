@@ -16,7 +16,7 @@ provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profil
   provider guidance: {{ entry }}
 {% endfor %}
 {% for model in provider.models %}
-  - {{ model.id }}{% if model.native_model %} ({{ model.native_model }}){% endif %}: {{ model.status }}, evidence {{ model.evidence }}{{ "" }}
+  - {{ model.id }}{% if model.native_model and model.native_model != model.id %} ({{ model.native_model }}){% endif %}: {{ model.status }}, evidence {{ model.evidence }}{{ "" }}
 {% if model.profiles %}
     profiles: {{ model.profiles }}
 {% endif %}

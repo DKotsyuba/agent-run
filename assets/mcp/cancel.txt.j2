@@ -6,4 +6,6 @@ agent-run cancel accepted
 {% if agent.task %}
 - Task: {{ agent.task }}
 {% endif %}
+{% if not agent.terminal %}
 - The durable cancellation command is queued; watch list_agents or transcript for the terminal state
+{% endif %}
