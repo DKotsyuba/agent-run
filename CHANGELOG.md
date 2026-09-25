@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-25
+
+- build(deps): update MCP, SQLite, hashing and TOML dependencies and GitHub
+  artifact actions
+- feat(routing): require orchestrators to read the dynamic delegation guide
+  before choosing a provider, model, effort and profile
 - fix(services): optionally reuse an already-ready external backend before
   spawning, recover a lost startup race only after owned cleanup, and never
   claim or stop the external process; preserve ownership across broker restarts

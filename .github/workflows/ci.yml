@@ -45,8 +45,8 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - name: Run workspace gates
         run: cargo xtask check
-      - name: Verify desktop transport fixture
-        run: node --test scripts/check-desktop-transport.cjs
+      - name: Verify desktop transport and service probe fixtures
+        run: node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
       - name: Build and verify sealed native release
         shell: bash
         run: |
