@@ -12,7 +12,7 @@
 
 use crate::{Error, Result};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 
@@ -108,11 +108,11 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
     };
     let result = match (tool, value) {
         ("delegation_guide", Value::String(text)) => {
-            CallToolResult::success(vec![Content::text(text.clone())])
+            CallToolResult::success(vec![ContentBlock::text(text.clone())])
         }
         ("delegation_guide", _) => error_result("RuntimeError", "delegation guide must be text"),
         (_, Value::Object(_)) => match render(tool, value) {
-            Ok(text) => CallToolResult::success(vec![Content::text(text)]),
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
             // A projection/template defect is a typed compact failure, never
             // JSON, a silent blank, or a success page hiding the failure.
             Err(error) => error_result(
@@ -137,7 +137,7 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
 /// The kind and (whitespace-normalized) message stay machine-greppable;
 /// no structured mirror and no result dump accompany it.
 pub fn error_result(kind: &str, message: &str) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
         render("error", &json!({"kind": kind, "message": prose(message)}))
             .unwrap_or_else(|error| format!("agent-run error {kind}: {error}")),
     )]);

@@ -2,8 +2,8 @@
 use crate::{cli::CliBroker, dispatch, domain::OrchestratorRef, Error, Result};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, ErrorData, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
+        PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
     ServerHandler, ServiceExt,
@@ -224,8 +224,8 @@ pub struct Proxy {
 }
 impl ServerHandler for Proxy {
     /// Report only the Python-compatible MCP capabilities and implementation identity.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = serde_json::from_value(json!({
             "experimental": {}, "tools": {"listChanged": false}
         }))
@@ -253,17 +253,19 @@ impl ServerHandler for Proxy {
             .find(|v| v["name"].as_str() == Some(name))
             .and_then(|v| serde_json::from_value(v).ok())
     }
-    /// Inject the host binding when needed, then forward the call through the resident broker.
+    /// Inject the host binding and forward the call through the resident broker.
+    /// Return completed text results, including typed tool failures; SDK negotiation owns framing.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<CallToolResponse, ErrorData> {
         if !dispatch::is_tool(request.name.as_ref()) {
             return Ok(crate::transport::mcp_text::error_result(
                 "unknown_tool",
                 format!("unknown tool: {}", request.name).as_str(),
-            ));
+            )
+            .into());
         }
         let mut arguments = request.arguments.unwrap_or_default();
         // Read tools accept exactly the arguments their shared registry
@@ -284,7 +286,8 @@ impl ServerHandler for Proxy {
                 return Ok(super::mcp_text::error_result(
                     "ValidationError",
                     python_unknown_arguments(names).as_str(),
-                ));
+                )
+                .into());
             }
         }
         if matches!(request.name.as_ref(), "start" | "resume")
@@ -294,17 +297,14 @@ impl ServerHandler for Proxy {
                 arguments.insert("orchestrator".into(), json!(o));
             }
         }
-        match detached_broker_call(
+        let result = match detached_broker_call(
             self.broker.clone(),
             request.name.to_string(),
             Value::Object(arguments),
         )
         .await
         {
-            Ok(value) => Ok(crate::transport::mcp_text::success_result(
-                request.name.as_ref(),
-                &value,
-            )),
+            Ok(value) => crate::transport::mcp_text::success_result(request.name.as_ref(), &value),
             Err(error) => {
                 let public = error.public();
                 let message = if matches!(error, Error::BrokerUnavailable) {
@@ -312,12 +312,10 @@ impl ServerHandler for Proxy {
                 } else {
                     public.message
                 };
-                Ok(crate::transport::mcp_text::error_result(
-                    public.kind,
-                    &message,
-                ))
+                crate::transport::mcp_text::error_result(public.kind, &message)
             }
-        }
+        };
+        Ok(result.into())
     }
 }
 
