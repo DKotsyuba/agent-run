@@ -18,6 +18,7 @@ agent-run-store = { path = "../agent-run-store" }
 clap.workspace = true
 fs2.workspace = true
 libc.workspace = true
+minijinja.workspace = true
 rmcp.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

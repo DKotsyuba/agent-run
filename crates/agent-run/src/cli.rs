@@ -87,6 +87,8 @@ pub trait CliService: Send + Sync {
     fn limits(&self) -> Result<Value>;
     /// Return the ordered capacity view, optionally for one exact model.
     fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value>;
+    /// Return the plain-text delegation guide as a JSON string value.
+    fn delegation_guide(&self) -> Result<Value>;
     /// Return one completion-delivery status view.
     fn delivery_status(&self, id: &AgentId) -> Result<Value>;
     /// Cancel one completion-delivery attempt.
@@ -128,6 +130,9 @@ impl CliService for Service {
     }
     fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
         Service::capacity_order(self, query)
+    }
+    fn delegation_guide(&self) -> Result<Value> {
+        Service::delegation_guide(self)
     }
     fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         Service::delivery_status(self, id)
@@ -242,6 +247,8 @@ pub enum Command {
         model: Option<String>,
     },
     Limits,
+    /// Print the compact plain-text routing guide for orchestrators.
+    DelegationGuide,
     Doc {
         topic: Option<String>,
     },
@@ -1386,6 +1393,14 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 .await?,
         )?,
         Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
+        Command::DelegationGuide => {
+            // The guide is text, not JSON: print it with a normal newline.
+            let value = dependencies.service.delegation_guide()?;
+            let text = value
+                .as_str()
+                .ok_or_else(|| invalid("delegation guide must be text"))?;
+            (dependencies.text_output)(&format!("{text}\n"))?;
+        }
         Command::Doc { topic } => {
             let topic = topic.as_deref().unwrap_or("index");
             (dependencies.output)(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;

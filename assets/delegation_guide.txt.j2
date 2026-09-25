@@ -1,0 +1,30 @@
+agent-run delegation guide
+
+Choose provider, model and profile; the broker selects the account.
+Provider order reflects capacity; guidance comes from configuration.
+
+{% if providers %}
+{% for provider in providers %}
+provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profiles %} — all models admit: {{ provider.profiles }}{% endif %}{{ "" }}
+{% for entry in provider.guidance %}
+  provider guidance: {{ entry }}
+{% endfor %}
+{% for model in provider.models %}
+  - {{ model.id }}: quota {{ model.status }}, evidence {{ model.evidence }}{% if model.resets %}, resets in {{ model.resets }}{% endif %}{% if model.age %}, sample age {{ model.age }}{% endif %}{{ "" }}
+{% if model.profiles %}
+    profiles: {{ model.profiles }}
+{% endif %}
+{% if model.params %}
+    params: {{ model.params }}
+{% endif %}
+{% if model.restrictions %}
+    restrictions: {{ model.restrictions }}
+{% endif %}
+{% for entry in model.guidance %}
+  model guidance: {{ entry }}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% else %}
+No providers are currently configured.
+{% endif %}

@@ -174,8 +174,10 @@ impl Broker {
         let _ = mcp.wait();
         assert_eq!(reply["id"], 2);
         assert_eq!(reply["result"]["isError"], true, "MCP: {reply}");
-        assert_eq!(
-            reply["result"]["structuredContent"]["error"]["code"], code,
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(code)),
             "MCP: {reply}"
         );
 
@@ -329,4 +331,115 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
         .unwrap_err();
     assert!(matches!(malformed, Error::Validation(_)), "{malformed:?}");
     assert_eq!(malformed.public().kind, "ValidationError");
+}
+
+/// The delegation guide is one plain-text result on every public transport:
+/// the private socket envelope carries the dispatcher's JSON string, MCP
+/// exposes that string as real text content with no structured placeholder
+/// and no JSON quoting, and the CLI prints the text itself with a normal
+/// newline. Strict argument validation holds on the wire, and no account,
+/// credential, or endpoint identity appears in the text.
+#[tokio::test]
+async fn delegation_guide_is_plain_text_on_every_public_transport() {
+    let broker = Broker::start();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let guide = client
+        .call("delegation_guide", Some(json!({})))
+        .await
+        .unwrap();
+    let text = guide.as_str().expect("guide result is a string").to_owned();
+    assert!(
+        text.contains("provider glm-user (harness claude-code)"),
+        "{text}"
+    );
+    assert!(text.contains("- fixture:"), "{text}");
+    assert!(
+        text.contains("provider glm-user (harness claude-code) — all models admit: review"),
+        "{text}"
+    );
+    for private in [
+        "acct-work",
+        "synthetic-token",
+        "gateway.example",
+        "FAKE_TOKEN",
+    ] {
+        assert!(!text.contains(private), "{private} leaked: {text}");
+    }
+    let strict = client
+        .call("delegation_guide", Some(json!({"unexpected": true})))
+        .await
+        .unwrap_err();
+    assert_eq!(strict.public().kind, "ValidationError");
+
+    let output = cli(&broker.home, &["delegation-guide"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{text}\n"),
+        "CLI prints the text itself, not JSON"
+    );
+
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(&broker.home)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = mcp.stdin.take().unwrap();
+    for message in [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegation_guide","arguments":{}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"delegation_guide","arguments":{"unexpected":true}}}),
+    ] {
+        writeln!(input, "{message}").unwrap();
+    }
+    input.flush().unwrap();
+    let mut replies = BufReader::new(mcp.stdout.take().unwrap());
+    // rmcp serves requests concurrently, so the locally-rejected strict call
+    // can reply before the broker-backed guide call: match by id, not order.
+    let mut call = Value::Null;
+    let mut strict_reply = Value::Null;
+    for _ in 0..3 {
+        let mut line = String::new();
+        replies.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        match reply["id"].as_i64() {
+            Some(2) => call = reply,
+            Some(3) => strict_reply = reply,
+            _ => {}
+        }
+        if !call.is_null() && !strict_reply.is_null() {
+            break;
+        }
+    }
+    drop(input);
+    let _ = mcp.wait();
+    assert_eq!(call["id"], 2);
+    assert_eq!(call["result"]["isError"], false, "{call}");
+    assert_eq!(call["result"]["content"][0]["type"], "text", "{call}");
+    assert_eq!(call["result"]["content"][0]["text"], text, "{call}");
+    assert!(
+        call["result"].get("structuredContent").is_none(),
+        "no structured mirror: {call}"
+    );
+    assert_eq!(strict_reply["id"], 3);
+    assert_eq!(strict_reply["result"]["isError"], true, "{strict_reply}");
+    assert!(
+        strict_reply["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|line| line.contains("ValidationError")),
+        "{strict_reply}"
+    );
+    assert!(
+        strict_reply["result"].get("structuredContent").is_none(),
+        "{strict_reply}"
+    );
 }

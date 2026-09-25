@@ -4,6 +4,21 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-25
+
+- feat(mcp)!: render all public tool results with compact, embedded MiniJinja
+  templates instead of duplicating the full structured JSON into model context;
+  preserve answer text, pagination, typed errors and actionable lifecycle diagnostics
+- feat(mcp): retain only the durable `agent_id` as structured metadata for
+  `start` and `resume`, preserving automatic chat binding; the broker socket
+  and existing CLI commands keep their structured JSON contracts
+- feat(delegation): add the read-only `delegation_guide` tool and
+  `agent-run delegation-guide` command with current provider order, quota
+  evidence, admissible profiles, configured effort choices and recommendation prose
+- feat(templates): keep provider/model guidance and shared profile lists compact,
+  with one template per tool and a shared error template; templates are sealed
+  with the binary and require no runtime filesystem loader
+
 ## [0.14.0] - 2026-09-24
 
 - fix(store): expire completed database history after fourteen days while

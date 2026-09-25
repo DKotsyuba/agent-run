@@ -4,6 +4,7 @@ pub mod codex;
 /// Durable command result handling shared by supervisor and engine runners.
 pub mod commands;
 pub mod continuity;
+pub mod delegation_guide;
 pub mod delivery;
 pub mod dispatch;
 pub mod doc;

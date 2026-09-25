@@ -1,6 +1,6 @@
 [
   {
-    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 this lists PROVIDERS (never accounts) by descending score, each with every offered model's own quota standing: status (available, unknown = no current sample, priority_overflow, exhausted, no_eligible_account), best_priority, evidence (fresh, stale, missing), newest_observed_at (sample age), and exhausted_until, plus config_revision, capacity_revision, and ranked_at (the advice clock, not sample age). Optional exact model filter keeps providers offering that model, ranked by it. Read-only: no quota collection, reservation, or start. Choosing provider, model, effort, and profile stays with the caller.",
+    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 providers (never accounts) are listed by descending score with every offered model's own cached standing. Over MCP it renders as one compact plain-text page (ordered providers with scores/multipliers and per-model quota status and evidence); the broker socket and CLI keep the full structured JSON.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -359,7 +359,7 @@
     "resultShape": null
   },
   {
-    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog: config_revision, capacity_revision, roles_sha256, canonical profiles with their grants, and providers in capacity order with harness, connection kind, recommendations, and every explicit model offering (native_model, default params, allowed_params, hard restrictions, recommendations, admissible profiles, cached quota standing with evidence and sample age). Providers are ranked over only the offerings the filters retain. Reuse a result only while config_revision, capacity_revision, and roles_sha256 all match. Optional exact provider, profile, and model filters; unknown values are validation errors. Read-only over current config, roles, and committed observations; recommendations are configured prose, not a ranking. The caller alone chooses provider, model, effort, and profile.",
+    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog over one committed read; exact provider/profile/model filters are validation-checked. Over MCP it renders as one compact plain-text page (providers in capacity order with harness, per-model quota status and evidence, admissible profiles stated once when shared, default/allowed params, hard restrictions, and configured guidance prose); the broker socket and CLI keep the full structured JSON.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -396,6 +396,17 @@
       "type": "object"
     },
     "name": "limits",
+    "outputSchema": null,
+    "resultShape": null
+  },
+  {
+    "description": "Read one compact plain-text routing guide for orchestrators, derived from the same committed schema-2 snapshot as models: providers in capacity order with their harness, each exact selectable model id with its cached quota status and evidence, admissible profiles, configured default and allowed params, hard restrictions, and configured provider and model guidance prose. The caller alone chooses provider, model, effort, and profile; the broker picks the account automatically. Read-only over current config and committed observations; schema_version 1 is Unsupported. Prefer this over reading the full models JSON when only choosing a route; it is configured guidance, not a model-ability ranking.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "delegation_guide",
     "outputSchema": null,
     "resultShape": null
   }

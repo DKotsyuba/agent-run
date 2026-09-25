@@ -191,8 +191,37 @@ fn extend_start_description(value: &mut Value) {
     }
 }
 
+/// The additive `delegation_guide` definition in its exact wire form: the
+/// registry entry with null result declarations omitted, as the SDK omits
+/// nulls on the wire. The frozen Python fixture has no such tool; parity
+/// expectations account for the addition explicitly instead of editing it.
+fn delegation_guide_wire() -> Value {
+    let mut value =
+        serde_json::to_value(agent_run_domain::tool("delegation_guide").unwrap()).unwrap();
+    value.as_object_mut().unwrap().retain(|key, value| {
+        !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
+    });
+    value
+}
+
+/// Appends the additive `delegation_guide` entry to every captured tools
+/// array anywhere in `value`, matching the registry's declaration order
+/// (last) so the expected list stays the advertised list.
+fn append_delegation_guide(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Array(tools)) = object.get_mut("tools") {
+                tools.push(delegation_guide_wire());
+            }
+            object.values_mut().for_each(append_delegation_guide);
+        }
+        Value::Array(items) => items.iter_mut().for_each(append_delegation_guide),
+        _ => {}
+    }
+}
+
 /// Read the captured Python exchange for one supported handshake protocol version,
-/// extended by the intentional start binding guidance.
+/// extended by the intentional start binding guidance and the additive tool.
 fn baseline(version: &str) -> Vec<Value> {
     let mut exchange = serde_json::from_str::<Value>(include_str!(
         "../../../tests/fixtures/baseline/mcp/handshake.json"
@@ -200,6 +229,7 @@ fn baseline(version: &str) -> Vec<Value> {
     .unwrap()[version]
         .clone();
     extend_start_description(&mut exchange);
+    append_delegation_guide(&mut exchange);
     exchange.as_array().unwrap().clone()
 }
 
@@ -212,6 +242,12 @@ fn initialize(version: &str) -> Value {
 
 /// Compare every observable non-time-dependent exchange from one captured Python session.
 /// Mirrors `test_mcp.py::test_official_client_negotiates_lists_and_calls_over_stdio`.
+///
+/// Initialize and tools/list stay byte-exact against the capture. Tool calls
+/// now render as compact plain text (the intentional new presentation): each
+/// reply keeps the captured id and isError verdict, errors name the captured
+/// typed code in their text, and successes equal our own renderer applied to
+/// the captured structured payload, pinning the text deterministically.
 #[test]
 fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
     for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
@@ -231,18 +267,49 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
             mcp.send(expected[2]["request"].clone()).unwrap(),
             expected[2]["response"]
         );
-        assert_eq!(
-            mcp.send(expected[3]["request"].clone()).unwrap(),
-            expected[3]["response"]
-        );
-        assert_eq!(
-            mcp.send(expected[4]["request"].clone()).unwrap(),
-            expected[4]["response"]
-        );
-        assert_eq!(
-            mcp.send(expected[5]["request"].clone()).unwrap(),
-            expected[5]["response"]
-        );
+        for index in [3usize, 4, 5] {
+            let reply = mcp.send(expected[index]["request"].clone()).unwrap();
+            let captured = &expected[index]["response"];
+            assert_eq!(reply["id"], captured["id"], "{version} item {index}");
+            assert_eq!(
+                reply["result"]["isError"], captured["result"]["isError"],
+                "{version} item {index}"
+            );
+            assert_eq!(
+                reply["result"]["content"][0]["type"], "text",
+                "{version} item {index}"
+            );
+            if captured["result"]["isError"] == true {
+                let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+                let code = captured["result"]["structuredContent"]["error"]["code"]
+                    .as_str()
+                    .unwrap();
+                assert!(text.contains(code), "{version} item {index}: {text}");
+                assert!(
+                    reply["result"].get("structuredContent").is_none(),
+                    "{version} item {index}"
+                );
+            } else {
+                let name = expected[index]["request"]["params"]["name"]
+                    .as_str()
+                    .unwrap();
+                let rendered =
+                    serde_json::to_value(agent_run::transport::mcp_text::success_result(
+                        name,
+                        &captured["result"]["structuredContent"],
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    reply["result"]["content"], rendered["content"],
+                    "{version} item {index}"
+                );
+                assert_eq!(
+                    reply["result"].get("structuredContent"),
+                    rendered.get("structuredContent"),
+                    "{version} item {index}"
+                );
+            }
+        }
         assert_eq!(mcp.send(expected[7]["request"].clone()), None);
         mcp.finish();
     }
@@ -261,6 +328,12 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     let mut expected: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/baseline/tools.json")).unwrap();
     extend_start_description(&mut expected);
+    // This fixture is the bare tool array (no "tools" wrapper), so the
+    // additive entry is appended directly, in registry declaration order.
+    expected
+        .as_array_mut()
+        .unwrap()
+        .push(delegation_guide_wire());
     for tool in expected.as_array_mut().unwrap() {
         tool.as_object_mut().unwrap().retain(|key, value| {
             !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
@@ -270,7 +343,8 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     mcp.finish();
 }
 
-/// Verify the unavailable broker is a Python-shaped tool error, not a local fallback.
+/// Verify the unavailable broker stays an official typed tool error in the
+/// compact text presentation, not a local fallback or a JSON dump.
 #[test]
 fn mcp_broker_unavailable_matches_python_tool_error() {
     let expected: Vec<Value> = serde_json::from_str(include_str!(
@@ -284,9 +358,14 @@ fn mcp_broker_unavailable_matches_python_tool_error() {
         expected[0]["response"]
     );
     assert_eq!(mcp.send(expected[1]["request"].clone()), None);
-    assert_eq!(
-        mcp.send(expected[2]["request"].clone()).unwrap(),
-        expected[2]["response"]
+    let reply = mcp.send(expected[2]["request"].clone()).unwrap();
+    assert_eq!(reply["id"], expected[2]["response"]["id"]);
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("broker is not running"), "{text}");
+    assert!(
+        reply["result"].get("structuredContent").is_none(),
+        "{reply}"
     );
     mcp.finish();
 }
