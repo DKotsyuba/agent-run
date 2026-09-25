@@ -210,6 +210,91 @@ fn retention_migration_retries_after_physical_preparation() {
     assert_eq!(schema_objects(&conn), fresh_schema_objects());
 }
 
+/// Migrating v19 preserves every service-generation field and grants no external
+/// ownership to old rows; new rows default to managed and reject invalid ownership.
+#[test]
+fn external_service_migration_preserves_managed_generations() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 19);
+    conn.execute(
+        "INSERT INTO managed_service_generations(\
+         id,service_id,revision,definition_json,state,broker_identity_json,process_identity_json,\
+         created_at,ready_at,checked_at,idle_since,failure_kind,cleanup_json) \
+         VALUES('existing','service',?1,'{\"command\":\"/bin/true\"}','ready',\
+         '{\"pid\":1234}','{\"pid\":5678}',1,2,3,4,NULL,'{\"confirmed\":false}')",
+        ["a".repeat(64)],
+    )
+    .unwrap();
+    /// All pre-v20 fields, encoded as one value to detect any migration data loss.
+    const GENERATION: &str = "SELECT json_array(\
+        id,service_id,revision,definition_json,state,broker_identity_json,process_identity_json,\
+        created_at,ready_at,checked_at,idle_since,failure_kind,cleanup_json) \
+        FROM managed_service_generations WHERE id='existing'";
+    let before: String = conn.query_row(GENERATION, [], |row| row.get(0)).unwrap();
+    drop(conn);
+
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(user_version(&store.conn), VERSION);
+    let after: String = store
+        .conn
+        .query_row(GENERATION, [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, before);
+    let ownership: String = store
+        .conn
+        .query_row(
+            "SELECT ownership FROM managed_service_generations WHERE id='existing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ownership, "managed");
+    for invalid in [None, Some("unknown")] {
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE managed_service_generations SET ownership=?1 WHERE id='existing'",
+                [invalid],
+            )
+            .is_err());
+    }
+    store
+        .conn
+        .execute(
+            "INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,\
+         broker_identity_json,created_at) VALUES('new-managed','managed',?1,'{}','ready','{}',5)",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,\
+         broker_identity_json,created_at,ownership) \
+         VALUES('new-external','external',?1,'{}','ready','{}',5,'external')",
+            ["c".repeat(64)],
+        )
+        .unwrap();
+    let owners: Vec<(String, String)> = store
+        .conn
+        .prepare("SELECT id,ownership FROM managed_service_generations ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        owners,
+        vec![
+            ("existing".into(), "managed".into()),
+            ("new-external".into(), "external".into()),
+            ("new-managed".into(), "managed".into()),
+        ]
+    );
+    assert_eq!(schema_objects(&store.conn), fresh_schema_objects());
+}
+
 // --- (b) existing rows survive migration ---
 
 /// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_v1_home_opens_transparently_and_keeps_its_rows`.
