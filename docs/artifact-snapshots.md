@@ -17,57 +17,70 @@ Verification succeeds only when all four sets are empty. Inspection never
 removes files. Publication also removes nothing: the destination must be empty,
 or an already verified snapshot with the same path/type topology.
 
-Each fresh attempt uses its own generated lineage home. A continuation reuses
-that lineage home only after its managed snapshot and recorded revision verify;
-it does not rematerialize from live skill sources. Native session logs and caches
-remain mutable runtime state outside the snapshot. Historical attempts without a
-lineage home retain their compatibility path.
+Each fresh start uses its own generated lineage home. Continuations and later
+account-switch attempts reuse it only after its managed snapshot and recorded
+revision verify; they do not rematerialize from live skill sources. Native
+session logs and caches remain mutable runtime state outside the asset snapshot.
+Provider continuation separately verifies a recorded native-history seal.
 
-The agent row records new-format configuration as
-`snapshot:v1:<config-sha256>`. That prefix is authoritative: a continuation
-whose lineage directory, config document, runtime index, or indexed root is
-missing fails closed instead of being reclassified as historical. Unprefixed
-rows alone use the shared-home compatibility path.
+The current provider supervisor records sealed assets as
+`snapshot:v2:<runtime-index-sha256>`. The durable `ProviderLaunchIdentity`
+contains the original request, exact admitted configuration-byte digest,
+validated provider configuration, normalized configuration snapshot, frozen
+authority and generated-home index digest. The generated `provider-launch.json`
+binds the provider, harness, connection, model, working directory and normalized
+configuration digest into that asset index. Continuation verifies this frozen
+authority and the indexed assets; missing or modified proof is refused, not
+reclassified as a historical launch.
 
-A fresh snapshot may record the runtime version returned by the adapter's
-bounded local probe. This is provenance observed during materialization.
-Continuations preserve it without probing again; it does not claim that the
-configured binary itself is pinned or unchanged at resume time. Adapters without
-trustworthy current version evidence record `null`.
+The index records each managed root's manifest SHA-256, adapter-owned flat
+configuration files, declared credential-link paths and targets, and the
+materialization revision. Deleting a whole indexed skill directory cannot hide
+its missing manifest. The configured executable path is frozen, but the index
+does not pin the external executable's bytes or version.
+
+The current Codex provider auth link is deliberately outside the sealed asset
+index. After immutable assets verify and previous process cleanup is proven,
+an eligible attempt can rebind `auth.json` to its selected account without
+changing the frozen role or tool assets. This exception does not permit
+rewriting indexed configuration or skill files.
 
 Executable contract scenarios live in
 `crates/agent-run-adapters/tests/snapshots.rs`:
 
 1. Copy a skill containing a manifest, script, and empty directory; changing
    only script bytes changes the snapshot revision.
-2. Replace a source entry with a symlink or special file; publication fails
-   before producing verified metadata.
-3. Fail final metadata publication; copied files are classified as orphans and
-   the snapshot remains unverified.
-4. Add an owned temporary and unowned orphan, then remove a referenced file;
-   recovery reports all three without deleting any path.
+2. Reject a source symlink and copy only explicitly selected assets.
+3. Detect a missing indexed root, a changed root manifest, a symlinked manifest
+   or intermediate directory, and an incomplete index shape.
+4. Detect tampered content, a missing referenced file, an extra orphan and a
+   manually constructed partial tree without its manifest.
 
-These fault injections verify ordering and fail-closed behavior in the process.
-They do not prove persistence through power loss on every filesystem. Directory
-fsync is used when the filesystem supports it.
+Separate `crates/agent-run-platform/tests/publish.rs` tests inject faults during
+file publication: mid-write and before rename preserve the old published name
+and leave a temporary file; after rename the full new content is visible but
+the call reports failure. A later failed group entry does not roll back earlier
+entries. These are per-file publication checks, not an atomic multi-file
+snapshot transaction or proof of power-loss persistence on every filesystem.
+Directory fsync is used when the filesystem supports it.
 
-`build_config_snapshot()` produces canonical attempt metadata binding the
-materialized file revision to the runtime name, adapter API version, config
-schema version, sanitized complete runtime declaration plus its hash, and
-effective profile body and grants. Configured environment values are represented by hashes, so content-only
-edits change the revision without copying credential-like values into metadata.
-An already-known native runtime version is recorded when available; snapshot
-creation does not run an additional version probe.
+## Historical configuration snapshot helpers
 
-Each published tree is also recorded in the generated home's snapshot index.
-Resume checks that index, so deleting an entire skill directory cannot hide its
-missing manifest. The finalized index binds each root's manifest SHA-256,
-adapter-known flat config files, declared credential-link paths and targets,
-and the materialization revision; resume requires its stored SHA-256, revision,
-and every referenced artifact to match. `inspect_config_snapshot()` likewise reads the attempt's
-configuration metadata as a no-follow regular file, checks its recorded hash,
-and requires canonical version-one JSON before reuse. Persisted revisions,
-snapshot manifests, and replay fingerprints hash one shared serialization
+`build_config_snapshot()` and `inspect_config_snapshot()` preserve the tested
+Python-v1 configuration-document format; the current provider launch path does
+not call them. The builder binds the materialized file revision and runtime
+index digest to the runtime name, adapter API version, config schema version,
+sanitized runtime declaration and effective profile grants. Configured
+environment values are represented by hashes. An already-known native version
+may be supplied as provenance; the helper does not probe the executable.
+
+`inspect_config_snapshot()` reads that historical configuration metadata as a
+no-follow regular file, checks its recorded hash, and requires canonical
+version-one JSON. Historical `snapshot:v1:` revisions and runtime request
+spellings remain compatibility data; schema-2 continuation does not remap a
+schema-1 run into a provider run.
+
+Persisted revisions, snapshot manifests, and replay fingerprints hash one shared serialization
 (`agent-run-domain::canonical`): sorted keys, `,`/`:` separators, and
 CPython-compatible string escaping and float rendering, with `ensure_ascii`
 chosen explicitly per document. Any change to those bytes makes existing runs
@@ -75,14 +88,17 @@ unresumable or falsely rejects a replay, so JSON used only as a wire frame or a
 Rust-local manifest may use its own serializer but must not replace this one at a
 persisted boundary.
 
+## Native assets
+
 For Codex, preparation writes the native per-workdir `trust_level = "trusted"`
 receipt before this index is finalized. The receipt is one exact project table
 for the resolved launch directory; a continuation never adds or reseals it.
 Changes to the generated config, including hook trust receipts, still fail
 snapshot verification.
 
-Claude and GLM may snapshot explicitly declared non-secret plugin assets. The
-optional `plugin_snapshot_assets` mapping is keyed by configured plugin basename;
+The Claude Code harness may snapshot explicitly declared non-secret plugin
+assets, as may historical Claude and GLM adapters. The optional
+`plugin_snapshot_assets` mapping is keyed by configured plugin basename;
 each value lists exact relative files or directories. Declared directories are
 recursive. No globbing, import tracing, discovery, or secret-name heuristic is
 performed: the trusted declaration owns complete transitive coverage. A plugin
