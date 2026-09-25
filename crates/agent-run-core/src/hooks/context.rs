@@ -10,7 +10,6 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -364,16 +363,12 @@ fn assemble(priority: &str, active: &str, budget: usize) -> (String, String, usi
 
 /// Hashes a visible component into the receipt representation.
 fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    agent_run_platform::fs::sha256(value.as_bytes())
 }
 
 /// Combines component hashes into the Python-compatible 32-character context key.
 fn combine_key(priority: &str, active: &str) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!("{priority}::{active}").as_bytes())
-    )[..32]
-        .into()
+    digest(&format!("{priority}::{active}"))[..32].into()
 }
 
 #[cfg(test)]

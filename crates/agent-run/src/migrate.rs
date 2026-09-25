@@ -195,7 +195,7 @@ fn file_digest(path: &Path) -> Result<String> {
         }
         hash.update(&bytes[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(agent_run_domain::canonical::hex_digest(&hash.finalize()))
 }
 
 /// Quotes a schema-provided identifier, including embedded double quotes.
@@ -251,7 +251,7 @@ fn content_digest(conn: &Connection) -> Result<String> {
         }
         hash.update(b"\x1d");
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(agent_run_domain::canonical::hex_digest(&hash.finalize()))
 }
 
 /// Takes the exclusive lease on the live database: a read-write connection in

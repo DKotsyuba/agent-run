@@ -12,8 +12,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// Hashes arbitrary bytes, including empty input, into 64 lowercase hexadecimal digits.
 pub fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    agent_run_domain::canonical::hex_digest(&Sha256::digest(bytes))
 }
 pub fn expand(path: &Path) -> Result<PathBuf> {
     let s = path.to_str().ok_or_else(|| invalid("path must be UTF-8"))?;
