@@ -1,6 +1,5 @@
 //! Immutable native release directory creation and manifest verification.
 
-use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -13,7 +12,7 @@ pub(crate) const SUPPORTED_SCHEMA_VERSION: u64 =
 
 /// Returns a lowercase SHA-256 digest for arbitrary bytes.
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    agent_run_platform::fs::sha256(bytes)
 }
 
 /// Returns a lowercase SHA-256 digest for one regular release file.

@@ -7,7 +7,7 @@
 //! `agent_run::canonical::dumps` and asserts the raw bytes and SHA-256 match
 //! what CPython actually produced.
 
-use agent_run_domain::canonical::{dumps, python_float_repr, sha256_hex};
+use agent_run_domain::canonical::{dumps, hex_digest, python_float_repr, sha256_hex};
 use serde_json::Value;
 use sha2::Digest;
 
@@ -106,6 +106,7 @@ fn primitives_match_python_byte_for_byte() {
     }
 }
 
+/// Keeps persisted document hashes identical to the frozen Python-produced fixtures.
 #[test]
 fn real_documents_match_python_byte_for_byte() {
     let vectors = vectors();
@@ -128,10 +129,21 @@ fn real_documents_match_python_byte_for_byte() {
             doc["source"].as_str().unwrap_or("")
         );
         let expected_sha = doc["sha256"].as_str().unwrap();
-        let actual_sha = format!("{:x}", sha2::Sha256::digest(&actual));
+        let actual_sha = hex_digest(&sha2::Sha256::digest(&actual));
         assert_eq!(
             actual_sha, expected_sha,
             "document {name}: sha256 diverges from Python"
         );
     }
+}
+
+/// Preserves zero padding and lowercase output independently of the digest array type.
+#[test]
+fn digest_hex_preserves_leading_zero_bytes() {
+    assert_eq!(hex_digest(&[]), "");
+    assert_eq!(hex_digest(&[0, 1, 15, 16, 128, 255]), "00010f1080ff");
+    assert_eq!(
+        hex_digest(&sha2::Sha256::digest(b"abc")),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
 }
