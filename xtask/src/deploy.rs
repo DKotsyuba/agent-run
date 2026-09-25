@@ -2,7 +2,7 @@
 
 use crate::release;
 use agent_run_platform::process::{self, ProcessState};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::{Connection, MAIN_DB};
 use serde_json::json;
 use std::{
     collections::BTreeSet,
@@ -257,7 +257,7 @@ fn backup_at(directory: &Path, home: &Path, old: Option<&Path>) -> Result<(), St
     if state.is_file() {
         let source = Connection::open(&state).map_err(|error| error.to_string())?;
         source
-            .backup(DatabaseName::Main, directory.join("state.db"), None)
+            .backup(MAIN_DB, directory.join("state.db"), None)
             .map_err(|error| error.to_string())?;
     }
     if home.join("config.toml").is_file() {

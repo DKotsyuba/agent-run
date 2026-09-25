@@ -406,12 +406,13 @@ impl Store {
             json!({"ok":version==VERSION&&integrity=="ok","schema_version":version,"integrity":integrity,"tables":tables}),
         )
     }
+    /// Copies the main database to an absent `destination` with owner-only permissions.
+    /// Rejects an existing destination and propagates SQLite or filesystem errors.
     pub fn backup(&self, destination: &Path) -> Result<()> {
         if destination.exists() {
             return Err(invalid("backup destination already exists"));
         }
-        self.conn
-            .backup(rusqlite::DatabaseName::Main, destination, None)?;
+        self.conn.backup(rusqlite::MAIN_DB, destination, None)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
         Ok(())

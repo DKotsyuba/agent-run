@@ -19,7 +19,7 @@
 //! needs to work around that quirk.
 
 use agent_run_domain::{error::invalid, Error, Result};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::{Connection, MAIN_DB};
 use std::{
     collections::HashSet,
     fs::OpenOptions,
@@ -227,10 +227,12 @@ impl Drop for SchemaLock {
     }
 }
 
+/// Replaces the pre-migration backup for `path` and schema `target` from `conn`.
+/// Returns its path after setting owner-only permissions; SQLite and I/O errors propagate.
 fn snapshot(conn: &Connection, path: &Path, target: i64) -> Result<PathBuf> {
     let backup = backup_path(path, target);
     let _ = std::fs::remove_file(&backup);
-    conn.backup(DatabaseName::Main, &backup, None)?;
+    conn.backup(MAIN_DB, &backup, None)?;
     std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
     Ok(backup)
 }
