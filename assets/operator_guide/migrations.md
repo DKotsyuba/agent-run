@@ -3,15 +3,16 @@
 state.db's schema version is tracked in SQLite's own `PRAGMA user_version`.
 Each schema change beyond the initial schema is a numbered SQL delta file
 under `sql/migrations/` (`NNN_slug.sql`), applied in order, each in its own
-`BEGIN IMMEDIATE` transaction. The current schema is version 19.
+`BEGIN IMMEDIATE` transaction. The current schema is version 20.
 
 ## Older stores refuse ordinary commands
 
 While a home's database is older than the running binary's schema, every
 command except `config` and `doc` refuses with `migration_required` instead
 of opening it, and the broker refuses to start: schema upgrades belong to
-the paired config migration below. `agent-run doctor` reports the condition
-as `state_migration_pending`. A newer store than the binary supports is
+the paired config migration below. Public `agent-run doctor` hits this
+`migration_required` preflight before its internal diagnostic can report
+`state_migration_pending`. A newer store than the binary supports is
 refused clearly rather than opened partially; see `releases`.
 
 ## Upgrading an existing schema-2 home
@@ -41,10 +42,7 @@ spill; migration does not build a whole-database string in Rust memory.
 
 ## Paired migration from schema 1 to schema 2
 
-This release pairs the schema-2 config with state database schema 19. While
-the home still has an older database, every command except `config` and
-`doc` refuses with `migration_required` instead of opening it (opening would
-upgrade it unpaired); the broker refuses to start the same way.
+This migration pairs schema-2 configuration with database schema 20.
 
 Write one mapping file. It names the two harnesses, declares every global
 account by nonsecret reference (no credential value is read), and maps each v1
@@ -91,7 +89,9 @@ agent-run config rollback --snapshot <home>/migrations/<id>-v1-to-v2
 The dry run renders and validates the schema-2 config and reports the
 database's current schema; it reads the database only through its file
 header (or a read-only connection when live WAL frames exist) and writes
-nothing. Invalid input and every refusal write nothing either.
+nothing. Early validation refusals also write nothing. A later apply refusal
+may retain a sealed backup while leaving the original config/database pair
+unchanged.
 
 Schema 2 requires canonical role files with explicit `revision`, `write`,
 `network`, `allow_external_read_roots`, `skills`, `mcp`, and
@@ -111,12 +111,18 @@ commands refuse older schemas with `migration_required` and unfinished journals
 with `migration_incomplete`. Recovery restores the original pair; there is no
 roll-forward.
 
-`--from-release` names the installed release directory — a sealed release
+`--from-release` names the immutable installed release directory — a sealed release
 as built by `xtask release` — not a bare executable. Its `COMPLETE`,
 `SHA256SUMS` and `metadata.json` must verify, and the schema its metadata
 records must equal the database's schema and be older than this binary's;
 nothing is executed to learn its version. An unsealed, tampered or
 incompatible release is refused before anything is written.
+
+When starting from `<prefix>/current`, resolve it first with
+`old_release="$(cd "<prefix>/current" && pwd -P)"` and pass `"$old_release"`.
+The snapshot records this path; a movable `current` symlink would resolve to
+the new release after switching and prevent rollback verification. Retain the
+recorded release while rollback remains possible.
 
 `--apply` rechecks the original config bytes and creates an exclusive snapshot:
 config, operator input, online SQLite backup, and a manifest binding the old

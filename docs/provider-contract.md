@@ -1,7 +1,7 @@
 # Provider contract
 
-Standalone public semantics for provider orchestration as of store schema
-v17. The canonical type definitions live in
+Standalone public semantics for provider orchestration, including the
+historical schema-v17 storage introduction. The canonical type definitions live in
 `crates/agent-run-domain/src/catalog.rs`; quota and session consumers import
 them from `agent_run_domain::catalog` rather than redefining business types.
 
@@ -84,12 +84,15 @@ Fixtures: `tests/contracts.rs` builds a minimal two-alias catalog
   window's own members, and the ranker applies samples and durable latches
   only to the models of that exact `(key, source, window)`, so after a
   collector source switch a carried latch keeps restricting only its own
-  models and the new source's facts never release or extend it. Latch
-  lookup, membership, carry and sample retention all use that full
+  models. Latch lookup, membership, carry and sample retention all use that full
   identity (retention always keeps each latched window's own newest row),
   and a latch is released only by its reset passing or by fresh positive
   (or fresher zero) evidence for the same pool and window, from any source,
-  that covers every model it governs; a stale positive never releases it.
+  that covers every model it governs. This settlement also applies when the
+  old latch has a known future reset: complete fresh evidence from a new source
+  can settle it before that reset, while evidence for a different model set or
+  a stale positive cannot. A fresher zero replaces the old fact without
+  inventing usable capacity.
   Scoring stays outside this DTO and the store.
 * `QuotaCandidateSet` is immutable and read-only: provider, explicit model,
   auto or pinned intent, deterministically ordered rank groups, and the
@@ -162,13 +165,16 @@ mechanisms as before; setting either on the other harness is a
 Resume on a schema-2 home is never a remap or prompt replay. A schema-1 run
 returns `Unsupported` (`legacy_continuation_unavailable`) with its history
 intact. A terminal provider run resumes explicitly through the existing
-`resume` tool/CLI/socket as a new logical child
-(`Service::admit_provider_resume`):
+`resume` tool/CLI/socket with the same public `agent_id` and a new `run_id`
+(`Service::resume_public` and `Service::admit_provider_resume`). An optional
+`run_id` selects an exact predecessor in that agent's lineage; omission selects
+the latest run. Storage still records a physical child:
 
 - The child keeps the parent's provider, harness, explicit model, workdir,
   role grants, sealed assets, frozen configuration, runtime home and native
   session id. Only the task text, timeout, orchestrator and the per-attempt
-  account lease change.
+  account lease change. Omitted timeout and orchestrator inherit the previous
+  request's values.
 - A repeated `request_id` returns the original child and account before any
   configuration or quota read; one parent admits at most one child, and a
   different request id for the same parent is refused.
@@ -203,6 +209,9 @@ intact. A terminal provider run resumes explicitly through the existing
   never adopted for the first time during resume.
 - In the admission transaction the parent must be terminal, its process
   group gone and every attempt cleanup-proven.
+- A failed preparation still needs its own recorded `runtime_session_id` to
+  enter public resume. A child carrying only `resume_of_runtime_session_id`
+  is refused; public resume does not recover context from an earlier ancestor.
 
 Automatic in-flight quota failover is not part of resume.
 
@@ -247,8 +256,9 @@ selected account only from its owned attempt. It plans credentials through the
 provider adapter for that account, binds events/messages to the real attempt,
 and releases physical keys only after verified cleanup or a certified
 never-spawned result. Replays return the first admission before consulting
-changed configuration or quota state. This first path does not switch accounts
-automatically; historical version-one rows retain their existing read path.
+changed configuration or quota state. Automatic Codex runs may later switch
+accounts under the quota-failover rules below; historical version-one rows
+retain their existing read path.
 Claude Messages launches request partial stream events so live assistant text
 can be journaled while the engine is running. Both Claude-family and Codex
 producers withhold a bounded possible launch-secret suffix between text
@@ -259,7 +269,7 @@ redaction preserves nonsecret whitespace, Codex flushes pending text when a
 turn ends without an item completion, and failure text is redacted before its
 published length limit is applied.
 
-## C4 Attempts and ownership (schema v17)
+## C4 Historical schema-v17 introduction: attempts and ownership
 
 * One logical agent id keeps its existing attempts/events/messages tables.
   Schema v17 adds:
@@ -307,10 +317,12 @@ published length limit is applied.
   release inserts default to 0 and are therefore unaffected.
 * Historical messages with a NULL attempt id remain readable, and current
   inserts of `running` attempt 1 remain valid, until consumers transition.
-* Schema v17 is unpublished preparation. The committed `current-v17.sqlite`
-  fixture is rebuilt from `historical-v16.sqlite` plus final migration 017.
-  Intermediate local dev17 homes from earlier schema drafts are disposable;
-  no live repair or migration 018 is implied.
+* During the original unpublished schema-v17 preparation, the committed
+  `current-v17.sqlite` fixture was rebuilt from `historical-v16.sqlite` plus
+  final migration 017. Intermediate local dev17 homes from earlier schema
+  drafts were disposable;
+  no live repair or migration 018 was implied by that fixture rebuild. This
+  section records the original migration stage, not the current schema version.
 
 ## C5 Historical decoding
 
@@ -372,9 +384,9 @@ harness, reserve, consume reset credits, write samples or start agents.
 ### Next attempt on one logical agent (store primitive)
 
 `Store::allocate_next_attempt` replaces a logical agent's cleaned-up attempt
-with the next one in one immediate transaction; explicit public resume stays
-a separate new logical child. It requires a nonterminal automatic provider
-run with no pending cancel, exactly one owned attempt carrying verified
+with the next one in one immediate transaction; explicit public resume creates
+a separate run under the same stable public agent. It requires a nonterminal
+automatic provider run with no pending cancel, exactly one owned attempt carrying verified
 cleanup proof and a recorded native history seal, and trusted candidates at
 the current capacity revision. The chosen account must be in the frozen
 scope, enabled, and not tried by an earlier attempt of the same agent

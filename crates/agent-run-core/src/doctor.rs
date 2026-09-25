@@ -216,7 +216,7 @@ fn managed_services(
             home.join("state.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        let mut query=connection.prepare("SELECT g.service_id,g.state,g.process_identity_json,g.checked_at,p.leader_json FROM managed_service_generations g LEFT JOIN process_ownership p ON p.owner_kind='service' AND p.owner_id=g.id WHERE g.state!='stopped' ORDER BY g.service_id LIMIT 256")?;
+        let mut query=connection.prepare("SELECT g.service_id,g.state,g.process_identity_json,g.checked_at,p.leader_json,g.ownership FROM managed_service_generations g LEFT JOIN process_ownership p ON p.owner_kind='service' AND p.owner_id=g.id WHERE g.state!='stopped' ORDER BY g.service_id LIMIT 256")?;
         let mut rows = query.query([])?;
         let mut seen = BTreeSet::new();
         while let Some(row) = rows.next()? {
@@ -225,6 +225,7 @@ fn managed_services(
             let identity: Option<String> = row.get(2)?;
             let checked: Option<f64> = row.get(3)?;
             let captured: Option<String> = row.get(4)?;
+            let external = row.get::<_, String>(5)? == "external";
             let component = if config.services.contains_key(&name) {
                 format!("service:{name}")
             } else {
@@ -244,7 +245,9 @@ fn managed_services(
                 }) && process::observe(Some(root.pid), Some(&root.token), Some(root.birth))
                     == ProcessState::Alive
             });
-            if matches!(state.as_str(), "unhealthy" | "unknown") || (state == "ready" && !alive) {
+            if matches!(state.as_str(), "unhealthy" | "unknown")
+                || (state == "ready" && !external && !alive)
+            {
                 add(
                     findings,
                     "managed_service_unavailable",
@@ -273,7 +276,9 @@ fn managed_services(
                     "managed_service_state",
                     "info",
                     &component,
-                    if state == "ready" {
+                    if state == "ready" && external {
+                        "external service passed its application check; the broker does not own its process"
+                    } else if state == "ready" {
                         "service is warm and its process identity is alive"
                     } else {
                         "service is starting or stopping"

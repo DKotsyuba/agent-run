@@ -8,20 +8,25 @@ const {pathToFileURL} = require('node:url');
 
 /**
  * Verify the configured PID/version and complete a real MCP status call.
+ * External mode discovers the existing endpoint without granting process ownership.
  * @returns {void} Exits zero only for the expected ready daemon; otherwise exits one.
  */
 function main() {
   const project = process.argv[2];
   const version = process.argv[3] || '1.6.0';
   const expected = Number(process.env.AGENT_RUN_SERVICE_PID);
-  if (!project || !path.isAbsolute(project) || !Number.isSafeInteger(expected) || expected <= 1) {
+  const mode = process.env.AGENT_RUN_SERVICE_OWNERSHIP || 'managed';
+  const external = mode === 'external';
+  if (!project || !path.isAbsolute(project) || !['managed', 'external'].includes(mode)
+      || (!external && (!Number.isSafeInteger(expected) || expected <= 1))) {
     process.exitCode = 1;
     return;
   }
   let info;
   try { info = JSON.parse(fs.readFileSync(path.join(project, '.codegraph', 'daemon.pid'), 'utf8')); }
   catch { process.exitCode = 1; return; }
-  if (!info || info.pid !== expected || typeof info.socketPath !== 'string') { process.exitCode = 1; return; }
+  if (!info || !Number.isSafeInteger(info.pid) || info.pid <= 1
+      || (!external && info.pid !== expected) || typeof info.socketPath !== 'string') { process.exitCode = 1; return; }
   const socket = net.createConnection(info.socketPath);
   let buffer = '';
   let hello = false;
@@ -49,7 +54,7 @@ function main() {
       catch { return finish(false); }
       buffer = buffer.slice(boundary + 1);
       if (!hello) {
-        if (message.pid !== expected || message.codegraph !== version || message.protocol !== 1) return finish(false);
+        if (message.pid !== info.pid || message.codegraph !== version || message.protocol !== 1) return finish(false);
         hello = true;
         socket.write([
           {codegraph_client: 1, pid: process.pid, hostPid: process.ppid},

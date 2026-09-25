@@ -3,25 +3,27 @@
 ## Central log
 
 Every entrypoint (`mcp`, other CLI verbs, and the detached supervisor) writes
-dense, rotating logs to `<home>/logs/<component>.log`
+dense, append-only logs to `<home>/logs/<component>.log`
 (`mcp.log`, `cli.log`, `supervisor.log`). Logging
 defaults to `DEBUG` so a postmortem has everything; set `AGENT_RUN_LOG_LEVEL`
 (e.g. `INFO`) in the environment to quiet it down once a system is stable.
 A log directory that cannot be created never blocks a command — the process
 falls back to stderr instead.
+There is no built-in log rotation.
 
 ## Start with doctor
 
 `agent-run doctor` is the first move for almost any reported problem. It
-separates errors (must fix) from warnings (should look at), including
-`state_migration_pending` — see `migrations`. The command exits nonzero
+separates errors (must fix) from warnings (should look at). An older database
+returns `migration_required` at public command preflight, before the internal
+`state_migration_pending` diagnostic — see `migrations`. The command exits nonzero
 whenever any finding is error-severity.
 
 Two checks matter most for a supervisor that cannot even start:
 
 - **Canary handshake** (`component: canary`): exercises the real fork ->
   exec -> identity-proof -> READY path with no provider/runtime, via a
-  throwaway home. `supervisor_canary_ok` means the path works; a
+  selected agent-run home. `supervisor_canary_ok` means the path works; a
   `supervisor_executable_missing` or `supervisor_start_failed` finding
   carries the same bootstrap evidence (stage, error type, pid) a failed
   `start` would, and means every `start` in this home is currently doomed
@@ -43,14 +45,14 @@ detail — don't parse `failure_text` to decide behavior.
 
 ## limits: honest-unknown, not always-fresh
 
-Capacity/limits data is only as fresh as its source last reported:
-
-- claude and codex sources appear for about 15 minutes after their most
-  recent run, then age out to unknown rather than showing stale numbers.
-
-An "unknown" limit is the system being honest about missing data, not a
-bug to chase. `agent-run limits` uses stored sample history to report freshness,
-burn rate, exhaustion risk, and advisory pacing without calling providers.
+Quota collection runs independently of model runs. `agent-run limits` reads
+the latest stored sample per quota identity without calling providers. It
+reports `known`, `remaining_percent`, `reset_at`, `observed_at`, and
+`valid_until`, plus account/pool identity for account-bound samples. Freshness
+depends on those timestamps, not a fixed interval after the last model run;
+unusable samples have no displayed remaining percentage. It does not expose
+burn-rate, forecast, or pacing fields. Unknown means no usable known standing,
+not proof that a sample's validity timestamp expired.
 
 ## Delivery binding
 
@@ -73,7 +75,7 @@ and credentials are intentionally unavailable.
 Desktop relay discovery requires the MCP process to have started with absolute
 `CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the
 MCP PID belongs to the supplied signed Node frontend, while its distinct Rust
-child has neither variable. A missing `ar-cdx-v3-*.sock` beside the agent-run
+child has neither variable. A missing `ar-cdx-v4-*.sock` beside the agent-run
 home indicates that the frontend could not bind its private relay; MCP continues
 without relay delivery and reports the failure on stderr.
 

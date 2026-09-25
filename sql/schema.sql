@@ -373,7 +373,7 @@ CREATE TABLE managed_service_generations (
     idle_since REAL,
     failure_kind TEXT CHECK(failure_kind IS NULL OR length(failure_kind) <= 64),
     cleanup_json TEXT CHECK(cleanup_json IS NULL OR json_valid(cleanup_json))
-);
+, ownership TEXT NOT NULL DEFAULT 'managed' CHECK(ownership IN ('managed','external')));
 CREATE UNIQUE INDEX idx_managed_service_live
     ON managed_service_generations(service_id) WHERE state != 'stopped';
 
@@ -422,4 +422,4 @@ CREATE INDEX idx_events_attempt ON events(attempt_id) WHERE attempt_id IS NOT NU
 CREATE INDEX idx_messages_attempt ON messages(attempt_id) WHERE attempt_id IS NOT NULL;
 CREATE INDEX idx_deliveries_terminal_event ON deliveries(terminal_event_seq) WHERE terminal_event_seq IS NOT NULL;
 
-PRAGMA user_version = 19;
+PRAGMA user_version = 20;

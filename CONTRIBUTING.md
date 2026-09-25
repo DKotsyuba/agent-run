@@ -10,8 +10,8 @@ Run the primary gate:
 cargo xtask check
 ```
 
-That command formats, lints with all targets and features, and runs the full
-workspace test suite offline. Before a release-affecting change also run:
+That command checks formatting, lints with all targets and features, and runs
+the full workspace test suite offline. Before a release-affecting change also run:
 
 ```bash
 cargo xtask archive --verify

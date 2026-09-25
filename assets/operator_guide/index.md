@@ -10,8 +10,8 @@ topic for this index.
 | config | `<home>/config.toml`: source of truth, fail-closed validation, hot reload, safe-edit discipline |
 | skills | revisioned-profile `skills = [...]`, plugin ownership, snapshots |
 | mcp-servers | `[mcp.<name>]` declarations and revisioned-profile selection |
-| plugins | `runtimes.<rt>.plugins`, per-runtime load mechanics, fail-closed refusal |
-| models | static model rosters and live availability |
+| plugins | `harnesses.<id>.plugins`, harness load mechanics, canonical role skill declarations |
+| models | provider/model catalog, cached quota standing, delegation guide, historical schema-1 rosters |
 | releases | sealed release build/switch/retention under standalone/releases |
 | migrations | PRAGMA user_version, numbered SQL deltas, pre-backup, refusal cases |
 | troubleshoot | doctor first, failure_kind vocabulary, limits honesty, orphan check |

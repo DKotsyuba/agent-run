@@ -37,8 +37,8 @@ launchd's default 256. A foreground process can still be run under another
 supervisor when launchd is unavailable.
 
 Future, unqualified Linux builds can run the foreground command under an
-external service manager. Linux is not a published 0.12.3 target, and agent-run
-does not generate systemd units. A user unit can use:
+external service manager. Linux is not a qualified or published release target,
+and agent-run does not generate systemd units. A user unit can use:
 
 ```ini
 [Unit]
@@ -59,11 +59,13 @@ paths, then run `systemctl --user enable --now agent-run.service`.
 - Socket path defaults to `<home>/api.sock` (with `--home ~/.agent-run`
   that is `~/.agent-run/api.sock`). Override with `--socket PATH`.
   macOS caps `AF_UNIX` paths at ~104 bytes — keep the path short.
-- The socket is `chmod 0600`; file permissions are the whole auth model.
-  There is no network listener and no token.
+- The home must be an owned private directory (mode `0700`) and the socket is
+  `chmod 0600`. The broker checks each peer's UID, and the built-in client checks
+  the broker's UID against its effective UID. There is no network listener or
+  token.
 - If a live server already owns the socket, a second `api serve` refuses
-  to start (it probes with `ping`). A stale socket file left by a crash is
-  replaced automatically.
+  to start (native ownership lock plus a connect probe). A stale socket file
+  left by a crash is replaced automatically.
 - `SIGTERM`/`SIGINT` shut the server down and remove the socket file.
 - Startup takes a couple of seconds (service construction); wait for the
   socket file to appear before connecting.
@@ -92,10 +94,11 @@ message id was observed. Each tail is at most 4096 UTF-8 bytes. Messages,
 session ids, argv/environment values, and credentials are never persisted.
 
 One connection may send many requests; on a single connection they are
-answered in order. Open several connections for parallelism — dispatch is
-serialized within two bounded owner lanes. Durable start/resume/cancel/steer
-admission uses the control lane; list, answer, transcript and capacity reads
-use a separate lane, so a slow read cannot starve cancellation. The server caps
+answered in order; no cross-connection ordering is promised. Separate
+connections execute concurrently within independently bounded control and read
+groups. Durable start/resume/cancel/steer admission uses the control group;
+ordinary reads use the read group, so slow reads cannot consume control permits.
+Long polls hold neither group's permit. The server caps
 connections and queued calls, reserves one connection slot for parsed control
 methods, rejects ordinary overload with JSON-RPC code `-32001`, and
 returns `-32002` when its request deadline expires. Input frames remain limited
@@ -104,10 +107,10 @@ holding the reserved slot without completing its first frame is disconnected
 within 0.5 seconds.
 
 The socket path is fenced by a lifetime native file lock. A pre-existing socket
-is reclaimed only when connecting returns `ECONNREFUSED` and the inode is still
-the one inspected. A slow or malformed ping is never evidence that an owner is
-dead. Shutdown rejects submissions, resolves queued calls, closes active
-connections, and closes each thread-affine service in its owner context.
+is reclaimed only after a refused or missing-endpoint connect result and an
+unchanged-inode check. A slow or malformed ping is never evidence that an owner
+is dead. Shutdown stops accepting connections and gives admitted handlers a
+bounded grace period before closing remaining streams.
 
 ## Method surface
 
@@ -120,8 +123,8 @@ Discover the authoritative surface at runtime:
 
 Over MCP, every tool result renders as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
-additionally keep a tiny `structuredContent` `{"agent_id": ...}` so automatic
-PostToolUse binding stays machine-extractable. This socket API and the CLI
+additionally keep `structuredContent` `{"agent_id": ..., "run_id": ...}` so
+automatic PostToolUse binding stays machine-extractable. This socket API and the CLI
 keep the structured contracts documented here.
 
 The tool set (same names as the MCP server) is exactly `start`, `resume`,
@@ -165,26 +168,21 @@ New rows also expose immutable `policy` evidence with the runtime/platform and
 one entry for every known constraint: actual enforcement, support, whether the
 caller required it, exact scope, and reason. Historical rows return `null`.
 
-`capacity_order` takes no parameters. It returns fresh non-exhausted physical
-quota routes in descending priority, plus deferred evidence, exhausted
-`omitted` routes, and `unavailable_runtimes`. Each working route includes its
-concrete runtime/account/quota-lane aliases, governing windows, raw score,
-configured multiplier, manual-reset credit count and its bounded bonus, final
-priority, and limiting exact key/reset. The manual reset bonus is only applied
-to the stable Codex ``codex`` limit id after the route remains eligible: with
-``n`` credits its factor is ``1 + n/(n+1)``. It never creates quota, changes
-forecasts, or restores an exhausted route. The list
-is role-independent: callers still choose the first alias whose models fit the
-task. `insufficient_diversity` is true when fewer than two working physical
-choices remain; the routes list is still authoritative and may contain one or
-zero entries.
+With schema 2, `capacity_order` accepts an optional exact `model` filter and
+returns provider-only advice: `schema_version`, `config_revision`,
+`capacity_revision`, `ranked_at`, and ordered `providers`. Each provider has its
+id, `priority_multiplier`, nullable `score`, and models with `native_model`
+and cached `quota` standing. It does not expose accounts or legacy physical-route
+aliases. An unknown model is a `ValidationError`. The view reads one committed
+snapshot without collecting quota, reserving capacity or starting work.
 
-The equivalent human-facing command is `agent-run capacity order`. Its first
-route is the highest capacity priority; it only reports a read-only order and
-never launches work. The orchestrator still selects a compatible role and model
-alias from that route's aliases.
+The CLI equivalent is `agent-run capacity order [--model MODEL]`. Select a
+compatible model and canonical role using `delegation_guide` and `models`.
+Schema 1 retains its historical physical-route output and rejects a model
+filter with `Unsupported`.
 
-Two extra methods exist only on this transport:
+Three methods exist only on this socket transport: `tools` and `ping` above,
+plus:
 
 - `wait` — params `{"agent_id": "...", "timeout_seconds": 240}` (timeout
   optional, positive number; omitted = wait forever). Blocks until the
@@ -220,7 +218,7 @@ Notes for the loop:
   delivery is configured. The MCP `start` description includes the shared
   notice format and handling contract; `agent-run doc completion` (or MCP
   `doc` with `{"topic": "completion"}`) serves the same contract. A notification ID is any nonblank
-  string of at most 512 characters, and delivery attempt evidence accepts only
+  string of at most 512 UTF-8 bytes, and delivery attempt evidence accepts only
   its declared fields. The `wait`
   example above is for an unbound API caller, not a bound-chat polling loop.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
@@ -228,19 +226,26 @@ Notes for the loop:
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
-- Use `capacity_order` to choose the first compatible available route.
-- Use `models` for current runtime rosters and health; `limits` returns stored
-  capacity projections without making provider calls.
+- Use `capacity_order` for provider capacity order, optionally for one model.
+- Use `models` for the configured provider catalog, admissible roles and cached
+  quota standing; `limits` returns the latest stored samples without provider calls.
 - `delegation_guide` (no params, schema 2 only) returns one compact plain-text
   routing guide — providers in capacity order with each exact model id, cached
   quota standing, admissible profiles, params, restrictions, and configured
   guidance prose — instead of reading the full `models` JSON just to pick a
   route. Its result is a JSON string here and real MCP text content on the MCP
   transport; the CLI equivalent is `agent-run delegation-guide`.
+  Before delegating a task, the orchestrator must call it and read the result
+  before choosing provider, model, effort or profile. Routing advice belongs in
+  provider/model `recommendations`, not a separately maintained delegation skill.
+  The tool does not select a model, authorize new access, or replace the
+  start/resume completion and permission contracts.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
-- Set `"write": true` in `start` params only when the agent must edit
-  files; default is read-only.
+- `start.write` is a compatibility intent flag; the selected canonical role
+  owns actual write permission. Choose a role with `write = false` for read-only
+  work: request `"write": false` is not an independent read-only guard, and
+  `"write": true` cannot grant writes beyond the role.
 
 ## Errors
 
@@ -265,6 +270,6 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 17, reached through the paired
+- The current database schema is version 20, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.

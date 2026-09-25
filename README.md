@@ -59,9 +59,10 @@ Build from source with the pinned Rust toolchain (also usable before publication
 
 ```bash
 release_root="$(mktemp -d)"
-cargo xtask release build-native --output "$release_root" --version 0.14.0
-"$release_root/releases/0.14.0/bin/agent-run-deploy" install \
-  --release "$release_root/releases/0.14.0" --version 0.14.0 \
+version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+cargo xtask release build-native --output "$release_root" --version "$version"
+"$release_root/releases/$version/bin/agent-run-deploy" install \
+  --release "$release_root/releases/$version" --version "$version" \
   --prefix "$HOME/.agent-run/standalone" --home "$HOME/.agent-run" --bin-dir "$HOME/.local/bin"
 ```
 
@@ -126,11 +127,12 @@ launchctl bootstrap "gui/$(id -u)" "$plist"
 
 Future Linux builds can run the same `agent-run api serve` command under an
 external service manager such as systemd. Linux is not a qualified or published
-0.12.3 platform, and agent-run does not generate systemd units.
+release platform, and agent-run does not generate systemd units.
 
 ## Use the CLI
 
 ```bash
+agent-run delegation-guide             # read before choosing a delegation route
 agent-run models                       # providers, explicit models, roles, standing
 agent-run start --provider codex --model gpt-6-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
@@ -142,7 +144,10 @@ agent-run transcript ag-... --follow --format text
 agent-run resume ag-... --task "Continue with the highest-priority finding."
 ```
 
-Output is line-delimited JSON. `transcript --follow` streams a live view:
+Output is line-delimited JSON except for the plain-text `delegation-guide` and
+text transcript rendering. Before every delegation, call `delegation_guide`
+(CLI: `agent-run delegation-guide`) and read it before choosing provider,
+model, effort or profile. `transcript --follow` streams a live view:
 model text, tool activity, and results as they arrive, exiting when the agent
 reaches a terminal state and its journal is drained; Ctrl-C exits only the
 viewer and never cancels the agent. `--format text|json` picks the rendering,
@@ -168,7 +173,7 @@ The MCP process is a thin stdio proxy over the resident broker:
 ```
 
 It exposes `start`, `resume`, `cancel`, `steer`, `list_agents`, `answer`,
-`transcript`, `capacity_order`, `doc`, `models`, and `limits`.
+`transcript`, `capacity_order`, `doc`, `models`, `delegation_guide`, and `limits`.
 
 ## Use the socket API
 

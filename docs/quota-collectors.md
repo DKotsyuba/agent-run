@@ -141,20 +141,22 @@ still handles quota exhaustion, but no guessed shared latch is written.
   the single `quota_capacity_revision` exactly once when it mutates rows and
   not at all for a no-op round. The account must be registered
   (`provider_accounts`), enforced by foreign key and an explicit
-  pre-transaction check. The store only persists raw facts; scoring,
+  check inside the same transaction. The store only persists raw facts; scoring,
   ranking, and reservation stay in core.
 * **Exhaustion latch** is durable in `quota_exhaustion`, keyed by account,
   physical key, stable collector source, and window — independent of rolling
   sample retention and of script revisions: a latched zero-remaining window
   survives a round that only produced unknown data (timeout/malformed
-  rounds persist nothing) until its known reset passes or — with no reset —
-  actually fresh positive evidence arrives (`remaining > 0`, observed at least
-  as late as the exhausted fact and not later than now, validity unexpired,
-  reset not passed). Missing pools and unrelated pools cannot release a latch;
-  an older exhausted report cannot roll it back. Matching is by lane and
-  window across collector source identities, so a script revision neither
-  forks the pool nor strands the latch. Carried facts keep their original
-  observation times; only the survival horizon extends (to the reset, or one
+  rounds persist nothing) until its known reset passes or actually fresh
+  positive evidence covers every model it governs (`remaining > 0`, observed
+  at least as late as the exhausted fact and not later than now, validity unexpired,
+  reset not passed). This evidence can release a latch even before its known
+  reset. Missing pools, partial membership and unrelated pools cannot release
+  it; an older exhausted report cannot roll it back. Matching is by lane and
+  window across collector source identities, so a new source can release the
+  old latch with covering positive evidence. A fresher covering zero replaces
+  the old latch with exhaustion under its own source. Carried facts keep their
+  original observation times; only the survival horizon extends (to the reset, or one
   900 s TTL past the round). If disjoint models report fresh zero for the same
   physical window, its one shared latch keeps the later known reset; an
   unknown reset remains unknown. This can conservatively block a newly

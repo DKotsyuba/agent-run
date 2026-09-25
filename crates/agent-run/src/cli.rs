@@ -1152,7 +1152,8 @@ fn provider_login_target(
 
 /// Executes one parsed command and returns its public process exit status.
 ///
-/// Success writes JSON (except the stdio server), while expected failures
+/// Success writes JSON except for the text guide, text transcript viewer and
+/// stdio server. Expected failures
 /// propagate as typed errors for `main` to render as the Python-compatible
 /// JSON error envelope. `start` and `resume` exclusively call the resident
 /// socket broker. Long-lived API and supervisor processes select their own

@@ -776,8 +776,16 @@ pub async fn serve_at_with_options(
     handlers.abort_all();
     Ok(())
 }
-/// A separate connection for every call; no shared response-routing state.
+/// Calls the selected home's broker without sharing response-routing state.
+/// Resume uses one idempotency key across at most one transport reconnect;
+/// explicit keys are preserved and domain errors are never retried. Wait keeps
+/// its bounded observation loop; other methods retain their one-shot behavior.
 pub async fn client(home: &Path, method: &str, params: Value) -> Result<Value> {
+    if method == "resume" {
+        return BrokerClient::new(home.join("api.sock"))
+            .call_with_timeout(method, Some(params), 120.0)
+            .await;
+    }
     client_with_wait_deadlines(
         home,
         method,

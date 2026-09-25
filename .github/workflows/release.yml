@@ -34,7 +34,7 @@ jobs:
       - name: Run Rust release gates
         run: |
           cargo xtask check
-          node --test scripts/check-desktop-transport.cjs
+          node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
       - name: Build and verify source archive
         shell: bash
         run: |

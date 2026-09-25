@@ -20,6 +20,10 @@ pub struct ManagedService {
     pub env_from: Vec<String>,
     /// Command whose zero exit confirms application readiness, separately from PID ownership.
     pub readiness: ReadinessProbe,
+    /// Check for an existing external service before spawning; its process is never owned or stopped.
+    /// Opt-in probes must support external mode without AGENT_RUN_SERVICE_PID.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reuse_existing: bool,
     /// Maximum cold-start readiness wait in seconds, between 1 and 300.
     #[serde(default = "startup_timeout")]
     pub startup_timeout_seconds: u64,
@@ -46,6 +50,11 @@ pub struct ReadinessProbe {
     /// Deadline for one probe, in seconds, between 1 and 30.
     #[serde(default = "probe_timeout")]
     pub timeout_seconds: u64,
+}
+
+/// Omits the disabled opt-in so historical frozen service revisions remain unchanged.
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Default cold-start budget in seconds.
@@ -126,5 +135,25 @@ impl ManagedService {
             &serde_json::to_value(self)?,
             true,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disabled reuse preserves historical frozen revisions; enabling it is an explicit revision change.
+    #[test]
+    fn external_reuse_is_opt_in_without_changing_legacy_serialization() {
+        let legacy = serde_json::json!({"command":"/bin/sleep","args":["20"],"cwd":"/tmp",
+            "env_from":[],"readiness":{"command":"/usr/bin/true","args":[],"timeout_seconds":2},
+            "startup_timeout_seconds":60,"idle_timeout_seconds":1800,"monitor_interval_seconds":5,
+            "stop_grace_seconds":2});
+        let mut service: ManagedService = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!service.reuse_existing);
+        assert_eq!(serde_json::to_value(&service).unwrap(), legacy);
+        let original = service.revision().unwrap();
+        service.reuse_existing = true;
+        assert_ne!(service.revision().unwrap(), original);
     }
 }

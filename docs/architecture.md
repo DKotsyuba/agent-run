@@ -2,7 +2,8 @@
 
 agent-run is one Rust workspace and one native `agent-run` executable. It owns
 durable admission, detached supervision, runtime materialization, evidence, and
-completion delivery for Codex, Claude, and GLM. For the local wire contract, see
+completion delivery for providers using Codex and Claude Code. Historical GLM
+adapter records remain readable. For the local wire contract, see
 [api.md](api.md).
 
 ## Component map
@@ -18,7 +19,7 @@ Unix socket API ───┘                              └─> detached super
 | `agent-run` | CLI, MCP proxy, Unix-socket daemon, launchd helper |
 | `agent-run-domain` | public requests, responses, tools, errors, states |
 | `agent-run-config` | strict config, profiles, role plans, snapshots |
-| `agent-run-store` | SQLite schema 19, migrations, events, projections |
+| `agent-run-store` | SQLite schema 20, migrations, events, projections |
 | `agent-run-adapters` | Codex, Claude, and GLM preparation and protocols |
 | `agent-run-core` | service, supervisor, lifecycle, delivery, capacity, doctor |
 | `agent-run-platform` | native launch, process identity, safe files, snapshots |
@@ -35,10 +36,14 @@ valid revision, compares the file SHA-256 every 60 seconds, and checks again at
 request boundaries. A malformed changed file is rejected without replacing the
 cached configuration.
 
-Each fresh run gets a generated lineage home. The adapter materializes only the
+Schema 2 separates `[harnesses.<id>]` launch settings from `[providers.<id>]`
+models, connections and account bindings; `runtimes.*` belongs to schema 1.
+
+Each fresh start gets a generated lineage home. The adapter materializes only the
 declared runtime settings, account bridge, skills, MCP servers, hooks, plugins,
-and role policy. Managed trees and the sanitized config snapshot are hashed and
-indexed. A continuation reuses the lineage only after the stored snapshot
+and role policy. Managed assets are indexed and hashed; the durable launch
+identity retains the frozen configuration and authority. A continuation reuses
+the lineage only after the stored snapshot
 verifies; it does not silently rebuild from changed live assets. See
 [artifact-snapshots.md](artifact-snapshots.md) and
 [runtime-contract.md](runtime-contract.md).
@@ -57,9 +62,11 @@ Only then does `start` return ownership to the caller. The supervisor opens its
 own store connection, materializes the runtime, starts the engine, journals its
 stream, seals an answer, records terminal evidence, and performs cleanup.
 
-The runtime execution itself has no automatic deadline or silence watchdog.
-Compatibility timeout fields remain in request identity, but a run ends only
-when the engine finishes or cancellation is requested. Success requires a
+A provider run has one execution deadline: admission time plus its stored
+`timeout_seconds`. Preparation and every account-switch attempt consume that
+same budget. Before each spawn the supervisor checks the remaining time; it
+bounds execution by that remainder, cleans up on expiry, and records
+`timed_out`. There is no independent silence watchdog. Success requires a
 verified answer plus completion and cleanup evidence; exit code alone is never
 enough.
 
@@ -70,15 +77,17 @@ Native process identity and signalling are described in
 
 - **Codex** speaks the app-server protocol, preserves normalized stream deltas,
   and stores the native thread identity for continuation.
-- **Claude** and **GLM** use their supported native CLI protocols and retain the
-  corresponding session identity when continuation is available.
+- **Claude Code** uses its native CLI protocol and retains the session identity
+  for continuation. The GLM adapter belongs to historical schema-1 runs.
 - Engine binaries and authentication remain external. Agent tasks execute through
   adapters and the supervisor. Quota metadata comes from separately configured,
   bounded executables; the shipped Codex collector starts no model turn.
 
-`resume` admits a new durable row linked to the latest terminal run and reuses
-the native conversation only after its immutable authority and generated-home
-snapshot verify. See [continuations.md](continuations.md).
+`resume` keeps the public `agent_id` and admits a new `run_id` linked to the
+latest terminal run (or an explicitly selected `run_id`). Each predecessor can
+have only one child. It reuses the native conversation only after its immutable
+authority, generated-home snapshot, history and cleanup proofs verify. See
+[continuations.md](continuations.md).
 
 ## Durable state
 

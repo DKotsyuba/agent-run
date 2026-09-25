@@ -27,10 +27,12 @@ A valid sealed directory contains `bin/agent-run`, `metadata.json`,
 
 ## Update and rollback
 
-The xtask deploy path verifies the release, requires writer quiescence, backs up
-SQLite and configuration, records `standalone/deploy.json`, migrates state, and
-switches `current` atomically. It does not control the platform service manager
-or perform the final API/MCP smoke.
+The xtask deploy path verifies the release and schema compatibility, requires
+writer quiescence, backs up SQLite and configuration, records
+`standalone/deploy.json`, and switches `current` atomically. It does not migrate
+state: when an upgrade is required, run the candidate binary's explicit paired
+`config migrate` first (see `migrations`). It does not control the platform
+service manager or perform the final API/MCP smoke.
 
 After an update, restart the launchd jobs on macOS. Verify version, database
 integrity, doctor, API

@@ -30,8 +30,10 @@ Transcript viewers pin their run while following/paging; MCP callers should
 carry the response run_id into subsequent cursor requests.
 
 Reuse `request_id` when retrying a resume at the application level. CLI/MCP
-transport reconnects automatically reuse one request key. A replay returns its
-original run even after the lineage advances; a changed request conflicts.
+generate a key when omitted and reuse it across their one bounded transport
+reconnect. Separate tool calls or CLI invocations are new requests: supply and
+reuse your own key when retrying those. Domain errors are not retried.
+A replay returns its original run even after the lineage advances; a changed request conflicts.
 Concurrent resumes still use the atomic one-child admission guard.
 
 Completion notices include both ids. PostToolUse binds the returned run_id,

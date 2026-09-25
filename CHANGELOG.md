@@ -4,6 +4,27 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-25
+
+- build(deps): update MCP, SQLite, hashing and TOML dependencies and GitHub
+  artifact actions
+- feat(routing): require orchestrators to read the dynamic delegation guide
+  before choosing a provider, model, effort and profile
+- fix(services): optionally reuse an already-ready external backend before
+  spawning, recover a lost startup race only after owned cleanup, and never
+  claim or stop the external process; preserve ownership across broker restarts
+- build: schema 20 records managed/external service ownership and keeps every
+  historical generation managed; paired configuration/database migration is required
+- fix(services): support external CodeGraph readiness in the shipped probe
+  while retaining PID verification for broker-owned instances
+
+- fix(continuations): use the existing idempotent broker client for CLI and MCP
+  resumes, preserving one request key across a bounded transport reconnect
+- docs: align operator guidance with current provider, permission, migration,
+  quota, continuation and transport contracts
+- docs(models): document verified GLM effort passthrough and explicit defaults;
+  cover low, high and max in the custom-provider adapter regression test
+
 ## [0.16.0] - 2026-09-25
 
 ### Changed

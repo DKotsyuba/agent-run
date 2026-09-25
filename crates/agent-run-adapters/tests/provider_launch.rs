@@ -524,6 +524,30 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
     let output = run_fake(&plan.launch);
     assert!(output.contains("glm-5.3[1m]"));
     assert!(!output.contains("synthetic-secret"));
+    // Custom Messages providers preserve the configured effort, without a
+    // vendor-specific Rust mapping or a downgrade in the harness arguments.
+    for effort in ["low", "high", "max"] {
+        let mut with_effort = authority.clone();
+        with_effort.effort = Some(effort.into());
+        let planned = plan_selected(
+            &config,
+            &catalog,
+            &with_effort,
+            &account,
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None,
+        )
+        .unwrap();
+        assert!(planned
+            .launch
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--effort", effort]));
+    }
     let mut changed_config = config.clone();
     changed_config
         .harnesses
