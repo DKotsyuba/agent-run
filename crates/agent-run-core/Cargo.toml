@@ -14,6 +14,7 @@ agent-run-store = { path = "../agent-run-store" }
 chrono.workspace = true
 fs2.workspace = true
 libc.workspace = true
+minijinja.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

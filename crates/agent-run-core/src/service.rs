@@ -1337,6 +1337,29 @@ impl Service {
             )),
         }
     }
+
+    /// Public `delegation_guide` read: compact routing text over the same
+    /// single committed snapshot [`Service::models`] would return for the
+    /// default query, rendered by [`crate::delegation_guide::render`] without
+    /// any new quota read, collection, or ranking. A schema-1 config has no
+    /// provider catalog, so the whole read is `Unsupported` there.
+    pub fn delegation_guide(&self) -> Result<Value> {
+        let active = self.active_config()?;
+        match &active.value {
+            CachedConfigValue::Providers(config) => {
+                let catalog = crate::capacity::provider_catalog::models(
+                    &self.home,
+                    config,
+                    &active.revision,
+                    &agent_run_domain::ModelsQuery::default(),
+                )?;
+                Ok(Value::String(crate::delegation_guide::render(&catalog)?))
+            }
+            CachedConfigValue::Legacy(_) => Err(Error::Unsupported(
+                "delegation_guide requires schema_version 2".into(),
+            )),
+        }
+    }
 }
 
 /// Refuses a provider resume when the current configuration no longer

@@ -84,6 +84,11 @@ impl CliService for CapacityServiceFake {
         Ok(self.payload.clone())
     }
 
+    /// Returns empty guide text for commands outside this fixture's scope.
+    fn delegation_guide(&self) -> agent_run::Result<Value> {
+        Ok(Value::String(String::new()))
+    }
+
     /// Returns an empty delivery status for commands outside this fixture's scope.
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
         Ok(json!({}))

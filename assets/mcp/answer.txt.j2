@@ -1,0 +1,16 @@
+agent-run answer for {{ agent_id }}
+{% if run_id %}
+- Run: {{ run_id }}
+{% endif %}
+
+- Status: {{ status }}
+{% if available %}
+- Answer: available (verified){% if inline_complete %}, complete inline text below{% else %}; inline text absent or partial — full artifact: {{ kind }}{% if media_type %} ({{ media_type }}){% endif %}{% if path %} at {{ path }}{% endif %}{% if size_bytes %}, {{ size_bytes }} bytes{% endif %}{{ "" }}
+{% endif %}
+{% if content %}
+
+{{ content }}
+{% endif %}
+{% else %}
+- Answer: NOT available — no verified sealed answer exists for this agent yet; this is not a claim about the run's success or failure
+{% endif %}

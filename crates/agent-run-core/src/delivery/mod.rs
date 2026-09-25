@@ -30,6 +30,9 @@ pub struct Notice {
     pub notification_id: String,
     /// Durable agent identifier whose result the recipient should inspect.
     pub agent_id: AgentId,
+    /// Exact execution being reported; absent only in legacy stored payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Terminal status being reported.
     pub status: Status,
     /// Runtime selector captured at admission, when still displayable.
@@ -281,6 +284,7 @@ impl Notice {
         Self {
             notification_id: notification_id.into(),
             agent_id,
+            run_id: None,
             status,
             runtime: None,
             model: None,
@@ -323,7 +327,8 @@ impl Notice {
         Ok(())
     }
 
-    /// Renders the exact frozen Python notice template using only safe contract text.
+    /// Render safe lifecycle text with stable identity and the optional exact run.
+    /// Legacy payloads without run_id retain their original notice shape.
     pub fn render(&self) -> Result<String> {
         self.validate()?;
         let failure = guidance(self.status, self.failure_kind.as_deref())?
@@ -331,9 +336,15 @@ impl Notice {
                 format!("\n- Failure: {kind} — {reason}\n- Advice: {advice}")
             })
             .unwrap_or_default();
+        let run = self
+            .run_id
+            .as_ref()
+            .map(|id| format!("\n- Run: {id}"))
+            .unwrap_or_default();
         Ok(format!(
-            "agent-run/completion\n\n- ID: {}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
+            "agent-run/completion\n\n- ID: {}{}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
             self.agent_id,
+            run,
             self.status.as_str(),
             failure,
             escaped(self.runtime.as_deref(), "unknown"),
@@ -479,9 +490,15 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         .ok()
         .and_then(|value| value.get("effort")?.as_str().map(str::to_owned))
         .and_then(bounded);
+    let root: String = tx.query_row(
+        "SELECT CASE WHEN root_agent_id='' THEN id ELSE root_agent_id END FROM agents WHERE id=?",
+        [&agent_id],
+        |row| row.get(0),
+    )?;
     let notice = Notice {
         notification_id: delivery_id.clone(),
-        agent_id: agent_id.parse()?,
+        agent_id: root.parse()?,
+        run_id: Some(agent_id.parse()?),
         status: status.parse()?,
         runtime: bounded(runtime),
         model: bounded(model),
@@ -647,11 +664,51 @@ fn claude_registry() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::dispatcher_lock;
+    use super::{claim, dispatcher_lock};
+    use crate::{domain::now, state::Store};
+    use rusqlite::params;
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    /// A resumed notice exposes stable identity without moving its delivery lease.
+    #[test]
+    fn resumed_notice_keeps_exact_run_and_stable_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        let root = "ag-20260925-000000-0000000001";
+        let child = "ag-20260925-000000-0000000002";
+        for id in [root, child] {
+            store.conn.execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) \
+                 VALUES(?1,'mock','fixture','review','task','task','/tmp','{}','succeeded',?2,1,'fixture',?3)",
+                params![id, now(), root],
+            ).unwrap();
+        }
+        store.conn.execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
+             VALUES('session','fixture','external',?1,?1)", [now()],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) \
+             VALUES('notice',?1,'session','pending',0)", [child],
+        ).unwrap();
+        let claimed = claim(home.path(), "test-owner").unwrap().unwrap();
+        assert_eq!(claimed.notice.agent_id.as_str(), root);
+        assert_eq!(claimed.notice.run_id.as_ref().unwrap().as_str(), child);
+        let rendered = claimed.notice.render().unwrap();
+        assert!(rendered.contains(&format!("- ID: {root}\n- Run: {child}\n")));
+        let stored_run: String = store
+            .conn
+            .query_row(
+                "SELECT agent_id FROM deliveries WHERE id='notice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_run, child);
+    }
 
     /// A child that inherited the held dispatcher descriptor (blocked on its
     /// stdin, so no timing is involved) must not keep the lock once the

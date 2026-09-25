@@ -1,0 +1,7 @@
+agent-run limits — latest stored capacity samples
+
+{% for item in items %}
+- {{ item.runtime }}/{{ item.lane }}/{{ item.window }}{% if item.account %} [{{ item.account }}{% if item.pool %} pool {{ item.pool }}{% endif %}]{% endif %}: {% if item.known %}{{ item.remaining_percent }}% remaining{% if item.resets_in %}, resets in {{ item.resets_in }}{% endif %}{% else %}no current sample (stale or expired){% endif %}{{ "" }}
+{% else %}
+no stored capacity samples
+{% endfor %}
