@@ -37,6 +37,8 @@ struct Generation {
     definition: ManagedService,
     /// Current durable lifecycle state.
     state: String,
+    /// Whether the broker owns a process or only observes an external application endpoint.
+    ownership: Ownership,
     /// Broker which originally authorized this launch.
     broker: Identity,
     /// Foreground identity committed before exec, when bootstrap reached that boundary.
@@ -49,8 +51,18 @@ struct Generation {
     idle_since: Option<f64>,
 }
 
+/// Durable authority: external readiness never authorizes signalling the external daemon.
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Ownership {
+    /// The generation may own its captured bootstrap process and descendants.
+    Managed,
+    /// Only the probe is owned; any original managed bootstrap has already been cleaned.
+    External,
+}
+
 /// Explicit projection avoids accidentally returning arguments or environment through diagnostics.
-const GENERATIONS: &str = "SELECT json_object('id',id,'service_id',service_id,'revision',revision,'definition',json(definition_json),'state',state,'broker',json(broker_identity_json),'root',json(process_identity_json),'created_at',created_at,'checked_at',checked_at,'idle_since',idle_since) FROM managed_service_generations";
+const GENERATIONS: &str = "SELECT json_object('id',id,'service_id',service_id,'revision',revision,'definition',json(definition_json),'state',state,'ownership',ownership,'broker',json(broker_identity_json),'root',json(process_identity_json),'created_at',created_at,'checked_at',checked_at,'idle_since',idle_since) FROM managed_service_generations";
 
 /// Reads frozen generations without holding a database connection across process or probe waits.
 fn generations(home: &Path) -> Result<Vec<Generation>> {
@@ -251,7 +263,7 @@ impl Manager {
         Ok(())
     }
 
-    /// Reuses an identical generation or starts one internal bootstrap; never replaces an occupied revision.
+    /// Reuses an identical generation or reserves one for preflight/bootstrap; never replaces an occupied revision.
     fn ensure_generation(
         &mut self,
         name: &str,
@@ -277,14 +289,28 @@ impl Manager {
             }
             return Ok(Some(current.id));
         }
-        let environment = environment(definition)?;
+        environment(definition)?;
         let id = uuid::Uuid::new_v4().to_string();
-        Store::open(&self.home)?.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,created_at) VALUES (?,?,?,?,'starting',?,?)", params![id,name,revision,serde_json::to_string(definition)?,serde_json::to_string(&self.owner)?,now()])?;
+        let ownership = if definition.reuse_existing {
+            "external"
+        } else {
+            "managed"
+        };
+        Store::open(&self.home)?.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,created_at,ownership) VALUES (?,?,?,?,'starting',?,?,?)", params![id,name,revision,serde_json::to_string(definition)?,serde_json::to_string(&self.owner)?,now(),ownership])?;
+        if !definition.reuse_existing {
+            self.spawn_generation(&id, definition)?;
+        }
+        Ok(Some(id))
+    }
+
+    /// Starts the owned bootstrap only after durable admission; spawn failures retire this generation.
+    fn spawn_generation(&mut self, id: &str, definition: &ManagedService) -> Result<()> {
+        let environment = environment(definition)?;
         let child = Command::new(&self.executable)
             .arg("--home")
             .arg(&self.home)
             .arg("_service-exec")
-            .arg(&id)
+            .arg(id)
             .current_dir(&definition.cwd)
             .env_clear()
             .envs(environment)
@@ -296,17 +322,18 @@ impl Manager {
         match child {
             Ok(child) => {
                 let owned = OwnedProcess::capture(child.id() as i32);
-                self.children.insert(id.clone(), child);
+                self.children.insert(id.to_owned(), child);
                 if let Some(snapshot) = owned.snapshot() {
-                    Store::open(&self.home)?.remember_processes("service", &id, &snapshot)?;
+                    Store::open(&self.home)?.remember_processes("service", id, &snapshot)?;
                 }
             }
             Err(_) => {
                 Store::open(&self.home)?.conn.execute("UPDATE managed_service_generations SET state='stopped',failure_kind='service_spawn_failed',cleanup_json='{\"never_spawned\":true,\"confirmed\":true}' WHERE id=?", [&id])?;
+                Store::open(&self.home)?.conn.execute("UPDATE agent_service_gates SET state='failed',failure_kind='service_spawn_failed' WHERE state='pending' AND agent_id IN (SELECT agent_id FROM managed_service_leases WHERE generation_id=? AND released_at IS NULL)", [id])?;
                 return Err(invalid("service bootstrap could not be spawned"));
             }
         }
-        Ok(Some(id))
+        Ok(())
     }
 
     /// Tests whether any agent still holds this exact generation, including unresolved lost attempts.
@@ -331,6 +358,9 @@ impl Manager {
 
     /// Checks root identity, startup/health and idle expiry, restoring only previously captured members.
     async fn observe_generation(&mut self, generation: Generation) -> Result<()> {
+        if generation.ownership == Ownership::External {
+            return self.observe_external(generation).await;
+        }
         let mut store = Store::open(&self.home)?;
         let held = self.held(&generation.id)?;
         let mut owned = store.remembered_processes("service", &generation.id)?;
@@ -381,6 +411,7 @@ impl Manager {
         };
         let root_state = observe(root);
         if root_state != ProcessState::Alive {
+            let mut cleaned = false;
             if generation.state != "unhealthy"
                 && matches!(root_state, ProcessState::Dead | ProcessState::Reused)
             {
@@ -398,10 +429,29 @@ impl Manager {
                         )?;
                     }
                     if let Ok(proof) = cleanup {
+                        cleaned = proof.confirmed;
                         Store::open(&self.home)?.conn.execute(
                             "UPDATE managed_service_generations SET cleanup_json=? WHERE id=?",
                             params![serde_json::to_string(&proof)?, generation.id],
                         )?;
+                    }
+                }
+            }
+            // Another launcher may have won between preflight and exec. Only a
+            // fully cleaned, never-ready bootstrap may fall back to external use.
+            if cleaned && generation.state == "starting" && generation.definition.reuse_existing {
+                match probe(&self.home, &generation, true).await {
+                    Ok(true) => {
+                        Store::open(&self.home)?.conn.execute(
+                            "UPDATE managed_service_generations SET ownership='external' WHERE id=?",
+                            [&generation.id],
+                        )?;
+                        return self.ready(&generation.id, now());
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        self.unhealthy(&generation.id, "service_probe_unavailable")?;
+                        return Ok(());
                     }
                 }
             }
@@ -424,7 +474,7 @@ impl Manager {
         {
             return Ok(());
         }
-        let healthy = match probe(&self.home, &generation).await {
+        let healthy = match probe(&self.home, &generation, false).await {
             Ok(healthy) => healthy,
             Err(_) => {
                 self.unhealthy(&generation.id, "service_probe_unavailable")?;
@@ -437,8 +487,7 @@ impl Manager {
             params![at, generation.id],
         )?;
         if healthy && observe(root) == ProcessState::Alive {
-            Store::open(&self.home)?.conn.execute("UPDATE managed_service_generations SET state='ready',ready_at=COALESCE(ready_at,?),failure_kind=NULL WHERE id=? AND state IN ('starting','ready')", params![at,generation.id])?;
-            self.qualified.insert(generation.id.clone());
+            self.ready(&generation.id, at)?;
         } else if generation.state == "ready"
             || at - generation.created_at >= generation.definition.startup_timeout_seconds as f64
         {
@@ -447,7 +496,71 @@ impl Manager {
         Ok(())
     }
 
+    /// Marks an application-qualified generation ready; process authority is unchanged.
+    fn ready(&mut self, id: &str, at: f64) -> Result<()> {
+        Store::open(&self.home)?.conn.execute("UPDATE managed_service_generations SET state='ready',ready_at=COALESCE(ready_at,?1),checked_at=?1,failure_kind=NULL WHERE id=?2 AND state IN ('starting','ready')", params![at,id])?;
+        self.qualified.insert(id.to_owned());
+        Ok(())
+    }
+
+    /// Checks an explicitly permitted external endpoint, never capturing or signalling its PID.
+    /// A negative initial preflight starts the owned bootstrap; later health loss blocks admissions.
+    async fn observe_external(&mut self, generation: Generation) -> Result<()> {
+        if !generation.definition.reuse_existing {
+            return Err(Error::Integrity(
+                "external service reuse was not authorized".into(),
+            ));
+        }
+        let held = self.held(&generation.id)?;
+        let expired = !held
+            && generation
+                .idle_since
+                .is_some_and(|at| now() - at >= generation.definition.idle_timeout_seconds as f64);
+        if generation.state == "stopping"
+            || expired
+            || (!held && matches!(generation.state.as_str(), "unhealthy" | "unknown"))
+        {
+            return self.stop(&generation, None).await;
+        }
+        if matches!(generation.state.as_str(), "unhealthy" | "unknown") {
+            return Ok(());
+        }
+        if self.qualified.contains(&generation.id)
+            && generation.checked_at.is_some_and(|at| {
+                now() - at < generation.definition.monitor_interval_seconds as f64
+            })
+        {
+            return Ok(());
+        }
+        let healthy = match probe(&self.home, &generation, true).await {
+            Ok(healthy) => healthy,
+            Err(_) => {
+                self.unhealthy(&generation.id, "service_probe_unavailable")?;
+                return Ok(());
+            }
+        };
+        if healthy {
+            self.ready(&generation.id, now())?;
+        } else if generation.state == "starting" && generation.root.is_none() {
+            if now() - generation.created_at >= generation.definition.startup_timeout_seconds as f64
+            {
+                return self.unhealthy(&generation.id, "service_readiness_timeout");
+            }
+            // Persist owned mode before allowing the child to exec. A broker
+            // crash here retains the ordinary bootstrap recovery contract.
+            Store::open(&self.home)?.conn.execute(
+                "UPDATE managed_service_generations SET ownership='managed',broker_identity_json=? WHERE id=? AND state='starting'",
+                params![serde_json::to_string(&self.owner)?,generation.id],
+            )?;
+            self.spawn_generation(&generation.id, &generation.definition)?;
+        } else {
+            self.unhealthy(&generation.id, "service_readiness_failed")?;
+        }
+        Ok(())
+    }
+
     /// Stops verified owned members, then retires the generation only with complete cleanup evidence.
+    /// External generations only release leases; prior bootstrap cleanup evidence is retained.
     async fn stop(&mut self, generation: &Generation, owned: Option<OwnedProcess>) -> Result<()> {
         self.qualified.remove(&generation.id);
         let store = Store::open(&self.home)?;
@@ -456,7 +569,23 @@ impl Manager {
             [&generation.id],
         )?;
         drop(store);
-        let mut proof = if let Some(mut owned) = owned {
+        let mut proof = if generation.ownership == Ownership::External {
+            let prior: Option<String> = Store::open(&self.home)?.conn.query_row(
+                "SELECT cleanup_json FROM managed_service_generations WHERE id=?",
+                [&generation.id],
+                |row| row.get(0),
+            )?;
+            let mut proof = prior
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({"confirmed":true}));
+            // External mode was entered only with no owned process or after
+            // confirmed bootstrap cleanup. Re-evaluate transient probes below;
+            // their previously unresolved cleanup must not strand this record.
+            proof["confirmed"] = serde_json::json!(true);
+            proof["external"] = serde_json::json!(true);
+            proof
+        } else if let Some(mut owned) = owned {
             let cleanup = owned
                 .cleanup(Duration::from_secs(
                     generation.definition.stop_grace_seconds,
@@ -488,8 +617,8 @@ impl Manager {
         )?;
         if probes {
             proof["confirmed"] = serde_json::json!(false);
-            proof["probes_gone"] = serde_json::json!(false);
         }
+        proof["probes_gone"] = serde_json::json!(!probes);
         let confirmed = proof["confirmed"] == true;
         store.conn.execute(
             "UPDATE managed_service_generations SET state=?,cleanup_json=? WHERE id=?",
@@ -507,7 +636,8 @@ impl Manager {
 }
 
 /// Executes one bounded probe in its own owned group; cancellation also cleans its descendants.
-async fn probe(home: &Path, generation: &Generation) -> Result<bool> {
+/// External mode omits the owned PID and cannot confer ownership of the checked service.
+async fn probe(home: &Path, generation: &Generation, external: bool) -> Result<bool> {
     use tokio::io::AsyncWriteExt;
     /// Makes interrupted broker maintenance release this probe's captured child tree.
     struct Probe(OwnedProcess);
@@ -518,9 +648,13 @@ async fn probe(home: &Path, generation: &Generation) -> Result<bool> {
         }
     }
     let mut environment = environment(&generation.definition)?;
-    if let Some(root) = &generation.root {
+    if let Some(root) = generation.root.as_ref().filter(|_| !external) {
         environment.insert("AGENT_RUN_SERVICE_PID".into(), root.pid.to_string());
     }
+    environment.insert(
+        "AGENT_RUN_SERVICE_OWNERSHIP".into(),
+        if external { "external" } else { "managed" }.into(),
+    );
     environment.insert("AGENT_RUN_SERVICE_ID".into(), generation.service_id.clone());
     environment.insert("AGENT_RUN_SERVICE_GENERATION".into(), generation.id.clone());
     // The shell only gates exec on our pipe. Arguments remain literal; the
@@ -637,6 +771,7 @@ pub fn bootstrap(home: &Path, id: &str) -> Result<()> {
     generation.definition.validate()?;
     let me = process::inspect(std::process::id() as i32)?;
     if generation.state != "starting"
+        || generation.ownership != Ownership::Managed
         || generation.root.is_some()
         || me.ppid != generation.broker.pid
         || me.group != me.pid
@@ -700,15 +835,34 @@ pub async fn wait_for_gate(home: &Path, id: &AgentId) -> Result<()> {
             ));
         }
         if state == "ready" {
-            let roots: Vec<Option<String>> = store.conn.prepare("SELECT g.process_identity_json FROM managed_service_leases l JOIN managed_service_generations g ON g.id=l.generation_id WHERE l.agent_id=? AND l.released_at IS NULL AND g.state='ready'")?.query_map([id.as_str()], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let ids: Vec<String> = store.conn.prepare("SELECT g.id FROM managed_service_leases l JOIN managed_service_generations g ON g.id=l.generation_id WHERE l.agent_id=? AND l.released_at IS NULL AND g.state='ready'")?.query_map([id.as_str()], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
             let expected: i64 = store.conn.query_row("SELECT COUNT(*) FROM managed_service_leases WHERE agent_id=? AND released_at IS NULL", [id.as_str()], |row| row.get(0))?;
-            if roots.len() as i64 != expected || roots.is_empty() {
+            if ids.len() as i64 != expected || ids.is_empty() {
                 return Err(invalid("service lease is unavailable"));
             }
-            for root in roots {
-                let root: Identity =
-                    serde_json::from_str(&root.ok_or_else(|| invalid("service root is missing"))?)?;
-                if observe(&root) != ProcessState::Alive {
+            let current = generations(home)?;
+            for id in ids {
+                let generation = current
+                    .iter()
+                    .find(|g| g.id == id && g.state == "ready")
+                    .ok_or_else(|| invalid("service lease is unavailable"))?;
+                if generation.ownership == Ownership::External {
+                    if !generation.definition.reuse_existing
+                        || generation.checked_at.is_none_or(|at| {
+                            at > now()
+                                || now() - at
+                                    > generation.definition.monitor_interval_seconds as f64 * 3.0
+                        })
+                    {
+                        return Err(invalid("external service health is stale or unauthorized"));
+                    }
+                    continue;
+                }
+                let root = generation
+                    .root
+                    .as_ref()
+                    .ok_or_else(|| invalid("service root is missing"))?;
+                if observe(root) != ProcessState::Alive {
                     return Err(invalid("service process is unavailable"));
                 }
             }

@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(services): optionally reuse an already-ready external backend before
+  spawning, recover a lost startup race only after owned cleanup, and never
+  claim or stop the external process; preserve ownership across broker restarts
+- build: schema 20 records managed/external service ownership and keeps every
+  historical generation managed; paired configuration/database migration is required
+- fix(services): support external CodeGraph readiness in the shipped probe
+  while retaining PID verification for broker-owned instances
+
 - fix(continuations): use the existing idempotent broker client for CLI and MCP
   resumes, preserving one request key across a bounded transport reconnect
 - docs: align operator guidance with current provider, permission, migration,

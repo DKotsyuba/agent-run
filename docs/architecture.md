@@ -19,7 +19,7 @@ Unix socket API ───┘                              └─> detached super
 | `agent-run` | CLI, MCP proxy, Unix-socket daemon, launchd helper |
 | `agent-run-domain` | public requests, responses, tools, errors, states |
 | `agent-run-config` | strict config, profiles, role plans, snapshots |
-| `agent-run-store` | SQLite schema 19, migrations, events, projections |
+| `agent-run-store` | SQLite schema 20, migrations, events, projections |
 | `agent-run-adapters` | Codex, Claude, and GLM preparation and protocols |
 | `agent-run-core` | service, supervisor, lifecycle, delivery, capacity, doctor |
 | `agent-run-platform` | native launch, process identity, safe files, snapshots |

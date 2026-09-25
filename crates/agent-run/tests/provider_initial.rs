@@ -20,6 +20,9 @@ use std::{
 };
 use tokio::process::Command;
 
+#[path = "provider_initial/external_services.rs"]
+mod external_services;
+
 /// Duplicates one inert test descriptor above the supervisor bootstrap range.
 fn bootstrap_fd() -> OwnedFd {
     let file = fs::File::options()
@@ -617,6 +620,7 @@ async fn managed_services_real_codegraph_qualification() {
     config.services.insert(
         "codegraph".into(),
         ManagedService {
+            reuse_existing: false,
             command: "/usr/bin/env".into(),
             args: vec![
                 format!("HOME={}", private_home.display()),
