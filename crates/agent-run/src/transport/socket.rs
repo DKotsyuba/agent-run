@@ -39,8 +39,10 @@ pub struct BrokerClient {
 /// The broker's minimal asynchronous start acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerStartResult {
-    /// Durable id assigned by the broker.
+    /// Stable logical agent id assigned by the broker.
     pub agent_id: String,
+    /// Exact execution id; absent only from a pre-stable-id broker.
+    pub run_id: Option<String>,
     /// Whether this request admitted a new row rather than replaying one.
     pub created: bool,
     /// The provider attempt the admission owns; absent from legacy brokers.
@@ -84,10 +86,13 @@ impl BrokerClient {
     }
 
     /// Sends one request after validating method, object parameters, and deadline.
+    /// Resume calls without a key receive one idempotency key shared by reconnect
+    /// retries; an explicitly supplied key is preserved, including invalid values
+    /// which remain the server's responsibility to reject.
     pub async fn call_with_timeout(
         &self,
         method: &str,
-        params: Option<Value>,
+        mut params: Option<Value>,
         timeout_seconds: f64,
     ) -> Result<Value> {
         if method.is_empty() {
@@ -101,6 +106,15 @@ impl BrokerClient {
         }
         if self.aborted.load(Ordering::Acquire) {
             return Err(Error::Runtime("broker call cancelled".into()));
+        }
+        // A stable agent may advance while a lost response is retried. Pin the
+        // resume intent once, outside the reconnect loop, to prevent a second turn.
+        if method == "resume" {
+            if let Some(arguments) = params.as_mut().and_then(Value::as_object_mut) {
+                if arguments.get("request_id").is_none_or(Value::is_null) {
+                    arguments.insert("request_id".into(), json!(uuid::Uuid::new_v4().to_string()));
+                }
+            }
         }
         let mut connection = self.connection.lock().await;
         for attempt in 0..2 {
@@ -166,8 +180,14 @@ impl BrokerClient {
                 ))
             }
         };
+        let run_id = match object.get("run_id") {
+            None => None,
+            Some(Value::String(id)) => Some(id.clone()),
+            Some(_) => return Err(Error::Runtime("broker returned an invalid run_id".into())),
+        };
         Ok(BrokerStartResult {
             agent_id: agent_id.into(),
+            run_id,
             created,
             attempt_id,
         })

@@ -16,6 +16,57 @@ fn endpoint(home: &tempfile::TempDir) -> PathBuf {
     home.path().join("api.sock")
 }
 
+/// A lost resume response retries the same intent rather than continuing again.
+#[tokio::test]
+async fn resume_transport_retry_keeps_one_generated_request_id() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(endpoint(&home)).unwrap();
+    let server = tokio::spawn(async move {
+        let mut keys = Vec::new();
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (input, mut output) = stream.into_split();
+            let mut input = BufReader::new(input);
+            let request: Value = serde_json::from_slice(
+                &frame::read(&mut input, socket::MAX_FRAME)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            keys.push(request["params"]["request_id"].as_str().unwrap().to_owned());
+            if attempt == 1 {
+                frame::write(
+                    &mut output,
+                    &json!({
+                        "jsonrpc":"2.0", "id":request["id"],
+                        "result":{"agent_id":"root","run_id":"child","created":false}
+                    }),
+                    socket::MAX_FRAME,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        keys
+    });
+    let result = socket::BrokerClient::new(endpoint(&home))
+        .call_with_timeout(
+            "resume",
+            Some(json!({"agent_id":"root","task":"continue"})),
+            5.0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["run_id"], "child");
+    let keys = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!keys[0].is_empty());
+    assert_eq!(keys[0], keys[1]);
+}
+
 /// Mirrors `test_broker_client.py::test_validation_error_mapping`.
 #[tokio::test]
 async fn client_maps_a_validation_envelope_to_a_typed_error() {

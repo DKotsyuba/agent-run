@@ -276,8 +276,21 @@ fn start_tool_description_embeds_the_completion_contract() {
         .expect("start tool");
     let description = start["description"].as_str().expect("description text");
     assert!(description.starts_with("Start one asynchronous durable agent."));
-    assert!(description.contains(dispatch::doc("completion").expect("completion contract")));
-    for field in ["- ID:", "- Status:", "- Runtime/model:", "- Notice:"] {
+    assert!(description.contains(
+        dispatch::doc("completion")
+            .expect("completion contract")
+            .split("\n## Stable agent and execution ids")
+            .next()
+            .unwrap()
+            .trim_end()
+    ));
+    for field in [
+        "- ID:",
+        "- Run:",
+        "- Status:",
+        "- Runtime/model:",
+        "- Notice:",
+    ] {
         assert!(description.contains(field), "missing {field}");
     }
 }
@@ -306,6 +319,7 @@ async fn huge_wait_is_rejected_without_panicking_or_opening_state() {
 }
 fn notice() -> Notice {
     Notice {
+        run_id: None,
         notification_id: "ntf_test".into(),
         agent_id: AgentId::new(),
         status: Status::Succeeded,

@@ -70,6 +70,7 @@ fn make_due(home: &Path, id: &str) {
 /// Builds one notice from a frozen rendering fixture input object.
 fn notice_from_case(input: &Value) -> Notice {
     Notice {
+        run_id: None,
         notification_id: input["notification_id"].as_str().unwrap().into(),
         agent_id: input["agent_id"]
             .as_str()
@@ -299,6 +300,7 @@ fn golden_delivery_database_is_read_from_a_copy() {
 /// Builds a valid notice without any task, answer, or host-provided text.
 fn notice() -> Notice {
     Notice {
+        run_id: None,
         notification_id: "ntf_test".into(),
         agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
         status: Status::Succeeded,
@@ -342,6 +344,7 @@ fn receipt_validates_its_optional_remote_id() {
 /// Creates a notice carrying the rich v2 selectors and v3 failure category.
 fn rich_notice() -> Notice {
     Notice {
+        run_id: None,
         notification_id: "ntf_rich".into(),
         agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
         status: Status::Succeeded,
@@ -503,7 +506,7 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
                     path.file_name()
                         .unwrap()
                         .to_string_lossy()
-                        .starts_with("ar-cdx-v3-")
+                        .starts_with("ar-cdx-v4-")
                 })
             {
                 break path;
@@ -1792,6 +1795,7 @@ async fn notice_projection_tolerates_rows_without_metadata() {
         "absent metadata must not fail the projection"
     );
     let bare = Notice {
+        run_id: None,
         notification_id: "ntf_old".into(),
         agent_id: "ag-20260825-120000-0123456789".parse().unwrap(),
         status: Status::Succeeded,

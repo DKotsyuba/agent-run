@@ -11,6 +11,9 @@ use std::path::PathBuf;
 pub struct DeliveryView {
     /// Agent that owns this delivery record.
     pub agent_id: AgentId,
+    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Whether an orchestrator session is durably bound.
     pub bound: bool,
     /// Bound external session id, when one exists.
@@ -51,8 +54,11 @@ pub struct CleanupView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentView {
-    /// Durable agent id.
+    /// Stable logical agent id; run_id distinguishes its executions.
     pub agent_id: AgentId,
+    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Selected runtime name.
     pub runtime: String,
     /// Selected model name.
@@ -93,6 +99,9 @@ pub struct AgentView {
     pub delivery: DeliveryView,
     /// Parent run resumed by this agent, or `null` for a fresh run.
     pub parent_agent_id: Option<AgentId>,
+    /// Exact previous execution; replaces the legacy parent_agent_id spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<AgentId>,
     /// First run in the lineage, or `null` for historical incomplete rows.
     pub root_agent_id: Option<AgentId>,
     /// One-based lineage position.
@@ -119,8 +128,11 @@ pub struct AgentView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartResult {
-    /// Durable id assigned to the requested run.
+    /// Stable logical agent id, unchanged across explicit resumes.
     pub agent_id: AgentId,
+    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Whether this call created rather than replayed admission.
     pub created: bool,
     /// The provider attempt the admission (or its replay) owns; absent in
@@ -139,6 +151,9 @@ pub struct CommandView {
     pub command_id: i64,
     /// Agent that owns the command.
     pub agent_id: AgentId,
+    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Command kind name.
     pub kind: String,
     /// Durable command state name.
@@ -169,6 +184,9 @@ pub struct MessageView {
 pub struct TranscriptPage {
     /// Agent whose transcript is paged.
     pub agent_id: AgentId,
+    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Ordered messages after the requested cursor.
     pub messages: Vec<MessageView>,
     /// Caller-provided cursor.
@@ -187,6 +205,9 @@ pub struct TranscriptPage {
 pub struct AnswerView {
     /// Agent whose answer was requested.
     pub agent_id: AgentId,
+    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<AgentId>,
     /// Current lifecycle status, independent of availability.
     pub status: Status,
     /// Whether a verified sealed answer exists.

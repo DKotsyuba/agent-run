@@ -63,6 +63,7 @@ fn registry_matches_python_golden_field_by_field() {
         if definition.name == "start" {
             rename_runtime_to_provider(&mut expected);
         }
+        extend_stable_identity(&mut expected);
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }
@@ -93,13 +94,33 @@ fn registry_matches_python_golden_field_by_field() {
     }
 }
 
-/// The only text the start description adds to the frozen Python baseline: the
+/// Apply only the declared stable-id delta to the immutable historical schema.
+fn extend_stable_identity(value: &mut Value) {
+    let name = value["name"].as_str().unwrap().to_owned();
+    if matches!(
+        name.as_str(),
+        "resume" | "cancel" | "steer" | "answer" | "transcript"
+    ) {
+        value["inputSchema"]["properties"]["agent_id"]["description"] = Value::String(
+            "Stable agent identity returned by start/resume. Historical run ids remain aliases for that lineage; omission of run_id selects its latest execution.".into()
+        );
+        value["inputSchema"]["properties"]["run_id"] = serde_json::json!({
+            "type": ["string", "null"],
+            "description": "Optional exact execution within this agent lineage. Use a notice or prior response run_id for historical reads and pinned control; omit for the latest run."
+        });
+    }
+    match name.as_str() {
+        "resume" => value["description"] = "Continue the latest terminal execution of a stable agent as a new run in the same native context. agent_id stays constant; run_id changes. Optional run_id pins the parent. Concurrent continuations cannot create parallel active runs. Reuse request_id for an identical retry, including after later resumes. Identity, permissions, native-history and cleanup checks remain mandatory.".into(),
+        "list_agents" => value["description"] = "List a bounded page of durable executions with an exact total. Each row has stable agent_id and exact run_id; resumed executions share agent_id and preserve separate history.".into(),
+        _ => {}
+    }
+}
+
+/// The binding text the start description adds to the frozen Python baseline: the
 /// binding guidance, inserted directly after the baseline's opening sentence. It names both direct host-visible aliases and forbids indirect calls.
 const START_BINDING_GUIDANCE: &str = "Automatic PostToolUse hook binding requires a direct, host-visible mcp__agent_run__start or mcp__agent-run__start call; do not wrap or nest start inside functions.exec, a shell call, another tool, or any other indirect invocation when automatic binding is expected. If a direct call is unavailable, pass the current session identity in orchestrator; otherwise delivery remains bound:false and no completion notice will arrive automatically. ";
 
-/// Pins the start description to the Python baseline plus exactly the binding
-/// guidance: removing that one insertion must reproduce the baseline byte for byte,
-/// so no historical guidance can disappear or drift unnoticed.
+/// Pin the historical start guidance plus the explicit binding and stable-id delta.
 #[test]
 fn start_description_extends_the_python_baseline_exactly() {
     let baseline = golden()
@@ -111,10 +132,12 @@ fn start_description_extends_the_python_baseline_exactly() {
         .to_owned();
     let description = &tool("start").expect("start tool").description;
     assert_eq!(description.matches(START_BINDING_GUIDANCE).count(), 1);
-    assert_eq!(
-        description.replacen(START_BINDING_GUIDANCE, "", 1),
-        baseline
-    );
+    let expected = baseline
+        .replacen("Start one asynchronous durable agent. ",
+            &format!("Start one asynchronous durable agent. agent_id is stable across resumes; run_id identifies this exact execution. Bind hooks use run_id. {START_BINDING_GUIDANCE}"), 1)
+        .replace("Use the notice's agent ID with answer(agent_id), list_agents, or transcript(agent_id).", "Use the notice agent_id and run_id with answer or transcript to inspect that exact completion. For a legacy notice without a Run line, use its ID as both agent_id and run_id.")
+        .replace("- ID: {agent_id}\n- Status:", "- ID: {agent_id}\n- Run: {run_id}\n- Status:");
+    assert_eq!(description, &expected);
 }
 
 /// The additive `delegation_guide` read extends the frozen Python table by

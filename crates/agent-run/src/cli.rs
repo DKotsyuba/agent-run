@@ -67,19 +67,31 @@ impl TranscriptFormat {
 /// Structured doctor callback used by [`CliDependencies`].
 pub type DoctorRunner = Arc<dyn Fn(&Path) -> Result<crate::doctor::Report> + Send + Sync>;
 
-/// Service operations used by public CLI commands.
+/// Exact-run operations plus public identity resolution used by CLI commands.
 pub trait CliService: Send + Sync {
-    /// Cancel one durable agent and return its public view.
+    /// Pin a public agent selection to an exact execution for this CLI command.
+    ///
+    /// Store-free test implementations retain literal ids; production verifies
+    /// lineage membership and resolves an omitted run to the current execution.
+    fn resolve_run_id(&self, id: &AgentId, run_id: Option<&AgentId>) -> Result<AgentId> {
+        Ok(run_id.unwrap_or(id).clone())
+    }
+    /// Add stable identity to an exact-run result without altering its content.
+    /// Store-free implementations may already supply a projected fixture.
+    fn public_run_result(&self, _run_id: &AgentId, value: Value) -> Result<Value> {
+        Ok(value)
+    }
+    /// Cancel one already pinned execution and return its unprojected view.
     fn cancel(&self, id: &AgentId) -> Result<Value>;
-    /// Send one steering command and return its durable acknowledgement.
+    /// Enqueue steering for one already pinned execution.
     fn steer(&self, id: &AgentId, text: &str) -> Result<Value>;
     /// List agents, optionally waiting for a durable revision.
     fn list<'a>(&'a self, query: Query) -> CliFuture<'a>;
-    /// Read one verified answer envelope.
+    /// Read one pinned execution's verified answer envelope.
     fn answer(&self, id: &AgentId) -> Result<Value>;
-    /// Read one durable agent view for follow-up terminal checks.
+    /// Read one pinned run for follow-up terminal checks without resolving again.
     fn agent(&self, id: &AgentId) -> Result<Value>;
-    /// Read one bounded transcript page.
+    /// Read one bounded page from the already pinned execution.
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value>;
     /// Return the configured model roster or schema-2 provider catalog.
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
@@ -89,7 +101,7 @@ pub trait CliService: Send + Sync {
     fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value>;
     /// Return the plain-text delegation guide as a JSON string value.
     fn delegation_guide(&self) -> Result<Value>;
-    /// Return one completion-delivery status view.
+    /// Return delivery status for one exact execution.
     fn delivery_status(&self, id: &AgentId) -> Result<Value>;
     /// Cancel one completion-delivery attempt.
     fn delivery_cancel(&self, id: &str) -> Result<Value>;
@@ -102,14 +114,23 @@ pub trait CliBroker: Send + Sync {
 }
 
 impl CliService for Service {
+    /// Resolve latest or exact selection through the same lineage boundary as MCP.
+    fn resolve_run_id(&self, id: &AgentId, run_id: Option<&AgentId>) -> Result<AgentId> {
+        Ok(Service::resolve_run(self, id, run_id)?.id)
+    }
+    /// Preserve exact-run content while projecting its stable public identity.
+    fn public_run_result(&self, run_id: &AgentId, value: Value) -> Result<Value> {
+        Service::public_run_result(self, run_id, value)
+    }
     fn cancel(&self, id: &AgentId) -> Result<Value> {
         Service::cancel(self, id)
     }
     fn steer(&self, id: &AgentId, text: &str) -> Result<Value> {
         Service::steer(self, id, text)
     }
+    /// List execution rows with the common stable-id projection.
     fn list<'a>(&'a self, query: Query) -> CliFuture<'a> {
-        Box::pin(Service::list(self, query))
+        Box::pin(Service::list_public(self, query))
     }
     fn answer(&self, id: &AgentId) -> Result<Value> {
         Service::answer(self, id)
@@ -209,19 +230,35 @@ pub enum Command {
     Resume(Resume),
     Bind(Bind),
     Cancel {
+        /// Stable agent id, or a historical run alias for that agent.
         agent_id: AgentId,
+        /// Pin cancellation to this exact run within the agent's history.
+        #[arg(long)]
+        run_id: Option<AgentId>,
     },
     Steer {
+        /// Stable agent id, or a historical run alias for that agent.
         agent_id: AgentId,
+        /// Pin steering to this exact run within the agent's history.
+        #[arg(long)]
+        run_id: Option<AgentId>,
         #[arg(long)]
         text: String,
     },
     Agents(Agents),
     Answer {
+        /// Stable agent id; defaults to its latest execution's answer.
         agent_id: AgentId,
+        /// Retrieve this exact historical run's verified answer.
+        #[arg(long)]
+        run_id: Option<AgentId>,
     },
     Transcript {
+        /// Stable agent id; the viewer pins its selected run before paging.
         agent_id: AgentId,
+        /// Retrieve this exact historical run's transcript.
+        #[arg(long)]
+        run_id: Option<AgentId>,
         #[arg(long, default_value_t = 0)]
         cursor: i64,
         #[arg(long, default_value_t = 200)]
@@ -426,7 +463,11 @@ pub struct Start {
 #[derive(Args, Debug)]
 #[command(group = ArgGroup::new("resume_task").required(true).args(["task", "task_file"]))]
 pub struct Resume {
+    /// Stable agent id or an old run alias; omission of run_id continues its tip.
     pub agent_id: AgentId,
+    /// Pin the terminal parent rather than resolving the latest run.
+    #[arg(long)]
+    pub run_id: Option<AgentId>,
     #[arg(long)]
     pub task: Option<String>,
     #[arg(long)]
@@ -441,8 +482,11 @@ pub struct Resume {
 /// A durable session binding request accepted by the Python command surface.
 #[derive(Args, Debug)]
 pub struct Bind {
-    /// Existing durable agent to bind.
+    /// Stable agent whose selected execution should be bound.
     pub agent_id: AgentId,
+    /// Exact execution to bind; use the run_id returned by start or resume.
+    #[arg(long)]
+    pub run_id: Option<AgentId>,
     /// Orchestrator transport name.
     #[arg(long)]
     pub session_transport: String,
@@ -582,8 +626,13 @@ pub enum Capacity {
 /// Completion-delivery commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Delivery {
+    /// Read delivery for the latest run, or an explicitly pinned execution.
     Status {
+        /// Stable agent id or historical alias.
         agent_id: AgentId,
+        /// Exact execution whose notification should be inspected.
+        #[arg(long)]
+        run_id: Option<AgentId>,
     },
     Cancel {
         delivery_id: String,
@@ -669,7 +718,8 @@ pub fn emit(value: &Value) -> Result<()> {
 ///
 /// Socket/MCP calls deliberately retain the full durable agent snapshot, but
 /// the shell command has historically emitted only an agent id and the replay
-/// indicator. A malformed broker result is treated as a typed validation
+/// indicator. It now also retains the exact run id for receipt binding and
+/// historical reads. A malformed broker result is treated as a typed validation
 /// failure rather than silently producing a partial acknowledgement.
 fn admission_output(result: &Value) -> Result<Value> {
     let agent_id = result
@@ -683,7 +733,14 @@ fn admission_output(result: &Value) -> Result<Value> {
     if !agent_id.is_string() || !created.is_boolean() {
         return Err(invalid("broker admission result has invalid fields"));
     }
-    Ok(json!({"agent_id":agent_id,"created":created}))
+    let mut output = json!({"agent_id":agent_id,"created":created});
+    if let Some(run_id) = result.get("run_id") {
+        if !run_id.is_string() {
+            return Err(invalid("broker admission result has invalid run_id"));
+        }
+        output["run_id"] = run_id.clone();
+    }
+    Ok(output)
 }
 fn result_code(value: &Value) -> i32 {
     match value.get("status").and_then(Value::as_str) {
@@ -1183,10 +1240,11 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 .await?;
             if a.wait {
                 let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
-                let result = dependencies
-                    .broker
-                    .call("wait", json!({"agent_id": id}))
-                    .await?;
+                let mut wait = json!({"agent_id": id});
+                if let Some(run_id) = result.get("run_id") {
+                    wait["run_id"] = run_id.clone();
+                }
+                let result = dependencies.broker.call("wait", wait).await?;
                 (dependencies.output)(&result)?;
                 return Ok(result_code(&result));
             }
@@ -1199,20 +1257,30 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 (None, Some(path)) => read_input(&path, 1024 * 1024)?,
                 _ => return Err(invalid("provide exactly one resume task source")),
             };
-            let result = dependencies
-                .broker
-                .call(
-                    "resume",
-                    json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?}),
-                )
-                .await?;
+            let mut arguments = json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?});
+            if let Some(run_id) = a.run_id {
+                arguments["run_id"] = json!(run_id);
+            }
+            let result = dependencies.broker.call("resume", arguments).await?;
             (dependencies.output)(&admission_output(&result)?)?;
         }
-        Command::Cancel { agent_id } => {
-            (dependencies.output)(&dependencies.service.cancel(&agent_id)?)?
+        Command::Cancel { agent_id, run_id } => {
+            let id = dependencies
+                .service
+                .resolve_run_id(&agent_id, run_id.as_ref())?;
+            let value = dependencies.service.cancel(&id)?;
+            (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?
         }
-        Command::Steer { agent_id, text } => {
-            (dependencies.output)(&dependencies.service.steer(&agent_id, &text)?)?
+        Command::Steer {
+            agent_id,
+            run_id,
+            text,
+        } => {
+            let id = dependencies
+                .service
+                .resolve_run_id(&agent_id, run_id.as_ref())?;
+            let value = dependencies.service.steer(&id, &text)?;
+            (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?
         }
         Command::Bind(a) => {
             let reference = OrchestratorRef {
@@ -1221,13 +1289,13 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_turn_id: a.session_turn_id,
             };
             let mut store = Store::open(&home)?;
-            hooks::bind::bind(
-                &mut store,
-                a.agent_id.clone(),
-                reference,
-                crate::domain::now(),
-            )?;
-            (dependencies.output)(&store.delivery_status(&a.agent_id)?)?;
+            let run =
+                agent_run_core::agent_identity::resolve(&store, &a.agent_id, a.run_id.as_ref())?;
+            hooks::bind::bind(&mut store, run.id.clone(), reference, crate::domain::now())?;
+            (dependencies.output)(&agent_run_core::agent_identity::result(
+                &run,
+                store.delivery_status(&run.id)?,
+            )?)?;
         }
         Command::Context(a) => {
             let reference = OrchestratorRef {
@@ -1278,18 +1346,25 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 })
                 .await?,
         )?,
-        Command::Answer { agent_id } => {
-            let value = dependencies.service.answer(&agent_id)?;
-            (dependencies.output)(&value)?;
+        Command::Answer { agent_id, run_id } => {
+            let id = dependencies
+                .service
+                .resolve_run_id(&agent_id, run_id.as_ref())?;
+            let value = dependencies.service.answer(&id)?;
+            (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?;
         }
         Command::Transcript {
             agent_id,
+            run_id,
             mut cursor,
             limit,
             follow,
             full,
             format,
         } => {
+            let agent_id = dependencies
+                .service
+                .resolve_run_id(&agent_id, run_id.as_ref())?;
             // An explicit --format always wins; otherwise text is interactive
             // and JSON keeps piped consumers on the historical machine shape.
             let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
@@ -1321,8 +1396,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     renderer.page(&messages, &mut |line| (dependencies.text_output)(line))?;
                     renderer.finish(&mut |line| (dependencies.text_output)(line))?;
                 } else {
+                    let value = json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages});
                     (dependencies.output)(
-                        &json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages}),
+                        &dependencies.service.public_run_result(&agent_id, value)?,
                     )?;
                 }
             } else {
@@ -1344,7 +1420,11 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                             &mut |line| (dependencies.text_output)(line),
                         )?;
                     } else {
-                        (dependencies.output)(&page)?;
+                        (dependencies.output)(
+                            &dependencies
+                                .service
+                                .public_run_result(&agent_id, page.clone())?,
+                        )?;
                     }
                     if let Some(seq) = page["messages"]
                         .as_array()
@@ -1456,8 +1536,12 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             }
         },
         Command::Delivery { command } => match command {
-            Delivery::Status { agent_id } => {
-                (dependencies.output)(&dependencies.service.delivery_status(&agent_id)?)?
+            Delivery::Status { agent_id, run_id } => {
+                let id = dependencies
+                    .service
+                    .resolve_run_id(&agent_id, run_id.as_ref())?;
+                let value = dependencies.service.delivery_status(&id)?;
+                (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?
             }
             Delivery::Cancel { delivery_id } => {
                 (dependencies.output)(&dependencies.service.delivery_cancel(&delivery_id)?)?

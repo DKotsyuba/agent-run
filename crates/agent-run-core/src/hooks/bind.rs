@@ -15,8 +15,10 @@ const HOOK_TRANSPORTS: [&str; 2] = ["claude_uds", "codex_queue"];
 /// One successful immutable durable-agent binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BindResult {
-    /// The durable agent whose terminal notification is now session-routable.
+    /// Stable agent identity for the bound execution's lineage.
     pub agent_id: AgentId,
+    /// Exact durable execution whose receipt was bound, never a moving alias.
+    pub run_id: AgentId,
     /// The opaque durable orchestrator-session primary key.
     pub session_id: String,
 }
@@ -24,9 +26,14 @@ pub struct BindResult {
 impl BindResult {
     /// Returns the exact safe confirmation injected into the post-tool host turn.
     pub fn message(&self) -> String {
+        let execution = if self.run_id == self.agent_id {
+            String::new()
+        } else {
+            format!(" (run {})", self.run_id)
+        };
         format!(
-            "agent-run: agent {} is bound to session {}; its completion will be delivered to this chat.",
-            self.agent_id, self.session_id
+            "agent-run: agent {}{} is bound to session {}; its completion will be delivered to this chat.",
+            self.agent_id, execution, self.session_id
         )
     }
 }
@@ -42,9 +49,11 @@ pub fn bind(
     reference: OrchestratorRef,
     at: f64,
 ) -> Result<BindResult> {
+    let root = store.get(&agent_id)?.root_agent_id;
     let session_id = store.bind_orchestrator(&agent_id, &reference, at)?;
     Ok(BindResult {
-        agent_id,
+        agent_id: root,
+        run_id: agent_id,
         session_id,
     })
 }
@@ -129,6 +138,7 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
     let allowed: BTreeSet<&str> = if bind {
         BTreeSet::from([
             "agent_id",
+            "run_id",
             "transport",
             "external_session_id",
             "external_turn_id",
@@ -152,7 +162,14 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
     };
     reference.validate()?;
     let agent_id = bind
-        .then(|| required_string(object.get("agent_id"), "agent_id"))
+        .then(|| {
+            let field = if object.contains_key("run_id") {
+                "run_id"
+            } else {
+                "agent_id"
+            };
+            required_string(object.get(field), field)
+        })
         .transpose()?;
     Ok(HookPayload {
         reference,
@@ -177,11 +194,17 @@ fn value_string(value: &Value) -> Result<String> {
         .ok_or_else(|| invalid("hook identifier must be a string"))
 }
 
-/// Recursively extracts exactly one agent id from raw Claude/Codex tool output.
+/// Extract one exact run id, falling back to legacy agent ids only when absent.
+///
+/// Stable agent ids must never make a delayed resume hook bind the root run.
+/// Conflicting ids still fail closed; no latest-run lookup is performed here.
 fn raw_agent_id(value: Option<&Value>) -> Result<String> {
     let mut ids = BTreeSet::new();
     if let Some(value) = value {
-        collect_agent_ids(value, &mut ids);
+        collect_ids(value, "run_id", &mut ids)?;
+        if ids.is_empty() {
+            collect_ids(value, "agent_id", &mut ids)?;
+        }
     }
     match ids.len() {
         0 => Err(invalid("raw PostToolUse payload has no agent_id")),
@@ -192,26 +215,46 @@ fn raw_agent_id(value: Option<&Value>) -> Result<String> {
     }
 }
 
-/// Searches structured values and JSON-encoded Claude content blocks for agent ids.
-fn collect_agent_ids(value: &Value, ids: &mut BTreeSet<String>) {
+/// Search structured and JSON-encoded envelopes for one identity field.
+/// Run ids are read only from agent metadata, never from task/answer text inside
+/// an admission object. Known nested agent/delivery metadata still participates
+/// in conflict detection, as do separate mirrored host envelopes.
+fn collect_ids(value: &Value, field: &str, ids: &mut BTreeSet<String>) -> Result<()> {
     match value {
-        Value::Object(object) => object.iter().for_each(|(key, item)| {
-            if key == "agent_id" {
-                if let Some(id) = item.as_str() {
-                    ids.insert(id.into());
+        Value::Object(object) => {
+            if field == "run_id" && object.contains_key("agent_id") {
+                required_string(object.get("agent_id"), "agent_id")?;
+                if let Some(run) = object.get("run_id") {
+                    ids.insert(required_string(Some(run), "run_id")?);
                 }
-            } else {
-                collect_agent_ids(item, ids);
+                for key in ["agent", "delivery"] {
+                    if let Some(metadata) = object.get(key) {
+                        collect_ids(metadata, field, ids)?;
+                    }
+                }
+                return Ok(());
             }
-        }),
-        Value::Array(items) => items.iter().for_each(|item| collect_agent_ids(item, ids)),
+            for (key, item) in object {
+                if key == field && field != "run_id" {
+                    ids.insert(required_string(Some(item), field)?);
+                } else {
+                    collect_ids(item, field, ids)?;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_ids(item, field, ids)?;
+            }
+        }
         Value::String(text) => {
             if let Ok(decoded) = serde_json::from_str(text) {
-                collect_agent_ids(&decoded, ids);
+                collect_ids(&decoded, field, ids)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Formats the required host-visible notification-confirmation failure.
