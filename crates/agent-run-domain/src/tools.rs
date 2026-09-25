@@ -209,6 +209,9 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         | ("doc", "topic")
         | ("models", "provider" | "profile" | "model")
         | ("capacity_order", "model") => Some(ArgumentDefault::Null),
+        ("resume" | "cancel" | "steer" | "answer" | "transcript", "run_id") => {
+            Some(ArgumentDefault::Null)
+        }
         ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),
         ("transcript", "limit") => Some(ArgumentDefault::Integer(200)),

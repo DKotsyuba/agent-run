@@ -1,4 +1,7 @@
 agent-run answer for {{ agent_id }}
+{% if run_id %}
+- Run: {{ run_id }}
+{% endif %}
 
 - Status: {{ status }}
 {% if available %}

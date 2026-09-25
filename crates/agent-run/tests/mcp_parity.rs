@@ -139,44 +139,16 @@ fn socket_ready(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_socket())
 }
 
-/// The only text the Rust start description adds to the frozen Python baseline,
-/// inserted directly after its opening sentence (see the domain registry contract).
-const START_BINDING_GUIDANCE: &str = "Automatic PostToolUse hook binding requires a direct, host-visible mcp__agent_run__start or mcp__agent-run__start call; do not wrap or nest start inside functions.exec, a shell call, another tool, or any other indirect invocation when automatic binding is expected. If a direct call is unavailable, pass the current session identity in orchestrator; otherwise delivery remains bound:false and no completion notice will arrive automatically. ";
-
-/// The baseline start description's opening sentence, which the guidance follows.
-const START_OPENING: &str = "Start one asynchronous durable agent. ";
-
-/// Inserts the intentional binding guidance into every captured `start` tool
-/// description found anywhere in `value`, leaving all other bytes untouched.
-///
-/// The schema-2 catalog reads (`models`, `capacity_order`) take their extended
-/// description and filter schema from the registry, whose exact extension over
-/// the Python baseline is pinned by the domain `tool_registry` test.
+/// Apply the current provider and stable-identity extensions to the historical
+/// wire fixture. The domain tool_registry tests independently pin each allowed
+/// field delta; every other discovery/envelope field remains a golden comparison.
 fn extend_start_description(value: &mut Value) {
     match value {
         Value::Object(object) => {
-            if object.get("name").and_then(Value::as_str) == Some("start") {
-                if let Some(Value::String(description)) = object.get_mut("description") {
-                    *description = description.replacen(
-                        START_OPENING,
-                        &format!("{START_OPENING}{START_BINDING_GUIDANCE}"),
-                        1,
-                    );
-                }
-                // Schema-2 cutover: the start schema names a provider (pinned by the
-                // domain `tool_registry` test); take it from the registry.
-                if object.contains_key("inputSchema") {
-                    object.insert(
-                        "inputSchema".into(),
-                        agent_run_domain::tool("start")
-                            .unwrap()
-                            .input_schema
-                            .clone(),
-                    );
-                }
-            }
-            if let Some(name @ ("models" | "capacity_order")) =
-                object.get("name").and_then(Value::as_str)
+            if let Some(
+                name @ ("start" | "resume" | "cancel" | "steer" | "answer" | "transcript"
+                | "list_agents" | "models" | "capacity_order"),
+            ) = object.get("name").and_then(Value::as_str)
             {
                 if object.contains_key("inputSchema") {
                     let tool = agent_run_domain::tool(name).unwrap();

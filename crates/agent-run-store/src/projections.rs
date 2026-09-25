@@ -111,6 +111,8 @@ impl Store {
             )
         };
         Ok(AgentView {
+            parent_run_id: None,
+            run_id: None,
             agent_id: record.id.clone(),
             runtime: record.request.runtime,
             model: record.request.model,
@@ -232,6 +234,7 @@ impl Store {
             .then(|| messages.last().map(|message| message.seq))
             .flatten();
         Ok(TranscriptPage {
+            run_id: None,
             agent_id: id.clone(),
             messages,
             cursor,
@@ -246,6 +249,7 @@ impl Store {
         let record = self.get(id)?;
         let Some(path) = record.answer_path.clone() else {
             return Ok(AnswerView {
+                run_id: None,
                 agent_id: id.clone(),
                 status: record.status,
                 available: false,
@@ -281,6 +285,7 @@ impl Store {
             .to_string_lossy()
             .into_owned();
         Ok(AnswerView {
+            run_id: None,
             agent_id: id.clone(),
             status: record.status,
             available: true,
@@ -308,6 +313,7 @@ impl Store {
         let delivery = self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? ORDER BY terminal_event_seq DESC LIMIT 1", [record.id.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?))).optional()?;
         let Some((notification_id, state, attempts, ambiguous, last_error)) = delivery else {
             return Ok(DeliveryView {
+                run_id: None,
                 agent_id: record.id.clone(),
                 bound: record.orchestrator_session_id.is_some(),
                 orchestrator_session_id: record.orchestrator_session_id.clone(),
@@ -321,6 +327,7 @@ impl Store {
         };
         let evidence = self.conn.query_row("SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1", [notification_id.as_str()], |row| row.get::<_, String>(0)).optional()?;
         Ok(DeliveryView {
+            run_id: None,
             agent_id: record.id.clone(),
             bound: record.orchestrator_session_id.is_some(),
             orchestrator_session_id: record.orchestrator_session_id.clone(),

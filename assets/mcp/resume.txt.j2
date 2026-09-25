@@ -1,6 +1,9 @@
 agent-run resume accepted (asynchronous durable run)
 
-- ID: {{ agent_id }} — durable; this response is NOT a completion
+- Agent: {{ agent_id }} — {{ "stable across resumes" if run_id else "durable run" }}; this response is NOT a completion
+{% if run_id %}
+- Run: {{ run_id }}
+{% endif %}
 - Admission: {{ "created" if created else "replayed" }}
 - Status: {{ status }}{% if phase %} ({{ phase }}){% endif %}{{ "" }}
 - Route: {{ runtime }}/{{ model }} profile {{ profile }}
@@ -11,6 +14,6 @@ agent-run resume accepted (asynchronous durable run)
 - Attempt: {{ attempt_id }}
 {% endif %}
 {% if parent_agent_id %}
-- Parent: {{ parent_agent_id }} (native-context continuation)
+- Previous run: {{ parent_agent_id }} (native-context continuation)
 {% endif %}
 - Notice binding: {{ "bound" if bound else "not bound" }}; use list_agents, transcript, or answer with the ID above for progress and results

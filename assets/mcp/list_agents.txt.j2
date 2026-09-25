@@ -2,6 +2,9 @@ agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
 
 {% for agent in agents %}
 - {{ agent.id }}: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %} — {{ agent.runtime }}/{{ agent.model }} profile {{ agent.profile }}{{ "" }}
+{% if agent.run_id %}
+  run: {{ agent.run_id }}
+{% endif %}
 {% if agent.task %}
   task: {{ agent.task }}
 {% endif %}

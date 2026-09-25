@@ -121,6 +121,8 @@ fn python_transport_error_mapping_preserves_answer_integrity() {
 fn python_view_dtos_keep_field_order_and_nulls() {
     let id: AgentId = "ag-20260825-010203-0123456789".parse().unwrap();
     let view = AgentView {
+        parent_run_id: None,
+        run_id: None,
         agent_id: id.clone(),
         runtime: "codex".into(),
         model: "model".into(),
@@ -141,6 +143,7 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         answer_sha256: None,
         effort: None,
         delivery: DeliveryView {
+            run_id: None,
             agent_id: id.clone(),
             bound: false,
             orchestrator_session_id: None,
