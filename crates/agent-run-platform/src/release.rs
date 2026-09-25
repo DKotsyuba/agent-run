@@ -5,7 +5,6 @@
 //! migration all read release facts from here, so a binary's supported schema
 //! has a single source: [`STORE_SCHEMA_VERSION`].
 
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
@@ -17,9 +16,8 @@ pub const STORE_SCHEMA_VERSION: i64 = 19;
 
 /// Lowercase SHA-256 of one release file.
 fn digest(path: &Path) -> Result<String, String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(fs::read(path).map_err(|error| error.to_string())?)
+    Ok(crate::fs::sha256(
+        &fs::read(path).map_err(|error| error.to_string())?,
     ))
 }
 

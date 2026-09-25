@@ -108,9 +108,8 @@ fn executable(path: &Path, text: &str) {
 
 /// Writes the exact release checksum using the workspace's existing hash implementation.
 fn checksums(remote: &Path, asset: &str) {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(fs::read(remote.join(asset)).unwrap());
-    fs::write(remote.join("SHA256SUMS"), format!("{digest:x}  {asset}\n")).unwrap();
+    let digest = agent_run_platform::fs::sha256(&fs::read(remote.join(asset)).unwrap());
+    fs::write(remote.join("SHA256SUMS"), format!("{digest}  {asset}\n")).unwrap();
 }
 
 /// Fresh install, no-op and update keep permanent releases, custom home and state backups.

@@ -44,7 +44,13 @@ pub fn dumps(value: &Value, ensure_ascii: bool) -> Vec<u8> {
 /// `dumps` followed by SHA-256, lowercase hex — matches
 /// `hashlib.sha256(json.dumps(...).encode("utf-8")).hexdigest()`.
 pub fn sha256_hex(value: &Value, ensure_ascii: bool) -> String {
-    format!("{:x}", Sha256::digest(dumps(value, ensure_ascii)))
+    hex_digest(&Sha256::digest(dumps(value, ensure_ascii)))
+}
+
+/// Encodes digest bytes as two lowercase hex digits per byte, preserving leading zeros.
+/// An empty digest produces an empty string; this does not hash or mutate the input.
+pub fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn write_value(value: &Value, ensure_ascii: bool, out: &mut Vec<u8>) {

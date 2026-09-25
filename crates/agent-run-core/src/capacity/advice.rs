@@ -5,7 +5,6 @@
 //! drops high-resolution timestamps so it changes only on material capacity
 //! state, not on every collection tick.
 use super::{Forecast, Key};
-use sha2::{Digest, Sha256};
 
 const REMAINING_BUCKET_PERCENT: f64 = 5.0;
 const RESET_BUCKET_SECONDS: i64 = 300;
@@ -117,6 +116,5 @@ pub fn advice_key(items: &[CapacityAdvice]) -> String {
             .join("|")
         })
         .collect();
-    let digest = Sha256::digest(parts.join("::").as_bytes());
-    format!("{digest:x}")[..32].to_string()
+    agent_run_platform::fs::sha256(parts.join("::").as_bytes())[..32].to_string()
 }
