@@ -267,10 +267,11 @@ impl ServerHandler for Proxy {
         }
         let mut arguments = request.arguments.unwrap_or_default();
         // Read tools accept exactly the arguments their shared registry
-        // schema declares (none for `limits`, exact filters for the others).
+        // schema declares (none for `limits` and `delegation_guide`, exact
+        // filters for the others).
         if matches!(
             request.name.as_ref(),
-            "capacity_order" | "models" | "limits"
+            "capacity_order" | "models" | "limits" | "delegation_guide"
         ) {
             let declared = dispatch::tool(request.name.as_ref())
                 .map(|tool| tool.arguments())
@@ -300,7 +301,7 @@ impl ServerHandler for Proxy {
         )
         .await
         {
-            Ok(value) => Ok(tool_result(value)),
+            Ok(value) => Ok(guide_or_tool_result(request.name.as_ref(), value)),
             Err(error) => {
                 let public = error.public();
                 let message = if matches!(error, Error::BrokerUnavailable) {
@@ -340,6 +341,19 @@ fn tool_result(value: Value) -> CallToolResult {
     let mut result = CallToolResult::structured(value);
     result.content = vec![Content::text("result in structuredContent")];
     result
+}
+
+/// Render one tool success for `name`: every structured tool keeps the
+/// placeholder form above, while the plain-text `delegation_guide` exposes
+/// the dispatcher's JSON string as real text content with no placeholder,
+/// no JSON-encoded quoting, and no redundant structured object.
+fn guide_or_tool_result(name: &str, value: Value) -> CallToolResult {
+    match (name, value) {
+        ("delegation_guide", Value::String(text)) => {
+            CallToolResult::success(vec![Content::text(text)])
+        }
+        (_, value) => tool_result(value),
+    }
 }
 
 /// Render one domain failure as a tool result instead of a JSON-RPC protocol error.

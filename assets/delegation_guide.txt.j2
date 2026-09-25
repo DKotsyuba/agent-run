@@ -1,0 +1,29 @@
+agent-run delegation guide
+
+You choose the provider, model, and profile for each start; the broker
+picks the account automatically. Providers follow the current capacity
+order; guidance repeats configured operator prose, not a model ranking.
+{% if providers %}
+{% for provider in providers %}
+provider {{ provider.id }} (harness {{ provider.harness }})
+{% for entry in provider.guidance %}
+  provider guidance: {{ entry }}
+{% endfor %}
+{% for model in provider.models %}
+  - {{ model.id }}: quota {{ model.status }}, evidence {{ model.evidence }}{% if model.resets %}, resets in {{ model.resets }}{% endif %}{% if model.age %}, sample age {{ model.age }}{% endif %}
+    profiles: {{ model.profiles }}
+{% if model.params %}
+    params: {{ model.params }}
+{% endif %}
+{% if model.restrictions %}
+    restrictions: {{ model.restrictions }}
+{% endif %}
+{% for entry in model.guidance %}
+  model guidance: {{ entry }}
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% else %}
+No providers are currently configured.
+{% endif %}
+

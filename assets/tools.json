@@ -398,5 +398,16 @@
     "name": "limits",
     "outputSchema": null,
     "resultShape": null
+  },
+  {
+    "description": "Read one compact plain-text routing guide for orchestrators, derived from the same committed schema-2 snapshot as models: providers in capacity order with their harness, each exact selectable model id with its cached quota status and evidence, admissible profiles, configured default and allowed params, hard restrictions, and configured provider and model guidance prose. The caller alone chooses provider, model, effort, and profile; the broker picks the account automatically. Read-only over current config and committed observations; schema_version 1 is Unsupported. Prefer this over reading the full models JSON when only choosing a route; it is configured guidance, not a model-ability ranking.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "delegation_guide",
+    "outputSchema": null,
+    "resultShape": null
   }
 ]

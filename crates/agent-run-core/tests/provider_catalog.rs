@@ -484,6 +484,130 @@ async fn quota_standing_reports_freshness_and_exhaustion() {
     );
 }
 
+/// The delegation guide renders one committed snapshot as compact text:
+/// capacity order, configured guidance at both levels, per-model standing
+/// with derived freshness, admissible profiles, params, restrictions — and
+/// no account, credential, or endpoint identity.
+#[tokio::test]
+async fn delegation_guide_renders_guidance_order_and_privacy() {
+    let temp = home();
+    let root = temp.path();
+    let service = Service::new(root.to_path_buf());
+    let guide = service.delegation_guide().unwrap();
+    let text = guide.as_str().expect("guide is a string result");
+    let glm = text.find("provider glm").expect("glm listed");
+    let codex = text.find("provider codex").expect("codex listed");
+    assert!(glm < codex, "capacity order: glm first\n{text}");
+    assert!(text.contains("provider glm (harness claude-code)"));
+    // Configured recommendation prose at both levels, and only where
+    // configured: glm carries no guidance, so nothing is fabricated.
+    assert!(text.contains("provider guidance: native subscription"));
+    assert!(text.contains("model guidance: broad coding"));
+    assert_eq!(text.matches("provider guidance:").count(), 1);
+    assert_eq!(text.matches("model guidance:").count(), 1);
+    // One short line per exact model id, with honest standing: the fresh
+    // glm sample reads available, the never-observed codex lanes do not.
+    assert!(text.contains("- glm-5.3: quota available, evidence fresh"));
+    assert!(text.contains("- gpt-main: quota unknown, evidence missing"));
+    assert!(text.contains("- gpt-review: quota unknown, evidence missing"));
+    assert!(text.contains("profiles: code, review"));
+    assert!(text.contains("params: effort=medium; allowed effort: medium|high"));
+    assert!(text.contains("restrictions: web_tools_disabled"));
+    for private in [
+        "acct-",
+        "personal",
+        "secret-",
+        "keychain",
+        "api.example.com",
+        "roles_sha",
+        "config_revision",
+    ] {
+        assert!(!text.contains(private), "{private} leaked: {text}");
+    }
+}
+
+/// Guide standing stays honest under staleness and exhaustion: an expired
+/// sample reads `stale` with its derived age, an active latch reads
+/// `exhausted` with a derived reset horizon, and none looks healthy.
+#[tokio::test]
+async fn delegation_guide_reports_stale_and_exhausted_standings() {
+    let temp = ranking_home();
+    let root = temp.path();
+    agent_run_store::Store::open(root)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE capacity_samples SET valid_until=observed_at+1 WHERE lane='b-open'",
+            [],
+        )
+        .unwrap();
+    let reset = agent_run_core::domain::now() + 7200.0;
+    agent_run_store::Store::open(root)
+        .unwrap()
+        .conn
+        .execute(
+            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) \
+             VALUES('acct-a','acct-a::a-locked','collector','5h',?1,?2)",
+            rusqlite::params![reset - 7300.0, reset],
+        )
+        .unwrap();
+    let text = Service::new(root.to_path_buf())
+        .delegation_guide()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.contains("- a-locked: quota exhausted, evidence fresh, resets in 2h"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- b-open: quota unknown, evidence stale, sample age"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- a-open: quota available, evidence fresh"),
+        "{text}"
+    );
+}
+
+/// The guide is schema-2 only (legacy configs are typed `Unsupported`),
+/// takes no arguments, and states an explicitly empty catalog as such.
+#[tokio::test]
+async fn delegation_guide_is_strict_schema2_and_states_empty_catalogs() {
+    let legacy = tempfile::tempdir().unwrap();
+    agent_run_store::Store::initialize(legacy.path()).unwrap();
+    fs::write(legacy.path().join("config.toml"), "schema_version = 1\n").unwrap();
+    let service = Service::new(legacy.path().to_path_buf());
+    assert_eq!(
+        service
+            .delegation_guide()
+            .unwrap_err()
+            .machine_code()
+            .as_str(),
+        "Unsupported"
+    );
+    for bad in [json!({"unexpected": 1}), json!([])] {
+        let error = dispatch::call(&service, "delegation_guide", bad.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.machine_code().as_str(), "ValidationError", "{bad}");
+    }
+    let empty = tempfile::tempdir().unwrap();
+    agent_run_store::Store::initialize(empty.path()).unwrap();
+    fs::write(empty.path().join("config.toml"), "schema_version = 2\n").unwrap();
+    let text = Service::new(empty.path().to_path_buf())
+        .delegation_guide()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.contains("No providers are currently configured."),
+        "{text}"
+    );
+}
+
 /// Operator `limits` keeps two accounts sharing one provider lane apart.
 #[test]
 fn limits_keep_account_bound_rows_distinct() {

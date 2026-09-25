@@ -124,7 +124,11 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             service.limits()
         }
         "capacity_order" => service.capacity_order(args(raw)?),
-        // Socket-only control/discovery methods; not part of the eleven MCP tools.
+        "delegation_guide" => {
+            let _: Empty = args(raw)?;
+            service.delegation_guide()
+        }
+        // Socket-only control/discovery methods; not part of the twelve MCP tools.
         "tools" => {
             let _: Empty = args(raw)?;
             // The private socket discovery method predates MCP and returns the

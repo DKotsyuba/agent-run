@@ -10,14 +10,26 @@ fn golden() -> Vec<Value> {
 }
 
 /// Pin every public discovery field and registry ordering to the Python release.
+///
+/// The additive `delegation_guide` read has no entry in the frozen Python
+/// baseline, so it is excluded here and pinned separately by
+/// [`delegation_guide_is_the_additive_twelfth_tool`] — the historical fixture
+/// itself is never edited to conceal the expected difference.
 #[test]
 fn registry_matches_python_golden_field_by_field() {
     let expected = golden();
-    let actual = tools_json();
-    assert_eq!(actual.len(), 11);
+    let actual: Vec<Value> = tools_json()
+        .into_iter()
+        .filter(|tool| tool["name"] != "delegation_guide")
+        .collect();
+    assert_eq!(tools_json().len(), 12);
     assert_eq!(actual.len(), expected.len());
 
-    for (definition, (actual, mut expected)) in registry().iter().zip(actual.iter().zip(expected)) {
+    for (definition, (actual, mut expected)) in registry()
+        .iter()
+        .filter(|definition| definition.name != "delegation_guide")
+        .zip(actual.iter().zip(expected))
+    {
         assert_eq!(actual["name"], expected["name"]);
         // The schema-2 catalog reads extend the baseline: their descriptions
         // keep the Python text as a prefix, and they add only the exact
@@ -93,6 +105,21 @@ fn start_description_extends_the_python_baseline_exactly() {
         description.replacen(START_BINDING_GUIDANCE, "", 1),
         baseline
     );
+}
+
+/// The additive `delegation_guide` read extends the frozen Python table by
+/// exactly one no-argument, strict-object tool with its own error classes;
+/// no baseline entry exists for it and none is invented.
+#[test]
+fn delegation_guide_is_the_additive_twelfth_tool() {
+    let definition = tool("delegation_guide").expect("delegation_guide tool");
+    assert!(golden()
+        .iter()
+        .all(|tool| tool["name"] != "delegation_guide"));
+    assert!(definition.arguments().is_empty());
+    assert_eq!(definition.input_schema["additionalProperties"], false);
+    assert_eq!(definition.input_schema["properties"], serde_json::json!({}));
+    assert!(!definition.error_classes().is_empty());
 }
 
 /// Preserve dispatch defaults that JSON Schema deliberately does not encode.

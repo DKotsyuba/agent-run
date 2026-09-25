@@ -93,3 +93,19 @@ parameter keys are rejected until a launch adapter can execute them.
 
 A schema-1 file keeps its historical runtime roster and route order; the
 filters are `Unsupported` there.
+
+## Delegation guide
+
+`agent-run delegation-guide` (or the no-argument `delegation_guide` tool over
+MCP and the broker socket) renders the same committed snapshot as one compact
+plain-text page for an orchestrator choosing a route: a two-line usage header,
+then each provider in capacity order with its harness, configured provider
+guidance, and one short line per exact selectable model id — cached quota
+status and evidence (with sample age and reset horizon derived from
+`ranked_at`, never raw timestamps), the admissible canonical profiles
+(`profiles: none` marks a model no role may use), nonempty default and allowed
+params, hard restrictions, and configured model guidance. Schema 1 is
+`Unsupported`; an explicitly empty catalog says so. The text omits skills, MCP
+arrays, hashes, accounts, credentials, and endpoints, and repeats
+recommendation prose verbatim — it adds no model-ability ranking and no facts
+beyond the `models` snapshot it renders.

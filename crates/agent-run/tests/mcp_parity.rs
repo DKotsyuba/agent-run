@@ -191,8 +191,37 @@ fn extend_start_description(value: &mut Value) {
     }
 }
 
+/// The additive `delegation_guide` definition in its exact wire form: the
+/// registry entry with null result declarations omitted, as the SDK omits
+/// nulls on the wire. The frozen Python fixture has no such tool; parity
+/// expectations account for the addition explicitly instead of editing it.
+fn delegation_guide_wire() -> Value {
+    let mut value =
+        serde_json::to_value(agent_run_domain::tool("delegation_guide").unwrap()).unwrap();
+    value.as_object_mut().unwrap().retain(|key, value| {
+        !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
+    });
+    value
+}
+
+/// Appends the additive `delegation_guide` entry to every captured tools
+/// array anywhere in `value`, matching the registry's declaration order
+/// (last) so the expected list stays the advertised list.
+fn append_delegation_guide(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Array(tools)) = object.get_mut("tools") {
+                tools.push(delegation_guide_wire());
+            }
+            object.values_mut().for_each(append_delegation_guide);
+        }
+        Value::Array(items) => items.iter_mut().for_each(append_delegation_guide),
+        _ => {}
+    }
+}
+
 /// Read the captured Python exchange for one supported handshake protocol version,
-/// extended by the intentional start binding guidance.
+/// extended by the intentional start binding guidance and the additive tool.
 fn baseline(version: &str) -> Vec<Value> {
     let mut exchange = serde_json::from_str::<Value>(include_str!(
         "../../../tests/fixtures/baseline/mcp/handshake.json"
@@ -200,6 +229,7 @@ fn baseline(version: &str) -> Vec<Value> {
     .unwrap()[version]
         .clone();
     extend_start_description(&mut exchange);
+    append_delegation_guide(&mut exchange);
     exchange.as_array().unwrap().clone()
 }
 
@@ -261,6 +291,12 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     let mut expected: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/baseline/tools.json")).unwrap();
     extend_start_description(&mut expected);
+    // This fixture is the bare tool array (no "tools" wrapper), so the
+    // additive entry is appended directly, in registry declaration order.
+    expected
+        .as_array_mut()
+        .unwrap()
+        .push(delegation_guide_wire());
     for tool in expected.as_array_mut().unwrap() {
         tool.as_object_mut().unwrap().retain(|key, value| {
             !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()

@@ -120,7 +120,7 @@ Discover the authoritative surface at runtime:
 
 The tool set (same names as the MCP server) is exactly `start`, `resume`,
 `cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
-`doc`, `models`, and `limits`.
+`doc`, `models`, `delegation_guide`, and `limits`.
 
 See [continuations](continuations.md) for native-context `resume`, inherited
 authority, idempotency and history availability.
@@ -225,6 +225,12 @@ Notes for the loop:
 - Use `capacity_order` to choose the first compatible available route.
 - Use `models` for current runtime rosters and health; `limits` returns stored
   capacity projections without making provider calls.
+- `delegation_guide` (no params, schema 2 only) returns one compact plain-text
+  routing guide — providers in capacity order with each exact model id, cached
+  quota standing, admissible profiles, params, restrictions, and configured
+  guidance prose — instead of reading the full `models` JSON just to pick a
+  route. Its result is a JSON string here and real MCP text content on the MCP
+  transport; the CLI equivalent is `agent-run delegation-guide`.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit
