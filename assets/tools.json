@@ -440,7 +440,7 @@
     "resultShape": null
   },
   {
-    "description": "Read one compact plain-text routing guide for orchestrators, derived from the same committed schema-2 snapshot as models: providers in capacity order with their harness, each exact selectable model id with its cached quota status and evidence, admissible profiles, configured default and allowed params, hard restrictions, and configured provider and model guidance prose. The caller alone chooses provider, model, effort, and profile; the broker picks the account automatically. Read-only over current config and committed observations; schema_version 1 is Unsupported. Prefer this over reading the full models JSON when only choosing a route; it is configured guidance, not a model-ability ranking.",
+    "description": "Before delegating any task, the orchestrator MUST call this tool and read its output before choosing a provider, model, effort, or profile. Do not route from a remembered model list or a separate delegation skill. Returns a compact plain-text guide from current configuration and committed quota observations: providers in capacity order, exact models, quota standing/freshness, admissible profiles, supported parameters, restrictions, and configured recommendations. The orchestrator makes the task-specific choice; the broker selects the account unless explicitly pinned. Follow the start/resume tool contracts for launch, binding, continuation and verified results. Read-only; schema_version 1 is Unsupported. Configured recommendations are guidance, not an automatic model-ability ranking.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

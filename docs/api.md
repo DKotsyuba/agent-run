@@ -237,6 +237,11 @@ Notes for the loop:
   guidance prose — instead of reading the full `models` JSON just to pick a
   route. Its result is a JSON string here and real MCP text content on the MCP
   transport; the CLI equivalent is `agent-run delegation-guide`.
+  Before delegating a task, the orchestrator must call it and read the result
+  before choosing provider, model, effort or profile. Routing advice belongs in
+  provider/model `recommendations`, not a separately maintained delegation skill.
+  The tool does not select a model, authorize new access, or replace the
+  start/resume completion and permission contracts.
 - `answer` re-fetches a finished agent's result any time later by id —
   results are durable, a dropped connection loses nothing.
 - Set `"write": true` in `start` params only when the agent must edit

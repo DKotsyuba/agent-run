@@ -107,7 +107,7 @@ endpoints; the broker socket and CLI keep the full structured JSON above.
 
 `agent-run delegation-guide` (or the no-argument `delegation_guide` tool over
 MCP and the broker socket) renders the same committed snapshot as one compact
-plain-text page for an orchestrator choosing a route: a two-line usage header,
+plain-text page for an orchestrator choosing a route: a compact operating header,
 then each provider in capacity order with its harness, configured provider
 guidance, and one short line per exact selectable model id — cached quota
 status and evidence (with sample age and reset horizon derived from
@@ -118,3 +118,17 @@ params, hard restrictions, and configured model guidance. Schema 1 is
 arrays, hashes, accounts, credentials, and endpoints, and repeats
 recommendation prose verbatim — it adds no model-ability ranking and no facts
 beyond the `models` snapshot it renders.
+
+Before delegating a task, the orchestrator must call this tool and read its
+output before choosing provider, model, effort or profile. Keep task-suitability
+and cost guidance in each provider/model's `recommendations`; changes appear
+after configuration reload without editing an orchestration skill. Empty guidance
+does not establish a model's suitability. Model choice remains the orchestrator's
+decision; omit the account unless the request explicitly pins one.
+
+Use the advertised start/resume schemas and completion contract. A brief names
+the bounded deliverable, role, working directory, allowed reads/writes and checks.
+Codex read-only tasks include their workdir in read_roots; writable tasks must
+fit their granted workspace and cannot gain access from paths in the prompt.
+Respect requests to work personally, available capacity and permission refusals.
+Inspect the returned evidence rather than treating a terminal status as acceptance.
