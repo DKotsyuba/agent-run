@@ -15,6 +15,7 @@ dependencies = [
  "clap",
  "fs2",
  "libc",
+ "minijinja",
  "rmcp",
  "rusqlite",
  "serde",

@@ -1,0 +1,45 @@
+agent-run models — schema {{ 2 if schema == 2 else 1 }} {{ "provider catalog" if schema == 2 else "runtime rosters" }}
+
+{% if schema == 2 %}
+- capacity revision: {{ capacity_revision }}; the caller alone chooses provider, model, effort and profile
+{% if profiles %}
+
+profiles (canonical role grants, stated once):
+{% for role in profiles %}
+- {{ role.name }}: write={{ role.write }}, network={{ role.network }}{% if role.constraints %}, constraints: {{ role.constraints }}{% endif %}{{ "" }}
+{% endfor %}
+{% endif %}
+{% for provider in providers %}
+
+provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profiles %} — all models admit: {{ provider.profiles }}{% endif %}{{ "" }}
+{% for entry in provider.guidance %}
+  provider guidance: {{ entry }}
+{% endfor %}
+{% for model in provider.models %}
+  - {{ model.id }}{% if model.native_model %} ({{ model.native_model }}){% endif %}: {{ model.status }}, evidence {{ model.evidence }}{{ "" }}
+{% if model.profiles %}
+    profiles: {{ model.profiles }}
+{% endif %}
+{% if model.params %}
+    params: {{ model.params }}
+{% endif %}
+{% if model.restrictions %}
+    restrictions: {{ model.restrictions }}
+{% endif %}
+{% for entry in model.guidance %}
+    model guidance: {{ entry }}
+{% endfor %}
+{% endfor %}
+{% else %}
+no providers are currently configured
+{% endfor %}
+{% else %}
+{% for runtime in runtimes %}
+- {{ runtime.name }}: {% if runtime.available %}available{% else %}unavailable{% endif %}{% if runtime.reason %} ({{ runtime.reason }}){% endif %}{{ "" }}
+{% for id in runtime.models %}
+  model: {{ id }}
+{% endfor %}
+{% else %}
+no enabled runtimes are configured
+{% endfor %}
+{% endif %}

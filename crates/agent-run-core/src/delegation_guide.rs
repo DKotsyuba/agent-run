@@ -61,11 +61,11 @@ pub fn render(catalog: &Value) -> Result<String> {
         .into_iter()
         .flatten()
         .map(|provider| {
-            json!({
-                "id": provider["provider"].as_str().unwrap_or("unknown"),
-                "harness": provider["harness"].as_str().unwrap_or("unknown"),
-                "guidance": guidance(&provider["recommendations"]),
-                "models": provider["models"].as_array().into_iter().flatten().map(|model| {
+            let models: Vec<Value> = provider["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|model| {
                     let profiles = strings(&model["profiles"]).join(", ");
                     json!({
                         "id": model["model"].as_str().unwrap_or("unknown"),
@@ -82,8 +82,33 @@ pub fn render(catalog: &Value) -> Result<String> {
                         "restrictions": nonempty(&strings(&model["restrictions"]).join(", ")),
                         "guidance": guidance(&model["recommendations"]),
                     })
-                }).collect::<Vec<_>>(),
-            })
+                })
+                .collect();
+            // When every model admits the same nonempty profile set, state it
+            // once at the provider instead of repeating it per model.
+            let common = models
+                .iter()
+                .map(|model| model["profiles"].as_str().unwrap_or("none"))
+                .reduce(|left, right| if left == right { left } else { "" })
+                .filter(|common| !common.is_empty() && *common != "none")
+                .map(str::to_owned);
+            let mut provider = json!({
+                "id": provider["provider"].as_str().unwrap_or("unknown"),
+                "harness": provider["harness"].as_str().unwrap_or("unknown"),
+                "guidance": guidance(&provider["recommendations"]),
+                "models": models,
+            });
+            // Null (not removal) so strict-undefined templates still see a
+            // defined, falsy key after hoisting.
+            provider["profiles"] = common
+                .as_deref()
+                .map_or(Value::Null, |common| json!(common));
+            if common.is_some() {
+                for model in provider["models"].as_array_mut().into_iter().flatten() {
+                    model["profiles"] = Value::Null;
+                }
+            }
+            provider
         })
         .collect();
     environment()

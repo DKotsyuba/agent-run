@@ -510,7 +510,13 @@ async fn delegation_guide_renders_guidance_order_and_privacy() {
     assert!(text.contains("- glm-5.3: quota available, evidence fresh"));
     assert!(text.contains("- gpt-main: quota unknown, evidence missing"));
     assert!(text.contains("- gpt-review: quota unknown, evidence missing"));
-    assert!(text.contains("profiles: code, review"));
+    // Identical admissible profiles are stated once per provider, not
+    // repeated per model.
+    assert!(
+        text.contains("provider codex (harness codex) — all models admit: code, review"),
+        "{text}"
+    );
+    assert_eq!(text.matches("profiles:").count(), 0, "{text}");
     assert!(text.contains("params: effort=medium; allowed effort: medium|high"));
     assert!(text.contains("restrictions: web_tools_disabled"));
     for private in [

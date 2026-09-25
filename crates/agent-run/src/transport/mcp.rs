@@ -2,7 +2,7 @@
 use crate::{cli::CliBroker, dispatch, domain::OrchestratorRef, Error, Result};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+        CallToolRequestParams, CallToolResult, ErrorData, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
@@ -260,9 +260,9 @@ impl ServerHandler for Proxy {
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
         if !dispatch::is_tool(request.name.as_ref()) {
-            return Ok(tool_error(
+            return Ok(crate::transport::mcp_text::error_result(
                 "unknown_tool",
-                format!("unknown tool: {}", request.name),
+                format!("unknown tool: {}", request.name).as_str(),
             ));
         }
         let mut arguments = request.arguments.unwrap_or_default();
@@ -281,9 +281,9 @@ impl ServerHandler for Proxy {
                 .filter(|name| !declared.iter().any(|argument| argument.name == *name))
                 .collect();
             if !names.is_empty() {
-                return Ok(tool_error(
+                return Ok(super::mcp_text::error_result(
                     "ValidationError",
-                    python_unknown_arguments(names),
+                    python_unknown_arguments(names).as_str(),
                 ));
             }
         }
@@ -301,7 +301,10 @@ impl ServerHandler for Proxy {
         )
         .await
         {
-            Ok(value) => Ok(guide_or_tool_result(request.name.as_ref(), value)),
+            Ok(value) => Ok(crate::transport::mcp_text::success_result(
+                request.name.as_ref(),
+                &value,
+            )),
             Err(error) => {
                 let public = error.public();
                 let message = if matches!(error, Error::BrokerUnavailable) {
@@ -309,7 +312,10 @@ impl ServerHandler for Proxy {
                 } else {
                     public.message
                 };
-                Ok(tool_error(public.kind, message))
+                Ok(crate::transport::mcp_text::error_result(
+                    public.kind,
+                    &message,
+                ))
             }
         }
     }
@@ -334,32 +340,6 @@ fn python_unknown_arguments(names: Vec<&String>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("unknown arguments: [{names}]")
-}
-
-/// Render one successful broker value with Python's fixed text-content marker.
-fn tool_result(value: Value) -> CallToolResult {
-    let mut result = CallToolResult::structured(value);
-    result.content = vec![Content::text("result in structuredContent")];
-    result
-}
-
-/// Render one tool success for `name`: every structured tool keeps the
-/// placeholder form above, while the plain-text `delegation_guide` exposes
-/// the dispatcher's JSON string as real text content with no placeholder,
-/// no JSON-encoded quoting, and no redundant structured object.
-fn guide_or_tool_result(name: &str, value: Value) -> CallToolResult {
-    match (name, value) {
-        ("delegation_guide", Value::String(text)) => {
-            CallToolResult::success(vec![Content::text(text)])
-        }
-        (_, value) => tool_result(value),
-    }
-}
-
-/// Render one domain failure as a tool result instead of a JSON-RPC protocol error.
-fn tool_error(code: impl Into<String>, message: impl Into<String>) -> CallToolResult {
-    let data = json!({"error": {"code": code.into(), "message": message.into()}});
-    CallToolResult::structured_error(data)
 }
 
 /// Run the stdio server until EOF while retaining no local execution capability.
@@ -583,13 +563,17 @@ mod tests {
     }
 
     /// Mirrors `tests/test_mcp.py::McpSdkTests::test_domain_error_is_an_official_tool_error_result`
+    /// for the compact text presentation: a domain failure is one official
+    /// tool error line with its typed kind, never a JSON dump.
     #[test]
     fn domain_error_is_an_official_tool_error_result() {
-        let result = super::tool_error("AgentRunError", "controlled broker failure");
+        let result =
+            crate::transport::mcp_text::error_result("AgentRunError", "controlled broker failure");
         assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, None);
         assert_eq!(
-            result.structured_content.unwrap()["error"]["message"],
-            "controlled broker failure"
+            serde_json::to_value(&result.content).unwrap()[0]["text"],
+            "agent-run error AgentRunError: controlled broker failure\n"
         );
     }
 }

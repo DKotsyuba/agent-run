@@ -174,8 +174,10 @@ impl Broker {
         let _ = mcp.wait();
         assert_eq!(reply["id"], 2);
         assert_eq!(reply["result"]["isError"], true, "MCP: {reply}");
-        assert_eq!(
-            reply["result"]["structuredContent"]["error"]["code"], code,
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(code)),
             "MCP: {reply}"
         );
 
@@ -351,7 +353,10 @@ async fn delegation_guide_is_plain_text_on_every_public_transport() {
         "{text}"
     );
     assert!(text.contains("- fixture:"), "{text}");
-    assert!(text.contains("profiles: review"), "{text}");
+    assert!(
+        text.contains("provider glm-user (harness claude-code) — all models admit: review"),
+        "{text}"
+    );
     for private in [
         "acct-work",
         "synthetic-token",
@@ -427,8 +432,14 @@ async fn delegation_guide_is_plain_text_on_every_public_transport() {
     );
     assert_eq!(strict_reply["id"], 3);
     assert_eq!(strict_reply["result"]["isError"], true, "{strict_reply}");
-    assert_eq!(
-        strict_reply["result"]["structuredContent"]["error"]["code"], "ValidationError",
+    assert!(
+        strict_reply["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|line| line.contains("ValidationError")),
+        "{strict_reply}"
+    );
+    assert!(
+        strict_reply["result"].get("structuredContent").is_none(),
         "{strict_reply}"
     );
 }

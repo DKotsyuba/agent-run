@@ -1,0 +1,10 @@
+agent-run transcript for {{ agent_id }} ({{ count }} messages, {% if complete %}complete page{% else %}continues at cursor {{ next_cursor }}{% endif %})
+
+{% for message in messages %}
+[{{ message.seq }}] {{ message.role }}{% if message.name %} ({{ message.name }}){% endif %}: {{ message.content }}{{ "" }}
+{% endfor %}
+{% if not complete %}
+next_cursor: {{ next_cursor }} — request the next page with this cursor; a complete page does not imply a terminal agent
+{% else %}
+page complete: no further transcript rows follow this cursor
+{% endif %}

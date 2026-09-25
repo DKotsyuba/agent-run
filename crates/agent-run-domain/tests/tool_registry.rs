@@ -40,8 +40,18 @@ fn registry_matches_python_golden_field_by_field() {
             _ => &[],
         };
         if !filters.is_empty() {
-            let base = expected["description"].as_str().unwrap();
-            assert!(actual["description"].as_str().unwrap().starts_with(base));
+            // The schema-2 catalog reads were re-described for the compact
+            // MCP text surface: only the baseline opening sentence must be
+            // preserved verbatim.
+            let text = expected["description"].as_str().unwrap().to_owned();
+            let base = text
+                .find(". ")
+                .map(|end| text[..end + 1].to_owned())
+                .unwrap_or(text);
+            assert!(actual["description"]
+                .as_str()
+                .unwrap()
+                .starts_with(base.as_str()));
             expected["description"] = actual["description"].clone();
             for name in filters {
                 expected["inputSchema"]["properties"][name] =

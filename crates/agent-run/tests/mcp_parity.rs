@@ -242,6 +242,12 @@ fn initialize(version: &str) -> Value {
 
 /// Compare every observable non-time-dependent exchange from one captured Python session.
 /// Mirrors `test_mcp.py::test_official_client_negotiates_lists_and_calls_over_stdio`.
+///
+/// Initialize and tools/list stay byte-exact against the capture. Tool calls
+/// now render as compact plain text (the intentional new presentation): each
+/// reply keeps the captured id and isError verdict, errors name the captured
+/// typed code in their text, and successes equal our own renderer applied to
+/// the captured structured payload, pinning the text deterministically.
 #[test]
 fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
     for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
@@ -261,18 +267,49 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
             mcp.send(expected[2]["request"].clone()).unwrap(),
             expected[2]["response"]
         );
-        assert_eq!(
-            mcp.send(expected[3]["request"].clone()).unwrap(),
-            expected[3]["response"]
-        );
-        assert_eq!(
-            mcp.send(expected[4]["request"].clone()).unwrap(),
-            expected[4]["response"]
-        );
-        assert_eq!(
-            mcp.send(expected[5]["request"].clone()).unwrap(),
-            expected[5]["response"]
-        );
+        for index in [3usize, 4, 5] {
+            let reply = mcp.send(expected[index]["request"].clone()).unwrap();
+            let captured = &expected[index]["response"];
+            assert_eq!(reply["id"], captured["id"], "{version} item {index}");
+            assert_eq!(
+                reply["result"]["isError"], captured["result"]["isError"],
+                "{version} item {index}"
+            );
+            assert_eq!(
+                reply["result"]["content"][0]["type"], "text",
+                "{version} item {index}"
+            );
+            if captured["result"]["isError"] == true {
+                let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+                let code = captured["result"]["structuredContent"]["error"]["code"]
+                    .as_str()
+                    .unwrap();
+                assert!(text.contains(code), "{version} item {index}: {text}");
+                assert!(
+                    reply["result"].get("structuredContent").is_none(),
+                    "{version} item {index}"
+                );
+            } else {
+                let name = expected[index]["request"]["params"]["name"]
+                    .as_str()
+                    .unwrap();
+                let rendered =
+                    serde_json::to_value(agent_run::transport::mcp_text::success_result(
+                        name,
+                        &captured["result"]["structuredContent"],
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    reply["result"]["content"], rendered["content"],
+                    "{version} item {index}"
+                );
+                assert_eq!(
+                    reply["result"].get("structuredContent"),
+                    rendered.get("structuredContent"),
+                    "{version} item {index}"
+                );
+            }
+        }
         assert_eq!(mcp.send(expected[7]["request"].clone()), None);
         mcp.finish();
     }
@@ -306,7 +343,8 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     mcp.finish();
 }
 
-/// Verify the unavailable broker is a Python-shaped tool error, not a local fallback.
+/// Verify the unavailable broker stays an official typed tool error in the
+/// compact text presentation, not a local fallback or a JSON dump.
 #[test]
 fn mcp_broker_unavailable_matches_python_tool_error() {
     let expected: Vec<Value> = serde_json::from_str(include_str!(
@@ -320,9 +358,14 @@ fn mcp_broker_unavailable_matches_python_tool_error() {
         expected[0]["response"]
     );
     assert_eq!(mcp.send(expected[1]["request"].clone()), None);
-    assert_eq!(
-        mcp.send(expected[2]["request"].clone()).unwrap(),
-        expected[2]["response"]
+    let reply = mcp.send(expected[2]["request"].clone()).unwrap();
+    assert_eq!(reply["id"], expected[2]["response"]["id"]);
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("broker is not running"), "{text}");
+    assert!(
+        reply["result"].get("structuredContent").is_none(),
+        "{reply}"
     );
     mcp.finish();
 }

@@ -94,6 +94,16 @@ parameter keys are rejected until a launch adapter can execute them.
 A schema-1 file keeps its historical runtime roster and route order; the
 filters are `Unsupported` there.
 
+## MCP compact presentation
+
+Over MCP, `models` and `capacity_order` render as one compact plain-text
+page per call: providers in order with harness, per-model standing with
+derived freshness, admissible profiles (stated once when identical across
+models), params, restrictions, and configured guidance. The page omits
+skills/MCP arrays, hashes, accounts and endpoints, and promises nothing the
+template does not show; the broker socket and the CLI keep the full
+structured JSON above.
+
 ## Delegation guide
 
 `agent-run delegation-guide` (or the no-argument `delegation_guide` tool over

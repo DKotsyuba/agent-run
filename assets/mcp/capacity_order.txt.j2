@@ -1,0 +1,24 @@
+agent-run capacity order — schema {{ 2 if schema == 2 else 1 }} {{ "providers" if schema == 2 else "routes" }} by current quota standing (not model ability)
+
+{% if schema == 2 %}
+- capacity revision: {{ capacity_revision }}
+{% for provider in providers %}
+
+{{ loop.index }}. {{ provider.id }}{% if provider.score %} (score {{ provider.score }}{% if provider.multiplier %}, multiplier {{ provider.multiplier }}{% endif %}){% endif %}{{ "" }}
+{% for model in provider.models %}
+   - {{ model.id }}: {{ model.status }}, evidence {{ model.evidence }}{{ "" }}
+{% endfor %}
+{% else %}
+
+no providers are currently configured
+{% endfor %}
+{% else %}
+{% for route in routes %}
+{{ loop.index }}. {{ route.runtime }} (priority {{ route.priority }}){% if route.aliases %} aliases: {{ route.aliases }}{% endif %}{{ "" }}
+{% else %}
+no working routes
+{% endfor %}
+{% if unavailable %}
+unavailable runtimes: {{ unavailable }}{{ "" }}
+{% endif %}
+{% endif %}
