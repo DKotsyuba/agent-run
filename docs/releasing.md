@@ -37,10 +37,10 @@ smoke.
 
 ```bash
 release_root="$(mktemp -d)"
-cargo xtask release build-native --output "$release_root" --version 0.15.0
-cargo xtask release verify --release "$release_root/releases/0.15.0"
+cargo xtask release build-native --output "$release_root" --version 0.16.0
+cargo xtask release verify --release "$release_root/releases/0.16.0"
 cargo xtask archive --revision HEAD \
-  --output "$release_root/agent-run-0.15.0-source.tar" --verify
+  --output "$release_root/agent-run-0.16.0-source.tar" --verify
 ```
 
 `build-native` seals the current host binaries. The sealed directory contains the
@@ -57,8 +57,8 @@ one host's binary.
 3. Create and push an annotated tag from that accepted commit:
 
    ```bash
-   git tag -a v0.15.0 -m "agent-run 0.15.0"
-   git push origin v0.15.0
+   git tag -a v0.16.0 -m "agent-run 0.16.0"
+   git push origin v0.16.0
    ```
 
 After CI accepts the commit, the tagged `Release` workflow runs the macOS

@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-25
+
 ### Changed
 
 - Agent identities now remain stable across explicit resumes. Public responses
