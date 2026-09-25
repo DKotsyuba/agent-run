@@ -15,9 +15,9 @@ fn service() -> Service {
 }
 /// Mirrors `test_dispatch.py::test_tools_table_is_exactly_pinned`.
 #[test]
-fn packaged_table_has_exactly_the_shared_eleven_tools() {
+fn packaged_table_has_exactly_the_shared_twelve_tools() {
     let tools = dispatch::tools();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
     let names: std::collections::BTreeSet<_> =
         tools.iter().map(|v| v["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -44,7 +44,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     )
     .await
     .unwrap();
-    assert_eq!(response["result"].as_array().unwrap().len(), 11);
+    assert_eq!(response["result"].as_array().unwrap().len(), 12);
 }
 /// Mirrors `test_api_socket.py::test_unknown_method_and_validation_error`.
 #[tokio::test]
@@ -276,8 +276,21 @@ fn start_tool_description_embeds_the_completion_contract() {
         .expect("start tool");
     let description = start["description"].as_str().expect("description text");
     assert!(description.starts_with("Start one asynchronous durable agent."));
-    assert!(description.contains(dispatch::doc("completion").expect("completion contract")));
-    for field in ["- ID:", "- Status:", "- Runtime/model:", "- Notice:"] {
+    assert!(description.contains(
+        dispatch::doc("completion")
+            .expect("completion contract")
+            .split("\n## Stable agent and execution ids")
+            .next()
+            .unwrap()
+            .trim_end()
+    ));
+    for field in [
+        "- ID:",
+        "- Run:",
+        "- Status:",
+        "- Runtime/model:",
+        "- Notice:",
+    ] {
         assert!(description.contains(field), "missing {field}");
     }
 }
@@ -306,6 +319,7 @@ async fn huge_wait_is_rejected_without_panicking_or_opening_state() {
 }
 fn notice() -> Notice {
     Notice {
+        run_id: None,
         notification_id: "ntf_test".into(),
         agent_id: AgentId::new(),
         status: Status::Succeeded,

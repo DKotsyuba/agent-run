@@ -1,0 +1,26 @@
+agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
+
+{% for agent in agents %}
+- {{ agent.id }}: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %} — {{ agent.runtime }}/{{ agent.model }} profile {{ agent.profile }}{{ "" }}
+{% if agent.run_id %}
+  run: {{ agent.run_id }}
+{% endif %}
+{% if agent.task %}
+  task: {{ agent.task }}
+{% endif %}
+{% if agent.failure_kind %}
+  failure: {{ agent.failure_kind }}{% if agent.failure_text %}: {{ agent.failure_text }}{% endif %}{{ "" }}
+{% endif %}
+{% if agent.warned or agent.ambiguous or agent.delivery_error %}
+  diagnostics: {% if agent.warned %}warned; {% endif %}{% if agent.ambiguous %}delivery ambiguous; {% endif %}{{ agent.delivery_error }}{{ "" }}
+{% endif %}
+{% if agent.cleanup_unconfirmed %}
+  cleanup unconfirmed{% if agent.process_state %} (process {{ agent.process_state }}){% endif %}{{ "" }}
+{% endif %}
+  binding: {{ "bound" if agent.bound else "not bound" }} ({{ agent.delivery_state }}){{ "" }}
+{% endfor %}
+{% if complete %}
+page complete: no further matching rows (total {{ total }})
+{% else %}
+next offset: {{ next_offset }} — more matching rows remain
+{% endif %}

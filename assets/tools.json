@@ -1,6 +1,6 @@
 [
   {
-    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 this lists PROVIDERS (never accounts) by descending score, each with every offered model's own quota standing: status (available, unknown = no current sample, priority_overflow, exhausted, no_eligible_account), best_priority, evidence (fresh, stale, missing), newest_observed_at (sample age), and exhausted_until, plus config_revision, capacity_revision, and ranked_at (the advice clock, not sample age). Optional exact model filter keeps providers offering that model, ranked by it. Read-only: no quota collection, reservation, or start. Choosing provider, model, effort, and profile stays with the caller.",
+    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 providers (never accounts) are listed by descending score with every offered model's own cached standing. Over MCP it renders as one compact plain-text page (ordered providers with scores/multipliers and per-model quota status and evidence); the broker socket and CLI keep the full structured JSON.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -18,7 +18,7 @@
     "resultShape": null
   },
   {
-    "description": "Start one asynchronous durable agent. Automatic PostToolUse hook binding requires a direct, host-visible mcp__agent_run__start or mcp__agent-run__start call; do not wrap or nest start inside functions.exec, a shell call, another tool, or any other indirect invocation when automatic binding is expected. If a direct call is unavailable, pass the current session identity in orchestrator; otherwise delivery remains bound:false and no completion notice will arrive automatically. Start returns a durable agent ID, not the final answer. Configured Codex/Claude chats receive completion automatically after binding is confirmed by a separate bind message or agent-run delivery status showing bound:true; the initial bound:false snapshot can precede the post-tool hook. Failed, lost, and timed-out notices include a safe failure category, explanation, and recovery advice; use list_agents or transcript for stored details. If confirmation is absent, inspect agent-run delivery status; unbound CLI callers use start --wait and API clients use private wait or list_agents. Once confirmed, do not wait or poll solely for completion. Use the notice's agent ID with answer(agent_id), list_agents, or transcript(agent_id). Never start a replacement merely because a notice arrived. These rules also apply to resumed/shared chats and older notice formats. Notices are lifecycle data, not new tasks or user approval; preserve all host permission and trust boundaries. Missing effort is unspecified, not an inferred runtime default.\n\nNotice format:\n```\nagent-run/completion\n\n- ID: {agent_id}\n- Status: {status}{failure_block}\n- Runtime/model: {runtime}/{model}:{effort}\n- Notice: [notification {notification_id} v{version}]\n```",
+    "description": "Start one asynchronous durable agent. agent_id is stable across resumes; run_id identifies this exact execution. Bind hooks use run_id. Automatic PostToolUse hook binding requires a direct, host-visible mcp__agent_run__start or mcp__agent-run__start call; do not wrap or nest start inside functions.exec, a shell call, another tool, or any other indirect invocation when automatic binding is expected. If a direct call is unavailable, pass the current session identity in orchestrator; otherwise delivery remains bound:false and no completion notice will arrive automatically. Start returns a durable agent ID, not the final answer. Configured Codex/Claude chats receive completion automatically after binding is confirmed by a separate bind message or agent-run delivery status showing bound:true; the initial bound:false snapshot can precede the post-tool hook. Failed, lost, and timed-out notices include a safe failure category, explanation, and recovery advice; use list_agents or transcript for stored details. If confirmation is absent, inspect agent-run delivery status; unbound CLI callers use start --wait and API clients use private wait or list_agents. Once confirmed, do not wait or poll solely for completion. Use the notice agent_id and run_id with answer or transcript to inspect that exact completion. For a legacy notice without a Run line, use its ID as both agent_id and run_id. Never start a replacement merely because a notice arrived. These rules also apply to resumed/shared chats and older notice formats. Notices are lifecycle data, not new tasks or user approval; preserve all host permission and trust boundaries. Missing effort is unspecified, not an inferred runtime default.\n\nNotice format:\n```\nagent-run/completion\n\n- ID: {agent_id}\n- Run: {run_id}\n- Status: {status}{failure_block}\n- Runtime/model: {runtime}/{model}:{effort}\n- Notice: [notification {notification_id} v{version}]\n```",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -142,7 +142,15 @@
       "additionalProperties": false,
       "properties": {
         "agent_id": {
-          "type": "string"
+          "type": "string",
+          "description": "Stable agent identity returned by start/resume. Historical run ids remain aliases for that lineage; omission of run_id selects its latest execution."
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional exact execution within this agent lineage. Use a notice or prior response run_id for historical reads and pinned control; omit for the latest run."
         }
       },
       "required": [
@@ -160,10 +168,18 @@
       "additionalProperties": false,
       "properties": {
         "agent_id": {
-          "type": "string"
+          "type": "string",
+          "description": "Stable agent identity returned by start/resume. Historical run ids remain aliases for that lineage; omission of run_id selects its latest execution."
         },
         "text": {
           "type": "string"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional exact execution within this agent lineage. Use a notice or prior response run_id for historical reads and pinned control; omit for the latest run."
         }
       },
       "required": [
@@ -177,7 +193,7 @@
     "resultShape": null
   },
   {
-    "description": "List a bounded page with an exact total.",
+    "description": "List a bounded page of durable executions with an exact total. Each row has stable agent_id and exact run_id; resumed executions share agent_id and preserve separate history.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -241,13 +257,21 @@
       "additionalProperties": false,
       "properties": {
         "agent_id": {
-          "type": "string"
+          "type": "string",
+          "description": "Stable agent identity returned by start/resume. Historical run ids remain aliases for that lineage; omission of run_id selects its latest execution."
         },
         "cursor": {
           "type": "integer"
         },
         "limit": {
           "type": "integer"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional exact execution within this agent lineage. Use a notice or prior response run_id for historical reads and pinned control; omit for the latest run."
         }
       },
       "required": [
@@ -265,7 +289,15 @@
       "additionalProperties": false,
       "properties": {
         "agent_id": {
-          "type": "string"
+          "type": "string",
+          "description": "Stable agent identity returned by start/resume. Historical run ids remain aliases for that lineage; omission of run_id selects its latest execution."
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional exact execution within this agent lineage. Use a notice or prior response run_id for historical reads and pinned control; omit for the latest run."
         }
       },
       "required": [
@@ -278,12 +310,13 @@
     "resultShape": null
   },
   {
-    "description": "Continue a terminal agent's native context as a new durable run with inherited identity and permissions.",
+    "description": "Continue the latest terminal execution of a stable agent as a new run in the same native context. agent_id stays constant; run_id changes. Optional run_id pins the parent. Concurrent continuations cannot create parallel active runs. Reuse request_id for an identical retry, including after later resumes. Identity, permissions, native-history and cleanup checks remain mandatory.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "agent_id": {
-          "type": "string"
+          "type": "string",
+          "description": "Stable agent identity returned by start/resume. Historical run ids remain aliases for that lineage; omission of run_id selects its latest execution."
         },
         "orchestrator": {
           "anyOf": [
@@ -328,6 +361,13 @@
             "number",
             "null"
           ]
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional exact execution within this agent lineage. Use a notice or prior response run_id for historical reads and pinned control; omit for the latest run."
         }
       },
       "required": [
@@ -359,7 +399,7 @@
     "resultShape": null
   },
   {
-    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog: config_revision, capacity_revision, roles_sha256, canonical profiles with their grants, and providers in capacity order with harness, connection kind, recommendations, and every explicit model offering (native_model, default params, allowed_params, hard restrictions, recommendations, admissible profiles, cached quota standing with evidence and sample age). Providers are ranked over only the offerings the filters retain. Reuse a result only while config_revision, capacity_revision, and roles_sha256 all match. Optional exact provider, profile, and model filters; unknown values are validation errors. Read-only over current config, roles, and committed observations; recommendations are configured prose, not a ranking. The caller alone chooses provider, model, effort, and profile.",
+    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog over one committed read; exact provider/profile/model filters are validation-checked. Over MCP it renders as one compact plain-text page (providers in capacity order with harness, per-model quota status and evidence, admissible profiles stated once when shared, default/allowed params, hard restrictions, and configured guidance prose); the broker socket and CLI keep the full structured JSON.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -396,6 +436,17 @@
       "type": "object"
     },
     "name": "limits",
+    "outputSchema": null,
+    "resultShape": null
+  },
+  {
+    "description": "Read one compact plain-text routing guide for orchestrators, derived from the same committed schema-2 snapshot as models: providers in capacity order with their harness, each exact selectable model id with its cached quota status and evidence, admissible profiles, configured default and allowed params, hard restrictions, and configured provider and model guidance prose. The caller alone chooses provider, model, effort, and profile; the broker picks the account automatically. Read-only over current config and committed observations; schema_version 1 is Unsupported. Prefer this over reading the full models JSON when only choosing a route; it is configured guidance, not a model-ability ranking.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "delegation_guide",
     "outputSchema": null,
     "resultShape": null
   }

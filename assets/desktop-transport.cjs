@@ -15,7 +15,7 @@ if (!path.isAbsolute(executable || "") || !path.isAbsolute(home || "") || !contr
 /** Desktop native-tools pipe inherited only by this signed frontend. @type {string | undefined} */
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
 /** Private relay endpoint with a random suffix so PID reuse cannot collide. @type {string} */
-const relayPath = path.join(home, `ar-cdx-v3-${process.pid}-${crypto.randomBytes(3).toString("hex")}.sock`);
+const relayPath = path.join(home, `ar-cdx-v4-${process.pid}-${crypto.randomBytes(3).toString("hex")}.sock`);
 /** Trusted completion template embedded by the Rust executable. @type {{template: string, status_guidance: Record<string, {reason: string, advice: string}>, failure_guidance: Record<string, {reason: string, advice: string}>, default_failure: {reason: string, advice: string}}} */
 const NOTICE_CONTRACT = JSON.parse(contractJson);
 /** Notice marker version, independent of the accepted relay wire versions. @type {number} */
@@ -26,6 +26,8 @@ const LEGACY_KEYS = ["agent_id", "notification_id", "op", "status", "thread_id",
 const V2_KEYS = ["agent_id", "effort", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
 /** Failure-aware v3 request keys. @type {string[]} */
 const V3_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
+/** Stable-agent and exact-run v4 request keys. @type {string[]} */
+const V4_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id", "op", "run_id", "runtime", "status", "thread_id", "version"];
 /** Launch metadata bound in code points, matching the Rust notice contract. @type {number} */
 const META_LIMIT = 128;
 
@@ -174,7 +176,7 @@ function failureBlock(status, failureKind) {
 }
 
 /**
- * Validate an unknown v1/v2/v3 request and render fixed lifecycle text.
+ * Validate an unknown v1-v4 request and render fixed lifecycle text.
  * @param {unknown} request Decoded relay JSON containing no arbitrary prompt.
  * @returns {string} Escaped completion notice using notice contract v1.
  * @throws {Error} If keys, identifiers, metadata, version, or lifecycle are invalid.
@@ -184,10 +186,10 @@ function notice(request) {
     throw new Error("invalid request");
   const keys = JSON.stringify(Object.keys(request).sort());
   const legacy = keys === JSON.stringify(LEGACY_KEYS);
-  const v2 = keys === JSON.stringify(V2_KEYS), v3 = keys === JSON.stringify(V3_KEYS);
-  const rich = v2 || v3;
+  const v2 = keys === JSON.stringify(V2_KEYS), v3 = keys === JSON.stringify(V3_KEYS), v4 = keys === JSON.stringify(V4_KEYS);
+  const rich = v2 || v3 || v4;
   if (!legacy && !rich) throw new Error("invalid request");
-  if (request.version !== (legacy ? 1 : v2 ? 2 : 3) || request.op !== "completion")
+  if (request.version !== (legacy ? 1 : v2 ? 2 : v3 ? 3 : 4) || request.op !== "completion")
     throw new Error("invalid request");
   for (const key of ["agent_id", "notification_id", "thread_id", "status"])
     if (typeof request[key] !== "string" || !request[key].trim() || [...request[key]].length > 512 || request[key].includes("\0"))
@@ -197,19 +199,21 @@ function notice(request) {
       if (request[key] !== null &&
           (typeof request[key] !== "string" || !request[key].trim() || [...request[key]].length > META_LIMIT))
         throw new Error("invalid metadata");
-  if (v3 && request.failure_kind !== null &&
+  if ((v3 || v4) && request.failure_kind !== null &&
       (typeof request.failure_kind !== "string" || !request.failure_kind.trim() ||
        [...request.failure_kind].length > META_LIMIT))
     throw new Error("invalid metadata");
   if (!/^ag-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.agent_id) ||
+      (v4 && (typeof request.run_id !== "string" || !/^ag-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.run_id))) ||
       !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
       !["succeeded", "failed", "timed_out", "cancelled", "lost"].includes(request.status) ||
-      (v3 && request.failure_kind !== null && ["succeeded", "cancelled"].includes(request.status)))
+      ((v3 || v4) && request.failure_kind !== null && ["succeeded", "cancelled"].includes(request.status)))
     throw new Error("invalid lifecycle");
   return renderTemplate({
     agent_id: request.agent_id,
+    run_block: v4 ? `\n- Run: ${request.run_id}` : "",
     status: request.status,
-    failure_block: failureBlock(request.status, v3 ? request.failure_kind : null),
+    failure_block: failureBlock(request.status, (v3 || v4) ? request.failure_kind : null),
     runtime: metaText(request.runtime, "unknown"),
     model: metaText(request.model, "unknown"),
     effort: metaText(request.effort, "unspecified"),

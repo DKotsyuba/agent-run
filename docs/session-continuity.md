@@ -123,3 +123,28 @@ quota-triggered Codex failover is implemented: after an authoritative
 `quota_exhausted` failure of an automatic run, the supervisor allocates the
 next eligible account and continues the same native thread (see
 `provider-contract.md`).
+
+## Stable public agent identity
+
+The public `agent_id` is the existing lineage root. Each start or explicit
+resume also returns an immutable `run_id`, backed by its original `agents.id`
+row. No rows, answers, timings, native sessions or process ownership records
+are renumbered. Internal retries/account handoffs retain their existing attempt
+identity inside that run.
+
+Public tools resolve an agent id (including a historical run alias) to its
+latest run, or validate an explicit run_id within that lineage. This resolution
+is shared by CLI, MCP and socket operations. Reads and controls pin the selected
+run; request-id replay resolves its original parent before any latest-run
+terminal check. The existing transactional lineage and cleanup gates still
+forbid concurrent ownership and unsafe native continuation.
+
+For migration from earlier clients, use `run_id` to address an exact historical
+execution. New completion notices and hook responses carry both identities;
+hooks bind the exact run. The database schema is unchanged. See the embedded
+[completion guide](../assets/operator_guide/completion.md) for examples.
+
+Reconnect MCP frontends during this contract upgrade. A pre-stable-id frontend
+strips run_id from the admission result, so updating only the broker is not a
+supported cutover for automatic hook binding. Legacy delivery relays remain
+readable: their notice ID identifies the exact completed execution.

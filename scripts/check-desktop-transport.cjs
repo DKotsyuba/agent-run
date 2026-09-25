@@ -35,7 +35,7 @@ function receive(socket){return new Promise((resolve,reject)=>{/** @type {Buffer
  * @returns {Promise<string>} Absolute relay path after it appears.
  * @throws {Error} When no endpoint appears within the bounded polling window.
  */
-async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v3-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
+async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v4-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
 
 /**
  * Connect after the listening callback, tolerating the socket-file visibility race.
@@ -67,7 +67,7 @@ async function scenario(mode,request=valid){
     if(mode==='connection_cap'){const holders=await Promise.all(Array.from({length:8},()=>connectRelay(endpoint)));await new Promise(resolve=>setTimeout(resolve,20));const overflow=await connectRelay(endpoint);await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('overflow connection stayed open')),1000);overflow.once('close',()=>{clearTimeout(timer);resolve();});});for(const socket of holders)socket.destroy();return {overflowClosed:true,calls};}
     const client=await connectRelay(endpoint);const reply=receive(client);client.write(frame(request));const result=await reply;client.destroy();for(let i=0;i<100&&!output.includes('\n');i++)await new Promise(resolve=>setTimeout(resolve,10));const child=JSON.parse(output.trim());return {result,calls,hostPid:host.pid,child};
   }finally{
-    host.kill('SIGTERM');await new Promise(resolve=>host.once('close',resolve));for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));assert.equal(fs.readdirSync(directory).some(v=>v.startsWith('ar-cdx-v3-')),false);fs.rmSync(directory,{recursive:true,force:true});
+    host.kill('SIGTERM');await new Promise(resolve=>host.once('close',resolve));for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));assert.equal(fs.readdirSync(directory).some(v=>v.startsWith('ar-cdx-v4-')),false);fs.rmSync(directory,{recursive:true,force:true});
   }
 }
 
@@ -83,5 +83,10 @@ test('ninth concurrent local connection is refused',async()=>{const{overflowClos
 test('extra typed-request properties are rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,prompt:'inject'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
 test('missing typed-request properties are rejected before host contact',async()=>{const malformed={...valid};delete malformed.failure_kind;const{result,calls}=await scenario('accepted',malformed);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
 test('success with failure guidance is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,failure_kind:'prepare_failed'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-test('unsupported wire version is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,version:4});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
+test('unsupported wire version is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,version:5});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
 test('relay bind failure still runs the capability-stripped MCP child',async()=>{const directory=fs.mkdtempSync(path.join(os.tmpdir(),'ar-node-fallback-'));const blockedHome=path.join(directory,'file');fs.writeFileSync(blockedHome,'x');const child=spawn(process.execPath,['-e',frontend,'--',process.execPath,blockedHome,contract,'-e',"process.stdout.write(JSON.stringify({pipe:process.env.CODEX_APP_TOOLS_PIPE_PATH||null,node:process.env.CODEX_MCP_NODE_PATH||null}))"],{env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:path.join(directory,'host.sock'),CODEX_MCP_NODE_PATH:process.execPath},stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',data=>output+=data);const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});assert.equal(status,0);assert.deepEqual(JSON.parse(output),{pipe:null,node:null});fs.rmSync(directory,{recursive:true,force:true});});
+
+/** The current relay preserves both identities in the rendered completion. */
+test('v4 completion retains stable agent and exact run',async()=>{const request={...valid,version:4,run_id:'ag-20260925-000000-0000000002'};const{result,calls}=await scenario('accepted',request);assert.equal(result.outcome,'accepted');const prompt=calls[1].params.arguments.prompt;assert.ok(prompt.includes(`- ID: ${request.agent_id}\n- Run: ${request.run_id}\n`));});
+/** A malformed execution selector cannot reach the native host. */
+test('v4 malformed run identity is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,version:4,run_id:'injected\ntext'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});

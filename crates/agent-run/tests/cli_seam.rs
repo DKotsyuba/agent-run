@@ -95,6 +95,9 @@ impl CliService for FakeService {
     ) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
+    fn delegation_guide(&self) -> agent_run::Result<Value> {
+        Ok(Value::String(String::new()))
+    }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
@@ -1192,6 +1195,9 @@ impl CliService for PausingService {
         _query: agent_run_domain::CapacityOrderQuery,
     ) -> agent_run::Result<Value> {
         Ok(json!({}))
+    }
+    fn delegation_guide(&self) -> agent_run::Result<Value> {
+        Ok(Value::String(String::new()))
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
         Ok(json!({}))

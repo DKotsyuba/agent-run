@@ -145,37 +145,21 @@ impl Broker {
         let error: Value = serde_json::from_slice(&output.stderr).unwrap();
         assert_eq!(error["error"]["type"], code, "CLI: {error}");
 
-        let mut mcp = Command::new(env!("CARGO_BIN_EXE_agent-run"))
-            .arg("--home")
-            .arg(&self.home)
-            .arg("mcp")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut input = mcp.stdin.take().unwrap();
-        let mut replies = BufReader::new(mcp.stdout.take().unwrap());
-        for message in [
-            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}),
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start","arguments":{"provider":"glm-user","model":"fixture","profile":"review","task":"fixture:answer","workdir":self.home}}}),
-        ] {
-            writeln!(input, "{message}").unwrap();
-        }
-        input.flush().unwrap();
-        let mut reply = Value::Null;
-        for _ in 0..2 {
-            let mut line = String::new();
-            replies.read_line(&mut line).unwrap();
-            reply = serde_json::from_str(&line).unwrap();
-        }
-        drop(input);
-        let _ = mcp.wait();
+        let reply = mcp_tool(
+            &self.home,
+            "start",
+            json!({
+                "provider":"glm-user", "model":"fixture", "profile":"review",
+                "task":"fixture:answer", "workdir":self.home,
+            }),
+        )
+        .await;
         assert_eq!(reply["id"], 2);
         assert_eq!(reply["result"]["isError"], true, "MCP: {reply}");
-        assert_eq!(
-            reply["result"]["structuredContent"]["error"]["code"], code,
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(code)),
             "MCP: {reply}"
         );
 
@@ -208,6 +192,49 @@ fn cli(home: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// Execute one real MCP tool call with bounded I/O and guaranteed child cleanup.
+async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(home)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut input = child.stdin.take().unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        for message in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stable-id-test","version":"1"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+        ] {
+            input.write_all(format!("{message}\n").as_bytes()).await.unwrap();
+        }
+        input.flush().await.unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(output.read_line(&mut line).await.unwrap() > 0);
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            if reply["id"] == 2 {
+                break reply;
+            }
+        }
+    }).await.expect("MCP call deadline");
+    if tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .is_err()
+    {
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+    reply
 }
 
 /// The exported socket client sends the strict provider request the real
@@ -243,6 +270,132 @@ async fn broker_client_starts_through_the_real_schema2_dispatcher() {
     assert_eq!(typed.attempt_id.as_deref(), response["attempt_id"].as_str());
     assert!(typed.attempt_id.is_some());
     broker.wait_terminal(typed.agent_id.as_str());
+}
+
+/// Stable references survive repeated native resumes and old-request replay;
+/// exact historical reads remain available through both socket and CLI.
+#[tokio::test]
+async fn stable_agent_identity_survives_resume_history_and_concurrent_controls() {
+    let broker = Broker::start();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let mut request = broker.request("fixture:answer", "stable-start");
+    request.timeout_seconds = Some(10.0);
+    let started = client
+        .call("start", Some(serde_json::to_value(request).unwrap()))
+        .await
+        .unwrap();
+    let agent = started["agent_id"].as_str().unwrap().to_owned();
+    let mut runs = vec![started["run_id"].as_str().unwrap().to_owned()];
+    broker.wait_terminal(&runs[0]);
+    for number in 1..=2 {
+        let arguments = json!({
+            "agent_id":agent, "task":"fixture:answer", "timeout_seconds":10.0,
+            "request_id":format!("stable-resume-{number}")
+        });
+        let continued = if number == 2 {
+            let reply = mcp_tool(&broker.home, "resume", arguments).await;
+            assert_ne!(reply["result"]["isError"], true, "{reply}");
+            let identity = reply["result"]["structuredContent"].clone();
+            assert_eq!(identity.as_object().unwrap().len(), 2);
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(&format!("- Agent: {agent}")), "{text}");
+            assert!(
+                text.contains(identity["run_id"].as_str().unwrap()),
+                "{text}"
+            );
+            identity
+        } else {
+            let result = client.call("resume", Some(arguments)).await.unwrap();
+            assert_eq!(result["agent"]["agent_id"], agent);
+            result
+        };
+        assert_eq!(continued["agent_id"], agent);
+        let run = continued["run_id"].as_str().unwrap().to_owned();
+        assert!(!runs.contains(&run));
+        broker.wait_terminal(&run);
+        runs.push(run);
+    }
+    let store = agent_run::state::Store::open(&broker.home).unwrap();
+    let native = store
+        .get(&runs[0].parse().unwrap())
+        .unwrap()
+        .runtime_session_id;
+    for (index, run) in runs.iter().enumerate() {
+        let row = store.get(&run.parse().unwrap()).unwrap();
+        assert_eq!(row.root_agent_id.as_str(), agent);
+        assert_eq!(row.sequence as usize, index + 1);
+        assert_eq!(row.runtime_session_id, native);
+        let answer = client
+            .call("answer", Some(json!({"agent_id":agent,"run_id":run})))
+            .await
+            .unwrap();
+        assert_eq!(answer["agent_id"], agent);
+        assert_eq!(answer["run_id"], *run);
+        assert_eq!(answer["available"], true);
+        let output = cli(&broker.home, &["answer", &agent, "--run-id", run]);
+        assert!(output.status.success(), "{output:?}");
+        let from_cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(from_cli["agent_id"], agent);
+        assert_eq!(from_cli["run_id"], *run);
+    }
+    // A delayed retry must return the original child, not append a fourth turn.
+    let replay = client
+        .call(
+            "resume",
+            Some(json!({
+                "agent_id":agent,"task":"fixture:answer","timeout_seconds":10.0,
+                "request_id":"stable-resume-1"
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], agent);
+    assert_eq!(replay["run_id"], runs[1]);
+    let conflicting = client
+        .call(
+            "resume",
+            Some(json!({
+                "agent_id":agent,"task":"different intent","timeout_seconds":10.0,
+                "request_id":"stable-resume-1"
+            })),
+        )
+        .await;
+    assert!(conflicting.is_err());
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+    let latest = client
+        .call("answer", Some(json!({"agent_id":runs[1]})))
+        .await
+        .unwrap();
+    assert_eq!(latest["agent_id"], agent);
+    assert_eq!(latest["run_id"], runs[2]);
+
+    // A bounded hanging fixture keeps the winner active until explicitly cancelled.
+    let other = BrokerClient::new(broker.home.join("api.sock"));
+    let first = json!({"agent_id":agent,"task":"fixture:hang","timeout_seconds":10.0,"request_id":"stable-race-a"});
+    let second = json!({"agent_id":agent,"task":"fixture:hang","timeout_seconds":10.0,"request_id":"stable-race-b"});
+    let (left, right) = tokio::join!(
+        client.call("resume", Some(first)),
+        other.call("resume", Some(second))
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let winner = left.or(right).unwrap();
+    assert_eq!(winner["agent_id"], agent);
+    let active_run = winner["run_id"].as_str().unwrap();
+    let cancelled = client
+        .call("cancel", Some(json!({"agent_id":agent})))
+        .await
+        .unwrap();
+    assert_eq!(cancelled["run_id"], active_run);
+    broker.wait_terminal(active_run);
+    let active: i64 = store.conn.query_row(
+        "SELECT COUNT(*) FROM agents WHERE status IN ('created','starting','running','cancelling')", [], |row| row.get(0)
+    ).unwrap();
+    assert_eq!(active, 0);
 }
 
 /// Authoritative quota exhaustion (a durable native latch on the model's
@@ -329,4 +482,115 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
         .unwrap_err();
     assert!(matches!(malformed, Error::Validation(_)), "{malformed:?}");
     assert_eq!(malformed.public().kind, "ValidationError");
+}
+
+/// The delegation guide is one plain-text result on every public transport:
+/// the private socket envelope carries the dispatcher's JSON string, MCP
+/// exposes that string as real text content with no structured placeholder
+/// and no JSON quoting, and the CLI prints the text itself with a normal
+/// newline. Strict argument validation holds on the wire, and no account,
+/// credential, or endpoint identity appears in the text.
+#[tokio::test]
+async fn delegation_guide_is_plain_text_on_every_public_transport() {
+    let broker = Broker::start();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let guide = client
+        .call("delegation_guide", Some(json!({})))
+        .await
+        .unwrap();
+    let text = guide.as_str().expect("guide result is a string").to_owned();
+    assert!(
+        text.contains("provider glm-user (harness claude-code)"),
+        "{text}"
+    );
+    assert!(text.contains("- fixture:"), "{text}");
+    assert!(
+        text.contains("provider glm-user (harness claude-code) — all models admit: review"),
+        "{text}"
+    );
+    for private in [
+        "acct-work",
+        "synthetic-token",
+        "gateway.example",
+        "FAKE_TOKEN",
+    ] {
+        assert!(!text.contains(private), "{private} leaked: {text}");
+    }
+    let strict = client
+        .call("delegation_guide", Some(json!({"unexpected": true})))
+        .await
+        .unwrap_err();
+    assert_eq!(strict.public().kind, "ValidationError");
+
+    let output = cli(&broker.home, &["delegation-guide"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{text}\n"),
+        "CLI prints the text itself, not JSON"
+    );
+
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(&broker.home)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = mcp.stdin.take().unwrap();
+    for message in [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegation_guide","arguments":{}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"delegation_guide","arguments":{"unexpected":true}}}),
+    ] {
+        writeln!(input, "{message}").unwrap();
+    }
+    input.flush().unwrap();
+    let mut replies = BufReader::new(mcp.stdout.take().unwrap());
+    // rmcp serves requests concurrently, so the locally-rejected strict call
+    // can reply before the broker-backed guide call: match by id, not order.
+    let mut call = Value::Null;
+    let mut strict_reply = Value::Null;
+    for _ in 0..3 {
+        let mut line = String::new();
+        replies.read_line(&mut line).unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        match reply["id"].as_i64() {
+            Some(2) => call = reply,
+            Some(3) => strict_reply = reply,
+            _ => {}
+        }
+        if !call.is_null() && !strict_reply.is_null() {
+            break;
+        }
+    }
+    drop(input);
+    let _ = mcp.wait();
+    assert_eq!(call["id"], 2);
+    assert_eq!(call["result"]["isError"], false, "{call}");
+    assert_eq!(call["result"]["content"][0]["type"], "text", "{call}");
+    assert_eq!(call["result"]["content"][0]["text"], text, "{call}");
+    assert!(
+        call["result"].get("structuredContent").is_none(),
+        "no structured mirror: {call}"
+    );
+    assert_eq!(strict_reply["id"], 3);
+    assert_eq!(strict_reply["result"]["isError"], true, "{strict_reply}");
+    assert!(
+        strict_reply["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|line| line.contains("ValidationError")),
+        "{strict_reply}"
+    );
+    assert!(
+        strict_reply["result"].get("structuredContent").is_none(),
+        "{strict_reply}"
+    );
 }

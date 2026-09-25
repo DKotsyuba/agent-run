@@ -4,6 +4,37 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-25
+
+### Changed
+
+- Agent identities now remain stable across explicit resumes. Public responses
+  include an immutable `run_id` for each execution; historical reads and controls
+  accept that selector. Existing run ids remain aliases for their logical agent.
+- Completion notices and binding hooks distinguish the stable agent from the
+  exact completed run. Resume transport retries reuse an idempotency key.
+
+### Compatibility
+
+- **Breaking:** `agent_id` selects the latest execution of a lineage. Supply
+  `run_id` to retrieve or control a specific historical execution. Stored rows,
+  native history and the SQLite schema are unchanged.
+
+## [0.15.0] - 2026-09-25
+
+- feat(mcp)!: render all public tool results with compact, embedded MiniJinja
+  templates instead of duplicating the full structured JSON into model context;
+  preserve answer text, pagination, typed errors and actionable lifecycle diagnostics
+- feat(mcp): retain only the durable `agent_id` as structured metadata for
+  `start` and `resume`, preserving automatic chat binding; the broker socket
+  and existing CLI commands keep their structured JSON contracts
+- feat(delegation): add the read-only `delegation_guide` tool and
+  `agent-run delegation-guide` command with current provider order, quota
+  evidence, admissible profiles, configured effort choices and recommendation prose
+- feat(templates): keep provider/model guidance and shared profile lists compact,
+  with one template per tool and a shared error template; templates are sealed
+  with the binary and require no runtime filesystem loader
+
 ## [0.14.0] - 2026-09-24
 
 - fix(store): expire completed database history after fourteen days while

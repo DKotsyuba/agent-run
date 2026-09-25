@@ -488,6 +488,7 @@ async fn python_successful_tool_round_trip() {
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_surface_is_dispatch_tools_plus_control_methods`.
+/// The current shared surface additionally exposes the compact delegation guide.
 #[test]
 fn python_socket_surface_is_shared_tools_plus_controls() {
     let names = agent_run::dispatch::tools()
@@ -495,7 +496,8 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
         .collect::<std::collections::BTreeSet<_>>();
     assert!(names.contains("start") && names.contains("list_agents"));
-    assert_eq!(names.len(), 11);
+    assert!(names.contains("delegation_guide"));
+    assert_eq!(names.len(), 12);
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_wait_timeout_validation`.
