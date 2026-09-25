@@ -220,6 +220,7 @@ fn initialize(version: &str) -> Value {
 /// reply keeps the captured id and isError verdict, errors name the captured
 /// typed code in their text, and successes equal our own renderer applied to
 /// the captured structured payload, pinning the text deterministically.
+/// Legacy sessions must not acquire the newer SDK's resultType discriminator.
 #[test]
 fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
     for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
@@ -242,6 +243,10 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
         for index in [3usize, 4, 5] {
             let reply = mcp.send(expected[index]["request"].clone()).unwrap();
             let captured = &expected[index]["response"];
+            assert!(
+                reply["result"].get("resultType").is_none(),
+                "{version} item {index}: modern resultType leaked to a legacy session"
+            );
             assert_eq!(reply["id"], captured["id"], "{version} item {index}");
             assert_eq!(
                 reply["result"]["isError"], captured["result"]["isError"],
