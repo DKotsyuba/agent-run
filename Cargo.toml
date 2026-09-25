@@ -32,7 +32,7 @@ sha2 = "0.10"
 tempfile = "3.19"
 thiserror = "2.0"
 tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros", "process", "net", "io-util", "io-std", "signal", "time", "sync"] }
-toml = "0.8"
+toml = "1.1"
 uuid = { version = "1.16", features = ["v4"] }
 url = "2.5.8"
 rmcp = { version = "=1.8.0", default-features = false, features = ["server", "transport-io"] }
