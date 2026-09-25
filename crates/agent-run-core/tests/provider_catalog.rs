@@ -10,7 +10,8 @@ use agent_run_domain::{
 use serde_json::{json, Value};
 use std::{fs, path::Path};
 
-/// Writes the v2 config with `recommendation` on the codex provider.
+/// Writes the v2 config with `recommendation` on the codex provider and a
+/// distinctive account label so privacy assertions cannot match ordinary prose.
 fn write_config(root: &Path, recommendation: &str) {
     fs::write(
         root.join("config.toml"),
@@ -38,7 +39,7 @@ recommendations = ["broad coding"]
 id = "gpt-review"
 restrictions = ["web_tools_disabled"]
 [[providers.codex.bindings]]
-label = "personal"
+label = "private-codex-label"
 account = "acct-codex"
 [providers.glm]
 harness = "claude-code"
@@ -163,7 +164,7 @@ async fn catalog_is_revisioned_ordered_and_account_free() {
     let text = catalog.to_string();
     for private in [
         "acct-",
-        "personal",
+        "private-codex-label",
         "secret-",
         "keychain",
         "api.example.com",
@@ -521,7 +522,7 @@ async fn delegation_guide_renders_guidance_order_and_privacy() {
     assert!(text.contains("restrictions: web_tools_disabled"));
     for private in [
         "acct-",
-        "personal",
+        "private-codex-label",
         "secret-",
         "keychain",
         "api.example.com",
