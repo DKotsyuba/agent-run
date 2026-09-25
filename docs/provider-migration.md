@@ -10,7 +10,7 @@ the old broker and other agent-run writers are stopped:
 ```bash
 candidate=/absolute/path/to/new-sealed-release/bin/agent-run
 runtime_home="$HOME/.agent-run"
-old_release="$HOME/.agent-run/standalone/current"
+old_release="$(cd "$HOME/.agent-run/standalone/current" && pwd -P)"
 
 "$candidate" --home "$runtime_home" config migrate \
   --target-config /absolute/path/to/config-v2.toml --dry-run
@@ -24,6 +24,11 @@ and never picks vendor scripts or changes credentials automatically. Retired
 Lua settings may appear in the original configuration; the replacement must
 use the current configuration contract. The target is checked again against
 the staged database before publication.
+
+Resolve `current` to its immutable release directory before `--apply` and keep
+that release until rollback is no longer needed. The snapshot records this
+path; passing the movable `current` symlink would break verification after
+the installed pointer switches.
 
 The printed snapshot supports `config rollback --snapshot DIR` through the
 same candidate, while no later writes have occurred. It restores the original

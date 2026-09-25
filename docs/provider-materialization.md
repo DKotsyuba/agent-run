@@ -56,6 +56,5 @@ alias. Its compatibility-only removal points are
 `config::Adapter::Glm`, `adapters::glm::cli_model`,
 `materialize`'s old `Adapter::Glm` branch, the `fable`/GLM model mapping in
 `core::stream::plan_with_environment`, GLM-specific environment handling in
-`adapters::auth`, and the matching `core::supervisor` dispatch. The
-capacity source's legacy GLM mapping remains historical quota-side code. No
+`adapters::auth`, and the matching `core::supervisor` dispatch. No
 public permanent GLM launch alias is promised by the v2 path.

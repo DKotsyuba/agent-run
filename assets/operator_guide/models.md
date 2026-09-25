@@ -1,6 +1,6 @@
 # models
 
-## claude, codex, and glm
+## Historical schema 1: claude, codex, and glm
 
 Static rosters: whatever model ids are listed in each runtime's `models =
 [...]` in config.toml. There is nothing else to sync: the broker loads a valid
@@ -51,13 +51,14 @@ explicit offering with its
 chosen `effort` outside the list is refused at start and resume),
 hard `restrictions`, model `recommendations`, the canonical `profiles`
 admission would accept for it, and cached `quota`: `status` (`available`,
-`unknown` = no current sample, `priority_overflow`, `exhausted`,
+`unknown` = no usable known standing, `priority_overflow`, `exhausted`,
 `no_eligible_account`), `best_priority`, `evidence` (`fresh` = a current
 sample or an active exhaustion fact decided it, `stale` = samples exist but
-none is current, `missing` = never observed), `newest_observed_at` (the
-newest sample time on that lane, i.e. its age) and `exhausted_until` (the
+yield no usable known standing, `missing` = never observed), `newest_observed_at`
+(the newest sample timestamp on that lane) and `exhausted_until` (the
 earliest known reset when exhausted). These are cached facts, not health
-claims. With a `profile` filter, providers are ranked over only the
+claims; `unknown`/`stale` alone do not prove an expired validity timestamp.
+With a `profile` filter, providers are ranked over only the
 offerings that role can use. No account id, label or credential reference
 appears; per-account facts stay in `limits` (each account-bound row names
 its `account` and physical `pool`) and `accounts list`.
@@ -94,6 +95,20 @@ parameter keys are rejected until a launch adapter can execute them.
 A schema-1 file keeps its historical runtime roster and route order; the
 filters are `Unsupported` there.
 
+### GLM effort through Claude Code
+
+For `glm-5.3` and `glm-5.3-flash`, a wire check with Claude Code 2.1.280
+confirmed that `--effort low|high|max` reaches the Messages request unchanged
+as `output_config.effort`. Omitting the flag in that check sent `high`;
+do not assume that omission requests the provider's `max` default. Configure
+`params.effort` explicitly when a stable default matters.
+
+[Z.AI's effort contract](https://docs.z.ai/devpack/latest-model#switch-effort-thinking-intensity)
+maps `minimal|light|low` to `low`, `medium|high` to `high`, and
+`xhigh|max|ultra` to `max`. Explicit effort takes priority over the thinking
+toggle and provider default. This describes wire behavior, not a model-ability
+ranking; only use values admitted by the configured `allowed_params`.
+
 ## MCP compact presentation
 
 Over MCP, `models` renders providers in order with their harness, per-model
@@ -115,9 +130,9 @@ status and evidence (with sample age and reset horizon derived from
 (`profiles: none` marks a model no role may use), nonempty default and allowed
 params, hard restrictions, and configured model guidance. Schema 1 is
 `Unsupported`; an explicitly empty catalog says so. The text omits skills, MCP
-arrays, hashes, accounts, credentials, and endpoints, and repeats
-recommendation prose verbatim — it adds no model-ability ranking and no facts
-beyond the `models` snapshot it renders.
+arrays, hashes, accounts, credentials, and endpoints, and normalizes whitespace
+and control characters in configured recommendation prose — it adds no
+model-ability ranking and no facts beyond the `models` snapshot it renders.
 
 Before delegating a task, the orchestrator must call this tool and read its
 output before choosing provider, model, effort or profile. Keep task-suitability
@@ -128,7 +143,10 @@ decision; omit the account unless the request explicitly pins one.
 
 Use the advertised start/resume schemas and completion contract. A brief names
 the bounded deliverable, role, working directory, allowed reads/writes and checks.
-Codex read-only tasks include their workdir in read_roots; writable tasks must
-fit their granted workspace and cannot gain access from paths in the prompt.
+Codex grants the working directory automatically. `read_roots` adds other paths
+only when the selected role permits external reads; leave it empty when
+`allow_external_read_roots = false`. Writable tasks must fit their granted
+workspace and cannot gain access from paths in the prompt. The role owns write
+permission; the request's compatibility `write` flag cannot narrow or expand it.
 Respect requests to work personally, available capacity and permission refusals.
 Inspect the returned evidence rather than treating a terminal status as acceptance.

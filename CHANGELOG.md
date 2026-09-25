@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(continuations): use the existing idempotent broker client for CLI and MCP
+  resumes, preserving one request key across a bounded transport reconnect
+- docs: align operator guidance with current provider, permission, migration,
+  quota, continuation and transport contracts
+- docs(models): document verified GLM effort passthrough and explicit defaults;
+  cover low, high and max in the custom-provider adapter regression test
+
 ## [0.16.0] - 2026-09-25
 
 ### Changed

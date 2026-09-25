@@ -211,10 +211,12 @@ fn authoritative_positive(window: &QuotaWindow, fact: &QuotaWindow, at: f64) -> 
 ///
 /// A latched zero-remaining window survives a round that only produced
 /// unknown data for its pool (empty or `None` remaining) until its known
-/// reset time passes, or — when reset is absent — until actually fresh
-/// positive evidence arrives (`remaining > 0`, observed at least as late as
-/// the exhaustion and not later than `at`, validity unexpired, reset not
-/// passed). Fresh exhaustion, fresh
+/// reset time passes or complete fresh evidence settles every governed model,
+/// including when the prior reset is known. Positive evidence requires
+/// `remaining > 0`, observation at least as late as the exhausted fact and not
+/// later than `at`, unexpired validity and no passed reset. A fresher zero can
+/// replace the old fact as described by [`settled_latches`], from any source.
+/// Fresh exhaustion, fresh
 /// percentages, and expired resets are never overridden; carried facts keep
 /// their original observation times and collector source.
 ///
