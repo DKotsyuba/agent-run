@@ -2023,6 +2023,81 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
     assert_eq!(children, 0);
 }
 
+/// MCP rights can be revoked by either catalog or profile; new global servers
+/// never enter an existing session's frozen role or generated runtime assets.
+#[tokio::test]
+async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
+    let (_temp, home) = home_with(
+        "\n[mcp.shared]\ntransport='stdio'\ncommand='/bin/true'\nglobal=true\n",
+        &[],
+    );
+    let service = Service::new(home.clone());
+    let id = completed_parent(&home, &service, "mcp-parent").await;
+    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(
+        parent.status,
+        Status::Succeeded,
+        "{:?}",
+        parent.failure_text
+    );
+    let view = Store::open(&home)
+        .unwrap()
+        .agent_view_at(&id, agent_run_core::domain::now())
+        .unwrap();
+    assert_eq!(view.mcp.len(), 1);
+    assert_eq!(view.mcp[0].source, "global");
+    assert_eq!(view.mcp[0].allowed_tools, None);
+    let resume = |key: &str| {
+        service.admit_provider_resume(
+            &parent,
+            "fixture:answer".into(),
+            None,
+            Some(key.into()),
+            None,
+        )
+    };
+    let original = fs::read_to_string(home.join("config.toml")).unwrap();
+    edit_config(&home, |config| {
+        config["mcp"]["shared"]
+            .as_table_mut()
+            .unwrap()
+            .insert("allowed_tools".into(), toml::Value::Array(vec![]));
+    });
+    assert!(resume("catalog-revoked")
+        .unwrap_err()
+        .to_string()
+        .contains("role grants"));
+    fs::write(home.join("config.toml"), &original).unwrap();
+    let profile = home.join("profiles/review.md");
+    let body = fs::read_to_string(&profile).unwrap();
+    fs::write(
+        &profile,
+        body.replace("mcp = []", "mcp = [{name='shared',allowed_tools=[]}]"),
+    )
+    .unwrap();
+    assert!(resume("profile-revoked")
+        .unwrap_err()
+        .to_string()
+        .contains("role grants"));
+    fs::write(profile, body).unwrap();
+    assert_eq!(rows(&home), (1, 1));
+    fs::write(
+        home.join("config.toml"),
+        format!("{original}\n[mcp.later]\ntransport='stdio'\ncommand='/bin/true'\nglobal=true\n"),
+    )
+    .unwrap();
+    let resumed = resume("new-global-does-not-widen").unwrap();
+    let child: AgentId = serde_json::from_value(resumed["agent_id"].clone()).unwrap();
+    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    assert_eq!(
+        row.identity.as_ref().unwrap()["authority"]["role_payload"],
+        parent.identity.as_ref().unwrap()["authority"]["role_payload"]
+    );
+    run_to_end(&home, &child).await;
+    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+}
+
 /// A resumed child cancelled between admission and spawn never starts a
 /// process, releases its own attempt with never-spawned proof, and leaves
 /// the sealed native history byte-identical.

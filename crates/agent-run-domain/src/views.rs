@@ -50,10 +50,25 @@ pub struct CleanupView {
     pub process_group_id: Option<i32>,
 }
 
+/// Frozen MCP selection, not a claim of live connection or tool availability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSelectionView {
+    /// Catalog server name; credentials and executable arguments are never exposed.
+    pub name: String,
+    /// Selection source: `global`, `profile`, or `both`.
+    pub source: String,
+    /// Effective exact tool cap; null means all and an empty list means none.
+    pub allowed_tools: Option<Vec<String>>,
+}
+
 /// Read-only agent status, lineage, policy evidence, and observation snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentView {
+    /// Admitted MCP selections from the sealed role; omitted on historical/empty roles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpSelectionView>,
     /// Stable logical agent id; run_id distinguishes its executions.
     pub agent_id: AgentId,
     /// Exact execution id; absent only in historical pre-stable-id payloads.

@@ -42,7 +42,12 @@ fallback. Account aliases share observations and failure backoff.
 
 Canonical Markdown profiles select skills, MCP servers, permissions and required
 constraints. Shared `[mcp.<name>]` declarations contain a transport, command,
-arguments and optional environment names; profiles select their ids. Harnesses
+arguments and optional environment names. In schema 2, `global = true` selects
+a server for all new runs. `allowed_tools = ["read"]` limits its tools; omit
+the field for all tools or use `[]` for none. Profiles accept both server names
+and `{ name = "server", allowed_tools = ["read"] }` entries; their lists only
+narrow the catalog cap. See [MCP controls](../../docs/provider-config-v2.md#mcp-selection-and-tool-caps)
+for native harness limits. Harnesses
 own native settings, hooks, plugins and workspace roots. Provider models carry
 explicit native aliases, effort settings, recommendations and restrictions.
 

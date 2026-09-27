@@ -1264,11 +1264,14 @@ impl Service {
             .identity
             .as_ref()
             .and_then(|i| i.get("effective_policy"));
-        Ok(
-            json!({"agent_id":row.id,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
+        let mut view = json!({"agent_id":row.id,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"warned":false,"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
-            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending"}),
-        )
+            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending"});
+        let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
+        if !mcp.is_empty() {
+            view["mcp"] = serde_json::to_value(mcp)?;
+        }
+        Ok(view)
     }
     /// Reconcile a bounded fair page of rows whose recorded ownership is proven gone.
     ///
@@ -1369,7 +1372,7 @@ impl Service {
 /// current hard model restriction is absent from the frozen role,
 /// the current canonical role no longer grants something the frozen role
 /// used (write, network, external read roots, a read root, a skill or MCP
-/// server) or requires a constraint the frozen role lacks, or the current
+/// server/tool cap) or requires a constraint the frozen role lacks, or the current
 /// harness policy rejects the frozen grants. Advice and ranking weights are
 /// not compared. The frozen authority is never replaced by the current one.
 pub(crate) fn current_policy_permits(
@@ -1482,6 +1485,16 @@ pub(crate) fn current_policy_permits(
             .all(|root| now_role.read_roots.contains(root))
         || !frozen_skills.is_subset(&now_skills)
         || !frozen_mcp.is_subset(&now_mcp)
+        || !role.mcp.iter().all(|server| {
+            now_role.mcp.iter().any(|current| {
+                current.id == server.id
+                    && match (&server.allowed_tools, &current.allowed_tools) {
+                        (_, None) => true,
+                        (Some(frozen), Some(now)) => frozen.iter().all(|tool| now.contains(tool)),
+                        (None, Some(_)) => false,
+                    }
+            })
+        })
         || !now_role
             .required_constraints
             .is_subset(&role.required_constraints)
@@ -1500,6 +1513,16 @@ pub(crate) fn current_policy_permits(
         read_roots: role.read_roots.clone(),
         skills: frozen_skills.into_iter().collect(),
         mcp: frozen_mcp.into_iter().collect(),
+        mcp_tools: role
+            .mcp
+            .iter()
+            .filter_map(|server| {
+                server
+                    .allowed_tools
+                    .clone()
+                    .map(|tools| (server.id.clone(), tools))
+            })
+            .collect(),
         required_constraints: role.required_constraints.clone(),
     };
     if policy::evaluate(authority.provider.as_str(), &runtime, &frozen_profile)

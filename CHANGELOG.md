@@ -4,6 +4,22 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-27
+
+- feat(mcp): declare global servers once and narrow their exact tool sets in
+  catalog configuration and individual profiles; preserve existing string-only profiles
+- feat(mcp): use Codex native enabled_tools and Claude/GLM native disallowedTools
+  computed from bounded, authenticated tools/list discovery before each attempt;
+  MCP connections remain direct, with no filtering proxy
+- fix(lifecycle): journal temporary discovery process identities before execution,
+  clean them on errors and cancellation, and recover them after supervisor crashes
+- fix(resume): preserve frozen MCP selections and refuse newly revoked tool grants
+- feat(diagnostics): show selected MCP sources and tool counts in compact start/resume responses
+- docs: describe configuration examples and Claude's launch-time catalog limitation;
+  tools added after discovery are not covered by the generated deny list
+
+Existing schema-2 configuration and schema-20 databases need no migration.
+
 ## [0.16.1] - 2026-09-25
 
 - build(deps): update MCP, SQLite, hashing and TOML dependencies and GitHub

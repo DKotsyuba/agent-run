@@ -82,6 +82,39 @@ fn accounts() -> Vec<AccountRecord> {
     .collect()
 }
 
+/// Schema 2 preserves explicit MCP controls through normalization and snapshots.
+#[test]
+fn mcp_controls_validate_without_changing_legacy_defaults() {
+    let home = tempfile::tempdir().unwrap();
+    let base = format!(
+        "{}\n[mcp.shared]\ntransport='stdio'\ncommand='/bin/echo'\n",
+        document(home.path())
+    );
+    let config = ProviderConfig::parse(
+        &format!("{base}global=true\nallowed_tools=['read']\n"),
+        home.path(),
+    )
+    .unwrap();
+    assert!(config.mcp["shared"].global);
+    assert_eq!(
+        config.mcp["shared"].allowed_tools,
+        Some(vec!["read".into()])
+    );
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["mcp"]["shared"]["allowed_tools"],
+        serde_json::json!(["read"])
+    );
+    for tools in ["['*']", "['read','read']", "['']", "[1]"] {
+        assert!(
+            ProviderConfig::parse(&format!("{base}allowed_tools={tools}\n"), home.path()).is_err()
+        );
+    }
+    let legacy = ProviderConfig::parse(&base, home.path()).unwrap();
+    assert!(!serde_json::to_string(&legacy.mcp)
+        .unwrap()
+        .contains("allowed_tools"));
+}
+
 /// Native aliases share one account, custom providers retain their protocol,
 /// and defaults, model parameters, prose, and snapshots remain explicit.
 #[test]

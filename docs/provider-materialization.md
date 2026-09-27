@@ -28,6 +28,17 @@ Changed live settings cannot replace frozen permissions. The resulting
 The existing effective-policy evaluator runs at materialization and retry,
 so a required model constraint must have actual harness/profile enforcement.
 
+MCP selections and effective tool caps come from the sealed role, including
+global catalog selections. Codex writes the cap as native `enabled_tools`.
+After managed-service readiness and before each Claude/GLM harness spawn, the
+supervisor calls `mcp_catalog::apply_claude_tool_filters` with an ownership
+observer. Bounded stdio discovery computes native `--disallowedTools`; it does
+not relay subsequent tool calls. Before executing the discovery backend, a
+temporary stdin gate waits for its root identity to be journaled. Descendant
+snapshots are refreshed, and dead-supervisor recovery cleans recorded discovery
+processes before releasing the prepared attempt. No credential or catalog body
+is journaled. See [MCP selection and limits](provider-config-v2.md#mcp-selection-and-tool-caps).
+
 Native Codex uses the existing login and app-server invocation. Its selected
 `auth.json` link is bound per attempt outside the immutable asset manifest,
 so the same lineage home can retain history while the session consumer

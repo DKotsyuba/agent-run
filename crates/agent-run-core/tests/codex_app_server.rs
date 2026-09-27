@@ -51,6 +51,7 @@ fn profile() -> Profile {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: Default::default(),
     }
 }

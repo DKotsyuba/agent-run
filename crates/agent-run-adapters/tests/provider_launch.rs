@@ -146,6 +146,7 @@ fn role(root: &Path, network: bool) -> ResolvedRolePlan {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
     };
     resolve_role_plan(&profile, root, &BTreeMap::new(), "account", Some("work")).unwrap()
@@ -189,6 +190,7 @@ fn claude_provider_uses_frozen_role_as_plugin_skill_allowlist() {
         read_roots: vec![],
         skills: vec!["plugin-review".into()],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
     };
     let role = resolve_role_plan(

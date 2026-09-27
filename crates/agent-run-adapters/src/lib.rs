@@ -7,6 +7,7 @@ pub mod command_policy;
 pub mod glm;
 pub mod io;
 pub mod materialize;
+pub mod mcp_catalog;
 pub mod native_failure;
 pub mod plugins;
 pub mod provider;

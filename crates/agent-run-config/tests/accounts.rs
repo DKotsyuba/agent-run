@@ -67,6 +67,7 @@ fn role_plan_serializes_global_and_account_auth_choices() {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     let account = resolve_role_plan(

@@ -624,6 +624,15 @@ fn materialize_with_provider(
                         toml::Value::String(s.approval_mode.clone()),
                     );
                 }
+                if let Some(tools) = profile.mcp_tools.get(name) {
+                    // Codex owns discovery and dispatch filtering natively; no intermediary server is added.
+                    t.insert(
+                        "enabled_tools".into(),
+                        toml::Value::Array(
+                            tools.iter().cloned().map(toml::Value::String).collect(),
+                        ),
+                    );
+                }
                 servers.insert(name.clone(), toml::Value::Table(t));
             }
             if !servers.is_empty() {
@@ -844,6 +853,7 @@ mod tests {
             read_roots: vec![],
             skills: vec![],
             mcp: vec![],
+            mcp_tools: Default::default(),
             required_constraints: BTreeSet::new(),
         };
         (config, runtime, request, profile)

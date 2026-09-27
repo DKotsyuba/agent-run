@@ -138,6 +138,57 @@ fn dead_pre_spawn_supervisor_releases_prepared_attempt() {
     );
 }
 
+/// A dead supervisor's temporary MCP process must be gone before its prepared
+/// attempt is released. The fixture exits after ten seconds even on test abort.
+#[test]
+fn dead_pre_spawn_supervisor_cleans_journaled_mcp_discovery() {
+    use std::os::unix::process::CommandExt;
+    /// Owns and reaps only the finite fixture process, including assertion failures.
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        /// Terminates the exact unreaped child; no PID search or group guessing.
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut command = Command::new("/bin/sleep");
+    command.arg("10").process_group(0);
+    let mut child = Child(command.spawn().unwrap());
+    let mut owned = process::OwnedProcess::capture(child.0.id() as i32);
+    owned.refresh();
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store, None);
+    active(&store, &id, 4246, "fixture:dead:6", 6.0);
+    store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES('att_probe',?,1,'prepared','{}',?,'prepared',1)",rusqlite::params![id.as_str(),agent_run_core::domain::now()]).unwrap();
+    store.bind_attempt("att_probe");
+    store
+        .event(
+            &id,
+            "mcp_discovery_ownership",
+            &serde_json::to_value(owned.snapshot().unwrap()).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| ProcessState::Unknown)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(child.0.try_wait().unwrap().is_none());
+    reconcile_with(&mut store, 10, |_, _, _| ProcessState::Dead).unwrap();
+    assert!(child.0.try_wait().unwrap().is_some());
+    let active: i64 = store
+        .conn
+        .query_row(
+            "SELECT ownership_active FROM attempts WHERE id='att_probe'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+}
+
 /// A missing group does not prove that an attempt already claiming spawn left
 /// no child; reconciliation records loss but retains its ownership reservation.
 #[test]

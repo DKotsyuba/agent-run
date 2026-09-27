@@ -68,6 +68,7 @@ fn request_profile(workdir: &Path, write: bool) -> (StartRequest, Profile) {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     (request, profile)
@@ -375,6 +376,8 @@ fn python_codex_materialize_uses_only_resolved_mcp() {
     cfg.mcp.insert(
         "agent_lsp".into(),
         Mcp {
+            global: false,
+            allowed_tools: None,
             transport: "stdio".into(),
             command: "/usr/bin/echo".into(),
             args: vec!["serve".into()],
@@ -523,6 +526,8 @@ fn python_codex_materialize_requires_declared_mcp_definition() {
     cfg.mcp.insert(
         "server".into(),
         Mcp {
+            global: false,
+            allowed_tools: None,
             transport: "stdio".into(),
             command: "/usr/bin/true".into(),
             args: vec![],

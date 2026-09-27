@@ -11,7 +11,10 @@ use agent_run_domain::{
 };
 use agent_run_platform::fs;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 /// Return whether a profile basename is a safe configured identifier.
 fn valid_profile_name(value: &str) -> bool {
@@ -21,6 +24,11 @@ fn valid_profile_name(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
 }
+/// One parsed profile: identity, grants, and catalog selections.
+///
+/// `mcp` keeps the profile's declaration order for every consumer; a server
+/// named here may additionally carry an exact native tool allowlist in
+/// `mcp_tools`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -33,6 +41,12 @@ pub struct Profile {
     pub read_roots: Vec<PathBuf>,
     pub skills: Vec<String>,
     pub mcp: Vec<String>,
+    /// Per-server exact native tool allowlists declared by this role's
+    /// front matter. A selected server absent from this map inherits its
+    /// catalog declaration's full surface; the empty default is omitted on
+    /// serialization so historical profile snapshots keep their bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_tools: BTreeMap<String, Vec<String>>,
     pub required_constraints: BTreeSet<Constraint>,
 }
 #[derive(Debug, Deserialize)]
@@ -43,8 +57,58 @@ struct Meta {
     network: Option<bool>,
     allow_external_read_roots: Option<bool>,
     skills: Option<Vec<String>>,
-    mcp: Option<Vec<String>>,
+    /// Raw front-matter entries; each is a bare server name or an inline
+    /// `{ name = "...", allowed_tools = [...] }` selection, validated by
+    /// [`declared_server`].
+    mcp: Option<Vec<toml::Value>>,
     required_constraints: Option<Vec<Constraint>>,
+}
+
+/// Extracts one front-matter MCP selection.
+///
+/// Accepts a bare catalog name string or an inline table of exactly `name`
+/// plus an optional `allowed_tools` string list; any other shape or key is
+/// rejected so a typo can never silently widen the declared tool cap. The
+/// returned tools are `None` when the entry imposes no profile-side filter.
+fn declared_server(entry: &toml::Value) -> Result<(String, Option<Vec<String>>)> {
+    match entry {
+        toml::Value::String(name) => Ok((name.clone(), None)),
+        toml::Value::Table(table) => {
+            if table.get("name").and_then(toml::Value::as_str).is_none()
+                || table
+                    .keys()
+                    .any(|key| key != "name" && key != "allowed_tools")
+            {
+                return Err(invalid(
+                    "profile mcp tables must contain name and optional allowed_tools",
+                ));
+            }
+            let name = table["name"].as_str().unwrap_or_default().to_string();
+            let tools = match table.get("allowed_tools") {
+                None => None,
+                Some(declared) => {
+                    let items = declared.as_array().ok_or_else(|| {
+                        invalid("profile mcp allowed_tools must be a list of strings")
+                    })?;
+                    let mut tools = Vec::with_capacity(items.len());
+                    for item in items {
+                        tools.push(
+                            item.as_str()
+                                .ok_or_else(|| {
+                                    invalid("profile mcp allowed_tools must be a list of strings")
+                                })?
+                                .to_string(),
+                        );
+                    }
+                    Some(tools)
+                }
+            };
+            Ok((name, tools))
+        }
+        _ => Err(invalid(
+            "profile mcp entries must be names or { name, allowed_tools } tables",
+        )),
+    }
 }
 pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut a = roots.to_vec();
@@ -115,6 +179,10 @@ pub fn profile_path(directory: &std::path::Path, name: &str) -> Result<PathBuf> 
     }
     Ok(resolved)
 }
+/// Parses Markdown and strict TOML front matter without loading catalog assets.
+/// Canonical roles own grants; legacy grants can only narrow the request.
+/// MCP entries accept unique catalog names or named exact tool caps. Invalid
+/// metadata, unsafe read roots and duplicate/invalid selections are rejected.
 pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
     let (meta, body) = if let Some(rest) = text.strip_prefix("+++\n") {
         let (front, body) = rest
@@ -167,6 +235,25 @@ pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
     if !request.read_roots.is_empty() && !allow_external_read_roots {
         return Err(invalid("role forbids external read roots"));
     }
+    // Profile MCP selections accept bare names and inline
+    // `{ name, allowed_tools }` tables; a duplicate name would make the
+    // effective tool cap order-dependent, so duplicates are rejected.
+    let mut mcp = Vec::new();
+    let mut mcp_tools = BTreeMap::new();
+    for entry in meta.mcp.unwrap_or_default() {
+        let (server, tools) = declared_server(&entry)?;
+        if !config::name(&server) {
+            return Err(invalid("profile MCP must name a catalog server"));
+        }
+        if mcp.contains(&server) {
+            return Err(invalid("duplicate MCP server in profile mcp"));
+        }
+        if let Some(tools) = tools {
+            config::validate_allowed_tools("profile MCP allowed_tools", &tools)?;
+            mcp_tools.insert(server.clone(), tools);
+        }
+        mcp.push(server);
+    }
     let revision = meta.revision.unwrap_or_else(|| "legacy".into());
     domain::nonblank("profile revision", &revision)?;
     Ok(Profile {
@@ -179,10 +266,14 @@ pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
         allow_external_read_roots,
         read_roots: normalize_read_roots(&request.read_roots)?,
         skills: meta.skills.unwrap_or_default(),
-        mcp: meta.mcp.unwrap_or_default(),
+        mcp,
+        mcp_tools,
         required_constraints,
     })
 }
+/// Loads one historical schema-1 profile inside its configured directory and
+/// validates catalog references. Profile-side MCP tool caps are schema-2-only
+/// and fail here rather than being silently ignored by the legacy launch path.
 pub fn load(cfg: &Config, rt: &Runtime, request: &StartRequest) -> Result<Profile> {
     if !config::name(&request.profile) || request.profile.contains('.') {
         return Err(invalid("profile must be a configured name, not a path"));
@@ -197,6 +288,11 @@ pub fn load(cfg: &Config, rt: &Runtime, request: &StartRequest) -> Result<Profil
         std::str::from_utf8(&raw).map_err(|_| invalid("profile must be UTF-8"))?,
         request,
     )?;
+    if !p.mcp_tools.is_empty() {
+        return Err(invalid(
+            "profile MCP tool controls require config schema_version 2",
+        ));
+    }
     if p.canonical && (!rt.skills.is_empty() || !rt.mcp.is_empty()) {
         return Err(invalid(
             "canonical role cannot mix runtime skills or MCP declarations",

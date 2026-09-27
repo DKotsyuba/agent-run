@@ -124,6 +124,11 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             }
             let row = store.get(id)?;
             if !row.status.terminal() {
+                if let Ok((attempt, _)) = store.provider_attempt(id) {
+                    if !crate::lifecycle::reconcile::cleanup_mcp_discovery(&store, &attempt)? {
+                        return Err(error);
+                    }
+                }
                 if row
                     .identity
                     .as_ref()
@@ -443,7 +448,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         } else {
             identity.provider_request.task.as_str()
         };
-        let planned = adapters::provider::plan_selected_with(
+        let mut planned = adapters::provider::plan_selected_with(
             &config,
             &catalog,
             &identity.authority,
@@ -520,6 +525,33 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             return timed_out_before_spawn(id, store);
         }
         service_gate?;
+        if identity.authority.harness == HarnessId::ClaudeCode && !store.cancel_pending(id)? {
+            let ownership_home = home.to_owned();
+            let ownership_agent = id.clone();
+            let ownership_attempt = attempt_id.clone();
+            let remaining = Duration::try_from_secs_f64((deadline - domain::now()).max(0.0))
+                .unwrap_or(Duration::MAX);
+            let discovery =
+                adapters::mcp_catalog::apply_claude_tool_filters(&mut planned, move |snapshot| {
+                    let mut store = Store::open(&ownership_home)?;
+                    store.bind_attempt(&ownership_attempt);
+                    store.event(
+                        &ownership_agent,
+                        "mcp_discovery_ownership",
+                        &serde_json::to_value(snapshot)?,
+                    )
+                });
+            let discovered = tokio::time::timeout(remaining, discovery).await;
+            if discovered.is_err() {
+                if !crate::lifecycle::reconcile::cleanup_mcp_discovery(store, &attempt_id)?
+                    || !store.provider_never_spawned(id)?
+                {
+                    return Err(invalid("MCP discovery cleanup is unconfirmed"));
+                }
+                return timed_out_before_spawn(id, store);
+            }
+            discovered.expect("checked discovery deadline")?;
+        }
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
         if !store.provider_spawning(id, &attempt_id)? {

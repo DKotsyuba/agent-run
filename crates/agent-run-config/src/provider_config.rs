@@ -232,6 +232,20 @@ impl ProviderConfig {
                 "capacity.codexbar_binary is retired in schema 2; remove it",
             ));
         }
+        // MCP tool controls are schema-2 features that the shared schema-1
+        // pass rejects outright, so their lists are validated here and the
+        // controls are stripped from the shared view, then restored onto the
+        // expanded declarations below.
+        let controls: BTreeMap<String, (bool, Option<Vec<String>>)> = self
+            .mcp
+            .iter()
+            .map(|(id, server)| (id.clone(), (server.global, server.allowed_tools.clone())))
+            .collect();
+        for (_, tools) in controls.values() {
+            if let Some(tools) = tools {
+                config::validate_allowed_tools("MCP allowed_tools", tools)?;
+            }
+        }
         let mut shared = Config {
             schema_version: 1,
             core: self.core.clone(),
@@ -239,7 +253,16 @@ impl ProviderConfig {
             delivery: self.delivery.clone(),
             profiles: self.profiles.clone(),
             skills: self.skills.clone(),
-            mcp: self.mcp.clone(),
+            mcp: self
+                .mcp
+                .iter()
+                .map(|(id, server)| {
+                    let mut stripped = server.clone();
+                    stripped.global = false;
+                    stripped.allowed_tools = None;
+                    (id.clone(), stripped)
+                })
+                .collect(),
             environments: self.environments.clone(),
             runtimes: BTreeMap::new(),
         };
@@ -251,6 +274,14 @@ impl ProviderConfig {
         self.skills = shared.skills;
         self.mcp = shared.mcp;
         self.environments = shared.environments;
+        for (id, (global, allowed_tools)) in controls {
+            let server = self
+                .mcp
+                .get_mut(&id)
+                .expect("schema-1 pass preserves MCP ids");
+            server.global = global;
+            server.allowed_tools = allowed_tools;
+        }
         for (id, harness) in &mut self.harnesses {
             harness.binary = fs::expand(&harness.binary)?;
             harness.home = fs::expand(&harness.home)?;
