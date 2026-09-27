@@ -120,6 +120,12 @@ but cannot contact native host tools. Without both capabilities, the Rust MCP
 runs directly. Claude uses its configured local UDS transport. Unbound callers
 retrieve completion through `wait`, `answer`, or `list_agents`.
 
+Desktop tool calls identify their caller with `callerSource: "codex"` in the
+native host envelope. A correlated JSON-RPC invalid-parameters rejection is a
+known refusal, while disconnects after sending, uncorrelated replies and generic
+execution errors remain ambiguous. The frontend code lives in its MCP process;
+after updating it, reconnect the Agent Run MCP client as well as the broker.
+
 The frontend passes its PID to its Rust MCP child through a private environment
 marker. The child observes its own parent relationship every 250 milliseconds
 and exits if that relationship ends, even when inherited stdin stays open.
