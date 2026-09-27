@@ -88,6 +88,7 @@ fn adapter_selection_checks_identity_and_capabilities_before_runtime_use() {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: Default::default(),
     };
     let request: StartRequest = serde_json::from_value(json!({

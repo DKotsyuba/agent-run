@@ -86,6 +86,7 @@ fn request_profile(
         read_roots: vec![],
         skills,
         mcp,
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     (request, profile)
@@ -109,6 +110,8 @@ fn config(runtime: &Runtime, mcp: BTreeMap<String, Mcp>) -> Config {
 /// Returns a stdio MCP definition with the requested arguments.
 fn mcp(args: &[&str]) -> Mcp {
     Mcp {
+        global: false,
+        allowed_tools: None,
         transport: "stdio".into(),
         command: PathBuf::from("/bin/echo"),
         args: args.iter().map(|arg| (*arg).into()).collect(),

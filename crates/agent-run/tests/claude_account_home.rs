@@ -72,6 +72,7 @@ fn run_config_dir(home: &Path) -> agent_run_domain::Result<String> {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     let host: BTreeMap<String, String> = [("HOME", home), ("PATH", Path::new("/usr/bin"))]

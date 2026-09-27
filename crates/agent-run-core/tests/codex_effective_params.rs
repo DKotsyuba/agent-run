@@ -400,6 +400,7 @@ fn read_only_profile(read_roots: Vec<PathBuf>) -> Profile {
         read_roots,
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     }
 }

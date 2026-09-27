@@ -39,6 +39,7 @@ fn profile(name: &str, write: bool, network: bool, reads: Vec<PathBuf>) -> Profi
         read_roots: reads,
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     }
 }

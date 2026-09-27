@@ -139,6 +139,11 @@ impl Default for Delivery {
 pub struct Catalog {
     pub directory: Option<PathBuf>,
 }
+/// One role-accessible MCP server declaration.
+///
+/// Both fields of the schema-2 tool controls are absent from historical
+/// schema-1 files, and their serde defaults keep those files' serialization
+/// and byte digests unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mcp {
@@ -150,6 +155,21 @@ pub struct Mcp {
     pub env_from: Vec<String>,
     #[serde(default = "auto")]
     pub approval_mode: String,
+    /// Schema-2 only: selects this server for every canonical role, even
+    /// when the role's profile does not name it. Schema-1 files must leave
+    /// it unset because their launch path cannot honor the flag.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub global: bool,
+    /// Schema-2 only: exact, case-sensitive native tool names this server
+    /// may expose. `None` exposes the server's full surface, an empty list
+    /// exposes nothing, and list entries are never wildcard patterns; the
+    /// effective cap is the intersection with the role's own profile filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+/// Returns whether a boolean is `false`, for skipping default serialization.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 fn auto() -> String {
     "auto".into()
@@ -315,6 +335,35 @@ fn names(v: &[String], label: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Upper bound on one MCP `allowed_tools` list, keeping a validated
+/// declaration and every derived frozen role payload small.
+const MAX_ALLOWED_TOOLS: usize = 1024;
+
+/// Validates one exact native tool allowlist.
+///
+/// Entries use MCP's recommended 1–128 byte ASCII letters, digits, `_`, `-`,
+/// or `.` spelling, with no wildcards, and must be unique. Declaration order is preserved here; the shared
+/// role resolver sorts the effective intersection. An empty list is valid
+/// and means the server exposes no tools.
+pub fn validate_allowed_tools(label: &str, tools: &[String]) -> Result<()> {
+    if tools.len() > MAX_ALLOWED_TOOLS {
+        return Err(invalid(format!(
+            "{label} exceeds {MAX_ALLOWED_TOOLS} entries"
+        )));
+    }
+    unique(tools, label)?;
+    if tools.iter().any(|tool| {
+        !(1..=128).contains(&tool.len())
+            || !tool
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    }) {
+        return Err(invalid(format!(
+            "{label} requires exact MCP tool names (1–128 ASCII letters, digits, _, -, .)"
+        )));
+    }
+    Ok(())
+}
 fn positive(v: f64, label: &str) -> Result<()> {
     if !v.is_finite() || v <= 0. {
         return Err(invalid(format!("{label} must be positive and finite")));
@@ -474,6 +523,18 @@ impl Config {
             if m.env_from.iter().any(|s| !env_name(s)) || m.args.iter().any(|s| s.contains('\0')) {
                 return Err(invalid("invalid MCP argument/environment declaration"));
             }
+            // Tool controls are schema-2 features: a historical schema-1 file
+            // declares them only by mistake, and the schema-1 launch path
+            // could only silently ignore them, so they fail closed here.
+            if m.global || m.allowed_tools.is_some() {
+                return Err(invalid(
+                    "MCP tool controls (global, allowed_tools) require config schema_version 2",
+                ));
+            }
+            validate_allowed_tools(
+                "MCP allowed_tools",
+                m.allowed_tools.as_deref().unwrap_or(&[]),
+            )?;
         }
         for (n, e) in &mut self.environments {
             if !name(n) {

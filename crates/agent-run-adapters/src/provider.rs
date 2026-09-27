@@ -133,6 +133,16 @@ fn profile(role: &ResolvedRolePlan) -> Profile {
         read_roots: role.read_roots.clone(),
         skills: role.skills.iter().map(|skill| skill.id.clone()).collect(),
         mcp: role.mcp.iter().map(|server| server.id.clone()).collect(),
+        mcp_tools: role
+            .mcp
+            .iter()
+            .filter_map(|server| {
+                server
+                    .allowed_tools
+                    .clone()
+                    .map(|tools| (server.id.clone(), tools))
+            })
+            .collect(),
         required_constraints: role.required_constraints.clone(),
     }
 }

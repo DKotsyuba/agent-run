@@ -66,6 +66,7 @@ fn identity(home: &common::Home, request: &StartRequest, write_override: Option<
         read_roots: request.read_roots.clone(),
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     let policy = policy::evaluate(&request.runtime, runtime, &profile);

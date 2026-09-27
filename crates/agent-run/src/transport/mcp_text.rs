@@ -196,6 +196,11 @@ fn agent_fields(view: &Value) -> Value {
             "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"),
         "runtime": view["runtime"], "model": view["model"], "profile": view["profile"],
         "phase": text("phase"), "effort": text("effort"),
+        "mcp": view["mcp"].as_array().into_iter().flatten().take(8).map(|server| json!({
+            "name": server["name"], "source": server["source"],
+            "tools": server["allowed_tools"].as_array().map(|tools| tools.len().to_string()).unwrap_or_else(|| "all".into()),
+        })).collect::<Vec<_>>(),
+        "mcp_more": view["mcp"].as_array().map_or(0, |servers| servers.len().saturating_sub(8)),
         "task": text("task_summary"),
         "failure_kind": text("failure_kind"),
         "failure_text": text("failure_text"),
@@ -548,6 +553,29 @@ mod tests {
             assert!(page.contains("glm-user/glm-5.3 profile review"), "{page}");
             assert!(page.contains("not bound"), "{page}");
             assert!(page.ends_with('\n') && !page.ends_with("\n\n"), "{page:?}");
+        }
+    }
+
+    /// Selected MCPs are summarized without claiming that admission proved availability.
+    #[test]
+    fn start_reports_frozen_mcp_selection_compactly() {
+        let mut agent = agent_view();
+        agent["mcp"] = json!([
+            {"name":"shared","source":"global","allowed_tools":null},
+            {"name":"tracker","source":"both","allowed_tools":["read"]},
+            {"name":"empty","source":"profile","allowed_tools":[]}
+        ]);
+        let value = json!({"agent_id":"ag-1","created":true,"agent":agent});
+        for tool in ["start", "resume"] {
+            let page = text(tool, &value);
+            assert!(page.contains("availability not verified"), "{page}");
+            assert!(
+                page.contains(
+                    "shared (global, tools=all); tracker (both, tools=1); empty (profile, tools=0)"
+                ),
+                "{page}"
+            );
+            assert!(!page.contains("allowed_tools"));
         }
     }
 

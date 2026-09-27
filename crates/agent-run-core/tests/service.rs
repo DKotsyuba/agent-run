@@ -64,6 +64,7 @@ fn identity(home: &common::Home, request: &agent_run_domain::domain::StartReques
         read_roots: request.read_roots.clone(),
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     let policy = policy::evaluate(&request.runtime, runtime, &profile);
@@ -208,6 +209,7 @@ fn python_test_service_required_unsupported_policy_refuses_admission() {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::from([Constraint::ExternalNetworkIsolation]),
     };
     let policy = policy::evaluate("mock", runtime, &profile);
@@ -251,6 +253,7 @@ fn python_test_service_live_plugin_cannot_satisfy_immutability() {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::from([Constraint::PluginImmutability]),
     };
     let mut configured = runtime.clone();
@@ -328,6 +331,7 @@ fn python_test_service_claude_account_uses_private_credential_home() {
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     let env = agent_run_core::adapters::materialize::environment(

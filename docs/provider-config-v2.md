@@ -106,6 +106,64 @@ the sealed adapter APIs that consume this configuration.
 The [one-time migration plan](provider-migration.md) requires explicit
 runtime, model, account, and harness mappings before any later apply step.
 
+## MCP selection and tool caps
+
+Declare a stdio server once in the shared catalog. `global` is optional and
+defaults to false; when true it joins every new run's profile-selected MCPs.
+Only selected servers are materialized. Existing running/resumed sessions keep
+their frozen selection rather than importing newly configured global servers.
+
+```toml
+[mcp.tracker]
+transport = "stdio"
+command = "/opt/tracker/connect"
+env_from = ["TRACKER_TOKEN"]
+global = true
+allowed_tools = ["get_context", "update_task"]
+```
+
+The profile's Markdown TOML front matter supports both forms:
+
+```toml
+mcp = ["codegraph", { name = "tracker", allowed_tools = ["get_context"] }]
+```
+
+Omitting `allowed_tools` means all tools; an empty list means none. Exact,
+case-sensitive names use 1–128 ASCII letters, digits, underscores, hyphens or
+dots, with no wildcard patterns. The profile cap intersects the catalog cap,
+so it cannot add permissions. Duplicate server selections, duplicate tool names
+and unknown fields are rejected. Selected servers retain profile order, followed
+by remaining global servers in catalog order. Existing string-only profiles and
+historical snapshot digests remain compatible. These controls require schema 2.
+
+| Harness | Enforcement |
+|---|---|
+| Codex | Generated `mcp_servers.<name>.enabled_tools` is the native allowlist. |
+| Claude Code, including GLM | Before each attempt/resume, Agent Run initializes the selected stdio MCP with the launch environment, reads every `tools/list` page, and passes the complement to native `--disallowedTools`. The harness connects directly to the original server. |
+
+Claude discovery has a 15-second per-server and 30-second total budget, plus
+bounded process teardown. A missing allowed name, incomplete/malformed catalog,
+catalog change during discovery, authentication failure or timeout refuses the
+restricted launch. An empty allowlist uses `mcp__server__*` without discovery.
+No filter means no discovery. Temporary discovery processes are cleaned on
+success, failure and cancellation; captured identities allow crash recovery.
+
+Claude's inversion is a **launch-time catalog snapshot**, not a permanent
+positive allowlist: a tool added after discovery or exposed differently to
+another client/connection can escape the generated deny list. Use a stable
+catalog for the duration of a run. Restricted discovery currently rejects
+`${...}` interpolation in command/arguments and native names containing dots
+or other unsupported characters instead of guessing Claude's normalization.
+Server names containing `__` or ending in `_` are also rejected for ambiguous
+native namespace boundaries. Declared `env_from` values remain supported.
+
+The frozen role records each selection's source (`global`, `profile`, `both`)
+and effective cap. Start/resume diagnostics summarize these **selected** servers;
+they do not assert live availability. Resume refuses newly revoked server/tool
+rights and never expands a previous session's frozen cap. Tool filtering is a
+harness feature, not operating-system isolation or server-side authorization
+against separate connections made with other granted tools.
+
 ## External quota execution
 
 For current configurations, use `limits_source = "exec"` and a collector with

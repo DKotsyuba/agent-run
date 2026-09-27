@@ -47,6 +47,7 @@ fn fixture(
         read_roots: vec![request.workdir.clone()],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     let config = Config {

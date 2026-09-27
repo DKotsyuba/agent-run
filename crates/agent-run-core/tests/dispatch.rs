@@ -21,6 +21,7 @@ fn identity(home: &common::Home) -> Value {
         read_roots: request.read_roots.clone(),
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     serde_json::to_value(LaunchIdentity {

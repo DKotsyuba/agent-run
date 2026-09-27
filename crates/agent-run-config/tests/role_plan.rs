@@ -51,6 +51,8 @@ Review the assigned change.\n";
     mcp_catalog.insert(
         "codegraph".to_string(),
         Mcp {
+            global: false,
+            allowed_tools: None,
             transport: "stdio".into(),
             command: PathBuf::from("/bin/echo").canonicalize().unwrap(),
             args: vec!["serve".into()],
@@ -309,6 +311,8 @@ Review.\n";
     unrelated.insert(
         "unused".to_string(),
         Mcp {
+            global: false,
+            allowed_tools: None,
             transport: "stdio".into(),
             command: PathBuf::from("/bin/echo").canonicalize().unwrap(),
             args: vec![],

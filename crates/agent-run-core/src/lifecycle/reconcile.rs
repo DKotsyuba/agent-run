@@ -203,6 +203,30 @@ where
 /// Grace between SIGTERM and SIGKILL when recovering an orphaned attempt.
 const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Recovers a terminal attempt's temporary MCP discovery processes from journaled
+/// identities before releasing its reservation. The owning supervisor may also call
+/// this after discovery stops. Never call it concurrently with a live discovery.
+/// Latest snapshots per root supersede earlier ones; no command or secret is stored.
+pub(crate) fn cleanup_mcp_discovery(store: &Store, attempt: &str) -> Result<bool> {
+    let mut query = store.conn.prepare("SELECT data_json FROM events WHERE agent_id=(SELECT agent_id FROM attempts WHERE id=?1) AND attempt_id=?1 AND kind='mcp_discovery_ownership' ORDER BY seq")?;
+    let rows = query.query_map([attempt], |row| row.get::<_, String>(0))?;
+    let mut roots = std::collections::BTreeMap::new();
+    for row in rows {
+        let snapshot: process::OwnershipSnapshot = serde_json::from_str(&row?)?;
+        roots.insert(
+            (snapshot.leader.pid, snapshot.leader.token.clone()),
+            snapshot,
+        );
+    }
+    for snapshot in roots.into_values() {
+        let mut owned = process::OwnedProcess::restore(snapshot)?;
+        if !owned.cleanup_blocking(ORPHAN_GRACE)?.confirmed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// One provider attempt still owned by a terminal logical run.
 struct OwnedAttempt {
     /// Attempt id.
@@ -312,6 +336,9 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
     }
     let rows: Vec<OwnedAttempt> = rows.into_iter().map(|(attempt, _)| attempt).collect();
     for attempt in rows {
+        if !cleanup_mcp_discovery(store, &attempt.id)? {
+            continue;
+        }
         let saved_processes = store.remembered_processes("attempt", &attempt.id)?;
         let confirmed = attempt
             .proof

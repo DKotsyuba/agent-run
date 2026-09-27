@@ -7,7 +7,10 @@
 //! hashes the full credential-free payload with
 //! `agent_run_domain::canonical` (byte-exact CPython `json.dumps` plus
 //! sha256), so identical inputs produce an identical, Python-compatible hash
-//! for every runtime.
+//! for every runtime. MCP tool controls (`Mcp::global`, `Mcp::allowed_tools`,
+//! profile `mcp_tools`) are unioned and intersected only here, so every
+//! consumer observes one deterministic selection and frozen restricted
+//! payloads verify their own digest.
 use crate::{
     config::Mcp,
     policy::{self, Constraint},
@@ -30,8 +33,8 @@ pub struct ResolvedSkill {
 }
 
 /// One credential-free MCP definition selected by a role: canonical launch
-/// data plus an `env_from` list of names (never values) and the
-/// operator-selected native approval mode.
+/// data plus an `env_from` list of names (never values), the operator-selected
+/// native approval mode, and the effective tool cap with its selection origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMcp {
     pub id: String,
@@ -40,6 +43,38 @@ pub struct ResolvedMcp {
     pub args: Vec<String>,
     pub env_from: Vec<String>,
     pub approval_mode: String,
+    /// Effective exact tool cap: the intersection of the catalog
+    /// declaration's `allowed_tools` and the role's profile filter, where
+    /// `None` means no restriction. Always sorted and deduplicated so frozen
+    /// payloads are deterministic.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Where this server's selection originated.
+    pub selection: McpSelectionSource,
+}
+
+/// Where a resolved MCP server's selection originated.
+///
+/// The frozen payload records the source only when it is not the
+/// historical default [`McpSelectionSource::Profile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpSelectionSource {
+    /// Named by the canonical role's profile only.
+    Profile,
+    /// Added by the catalog declaration's `global` flag only.
+    Global,
+    /// Named by the profile and flagged `global`; listed exactly once.
+    Both,
+}
+
+impl McpSelectionSource {
+    /// Returns the stable lowercase payload spelling of this source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Global => "global",
+            Self::Both => "both",
+        }
+    }
 }
 
 /// Immutable, serializable role contract shared by every adapter. Never
@@ -87,6 +122,15 @@ fn canonical_payload(plan: &ResolvedRolePlan) -> Value {
             object.insert("env_from".into(), json!(server.env_from));
             if server.approval_mode != "auto" {
                 object.insert("approval_mode".into(), json!(server.approval_mode));
+            }
+            // Frozen payloads carry the tool cap only when it restricts and
+            // the selection origin only when it is not the historical
+            // default, so legacy plans keep their exact bytes and digest.
+            if let Some(tools) = &server.allowed_tools {
+                object.insert("allowed_tools".into(), json!(tools));
+            }
+            if server.selection != McpSelectionSource::Profile {
+                object.insert("selection".into(), json!(server.selection.as_str()));
             }
             Value::Object(object)
         })
@@ -213,11 +257,19 @@ impl ResolvedRolePlan {
                 invalid(format!("resolved role mcp[{index}] has an invalid shape"))
             })?;
             let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
-            let old_keys: BTreeSet<&str> =
-                ["id", "transport", "command", "args", "env_from"].into();
-            let mut new_keys = old_keys.clone();
-            new_keys.insert("approval_mode");
-            if keys != old_keys && keys != new_keys {
+            let base: BTreeSet<&str> = ["id", "transport", "command", "args", "env_from"].into();
+            let permitted: BTreeSet<&str> = [
+                "id",
+                "transport",
+                "command",
+                "args",
+                "env_from",
+                "approval_mode",
+                "allowed_tools",
+                "selection",
+            ]
+            .into();
+            if !base.is_subset(&keys) || !keys.is_subset(&permitted) {
                 return Err(invalid(format!(
                     "resolved role mcp[{index}] has an invalid shape"
                 )));
@@ -256,6 +308,34 @@ impl ResolvedRolePlan {
                 .to_string(),
                 None => "auto".to_string(),
             };
+            let allowed_tools = match object.get("allowed_tools") {
+                Some(value) => {
+                    let path = format!("resolved role mcp[{index}].allowed_tools");
+                    let list = strings(value, &path, false)?;
+                    if list.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(invalid(format!("{path} must be sorted and unique")));
+                    }
+                    crate::config::validate_allowed_tools(&path, &list)?;
+                    Some(list)
+                }
+                None => None,
+            };
+            let selection = match object.get("selection") {
+                Some(value) => match text(
+                    value,
+                    &format!("resolved role mcp[{index}].selection"),
+                    false,
+                )? {
+                    "global" => McpSelectionSource::Global,
+                    "both" => McpSelectionSource::Both,
+                    _ => {
+                        return Err(invalid(format!(
+                            "resolved role mcp[{index}] selection is invalid"
+                        )))
+                    }
+                },
+                None => McpSelectionSource::Profile,
+            };
             let canonical_command = lexical_absolute(command)?;
             if !config_id(id)
                 || transport != "stdio"
@@ -272,6 +352,8 @@ impl ResolvedRolePlan {
                 args,
                 env_from,
                 approval_mode,
+                allowed_tools,
+                selection,
             });
         }
         if unique_len(servers.iter().map(|server| server.id.as_str())) != servers.len() {
@@ -393,7 +475,8 @@ pub fn role_from_authority(
 /// Missing or unsafe skills, missing MCP definitions, disallowed task read
 /// roots, and inconsistent auth choices are rejected. The returned revision
 /// hashes the full credential-free payload, so identical inputs produce
-/// identical role plans for every runtime.
+/// identical role plans for every runtime. Profile selections join global
+/// catalog servers once; profile tool filters intersect the catalog cap.
 pub fn resolve_role_plan(
     profile: &Profile,
     skills_root: &Path,
@@ -441,6 +524,18 @@ pub fn resolve_role_plan(
     }
 
     let mut servers = Vec::with_capacity(profile.mcp.len());
+    if profile
+        .mcp_tools
+        .keys()
+        .any(|name| !profile.mcp.contains(name))
+    {
+        return Err(invalid(
+            "profile MCP tool filter must reference a selected server",
+        ));
+    }
+    for tools in profile.mcp_tools.values() {
+        crate::config::validate_allowed_tools("profile MCP allowed_tools", tools)?;
+    }
     for name in &profile.mcp {
         if !config_id(name) {
             return Err(invalid(format!("invalid role MCP id: {name}")));
@@ -448,14 +543,30 @@ pub fn resolve_role_plan(
         let definition = mcp_catalog
             .get(name)
             .ok_or_else(|| invalid(format!("role references unknown MCP server: {name}")))?;
-        servers.push(ResolvedMcp {
-            id: name.clone(),
-            transport: definition.transport.clone(),
-            command: definition.command.to_string_lossy().into_owned(),
-            args: definition.args.clone(),
-            env_from: definition.env_from.clone(),
-            approval_mode: definition.approval_mode.clone(),
-        });
+        servers.push(resolved_server(
+            name,
+            definition,
+            profile.mcp_tools.get(name).map(Vec::as_slice),
+            McpSelectionSource::Profile,
+        ));
+    }
+
+    // Global catalog declarations join every role; servers the profile
+    // already named become `Both` instead of a second entry, and unselected
+    // ones follow in catalog order after the profile's declaration order.
+    for (name, definition) in mcp_catalog.iter() {
+        if !definition.global {
+            continue;
+        }
+        match servers.iter_mut().find(|server| server.id == *name) {
+            Some(server) => server.selection = McpSelectionSource::Both,
+            None => servers.push(resolved_server(
+                name,
+                definition,
+                profile.mcp_tools.get(name).map(Vec::as_slice),
+                McpSelectionSource::Global,
+            )),
+        }
     }
 
     let mut plan = ResolvedRolePlan {
@@ -475,6 +586,57 @@ pub fn resolve_role_plan(
     };
     plan.config_revision = canonical::sha256_hex(&canonical_payload(&plan), true);
     Ok(plan)
+}
+
+/// Intersects the declaration and profile tool filters; `None` is universal,
+/// so the result restricts only when at least one side restricts. Results
+/// are sorted and deduplicated for deterministic frozen payloads.
+fn effective_tools(
+    declaration: Option<&[String]>,
+    profile: Option<&[String]>,
+) -> Option<Vec<String>> {
+    match (declaration, profile) {
+        (None, None) => None,
+        (Some(list), None) | (None, Some(list)) => Some(
+            list.iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .cloned()
+                .collect(),
+        ),
+        (Some(declared), Some(filtered)) => {
+            let filter: BTreeSet<&String> = filtered.iter().collect();
+            Some(
+                declared
+                    .iter()
+                    .filter(|tool| filter.contains(*tool))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Materializes one resolved server from its catalog declaration, applying
+/// the declaration's tool cap and the role's optional profile filter.
+fn resolved_server(
+    name: &str,
+    definition: &Mcp,
+    profile_filter: Option<&[String]>,
+    selection: McpSelectionSource,
+) -> ResolvedMcp {
+    ResolvedMcp {
+        id: name.to_string(),
+        transport: definition.transport.clone(),
+        command: definition.command.to_string_lossy().into_owned(),
+        args: definition.args.clone(),
+        env_from: definition.env_from.clone(),
+        approval_mode: definition.approval_mode.clone(),
+        allowed_tools: effective_tools(definition.allowed_tools.as_deref(), profile_filter),
+        selection,
+    }
 }
 
 fn config_id(value: &str) -> bool {

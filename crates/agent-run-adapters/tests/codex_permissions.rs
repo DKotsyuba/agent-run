@@ -70,6 +70,7 @@ fn fixture(root: &Path, write: bool) -> (Config, Runtime, StartRequest, Profile)
         read_roots: vec![],
         skills: vec![],
         mcp: vec![],
+        mcp_tools: Default::default(),
         required_constraints: BTreeSet::new(),
     };
     (config, runtime, request, profile)
@@ -240,6 +241,8 @@ fn python_test_codex_adapter_materializes_only_declared_mcp_approval() {
     config.mcp.insert(
         "approved".into(),
         Mcp {
+            global: false,
+            allowed_tools: None,
             transport: "stdio".into(),
             command: Path::new("/bin/true").into(),
             args: vec!["--fixture".into()],
@@ -275,6 +278,38 @@ fn python_test_codex_adapter_materializes_only_declared_mcp_approval() {
         .get("matcher")
         .and_then(toml::Value::as_str)
         .is_some_and(|matcher| matcher.contains("mcp__approved__")));
+}
+
+/// Codex receives its native exact allowlist, preserving omitted and empty semantics.
+#[test]
+fn codex_native_mcp_enabled_tools_preserves_effective_caps() {
+    for tools in [None, Some(vec![]), Some(vec!["read".to_string()])] {
+        let root = temporary_directory();
+        let (mut config, runtime, request, mut profile) = fixture(&root, false);
+        config.mcp.insert(
+            "selected".into(),
+            serde_json::from_value(json!({"transport":"stdio","command":"/bin/echo"})).unwrap(),
+        );
+        profile.mcp = vec!["selected".into()];
+        if let Some(tools) = tools.clone() {
+            profile.mcp_tools.insert("selected".into(), tools);
+        }
+        let home = root.join("home");
+        materialize::materialize(&config, &runtime, &request, &profile, &home, &root).unwrap();
+        let native: toml::Value =
+            toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        let server = &native["mcp_servers"]["selected"];
+        assert_eq!(server["command"].as_str(), Some("/bin/echo"));
+        assert_eq!(
+            server.get("enabled_tools").map(|v| v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()),
+            tools
+        );
+    }
 }
 
 /// Mirrors `test_codex_adapter.py::test_materialize_uses_only_each_explicit_service_skill_root`.

@@ -5,7 +5,8 @@ use agent_run_domain::{
     domain::{AgentId, Status},
     error::invalid,
     views::{
-        AgentPage, AgentView, AnswerView, CleanupView, DeliveryView, MessageView, TranscriptPage,
+        AgentPage, AgentView, AnswerView, CleanupView, DeliveryView, McpSelectionView, MessageView,
+        TranscriptPage,
     },
     Result,
 };
@@ -15,6 +16,25 @@ use agent_run_platform::{
 };
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
+
+/// Projects verified frozen role selections without leaking command, env or auth data.
+/// Historical identities without a provider role and invalid payloads report no selections.
+pub fn selected_mcp(identity: Option<&Value>) -> Vec<McpSelectionView> {
+    identity
+        .and_then(|v| v.get("authority")?.get("role_payload"))
+        .and_then(|v| agent_run_config::role_plan::ResolvedRolePlan::from_payload(v).ok())
+        .map(|role| {
+            role.mcp
+                .into_iter()
+                .map(|mcp| McpSelectionView {
+                    name: mcp.id,
+                    source: mcp.selection.as_str().into(),
+                    allowed_tools: mcp.allowed_tools,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Decodes an optional JSON field while treating invalid durable state as a store error.
 fn json(value: Option<String>) -> Result<Option<Value>> {
@@ -111,6 +131,7 @@ impl Store {
             )
         };
         Ok(AgentView {
+            mcp: selected_mcp(record.identity.as_ref()),
             parent_run_id: None,
             run_id: None,
             agent_id: record.id.clone(),
