@@ -328,6 +328,12 @@ fn native_provider_keeps_login_and_model_alias() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "gpt-native");
+    assert_eq!(plan.profile.body, role.prompt);
+    assert!(plan
+        .profile
+        .body
+        .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end()));
+    assert!(plan.profile.body.ends_with("Review safely."));
     assert!(run_home.join("auth.json").exists());
     assert!(!fs::read_to_string(run_home.join("config.toml"))
         .unwrap()
@@ -419,6 +425,17 @@ fn native_provider_keeps_login_and_model_alias() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "claude-sonnet");
+    let system_prompt = &plan.launch.args[plan
+        .launch
+        .args
+        .iter()
+        .position(|arg| arg == "--append-system-prompt")
+        .unwrap()
+        + 1];
+    assert_eq!(system_prompt, &role.prompt);
+    assert!(system_prompt
+        .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end()));
+    assert!(system_prompt.ends_with("Review safely."));
     // The admitted output_schema joins the claude system prompt.
     let schema = serde_json::json!({"type": "object"});
     let with_schema = agent_run_adapters::provider::plan_selected_with(

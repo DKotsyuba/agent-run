@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-27
+
+- fix(roles): prepend shared worker instructions to new canonical roles so
+  delegated agents focus on execution and concise final reports instead of
+  conversational progress narration; preserve verification and approval obligations
+- fix(roles): freeze the complete role prompt for continuation without duplicating
+  the preamble or changing historical sessions
+- docs: describe the shared prompt asset and its native Claude/GLM and Codex delivery
+
+No configuration or database migration is required. The new instructions apply
+to newly created sessions; resumed sessions retain their admitted prompt.
+
 ## [0.17.0] - 2026-09-27
 
 - feat(mcp): declare global servers once and narrow their exact tool sets in

@@ -99,6 +99,10 @@ pub struct ResolvedRolePlan {
 
 const APPROVAL_MODES: [&str; 4] = ["auto", "prompt", "writes", "approve"];
 
+/// Shared behavioral preamble for newly resolved roles. The composed text is
+/// frozen in `prompt`; restoring an existing payload never injects new rules.
+const WORKER_INSTRUCTIONS: &str = include_str!("../../../assets/worker_instructions.md");
+
 fn sorted_constraint_names(constraints: &BTreeSet<Constraint>) -> Vec<String> {
     let mut names: Vec<String> = constraints
         .iter()
@@ -477,6 +481,8 @@ pub fn role_from_authority(
 /// hashes the full credential-free payload, so identical inputs produce
 /// identical role plans for every runtime. Profile selections join global
 /// catalog servers once; profile tool filters intersect the catalog cap.
+/// The shared worker instructions precede the profile body and are hashed with
+/// it, so continuation restores exactly the admitted behavior without reinjection.
 pub fn resolve_role_plan(
     profile: &Profile,
     skills_root: &Path,
@@ -572,7 +578,7 @@ pub fn resolve_role_plan(
     let mut plan = ResolvedRolePlan {
         role_name: profile.name.clone(),
         role_revision: profile.revision.clone(),
-        prompt: profile.body.clone(),
+        prompt: format!("{}\n\n{}", WORKER_INSTRUCTIONS.trim_end(), profile.body),
         write: profile.write,
         network: profile.network,
         allow_external_read_roots: profile.allow_external_read_roots,

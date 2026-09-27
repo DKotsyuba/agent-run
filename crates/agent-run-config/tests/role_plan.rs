@@ -334,3 +334,32 @@ Review.\n";
         after_prompt_change.config_revision
     );
 }
+
+/// New roles freeze the shared prefix once; round trips and historical payloads
+/// retain their admitted text, and tampering with the prefix breaks the digest.
+#[test]
+fn worker_preamble_is_frozen_once_before_role_body() {
+    let home = common::Home::new();
+    let text = "+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nInspect the assigned code.";
+    let profile = profiles::parse(text, &home.request()).unwrap();
+    let plan = resolve_role_plan(&profile, &home.path, &BTreeMap::new(), "global", None).unwrap();
+    let prefix = include_str!("../../../assets/worker_instructions.md").trim_end();
+    assert!(prefix.starts_with("You are a delegated worker"));
+    assert_eq!(plan.prompt, format!("{prefix}\n\n{}", profile.body));
+    assert_eq!(profile.body, "Inspect the assigned code.");
+    let payload = plan.to_payload();
+    let mut restored = plan.clone();
+    for _ in 0..3 {
+        restored = ResolvedRolePlan::from_payload(&restored.to_payload()).unwrap();
+        assert_eq!(restored, plan);
+    }
+    let mut tampered = payload;
+    tampered["prompt"] = json!(profile.body);
+    assert!(ResolvedRolePlan::from_payload(&tampered).is_err());
+
+    let historical: Value =
+        serde_json::from_str(include_str!("fixtures/role_plan_7bbd43b.json")).unwrap();
+    let restored = ResolvedRolePlan::from_payload(&historical).unwrap();
+    assert_eq!(restored.to_payload(), historical);
+    assert!(!restored.prompt.contains(prefix));
+}
