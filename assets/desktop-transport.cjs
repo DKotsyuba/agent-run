@@ -113,14 +113,19 @@ function connect(socket, endpoint, deadline) {
  * @param {Record<string, unknown>} params Fixed method parameters.
  * @param {number} deadline Shared absolute millisecond deadline.
  * @returns {Promise<Record<string, unknown>>} Validated result object.
- * @throws {Error} On transport, framing, correlation, or host-envelope failure.
+ * @throws {Error & {code?: string}} On transport, framing, correlation, or host-envelope
+ * failure. A correlated JSON-RPC -32602 error without a result sets
+ * `code = "HOST_INVALID_PARAMS"`, proving rejection before native tool execution.
  */
 async function rpc(socket, id, method, params, deadline) {
   const reply = receive(socket, HOST_LIMIT, deadline);
   socket.write(frame({ jsonrpc: "2.0", id, method, params }, HOST_LIMIT));
   const value = await reply;
-  if (!value || value.jsonrpc !== "2.0" || value.id !== id || "error" in value || !value.result)
+  if (!value || value.jsonrpc !== "2.0" || value.id !== id)
     throw new Error("invalid response");
+  if (!("result" in value) && value.error?.code === -32602 && typeof value.error.message === "string")
+    throw Object.assign(new Error("native host rejected request parameters"), {code: "HOST_INVALID_PARAMS"});
+  if ("error" in value || !value.result) throw new Error("invalid response");
   return value.result;
 }
 
@@ -240,12 +245,12 @@ async function deliver(request) {
     if (!tool) return "rejected";
     sent = true;
     const result = await rpc(socket, 2, "tools/call", {
-      arguments: { threadId: request.thread_id, prompt },
+      arguments: { threadId: request.thread_id, prompt }, callerSource: "codex",
       callId: request.notification_id, namespace: tool.namespace,
       threadId: request.thread_id, tool: tool.name, turnId: request.notification_id,
     }, deadline);
     return result.success === true ? "accepted" : result.success === false ? "rejected" : "ambiguous";
-  } catch (_) { return sent ? "ambiguous" : "rejected"; }
+  } catch (error) { return error.code === "HOST_INVALID_PARAMS" ? "rejected" : sent ? "ambiguous" : "rejected"; }
   finally { socket.destroy(); }
 }
 

@@ -4,6 +4,19 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-28
+
+- fix(delivery): send the callerSource field required by the current Codex Desktop
+  native tool protocol, restoring completion notifications
+- fix(delivery): classify correlated invalid-parameter replies as rejected while
+  retaining ambiguity for interrupted calls and unknown execution errors
+- test(delivery): cover the required caller identity and distinguish known rejection
+  from uncertain delivery
+
+Reconnect Agent Run MCP clients after installing so their long-lived Desktop
+frontends load this fix. Restarting only the broker does not refresh those clients.
+No configuration or database migration is required.
+
 ## [0.17.1] - 2026-09-27
 
 - fix(roles): prepend shared worker instructions to new canonical roles so
