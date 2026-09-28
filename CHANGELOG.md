@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-28
+
 - feat(workers): add a separate one-tool MCP for durable worker-to-orchestrator
   reports, bound to an active run and attempt with no recipient selector
 - feat(delivery): deliver worker reports through the existing outbox and Desktop
