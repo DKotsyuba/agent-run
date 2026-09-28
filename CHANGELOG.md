@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-09-28
+
 - fix(runtime): forward resolved Rust roots to Codex MCP tools, avoid repeated
   remote catalog downloads, and reuse identical same-account native plugin
   cache blocks after verified cleanup while keeping each run's files private
