@@ -137,6 +137,9 @@ pub struct AgentView {
     pub runtime_outcome: Option<String>,
     /// Human/orchestrator acceptance state, distinct from runtime success.
     pub acceptance: String,
+    /// Working directory the run was admitted with, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
 }
 
 /// The durable start result, including the immediately committed agent snapshot.

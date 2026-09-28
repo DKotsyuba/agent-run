@@ -6,6 +6,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [0.19.0] - 2026-09-28
 
+- feat(tui): ship `agent-run-tui` as a separate read-only terminal observer
+  with live agent cards, transcripts, answer viewing and mouse navigation
+- feat(install): install both native binaries from the same versioned release
+- fix(tui): keep transcript reads independent of pending list watches and show
+  only the stable public agent identity
+
 - fix(identity): expose only the stable agent ID in public responses, completion
   and worker notices, CLI output, and hook context; keep execution records private
 - fix(binding): pin delayed notification bindings and CLI waits to the admitted

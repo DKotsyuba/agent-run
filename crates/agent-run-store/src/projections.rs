@@ -174,6 +174,7 @@ impl Store {
                 .terminal()
                 .then(|| record.status.as_str().to_owned()),
             acceptance: "pending".to_owned(),
+            workdir: Some(record.request.workdir.display().to_string()),
         })
     }
 

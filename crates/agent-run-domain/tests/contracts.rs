@@ -166,6 +166,7 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         observed_at: 1.0,
         runtime_outcome: None,
         acceptance: "pending".into(),
+        workdir: None,
     };
     let page = AgentPage {
         items: vec![view],
