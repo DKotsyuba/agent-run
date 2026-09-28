@@ -87,5 +87,17 @@ not replace Codex sandboxing or residual auto-review.
 ## Current state
 
 Current Codex and Claude Code children receive only the MCP servers selected
-by their effective revisioned profile. Historical schema-1 runtimes retain
+by their effective revisioned profile, plus the separate built-in
+`agent_run_worker` for newly admitted schema-2 roles. Its sole tool,
+`notify_orchestrator`, queues a bounded material report to the current run's
+bound orchestrator without ending the run. It exposes no operator tools and
+accepts no recipient or run selector. Reports use `agent-run/worker-message`
+framing and are data, not completion or owner approval. The parent can reply
+through `steer`. A queue receipt does not prove delivery or grant permission.
+Reuse the same `request_id` and content on retry. Bodies are limited to 2048
+UTF-8 bytes, with at most 20 reports per exact run and 30 seconds between them.
+The namespace is reserved; no config entry is needed. Historical frozen roles
+without the channel keep their previous tool set on resume. Schema 21 and
+updated Desktop MCP frontends are required for the new channel.
+Historical schema-1 runtimes retain
 their compatibility selection path.

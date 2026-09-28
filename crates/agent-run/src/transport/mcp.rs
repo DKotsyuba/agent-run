@@ -84,7 +84,7 @@ pub fn exec_desktop_frontend(home: &Path) -> Result<()> {
 }
 
 /// Bound stdin one LF-delimited MCP frame at a time for the SDK transport.
-struct BoundedReader<R> {
+pub(super) struct BoundedReader<R> {
     /// Input byte stream whose bytes are fed to the MCP SDK.
     inner: R,
     /// Bytes received since the most recent LF delimiter.
@@ -93,7 +93,7 @@ struct BoundedReader<R> {
 
 impl BoundedReader<tokio::io::Stdin> {
     /// Wrap process stdin while retaining only the current frame's byte count.
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: tokio::io::stdin(),
             line_bytes: 0,
@@ -135,7 +135,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
 type BoundedStdin = BoundedReader<tokio::io::Stdin>;
 
 /// Bound stdout one LF-delimited MCP response frame before it reaches the host.
-struct BoundedStdout {
+pub(super) struct BoundedStdout {
     /// The process stdout used exclusively for MCP protocol responses.
     inner: tokio::io::Stdout,
     /// Bytes written since the most recent LF delimiter.
@@ -144,7 +144,7 @@ struct BoundedStdout {
 
 impl BoundedStdout {
     /// Wrap process stdout while retaining only the current frame's byte count.
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: tokio::io::stdout(),
             line_bytes: 0,

@@ -18,6 +18,10 @@ use std::sync::OnceLock;
 
 /// The embedded per-tool templates, keyed by public tool name.
 const TEMPLATES: &[(&str, &str)] = &[
+    (
+        "notify_orchestrator",
+        include_str!("../../../../assets/mcp/notify_orchestrator.txt.j2"),
+    ),
     ("start", include_str!("../../../../assets/mcp/start.txt.j2")),
     (
         "resume",

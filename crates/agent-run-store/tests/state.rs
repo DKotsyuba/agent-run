@@ -22,7 +22,7 @@ fn schema_initialization_and_reopen() {
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 26);
+    assert_eq!(a["tables"], 28);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     assert_eq!(

@@ -173,6 +173,65 @@ impl Drop for Harness {
         let _ = &self.temp;
     }
 }
+/// A real supervisor injects a worker-only MCP capability, the fake harness
+/// reports through the real stdio/socket boundaries, and the run stays active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_mcp_queues_a_report_without_ending_the_run() {
+    let mut h = Harness::new();
+    h.start_broker().await;
+    let result = socket::client(
+        &h.home,
+        "start",
+        json!({
+            "provider":"mock","model":"fixture","profile":"review",
+            "task":"fixture:worker-notify","workdir":h.home,"timeout_seconds":20,
+            "orchestrator":{"transport":"codex_queue","external_session_id":"fixture-worker-thread"}
+        }),
+    )
+    .await
+    .unwrap();
+    let id: AgentId = serde_json::from_value(result["run_id"].clone()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.home.join("worker-receipt.json").exists() {
+        let row = Store::open(&h.home).unwrap().get(&id).unwrap();
+        assert!(
+            !row.status.terminal(),
+            "worker exited before reporting: {:?}",
+            row.failure_text
+        );
+        assert!(Instant::now() < deadline, "missing worker receipt");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let store = Store::open(&h.home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Running);
+    let (count, message): (i64, String) = store
+        .conn
+        .query_row(
+            "SELECT count(*),message FROM worker_notifications WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(message, "Fixture material finding");
+    let receipt = std::fs::read_to_string(h.home.join("worker-receipt.json")).unwrap();
+    assert!(receipt.contains("Queue acknowledgement only"));
+    assert!(!receipt.contains("AGENT_RUN_WORKER_TOKEN"));
+    std::fs::write(h.home.join("worker-continue"), "").unwrap();
+    let answer = h.terminal(&id).await;
+    assert_eq!(answer["status"], "succeeded");
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM deliveries WHERE agent_id=?",
+                [id.as_str()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_exit_and_broker_restart_do_not_cancel_admitted_job() {
     let mut h = Harness::new();

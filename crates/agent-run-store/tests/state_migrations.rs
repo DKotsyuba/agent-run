@@ -18,8 +18,8 @@ const V1_AGENTS: [&str; 3] = ["agt_alpha", "agt_beta", "agt_gamma"];
 /// would leave a store that stopped at that version.
 fn build_fixture(path: &Path, version: i64) -> Connection {
     if version >= 2 {
-        let fixture_name = if version == VERSION {
-            format!("current-v{VERSION}.sqlite")
+        let fixture_name = if version == VERSION || version == 20 {
+            format!("current-v{version}.sqlite")
         } else {
             format!("historical-v{version}.sqlite")
         };

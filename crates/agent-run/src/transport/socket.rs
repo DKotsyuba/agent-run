@@ -420,7 +420,8 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
             Some(err(id, -32602, "params must be an object", None))
         };
     }
-    let known = dispatch::is_tool(method) || ["tools", "ping", "wait"].contains(&method);
+    let known = dispatch::is_tool(method)
+        || ["tools", "ping", "wait", agent_run_domain::worker::METHOD].contains(&method);
     let response = if !known {
         err(id, -32601, "method not found", None)
     } else {

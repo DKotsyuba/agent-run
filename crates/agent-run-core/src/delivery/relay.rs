@@ -1,6 +1,7 @@
 //! v1-v4 Desktop relay interoperability, bounded to ten seconds.
 use super::{Evidence, Notice};
 use crate::{error::invalid, Result};
+use agent_run_domain::worker::WorkerNotice;
 use serde_json::{json, Value};
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
@@ -44,6 +45,27 @@ async fn read<R: AsyncRead + Unpin>(stream: &mut R) -> Result<Value> {
 /// malformed or interrupted exchanges are ambiguous because delivery may have
 /// reached the relay. No reachable endpoint returns `relay_unavailable`.
 pub async fn send(home: &Path, thread: &str, notice: &Notice) -> Evidence {
+    send_payload(home, thread, RelayPayload::Completion(notice)).await
+}
+
+/// Sends a worker report only to a v4 relay that understands `worker_message`.
+pub async fn send_worker(home: &Path, thread: &str, notice: &WorkerNotice) -> Evidence {
+    if notice.validate().is_err() {
+        return Evidence::new("relay_rejected", false, false);
+    }
+    send_payload(home, thread, RelayPayload::Worker(notice)).await
+}
+
+/// Distinguishes the two fixed relay operations without accepting arbitrary methods.
+enum RelayPayload<'a> {
+    /// Existing completion wire shape.
+    Completion(&'a Notice),
+    /// v4-only worker report shape.
+    Worker(&'a WorkerNotice),
+}
+
+/// Shares socket selection, framing, deadlines, and evidence classification.
+async fn send_payload(home: &Path, thread: &str, payload: RelayPayload<'_>) -> Evidence {
     let mut paths: Vec<_> = std::fs::read_dir(home)
         .into_iter()
         .flatten()
@@ -86,26 +108,36 @@ pub async fn send(home: &Path, thread: &str, notice: &Notice) -> Evidence {
         } else {
             1
         };
-        let exact = notice.run_id.as_ref().unwrap_or(&notice.agent_id);
-        // Old hosts have no separate run field: keep their ID pinned to the
-        // completed execution instead of silently reporting a moving root alias.
-        let agent_id = if version >= 4 {
-            &notice.agent_id
-        } else {
-            exact
+        let request = match payload {
+            RelayPayload::Worker(notice) if version >= 4 => json!({
+                "version":4,"op":"worker_message","thread_id":thread,
+                "notification_id":notice.notification_id,"agent_id":notice.agent_id,
+                "run_id":notice.run_id,"kind":notice.kind,"message":notice.message,
+            }),
+            RelayPayload::Worker(_) => continue,
+            RelayPayload::Completion(notice) => {
+                let exact = notice.run_id.as_ref().unwrap_or(&notice.agent_id);
+                // Legacy hosts only know the exact completed execution.
+                let agent_id = if version >= 4 {
+                    &notice.agent_id
+                } else {
+                    exact
+                };
+                let mut request = json!({"version":version,"op":"completion","thread_id":thread,"notification_id":notice.notification_id,"agent_id":agent_id,"status":notice.status});
+                if version >= 4 {
+                    request["run_id"] = json!(exact);
+                }
+                if version >= 2 {
+                    request["runtime"] = json!(notice.runtime);
+                    request["model"] = json!(notice.model);
+                    request["effort"] = json!(notice.effort);
+                }
+                if version >= 3 {
+                    request["failure_kind"] = json!(notice.failure_kind);
+                }
+                request
+            }
         };
-        let mut request = json!({"version":version,"op":"completion","thread_id":thread,"notification_id":notice.notification_id,"agent_id":agent_id,"status":notice.status});
-        if version >= 4 {
-            request["run_id"] = json!(exact);
-        }
-        if version >= 2 {
-            request["runtime"] = json!(notice.runtime);
-            request["model"] = json!(notice.model);
-            request["effort"] = json!(notice.effort);
-        }
-        if version >= 3 {
-            request["failure_kind"] = json!(notice.failure_kind);
-        }
         let mut stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&path)).await {
             Ok(Ok(s)) => s,
             _ => continue,
@@ -183,6 +215,43 @@ mod tests {
                 assert!(request.get("run_id").is_none());
             }
         }
+    }
+
+    /// Worker reports use only the v4 typed operation and preserve bounded prose.
+    #[tokio::test]
+    async fn worker_report_uses_v4_typed_relay() {
+        let home = tempfile::tempdir().unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(home.path().join("ar-cdx-v4-worker.sock")).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read(&mut stream).await.unwrap();
+            write(&mut stream, &json!({"outcome":"accepted"}))
+                .await
+                .unwrap();
+            request
+        });
+        let notice = WorkerNotice {
+            notification_id: "ntf_worker".into(),
+            agent_id: "ag-20260925-000000-0000000001".parse().unwrap(),
+            run_id: "ag-20260925-000000-0000000002".parse().unwrap(),
+            kind: agent_run_domain::worker::WorkerMessageKind::Blocker,
+            message: "A material blocker".into(),
+        };
+        assert_eq!(
+            send_worker(home.path(), "thread", &notice).await.classifier,
+            "relay_accepted"
+        );
+        let request = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["op"], "worker_message");
+        assert_eq!(request["version"], 4);
+        assert_eq!(request["agent_id"], notice.agent_id.as_str());
+        assert_eq!(request["run_id"], notice.run_id.as_str());
+        assert_eq!(request["message"], notice.message);
+        assert!(request.get("status").is_none());
     }
 
     /// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_frame_bound_is_enforced`.

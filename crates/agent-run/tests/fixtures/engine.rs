@@ -13,6 +13,47 @@ fn argument(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
+/// Exercise the sealed worker MCP using only inherited capability names. The
+/// child has a six-second deadline and kill-on-drop; no provider or Desktop
+/// is contacted. Persist only the nonsecret tool response for the owning test.
+fn worker_report(args: &[String]) {
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(argument(args, "--mcp-config").expect("worker config path"))
+            .unwrap(),
+    )
+    .unwrap();
+    let server = &config["mcpServers"]["agent_run_worker"];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use agent_run::transport::{frame, socket};
+        use tokio::io::BufReader;
+        use std::process::Stdio;
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+            .args(server["args"].as_array().unwrap().iter().map(|arg|arg.as_str().unwrap()))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(6), async {
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"worker-fixture","version":"1"}}}),socket::MAX_FRAME).await.unwrap();
+            frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap();
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","method":"notifications/initialized"}),socket::MAX_FRAME).await.unwrap();
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),socket::MAX_FRAME).await.unwrap();
+            let roster: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+            assert_eq!(roster["result"]["tools"].as_array().unwrap().len(),1);
+            assert_eq!(roster["result"]["tools"][0]["name"],"notify_orchestrator");
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"notify_orchestrator","arguments":{"request_id":"fixture-report","kind":"risk","message":"Fixture material finding"}}}),socket::MAX_FRAME).await.unwrap();
+            let reply: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+            assert_ne!(reply["result"]["isError"],true,"{reply}");
+            assert!(reply.get("error").is_none(),"{reply}");
+            std::fs::write("worker-receipt.json",reply.to_string()).unwrap();
+            drop(input);
+            assert!(child.wait().await.unwrap().success());
+        }).await.expect("bounded worker MCP fixture");
+    });
+}
 /// Runs one offline native-protocol scenario selected only by fixture task text.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -146,6 +187,15 @@ fn main() {
     }
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
+    }
+    if task == "fixture:worker-notify" {
+        worker_report(&args);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::path::Path::new("worker-continue").exists()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     native_history(&session, &task);
     // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the

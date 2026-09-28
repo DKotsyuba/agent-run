@@ -23,6 +23,8 @@ pub mod retention;
 pub mod run_stats;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
+/// Authenticated, bounded worker reports and their durable outbox rows.
+pub mod worker;
 use agent_run_domain::{
     catalog::{AccountId, PhysicalQuotaKey},
     domain::{self, now, AgentId, Outcome, StartRequest, Status},
@@ -1115,7 +1117,7 @@ impl Store {
     }
     pub fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         let row = self.get(id)?;
-        let d=self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? ORDER BY terminal_event_seq DESC LIMIT 1",[id.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
+        let d=self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) ORDER BY terminal_event_seq DESC LIMIT 1",[id.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
         let (notification_id, state, attempts, ambiguous, last_error, last_attempt) = if let Some(
             (did, state, attempts, ambiguous, last_error),
         ) = d

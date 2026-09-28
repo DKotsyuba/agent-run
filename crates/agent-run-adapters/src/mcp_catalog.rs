@@ -476,7 +476,8 @@ done
             },
             native_model: "fixture".into(),
             role: ResolvedRolePlan {
-                role_name: "review".into(), role_revision: "test".into(), prompt: String::new(),
+                worker_mcp: false,
+        role_name: "review".into(), role_revision: "test".into(), prompt: String::new(),
                 write: false, network: false, allow_external_read_roots: false, read_roots: vec![],
                 skills: vec![], mcp: vec![server], required_constraints: BTreeSet::new(),
                 auth_mode: "native".into(), auth_reference: None, config_revision: "test".into(),

@@ -166,6 +166,7 @@ fn documented_full_config_example_loads() {
 /// Build a fixed runtime and role so canonical snapshot bytes are reproducible.
 fn role_fixture() -> ResolvedRolePlan {
     ResolvedRolePlan {
+        worker_mcp: false,
         role_name: "review".into(),
         role_revision: "legacy".into(),
         prompt: "Review carefully.".into(),

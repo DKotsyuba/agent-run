@@ -1,6 +1,7 @@
 //! Bounded Claude inbox delivery through a session descriptor and Unix socket.
 
 use super::{Evidence, Notice};
+use agent_run_domain::worker::WorkerNotice;
 use serde_json::{json, Value};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,11 @@ pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
     send_after(registry, session, notice, async {}).await
 }
 
+/// Delivers a bounded worker report through the same Claude inbox route.
+pub async fn send_worker(registry: &Path, session: &str, notice: &WorkerNotice) -> Evidence {
+    send_text_after(registry, session, notice.render().ok(), async {}).await
+}
+
 /// [`send`] with `before_write` awaited after the connection is established
 /// and before any frame is written. Production passes an already-ready
 /// future; tests use it to order a peer close before the write, so an
@@ -35,11 +41,21 @@ pub async fn send_after(
     notice: &Notice,
     before_write: impl std::future::Future<Output = ()>,
 ) -> Evidence {
-    if !bounded(session, SESSION_LIMIT) || notice.render().is_err() {
+    send_text_after(registry, session, notice.render().ok(), before_write).await
+}
+
+/// Writes already-rendered trusted framing around bounded report text.
+async fn send_text_after(
+    registry: &Path,
+    session: &str,
+    message: Option<String>,
+    before_write: impl std::future::Future<Output = ()>,
+) -> Evidence {
+    if !bounded(session, SESSION_LIMIT) {
         return Evidence::new("uds_rejected", false, false);
     }
-    let message = match notice.render() {
-        Ok(message) if message.len() <= MESSAGE_LIMIT => message,
+    let message = match message {
+        Some(message) if message.len() <= MESSAGE_LIMIT => message,
         _ => return Evidence::new("uds_rejected", false, false),
     };
     let Some((pid, socket)) = resolve(registry, session) else {

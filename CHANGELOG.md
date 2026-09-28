@@ -4,6 +4,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(workers): add a separate one-tool MCP for durable worker-to-orchestrator
+  reports, bound to an active run and attempt with no recipient selector
+- feat(delivery): deliver worker reports through the existing outbox and Desktop
+  transports without ending the run or changing completion delivery status
+- feat(roles): attach the worker channel to newly frozen schema-2 roles while
+  preserving historical snapshots on resume
+
+Requires the paired database upgrade to schema 21 and refreshed Desktop Agent Run
+MCP frontends for worker-message delivery. The operator tool table is unchanged.
+
 ## [0.17.2] - 2026-09-28
 
 - fix(delivery): send the callerSource field required by the current Codex Desktop

@@ -175,6 +175,11 @@ The MCP process is a thin stdio proxy over the resident broker:
 It exposes `start`, `resume`, `cancel`, `steer`, `list_agents`, `answer`,
 `transcript`, `capacity_order`, `doc`, `models`, `delegation_guide`, and `limits`.
 
+New schema-2 workers receive a separate built-in MCP with only
+`notify_orchestrator`: a durable report to their bound orchestrator without
+ending the run. Ordinary work MCPs remain profile-controlled.
+See [worker reports](docs/worker-mcp.md) for bounds, replies and upgrade behavior.
+
 ## Use the socket API
 
 The broker binds `<home>/api.sock` with mode `0600`. It accepts newline-framed

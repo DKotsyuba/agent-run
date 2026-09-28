@@ -152,6 +152,48 @@ fn role(root: &Path, network: bool) -> ResolvedRolePlan {
     resolve_role_plan(&profile, root, &BTreeMap::new(), "account", Some("work")).unwrap()
 }
 
+/// Historical role payloads do not acquire a worker MCP when materialized by
+/// a newer executable; both native harness config formats keep that boundary.
+#[test]
+fn historical_role_keeps_worker_channel_absent() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let config = config(root, &fake_engine(root));
+    let catalog = catalog(&config);
+    let mut payload = role(root, false).to_payload();
+    let seed = payload.as_object_mut().unwrap();
+    seed.remove("worker_mcp");
+    seed.remove("config_revision");
+    payload["config_revision"] =
+        serde_json::json!(agent_run_domain::canonical::sha256_hex(&payload, true));
+    let historical = ResolvedRolePlan::from_payload(&payload).unwrap();
+    assert!(!historical.worker_mcp);
+    for (provider, model, account) in [
+        ("codex-plus", "gpt", "acct-native"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let run_home = root.join(provider);
+        materialize_selected(
+            &config,
+            &catalog,
+            &provider.parse().unwrap(),
+            model,
+            &account.parse().unwrap(),
+            &historical,
+            root,
+            &run_home,
+            root,
+        )
+        .unwrap();
+        assert!(!run_home.join("mcp/mcp-config.json").exists());
+        if provider == "codex-plus" {
+            assert!(!fs::read_to_string(run_home.join("config.toml"))
+                .unwrap()
+                .contains("agent_run_worker"));
+        }
+    }
+}
+
 /// Claude Code providers admit every plugin skill declared by the frozen role
 /// and still refuse an undeclared skill shipped by the same plugin.
 #[test]
@@ -321,7 +363,13 @@ fn native_provider_keeps_login_and_model_alias() {
         &account,
         &run_home,
         root,
-        &BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]),
+        &BTreeMap::from([
+            ("HOME".into(), root.to_string_lossy().into_owned()),
+            ("AGENT_RUN_WORKER_HOME".into(), "/stale/home".into()),
+            ("AGENT_RUN_WORKER_RUN_ID".into(), "stale-run".into()),
+            ("AGENT_RUN_WORKER_ATTEMPT_ID".into(), "stale-attempt".into()),
+            ("AGENT_RUN_WORKER_TOKEN".into(), "stale-capability".into()),
+        ]),
         &FakeReader,
         "task",
         None,
@@ -335,6 +383,18 @@ fn native_provider_keeps_login_and_model_alias() {
         .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end()));
     assert!(plan.profile.body.ends_with("Review safely."));
     assert!(run_home.join("auth.json").exists());
+    let native_config: toml::Value =
+        toml::from_str(&fs::read_to_string(run_home.join("config.toml")).unwrap()).unwrap();
+    let worker = &native_config["mcp_servers"]["agent_run_worker"];
+    assert_eq!(worker["args"][0].as_str(), Some("_worker-mcp"));
+    assert_eq!(worker["env_vars"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        worker["default_tools_approval_mode"].as_str(),
+        Some("approve")
+    );
+    for name in agent_run_domain::worker::ENV_NAMES {
+        assert!(!plan.launch.environment.contains_key(name));
+    }
     assert!(!fs::read_to_string(run_home.join("config.toml"))
         .unwrap()
         .contains("model_providers"));
@@ -425,6 +485,21 @@ fn native_provider_keeps_login_and_model_alias() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "claude-sonnet");
+    assert!(plan.launch.args.iter().any(|arg| arg == "--mcp-config"));
+    assert!(plan
+        .launch
+        .args
+        .iter()
+        .any(|arg| arg.contains("mcp__agent_run_worker")));
+    let mcp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(run_home.join("mcp/mcp-config.json")).unwrap())
+            .unwrap();
+    let worker = &mcp["mcpServers"]["agent_run_worker"];
+    assert_eq!(worker["args"], serde_json::json!(["_worker-mcp"]));
+    assert_eq!(
+        worker["env"]["AGENT_RUN_WORKER_TOKEN"],
+        "${AGENT_RUN_WORKER_TOKEN}"
+    );
     let system_prompt = &plan.launch.args[plan
         .launch
         .args

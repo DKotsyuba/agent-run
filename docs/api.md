@@ -2,9 +2,13 @@
 
 Programmatic access to agent-run for external processes on the same machine.
 This is the third transport next to the CLI and the stdio MCP server; all
-three expose the same tool surface through one shared dispatcher
+three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
+
+Workers use a [separate MCP surface](worker-mcp.md) containing only
+`notify_orchestrator`. Its private `worker/notify` broker route is not in operator
+discovery and requires the current run/attempt capability on every call.
 
 Audience: an integrating agent or developer who has never seen this repo.
 Everything needed to connect is on this page.
@@ -62,7 +66,8 @@ paths, then run `systemctl --user enable --now agent-run.service`.
 - The home must be an owned private directory (mode `0700`) and the socket is
   `chmod 0600`. The broker checks each peer's UID, and the built-in client checks
   the broker's UID against its effective UID. There is no network listener or
-  token.
+  general operator token. The internal worker notification route additionally
+  verifies an attempt-specific capability; it cannot choose its recipient.
 - If a live server already owns the socket, a second `api serve` refuses
   to start (native ownership lock plus a connect probe). A stale socket file
   left by a crash is replaced automatically.

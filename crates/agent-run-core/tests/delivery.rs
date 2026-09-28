@@ -1174,6 +1174,76 @@ async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
 }
 
+/// A durable worker row is dispatched through v4 and retains the usual retry evidence.
+#[tokio::test]
+async fn dispatches_worker_report_without_completion_status() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_worker", "codex_queue", "pending");
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    connection.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES('attempt-worker',?,1,'finished','{}',?)",
+        params!["ag-20260825-120000-0123456789", now()],
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO worker_notifications(delivery_id,agent_id,attempt_id,request_id,kind,message,created_at)
+         VALUES('ntf_worker',?,'attempt-worker','key','question','Need a decision',?)",
+        params!["ag-20260825-120000-0123456789", now()],
+    ).unwrap();
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM deliveries WHERE id='ntf_worker'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "retry_wait"
+    );
+    let listener = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-worker.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    make_due(&home.path, "ntf_worker");
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request["op"], "worker_message");
+    assert_eq!(request["message"], "Need a decision");
+    assert!(request.get("status").is_none());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM deliveries WHERE id='ntf_worker'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "delivered"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_attempt_evidence WHERE delivery_id='ntf_worker'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+}
+
 /// Mirrors `tests/test_codex_queue.py::test_send_uses_the_relay_without_a_queue_message_id`.
 #[tokio::test]
 async fn relay_acceptance_has_no_queue_message_identifier() {

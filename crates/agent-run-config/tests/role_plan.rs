@@ -70,6 +70,8 @@ Review the assigned change.\n";
     )
     .expect("resolves");
     let payload = plan.to_payload();
+    assert!(plan.worker_mcp);
+    assert_eq!(payload["worker_mcp"], true);
     assert_eq!(payload["role_revision"], "3");
     assert_eq!(
         payload["auth"],
@@ -134,6 +136,13 @@ fn from_payload_rejects_malformed_or_tampered_documents() {
             .to_payload(),
         payload
     );
+    assert!(!ResolvedRolePlan::from_payload(&payload).unwrap().worker_mcp);
+    for invalid_flag in [json!(false), json!(null), json!("true")] {
+        let mut invalid = payload.clone();
+        invalid["worker_mcp"] = invalid_flag;
+        reseal(&mut invalid);
+        assert!(ResolvedRolePlan::from_payload(&invalid).is_err());
+    }
 
     let mut cases = Vec::new();
 

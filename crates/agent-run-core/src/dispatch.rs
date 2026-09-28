@@ -111,6 +111,22 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
+        agent_run_domain::worker::METHOD => {
+            let call: agent_run_domain::worker::WorkerCall = args(raw)?;
+            let home = service.home.clone();
+            tokio::task::spawn_blocking(move || {
+                let receipt = crate::state::Store::open(&home)?.notify_orchestrator(
+                    &call.run_id,
+                    &call.attempt_id,
+                    &call.token,
+                    &call.input,
+                    crate::domain::now(),
+                )?;
+                Ok(serde_json::to_value(receipt)?)
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("worker notification failed".into()))?
+        }
         // Public initial start is provider + explicit model only; a legacy
         // `runtime` payload is an unknown field (ValidationError).
         "start" => {
