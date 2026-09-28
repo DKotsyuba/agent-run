@@ -473,8 +473,11 @@ pub fn materialize_provider(
     )
 }
 
-/// Shared v1/v2 writer; only the optional provider branch adds new files or
-/// custom gateway settings, so historical materialization stays byte-stable.
+/// Publishes a new v1/v2 home with frozen local assets and private native state.
+///
+/// Codex homes disable remote catalog discovery and forward resolved Rust roots
+/// to user MCP servers; the optional provider branch seals connection settings.
+/// Existing homes are verified separately and never regenerated during resume.
 fn materialize_with_provider(
     config: &Config,
     runtime: &Runtime,
@@ -594,6 +597,15 @@ fn materialize_with_provider(
                 }
             }
             let mut doc = toml::Table::new();
+            // Declared local plugins are already frozen in this home's snapshot.
+            // Do not download an unrelated remote catalog into every new home.
+            doc.insert(
+                "features".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "remote_plugin".into(),
+                    toml::Value::Boolean(false),
+                )])),
+            );
             let mut servers = toml::Table::new();
             for name in &profile.mcp {
                 let s = &config.mcp[name];
@@ -606,15 +618,22 @@ fn materialize_with_provider(
                     "args".into(),
                     toml::Value::Array(s.args.iter().cloned().map(toml::Value::String).collect()),
                 );
-                if !s.env_from.is_empty() {
+                let mut forwarded = s.env_from.clone();
+                // Codex's stdio MCP environment is separately filtered. Forward
+                // the already resolved toolchain roots, never raw host values.
+                // The worker channel only needs its attempt-bound capability.
+                if name != agent_run_domain::worker::SERVER_NAME {
+                    for variable in ["RUSTUP_HOME", "CARGO_HOME"] {
+                        if !forwarded.iter().any(|name| name == variable) {
+                            forwarded.push(variable.into());
+                        }
+                    }
+                }
+                if !forwarded.is_empty() {
                     t.insert(
                         "env_vars".into(),
                         toml::Value::Array(
-                            s.env_from
-                                .iter()
-                                .cloned()
-                                .map(toml::Value::String)
-                                .collect(),
+                            forwarded.into_iter().map(toml::Value::String).collect(),
                         ),
                     );
                 }

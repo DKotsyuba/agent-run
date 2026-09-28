@@ -445,19 +445,22 @@ fn codex_unsupported_hook_event_fails_closed() {
     );
 }
 
-/// Mirrors `tests/test_plugin_integration.py::ExtraMcpServerTests::test_codex_config_lists_both_servers`.
+/// Local plugins remain selected while MCP tools reuse the inherited Rust roots.
 #[test]
 fn codex_config_lists_both_declared_mcp_servers() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("codex");
+    let mut compiler = mcp(&["lsp"]);
+    compiler.env_from = vec!["COMPILER_TOKEN".into()];
     let servers = BTreeMap::from([
-        ("agent_lsp".into(), mcp(&["lsp"])),
+        ("agent_lsp".into(), compiler),
         ("codegraph".into(), mcp(&["serve", "--mcp"])),
     ]);
+    let declared = plugin(root.path(), "demo-plugin", &[], false);
     let runtime = runtime(
         "codex",
         &home,
-        vec![],
+        vec![declared],
         vec![],
         vec!["agent_lsp".into(), "codegraph".into()],
         vec![],
@@ -489,6 +492,33 @@ fn codex_config_lists_both_declared_mcp_servers() {
             toml::Value::String("--mcp".into())
         ]
     );
+    for name in ["agent_lsp", "codegraph"] {
+        let forwarded = document["mcp_servers"][name]["env_vars"]
+            .as_array()
+            .unwrap();
+        for variable in ["RUSTUP_HOME", "CARGO_HOME"] {
+            assert_eq!(
+                forwarded
+                    .iter()
+                    .filter(|value| value.as_str() == Some(variable))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(forwarded.len(), if name == "agent_lsp" { 3 } else { 2 });
+    }
+    assert_eq!(
+        document["mcp_servers"]["agent_lsp"]["env_vars"][0].as_str(),
+        Some("COMPILER_TOKEN")
+    );
+    assert_eq!(document["features"]["remote_plugin"].as_bool(), Some(false));
+    assert_eq!(
+        document["plugins"]["demo-plugin@personal"]["enabled"].as_bool(),
+        Some(true)
+    );
+    assert!(home
+        .join("plugins/cache/personal/demo-plugin/1.0.0/.claude-plugin/plugin.json")
+        .is_file());
 }
 
 /// Mirrors `tests/test_plugin_integration.py::ExtraMcpServerTests::test_claude_mcp_config_lists_both_servers`.

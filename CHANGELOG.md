@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(runtime): forward resolved Rust roots to Codex MCP tools, avoid repeated
+  remote catalog downloads, and reuse identical same-account native plugin
+  cache blocks after verified cleanup while keeping each run's files private
+
 - perf(runtime): clone managed plugin and skill snapshot files on supported
   macOS filesystems, preserving per-run isolation and historical verification;
   retain the byte writer on unsupported volumes or incompatible source metadata
