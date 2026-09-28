@@ -154,6 +154,36 @@ pub struct Entry {
     pub modified: f64,
 }
 
+/// Checks whether cloning would preserve only the provenance xattr that macOS
+/// already assigns to normally written managed files. Other source metadata
+/// uses the byte writer so snapshot publication keeps its existing behavior.
+#[cfg(target_os = "macos")]
+fn clone_attributes_compatible(file: &File) -> bool {
+    // SAFETY: fstat initializes this plain C output buffer for the live descriptor.
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: the descriptor and output buffer remain valid for this call.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut status) } < 0 || status.st_flags != 0 {
+        return false;
+    }
+    // SAFETY: the descriptor is live; a null buffer asks only for the name length.
+    let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
+    if !(0..=256).contains(&count) {
+        return false;
+    }
+    if count == 0 {
+        return true;
+    }
+    let mut names = vec![0_u8; count as usize];
+    // SAFETY: the allocated buffer remains live and has the queried length.
+    let written =
+        unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len(), 0) };
+    written == count
+        && names.last() == Some(&0)
+        && names[..names.len() - 1]
+            .split(|byte| *byte == 0)
+            .all(|name| name == b"com.apple.provenance")
+}
+
 /// Converts one raw `stat` result into the public no-follow identity shape.
 fn entry_of(status: &libc::stat) -> Entry {
     let kind = status.st_mode & libc::S_IFMT;
@@ -570,6 +600,130 @@ impl Dir {
     pub fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
         self.write_seamed(path, data, mode, None)
     }
+    /// Publishes captured snapshot bytes, cloning their source blocks when macOS supports it.
+    ///
+    /// `source_path` and `path` are no-follow relative paths in their respective
+    /// directories. The returned boolean reports a verified APFS clone; false
+    /// means the existing byte writer published `data`. Unsupported volumes,
+    /// changed source bytes, and source xattrs other than system provenance
+    /// fall back to that writer. Other clone failures propagate without
+    /// replacing the destination. Both paths publish through a temporary name
+    /// and retain the same private mode and parent-directory sync contract.
+    pub fn write_snapshot_file(
+        &self,
+        path: &Path,
+        source: &Dir,
+        source_path: &Path,
+        data: &[u8],
+        mode: u32,
+    ) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if self.try_clone_snapshot(path, source, source_path, data, mode)? {
+            return Ok(true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (source, source_path);
+        self.write(path, data, mode)?;
+        Ok(false)
+    }
+
+    /// Returns true only after an exact-byte clone has been durably renamed.
+    #[cfg(target_os = "macos")]
+    fn try_clone_snapshot(
+        &self,
+        path: &Path,
+        source: &Dir,
+        source_path: &Path,
+        data: &[u8],
+        mode: u32,
+    ) -> Result<bool> {
+        let source_file = match source.open_file(source_path) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if source_file.metadata()?.len() != data.len() as u64
+            || !clone_attributes_compatible(&source_file)
+        {
+            return Ok(false);
+        }
+        let (parent, name) = self.parent(path, true)?;
+        let temporary = CString::new(format!(".agent-run-{}.tmp", uuid::Uuid::new_v4().simple()))
+            .expect("ASCII UUID");
+        // SAFETY: source is an opened regular file; parent and temp basename
+        // are owned and live. Flags prohibit path links and foreign ownership.
+        if unsafe {
+            libc::fclonefileat(
+                source_file.as_raw_fd(),
+                parent.as_raw_fd(),
+                temporary.as_ptr(),
+                0x0008 | 0x0002,
+            )
+        } < 0
+        {
+            let error = std::io::Error::last_os_error();
+            return if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTSUP | libc::EXDEV | libc::ENOSYS | libc::EINVAL)
+            ) {
+                Ok(false)
+            } else {
+                Err(error.into())
+            };
+        }
+        let result = (|| -> Result<bool> {
+            // SAFETY: clonefileat just created this unique temp name in parent.
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    temporary.as_ptr(),
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: this invocation uniquely owns the opened descriptor.
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            if !file.metadata()?.is_file()
+                || file.metadata()?.len() != data.len() as u64
+                || !clone_attributes_compatible(&file)
+            {
+                return Ok(false);
+            }
+            let mut captured = Vec::with_capacity(data.len());
+            Read::by_ref(&mut file)
+                .take(data.len() as u64 + 1)
+                .read_to_end(&mut captured)?;
+            if captured != data {
+                return Ok(false);
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            file.sync_all()?;
+            // SAFETY: both names are relative to the verified directory;
+            // rename replaces the destination atomically without following it.
+            if unsafe {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    temporary.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                )
+            } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            sync_directory(&parent)?;
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            // SAFETY: only the fresh temporary name owned by this invocation.
+            unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
+        }
+        result
+    }
     /// Same durable temp-then-rename write as [`Dir::write`], with an optional
     /// fault hook fired at the three crash points a real publish can be
     /// interrupted at. `fault` is always `None` on every production call
@@ -722,5 +876,168 @@ mod scan_tests {
             }
         }
         assert_eq!(seen.len(), 40);
+    }
+}
+
+#[cfg(test)]
+/// Verifies isolated snapshot bytes and macOS clone fallback.
+mod snapshot_clone_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Independent inodes keep their pinned bytes when either side changes.
+    #[test]
+    fn clone_keeps_private_snapshot_bytes_and_modes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source");
+        let target_path = temporary.path().join("target");
+        private_dir(&source_path).unwrap();
+        private_dir(&target_path).unwrap();
+        let source = Dir::open(&source_path).unwrap();
+        let target = Dir::open(&target_path).unwrap();
+        let old = b"frozen selected plugin version";
+        source.write(Path::new("skill.txt"), old, 0o600).unwrap();
+        let cloned = target
+            .write_snapshot_file(
+                Path::new("selected/skill.txt"),
+                &source,
+                Path::new("skill.txt"),
+                old,
+                0o700,
+            )
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(cloned, "APFS temp homes should support native cloning");
+        #[cfg(not(target_os = "macos"))]
+        assert!(!cloned, "other targets use the existing byte writer");
+        assert_eq!(
+            target.read(Path::new("selected/skill.txt"), 1024).unwrap(),
+            old
+        );
+        let stored = std::fs::metadata(target_path.join("selected/skill.txt")).unwrap();
+        assert_eq!(stored.permissions().mode() & 0o777, 0o700);
+        assert_ne!(
+            stored.ino(),
+            std::fs::metadata(source_path.join("skill.txt"))
+                .unwrap()
+                .ino()
+        );
+        source
+            .write(Path::new("skill.txt"), b"new plugin version", 0o600)
+            .unwrap();
+        assert_eq!(
+            target.read(Path::new("selected/skill.txt"), 1024).unwrap(),
+            old
+        );
+        target
+            .write(
+                Path::new("selected/skill.txt"),
+                b"per-run private change",
+                0o700,
+            )
+            .unwrap();
+        assert_eq!(
+            source.read(Path::new("skill.txt"), 1024).unwrap(),
+            b"new plugin version"
+        );
+    }
+
+    /// Unselected source xattrs retain the historical byte-write behavior.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extra_source_xattr_falls_back_without_copying_metadata() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source");
+        let target_path = temporary.path().join("target");
+        private_dir(&source_path).unwrap();
+        private_dir(&target_path).unwrap();
+        let source = Dir::open(&source_path).unwrap();
+        let target = Dir::open(&target_path).unwrap();
+        let payload = b"selected source";
+        source.write(Path::new("asset"), payload, 0o600).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source_path.join("asset"))
+            .unwrap();
+        let name = c"com.agent_run_snapshot_test";
+        let value = b"private xattr";
+        assert_eq!(
+            // SAFETY: name, value and owned descriptor stay valid for this syscall.
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        assert!(!target
+            .write_snapshot_file(
+                Path::new("asset"),
+                &source,
+                Path::new("asset"),
+                payload,
+                0o600
+            )
+            .unwrap());
+        assert_eq!(target.read(Path::new("asset"), 1024).unwrap(), payload);
+        assert_eq!(
+            // SAFETY: a null output buffer only queries whether the known xattr exists.
+            unsafe {
+                libc::fgetxattr(
+                    target.open_file(Path::new("asset")).unwrap().as_raw_fd(),
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            -1
+        );
+    }
+
+    /// Source file flags are not inherited by a new managed snapshot file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_flags_fall_back_to_byte_writer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source");
+        let target_path = temporary.path().join("target");
+        private_dir(&source_path).unwrap();
+        private_dir(&target_path).unwrap();
+        let source = Dir::open(&source_path).unwrap();
+        let target = Dir::open(&target_path).unwrap();
+        let payload = b"selected source";
+        source.write(Path::new("asset"), payload, 0o600).unwrap();
+        let file = source.open_file(Path::new("asset")).unwrap();
+        assert_eq!(
+            // SAFETY: the descriptor is live and the user owns this temporary file.
+            unsafe { libc::fchflags(file.as_raw_fd(), libc::UF_NODUMP) },
+            0
+        );
+        assert!(!target
+            .write_snapshot_file(
+                Path::new("asset"),
+                &source,
+                Path::new("asset"),
+                payload,
+                0o600
+            )
+            .unwrap());
+        assert_eq!(target.read(Path::new("asset"), 1024).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(target_path.join("asset"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

@@ -17,6 +17,18 @@ Each runtime gets generated lightweight configuration so subagents see only the
 skills and MCP servers selected by their role. The generated directory is
 configuration separation, not an OS security boundary.
 
+On macOS, Agent Run attempts an APFS copy-on-write clone for selected regular
+plugin and skill snapshot files. Each run still has its own file inode, private
+directory, account binding, role/MCP configuration, native history, and snapshot
+manifest. The clone is published only after its bytes match the captured source
+and its mode is restored. Source files with other extended attributes or file
+flags, changed bytes, or unsupported filesystems use the existing byte writer.
+Historical snapshot/index formats and resume verification are unchanged.
+Native Codex plugin and remote catalog caches are written by the harness in
+its own `CODEX_HOME`; this first increment does not share them. APFS clones reduce
+physical blocks for unchanged files, while per-directory logical sizes can
+still count each clone.
+
 Current schema-2 configuration separates `[harnesses.<id>]` launch settings
 from `[providers.<id>]` models, connections and account bindings. Historical
 schema-1 `runtimes.*`, singular `workspace_root` and `default_account` fields

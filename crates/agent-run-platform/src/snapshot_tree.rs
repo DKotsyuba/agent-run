@@ -341,9 +341,16 @@ pub fn snapshot_managed_tree(
         }
     }
     let map = entry_map(&entries)?;
+    let source_dir = Dir::open(source)?;
     for (path, payload) in &files {
         let mode = map[path]["mode"].as_u64().expect("file mode") as u32;
-        home_dir.write(&relative_root.join(path), payload, mode)?;
+        home_dir.write_snapshot_file(
+            &relative_root.join(path),
+            &source_dir,
+            Path::new(path),
+            payload,
+            mode,
+        )?;
     }
     let document = manifest(&entries);
     publish::publish_group(

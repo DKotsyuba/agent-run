@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- perf(runtime): clone managed plugin and skill snapshot files on supported
+  macOS filesystems, preserving per-run isolation and historical verification;
+  retain the byte writer on unsupported volumes or incompatible source metadata
+
 ## [0.18.1] - 2026-09-28
 
 - fix(retention): expire unreferenced run directories, completed deployment and
