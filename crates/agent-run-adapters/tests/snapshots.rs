@@ -417,6 +417,7 @@ fn python_test_config_snapshot_binds_revision_without_secret_values() {
     }))
     .expect("config");
     let profile = ResolvedRolePlan {
+        worker_mcp: false,
         role_name: "review".into(),
         role_revision: "legacy".into(),
         prompt: "Review exactly.".into(),

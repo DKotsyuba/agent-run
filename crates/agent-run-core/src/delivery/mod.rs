@@ -10,6 +10,7 @@ use crate::{
     Result,
 };
 use agent_run_config::provider_config::ProviderConfig;
+use agent_run_domain::worker::{WorkerMessageKind, WorkerNotice};
 use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -362,7 +363,15 @@ struct Claim {
     attempt: u32,
     transport: String,
     session: String,
-    notice: Notice,
+    payload: Payload,
+}
+
+/// The one trusted delivery shape selected from the durable outbox row.
+enum Payload {
+    /// Existing terminal lifecycle notice.
+    Completion(Notice),
+    /// Untrusted worker report with no lifecycle effect.
+    Worker(WorkerNotice),
 }
 
 /// Counts one bounded outbox drain and reports whether another process owns it.
@@ -465,6 +474,13 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [session_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let worker: Option<(String, String)> = tx
+        .query_row(
+            "SELECT kind,message FROM worker_notifications WHERE delivery_id=?",
+            [&delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
     let (runtime, model, request_json, status, kind): (
         String,
         String,
@@ -495,17 +511,37 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [&agent_id],
         |row| row.get(0),
     )?;
-    let notice = Notice {
-        notification_id: delivery_id.clone(),
-        agent_id: root.parse()?,
-        run_id: Some(agent_id.parse()?),
-        status: status.parse()?,
-        runtime: bounded(runtime),
-        model: bounded(model),
-        effort,
-        failure_kind: kind.and_then(bounded),
+    let payload = if let Some((kind, message)) = worker {
+        let kind = match kind.as_str() {
+            "notice" => WorkerMessageKind::Notice,
+            "risk" => WorkerMessageKind::Risk,
+            "question" => WorkerMessageKind::Question,
+            "blocker" => WorkerMessageKind::Blocker,
+            _ => return Err(invalid("invalid stored worker kind")),
+        };
+        let notice = WorkerNotice {
+            notification_id: delivery_id.clone(),
+            agent_id: root.parse()?,
+            run_id: agent_id.parse()?,
+            kind,
+            message,
+        };
+        notice.validate()?;
+        Payload::Worker(notice)
+    } else {
+        let notice = Notice {
+            notification_id: delivery_id.clone(),
+            agent_id: root.parse()?,
+            run_id: Some(agent_id.parse()?),
+            status: status.parse()?,
+            runtime: bounded(runtime),
+            model: bounded(model),
+            effort,
+            failure_kind: kind.and_then(bounded),
+        };
+        notice.validate()?;
+        Payload::Completion(notice)
     };
-    notice.validate()?;
     let attempt = attempts
         .checked_add(1)
         .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
@@ -525,7 +561,7 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         attempt,
         transport,
         session,
-        notice,
+        payload,
     }))
 }
 
@@ -595,9 +631,19 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         return Ok(None);
     };
     let started = std::time::Instant::now();
-    let mut evidence = match claim.transport.as_str() {
-        "codex_queue" => relay::send(home, &claim.session, &claim.notice).await,
-        "claude_uds" => claude::send(&claude_registry(), &claim.session, &claim.notice).await,
+    let mut evidence = match (claim.transport.as_str(), &claim.payload) {
+        ("codex_queue", Payload::Completion(notice)) => {
+            relay::send(home, &claim.session, notice).await
+        }
+        ("codex_queue", Payload::Worker(notice)) => {
+            relay::send_worker(home, &claim.session, notice).await
+        }
+        ("claude_uds", Payload::Completion(notice)) => {
+            claude::send(&claude_registry(), &claim.session, notice).await
+        }
+        ("claude_uds", Payload::Worker(notice)) => {
+            claude::send_worker(&claude_registry(), &claim.session, notice).await
+        }
         _ => Evidence::new("unsupported_transport", false, false),
     };
     evidence.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -664,7 +710,7 @@ fn claude_registry() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim, dispatcher_lock};
+    use super::{claim, dispatcher_lock, Payload};
     use crate::{domain::now, state::Store};
     use rusqlite::params;
     use std::io::Write;
@@ -695,9 +741,12 @@ mod tests {
              VALUES('notice',?1,'session','pending',0)", [child],
         ).unwrap();
         let claimed = claim(home.path(), "test-owner").unwrap().unwrap();
-        assert_eq!(claimed.notice.agent_id.as_str(), root);
-        assert_eq!(claimed.notice.run_id.as_ref().unwrap().as_str(), child);
-        let rendered = claimed.notice.render().unwrap();
+        let Payload::Completion(notice) = claimed.payload else {
+            panic!("expected completion")
+        };
+        assert_eq!(notice.agent_id.as_str(), root);
+        assert_eq!(notice.run_id.as_ref().unwrap().as_str(), child);
+        let rendered = notice.render().unwrap();
         assert!(rendered.contains(&format!("- ID: {root}\n- Run: {child}\n")));
         let stored_run: String = store
             .conn

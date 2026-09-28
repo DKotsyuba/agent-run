@@ -372,6 +372,8 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
 /// process-identity fence, transcript, cleanup verifier, and terminal outbox.
 /// Checkpoints observed root/descendant identities on change, including final
 /// cleanup, so recovery retains captured members after this supervisor exits.
+/// Worker-enabled roles receive a fresh capability for each attempt, hashed in
+/// the store and injected only into the launch environment before spawning.
 async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     if store.cancel_pending(id)? {
         if !store.provider_never_spawned(id)? {
@@ -464,6 +466,26 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 output_schema: identity.provider_request.output_schema.as_ref(),
             },
         )?;
+        if planned.role.worker_mcp {
+            // This attempt-only capability is never part of the sealed home or
+            // argv. New attempts receive a new token; the broker checks durable
+            // ownership and run liveness for every report.
+            let token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            store.issue_worker_capability(id, &attempt_id, &token, domain::now())?;
+            let values = [
+                home.to_string_lossy().into_owned(),
+                id.as_str().to_owned(),
+                attempt_id.clone(),
+                token,
+            ];
+            for (name, value) in agent_run_domain::worker::ENV_NAMES.into_iter().zip(values) {
+                planned.launch.environment.insert(name.into(), value);
+            }
+        }
         // Any continuation re-verifies its recorded history seal at the
         // handoff itself, bound to the history root this exact launch plan
         // selects: a seal for one directory never authorizes a launch whose

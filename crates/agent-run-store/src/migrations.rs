@@ -118,6 +118,10 @@ const PENDING_FILES: &[(i64, &str)] = &[
         20,
         include_str!("../../../sql/migrations/020_external_services.sql"),
     ),
+    (
+        21,
+        include_str!("../../../sql/migrations/021_worker_notifications.sql"),
+    ),
 ];
 
 /// Every migration file, ordered by the version it produces.

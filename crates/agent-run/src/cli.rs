@@ -290,6 +290,9 @@ pub enum Command {
         topic: Option<String>,
     },
     Mcp,
+    /// Internal run-bound worker channel; context is inherited from the supervisor.
+    #[command(name = "_worker-mcp", hide = true)]
+    WorkerMcp,
     Api {
         #[command(subcommand)]
         command: Api,
@@ -1159,6 +1162,12 @@ fn provider_login_target(
 /// socket broker. Long-lived API and supervisor processes select their own
 /// component log before the process-wide logger is initialized.
 pub async fn run(cli: Cli) -> Result<i32> {
+    // A worker frontend is a thin socket client. It must never migrate/open
+    // the store or inherit Desktop host capabilities through the normal MCP.
+    if matches!(cli.command, Command::WorkerMcp) {
+        transport::worker_mcp::serve_from_env().await?;
+        return Ok(0);
+    }
     let home = fs::home(cli.home.clone())?;
     // An older state database must be migrated together with its config;
     // no other command may open (and so auto-upgrade) it first.
@@ -1487,6 +1496,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             (dependencies.output)(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;
         }
         Command::Mcp => transport::mcp::serve_with(home, None, dependencies.broker.clone()).await?,
+        Command::WorkerMcp => transport::worker_mcp::serve_from_env().await?,
         Command::Api { command } => match command {
             Api::Serve { socket } => {
                 if let Some(socket) = socket {

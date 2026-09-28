@@ -12,6 +12,7 @@ pub mod quota_snapshot;
 pub mod tools;
 pub mod types;
 pub mod views;
+pub mod worker;
 
 pub use catalog::{
     AccountId, AccountRecord, AccountStatus, AttemptCredentials, AuthFamily, CredentialHeader,
@@ -36,3 +37,4 @@ pub use views::{
     AgentPage, AgentView, AnswerView, CapacityOrderQuery, CleanupView, CommandView, DeliveryView,
     MessageView, ModelsQuery, StartResult, TranscriptPage,
 };
+pub use worker::{NotifyReceipt, NotifyRequest, WorkerCall, WorkerMessageKind, WorkerNotice};

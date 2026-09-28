@@ -104,9 +104,11 @@ pub fn runtime(config: &ProviderConfig, harness: HarnessId, model: &str) -> Resu
 }
 
 /// Returns existing shared role, skill, MCP, and environment declarations for
-/// the established asset writer, without selecting a v1 runtime.
-fn shared(config: &ProviderConfig) -> Config {
-    Config {
+/// the established asset writer, without selecting a v1 runtime. When frozen
+/// `worker_mcp` is enabled, add the built-in server using the current executable
+/// and environment names only; executable lookup can fail without writing files.
+fn shared(config: &ProviderConfig, worker_mcp: bool) -> Result<Config> {
+    let mut shared = Config {
         schema_version: 1,
         core: config.core.clone(),
         capacity: config.capacity.clone(),
@@ -116,13 +118,32 @@ fn shared(config: &ProviderConfig) -> Config {
         mcp: config.mcp.clone(),
         environments: config.environments.clone(),
         runtimes: BTreeMap::new(),
+    };
+    if worker_mcp {
+        shared.mcp.insert(
+            agent_run_domain::worker::SERVER_NAME.into(),
+            config::Mcp {
+                transport: "stdio".into(),
+                command: std::env::current_exe()?,
+                args: vec!["_worker-mcp".into()],
+                env_from: agent_run_domain::worker::ENV_NAMES
+                    .iter()
+                    .map(|name| (*name).into())
+                    .collect(),
+                approval_mode: "approve".into(),
+                global: false,
+                allowed_tools: None,
+            },
+        );
     }
+    Ok(shared)
 }
 
 /// Reconstructs role grants from a validated canonical plan rather than a
 /// mutable profile file; the materializer still verifies skill/MCP assets.
+/// Includes the built-in worker namespace only when frozen in the role.
 fn profile(role: &ResolvedRolePlan) -> Profile {
-    Profile {
+    let mut profile = Profile {
         name: role.role_name.clone(),
         body: role.prompt.clone(),
         write: role.write,
@@ -144,7 +165,13 @@ fn profile(role: &ResolvedRolePlan) -> Profile {
             })
             .collect(),
         required_constraints: role.required_constraints.clone(),
+    };
+    if role.worker_mcp {
+        profile
+            .mcp
+            .push(agent_run_domain::worker::SERVER_NAME.into());
     }
+    profile
 }
 
 /// Seals one provider's native settings, tools, grants, and model alias once.
@@ -222,7 +249,7 @@ pub fn materialize_selected(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid("v2 config snapshot lacks a digest"))?
         .to_owned();
-    let config = shared(config);
+    let config = shared(config, role.worker_mcp)?;
     if role_profile
         .mcp
         .iter()
@@ -394,15 +421,27 @@ pub fn plan_selected_with(
         CredentialRef::Named { label, .. } => Some(label.as_str()),
         _ => None,
     };
+    // The supervisor injects the worker capability after planning. Only user
+    // MCP environment declarations are sourced from the host; a worker must
+    // never inherit another attempt's capability from an upstream environment.
+    let mut environment_profile = profile(&role);
+    if role.worker_mcp {
+        environment_profile
+            .mcp
+            .retain(|name| name != agent_run_domain::worker::SERVER_NAME);
+    }
     let mut environment = materialize::environment_with_host(
-        &shared(config),
+        &shared(config, false)?,
         &runtime,
-        &profile(&role),
+        &environment_profile,
         home,
         selected_label,
         app_home,
         host,
     )?;
+    for name in agent_run_domain::worker::ENV_NAMES {
+        environment.remove(name);
+    }
     let host_home = host
         .get("HOME")
         .cloned()
@@ -554,6 +593,9 @@ fn claude_args(
         })
         .collect::<Vec<_>>();
     allowed.extend(role.mcp.iter().map(|server| format!("mcp__{}", server.id)));
+    if role.worker_mcp {
+        allowed.push(format!("mcp__{}", agent_run_domain::worker::SERVER_NAME));
+    }
     let denied = if role.network {
         String::new()
     } else {
@@ -588,7 +630,7 @@ fn claude_args(
         "--disallowedTools".into(),
         denied,
     ]);
-    if !role.mcp.is_empty() {
+    if !role.mcp.is_empty() || role.worker_mcp {
         args.extend([
             "--mcp-config".into(),
             home.join("mcp/mcp-config.json")

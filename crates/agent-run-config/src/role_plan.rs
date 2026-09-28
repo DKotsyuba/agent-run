@@ -91,6 +91,9 @@ pub struct ResolvedRolePlan {
     pub read_roots: Vec<PathBuf>,
     pub skills: Vec<ResolvedSkill>,
     pub mcp: Vec<ResolvedMcp>,
+    /// Frozen first-party worker channel. Absent in historical payloads, which
+    /// must not gain tools when restored; newly resolved roles enable it.
+    pub worker_mcp: bool,
     pub required_constraints: BTreeSet<Constraint>,
     pub auth_mode: String,
     pub auth_reference: Option<String>,
@@ -139,7 +142,7 @@ fn canonical_payload(plan: &ResolvedRolePlan) -> Value {
             Value::Object(object)
         })
         .collect();
-    json!({
+    let mut payload = json!({
         "role_name": plan.role_name,
         "role_revision": plan.role_revision,
         "prompt": plan.prompt,
@@ -157,7 +160,11 @@ fn canonical_payload(plan: &ResolvedRolePlan) -> Value {
         "mcp": mcp,
         "required_constraints": sorted_constraint_names(&plan.required_constraints),
         "auth": {"mode": plan.auth_mode, "reference": plan.auth_reference},
-    })
+    });
+    if plan.worker_mcp {
+        payload["worker_mcp"] = json!(true);
+    }
+    payload
 }
 
 impl ResolvedRolePlan {
@@ -176,21 +183,26 @@ impl ResolvedRolePlan {
     /// the auth choice are validated. The credential-free config revision is
     /// recomputed before the immutable plan is returned.
     pub fn from_payload(payload: &Value) -> Result<ResolvedRolePlan> {
-        let document = exact_object(
-            payload,
-            &[
-                "role_name",
-                "role_revision",
-                "prompt",
-                "grants",
-                "skills",
-                "mcp",
-                "required_constraints",
-                "auth",
-                "config_revision",
-            ],
-            "resolved role",
-        )?;
+        let worker_mcp = match payload.get("worker_mcp") {
+            None => false,
+            Some(Value::Bool(true)) => true,
+            _ => return Err(invalid("resolved role worker_mcp must be true or absent")),
+        };
+        let mut keys = vec![
+            "role_name",
+            "role_revision",
+            "prompt",
+            "grants",
+            "skills",
+            "mcp",
+            "required_constraints",
+            "auth",
+            "config_revision",
+        ];
+        if worker_mcp {
+            keys.push("worker_mcp");
+        }
+        let document = exact_object(payload, &keys, "resolved role")?;
 
         let grants = exact_object(
             &document["grants"],
@@ -441,6 +453,7 @@ impl ResolvedRolePlan {
             read_roots: roots,
             skills,
             mcp: servers,
+            worker_mcp,
             required_constraints: constraints,
             auth_mode,
             auth_reference,
@@ -483,6 +496,8 @@ pub fn role_from_authority(
 /// catalog servers once; profile tool filters intersect the catalog cap.
 /// The shared worker instructions precede the profile body and are hashed with
 /// it, so continuation restores exactly the admitted behavior without reinjection.
+/// New plans enable the built-in worker MCP; its namespace is reserved and
+/// cannot be replaced through the user MCP catalog or profile declarations.
 pub fn resolve_role_plan(
     profile: &Profile,
     skills_root: &Path,
@@ -490,6 +505,16 @@ pub fn resolve_role_plan(
     auth_mode: &str,
     auth_reference: Option<&str>,
 ) -> Result<ResolvedRolePlan> {
+    if mcp_catalog.contains_key(agent_run_domain::worker::SERVER_NAME)
+        || profile
+            .mcp
+            .iter()
+            .any(|name| name == agent_run_domain::worker::SERVER_NAME)
+    {
+        return Err(invalid(
+            "agent_run_worker is reserved for the built-in worker MCP",
+        ));
+    }
     if !profile.canonical {
         return Err(invalid("resolved role plans require a canonical profile"));
     }
@@ -585,6 +610,7 @@ pub fn resolve_role_plan(
         read_roots: profiles::normalize_roots(&profile.read_roots),
         skills,
         mcp: servers,
+        worker_mcp: true,
         required_constraints: profile.required_constraints.clone(),
         auth_mode: auth_mode.to_string(),
         auth_reference: auth_reference.map(str::to_string),

@@ -16,7 +16,7 @@ if (!path.isAbsolute(executable || "") || !path.isAbsolute(home || "") || !contr
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
 /** Private relay endpoint with a random suffix so PID reuse cannot collide. @type {string} */
 const relayPath = path.join(home, `ar-cdx-v4-${process.pid}-${crypto.randomBytes(3).toString("hex")}.sock`);
-/** Trusted completion template embedded by the Rust executable. @type {{template: string, status_guidance: Record<string, {reason: string, advice: string}>, failure_guidance: Record<string, {reason: string, advice: string}>, default_failure: {reason: string, advice: string}}} */
+/** Trusted notice templates embedded by the Rust executable. @type {{template: string, worker_template: string, status_guidance: Record<string, {reason: string, advice: string}>, failure_guidance: Record<string, {reason: string, advice: string}>, default_failure: {reason: string, advice: string}}} */
 const NOTICE_CONTRACT = JSON.parse(contractJson);
 /** Notice marker version, independent of the accepted relay wire versions. @type {number} */
 const COMPLETION_NOTICE_VERSION = 1;
@@ -28,6 +28,8 @@ const V2_KEYS = ["agent_id", "effort", "model", "notification_id", "op", "runtim
 const V3_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id", "op", "runtime", "status", "thread_id", "version"];
 /** Stable-agent and exact-run v4 request keys. @type {string[]} */
 const V4_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id", "op", "run_id", "runtime", "status", "thread_id", "version"];
+/** Strict v4 worker report keys; the frontend never accepts arbitrary host methods. @type {string[]} */
+const WORKER_KEYS = ["agent_id", "kind", "message", "notification_id", "op", "run_id", "thread_id", "version"];
 /** Launch metadata bound in code points, matching the Rust notice contract. @type {number} */
 const META_LIMIT = 128;
 
@@ -157,10 +159,11 @@ function metaText(value, marker) {
 /**
  * Render the trusted template once; braces and dollar signs in values stay literal.
  * @param {Record<string, string | number>} values Validated display-safe fields.
+ * @param {string} [template=NOTICE_CONTRACT.template] Trusted template to render.
  * @returns {string} Notice text without further I/O or value interpretation.
  */
-function renderTemplate(values) {
-  return NOTICE_CONTRACT.template.replace(/\{([^}]+)\}/g, (match, key) => values[key] ?? match);
+function renderTemplate(values, template=NOTICE_CONTRACT.template) {
+  return template.replace(/\{([^}]+)\}/g, (match, key) => values[key] ?? match);
 }
 
 /**
@@ -228,6 +231,37 @@ function notice(request) {
 }
 
 /**
+ * Validate and render one bounded untrusted worker report under trusted framing.
+ * @param {unknown} request Decoded v4 relay value.
+ * @returns {string} Trusted framing around untrusted worker prose.
+ * @throws {Error} If fields, identifiers, body, or size violate the fixed contract.
+ */
+function workerMessage(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(WORKER_KEYS) ||
+      request.version !== 4 || request.op !== "worker_message") throw new Error("invalid worker request");
+  if (typeof request.thread_id !== "string" || !request.thread_id.trim() ||
+      [...request.thread_id].length > 512 || request.thread_id.includes("\0") ||
+      typeof request.notification_id !== "string" || !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
+      !/^ag-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.agent_id) ||
+      !/^ag-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.run_id) ||
+      !["notice", "risk", "question", "blocker"].includes(request.kind) ||
+      typeof request.message !== "string" || !request.message.trim() ||
+      Buffer.byteLength(request.message, "utf8") > 2048 ||
+      /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(request.message)) throw new Error("invalid worker report");
+  return renderTemplate(request, NOTICE_CONTRACT.worker_template);
+}
+
+/**
+ * Select one of the two fixed typed renderers without routing worker fields to tools.
+ * @param {unknown} request Decoded relay request.
+ * @returns {string} Trusted framing with validated facts or bounded worker prose.
+ */
+function renderRequest(request) {
+  return request && request.op === "worker_message" ? workerMessage(request) : notice(request);
+}
+
+/**
  * Deliver one typed notice through the fixed native-host tool.
  * @param {Record<string, unknown>} request Validated only by `notice` before host contact.
  * @returns {Promise<"accepted" | "rejected" | "ambiguous">} Durable delivery classification.
@@ -237,7 +271,7 @@ async function deliver(request) {
   let sent = false;
   const socket = new net.Socket(), deadline = Date.now() + HOST_MS;
   try {
-    const prompt = notice(request);
+    const prompt = renderRequest(request);
     await connect(socket, pipe, deadline);
     const listed = await rpc(socket, 1, "tools/list", { threadStartKind: "all" }, deadline);
     const tool = Array.isArray(listed.tools) && listed.tools.find(
