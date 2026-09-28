@@ -26,7 +26,7 @@ removed. Each transaction considers at most 32 agents and deletes at most 2,000
 rows per large journal. Foreign keys stay enabled. SQLite's progress callback
 interrupts a batch after two seconds; rollback preserves earlier committed work.
 
-After the backlog drains, the broker runs SQLite `incremental_vacuum` in batches
+After the database backlog drains, the broker runs SQLite `incremental_vacuum` in batches
 of at most 1,024 pages (4 MiB with the usual page size), pausing one second between
 batches until free pages are reclaimed. Compaction waits for agents,
 workflows and managed services to become idle. Unresolved terminal ownership
@@ -71,8 +71,12 @@ nonblocking probe unlinks only a refused socket whose inode is unchanged.
 Each filesystem pass scans at most 1,024 entries, begins at most 16 tree
 roots, unlinks at most 256 descendant entries and 64 standalone files, probes at
 most 16 sockets, and stops after two seconds or 32 tree levels. The broker
-keeps live directory scans between passes so an undeletable first batch does
-not starve later entries. At most 64 streams remain open; the least recently
+remembers completed namespaces for one scan round, so differently sized
+directories do not keep the one-second maintenance loop running indefinitely.
+SQLite compaction does not wait for filesystem traversal to finish.
+Live directory scans keep an undeletable first batch from starving later
+entries. At most 20,000 namespace keys and 64 streams are retained; excess
+bookkeeping resets the round and retries after a minute. The least recently
 used scan restarts at the beginning if that limit is reached. A broker restart
 also rescans from the beginning; immutable
 names and fresh reference checks make partial cleanup safe to resume. Unknown,

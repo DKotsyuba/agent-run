@@ -682,7 +682,8 @@ pub async fn serve_at_with_options(
                 // batches still report work, so a large journal backlog can
                 // never starve reclaiming disposable files on disk.
                 let filesystem = agent_run_core::housekeeping::sweep(&home, now, &store);
-                let mut done = database?;
+                let database_removed = database?;
+                let mut done = database_removed;
                 let filesystem_failed = match filesystem {
                     Ok(removed) => {
                         done += removed;
@@ -693,8 +694,10 @@ pub async fn serve_at_with_options(
                         true
                     }
                 };
-                if done == 0 && store.vacuum_history()? {
-                    return Ok((1, filesystem_failed)); // Continue vacuum after the short pause.
+                // SQLite compaction follows its own idle rules. A filesystem
+                // traversal can need more passes without delaying free-page work.
+                if database_removed == 0 && store.vacuum_history()? {
+                    done += 1;
                 }
                 Ok((done, filesystem_failed))
             })

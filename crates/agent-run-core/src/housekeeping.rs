@@ -18,7 +18,7 @@ use agent_run_domain::domain::AgentId;
 use agent_run_store::retention::StorageProtection;
 use fs2::FileExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::OpenOptions,
     os::unix::fs::OpenOptionsExt,
@@ -48,6 +48,8 @@ const ENTRY_UNLINKS_PER_PASS: usize = 256;
 const SOCKET_PROBES_PER_PASS: usize = 16;
 /// Maximum log/config backup files one pass removes.
 const FILE_REMOVALS_PER_PASS: usize = 64;
+/// Maximum remembered namespaces in one unfinished scan round.
+const ROUND_KEYS_LIMIT: usize = 20_000;
 /// Component labels this codebase uses for direct UTC-daily files.
 const LOG_COMPONENTS: [&str; 6] = ["cli", "api", "api-serve", "mcp", "services", "supervisor"];
 
@@ -148,12 +150,24 @@ struct LiveScan {
     last_used: Instant,
 }
 
-/// Active broker scans only; restart begins at the start of each directory.
-static SCANS: OnceLock<Mutex<BTreeMap<String, LiveScan>>> = OnceLock::new();
+/// Live offsets and completed namespaces for one in-memory scan round.
+#[derive(Default)]
+struct ScanRegistry {
+    /// Open streams still traversing a directory.
+    active: BTreeMap<String, LiveScan>,
+    /// Namespaces whose EOF was seen this round; later passes may revisit them
+    /// to reach child scans without making their size hold the round open.
+    done: BTreeSet<String>,
+    /// Namespaces skipped or still scanning because a pass exhausted its budget.
+    needed: BTreeSet<String>,
+}
+
+/// Broker-local scan rounds only; restart begins at the start of each directory.
+static SCANS: OnceLock<Mutex<ScanRegistry>> = OnceLock::new();
 
 /// Returns the shared bounded scan registry without opening directories.
-fn scans() -> &'static Mutex<BTreeMap<String, LiveScan>> {
-    SCANS.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn scans() -> &'static Mutex<ScanRegistry> {
+    SCANS.get_or_init(|| Mutex::new(ScanRegistry::default()))
 }
 
 impl Pass {
@@ -176,12 +190,23 @@ impl Pass {
 
     /// Scans one finite batch, advancing a live DIR even when entries are retained.
     fn list(&mut self, dir: &fs::Dir, key: &str) -> Option<Vec<OsString>> {
+        let full_key = format!("{}:{key}", self.home_key);
         if Instant::now() >= self.deadline {
             self.pending = true;
+            scans()
+                .lock()
+                .expect("scan lock is not poisoned")
+                .needed
+                .insert(full_key);
             return None;
         }
         if self.scans == 0 {
             self.pending = true;
+            scans()
+                .lock()
+                .expect("scan lock is not poisoned")
+                .needed
+                .insert(full_key);
             return None;
         }
         // Match the tree-root budget so an undeletable first batch cannot
@@ -194,22 +219,33 @@ impl Pass {
                 return None;
             }
         };
-        let full_key = format!("{}:{key}", self.home_key);
-        let mut active = scans().lock().expect("scan lock is not poisoned");
-        if active
+        let mut registry = scans().lock().expect("scan lock is not poisoned");
+        if registry
+            .active
             .get(&full_key)
             .is_some_and(|scan| scan.identity != identity)
         {
-            active.remove(&full_key);
+            registry.active.remove(&full_key);
+            registry.done.remove(&full_key);
+            registry.needed.insert(full_key.clone());
         }
-        if !active.contains_key(&full_key) {
-            if active.len() >= 64 {
-                if let Some(oldest) = active
+        let completed_before = registry.done.contains(&full_key);
+        if !registry.active.contains_key(&full_key) {
+            if registry.active.len() >= 64 {
+                if let Some(oldest) = registry
+                    .active
                     .iter()
                     .min_by_key(|(_, scan)| scan.last_used)
                     .map(|(name, _)| name.clone())
                 {
-                    active.remove(&oldest);
+                    registry.active.remove(&oldest);
+                    // A vanished directory must not leave an orphaned needed
+                    // key holding the round open forever. Its parent will be
+                    // rechecked in the next round if the path still exists.
+                    if !registry.done.contains(&oldest) {
+                        registry.needed.remove(&oldest);
+                        self.pending = true;
+                    }
                 }
             }
             let scan = match dir.scan() {
@@ -219,7 +255,7 @@ impl Pass {
                     return None;
                 }
             };
-            active.insert(
+            registry.active.insert(
                 full_key.clone(),
                 LiveScan {
                     identity,
@@ -228,15 +264,18 @@ impl Pass {
                 },
             );
         }
-        let current = active.get_mut(&full_key).expect("inserted scan");
+        let current = registry.active.get_mut(&full_key).expect("inserted scan");
         current.last_used = Instant::now();
         let result = current.scan.next_batch(limit);
         match result {
             Ok((names, done)) => {
                 self.scans -= names.len().max(1);
                 if done {
-                    active.remove(&full_key);
-                } else {
+                    registry.active.remove(&full_key);
+                    registry.done.insert(full_key.clone());
+                    registry.needed.remove(&full_key);
+                } else if !completed_before {
+                    registry.needed.insert(full_key.clone());
                     self.pending = true;
                 }
                 Some(names)
@@ -253,15 +292,44 @@ impl Pass {
         scans()
             .lock()
             .expect("scan lock is not poisoned")
+            .active
             .contains_key(&format!("{}:{key}", self.home_key))
     }
 
-    /// Refuses to report an idle pass if a directory read failed.
-    fn finish(&self) -> Result<()> {
+    /// Forgets a completed tree after its verified directory inode was removed.
+    fn forget_tree(&self, device: u64, inode: u64) {
+        let key = format!("{}:tree:{device}:{inode}", self.home_key);
+        let mut registry = scans().lock().expect("scan lock is not poisoned");
+        registry.active.remove(&key);
+        registry.done.remove(&key);
+        registry.needed.remove(&key);
+    }
+
+    /// Completes the round once every discovered namespace reached EOF.
+    fn finish(&self) -> Result<bool> {
+        let prefix = format!("{}:", self.home_key);
+        let mut registry = scans().lock().expect("scan lock is not poisoned");
+        if registry.done.len() + registry.needed.len() > ROUND_KEYS_LIMIT {
+            registry.active.retain(|key, _| !key.starts_with(&prefix));
+            registry.done.retain(|key| !key.starts_with(&prefix));
+            registry.needed.retain(|key| !key.starts_with(&prefix));
+            return Err(invalid("filesystem retention round exceeds bound"));
+        }
         if self.failed {
             return Err(invalid("filesystem retention scan incomplete"));
         }
-        Ok(())
+        let unfinished = self.pending
+            || registry.needed.iter().any(|key| key.starts_with(&prefix))
+            || registry
+                .active
+                .keys()
+                .any(|key| key.starts_with(&prefix) && !registry.done.contains(key));
+        if !unfinished {
+            registry.active.retain(|key, _| !key.starts_with(&prefix));
+            registry.done.retain(|key| !key.starts_with(&prefix));
+            registry.needed.retain(|key| !key.starts_with(&prefix));
+        }
+        Ok(unfinished)
     }
 }
 
@@ -306,8 +374,8 @@ pub fn sweep(home: &Path, now: f64, store: &Store) -> Result<usize> {
             );
         }
     }
-    pass.finish()?;
-    Ok(pass.removed + usize::from(pass.pending && pass.removed == 0))
+    let more = pass.finish()?;
+    Ok(pass.removed + usize::from(more && pass.removed == 0))
 }
 
 /// True when one canonical run id's encoded creation is older than the cutoff.
@@ -957,6 +1025,7 @@ fn remove_root(parent: &fs::Dir, name: &str, preserve_complete: bool, pass: &mut
                 && parent.remove_directory(rel).is_ok() =>
         {
             pass.removed += 1;
+            pass.forget_tree(entry.device, entry.inode);
         }
         _ => {}
     }
@@ -1040,6 +1109,7 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
                 } else {
                     pass.unlinks -= 1;
                     pass.removed += 1;
+                    pass.forget_tree(entry.device, entry.inode);
                 }
             }
             fs::EntryType::Special => empty = false,
@@ -1105,7 +1175,7 @@ mod tests {
     /// Evicting the least recently used stream resets only that traversal and allows progress.
     #[test]
     fn scan_registry_pressure_recovers_after_eviction() {
-        scans().lock().unwrap().clear();
+        *scans().lock().unwrap() = ScanRegistry::default();
         let home = tempfile::tempdir().unwrap();
         for index in 0..20 {
             std::fs::write(home.path().join(format!("entry-{index:02}")), "x").unwrap();
@@ -1122,13 +1192,29 @@ mod tests {
             };
             assert_eq!(pass.list(&root, &key).unwrap().len(), 16);
         }
-        assert_eq!(scans().lock().unwrap().len(), 64);
-        assert!(!scans().lock().unwrap().contains_key(&first_key));
+        assert_eq!(scans().lock().unwrap().active.len(), 64);
+        assert!(!scans().lock().unwrap().active.contains_key(&first_key));
+        assert!(!scans().lock().unwrap().needed.contains(&first_key));
         let mut resumed = Pass::new(home.path(), &root).unwrap();
         assert_eq!(resumed.list(&root, "first").unwrap().len(), 16);
         let mut resumed = Pass::new(home.path(), &root).unwrap();
         assert_eq!(resumed.list(&root, "first").unwrap().len(), 4);
         assert!(!resumed.pending_for("first"));
-        scans().lock().unwrap().clear();
+        // A failed traversal must still enforce the round's memory ceiling.
+        let prefix = format!("{}:", resumed.home_key);
+        scans()
+            .lock()
+            .unwrap()
+            .needed
+            .extend((0..=ROUND_KEYS_LIMIT).map(|index| format!("{prefix}excess-{index}")));
+        resumed.failed = true;
+        assert!(resumed.finish().is_err());
+        assert!(!scans()
+            .lock()
+            .unwrap()
+            .needed
+            .iter()
+            .any(|key| key.starts_with(&prefix)));
+        *scans().lock().unwrap() = ScanRegistry::default();
     }
 }

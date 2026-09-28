@@ -304,3 +304,75 @@ fn live_and_stale_relay_sockets_are_distinguished() {
     assert!(!stale.exists());
     drop(listener);
 }
+
+/// A complete no-garbage scan ends by the longest namespace, not the LCM of batch counts.
+#[test]
+fn retained_namespaces_finish_one_scan_round_promptly() {
+    let home = common::Home::new();
+    let store = home.store();
+    for index in 0..31 {
+        run_tree(&home, &format!("ag-20350101-000000-{index:010x}"));
+    }
+    let logs = home.path.join("logs");
+    fs::private_dir(&logs).unwrap();
+    for day in 1..=31 {
+        std::fs::write(logs.join(format!("cli.2035-01-{day:02}.log")), "future").unwrap();
+    }
+    for day in 1..=16 {
+        std::fs::write(logs.join(format!("mcp.2035-02-{day:02}.log")), "future").unwrap();
+    }
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        let progress = sweep(&home.path, NOW, &store).unwrap();
+        if progress == 0 {
+            break;
+        }
+        assert!(
+            calls < 4,
+            "retained namespaces must finish by the longest 3-batch scan"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(home.path.join("agents")).unwrap().count(),
+        31
+    );
+    assert_eq!(std::fs::read_dir(logs).unwrap().count(), 47);
+}
+
+/// A parent runtime reaching EOF still revisits its late child until that child drains.
+#[test]
+fn nested_runtime_scan_reaches_late_orphan() {
+    let home = common::Home::new();
+    let store = home.store();
+    fs::private_dir(&home.path.join("agents")).unwrap();
+    let mut late_runs = None;
+    for runtime in 0..17 {
+        let runs = home.path.join(format!("runtimes/r{runtime:02}/home/runs"));
+        fs::private_dir(&runs).unwrap();
+        if runtime == 16 {
+            late_runs = Some(runs);
+        }
+    }
+    let runs = late_runs.unwrap();
+    for index in 0..31 {
+        fs::private_dir(&runs.join(format!("ag-20350101-000000-{index:010x}"))).unwrap();
+    }
+    let orphan = runs.join("ag-20260101-000000-fffffffffe");
+    fs::private_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("answer.md"), "old").unwrap();
+    let mut finished = false;
+    let mut observed = Vec::new();
+    for _ in 0..6 {
+        let progress = sweep(&home.path, NOW, &store).unwrap();
+        observed.push((progress, orphan.exists()));
+        if !orphan.exists() && progress == 0 {
+            finished = true;
+            break;
+        }
+    }
+    assert!(
+        finished,
+        "late nested orphan must drain and the scan round must become idle: {observed:?}"
+    );
+}
