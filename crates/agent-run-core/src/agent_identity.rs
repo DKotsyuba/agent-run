@@ -1,7 +1,7 @@
 //! Stable public agent identities over immutable execution records.
 //!
 //! Storage, supervisors and delivery leases continue to address exact run rows.
-//! Public callers use the lineage root and may pin a historical `run_id`.
+//! Public callers use only the lineage root; legacy execution selectors remain accepted.
 
 use crate::{domain::AgentId, error::invalid, state::Record, state::Store, Error, Result};
 use rusqlite::OptionalExtension;
@@ -44,55 +44,85 @@ pub fn resolve(store: &Store, agent_id: &AgentId, run_id: Option<&AgentId>) -> R
     )
 }
 
-/// Attach public identity to a known run result without traversing user content.
+/// Project one execution as the stable public agent without changing user content.
 ///
-/// Only the envelope and its delivery metadata are changed. Answers, transcript
-/// messages, policy and arbitrary tool content remain byte-for-byte untouched.
+/// Only product-owned envelope, agent and delivery metadata are normalized.
+/// Answers, transcript text, policy and arbitrary tool content remain untouched.
 pub fn result(row: &Record, mut value: Value) -> Result<Value> {
-    identify(&mut value, &row.root_agent_id, &row.id)?;
-    if value.get("parent_agent_id").is_some() {
-        if let Some(parent) = &row.parent_agent_id {
-            value["parent_run_id"] = json!(parent);
-        }
-    }
+    identify(&mut value, &row.root_agent_id)?;
     Ok(value)
 }
 
-/// Convert an exact-run view into a stable public view while retaining lineage.
+/// Convert an internal execution view into one stable public agent view.
 pub fn view(mut value: Value) -> Result<Value> {
-    let run: AgentId = serde_json::from_value(value["agent_id"].clone())?;
     let root: AgentId = serde_json::from_value(value["root_agent_id"].clone())?;
-    identify(&mut value, &root, &run)?;
-    if value["parent_agent_id"].is_string() {
-        value["parent_run_id"] = value["parent_agent_id"].clone();
-    }
+    identify(&mut value, &root)?;
     Ok(value)
 }
 
-/// Project a fully admitted run only after the supervisor handoff used its id.
+/// Project an admitted execution after its supervisor handoff.
 ///
-/// The exact execution id remains available for hooks and observer pinning;
-/// replay and new admission use the same envelope.
+/// The stable ID is the only public agent identifier. Its existing sequence
+/// counter is retained as a machine receipt for delayed hooks and CLI wait;
+/// neither transport must guess the latest execution when consuming a receipt.
 pub fn admission(mut value: Value) -> Result<Value> {
+    let sequence = value["agent"]["sequence"].clone();
     value["agent"] = view(value["agent"].take())?;
     let root = serde_json::from_value(value["agent"]["agent_id"].clone())?;
-    let run = serde_json::from_value(value["agent"]["run_id"].clone())?;
-    identify(&mut value, &root, &run)?;
+    identify(&mut value, &root)?;
+    value["sequence"] = sequence;
     Ok(value)
 }
 
-/// Add the two identities to one product-owned object and its delivery receipt.
-fn identify(value: &mut Value, root: &AgentId, run: &AgentId) -> Result<()> {
+/// Remove execution identities only from known product metadata objects.
+fn identify(value: &mut Value, root: &AgentId) -> Result<()> {
     let object = value
         .as_object_mut()
-        .ok_or_else(|| invalid("run result must be an object"))?;
+        .ok_or_else(|| invalid("agent result must be an object"))?;
     object.insert("agent_id".into(), json!(root));
-    object.insert("run_id".into(), json!(run));
-    if let Some(Value::Object(delivery)) = object.get_mut("delivery") {
-        delivery.insert("agent_id".into(), json!(root));
-        delivery.insert("run_id".into(), json!(run));
+    for key in [
+        "run_id",
+        "parent_run_id",
+        "parent_agent_id",
+        "root_agent_id",
+        "attempt_id",
+    ] {
+        object.remove(key);
+    }
+    for key in ["agent", "delivery"] {
+        if let Some(nested @ Value::Object(_)) = object.get_mut(key) {
+            identify(nested, root)?;
+        }
     }
     Ok(())
+}
+
+/// Resolve a transport receipt to its exact execution, never to a moving tip.
+///
+/// The positive sequence is an internal counter, not an orchestrator selector.
+/// Missing or ambiguous receipts fail closed, including after history retention.
+pub fn resolve_sequence(store: &Store, agent_id: &AgentId, sequence: u32) -> Result<Record> {
+    if sequence == 0 {
+        return Err(invalid("execution receipt sequence must be positive"));
+    }
+    let root = match store.get(agent_id) {
+        Ok(row) => row.root_agent_id,
+        Err(Error::NotFound(_)) => agent_id.clone(),
+        Err(error) => return Err(error),
+    };
+    let mut statement = store.conn.prepare(
+        "SELECT id FROM agents WHERE (root_agent_id=?1 OR id=?1) AND sequence=?2 LIMIT 2",
+    )?;
+    let ids = statement
+        .query_map(rusqlite::params![root.as_str(), sequence], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match ids.as_slice() {
+        [id] => store.get(&id.parse()?),
+        [] => Err(Error::NotFound(root.to_string())),
+        _ => Err(invalid("execution receipt is ambiguous")),
+    }
 }
 
 impl crate::service::Service {
@@ -106,18 +136,22 @@ impl crate::service::Service {
         result(&Store::open(&self.home)?.get(run_id)?, value)
     }
 
-    /// Return paged execution history with stable agent ids and exact run ids.
-    ///
-    /// Existing pagination counts executions, including resumed runs; it is not
-    /// silently regrouped or filtered, so no historical run disappears.
+    /// Return one latest view per logical agent with exact logical pagination.
     pub async fn list_public(&self, query: crate::service::Query) -> Result<Value> {
-        let mut value = self.list(query).await?;
+        let mut value = self.list_selected(query, true).await?;
         if let Some(items) = value["items"].as_array_mut() {
             for item in items {
                 *item = view(item.take())?;
             }
         }
         Ok(value)
+    }
+
+    /// Read retained lineage messages using the same global cursor across resumes.
+    pub fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        let store = Store::open(&self.home)?;
+        let row = resolve(&store, id, None)?;
+        result(&row, store.transcript_lineage(&row.id, cursor, limit)?)
     }
 
     /// Continue the current run of a stable agent, preserving request-id replay.

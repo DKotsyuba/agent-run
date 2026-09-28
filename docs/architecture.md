@@ -83,8 +83,8 @@ Native process identity and signalling are described in
   adapters and the supervisor. Quota metadata comes from separately configured,
   bounded executables; the shipped Codex collector starts no model turn.
 
-`resume` keeps the public `agent_id` and admits a new `run_id` linked to the
-latest terminal run (or an explicitly selected `run_id`). Each predecessor can
+`resume` keeps the public `agent_id` and admits a new internal execution linked
+to the latest terminal run. Each predecessor can
 have only one child. It reuses the native conversation only after its immutable
 authority, generated-home snapshot, history and cleanup proofs verify. See
 [continuations.md](continuations.md).

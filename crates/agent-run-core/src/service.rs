@@ -1160,7 +1160,13 @@ impl Service {
         let cancelled = Store::open(&self.home)?.cancel_delivery(delivery_id)?;
         Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
     }
+    /// List execution history, optionally waiting for a newer durable revision.
     pub async fn list(&self, query: Query) -> Result<Value> {
+        self.list_selected(query, false).await
+    }
+
+    /// Share revision waiting and pagination with the stable public agent list.
+    pub(crate) async fn list_selected(&self, query: Query, latest: bool) -> Result<Value> {
         query.validate()?;
         let until = tokio::time::Instant::now() + Duration::from_secs_f64(query.wait_seconds);
         loop {
@@ -1172,7 +1178,13 @@ impl Service {
                 {
                     None
                 } else {
-                    let (rows, total) = store.list(
+                    let list = if latest {
+                        Store::list_latest
+                    } else {
+                        Store::list
+                    };
+                    let (rows, total) = list(
+                        &store,
                         query.active,
                         query.offset,
                         query.limit,

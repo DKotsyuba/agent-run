@@ -328,8 +328,7 @@ impl Notice {
         Ok(())
     }
 
-    /// Render safe lifecycle text with stable identity and the optional exact run.
-    /// Legacy payloads without run_id retain their original notice shape.
+    /// Render lifecycle text using only the stable public agent identity.
     pub fn render(&self) -> Result<String> {
         self.validate()?;
         let failure = guidance(self.status, self.failure_kind.as_deref())?
@@ -337,15 +336,9 @@ impl Notice {
                 format!("\n- Failure: {kind} — {reason}\n- Advice: {advice}")
             })
             .unwrap_or_default();
-        let run = self
-            .run_id
-            .as_ref()
-            .map(|id| format!("\n- Run: {id}"))
-            .unwrap_or_default();
         Ok(format!(
-            "agent-run/completion\n\n- ID: {}{}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
+            "agent-run/completion\n\n- ID: {}\n- Status: {}{}\n- Runtime/model: {}/{}:{}\n- Notice: [notification {} v1]",
             self.agent_id,
-            run,
             self.status.as_str(),
             failure,
             escaped(self.runtime.as_deref(), "unknown"),
@@ -747,7 +740,8 @@ mod tests {
         assert_eq!(notice.agent_id.as_str(), root);
         assert_eq!(notice.run_id.as_ref().unwrap().as_str(), child);
         let rendered = notice.render().unwrap();
-        assert!(rendered.contains(&format!("- ID: {root}\n- Run: {child}\n")));
+        assert!(rendered.contains(&format!("- ID: {root}\n")));
+        assert!(!rendered.contains(child));
         let stored_run: String = store
             .conn
             .query_row(

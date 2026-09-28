@@ -190,7 +190,7 @@ async fn worker_mcp_queues_a_report_without_ending_the_run() {
     )
     .await
     .unwrap();
-    let id: AgentId = serde_json::from_value(result["run_id"].clone()).unwrap();
+    let id: AgentId = serde_json::from_value(result["agent_id"].clone()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !h.home.join("worker-receipt.json").exists() {
         let row = Store::open(&h.home).unwrap().get(&id).unwrap();

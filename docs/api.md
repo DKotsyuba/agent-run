@@ -128,8 +128,10 @@ Discover the authoritative surface at runtime:
 
 Over MCP, every tool result renders as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
-additionally keep `structuredContent` `{"agent_id": ..., "run_id": ...}` so
-automatic PostToolUse binding stays machine-extractable. This socket API and the CLI
+additionally keep `structuredContent` `{"agent_id": ..., "sequence": ...}` so
+automatic PostToolUse binding can pin its exact admission. The numeric counter
+is transport metadata, not another agent identifier; orchestrators use only
+`agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
 
 The tool set (same names as the MCP server) is exactly `start`, `resume`,

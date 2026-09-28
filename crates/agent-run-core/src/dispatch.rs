@@ -101,6 +101,9 @@ struct Wait {
     /// Exact execution returned by the admission being observed.
     #[serde(default)]
     run_id: Option<AgentId>,
+    /// Admission receipt counter, pinning a delayed wait without exposing run IDs.
+    #[serde(default)]
+    sequence: Option<u32>,
     #[serde(default)]
     /// Optional observer deadline in seconds, distinct from the run deadline.
     timeout_seconds: Option<f64>,
@@ -165,6 +168,9 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         "transcript" => {
             let a: Transcript = args(raw)?;
+            if a.run_id.is_none() {
+                return service.transcript_public(&a.agent_id, a.cursor, a.limit);
+            }
             let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
             agent_identity::result(&row, service.transcript(&row.id, a.cursor, a.limit)?)
         }
@@ -197,12 +203,22 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         "wait" => {
             let a: Wait = args(raw)?;
+            if a.sequence.is_some() && a.run_id.is_some() {
+                return Err(invalid("conflicting execution receipt selectors"));
+            }
             if a.timeout_seconds
                 .is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0)
             {
                 return Err(invalid("timeout_seconds must be a positive finite number"));
             }
-            let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
+            let row = match a.sequence {
+                Some(sequence) => agent_identity::resolve_sequence(
+                    &crate::state::Store::open(&service.home)?,
+                    &a.agent_id,
+                    sequence,
+                )?,
+                None => service.resolve_run(&a.agent_id, a.run_id.as_ref())?,
+            };
             let mut result =
                 agent_identity::result(&row, service.wait(&row.id, a.timeout_seconds).await?)?;
             if a.timeout_seconds.is_some() && result["terminal"] == false {

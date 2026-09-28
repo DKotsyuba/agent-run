@@ -238,7 +238,7 @@ async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
 }
 
 /// The exported socket client sends the strict provider request the real
-/// schema-2 dispatcher accepts and returns the admitted attempt id, and the
+/// schema-2 dispatcher accepts without exposing an attempt id, and the
 /// real start response decodes as the exported `StartResult`.
 #[tokio::test]
 async fn broker_client_starts_through_the_real_schema2_dispatcher() {
@@ -249,10 +249,7 @@ async fn broker_client_starts_through_the_real_schema2_dispatcher() {
         .await
         .unwrap();
     assert!(started.created);
-    assert!(started
-        .attempt_id
-        .as_deref()
-        .is_some_and(|id| id.starts_with("att_")));
+    assert!(started.attempt_id.is_none());
     let replay = client
         .start(&broker.request("fixture:answer", "client-1"))
         .await
@@ -268,7 +265,7 @@ async fn broker_client_starts_through_the_real_schema2_dispatcher() {
     let typed: StartResult = serde_json::from_value(response.clone()).unwrap();
     assert!(typed.created, "{response}");
     assert_eq!(typed.attempt_id.as_deref(), response["attempt_id"].as_str());
-    assert!(typed.attempt_id.is_some());
+    assert!(typed.attempt_id.is_none());
     broker.wait_terminal(typed.agent_id.as_str());
 }
 
@@ -285,7 +282,8 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         .await
         .unwrap();
     let agent = started["agent_id"].as_str().unwrap().to_owned();
-    let mut runs = vec![started["run_id"].as_str().unwrap().to_owned()];
+    let mut runs = vec![agent.clone()];
+    assert!(started.get("run_id").is_none());
     broker.wait_terminal(&runs[0]);
     for number in 1..=2 {
         let arguments = json!({
@@ -299,10 +297,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
             assert_eq!(identity.as_object().unwrap().len(), 2);
             let text = reply["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(&format!("- Agent: {agent}")), "{text}");
-            assert!(
-                text.contains(identity["run_id"].as_str().unwrap()),
-                "{text}"
-            );
+            assert!(!text.contains("- Run:"), "{text}");
             identity
         } else {
             let result = client.call("resume", Some(arguments)).await.unwrap();
@@ -310,7 +305,16 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
             result
         };
         assert_eq!(continued["agent_id"], agent);
-        let run = continued["run_id"].as_str().unwrap().to_owned();
+        assert!(continued.get("run_id").is_none());
+        let store = agent_run::state::Store::open(&broker.home).unwrap();
+        let run = agent_run_core::agent_identity::resolve_sequence(
+            &store,
+            &agent.parse().unwrap(),
+            continued["sequence"].as_u64().unwrap() as u32,
+        )
+        .unwrap()
+        .id
+        .to_string();
         assert!(!runs.contains(&run));
         broker.wait_terminal(&run);
         runs.push(run);
@@ -330,13 +334,13 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
             .await
             .unwrap();
         assert_eq!(answer["agent_id"], agent);
-        assert_eq!(answer["run_id"], *run);
+        assert!(answer.get("run_id").is_none());
         assert_eq!(answer["available"], true);
         let output = cli(&broker.home, &["answer", &agent, "--run-id", run]);
         assert!(output.status.success(), "{output:?}");
         let from_cli: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(from_cli["agent_id"], agent);
-        assert_eq!(from_cli["run_id"], *run);
+        assert!(from_cli.get("run_id").is_none());
     }
     // A delayed retry must return the original child, not append a fourth turn.
     let replay = client
@@ -351,7 +355,8 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], agent);
-    assert_eq!(replay["run_id"], runs[1]);
+    assert_eq!(replay["sequence"], 2);
+    assert!(replay.get("run_id").is_none());
     let conflicting = client
         .call(
             "resume",
@@ -372,7 +377,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         .await
         .unwrap();
     assert_eq!(latest["agent_id"], agent);
-    assert_eq!(latest["run_id"], runs[2]);
+    assert!(latest.get("run_id").is_none());
 
     // A bounded hanging fixture keeps the winner active until explicitly cancelled.
     let other = BrokerClient::new(broker.home.join("api.sock"));
@@ -385,13 +390,21 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
     let winner = left.or(right).unwrap();
     assert_eq!(winner["agent_id"], agent);
-    let active_run = winner["run_id"].as_str().unwrap();
+    let active_run = agent_run_core::agent_identity::resolve_sequence(
+        &store,
+        &agent.parse().unwrap(),
+        winner["sequence"].as_u64().unwrap() as u32,
+    )
+    .unwrap()
+    .id
+    .to_string();
     let cancelled = client
         .call("cancel", Some(json!({"agent_id":agent})))
         .await
         .unwrap();
-    assert_eq!(cancelled["run_id"], active_run);
-    broker.wait_terminal(active_run);
+    assert!(cancelled.get("run_id").is_none());
+    assert_eq!(cancelled["agent_id"], agent);
+    broker.wait_terminal(&active_run);
     let active: i64 = store.conn.query_row(
         "SELECT COUNT(*) FROM agents WHERE status IN ('created','starting','running','cancelling')", [], |row| row.get(0)
     ).unwrap();

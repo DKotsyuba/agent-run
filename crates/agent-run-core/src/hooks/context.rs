@@ -235,7 +235,12 @@ fn active_block(agents: &[Value], at: f64) -> (String, String) {
         .iter()
         .take(MAX_LISTED_AGENTS)
         .map(|agent| {
-            let id = string(agent, "id");
+            let root = string(agent, "root_agent_id");
+            let id = if root.is_empty() {
+                string(agent, "id")
+            } else {
+                root
+            };
             let runtime = string(agent, "runtime");
             let model = string(agent, "model");
             let profile = string(agent, "profile");

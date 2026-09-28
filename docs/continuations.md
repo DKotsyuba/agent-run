@@ -2,15 +2,14 @@
 
 `resume` starts a **new durable run in the same native conversation**. It does
 not reset the previous run or substitute a summary for the runtime's history.
-The public `agent_id` stays stable and each execution receives a new `run_id`.
+The public `agent_id` stays stable; execution identifiers remain internal.
 Each run retains its own prompt, timestamps, events, transcript, answer proof
-and completion notification. `parent_run_id` and `sequence` expose the physical
-chain; storage retains `parent_agent_id` and `root_agent_id` for that lineage.
+and completion notification. Storage retains `parent_agent_id`, `root_agent_id`
+and `sequence` for that lineage.
 
 ```sh
 agent-run resume <agent-id> --task "Address these review findings" --request-id review-2
 agent-run resume <agent-id> --task-file review.txt --timeout 900
-agent-run resume <agent-id> --run-id <run-id> --task "Continue this run"
 ```
 
 `--task` and `--task-file` are mutually exclusive. A task file is UTF-8 and its
@@ -19,11 +18,12 @@ the resident broker, so closing the CLI cannot orphan a preparation worker.
 The usual `--session-transport`, `--session-id` and `--session-turn-id` options
 bind the **new** run's notification to its caller.
 
-MCP and the socket API expose `resume(agent_id, task, run_id?, timeout_seconds?,
-request_id?, orchestrator?)`, which returns the normal asynchronous start
-envelope with the stable `agent_id` and a new `run_id`. Without `run_id`, the
-agent resolves to its latest run; an exact run must belong to that agent.
-Historical run identifiers remain aliases for their stable agent.
+MCP and the socket API expose `resume(agent_id, task, timeout_seconds?,
+request_id?, orchestrator?)`, returning the same stable `agent_id`. The broker
+continues the latest terminal execution. Old execution identifiers remain
+accepted as aliases; internal rows are never renumbered. `answer` reads the
+latest result, `transcript` spans retained conversation history, and
+`list_agents` shows each logical agent once.
 
 The original provider, harness, model, reasoning effort, generated home, working
 directory, write/network/read-root grants, output schema and fast setting are
