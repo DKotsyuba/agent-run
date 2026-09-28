@@ -4,6 +4,21 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-09-28
+
+- fix(retention): expire unreferenced run directories, completed deployment and
+  migration backups, and obsolete configuration/profile backups after 14 days
+- fix(retention): preserve retained session and credential references, pending
+  recovery, and unknown filesystem entries during bounded background cleanup
+- fix(logging): write UTC-daily component logs and expire old daily files
+  after 30 days; preserve undated legacy and launchd logs with unknown writers
+- fix(maintenance): keep database expiry and vacuum running independently of
+  filesystem cleanup failures, and reclaim verified stale Desktop relay sockets
+
+No configuration or database migration is required. Restart the broker after
+installation to enable filesystem cleanup; long-lived clients adopt daily
+logging when restarted. Shared runtime-home optimization is not included.
+
 ## [0.18.0] - 2026-09-28
 
 - feat(workers): add a separate one-tool MCP for durable worker-to-orchestrator
