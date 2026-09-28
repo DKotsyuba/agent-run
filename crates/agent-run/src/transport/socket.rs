@@ -673,18 +673,38 @@ pub async fn serve_at_with_options(
             let home = history_home.clone();
             // SQLite work runs outside the async executor. One job at a time;
             // short SQL deadlines also bound it if the broker task is aborted.
-            let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let result = tokio::task::spawn_blocking(move || -> Result<(usize, bool)> {
                 let mut store = crate::state::Store::open(&home)?;
                 store.conn.busy_timeout(Duration::from_millis(100))?;
-                let deleted = store.prune_history(crate::domain::now())?;
-                if deleted == 0 && store.vacuum_history()? {
-                    return Ok(1); // More free pages may remain; continue after the short pause.
+                let now = crate::domain::now();
+                let database = store.prune_history(now);
+                // Filesystem retention runs every cycle, even while database
+                // batches still report work, so a large journal backlog can
+                // never starve reclaiming disposable files on disk.
+                let filesystem = agent_run_core::housekeeping::sweep(&home, now, &store);
+                let database_removed = database?;
+                let mut done = database_removed;
+                let filesystem_failed = match filesystem {
+                    Ok(removed) => {
+                        done += removed;
+                        false
+                    }
+                    Err(error) => {
+                        eprintln!("filesystem maintenance: {}", error.public().kind);
+                        true
+                    }
+                };
+                // SQLite compaction follows its own idle rules. A filesystem
+                // traversal can need more passes without delaying free-page work.
+                if database_removed == 0 && store.vacuum_history()? {
+                    done += 1;
                 }
-                Ok(deleted)
+                Ok((done, filesystem_failed))
             })
             .await;
             let delay = match result {
-                Ok(Ok(0)) => 3600,
+                Ok(Ok((0, false))) => 3600,
+                Ok(Ok((0, true))) => 60,
                 Ok(Ok(_)) => 1,
                 Ok(Err(error)) => {
                     eprintln!("history maintenance: {}", error.public().kind);

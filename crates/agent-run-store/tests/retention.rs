@@ -419,3 +419,125 @@ fn retention_deletes_do_not_scan_unrelated_journals() {
         }
     }
 }
+
+/// Filesystem evidence decodes JSON paths and protects disabled-account credentials and aliases.
+#[test]
+fn storage_protection_preserves_decoded_paths_and_account_files() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&home, &mut store, "succeeded", Some(NOW));
+    let runtime = home.path.join("runtime-résumé-\"quoted\"");
+    let answer = home.path.join("answer-old");
+    let attempt_home = home.path.join("attempt-old");
+    let credential = home.path.join("standalone/backups/old/secret");
+    std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(home.path.join("temporary")).unwrap();
+    std::fs::write(&credential, "fixture only").unwrap();
+    let identity = json!({"runtime_home": runtime.join("session.json")})
+        .to_string()
+        .replace('é', "\\u00e9")
+        .replace('/', "\\/");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=?,answer_path=? WHERE id=?",
+            params![
+                identity,
+                answer.join("answer.txt").to_str().unwrap(),
+                id.as_str()
+            ],
+        )
+        .unwrap();
+    store
+        .create_attempt(&id, "succeeded", &json!({"runtime_home": attempt_home}))
+        .unwrap();
+    let alias = home.path.join("temporary/../standalone/backups/old/secret");
+    store
+        .conn
+        .execute(
+            "INSERT INTO provider_accounts VALUES ('disabled-file','fixture',?,'disabled',0,0)",
+            [format!("file:{}", alias.display())],
+        )
+        .unwrap();
+    let mut proof = store.storage_protection_snapshot().unwrap();
+    for path in [
+        &runtime,
+        &answer,
+        &attempt_home,
+        credential.parent().unwrap(),
+    ] {
+        assert!(
+            proof.retains("unregistered", path),
+            "lost reference: {path:?}"
+        );
+    }
+    assert!(proof.retains(id.as_str(), &home.path.join("other")));
+    assert!(!proof.retains(
+        "unregistered",
+        &home.path.join("runtime-résumé-\"quoted\"-other")
+    ));
+    assert!(!proof.retains("unregistered", &home.path.join("unreferenced")));
+    let config_target = home.path.join("config-only/data");
+    proof.protect_path(config_target.to_str().unwrap());
+    assert!(proof.retains("unregistered", config_target.parent().unwrap()));
+    // Ordinary retained metadata can already exceed eight MiB across a home.
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=json_set(identity_json,'$.padding',?) WHERE id=?",
+            params!["x".repeat(9 * 1024 * 1024), id.as_str()],
+        )
+        .unwrap();
+    assert!(store
+        .storage_protection_snapshot()
+        .unwrap()
+        .retains("unregistered", &runtime));
+    integrity(&store);
+}
+
+/// Unreadable structured evidence rejects the entire snapshot and leaves the connection usable.
+#[test]
+fn storage_protection_rejects_corrupt_evidence_without_losing_history() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&home, &mut store, "succeeded", Some(NOW));
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json='{' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    assert!(store.storage_protection_snapshot().is_err());
+    assert_eq!(count(&store, "agents"), 1);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json='{}' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    assert!(store.storage_protection_snapshot().is_ok());
+    integrity(&store);
+}
+
+/// Excessive metadata, even without JSON payloads, fails closed rather than growing indefinitely.
+#[test]
+fn storage_protection_bounds_account_rows_and_clears_sql_handler() {
+    let home = common::Home::new();
+    let store = home.store();
+    store.conn.execute_batch(
+        "WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<20001)
+         INSERT INTO provider_accounts SELECT 'bounded-'||n,'fixture','env:BOUND_'||n,'disabled',0,0 FROM ids;"
+    ).unwrap();
+    assert!(store.storage_protection_snapshot().is_err());
+    assert_eq!(count(&store, "provider_accounts"), 20_001);
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    // More than 1,000 VM instructions exercise the progress callback after the failed read.
+    let total: i64 = store.conn.query_row(
+        "WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<10000) SELECT sum(n) FROM ids",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(total, 50_005_000);
+    integrity(&store);
+}

@@ -52,6 +52,25 @@ async fn broker_expires_old_history_on_startup() {
             [],
         )
         .unwrap();
+    let agents = temp.path().join("agents");
+    for index in 0..40 {
+        let run = agents.join(format!("ag-20260101-000000-{index:010x}"));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("answer.md"), "expired fixture").unwrap();
+    }
+    let old_log = temp.path().join("logs/cli.2026-01-01.log");
+    std::fs::create_dir_all(old_log.parent().unwrap()).unwrap();
+    std::fs::write(&old_log, "old operational log").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&old_log)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            ),
+        )
+        .unwrap();
     let path = temp.path().join("broker.sock");
     let task = tokio::spawn({
         let home = temp.path().to_owned();
@@ -59,24 +78,88 @@ async fn broker_expires_old_history_on_startup() {
         async move { socket::serve_at(&home, &path).await }
     });
     wait_for_socket(&path).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let immediate_ping = tokio::time::timeout(
+        Duration::from_millis(500),
+        request(
+            &path,
+            json!({"jsonrpc":"2.0","id":0,"method":"ping","params":{}}),
+        ),
+    )
+    .await
+    .expect("maintenance must not block broker ping");
+    assert_eq!(immediate_ping["result"]["ok"], true);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         let count: i64 = store
             .conn
             .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
             .unwrap();
-        if count == 0 {
+        let remaining = std::fs::read_dir(&agents).unwrap().count();
+        if count == 0 && remaining == 0 && !old_log.exists() {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "broker did not expire history"
+            "broker did not expire history and filesystem artifacts: samples={count} runs={remaining} daily_log={} config={}",
+            old_log.exists(),temp.path().join("config.toml").exists()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let ping = request(
         &path,
         json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{}}),
+    )
+    .await;
+    assert_eq!(ping["result"]["ok"], true);
+    task.abort();
+    let _ = task.await;
+}
+
+/// Invalid filesystem protection evidence cannot stop existing SQLite expiry or broker pings.
+#[tokio::test]
+async fn filesystem_retention_error_does_not_block_database_history() {
+    let temp = tempfile::tempdir().unwrap();
+    cli::init(temp.path()).unwrap();
+    let mut store = agent_run::state::Store::open(temp.path()).unwrap();
+    let tx = store.conn.transaction().unwrap();
+    for _ in 0..5_000 {
+        tx.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+             VALUES ('fixture','shared','fixture','fixture','{}',0)",
+            [],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let path = temp.path().join("broker.sock");
+    let task = tokio::spawn({
+        let home = temp.path().to_owned();
+        let path = path.clone();
+        async move { socket::serve_at(&home, &path).await }
+    });
+    wait_for_socket(&path).await;
+    std::fs::write(temp.path().join("config.toml"), "schema_version = 999\n").unwrap();
+    assert!(
+        agent_run_core::housekeeping::sweep(temp.path(), agent_run::domain::now(), &store).is_err()
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
+            .unwrap();
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "database retention stopped after filesystem error"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ping = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":3,"method":"ping","params":{}}),
     )
     .await;
     assert_eq!(ping["result"]["ok"], true);

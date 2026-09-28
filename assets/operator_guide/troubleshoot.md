@@ -3,13 +3,14 @@
 ## Central log
 
 Every entrypoint (`mcp`, other CLI verbs, and the detached supervisor) writes
-dense, append-only logs to `<home>/logs/<component>.log`
-(`mcp.log`, `cli.log`, `supervisor.log`). Logging
+dense, append-only UTC-daily logs to `<home>/logs/<component>.YYYY-MM-DD.log`
+(`mcp.2026-09-28.log`, `cli.2026-09-28.log`, `supervisor.2026-09-28.log`). Logging
 defaults to `DEBUG` so a postmortem has everything; set `AGENT_RUN_LOG_LEVEL`
 (e.g. `INFO`) in the environment to quiet it down once a system is stable.
 A log directory that cannot be created never blocks a command — the process
 falls back to stderr instead.
-There is no built-in log rotation.
+The broker expires old daily files after 30 days; legacy undated logs remain
+until their writers are known closed.
 
 ## Start with doctor
 
