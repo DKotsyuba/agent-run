@@ -53,6 +53,66 @@ fn python_test_full_tree_is_copied_and_content_changes_revision() {
     );
 }
 
+/// Concurrent homes retain independent pinned plugin bytes across updates and expiry.
+#[test]
+fn independent_homes_share_clone_blocks_without_sharing_mutable_state() {
+    let temporary = TempDir::new().unwrap();
+    let source = source(temporary.path());
+    let first = tempfile::Builder::new()
+        .prefix("first-home")
+        .tempdir_in(temporary.path())
+        .unwrap();
+    let second = tempfile::Builder::new()
+        .prefix("second-home")
+        .tempdir_in(temporary.path())
+        .unwrap();
+    let (first_manifest, second_manifest) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            snapshot_tree::snapshot_managed_tree(
+                first.path(),
+                Path::new("declared-plugins/demo"),
+                &source,
+                None,
+            )
+            .unwrap()
+        });
+        let right = scope.spawn(|| {
+            snapshot_tree::snapshot_managed_tree(
+                second.path(),
+                Path::new("declared-plugins/demo"),
+                &source,
+                None,
+            )
+            .unwrap()
+        });
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    assert_eq!(first_manifest.sha256, second_manifest.sha256);
+    let first_index =
+        snapshot_tree::finalize_runtime_snapshots(first.path(), "same", &[], &[]).unwrap();
+    let second_index =
+        snapshot_tree::finalize_runtime_snapshots(second.path(), "same", &[], &[]).unwrap();
+    assert_eq!(first_index, second_index);
+    stdfs::write(source.join("SKILL.md"), "updated version").unwrap();
+    for home in [first.path(), second.path()] {
+        assert_eq!(
+            stdfs::read(home.join("declared-plugins/demo/SKILL.md")).unwrap(),
+            b"first"
+        );
+        assert!(
+            snapshot_tree::inspect_runtime_snapshots(home, "same", &first_index)
+                .unwrap()
+                .verified
+        );
+    }
+    drop(first);
+    assert!(
+        snapshot_tree::inspect_runtime_snapshots(second.path(), "same", &second_index)
+            .unwrap()
+            .verified
+    );
+}
+
 /// Mirrors `test_snapshots.py::test_sources_reject_symlinks_and_special_files`.
 #[test]
 fn python_test_sources_reject_symlinks() {

@@ -13,9 +13,46 @@ host ``HOME`` are forwarded before the child ``HOME`` is isolated. Agent-run
 does not create these directories or provision or probe Python, Node, or Rust
 during start.
 
+Codex filters the environment of stdio MCP servers separately from its own
+environment. Generated user MCP entries explicitly forward the resolved
+`RUSTUP_HOME` and `CARGO_HOME` names so compiler-backed tools use the existing
+toolchain and package cache. Values and credentials are not written into the
+generated configuration. The internal worker channel retains only its
+attempt-specific environment declaration.
+
 Each runtime gets generated lightweight configuration so subagents see only the
 skills and MCP servers selected by their role. The generated directory is
 configuration separation, not an OS security boundary.
+
+On macOS, Agent Run attempts an APFS copy-on-write clone for selected regular
+plugin and skill snapshot files. Each run still has its own file inode, private
+directory, account binding, role/MCP configuration, native history, and snapshot
+manifest. The clone is published only after its bytes match the captured source
+and its mode is restored. Source files with other extended attributes or file
+flags, changed bytes, or unsupported filesystems use the existing byte writer.
+Historical snapshot/index formats and resume verification are unchanged.
+Generated Codex homes disable remote catalog discovery with
+`features.remote_plugin = false`; declared local plugins remain enabled.
+The harness can still materialize account-installed plugin packages inside
+its own `CODEX_HOME`. After a successful independent Codex run and verified
+process cleanup, Agent Run attempts to reuse identical plugin-cache blocks
+from a completed original run of the same account. It compares bytes before
+atomic replacement and preserves the destination's mode, ACL and timestamps.
+Personal managed plugins, generated configuration, credentials and native
+session history are excluded. Resumed homes are not rewritten by this pass.
+
+Cache reuse examines at most 32 recent account attempts and walks at most
+4,096 entries / 128 MiB for two seconds (16 MiB per file, eight directory
+levels). Unsupported filesystems, metadata, differing versions, missing files
+and incomplete scans leave the remaining files independent. Cache errors do
+not change the run's completion verdict. Each clone owns its inode, so ordinary
+reference-aware retention can remove either run without invalidating the
+other; there is no shared cache directory to retain or garbage-collect.
+Reconstructible cache replacements use atomic rename without forcing a disk
+flush for each file; sealed snapshots keep their existing durability barriers.
+APFS clones reduce physical blocks for unchanged files, while per-directory
+logical sizes can still count each clone. The `runtime_cache_reuse` event
+reports examined files and cloned logical bytes, not physical savings.
 
 Current schema-2 configuration separates `[harnesses.<id>]` launch settings
 from `[providers.<id>]` models, connections and account bindings. Historical

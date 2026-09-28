@@ -1,4 +1,5 @@
 //! Descriptor-anchored local storage. No symlinks are followed inside an owned tree.
+mod cloning;
 use agent_run_domain::{error::invalid, Error, Result};
 use sha2::{Digest, Sha256};
 use std::{

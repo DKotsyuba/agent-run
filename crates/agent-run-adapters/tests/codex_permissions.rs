@@ -156,7 +156,7 @@ fn python_test_command_policy_codex_rules_cover_bare_and_absolute_commands() {
     assert!(review.contains("Review network command before execution"));
 }
 
-/// Mirrors the read-only/write generated-home captures in `tests/fixtures/baseline/homes/codex`.
+/// Keeps the historical read-only/write captures intact and checks the new catalog default.
 #[test]
 fn python_golden_codex_home_config_matches_read_only_and_write_captures() {
     for (name, write) in [("read-only", false), ("write", true)] {
@@ -175,12 +175,18 @@ fn python_golden_codex_home_config_matches_read_only_and_write_captures() {
             .expect("golden tree"),
         )
         .expect("golden JSON");
+        // Old snapshots retain their original bytes; only newly generated
+        // homes add the runtime-owned remote catalog switch.
         let expected_config = expected["config.toml"]["content"]
             .as_str()
             .expect("golden config")
             .replace(
                 "${TEMP_ROOT}/workdir",
                 &request.workdir.display().to_string(),
+            )
+            .replace(
+                "\n[projects.",
+                "\n[features]\nremote_plugin = false\n\n[projects.",
             );
         assert_eq!(
             std::fs::read_to_string(home.join("config.toml")).expect("generated config"),

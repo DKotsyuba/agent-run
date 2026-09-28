@@ -794,6 +794,29 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             domain::now(),
             verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
         )?;
+        if cleanup.confirmed
+            && outcome.status == Status::Succeeded
+            && identity.authority.harness == HarnessId::Codex
+            && row.parent_agent_id.is_none()
+            && continuing.is_none()
+        {
+            // The destination is still exclusively owned: resume admission
+            // cannot observe it as terminal until the following store.finish.
+            // Cache reuse never changes the model's completion verdict.
+            match crate::runtime_cache::reuse(store, id, &account, &runtime_home, &harness.home) {
+                Ok(reused) if reused.files_examined > 0 => {
+                    let _ = store.event(id, "runtime_cache_reuse", &json!(reused));
+                }
+                Err(error) => {
+                    let _ = store.event(
+                        id,
+                        "runtime_cache_reuse_skipped",
+                        &json!({"class": error.public().kind}),
+                    );
+                }
+                _ => {}
+            }
+        }
         store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
         commands::complete_terminal(store, id)?;
         return Ok(());

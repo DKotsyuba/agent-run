@@ -16,6 +16,8 @@ pub mod housekeeping;
 pub mod lifecycle;
 pub mod logging;
 pub mod managed_services;
+/// Optional reuse of native plugin blocks after verified, session-owned cleanup.
+mod runtime_cache;
 pub mod service;
 pub mod stream;
 pub mod supervisor;
