@@ -4,6 +4,20 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-28
+
+- fix(identity): expose only the stable agent ID in public responses, completion
+  and worker notices, CLI output, and hook context; keep execution records private
+- fix(binding): pin delayed notification bindings and CLI waits to the admitted
+  execution using the existing lineage counter, preserving legacy receipt support
+- fix(history): list each logical agent once and keep transcript pagination
+  continuous across resumes without rewriting prior messages or answer content
+
+Public contract change: run and attempt identifiers are no longer returned;
+legacy execution selectors remain accepted but are hidden from discovery.
+Reconnect Agent Run MCP clients together with the broker update so their
+binding receipts use the matching format. No database migration is required.
+
 ## [0.18.2] - 2026-09-28
 
 - fix(runtime): forward resolved Rust roots to Codex MCP tools, avoid repeated
