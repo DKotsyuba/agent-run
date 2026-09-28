@@ -5,7 +5,33 @@ mod common;
 use agent_run_core::logging::{self, Level};
 use agent_run_core::service::Service;
 use agent_run_platform::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Lists direct UTC-daily component files, excluding legacy component.log.
+fn daily_files(home: &Path, component: &str) -> Vec<PathBuf> {
+    let prefix = format!("{component}.");
+    let mut files: Vec<_> = std::fs::read_dir(home.join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".log")
+            })
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Concatenates this component's daily files for assertions independent of midnight.
+fn daily_text(home: &Path, component: &str) -> String {
+    daily_files(home, component)
+        .iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect()
+}
 
 /// Serializes process-global logger tests so each case owns its reset boundary.
 fn logger_guard() -> MutexGuard<'static, ()> {
@@ -31,7 +57,7 @@ fn logging_setup_is_bounded_idempotent_and_falls_back() {
     reset_logging();
     let temporary = tempfile::tempdir().unwrap();
     let first = logging::configure(temporary.path(), "cli");
-    assert!(temporary.path().join("logs/cli.log").is_file());
+    assert_eq!(daily_files(temporary.path(), "cli").len(), 1);
     assert_eq!(first.level(), Level::Debug);
     let second_home = temporary.path().join("other");
     let second = logging::configure(&second_home, "mcp");
@@ -64,7 +90,7 @@ fn service_start_logging_is_reconstructable_without_private_payloads() {
     let logger = logging::configure(temporary.path(), "cli");
     logging::start("fake", "model", "ag-test", true);
     logger.log(Level::Debug, "task text is intentionally not accepted here");
-    let text = std::fs::read_to_string(temporary.path().join("logs/cli.log")).unwrap();
+    let text = daily_text(temporary.path(), "cli");
     assert!(text.contains("start runtime=fake model=model agent_id=ag-test created=true"));
     assert!(!text.contains("sk-super-secret-token-value"));
     assert!(!text.contains("do the work do the work"));
@@ -83,7 +109,7 @@ fn config_reload_diagnostics_name_the_active_revision() {
     logging::configure(&home.path, "cli");
     let service = Service::new(home.path.clone());
     let digest = |bytes: &[u8]| fs::sha256(bytes);
-    let log = || std::fs::read_to_string(home.path.join("logs/cli.log")).unwrap();
+    let log = || daily_text(&home.path, "cli");
     // The newest line after an adoption names the revision that is now active.
     let newest_is = |line: String| assert!(log().lines().last().unwrap().ends_with(&line));
 
@@ -156,7 +182,7 @@ fn config_reload_rejection_survives_warning_threshold() {
     let invalid = "not valid TOML = [";
     std::fs::write(&config_path, invalid).unwrap();
     assert!(service.refresh_config().is_err());
-    let text = std::fs::read_to_string(home.path.join("logs/cli.log")).unwrap();
+    let text = daily_text(&home.path, "cli");
     assert!(text.contains(&format!(
         "Warning cli config reload rejected revision={}",
         fs::sha256(&original)

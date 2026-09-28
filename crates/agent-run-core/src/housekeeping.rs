@@ -1,0 +1,1134 @@
+//! Bounded filesystem retention for recognized disposable agent-run storage.
+//!
+//! Database history retention (`agent_run_store::retention`) expires durable
+//! runs fourteen days after they finish. This module reclaims the files those
+//! runs leave behind, plus a fixed set of other agent-run-owned disposable
+//! artifacts. It never sweeps by modification time alone: every candidate must
+//! be a recognized, named, currently effective-user-owned shape inside the
+//! configured home, and run trees additionally require the store to prove no
+//! retained row still owns or references them. Unknown names, foreign
+//! ownership, unreadable metadata and unrecognized categories are always
+//! retained (fail closed). Permanent configuration, accounts, credentials,
+//! skills, plugins, tools, installed releases and probes are not expiring user
+//! data and are never candidates.
+
+use crate::{error::invalid, fs, logging, state::Store, Result};
+use agent_run_config::{config::Config, provider_config::ProviderConfig};
+use agent_run_domain::domain::AgentId;
+use agent_run_store::retention::StorageProtection;
+use fs2::FileExt;
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs::OpenOptions,
+    os::unix::fs::OpenOptionsExt,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+/// Disposable storage expires with its durable history: fourteen days.
+pub const STORAGE_SECONDS: f64 = agent_run_store::retention::HISTORY_SECONDS;
+/// Operational component and daemon log files are kept for thirty days.
+///
+/// This is deliberately longer than [`STORAGE_SECONDS`]: a per-run model
+/// transcript or journal is execution history and follows the fourteen-day
+/// rule with its run directories, while component/daemon logs describe the
+/// service itself and stay useful for a longer operational window.
+pub const LOG_SECONDS: f64 = 30.0 * 24.0 * 3600.0;
+/// Maximum tree roots one pass may begin removing.
+const TREE_ROOTS_PER_PASS: usize = 16;
+/// Maximum descendant unlinks one pass performs, in addition to the bounded tree roots.
+const ENTRY_UNLINKS_PER_PASS: usize = 256;
+/// Maximum stale-socket probes one pass performs.
+const SOCKET_PROBES_PER_PASS: usize = 16;
+/// Maximum log/config backup files one pass removes.
+const FILE_REMOVALS_PER_PASS: usize = 64;
+/// Component labels this codebase uses for direct UTC-daily files.
+const LOG_COMPONENTS: [&str; 6] = ["cli", "api", "api-serve", "mcp", "services", "supervisor"];
+
+/// The effective user id; retention only ever touches its own entries.
+fn euid() -> u32 {
+    // SAFETY: geteuid inspects process identity and takes no pointers.
+    unsafe { libc::geteuid() }
+}
+
+/// Creation time encoded in one canonical run id (`ag-YYYYMMDD-HHMMSS-hex`).
+///
+/// Returns the UTC creation instant in Unix seconds, or `None` when the name
+/// is not a canonical id with a sane timestamp. The id is immutable, so this
+/// stays correct across partial removals and restarts, unlike directory
+/// modification times which any unlink refreshes.
+fn run_id_created(id: &str) -> Option<f64> {
+    id.parse::<AgentId>().ok()?;
+    let year: i32 = id[3..7].parse().ok()?;
+    if !(2020..=2100).contains(&year) {
+        return None;
+    }
+    let date = chrono::NaiveDate::parse_from_str(&id[3..11], "%Y%m%d").ok()?;
+    let hour: u32 = id[12..14].parse().ok()?;
+    let minute: u32 = id[14..16].parse().ok()?;
+    let second: u32 = id[16..18].parse().ok()?;
+    Some(
+        date.and_hms_opt(hour, minute, second)?
+            .and_utc()
+            .timestamp() as f64,
+    )
+}
+
+/// Creation time encoded in an all-digit timestamp directory name.
+///
+/// Accepts second, millisecond, microsecond and nanosecond stamps by dividing
+/// until the value is plausibly seconds; returns `None` for other shapes.
+fn stamp_created(name: &str) -> Option<f64> {
+    if !(9..=19).contains(&name.len()) || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut value: u64 = name.parse().ok()?;
+    while value > 100_000_000_000 {
+        value /= 1000;
+    }
+    if !(1_000_000_000..100_000_000_000).contains(&value) {
+        return None;
+    }
+    Some(value as f64)
+}
+
+/// Creation time encoded in one migration snapshot name (`<seconds>-<hex>-<kind>`).
+fn migration_created(name: &str) -> Option<f64> {
+    let (seconds, rest) = name.split_once('-')?;
+    let (uuid, kind) = rest.split_once('-')?;
+    if uuid.len() != 32
+        || !uuid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(kind, "v1-to-v2" | "v2-state-upgrade")
+    {
+        return None;
+    }
+    if seconds.len() < 9 || seconds.len() > 11 {
+        return None;
+    }
+    stamp_created(seconds)
+}
+
+/// One bounded sweep's remaining budgets and removed-entry counter.
+struct Pass {
+    /// Remaining directory roots that may begin draining.
+    roots: usize,
+    /// Remaining file and nested-directory unlinks inside approved trees.
+    unlinks: usize,
+    /// Remaining nonblocking socket probes.
+    sockets: usize,
+    /// Remaining standalone file unlinks.
+    files: usize,
+    /// Number of entries actually removed this pass.
+    removed: usize,
+    /// Remaining directory entries that may be inspected this pass.
+    scans: usize,
+    /// A live scan has more entries, so broker maintenance should retry soon.
+    pending: bool,
+    /// A directory read or safety limit failed; the pass cannot claim success.
+    failed: bool,
+    /// Home path and inode prefix that prevents cross-home cursor reuse.
+    home_key: String,
+    /// Two-second cooperative deadline for this filesystem pass.
+    deadline: Instant,
+}
+
+/// One retained live scan, rejected when its directory's inode changes.
+struct LiveScan {
+    /// Directory identity captured before opening the stream.
+    identity: (u64, u64),
+    /// Exclusively owned live directory offset.
+    scan: fs::DirScan,
+    /// Last access used to evict the oldest stream at the descriptor ceiling.
+    last_used: Instant,
+}
+
+/// Active broker scans only; restart begins at the start of each directory.
+static SCANS: OnceLock<Mutex<BTreeMap<String, LiveScan>>> = OnceLock::new();
+
+/// Returns the shared bounded scan registry without opening directories.
+fn scans() -> &'static Mutex<BTreeMap<String, LiveScan>> {
+    SCANS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+impl Pass {
+    /// Starts a pass with finite work budgets and a home-scoped live-scan key.
+    fn new(home: &Path, root: &fs::Dir) -> Result<Self> {
+        let identity = root.entry(None)?;
+        Ok(Self {
+            roots: TREE_ROOTS_PER_PASS,
+            unlinks: ENTRY_UNLINKS_PER_PASS,
+            sockets: SOCKET_PROBES_PER_PASS,
+            files: FILE_REMOVALS_PER_PASS,
+            removed: 0,
+            scans: 1024,
+            pending: false,
+            failed: false,
+            home_key: format!("{}:{}:{}", home.display(), identity.device, identity.inode),
+            deadline: Instant::now() + Duration::from_secs(2),
+        })
+    }
+
+    /// Scans one finite batch, advancing a live DIR even when entries are retained.
+    fn list(&mut self, dir: &fs::Dir, key: &str) -> Option<Vec<OsString>> {
+        if Instant::now() >= self.deadline {
+            self.pending = true;
+            return None;
+        }
+        if self.scans == 0 {
+            self.pending = true;
+            return None;
+        }
+        // Match the tree-root budget so an undeletable first batch cannot
+        // consume every removal slot and reset the scan cursor at EOF.
+        let limit = self.scans.min(TREE_ROOTS_PER_PASS);
+        let identity = match dir.entry(None) {
+            Ok(entry) => (entry.device, entry.inode),
+            Err(_) => {
+                self.failed = true;
+                return None;
+            }
+        };
+        let full_key = format!("{}:{key}", self.home_key);
+        let mut active = scans().lock().expect("scan lock is not poisoned");
+        if active
+            .get(&full_key)
+            .is_some_and(|scan| scan.identity != identity)
+        {
+            active.remove(&full_key);
+        }
+        if !active.contains_key(&full_key) {
+            if active.len() >= 64 {
+                if let Some(oldest) = active
+                    .iter()
+                    .min_by_key(|(_, scan)| scan.last_used)
+                    .map(|(name, _)| name.clone())
+                {
+                    active.remove(&oldest);
+                }
+            }
+            let scan = match dir.scan() {
+                Ok(scan) => scan,
+                Err(_) => {
+                    self.failed = true;
+                    return None;
+                }
+            };
+            active.insert(
+                full_key.clone(),
+                LiveScan {
+                    identity,
+                    scan,
+                    last_used: Instant::now(),
+                },
+            );
+        }
+        let current = active.get_mut(&full_key).expect("inserted scan");
+        current.last_used = Instant::now();
+        let result = current.scan.next_batch(limit);
+        match result {
+            Ok((names, done)) => {
+                self.scans -= names.len().max(1);
+                if done {
+                    active.remove(&full_key);
+                } else {
+                    self.pending = true;
+                }
+                Some(names)
+            }
+            Err(_) => {
+                self.failed = true;
+                None
+            }
+        }
+    }
+
+    /// Reports whether this directory still has entries in its live scan.
+    fn pending_for(&self, key: &str) -> bool {
+        scans()
+            .lock()
+            .expect("scan lock is not poisoned")
+            .contains_key(&format!("{}:{key}", self.home_key))
+    }
+
+    /// Refuses to report an idle pass if a directory read failed.
+    fn finish(&self) -> Result<()> {
+        if self.failed {
+            return Err(invalid("filesystem retention scan incomplete"));
+        }
+        Ok(())
+    }
+}
+
+/// Runs one bounded filesystem retention pass for `home` at Unix time `now`.
+///
+/// Returns the removed-entry count, or one when traversal needs another pass
+/// without having removed an entry. Zero means the pass found no actionable work. Each
+/// pass removes at most a fixed number of tree roots and unlinks, so a huge
+/// tree drains over successive passes instead of blocking one call; partially
+/// removed trees stay eligible because eligibility comes from immutable names
+/// and durable markers, never from timestamps the removal itself refreshes.
+/// The store is only read with short bounded queries between filesystem work,
+/// never inside a write transaction. Callers should rerun after one second
+/// while work remains and hourly when idle, matching history maintenance.
+pub fn sweep(home: &Path, now: f64, store: &Store) -> Result<usize> {
+    if !now.is_finite() || now < LOG_SECONDS {
+        return Err(invalid("filesystem retention requires a finite Unix time"));
+    }
+    let root = fs::Dir::open(home)?;
+    let identity = root.entry(None)?;
+    if identity.kind != fs::EntryType::Directory || identity.uid != euid() {
+        return Err(invalid(
+            "filesystem retention requires an owned home directory",
+        ));
+    }
+    let mut proof = store.storage_protection_snapshot()?;
+    let config = current_config(home, &root)
+        .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
+    collect_config_paths(&config, &mut proof);
+    let mut pass = Pass::new(home, &root)?;
+    run_directories(home, &root, now, &proof, &mut pass);
+    standalone_backups(home, &root, now, &proof, &mut pass);
+    migration_snapshots(home, &root, now, &proof, &mut pass);
+    config_profile_backups(home, &root, now, &config, &proof, &mut pass);
+    aged_logs(home, &root, now, &proof, &mut pass);
+    stale_sockets(home, &root, &proof, &mut pass);
+    if pass.removed > 0 {
+        if let Some(logger) = logging::configured() {
+            logger.log(
+                logging::Level::Debug,
+                &format!("housekeeping removed={}", pass.removed),
+            );
+        }
+    }
+    pass.finish()?;
+    Ok(pass.removed + usize::from(pass.pending && pass.removed == 0))
+}
+
+/// True when one canonical run id's encoded creation is older than the cutoff.
+fn older_than(created: f64, now: f64, window: f64) -> bool {
+    created.is_finite() && now - created > window
+}
+
+/// Reads and parses the current configuration through the no-follow home descriptor.
+/// Absence, invalid TOML, or an oversized file gives no deletion proof.
+fn current_config(home: &Path, root: &fs::Dir) -> Option<toml::Value> {
+    let bytes = root
+        .optional(Path::new("config.toml"), 1024 * 1024)
+        .ok()??;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let raw: toml::Value = toml::from_str(text).ok()?;
+    if ProviderConfig::parse(text, home).is_err() {
+        // Match the schema-1 loader's retired runtime handling and validate
+        // the same bytes before they can authorize filesystem deletion.
+        let mut parsed = raw.clone();
+        if let Some(runtimes) = parsed
+            .get_mut("runtimes")
+            .and_then(toml::Value::as_table_mut)
+        {
+            runtimes.remove("opencode");
+        }
+        let rewritten = toml::to_string(&parsed).ok()?;
+        let mut legacy: Config = toml::from_str(&rewritten).ok()?;
+        legacy.validate(home).ok()?;
+    }
+    Some(raw)
+}
+
+/// Adds absolute paths and file credential references from the parsed live configuration.
+fn collect_config_paths(value: &toml::Value, proof: &mut StorageProtection) {
+    match value {
+        toml::Value::String(text) => proof.protect_path(text),
+        toml::Value::Array(values) => {
+            for value in values {
+                collect_config_paths(value, proof);
+            }
+        }
+        toml::Value::Table(values) => {
+            for value in values.values() {
+                collect_config_paths(value, proof);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reports an exact live configuration string or path-basename reference.
+fn config_references(value: &toml::Value, name: &str) -> bool {
+    match value {
+        toml::Value::String(text) => {
+            text == name
+                || Path::new(text.strip_prefix("file:").unwrap_or(text))
+                    .file_name()
+                    .is_some_and(|part| part == name)
+        }
+        toml::Value::Array(values) => values.iter().any(|value| config_references(value, name)),
+        toml::Value::Table(values) => values.values().any(|value| config_references(value, name)),
+        _ => false,
+    }
+}
+
+/// Removes orphan `agents/<id>` trees and pruned runtime run directories.
+///
+/// A tree qualifies only when its canonical id encodes a creation older than
+/// fourteen days and the store proves no retained agent row owns the id or
+/// references the exact path (covering resumed children and identities that
+/// embed `runtime_home`). Read failures fail closed and retain the tree.
+fn run_directories(
+    home: &Path,
+    root: &fs::Dir,
+    now: f64,
+    proof: &StorageProtection,
+    pass: &mut Pass,
+) {
+    let Some(agents) = open_owned(root, "agents") else {
+        return;
+    };
+    let Some(names) = pass.list(&agents, "agents") else {
+        return;
+    };
+    for name in names {
+        if pass.roots == 0 {
+            return;
+        }
+        let Some(id) = name.to_str() else { continue };
+        let Some(created) = run_id_created(id) else {
+            continue;
+        };
+        if !older_than(created, now, STORAGE_SECONDS) {
+            continue;
+        }
+        if proof.retains(id, &home.join("agents").join(id)) {
+            continue;
+        }
+        remove_root(&agents, id, false, pass);
+    }
+    let Some(runtimes) = open_owned(root, "runtimes") else {
+        return;
+    };
+    let Some(names) = pass.list(&runtimes, "runtimes") else {
+        return;
+    };
+    for runtime in names {
+        let Some(runtime) = runtime.to_str() else {
+            continue;
+        };
+        let Some(runtime_dir) = open_owned(&runtimes, runtime) else {
+            continue;
+        };
+        let Some(bases) = pass.list(&runtime_dir, &format!("runtime:{runtime}")) else {
+            continue;
+        };
+        for base in bases {
+            let Some(base) = base.to_str() else { continue };
+            if !is_runtime_base(base) {
+                continue;
+            }
+            let Some(base_dir) = open_owned(&runtime_dir, base) else {
+                continue;
+            };
+            let Some(runs) = open_owned(&base_dir, "runs") else {
+                continue;
+            };
+            let Some(names) = pass.list(&runs, &format!("runs:{runtime}/{base}")) else {
+                continue;
+            };
+            for name in names {
+                if pass.roots == 0 {
+                    return;
+                }
+                let Some(id) = name.to_str() else { continue };
+                let Some(created) = run_id_created(id) else {
+                    continue;
+                };
+                if !older_than(created, now, STORAGE_SECONDS) {
+                    continue;
+                }
+                if proof.retains(
+                    id,
+                    &home
+                        .join("runtimes")
+                        .join(runtime)
+                        .join(base)
+                        .join("runs")
+                        .join(id),
+                ) {
+                    continue;
+                }
+                remove_root(&runs, id, false, pass);
+            }
+        }
+    }
+}
+
+/// Recognizes runtime home bases: `home` and labelled `home@<account>` forms.
+fn is_runtime_base(name: &str) -> bool {
+    match name.strip_prefix("home") {
+        None => false,
+        Some("") => true,
+        Some(rest) => match rest.strip_prefix('@') {
+            Some(label) => !label.is_empty() && !label.contains('@'),
+            None => false,
+        },
+    }
+}
+
+/// Expires timestamped `standalone/backups` entries after fourteen days.
+///
+/// The persistent installer lock is acquired nonblocking and held for the
+/// pass. A missing, corrupt, pending or unknown deployment journal blocks
+/// deletion; completed backups may expire, including the latest completed
+/// backup. Installed releases and `current` are never touched.
+fn standalone_backups(
+    home: &Path,
+    root: &fs::Dir,
+    now: f64,
+    proof: &StorageProtection,
+    pass: &mut Pass,
+) {
+    let Some(standalone) = open_owned(root, "standalone") else {
+        return;
+    };
+    // The install lock persists after installation: hold the same advisory lock
+    // while judging backups instead of treating its mere presence as activity.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(home.join("standalone/.install.lock"));
+    let Ok(lock) = lock else { return };
+    if lock.try_lock_exclusive().is_err() {
+        return;
+    }
+    let deploy_lock = match standalone.entry(Some(Path::new("deploy.lock"))) {
+        Ok(_) => {
+            let Ok(file) = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(home.join("standalone/deploy.lock"))
+            else {
+                return;
+            };
+            if file.try_lock_exclusive().is_err() {
+                return;
+            }
+            Some(file)
+        }
+        Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
+    let _guards = (lock, deploy_lock);
+    match standalone.optional(Path::new("deploy.json"), 8192) {
+        Ok(None) => {}
+        Ok(Some(bytes)) => {
+            let Ok(journal) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return;
+            };
+            let Some(phase) = journal.get("phase").and_then(serde_json::Value::as_str) else {
+                return;
+            };
+            if !matches!(
+                phase,
+                "committed" | "recovered" | "rolled_forward" | "rolled_back"
+            ) {
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    let Some(backups) = open_owned(&standalone, "backups") else {
+        return;
+    };
+    let Some(names) = pass.list(&backups, "standalone/backups") else {
+        return;
+    };
+    for name in names {
+        if pass.roots == 0 {
+            return;
+        }
+        let Some(name) = name.to_str() else { continue };
+        let Some(created) = stamp_created(name) else {
+            continue;
+        };
+        if !older_than(created, now, STORAGE_SECONDS) {
+            continue;
+        }
+        if proof.retains("", &home.join("standalone/backups").join(name)) {
+            continue;
+        }
+        remove_root(&backups, name, false, pass);
+    }
+}
+
+/// Expires completed migration snapshots and their applied markers.
+///
+/// Eligibility requires the sibling `<snapshot>.applied.json` marker; while
+/// `migrations/in-progress.json` exists nothing in the category is touched.
+/// A snapshot directory must carry `COMPLETE`, or be empty after a prior
+/// COMPLETE-last partial drain. Snapshots are
+/// owner-read-only (`0500`/`0400`); write permission is restored only on the
+/// descriptor of the already-judged-disposable directory. If a crash removes
+/// the snapshot but not its marker, a later pass unlinks just the marker, so
+/// partial passes always resume safely.
+fn migration_snapshots(
+    home: &Path,
+    root: &fs::Dir,
+    now: f64,
+    proof: &StorageProtection,
+    pass: &mut Pass,
+) {
+    let Some(migrations) = open_owned(root, "migrations") else {
+        return;
+    };
+    if migrations
+        .entry(Some(Path::new("in-progress.json")))
+        .is_ok()
+    {
+        return;
+    }
+    let Some(names) = pass.list(&migrations, "migrations") else {
+        return;
+    };
+    for name in names {
+        let Some(name) = name.to_str() else { continue };
+        let Some(marker) = name.strip_suffix(".applied.json") else {
+            continue;
+        };
+        if pass.files == 0 {
+            return;
+        }
+        let Some(created) = migration_created(marker) else {
+            continue;
+        };
+        if !older_than(created, now, STORAGE_SECONDS) {
+            continue;
+        }
+        if proof.retains("", &home.join("migrations").join(marker))
+            || proof.retains("", &home.join("migrations").join(name))
+        {
+            continue;
+        }
+        let snapshot = PathBuf::from(marker);
+        match migrations.entry(Some(&snapshot)) {
+            Ok(entry) => {
+                let empty_after_partial = migrations
+                    .subdir(&snapshot)
+                    .ok()
+                    .and_then(|dir| dir.list_batch(1).ok())
+                    .is_some_and(|(names, done)| done && names.is_empty());
+                if entry.kind == fs::EntryType::Directory
+                    && entry.uid == euid()
+                    && (empty_after_partial
+                        || migrations
+                            .entry(Some(&snapshot.join("COMPLETE")))
+                            .is_ok_and(|complete| {
+                                complete.kind == fs::EntryType::File && complete.uid == euid()
+                            }))
+                {
+                    remove_root(&migrations, marker, true, pass);
+                }
+            }
+            // The snapshot is already gone; finish by removing its marker.
+            Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                remove_owned_file(&migrations, name, now, STORAGE_SECONDS, pass);
+            }
+            // Unknown snapshot state fails closed and retains the marker.
+            Err(_) => {}
+        }
+    }
+}
+
+/// Expires recognized obsolete configuration and profile backups after fourteen days.
+///
+/// Recognized shapes are `config.toml.bak[.<suffix>]`, `config.toml.orig`,
+/// `config.toml.target-<suffix>` at the home root and `*.md.bak[.<suffix>]`
+/// inside `profiles`/`profiles-v2`. A candidate whose name the current
+/// `config.toml` still references is retained, protecting active
+/// configuration and account credential wiring; live configuration,
+/// profiles and account data never match these shapes.
+fn config_profile_backups(
+    home: &Path,
+    root: &fs::Dir,
+    now: f64,
+    config: &toml::Value,
+    proof: &StorageProtection,
+    pass: &mut Pass,
+) {
+    let Some(names) = pass.list(root, "config-home") else {
+        return;
+    };
+    for name in names {
+        if pass.files == 0 {
+            return;
+        }
+        let Some(name) = name.to_str() else { continue };
+        if !is_config_backup(name)
+            || config_references(config, name)
+            || proof.retains("", &home.join(name))
+        {
+            continue;
+        }
+        remove_owned_file(root, name, now, STORAGE_SECONDS, pass);
+    }
+    for profiles in ["profiles", "profiles-v2"] {
+        let Some(dir) = open_owned(root, profiles) else {
+            continue;
+        };
+        let Some(names) = pass.list(&dir, &format!("profiles:{profiles}")) else {
+            continue;
+        };
+        for name in names {
+            if pass.files == 0 {
+                return;
+            }
+            let Some(name) = name.to_str() else { continue };
+            if !is_profile_backup(name)
+                || config_references(config, name)
+                || proof.retains("", &home.join(profiles).join(name))
+            {
+                continue;
+            }
+            remove_owned_file(&dir, name, now, STORAGE_SECONDS, pass);
+        }
+    }
+}
+
+/// Recognizes profile backup names: `<profile>.md.bak[.<suffix>]`.
+fn is_profile_backup(name: &str) -> bool {
+    match name.find(".md.bak") {
+        Some(at) => {
+            let suffix = &name[at + ".md.bak".len()..];
+            suffix.is_empty()
+                || ((suffix.starts_with('.') || suffix.starts_with('-'))
+                    && suffix.len() > 1
+                    && suffix[1..]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        }
+        None => false,
+    }
+}
+
+/// Recognizes home-root configuration backup names this codebase creates.
+fn is_config_backup(name: &str) -> bool {
+    (name == "config.toml.bak"
+        || name.starts_with("config.toml.bak.")
+        || name.starts_with("config.toml.bak-"))
+        || name == "config.toml.orig"
+        || name.starts_with("config.toml.target-")
+}
+
+/// Expires aged operational log files after thirty days.
+///
+/// Only direct UTC-daily files are eligible. The logger reopens the current
+/// day's file before its next write, so an old dated inode cannot receive a
+/// future line. Undated legacy component and launchd stdout/stderr files are
+/// retained: age or an advisory lock cannot prove a writer closed them.
+fn aged_logs(home: &Path, root: &fs::Dir, now: f64, proof: &StorageProtection, pass: &mut Pass) {
+    let Some(logs) = open_owned(root, "logs") else {
+        return;
+    };
+    let Some(names) = pass.list(&logs, "logs") else {
+        return;
+    };
+    for name in names {
+        if pass.files == 0 {
+            return;
+        }
+        let Some(name) = name.to_str() else { continue };
+        let Some(created) = daily_log_created(name) else {
+            continue;
+        };
+        if !older_than(created, now, LOG_SECONDS) {
+            continue;
+        }
+        if proof.retains("", &home.join("logs").join(name)) {
+            continue;
+        }
+        remove_owned_file(&logs, name, now, LOG_SECONDS, pass);
+    }
+}
+
+/// Parses one recognized daily component filename into its UTC midnight timestamp.
+fn daily_log_created(name: &str) -> Option<f64> {
+    let stem = name.strip_suffix(".log")?;
+    let (component, date) = stem.rsplit_once('.')?;
+    if !LOG_COMPONENTS.contains(&component) || !date.is_ascii() {
+        return None;
+    }
+    let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(day.and_hms_opt(0, 0, 0)?.and_utc().timestamp() as f64)
+}
+
+/// Reclaims stale Desktop relay sockets at the home root.
+///
+/// A socket is stale only when a fresh nonblocking connect is refused and the inode is
+/// unchanged across the probe; live sockets and unknown outcomes are retained.
+/// No process identity is guessed and nothing is killed.
+fn stale_sockets(home: &Path, root: &fs::Dir, proof: &StorageProtection, pass: &mut Pass) {
+    let Some(names) = pass.list(root, "sockets") else {
+        return;
+    };
+    for name in names {
+        if pass.sockets == 0 {
+            return;
+        }
+        let Some(name) = name.to_str() else { continue };
+        if !is_relay_socket(name) {
+            continue;
+        }
+        if proof.retains("", &home.join(name)) {
+            continue;
+        }
+        let rel = Path::new(name);
+        let Ok(entry) = root.entry(Some(rel)) else {
+            continue;
+        };
+        if entry.kind != fs::EntryType::Special || !entry.socket || entry.uid != euid() {
+            continue;
+        }
+        pass.sockets -= 1;
+        // A full listen backlog returns pending/uncertain immediately; only an
+        // explicit refused or vanished endpoint proves a socket stale.
+        if !matches!(probe_socket(&home.join(name)), Ok(false)) {
+            continue;
+        }
+        // Identity must still be the probed object immediately before unlink.
+        match root.entry(Some(rel)) {
+            Ok(current)
+                if current.device == entry.device
+                    && current.inode == entry.inode
+                    && current.socket =>
+            {
+                if root.remove(rel).is_ok() {
+                    pass.removed += 1;
+                }
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Probes a Unix socket without ever waiting for a full listen backlog.
+/// Returns `false` only for a definite refused or vanished endpoint.
+fn probe_socket(path: &Path) -> std::io::Result<bool> {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: sockaddr_un is a plain C buffer; address fields are filled before connect.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length as u8;
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    // SAFETY: socket returns one owned descriptor; File closes it on every path.
+    let descriptor = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socket returned a valid descriptor which is uniquely owned here.
+    let socket = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    // SAFETY: fcntl modifies only this newly created descriptor.
+    if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: address is initialized and length includes the terminating NUL.
+    if unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            length as libc::socklen_t,
+        )
+    } == 0
+    {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ECONNREFUSED) | Some(libc::ENOENT) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+/// Recognizes Desktop relay socket names (`ar-cdx-v<version>-...sock`).
+fn is_relay_socket(name: &str) -> bool {
+    let rest = match name.strip_prefix("ar-cdx-v") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    name.ends_with(".sock")
+        && rest.starts_with(|b: char| b.is_ascii_digit())
+        && name.len() > "ar-cdx-v1-.sock".len()
+}
+
+/// Opens one direct child of `root` when it is an effective-user-owned directory.
+fn open_owned(root: &fs::Dir, name: &str) -> Option<fs::Dir> {
+    let rel = Path::new(name);
+    let entry = root.entry(Some(rel)).ok()?;
+    if entry.kind != fs::EntryType::Directory || entry.uid != euid() {
+        return None;
+    }
+    let dir = root.subdir(rel).ok()?;
+    match dir.entry(None) {
+        Ok(current) if current.device == entry.device && current.inode == entry.inode => Some(dir),
+        _ => None,
+    }
+}
+
+/// Removes one recognized owned regular file older than `window` by last write.
+fn remove_owned_file(dir: &fs::Dir, name: &str, now: f64, window: f64, pass: &mut Pass) {
+    let rel = Path::new(name);
+    let Ok(entry) = dir.entry(Some(rel)) else {
+        return;
+    };
+    if entry.kind != fs::EntryType::File || entry.uid != euid() || entry.modified > now - window {
+        return;
+    }
+    match dir.entry(Some(rel)) {
+        Ok(current)
+            if current.device == entry.device
+                && current.inode == entry.inode
+                && dir.remove(rel).is_ok() =>
+        {
+            pass.files -= 1;
+            pass.removed += 1;
+        }
+        _ => {}
+    }
+}
+
+/// Removes one judged-disposable directory tree through its parent, bounded by the pass.
+///
+/// The root's identity is re-verified on the opened descriptor; every entry is
+/// then unlinked through no-follow parent descriptors with a fresh ownership
+/// check, recursing only into owned real directories. Special entries (FIFOs,
+/// devices, sockets) inside a tree are left in place, so a tree holding one
+/// stays recognizable but harmless. When the unlink budget runs out the tree
+/// remains partially removed and eligible again on the next pass, because
+/// eligibility never depends on timestamps this removal changes.
+fn remove_root(parent: &fs::Dir, name: &str, preserve_complete: bool, pass: &mut Pass) {
+    if pass.roots == 0 || pass.unlinks == 0 {
+        return;
+    }
+    let rel = Path::new(name);
+    let Ok(entry) = parent.entry(Some(rel)) else {
+        return;
+    };
+    if entry.kind != fs::EntryType::Directory || entry.uid != euid() {
+        return;
+    }
+    let Ok(dir) = parent.subdir(rel) else { return };
+    match dir.entry(None) {
+        Ok(current) if current.device == entry.device && current.inode == entry.inode => {}
+        _ => return,
+    }
+    pass.roots -= 1;
+    // Owner-read-only snapshot directories need write permission to unlink
+    // their contents; this fchmod can only ever affect this owned descriptor.
+    if dir.permit_owner_write().is_err() {
+        return;
+    }
+    if !drain(&dir, preserve_complete, 0, pass) {
+        return;
+    }
+    match parent.entry(Some(rel)) {
+        Ok(current)
+            if current.device == entry.device
+                && current.inode == entry.inode
+                && current.kind == fs::EntryType::Directory
+                && parent.remove_directory(rel).is_ok() =>
+        {
+            pass.removed += 1;
+        }
+        _ => {}
+    }
+}
+
+/// Unlinks every entry of `dir` under the pass budget; true when it became empty.
+fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) -> bool {
+    if depth >= 32 || Instant::now() >= pass.deadline {
+        pass.failed = true;
+        return false;
+    }
+    let Ok(identity) = dir.entry(None) else {
+        return false;
+    };
+    let key = format!("tree:{}:{}", identity.device, identity.inode);
+    let Some(names) = pass.list(dir, &key) else {
+        return false;
+    };
+    let mut empty = true;
+    for name in names {
+        let rel = PathBuf::from(name);
+        if preserve_complete && rel == Path::new("COMPLETE") {
+            continue;
+        }
+        let Ok(entry) = dir.entry(Some(&rel)) else {
+            return false;
+        };
+        if entry.uid != euid() {
+            return false;
+        }
+        match entry.kind {
+            fs::EntryType::File | fs::EntryType::Symlink => {
+                if pass.unlinks == 0 {
+                    return false;
+                }
+                match dir.entry(Some(&rel)) {
+                    Ok(current)
+                        if current.device == entry.device
+                            && current.inode == entry.inode
+                            && current.kind == entry.kind => {}
+                    _ => return false,
+                }
+                if dir.remove(&rel).is_err() {
+                    return false;
+                }
+                pass.unlinks -= 1;
+                pass.removed += 1;
+            }
+            fs::EntryType::Directory => {
+                if pass.unlinks == 0 {
+                    return false;
+                }
+                let Ok(child) = dir.subdir(&rel) else {
+                    return false;
+                };
+                match child.entry(None) {
+                    Ok(current)
+                        if current.device == entry.device && current.inode == entry.inode => {}
+                    _ => return false,
+                }
+                // Nested owner-read-only directories relax the same narrow way.
+                if child.permit_owner_write().is_err() {
+                    return false;
+                }
+                if !drain(&child, false, depth + 1, pass) {
+                    empty = false;
+                    continue;
+                }
+                match dir.entry(Some(&rel)) {
+                    Ok(current)
+                        if current.device == entry.device
+                            && current.inode == entry.inode
+                            && current.kind == fs::EntryType::Directory => {}
+                    _ => return false,
+                }
+                if pass.unlinks == 0 {
+                    return false;
+                }
+                if dir.remove_directory(&rel).is_err() {
+                    empty = false;
+                } else {
+                    pass.unlinks -= 1;
+                    pass.removed += 1;
+                }
+            }
+            fs::EntryType::Special => empty = false,
+        }
+    }
+    if pass.pending_for(&key) || !empty {
+        return false;
+    }
+    if preserve_complete {
+        // Earlier pages may have contained a retained special entry. A fresh
+        // independent scan must prove the whole directory now contains only
+        // COMPLETE before that recovery marker may be removed.
+        let only_marker = dir.list_batch(2).is_ok_and(|(names, done)| {
+            done && (names.is_empty() || (names.len() == 1 && names[0] == "COMPLETE"))
+        });
+        if !only_marker {
+            return false;
+        }
+        let rel = Path::new("COMPLETE");
+        match dir.entry(Some(rel)) {
+            Ok(entry) if entry.kind == fs::EntryType::File && entry.uid == euid() => {
+                if pass.unlinks == 0 {
+                    return false;
+                }
+                match dir.entry(Some(rel)) {
+                    Ok(current)
+                        if current.device == entry.device && current.inode == entry.inode => {}
+                    _ => return false,
+                }
+                if dir.remove(rel).is_err() {
+                    return false;
+                }
+                pass.unlinks -= 1;
+                pass.removed += 1;
+            }
+            Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return false,
+        }
+    }
+    empty
+}
+
+#[cfg(test)]
+/// Socket probes use private finite listeners and never launch a model process.
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// A listener with zero queued slots still returns from the nonblocking probe promptly.
+    #[test]
+    fn zero_backlog_probe_is_bounded() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("ar-cdx-v4-backlog.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // SAFETY: listen changes only this test-owned listener's backlog.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let started = Instant::now();
+        let result = probe_socket(&path);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(!matches!(result, Ok(false)), "a live listener is not stale");
+    }
+
+    /// Evicting the least recently used stream resets only that traversal and allows progress.
+    #[test]
+    fn scan_registry_pressure_recovers_after_eviction() {
+        scans().lock().unwrap().clear();
+        let home = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            std::fs::write(home.path().join(format!("entry-{index:02}")), "x").unwrap();
+        }
+        let root = fs::Dir::open(home.path()).unwrap();
+        let original = Pass::new(home.path(), &root).unwrap();
+        let first_key = format!("{}:first", original.home_key);
+        for index in 0..260 {
+            let mut pass = Pass::new(home.path(), &root).unwrap();
+            let key = if index == 0 {
+                "first".to_owned()
+            } else {
+                format!("key-{index}")
+            };
+            assert_eq!(pass.list(&root, &key).unwrap().len(), 16);
+        }
+        assert_eq!(scans().lock().unwrap().len(), 64);
+        assert!(!scans().lock().unwrap().contains_key(&first_key));
+        let mut resumed = Pass::new(home.path(), &root).unwrap();
+        assert_eq!(resumed.list(&root, "first").unwrap().len(), 16);
+        let mut resumed = Pass::new(home.path(), &root).unwrap();
+        assert_eq!(resumed.list(&root, "first").unwrap().len(), 4);
+        assert!(!resumed.pending_for("first"));
+        scans().lock().unwrap().clear();
+    }
+}

@@ -1,14 +1,87 @@
 //! Fourteen-day retention for completed work; active ownership and retained lineage win over age.
 
 use crate::Store;
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{domain::AgentId, error::invalid, Result};
 use rusqlite::{params, TransactionBehavior};
+use serde_json::Value;
 use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 /// Completed history expires strictly after fourteen days, measured from `finished_at`.
 pub const HISTORY_SECONDS: f64 = 14.0 * 24.0 * 3600.0;
 /// Maximum rows removed from each large journal in one transaction.
 const ROW_BATCH: i64 = 2_000;
+
+/// Bounded in-memory proof of paths and run identities still referenced by retained rows.
+pub struct StorageProtection {
+    /// Agent and continuation identities which a filesystem pass must preserve.
+    ids: HashSet<String>,
+    /// Decoded, normalized and resolved paths, deduplicated across retained records.
+    paths: HashSet<PathBuf>,
+}
+
+impl StorageProtection {
+    /// Returns true when a retained row owns `id` or contains `path` or one of its descendants.
+    pub fn retains(&self, id: &str, path: &Path) -> bool {
+        self.ids.contains(id) || self.paths.iter().any(|retained| retained.starts_with(path))
+    }
+
+    /// Protects one currently loaded configuration path, including `file:` credential refs.
+    pub fn protect_path(&mut self, value: &str) {
+        self.add_path(value);
+    }
+
+    /// Adds a validated absolute path decoded from retained structured evidence.
+    fn add_path(&mut self, value: &str) {
+        let value = value.strip_prefix("file:").unwrap_or(value);
+        let path = Path::new(value);
+        if path.is_absolute() {
+            if !self.paths.insert(path.to_owned()) {
+                return;
+            }
+            let mut normalized = PathBuf::from("/");
+            for part in path.components() {
+                match part {
+                    std::path::Component::Normal(name) => normalized.push(name),
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    _ => {}
+                }
+            }
+            self.paths.insert(normalized);
+            if let Ok(resolved) = path.canonicalize() {
+                self.paths.insert(resolved);
+            }
+        }
+    }
+
+    /// Walks one parsed JSON value so escaped Unicode and slashes are decoded before comparison.
+    fn add_json(&mut self, value: &Value) {
+        match value {
+            Value::String(text) => {
+                self.add_path(text);
+                if text.parse::<AgentId>().is_ok() {
+                    self.ids.insert(text.clone());
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.add_json(value);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    self.add_json(value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Store {
     /// Removes one bounded portion of expired history at finite Unix time `at`.
@@ -34,6 +107,103 @@ impl Store {
         let deleted = result?;
         cleanup?;
         Ok(deleted)
+    }
+
+    /// Captures retained path evidence without taking a database writer lock.
+    ///
+    /// The read is limited to 20,000 metadata rows, 64 MiB of selected values,
+    /// and a cooperative two-second deadline shared by SQLite and row processing.
+    /// It excludes task bodies and transcript journals. Malformed, oversized or
+    /// interrupted evidence returns an error; callers must retain all candidates.
+    /// The progress handler is cleared on either outcome. OS I/O is not preempted.
+    pub fn storage_protection_snapshot(&self) -> Result<StorageProtection> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        self.conn
+            .progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+        let result = self.storage_protection_until(deadline);
+        let cleanup = self.conn.progress_handler(0, None::<fn() -> bool>);
+        let proof = result?;
+        cleanup?;
+        Ok(proof)
+    }
+
+    /// Builds the complete protection set or rejects it under the caller's SQL deadline.
+    /// Every selected column, including non-JSON account references, consumes the budget.
+    fn storage_protection_until(&self, deadline: Instant) -> Result<StorageProtection> {
+        let mut proof = StorageProtection {
+            ids: HashSet::new(),
+            paths: HashSet::new(),
+        };
+        let mut bytes = 0usize;
+        let mut visited = 0usize;
+        // Inspect borrowed SQLite values before allocating owned Strings or parsing JSON.
+        let mut check = |row: &rusqlite::Row<'_>| -> Result<()> {
+            visited += 1;
+            for column in 0..row.as_ref().column_count() {
+                match row.get_ref(column)? {
+                    rusqlite::types::ValueRef::Null => {}
+                    rusqlite::types::ValueRef::Text(value) => {
+                        bytes = bytes.saturating_add(value.len())
+                    }
+                    _ => return Err(invalid("invalid storage protection metadata")),
+                }
+            }
+            if visited > 20_000 || bytes > 64 * 1024 * 1024 || Instant::now() >= deadline {
+                return Err(invalid("storage protection evidence exceeds bound"));
+            }
+            Ok(())
+        };
+        let mut agents = self.conn.prepare("SELECT id,parent_agent_id,root_agent_id,answer_path,identity_json,workdir,json_extract(request_json,'$.read_roots') FROM agents")?;
+        let mut rows = agents.query([])?;
+        while let Some(row) = rows.next()? {
+            check(row)?;
+            let id: String = row.get(0)?;
+            proof.ids.insert(id);
+            for column in [1, 2] {
+                if let Some(id) = row.get::<_, Option<String>>(column)? {
+                    if id.parse::<AgentId>().is_ok() {
+                        proof.ids.insert(id);
+                    }
+                }
+            }
+            for column in [3, 5] {
+                if let Some(path) = row.get::<_, Option<String>>(column)? {
+                    proof.add_path(&path);
+                }
+            }
+            for column in [4, 6] {
+                if let Some(raw) = row.get::<_, Option<String>>(column)? {
+                    proof.add_json(&serde_json::from_str::<Value>(&raw)?);
+                }
+            }
+        }
+        let mut attempts = self.conn.prepare(
+            "SELECT adapter_state_json,session_facts_json,cleanup_proof_json FROM attempts",
+        )?;
+        let mut rows = attempts.query([])?;
+        while let Some(row) = rows.next()? {
+            check(row)?;
+            for column in 0..3 {
+                if let Some(raw) = row.get::<_, Option<String>>(column)? {
+                    proof.add_json(&serde_json::from_str::<Value>(&raw)?);
+                }
+            }
+        }
+        // Registered credentials remain protected even when their account is disabled
+        // or the current configuration no longer mentions them.
+        let mut accounts = self
+            .conn
+            .prepare("SELECT secret_ref FROM provider_accounts")?;
+        let mut rows = accounts.query([])?;
+        while let Some(row) = rows.next()? {
+            check(row)?;
+            let reference: String = row.get(0)?;
+            proof.add_path(&reference);
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid("storage protection deadline exceeded"));
+        }
+        Ok(proof)
     }
 
     /// Runs one short transaction under the caller's progress/lock deadlines.

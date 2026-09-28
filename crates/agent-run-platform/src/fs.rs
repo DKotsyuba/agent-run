@@ -130,7 +130,111 @@ pub enum EntryType {
     /// A device, FIFO, socket, or other unsupported entry.
     Special,
 }
+
+/// One no-follow identity snapshot of an entry beneath an owned directory.
+///
+/// Captured through `fstatat`/`fstat` on a live descriptor, so every field
+/// describes the entry this process actually opened rather than a path that
+/// may have been swapped between checks. Retention uses it to prove type,
+/// ownership and age before any removal, and `device`/`inode` to re-verify
+/// the same object immediately before unlinking it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Entry {
+    /// Classification of the final entry without following it.
+    pub kind: EntryType,
+    /// Whether the entry is a Unix socket, the one `Special` shape retention probes.
+    pub socket: bool,
+    /// Owning user id; only the effective user's entries are ever touched.
+    pub uid: u32,
+    /// Device half of the entry's inode identity.
+    pub device: u64,
+    /// Inode half of the entry's inode identity.
+    pub inode: u64,
+    /// Last modified time in Unix seconds, including available subseconds.
+    pub modified: f64,
+}
+
+/// Converts one raw `stat` result into the public no-follow identity shape.
+fn entry_of(status: &libc::stat) -> Entry {
+    let kind = status.st_mode & libc::S_IFMT;
+    Entry {
+        kind: if kind == libc::S_IFDIR {
+            EntryType::Directory
+        } else if kind == libc::S_IFREG {
+            EntryType::File
+        } else if kind == libc::S_IFLNK {
+            EntryType::Symlink
+        } else {
+            EntryType::Special
+        },
+        uid: status.st_uid,
+        #[cfg(target_os = "macos")]
+        device: status.st_dev as u64,
+        #[cfg(not(target_os = "macos"))]
+        device: status.st_dev,
+        inode: status.st_ino,
+        socket: kind == libc::S_IFSOCK,
+        modified: status.st_mtime as f64 + status.st_mtime_nsec as f64 / 1e9,
+    }
+}
+
 pub struct Dir(File);
+
+/// One live bounded scan with its own directory offset, reusable across broker passes.
+pub struct DirScan {
+    /// Unique libc directory stream, closed when the scan is dropped.
+    stream: *mut libc::DIR,
+}
+
+// SAFETY: the broker stores each DIR pointer behind a mutex and never invokes
+// readdir concurrently on one stream; ownership may move between workers.
+unsafe impl Send for DirScan {}
+
+impl Drop for DirScan {
+    /// Closes the uniquely owned directory stream.
+    fn drop(&mut self) {
+        // SAFETY: this pointer came from one successful fdopendir.
+        unsafe { libc::closedir(self.stream) };
+    }
+}
+
+impl DirScan {
+    /// Returns at most `limit` names and whether this live stream reached EOF.
+    pub fn next_batch(&mut self, limit: usize) -> Result<(Vec<OsString>, bool)> {
+        if limit == 0 || limit > 256 {
+            return Err(invalid("invalid directory batch"));
+        }
+        let mut names = Vec::with_capacity(limit);
+        while names.len() < limit {
+            // SAFETY: errno is thread-local; clearing it distinguishes EOF from a read error.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            // SAFETY: Linux exposes the same thread-local errno through this accessor.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            // SAFETY: this live DIR pointer is exclusively borrowed by the caller.
+            let entry = unsafe { libc::readdir(self.stream) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error().is_some_and(|code| code != 0) {
+                    return Err(error.into());
+                }
+                return Ok((names, true));
+            }
+            // SAFETY: d_name is NUL-terminated while the entry is live.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                use std::os::unix::ffi::OsStringExt;
+                names.push(OsString::from_vec(name.to_vec()));
+            }
+        }
+        Ok((names, false))
+    }
+}
 impl Dir {
     pub fn open(path: &Path) -> Result<Self> {
         let f = OpenOptions::new()
@@ -138,6 +242,32 @@ impl Dir {
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(path)?;
         Ok(Self(f))
+    }
+    /// Opens a new directory description so independent scans start at offset zero.
+    pub fn scan(&self) -> Result<DirScan> {
+        // SAFETY: openat of "." resolves beneath this already-open real directory.
+        let raw = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fdopendir consumes the distinct descriptor on success.
+        let stream = unsafe { libc::fdopendir(raw) };
+        if stream.is_null() {
+            // SAFETY: fdopendir did not take ownership on failure.
+            unsafe { libc::close(raw) };
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(DirScan { stream })
+    }
+    /// Reads one bounded batch from the start using an independent stream.
+    pub fn list_batch(&self, limit: usize) -> Result<(Vec<OsString>, bool)> {
+        self.scan()?.next_batch(limit)
     }
     /// List a directory through its descriptor without following path links.
     ///
@@ -192,6 +322,56 @@ impl Dir {
         names.sort();
         Ok(names)
     }
+    /// Captures one entry's no-follow identity through this directory.
+    ///
+    /// `path` is relative to this directory; `None` stats the directory's own
+    /// descriptor. The result never follows the final entry, and every parent
+    /// component is opened with `O_NOFOLLOW`, matching [`Dir::list`]. An error
+    /// means the entry's identity is unknown and callers must fail closed.
+    pub fn entry(&self, path: Option<&Path>) -> Result<Entry> {
+        let (parent, name) = match path {
+            Some(path) => self.parent(path, false)?,
+            None => {
+                // SAFETY: stat is a plain C output buffer; fstat initializes it before use.
+                let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+                // SAFETY: the descriptor is live and owned by this Dir.
+                if unsafe { libc::fstat(self.0.as_raw_fd(), &mut status) } < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                return Ok(entry_of(&status));
+            }
+        };
+        // SAFETY: stat is a plain C output buffer; fstatat initializes it before use.
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: descriptor/name are live and fstatat retains neither.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &mut status,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(entry_of(&status))
+    }
+    /// Remove one empty owned directory through its no-follow parent.
+    ///
+    /// The final component is unlinked with `AT_REMOVEDIR`, so a symlink or
+    /// non-directory at that name is refused by the kernel rather than
+    /// dereferenced; the parent directory is synced like [`Dir::remove`].
+    /// Fails with `ENOTEMPTY` while the directory still holds entries.
+    pub fn remove_directory(&self, path: &Path) -> Result<()> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        sync_directory(&parent)?;
+        Ok(())
+    }
     /// Classify a final path entry without following it or any parent link.
     pub fn entry_type(&self, path: &Path) -> Result<EntryType> {
         let (parent, name) = self.parent(path, false)?;
@@ -219,6 +399,28 @@ impl Dir {
         } else {
             EntryType::Special
         })
+    }
+    /// Opens one real child directory through this descriptor, links never followed.
+    ///
+    /// `path` is relative to this directory and resolved component by component
+    /// with `openat`/`O_NOFOLLOW`, so a substituted symlink anywhere on the way
+    /// fails instead of resolving. The caller should re-verify identity with
+    /// [`Dir::entry`] on the result when it must act on the same object it
+    /// classified beforehand.
+    pub fn subdir(&self, path: &Path) -> Result<Dir> {
+        Ok(Dir(self.open_directory(path)?))
+    }
+    /// Restores owner write permission on this already-open directory descriptor.
+    ///
+    /// Retention of obsolete owner-read-only snapshots (directory `0500`, files
+    /// `0400`) must unlink entries inside the snapshot before removing it. The
+    /// `fchmod` runs on the live descriptor this process opened and verified,
+    /// so it can never change permissions of anything outside that one judged
+    /// directory, and never follows a path again.
+    pub fn permit_owner_write(&self) -> Result<()> {
+        self.0
+            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
     }
     /// Read a final symbolic-link target without following it or its parents.
     pub fn read_link(&self, path: &Path) -> Result<Option<PathBuf>> {
@@ -493,4 +695,32 @@ pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>> {
         }
     }
     Ok(serde_json::to_vec(&normalized(value))?)
+}
+
+#[cfg(test)]
+/// Checks that bounded scans own independent offsets and converge beyond one batch.
+mod scan_tests {
+    use super::*;
+
+    /// Two fresh scans repeat the first page; one live scan reaches every later entry.
+    #[test]
+    fn independent_offsets_and_multi_batch_convergence() {
+        let home = tempfile::tempdir().unwrap();
+        for index in 0..40 {
+            std::fs::write(home.path().join(format!("file-{index:02}")), "x").unwrap();
+        }
+        let dir = Dir::open(home.path()).unwrap();
+        let first = dir.list_batch(16).unwrap().0;
+        assert_eq!(first, dir.list_batch(16).unwrap().0);
+        let mut scan = dir.scan().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let (names, done) = scan.next_batch(16).unwrap();
+            seen.extend(names);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 40);
+    }
 }

@@ -3726,7 +3726,17 @@ async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
     service.reconcile().unwrap();
     let row = Store::open(&home).unwrap().get(&id).unwrap();
     assert_eq!(row.status, Status::Lost, "{:?}", row.failure_text);
-    let supervisor_log = fs::read_to_string(home.join("logs/supervisor.log")).unwrap();
+    let supervisor_log: String = fs::read_dir(home.join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("supervisor.") && name.ends_with(".log")
+            })
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
     assert!(supervisor_log.contains("class=RuntimeError"));
     let attempts = attempts(&home, &id);
     assert_eq!(attempts.len(), 1, "{attempts:?}");
