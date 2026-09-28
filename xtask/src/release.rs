@@ -41,44 +41,69 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(result)
 }
 
-/// Creates a sealed release from an already-built native binary.
+/// Creates a sealed legacy release from an already-built native binary.
 ///
 /// The resulting `releases/<version>` contains the binary, external collectors, metadata,
 /// SHA256SUMS and COMPLETE marker. Existing complete releases are verified and
 /// reused; incomplete candidates are rejected to retain forensic evidence.
+/// This shape bundles no `agent-run-tui` observer; deploy fixtures and the
+/// legacy-installability guarantees rely on it staying available.
 pub fn build(output: &Path, version: &str, binary: &Path) -> Result<PathBuf, String> {
-    build_inner(output, version, binary, None)
+    build_inner(output, version, binary, None, None)
 }
 
 /// Seals a native release with the standalone deployment helper required by install.sh.
+///
+/// `tui` is the already-built `agent-run-tui` observer binary. When given, it
+/// is sealed as `bin/agent-run-tui` from the same workspace version, and a
+/// reused release directory that predates the bundled observer is rejected so
+/// the version cannot silently lose its second executable.
 pub fn build_with_installer(
     output: &Path,
     version: &str,
     binary: &Path,
     installer: &Path,
+    tui: Option<&Path>,
 ) -> Result<PathBuf, String> {
     if !installer.is_file() {
         return Err("native release requires a built deployment helper".into());
     }
-    let release = build_inner(output, version, binary, Some(installer))?;
+    let release = build_inner(output, version, binary, Some(installer), tui)?;
     if !release.join("bin/agent-run-deploy").is_file() {
         return Err("existing release predates install.sh; choose a new version".into());
+    }
+    if tui.is_some() && !release.join("bin/agent-run-tui").is_file() {
+        return Err("existing release predates the bundled TUI; choose a new version".into());
     }
     Ok(release)
 }
 
-/// Writes a release once, optionally including the native installation entry point.
+/// Writes a release once, optionally including the deployment helper and observer binaries.
+///
+/// `binary` is sealed as `bin/agent-run`; `installer`, when present, as
+/// `bin/agent-run-deploy`; `tui`, when present, as `bin/agent-run-tui`. Each
+/// input must already be a regular file, checked before the release directory
+/// is created so a bad argument never leaves an incomplete candidate.
 fn build_inner(
     output: &Path,
     version: &str,
     binary: &Path,
     installer: Option<&Path>,
+    tui: Option<&Path>,
 ) -> Result<PathBuf, String> {
     if version.trim().is_empty() || version.contains('/') {
         return Err("version must be a nonblank path component".into());
     }
     if !binary.is_file() {
         return Err(format!("binary is not a file: {}", binary.display()));
+    }
+    if let Some(tui) = tui {
+        if !tui.is_file() {
+            return Err(format!(
+                "bundled TUI binary is not a file: {}",
+                tui.display()
+            ));
+        }
     }
     let release = output.join("releases").join(version);
     if release.exists() {
@@ -90,6 +115,9 @@ fn build_inner(
     if let Some(installer) = installer {
         fs::copy(installer, release.join("bin/agent-run-deploy"))
             .map_err(|error| error.to_string())?;
+    }
+    if let Some(tui) = tui {
+        fs::copy(tui, release.join("bin/agent-run-tui")).map_err(|error| error.to_string())?;
     }
     // External integration scripts remain ordinary files, never embedded executable logic.
     for directory in ["collectors", "services"] {
